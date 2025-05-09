@@ -193,6 +193,12 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### Multimodal support
+
+Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.
+
+For more details, please refer to [multimodal documentation](../../docs/multimodal.md)
+
 ## Build
 
 `llama-server` is built alongside everything else from the root of the project
@@ -749,6 +755,9 @@ This endpoint is public (no API key check). By default, it is read-only. To make
   "total_slots": 1,
   "model_path": "../models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
   "chat_template": "...",
+  "modalities": {
+    "vision": false
+  },
   "build_info": "b(build number)-(build commit hash)"
 }
 ```
@@ -757,6 +766,7 @@ This endpoint is public (no API key check). By default, it is read-only. To make
 - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
 - `model_path` - the path to model file (same with `-m` argument)
 - `chat_template` - the model's original Jinja2 prompt template
+- `modalities` - the list of supported modalities
 
 ### POST `/props`: Change server global properties.
 
@@ -1068,6 +1078,8 @@ print(completion.choices[0].text)
 ### POST `/v1/chat/completions`: OpenAI-compatible Chat Completions API
 
 Given a ChatML-formatted json description in `messages`, it returns the predicted completion. Both synchronous and streaming mode are supported, so scripted and interactive applications work fine. While no strong claims of compatibility with OpenAI API spec is being made, in our experience it suffices to support many apps. Only models with a [supported chat template](https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template) can be used optimally with this endpoint. By default, the ChatML template will be used.
+
+If model supports multimodal, you can input the media file via `image_url` content part. We support both base64 and remote URL as input. See OAI documentation for more.
 
 *Options:*
 

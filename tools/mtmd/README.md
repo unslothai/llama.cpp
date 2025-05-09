@@ -16,38 +16,7 @@ The naming and structure related to multimodal support have evolved, which might
 
 ## Pre-quantized models
 
-These are ready-to-use models, most of them come with `Q4_K_M` quantization by default:
-
-```sh
-# Gemma 3
-llama-mtmd-cli -hf ggml-org/gemma-3-4b-it-GGUF
-llama-mtmd-cli -hf ggml-org/gemma-3-12b-it-GGUF
-llama-mtmd-cli -hf ggml-org/gemma-3-27b-it-GGUF
-
-# SmolVLM
-llama-mtmd-cli -hf ggml-org/SmolVLM-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/SmolVLM-256M-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/SmolVLM-500M-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/SmolVLM2-2.2B-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/SmolVLM2-500M-Video-Instruct-GGUF
-
-# Pixtral 12B
-llama-mtmd-cli -hf ggml-org/pixtral-12b-GGUF
-
-# Qwen 2 VL
-llama-mtmd-cli -hf ggml-org/Qwen2-VL-2B-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/Qwen2-VL-7B-Instruct-GGUF
-
-# Qwen 2.5 VL
-llama-mtmd-cli -hf ggml-org/Qwen2.5-VL-3B-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/Qwen2.5-VL-7B-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/Qwen2.5-VL-32B-Instruct-GGUF
-llama-mtmd-cli -hf ggml-org/Qwen2.5-VL-72B-Instruct-GGUF
-
-# Mistral Small 3.1 24B (IQ2_M quantization)
-llama-mtmd-cli -hf ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF --chat-template mistral-v7
-```
+See the list of pre-quantized model [here](../../docs/multimodal.md)
 
 ## How it works and what is `mmproj`?
 

@@ -118,6 +118,8 @@ export interface LlamaCppServerProps {
   build_info: string;
   model_path: string;
   n_ctx: number;
-  has_multimodal: boolean;
+  modalities?: {
+    vision: boolean;
+  };
   // TODO: support params
 }

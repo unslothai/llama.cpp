@@ -37,19 +37,26 @@ export function useChatExtraContext(): ChatExtraContextApi {
         break;
       }
 
-      if (mimeType.startsWith('image/') && mimeType !== 'image/svg+xml') {
-        if (!serverProps?.has_multimodal) {
+      if (mimeType.startsWith('image/')) {
+        if (!serverProps?.modalities?.vision) {
           toast.error('Multimodal is not supported by this server or model.');
           break;
         }
         const reader = new FileReader();
-        reader.onload = (event) => {
+        reader.onload = async (event) => {
           if (event.target?.result) {
+            let base64Url = event.target.result as string;
+
+            if (mimeType === 'image/svg+xml') {
+              // Convert SVG to PNG
+              base64Url = await svgBase64UrlToPngDataURL(base64Url);
+            }
+
             addItems([
               {
                 type: 'imageFile',
                 name: file.name,
-                base64Url: event.target.result as string,
+                base64Url,
               },
             ]);
           }
@@ -171,4 +178,57 @@ export function isLikelyNotBinary(str: string): boolean {
   // Check ratio of suspicious characters
   const ratio = suspiciousCharCount / sampleLength;
   return ratio <= options.suspiciousCharThresholdRatio;
+}
+
+// WARN: vibe code below
+// Converts a Base64URL encoded SVG string to a PNG Data URL using browser Canvas API.
+function svgBase64UrlToPngDataURL(base64UrlSvg: string): Promise<string> {
+  const backgroundColor = 'white'; // Default background color for PNG
+
+  return new Promise((resolve, reject) => {
+    try {
+      const img = new Image();
+
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+
+        if (!ctx) {
+          reject(new Error('Failed to get 2D canvas context.'));
+          return;
+        }
+
+        // Use provided dimensions or SVG's natural dimensions, with fallbacks
+        // Fallbacks (e.g., 300x300) are for SVGs without explicit width/height
+        // or when naturalWidth/Height might be 0 before full processing.
+        const targetWidth = img.naturalWidth || 300;
+        const targetHeight = img.naturalHeight || 300;
+
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+
+        if (backgroundColor) {
+          ctx.fillStyle = backgroundColor;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+        resolve(canvas.toDataURL('image/png'));
+      };
+
+      img.onerror = () => {
+        reject(
+          new Error('Failed to load SVG image. Ensure the SVG data is valid.')
+        );
+      };
+
+      // Load SVG string into an Image element
+      img.src = base64UrlSvg;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errorMessage = `Error converting SVG to PNG: ${message}`;
+      toast.error(errorMessage);
+      reject(new Error(errorMessage));
+    }
+  });
 }

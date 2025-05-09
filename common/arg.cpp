@@ -40,7 +40,7 @@ using json = nlohmann::ordered_json;
 
 std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_LLAVA,
-    // TODO: add LLAMA_EXAMPLE_SERVER when it's ready
+    LLAMA_EXAMPLE_SERVER,
 };
 
 static std::string read_file(const std::string & fname) {
@@ -2625,6 +2625,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("start processing the input from chunk N (default: %d)", params.i_chunk),
         [](common_params & params, int value) {
             params.i_chunk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--parse-special"},
+        string_format("prase special tokens (chat, tool, etc) (default: %s)", params.parse_special ? "true" : "false"),
+        [](common_params & params) {
+            params.parse_special = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
