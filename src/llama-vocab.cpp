@@ -430,7 +430,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 regex_exprs = {
                     // 1. Han characters
                     "[一-鿿]+",
-                    // 2. 
+                    // 2. Replace unicode with replacements from https://github.com/ggml-org/llama.cpp/blob/923e3ea2e3c96a0b4c208f53bc3bc90cdcdf13c0/src/unicode.cpp#L675
                     "[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[a-z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[A-Z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
                     // 3. Numbers (1-3 digits)
                     "\\p{N}{1,3}",
