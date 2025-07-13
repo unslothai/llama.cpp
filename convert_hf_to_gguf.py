@@ -5605,8 +5605,17 @@ class DeepseekV2Model(TextModel):
             print(f'tokenizer.vocab_size = {tokenizer.vocab_size}', flush = True)
             print("====================================", flush = True)
 
-            assert tokenizer.vocab_size == vocab_size
+            # Kimi-K2 adds 2 extra reserved tokens which is incorrect
             special_tokens = tokenizer.special_tokens
+            tokenizer_vocab_size = tokenizer.vocab_size
+            bad_tokens = ["<|reserved_token_163840|>", "<|reserved_token_163841|>"]
+            for bad_token in bad_tokens:
+                if bad_token in special_tokens and special_tokens[bad_token] >= vocab_size:
+                    print(f"Removing bad reserved token = {bad_token}")
+                    special_tokens.pop(bad_token)
+                    tokenizer_vocab_size -= 1
+
+            assert tokenizer_vocab_size == vocab_size
             reverse_vocab = {id_ : encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
             tokens: list[str] = []
             toktypes: list[int] = []
