@@ -426,22 +426,10 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 break;
             case LLAMA_VOCAB_PRE_TYPE_KIMI_K2:
-                // Same as GPT-4o tokenizer except for Han characters [\\p{Han}]+
                 regex_exprs = {
-                    // 1. Han characters
-                    "[一-鿿]+",
-                    // 2. Replace unicode with replacements from https://github.com/ggml-org/llama.cpp/blob/923e3ea2e3c96a0b4c208f53bc3bc90cdcdf13c0/src/unicode.cpp#L675
-                    "[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[a-z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[A-Z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
-                    // 3. Numbers (1-3 digits)
-                    "\\p{N}{1,3}",
-                    // 4. Punctuation and symbols
-                    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
-                    // 5. Newlines
-                    "\\s*[\\r\\n]+",
-                    // 6.Whitespace at the end of a line
-                    "\\s+(?!\\S)",
-                    // 7. General whitespace
-                    "\\s+",
+                    // K2 trigger pattern - this will activate the custom K2 handler in unicode.cpp
+                    // The custom handler implements all K2 patterns with proper Han character exclusion
+                    "\\p{Han}+",
                 };
                 break;
             default:
