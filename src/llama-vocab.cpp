@@ -425,6 +425,29 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1}| ?[^\\s\\p{L}\\p{N}\\r\\n]+|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_KIMI_K2:
+                // Same as GPT-4o tokenizer except for Han characters [\\p{Han}]+
+                regex_exprs = {
+                    // 1. Add the high-priority Han character rule. Backslashes must be escaped.
+                    "[\\p{Han}]+",
+
+                    // 2 & 3. Use the adapted word patterns from GPT4O/Tekken, which emulate the uppercase/lowercase logic in a C++-compatible way. 
+                    // We also adapt the case-insensitive contraction to be C++ compatible.
+                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+
+                    // 4. Add the number rule.
+                    "\\p{N}{1,3}",
+
+                    // 5. Use the Kimi K2 symbol rule precisely (no trailing '/').
+                    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
+
+                    // 6, 7, 8. Add the identical whitespace rules.
+                    "\\s*[\\r\\n]+",
+                    "\\s+(?!\\S)",
+                    "\\s+",
+                };
+                break;
             default:
                 // default regex for BPE tokenization pre-processing
                 regex_exprs = {
@@ -1664,6 +1687,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (
                 tokenizer_pre == "hunyuan") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_HUNYUAN;
+                clean_spaces = false;
+            } else if (
+                tokenizer_pre == "kimi-k2") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_KIMI_K2;
                 clean_spaces = false;
             } else {
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));

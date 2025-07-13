@@ -840,6 +840,9 @@ class TextModel(ModelBase):
         if chkhsh == "169bf0296a13c4d9b7672313f749eb36501d931022de052aad6e36f2bf34dd51":
             # ref: https://huggingface.co/LiquidAI/LFM2-Tokenizer
             res = "lfm2"
+        if chkhsh == "81212dc7cdb7e0c1074ca62c5aeab0d43c9f52b8a737be7b12a777c953027890":
+            # ref: https://huggingface.co/moonshotai/Kimi-K2-Instruct
+            res = "kimi-k2"
 
         if res is None:
             logger.warning("\n")
@@ -5563,7 +5566,68 @@ class DeepseekV2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK2
 
     def set_vocab(self):
-        self._set_vocab_gpt2()
+        try:
+            self._set_vocab_gpt2()
+            return
+        except:
+            pass
+        # Try using trust_remote_code=True
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+        tokpre = self.get_vocab_base_pre(tokenizer)
+        merges = []
+        vocab = {}
+        tokens: list[str] = []
+        toktypes: list[int] = []
+
+        if tokpre == "kimi-k2":
+            # Copied from Hunyuan tokenizer conversion
+            # 2. Reverse-engineer the merges list from mergeable_ranks
+            merges = []
+            vocab = {}
+            from tiktoken.load import load_tiktoken_bpe
+            mergeable_ranks = load_tiktoken_bpe(tokenizer.vocab_file)
+            for token, rank in mergeable_ranks.items():
+                vocab[QwenModel.token_bytes_to_string(token)] = rank
+                if len(token) == 1:
+                    continue
+                merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
+                if len(merged) == 2: # todo this is an assert in Qwen, why?
+                    merges.append(' '.join(map(QwenModel.token_bytes_to_string, merged)))
+
+            # 3. Generate the tokens and toktypes lists
+            vocab_size = self.hparams["vocab_size"]
+            assert tokenizer.vocab_size == vocab_size
+            special_tokens = tokenizer.special_tokens
+            reverse_vocab = {id_ : encoded_tok for encoded_tok, id_ in {**vocab, **special_tokens}.items()}
+            tokens: list[str] = []
+            toktypes: list[int] = []
+            for i in range(vocab_size):
+                if i not in reverse_vocab:
+                    tokens.append(f"[PAD{i}]")
+                    toktypes.append(gguf.TokenType.UNUSED)
+                else:
+                    token = reverse_vocab[i]
+                    tokens.append(token)
+                    if i in special_tokens.values():
+                        toktypes.append(gguf.TokenType.CONTROL)
+                    else:
+                        toktypes.append(gguf.TokenType.NORMAL)
+
+            # 5. Add special tokens and chat templates
+            special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False)
+            special_vocab.add_to_gguf(self.gguf_writer)
+            # FIX - Kimi-K2 does not add a BOS
+            self.gguf_writer.add_bos_token(False)
+        else:
+            raise NotImplementedError(f"{self.dir_model} is not supported yet!")
+
+        # 4. Write all vocab-related fields to the GGUF writer
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_token_merges(merges)
 
     def set_gguf_parameters(self):
 
@@ -6973,6 +7037,8 @@ class HunYuanMoEModel(TextModel):
         special_vocab.add_to_gguf(self.gguf_writer)
         # FIX for BOS token: Overwrite incorrect id read from config.json
         self.gguf_writer.add_bos_token_id(127959) # <|bos|>
+        # FIX - Hunyuan does not add a BOS
+        self.gguf_writer.add_bos_token(False)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
