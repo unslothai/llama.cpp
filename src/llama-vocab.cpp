@@ -430,8 +430,8 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 regex_exprs = {
                     // 1. Han characters
                     "[\\p{Han}]+",
-                    // 2. Words ending in lowercase (non-Han) with contractions
-                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?!\\p{Han})(?:\\p{Lu}|\\p{Lt}|\\p{Lm}|\\p{Lo}|\\p{M})*(?!\\p{Han})(?:\\p{Ll}|\\p{Lm}|\\p{Lo}|\\p{M})+|(?!\\p{Han})(?:\\p{Lu}|\\p{Lt}|\\p{Lm}|\\p{Lo}|\\p{M})+(?!\\p{Han})(?:\\p{Ll}|\\p{Lm}|\\p{Lo}|\\p{M})*)(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    // 2. Extract Latin/Greek/Cyrillic (or any non-Han) "words" from text that may also contain CJK.
+                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?:(?=[\\p{L}])(?!\\p{Han})[^a-z])|\\p{M})*(?:(?:(?=[\\p{L}])(?!\\p{Han})[^A-Z])|\\p{M})+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?(?:(?:(?=[\\p{L}])(?!\\p{Han})[^a-z])|\\p{M})+(?:(?:(?=[\\p{L}])(?!\\p{Han})[^A-Z])|\\p{M})*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
                     // 3. Numbers (1-3 digits)
                     "\\p{N}{1,3}",
                     // 4. Punctuation and symbols
