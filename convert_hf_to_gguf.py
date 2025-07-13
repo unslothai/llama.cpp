@@ -5638,7 +5638,7 @@ class DeepseekV2Model(TextModel):
             special_vocab.add_to_gguf(self.gguf_writer)
             # FIX - Kimi-K2 does not add a BOS
             self.gguf_writer.add_bos_token_id(163584) # [BOS]
-            self.gguf_writer.add_bos_token(False)
+            self.gguf_writer.add_add_bos_token(False)
             # FIX - Kimi-K2's EOS token is wrong - should be <|im_end|>
             self.gguf_writer.add_eos_token_id(163586) # <|im_end|>
         else:
@@ -7060,7 +7060,7 @@ class HunYuanMoEModel(TextModel):
         # FIX for BOS token: Overwrite incorrect id read from config.json
         self.gguf_writer.add_bos_token_id(127959) # <|bos|>
         # FIX - Hunyuan does not add a BOS
-        self.gguf_writer.add_bos_token(False)
+        self.gguf_writer.add_add_bos_token(False)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
