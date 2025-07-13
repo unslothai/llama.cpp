@@ -431,7 +431,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     // 1. Han characters
                     "[一-鿿]+",
                     // 2. 
-                    "[^\\r\\n\\p{L}\\p{N}]?(?=(?:(?![一-鿿])[\\p{L}\\p{M}])*?[a-z])(?:(?![一-鿿])[\\p{L}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?(?=(?:(?![一-鿿])[\\p{L}\\p{M}])*?[A-Z])(?:(?![一-鿿])[\\p{L}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    "[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[a-z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\nA-Za-z0-9]?(?=(?:(?![一-鿿])[A-Za-z])*?[A-Z])(?:(?![一-鿿])[A-Za-z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
                     // 3. Numbers (1-3 digits)
                     "\\p{N}{1,3}",
                     // 4. Punctuation and symbols
