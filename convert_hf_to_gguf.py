@@ -5599,7 +5599,7 @@ class DeepseekV2Model(TextModel):
             vocab_size = self.hparams["vocab_size"]
             prit("====================================")
             print(f'self.hparams["vocab_size"] = {vocab_size}')
-            print(f'vocab_size = {vocab_size}')
+            print(f'tokenizer.vocab_size = {tokenizer.vocab_size}')
             prit("====================================")
 
             assert tokenizer.vocab_size == vocab_size
