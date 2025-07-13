@@ -5635,7 +5635,10 @@ class DeepseekV2Model(TextModel):
             special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False)
             special_vocab.add_to_gguf(self.gguf_writer)
             # FIX - Kimi-K2 does not add a BOS
+            self.gguf_writer.add_bos_token_id(163584) # [BOS]
             self.gguf_writer.add_bos_token(False)
+            # FIX - Kimi-K2's EOS token is wrong - should be <|im_end|>
+            self.gguf_writer.add_eos_token_id(163586) # <|im_end|>
         else:
             raise NotImplementedError(f"{self.dir_model} is not supported yet!")
 
