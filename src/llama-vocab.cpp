@@ -428,20 +428,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
             case LLAMA_VOCAB_PRE_TYPE_KIMI_K2:
                 // Same as GPT-4o tokenizer except for Han characters [\\p{Han}]+
                 regex_exprs = {
-                    // 1. Han characters
-                    "[\\p{Han}]+",
-                    // 2. Extract Latin/Greek/Cyrillic (or any non-Han) "words" from text that may also contain CJK.
-                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?:(?=[\\p{L}])(?!\\p{Han})[^a-z])|\\p{M})*(?:(?:(?=[\\p{L}])(?!\\p{Han})[^A-Z])|\\p{M})+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?(?:(?:(?=[\\p{L}])(?!\\p{Han})[^a-z])|\\p{M})+(?:(?:(?=[\\p{L}])(?!\\p{Han})[^A-Z])|\\p{M})*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
-                    // 3. Numbers (1-3 digits)
-                    "\\p{N}{1,3}",
-                    // 4. Punctuation and symbols
-                    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
-                    // 5. Newlines
-                    "\\s*[\\r\\n]+",
-                    // 6.Whitespace at the end of a line
-                    "\\s+(?!\\S)",
-                    // 7. General whitespace
-                    "\\s+",
+                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
                 break;
             default:
