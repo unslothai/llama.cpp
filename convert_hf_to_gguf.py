@@ -5584,7 +5584,9 @@ class DeepseekV2Model(TextModel):
         toktypes: list[int] = []
 
         if tokpre == "kimi-k2":
-            # Copied from Hunyuan tokenizer conversion
+            # Copyright 2025-present the Unsloth team. All rights reserved.
+            # Licensed under the MIT License
+            # Derived from Hunyuan tokenizer conversion
             # 2. Reverse-engineer the merges list from mergeable_ranks
             merges = []
             vocab = {}
