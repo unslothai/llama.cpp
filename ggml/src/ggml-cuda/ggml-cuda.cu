@@ -2303,6 +2303,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_EXP:
                     ggml_cuda_op_exp(ctx, dst);
                     break;
+                case GGML_UNARY_OP_ELU:
+                    ggml_cuda_op_elu(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -3116,6 +3119,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_ELU:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
@@ -3222,7 +3226,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
-                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+#pragma message("TODO: implement Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
+                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        op->src[1]->type == GGML_TYPE_I64;
             } break;
