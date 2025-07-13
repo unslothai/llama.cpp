@@ -428,23 +428,21 @@ struct llm_tokenizer_bpe : llm_tokenizer {
             case LLAMA_VOCAB_PRE_TYPE_KIMI_K2:
                 // Same as GPT-4o tokenizer except for Han characters [\\p{Han}]+
                 regex_exprs = {
-                    // 1. Add the high-priority Han character rule. Backslashes must be escaped.
+                    // 1. Han characters
                     "[\\p{Han}]+",
-
-                    // 2 & 3. Use the adapted word patterns from GPT4O/Tekken, which emulate the uppercase/lowercase logic in a C++-compatible way. 
-                    // We also adapt the case-insensitive contraction to be C++ compatible.
-                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
-                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
-
-                    // 4. Add the number rule.
+                    // 2. Words ending in lowercase (non-Han) with contractions
+                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?![\\p{Han}])[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}])*(?:(?![\\p{Han}])[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    // 3. Words starting with uppercase (non-Han) with contractions
+                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?![\\p{Han}])[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}])+(?:(?![\\p{Han}])[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}])*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    // 4. Numbers (1-3 digits)
                     "\\p{N}{1,3}",
-
-                    // 5. Use the Kimi K2 symbol rule precisely (no trailing '/').
+                    // 5. Punctuation and symbols
                     " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
-
-                    // 6, 7, 8. Add the identical whitespace rules.
+                    // 6. Newlines
                     "\\s*[\\r\\n]+",
+                    // 7.Whitespace at the end of a line
                     "\\s+(?!\\S)",
+                    // 8. General whitespace
                     "\\s+",
                 };
                 break;
