@@ -431,9 +431,9 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     // 1. Han characters
                     "[\\p{Han}]+",
                     // 2. Words ending in lowercase (non-Han) with contractions
-                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?![\\p{Han}])[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}])*(?:(?![\\p{Han}])[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
                     // 3. Words starting with uppercase (non-Han) with contractions
-                    "[^\\r\\n\\p{L}\\p{N}]?(?:(?![\\p{Han}])[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}])+(?:(?![\\p{Han}])[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}])*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
                     // 4. Numbers (1-3 digits)
                     "\\p{N}{1,3}",
                     // 5. Punctuation and symbols
