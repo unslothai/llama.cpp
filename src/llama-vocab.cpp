@@ -428,7 +428,20 @@ struct llm_tokenizer_bpe : llm_tokenizer {
             case LLAMA_VOCAB_PRE_TYPE_KIMI_K2:
                 // Same as GPT-4o tokenizer except for Han characters [\\p{Han}]+
                 regex_exprs = {
-                    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                    // 1. Han characters
+                    "[一-鿿]+",
+                    // 2. 
+                    "[^\\r\\n\\p{L}\\p{N}]?(?=(?:(?![一-鿿])[\\p{L}\\p{M}])*?[a-z])(?:(?![一-鿿])[\\p{L}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?(?=(?:(?![一-鿿])[\\p{L}\\p{M}])*?[A-Z])(?:(?![一-鿿])[\\p{L}\\p{M}])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+                    // 3. Numbers (1-3 digits)
+                    "\\p{N}{1,3}",
+                    // 4. Punctuation and symbols
+                    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
+                    // 5. Newlines
+                    "\\s*[\\r\\n]+",
+                    // 6.Whitespace at the end of a line
+                    "\\s+(?!\\S)",
+                    // 7. General whitespace
+                    "\\s+",
                 };
                 break;
             default:
