@@ -5575,6 +5575,9 @@ class DeepseekV2Model(TextModel):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         tokpre = self.get_vocab_base_pre(tokenizer)
+        print("====================================", flush = True)
+        print(f'tokpre = {tokpre}', flush = True)
+        print("====================================", flush = True)
         merges = []
         vocab = {}
         tokens: list[str] = []
@@ -5597,10 +5600,10 @@ class DeepseekV2Model(TextModel):
 
             # 3. Generate the tokens and toktypes lists
             vocab_size = self.hparams["vocab_size"]
-            prit("====================================")
-            print(f'self.hparams["vocab_size"] = {vocab_size}')
-            print(f'tokenizer.vocab_size = {tokenizer.vocab_size}')
-            prit("====================================")
+            print("====================================", flush = True)
+            print(f'self.hparams["vocab_size"] = {vocab_size}', flush = True)
+            print(f'tokenizer.vocab_size = {tokenizer.vocab_size}', flush = True)
+            print("====================================", flush = True)
 
             assert tokenizer.vocab_size == vocab_size
             special_tokens = tokenizer.special_tokens
