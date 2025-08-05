@@ -8021,7 +8021,8 @@ class GptOssModel(TextModel):
                 self.gguf_writer.add_tensor(new_name, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
                 found_mxfp4_tensors = True
             elif "mlp.experts.gate_up_proj" in name:
-                blocks0, blocks1 = data_torch[:, ::2, :, :], data_torch[:, 1::2, :, :]
+                blocks0 = data_torch[:, :, :data_torch.shape[-1]//2]
+                blocks1 = data_torch[:, :, data_torch.shape[-1]//2:]
                 new_name_gate = self.map_tensor_name(name.replace("gate_up_proj_scales", "gate_proj.weight"))
                 self.gguf_writer.add_tensor(new_name_gate, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
                 new_name_up = self.map_tensor_name(name.replace("gate_up_proj_scales", "up_proj.weight"))
