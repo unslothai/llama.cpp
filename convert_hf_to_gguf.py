@@ -8017,15 +8017,15 @@ class GptOssModel(TextModel):
                 found_mxfp4_tensors = True
             elif "mlp.experts.down_proj" in name and "bias" not in name:
                 blocks0 = data_torch
-                new_name = self.map_tensor_name(name.replace("_scales", ".weight"))
+                new_name = self.map_tensor_name(name + ".weight")
                 self.gguf_writer.add_tensor(new_name, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
                 found_mxfp4_tensors = True
             elif "mlp.experts.gate_up_proj" in name and "bias" not in name:
                 blocks0 = data_torch[:, :, :data_torch.shape[-1]//2]
                 blocks1 = data_torch[:, :, data_torch.shape[-1]//2:]
-                new_name_gate = self.map_tensor_name(name.replace("gate_up_proj_scales", "gate_proj.weight"))
+                new_name_gate = self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight"))
                 self.gguf_writer.add_tensor(new_name_gate, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
-                new_name_up = self.map_tensor_name(name.replace("gate_up_proj_scales", "up_proj.weight"))
+                new_name_up = self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight"))
                 self.gguf_writer.add_tensor(new_name_up, blocks1, raw_dtype=gguf.GGMLQuantizationType.BF16)
                 found_mxfp4_tensors = True
 
