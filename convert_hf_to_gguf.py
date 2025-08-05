@@ -8019,7 +8019,7 @@ class GptOssModel(TextModel):
                 blocks0 = data_torch.transpose(0, 2)
                 print(blocks0.shape, data_torch.transpose(0, 2).shape, name)
                 new_name = self.map_tensor_name(name + ".weight")
-                self.gguf_writer.add_tensor(new_name, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
+                self.gguf_writer.add_tensor(new_name, blocks0.numpy(), raw_dtype=gguf.GGMLQuantizationType.BF16)
                 found_mxfp4_tensors = True
             elif "mlp.experts.gate_up_proj" in name and "bias" not in name:
                 blocks0 = data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 2)
@@ -8027,9 +8027,9 @@ class GptOssModel(TextModel):
                 blocks1 = data_torch[:, :, data_torch.shape[-1]//2:]
                 print(blocks1.shape, data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 2).shape, name)
                 new_name_gate = self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight"))
-                self.gguf_writer.add_tensor(new_name_gate, blocks0, raw_dtype=gguf.GGMLQuantizationType.BF16)
+                self.gguf_writer.add_tensor(new_name_gate, blocks0.numpy(), raw_dtype=gguf.GGMLQuantizationType.BF16)
                 new_name_up = self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight"))
-                self.gguf_writer.add_tensor(new_name_up, blocks1, raw_dtype=gguf.GGMLQuantizationType.BF16)
+                self.gguf_writer.add_tensor(new_name_up, blocks1.numpy(), raw_dtype=gguf.GGMLQuantizationType.BF16)
                 found_mxfp4_tensors = True
 
         if not found_mxfp4_tensors:
