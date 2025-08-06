@@ -8047,10 +8047,9 @@ class GptOssModel(TextModel):
             if name.endswith("_bias"):
                 name = name.replace("down_proj_bias", "down_proj.bias")
             else:
-                blocks0 = data_torch.transpose(0, 2).transpose(0, 1)
-                print(blocks0.shape, data_torch.transpose(0, 2).transpose(0, 1).shape, name)
+                down_proj = data_torch.transpose(-1, -2)
                 return [
-                    (self.map_tensor_name(name + ".weight"), blocks0)]
+                    (self.map_tensor_name(name + ".weight"), down_proj)]
 
         # split the gate_up into gate and up
         if "gate_up_proj" in name:
@@ -8063,13 +8062,10 @@ class GptOssModel(TextModel):
                     (self.map_tensor_name(name_up), up_proj_bias),
                 ]
             else:
-                blocks0 = data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 2).transpose(0, 1)
-                print(blocks0.shape, data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 2).transpose(0, 1).shape, name)
-                blocks1 = data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 2).transpose(0, 1)
-                print(blocks1.shape, data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 2).transpose(0, 1).shape, name)
+                gate_proj, up_proj = data_torch.transpose(-1, -2).split(dim_half, dim=-2)
                 return [
-                    (self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight")), blocks0),
-                    (self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight")), blocks1),
+                    (self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight")), gate_proj),
+                    (self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight")), up_proj),
                 ]
 
         return [(self.map_tensor_name(name), data_torch)]
