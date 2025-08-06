@@ -8047,8 +8047,8 @@ class GptOssModel(TextModel):
             if name.endswith("_bias"):
                 name = name.replace("down_proj_bias", "down_proj.bias")
             else:
-                blocks0 = data_torch#.transpose(0, 2)
-                print(blocks0.shape, data_torch.transpose(0, 2).shape, name)
+                blocks0 = data_torch.transpose(0, 1)
+                print(blocks0.shape, data_torch.transpose(0, 1).shape, name)
                 return [
                     (self.map_tensor_name(name + ".weight"), blocks0)]
 
@@ -8063,10 +8063,10 @@ class GptOssModel(TextModel):
                     (self.map_tensor_name(name_up), up_proj_bias),
                 ]
             else:
-                blocks0 = data_torch[:, :, :data_torch.shape[-1]//2]#.transpose(0, 2)
-                print(blocks0.shape, data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 2).shape, name)
-                blocks1 = data_torch[:, :, data_torch.shape[-1]//2:]#.transpose(0, 2)
-                print(blocks1.shape, data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 2).shape, name)
+                blocks0 = data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 1)
+                print(blocks0.shape, data_torch[:, :, :data_torch.shape[-1]//2].transpose(0, 1).shape, name)
+                blocks1 = data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 1)
+                print(blocks1.shape, data_torch[:, :, data_torch.shape[-1]//2:].transpose(0, 1).shape, name)
                 return [
                     (self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight")), blocks0),
                     (self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight")), blocks1),
