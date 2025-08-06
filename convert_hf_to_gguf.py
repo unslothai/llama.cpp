@@ -8064,6 +8064,7 @@ class GptOssModel(TextModel):
             else:
                 dim_half = data_torch.shape[-1] // 2
                 gate_proj, up_proj = data_torch.transpose(-1, -2).split(dim_half, dim=-2)
+                print("########")
                 return [
                     (self.map_tensor_name(name.replace("gate_up_proj", "gate_proj.weight")), gate_proj),
                     (self.map_tensor_name(name.replace("gate_up_proj", "up_proj.weight")), up_proj),
