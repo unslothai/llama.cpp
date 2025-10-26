@@ -1185,6 +1185,7 @@ class TensorNameMap:
             "model.vision_model.embeddings.position_embedding", # SmolVLM
             "vision_model.positional_embedding_vlm", # llama 4
             "vision_tower.patch_embed.pos_emb", # kimi-vl
+            "visual.pos_embed", # qwen3vl
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q: (
@@ -1282,6 +1283,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.fc1", # llama4
             "visual.blocks.{bid}.mlp.fc1", # qwen2vl
             "visual.blocks.{bid}.mlp.up_proj", # qwen2.5vl
+            "visual.blocks.{bid}.mlp.linear_fc1", # qwen3vl
             "vision_tower.encoder.blocks.{bid}.mlp.fc0", # kimi-vl (fc0/fc1)
         ),
 
@@ -1301,6 +1303,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.fc2", # llama4
             "visual.blocks.{bid}.mlp.fc2", # qwen2vl
             "visual.blocks.{bid}.mlp.down_proj", # qwen2.5vl
+            "visual.blocks.{bid}.mlp.linear_fc2", # qwen3vl
             "vision_tower.encoder.blocks.{bid}.mlp.fc1", # kimi-vl (fc0/fc1)
         ),
 
@@ -1395,6 +1398,18 @@ class TensorNameMap:
         MODEL_TENSOR.V_MM_PATCH_MERGER: (
             "multi_modal_projector.patch_merger.merging_layer", # mistral small 3.1 - hf
             "patch_merger.merging_layer", # mistral
+        ),
+
+        MODEL_TENSOR.V_DS_NORM: (
+            "model.visual.deepstack_merger_list.{bid}.norm", # deepstack in qwen3vl
+        ),
+
+        MODEL_TENSOR.V_DS_FC1: (
+            "model.visual.deepstack_merger_list.{bid}.linear_fc1", # deepstack in qwen3vl
+        ),
+
+        MODEL_TENSOR.V_DS_FC2: (
+            "model.visual.deepstack_merger_list.{bid}.linear_fc2", # deepstack in qwen3vl
         ),
 
         # audio (mtmd)
