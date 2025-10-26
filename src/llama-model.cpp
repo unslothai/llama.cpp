@@ -3350,7 +3350,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 {
                     // for deepstack features, we consider the embd to be [main_embd, deepstack_embd_1, deepstack_embd_2, ...]
                     int64_t n_embd = hparams.n_embd;
-                    if (arch == LLM_ARCH_QWEN3VL) { 
+                    if (arch == LLM_ARCH_QWEN3VLMOE) { 
                         n_embd = hparams.n_embd / (hparams.n_deepstack_layers + 1);
                     }
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
