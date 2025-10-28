@@ -993,13 +993,11 @@ struct clip_graph {
                 feat = ggml_reshape_3d(ctx0, feat, n_embd * merge_factor, n_pos / merge_factor, batch_size);
 
                 feat = build_norm(feat, merger.norm_w, merger.norm_b, norm_t, eps, il);
-                feat = ggml_mul_mat(ctx0, merger.fc1_w, feat);
-                feat = ggml_add(ctx0, feat, merger.fc1_b);
-
-                feat = ggml_gelu(ctx0, feat);
-
-                feat = ggml_mul_mat(ctx0, merger.fc2_w, feat);
-                feat = ggml_add(ctx0, feat, merger.fc2_b);
+                feat = build_ffn(feat,
+                    merger.fc1_w, merger.fc1_b,
+                    nullptr, nullptr,
+                    merger.fc2_w, merger.fc2_b,
+                    ffn_op_type::FFN_GELU, il);
 
                 if(!deepstack_features) {
                     deepstack_features = feat;
@@ -1021,15 +1019,11 @@ struct clip_graph {
         ggml_tensor * embeddings = inpL;
         embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
 
-        embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
-        embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
-
-        // GELU activation
-        embeddings = ggml_gelu(ctx0, embeddings);
-
-        // Second linear layer
-        embeddings = ggml_mul_mat(ctx0, model.mm_1_w, embeddings);
-        embeddings = ggml_add(ctx0, embeddings, model.mm_1_b);
+        embeddings = build_ffn(embeddings,
+            model.mm_0_w, model.mm_0_b,
+            nullptr, nullptr,
+            model.mm_1_w, model.mm_1_b,
+            ffn_op_type::FFN_GELU, -1);
 
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0); // concat along the feature dimension
 
