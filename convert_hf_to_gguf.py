@@ -7170,7 +7170,6 @@ class MiniMaxM2Model(TextModel):
         self.gguf_writer.add_rope_dimension_count(self.find_hparam(["rotary_dim"]))
         self.gguf_writer.add_rope_freq_base(self.find_hparam(["rope_theta"]))
 
-
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         if name.endswith("e_score_correction_bias"):
             name = name.replace("e_score_correction_bias", "e_score_correction.bias")
