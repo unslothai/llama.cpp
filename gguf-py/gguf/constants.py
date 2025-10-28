@@ -278,7 +278,7 @@ class Keys:
         USE_GELU            = "clip.use_gelu"
         USE_SILU            = "clip.use_silu"
         N_WA_PATTERN        = "clip.vision.n_wa_pattern" # used by qwen2.5vl
-        DEEPSTACK_LAYERS    = "clip.vision.deepstack_layers"
+        IS_DEEPSTACK_LAYERS    = "clip.vision.is_deepstack_layers"
 
         class Attention:
             HEAD_COUNT      = "clip.vision.attention.head_count"

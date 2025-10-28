@@ -4046,7 +4046,9 @@ class Qwen3VLVisionModel(MmprojModel):
         self.hparams_vision["num_attention_heads"] = self.hparams_vision.get("num_heads")
         self.hparams_vision["num_hidden_layers"] = self.hparams_vision.get("depth")
 
-        self.deepstack_layers: list[int] = list(self.hparams_vision.get("deepstack_visual_indexes", []))
+        self.is_deepstack_layers = [False] * int(self.hparams_vision["num_hidden_layers"] or 0)
+        for idx in self.hparams_vision.get("deepstack_visual_indexes", []):
+            self.is_deepstack_layers[idx] = True
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -4062,10 +4064,11 @@ class Qwen3VLVisionModel(MmprojModel):
         rms_norm_eps = self.global_config.get("text_config", {}).get("rms_norm_eps", 1e-6)
         self.gguf_writer.add_vision_attention_layernorm_eps(rms_norm_eps)
 
-        if self.deepstack_layers:
-            self.gguf_writer.add_vision_deepstack_layers(self.deepstack_layers)
+        if self.is_deepstack_layers:
+            self.gguf_writer.add_vision_is_deepstack_layers(self.is_deepstack_layers)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        assert self.hparams_vision is not None
         # Skip text model tensors - they go in the text model file
         if name.startswith("model.language_model.") or name.startswith("lm_head."):
             return []
@@ -4075,7 +4078,8 @@ class Qwen3VLVisionModel(MmprojModel):
 
         if name.startswith("visual.deepstack_merger_list."):
             prefix, rest = name.split(".", maxsplit=3)[2:]
-            idx = int(prefix)
+            # prefix is the layer index, convert to absolute clip layer index!
+            idx = self.hparams_vision.get("deepstack_visual_indexes", [])[int(prefix)]
             target = rest
 
             tensor_type: gguf.MODEL_TENSOR
