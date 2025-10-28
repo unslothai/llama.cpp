@@ -1996,7 +1996,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (
                 tokenizer_pre == "minimax-m2") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2;
-                clean_spaces = false;          
+                clean_spaces = false;
             } else {
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
             }
