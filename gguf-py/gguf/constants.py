@@ -427,6 +427,7 @@ class MODEL_ARCH(IntEnum):
     COGVLM           = auto()
     MINIMAXM2        = auto()
 
+
 class VISION_PROJECTOR_TYPE(IntEnum):
     MLP       = auto()
     LDP       = auto()

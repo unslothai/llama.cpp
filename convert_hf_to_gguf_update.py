@@ -421,8 +421,6 @@ tests = [
 # with each model, encode all tests and write the results in ./models/ggml-vocab-{name}.gguf.out
 # for each test, write the resulting tokens on a separate line
 
-print(f"Have models: {models}\n\n")
-
 for model in models:
     name = model["name"]
     tokt = model["tokt"]
