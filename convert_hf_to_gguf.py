@@ -742,6 +742,12 @@ class TextModel(ModelBase):
         if (n_experts_used := self.hparams.get("num_experts_per_tok")) is not None:
             self.gguf_writer.add_expert_used_count(n_experts_used)
             logger.info(f"gguf: experts used count = {n_experts_used}")
+        if (n_expert_groups := self.hparams.get("n_group")) is not None:
+            self.gguf_writer.add_expert_group_count(n_expert_groups)
+            logger.info(f"gguf: expert groups count = {n_expert_groups}")
+        if (n_group_used := self.hparams.get("topk_group")) is not None:
+            self.gguf_writer.add_expert_group_used_count(n_group_used)
+            logger.info(f"gguf: expert groups used count = {n_group_used}")
 
         if (head_dim := self.hparams.get("head_dim")) is not None:
             self.gguf_writer.add_key_length(head_dim)
@@ -2454,18 +2460,21 @@ class ArceeModel(LlamaModel):
 )
 class LlavaVisionModel(MmprojModel):
     img_break_tok_id = -1
+    use_break_tok = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.hparams.get("model_type") == "pixtral":
             # layer_norm_eps is not in config.json, it is hard-coded in modeling_pixtral.py
             self.hparams["layer_norm_eps"] = self.hparams.get("layer_norm_eps", 1e-5)
-            self.img_break_tok_id = self.get_token_id("[IMG_BREAK]")
+            if self.use_break_tok:
+                self.img_break_tok_id = self.get_token_id("[IMG_BREAK]")
         elif self.is_mistral_format:
             # hparams is already vision config here so norm_eps is only defined in global_config.
             self.hparams["norm_eps"] = self.global_config.get("norm_eps", None)
             assert self.hparams["norm_eps"] is not None, "norm_eps not found in params.json"
-            self.img_break_tok_id = self.find_vparam(["image_break_token_id"])
+            if self.use_break_tok:
+                self.img_break_tok_id = self.find_vparam(["image_break_token_id"])
         else:
             raise ValueError(f"Unsupported model type: {self.hparams['model_type']}")
         logger.info(f"Image break token id: {self.img_break_tok_id}")
@@ -3992,6 +4001,10 @@ class Qwen3Model(Qwen2Model):
         return torch.stack([true_row, false_row], dim=0)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "model.vision_" in name:
+            # skip multimodal tensors
+            return []
+
         if self.is_rerank:
             is_tied_head = self.is_tied_embeddings and "embed_tokens" in name
             is_real_head = not self.is_tied_embeddings and "lm_head" in name
@@ -8468,8 +8481,6 @@ class BailingMoeV2Model(TextModel):
         self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
         self.gguf_writer.add_expert_count(hparams["num_experts"])
         self.gguf_writer.add_expert_shared_count(hparams["num_shared_experts"])
-        self.gguf_writer.add_expert_group_count(hparams["n_group"])
-        self.gguf_writer.add_expert_group_used_count(hparams["topk_group"])
         self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
 
         if hparams["score_function"] == "sigmoid":
@@ -9664,6 +9675,21 @@ class PixtralModel(LlavaVisionModel):
         elif name == "vision_language_adapter.w_out.weight":
             return "mm.2.weight"
         return super().map_tensor_name(name, try_suffixes)
+
+
+@ModelBase.register("LightOnOCRForConditionalGeneration")
+class LightOnOCRVisionModel(LlavaVisionModel):
+    is_mistral_format = False
+    use_break_tok = False
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.LIGHTONOCR)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        name = name.replace("model.vision_encoder.", "vision_tower.")
+        name = name.replace("model.vision_projection.", "multi_modal_projector.")
+        return super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("KimiVLForConditionalGeneration")
