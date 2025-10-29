@@ -216,6 +216,8 @@ struct clip_layer {
     ggml_tensor * q_b = nullptr;
     ggml_tensor * v_w = nullptr;
     ggml_tensor * v_b = nullptr;
+    ggml_tensor * qkv_w = nullptr;
+    ggml_tensor * qkv_b = nullptr;
 
     ggml_tensor * o_w = nullptr;
     ggml_tensor * o_b = nullptr;
@@ -927,16 +929,15 @@ struct clip_graph {
 
             // self-attention
             {
-                ggml_tensor * Qcur = ggml_add(ctx0,
-                    ggml_mul_mat(ctx0, layer.q_w, cur), layer.q_b);
-                ggml_tensor * Kcur = ggml_add(ctx0,
-                    ggml_mul_mat(ctx0, layer.k_w, cur), layer.k_b);
-                ggml_tensor * Vcur = ggml_add(ctx0,
-                    ggml_mul_mat(ctx0, layer.v_w, cur), layer.v_b);
+                cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
+                cur = ggml_add(ctx0, cur, layer.qkv_b);
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_patches);
-                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_patches);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_patches);
+                ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                    cur->nb[1], 0);
+                ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                    cur->nb[1], n_embd * sizeof(float));
+                ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                    cur->nb[1], 2 * n_embd * sizeof(float));
 
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
@@ -2758,10 +2759,11 @@ struct clip_model_loader {
         model.layers.resize(hparams.n_layer);
         for (int il = 0; il < hparams.n_layer; ++il) {
             auto & layer = model.layers[il];
-            layer.k_w    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "weight"));
-            layer.q_w    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "weight"));
-            layer.v_w    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "weight"));
+            layer.k_w    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "weight"), false);
+            layer.q_w    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "weight"), false);
+            layer.v_w    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "weight"), false);
             layer.o_w    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "weight"));
+            layer.qkv_w  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "weight"), false);
             layer.k_norm = get_tensor(string_format(TN_ATTN_K_NORM, prefix, il, "weight"), false);
             layer.q_norm = get_tensor(string_format(TN_ATTN_Q_NORM, prefix, il, "weight"), false);
             layer.ln_1_w = get_tensor(string_format(TN_LN_1,        prefix, il, "weight"), false);
@@ -2773,6 +2775,7 @@ struct clip_model_loader {
             layer.q_b    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "bias"), false);
             layer.v_b    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "bias"), false);
             layer.o_b    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "bias"), false);
+            layer.qkv_b  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "bias"), false);
             layer.ln_1_b = get_tensor(string_format(TN_LN_1,        prefix, il, "bias"), false);
             layer.ln_2_b = get_tensor(string_format(TN_LN_2,        prefix, il, "bias"), false);
 

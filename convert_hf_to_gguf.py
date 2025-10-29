@@ -4147,24 +4147,6 @@ class Qwen3VLVisionModel(MmprojModel):
             return [(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".bias", data_torch)]
 
         if name.startswith("visual."):
-            if ".qkv." in name:
-                if data_torch.ndim == 2:
-                    c3, _ = data_torch.shape
-                else:
-                    c3 = data_torch.shape[0]
-                if c3 % 3 != 0:
-                    raise ValueError(f"Unexpected QKV shape for {name}: {data_torch.shape}")
-                c = c3 // 3
-                wq = data_torch[:c]
-                wk = data_torch[c: c * 2]
-                wv = data_torch[c * 2:]
-                base = name.replace("qkv", "{placeholder}")
-                return [
-                    (self.map_tensor_name(base.format(placeholder="q")), wq),
-                    (self.map_tensor_name(base.format(placeholder="k")), wk),
-                    (self.map_tensor_name(base.format(placeholder="v")), wv),
-                ]
-
             return [(self.map_tensor_name(name), data_torch)]
 
         # Fall back to parent class for other tensors

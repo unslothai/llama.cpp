@@ -1188,6 +1188,10 @@ class TensorNameMap:
             "visual.pos_embed", # qwen3vl
         ),
 
+        MODEL_TENSOR.V_ENC_ATTN_QKV: (
+            "visual.blocks.{bid}.attn.qkv", # qwen3vl
+        ),
+
         MODEL_TENSOR.V_ENC_ATTN_Q: (
             "vision_tower.vision_model.encoder.layers.{bid}.self_attn.q_proj",
             "model.vision_tower.encoder.layer.{bid}.attention.q_proj", # Intern-S1
