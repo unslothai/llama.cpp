@@ -1027,7 +1027,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_QWEN3VL:
             {
-                ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, 0);
+                ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 switch (hparams.n_layer) {
@@ -1036,8 +1036,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 64: type = LLM_TYPE_32B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
-                // for deepstack patch, we consider the embd to be [main_embd, deepstack_embd_1, deepstack_embd_2, ...]
-                hparams.n_embd = hparams.n_embd * (hparams.n_deepstack_layers + 1);
+                // since vision model stacks deepstack features along feature dim
+                // we also create a fake "n_embd" for text model to be the main embd + deepstack embds
+                hparams.n_embd *= hparams.n_deepstack_layers + 1;
             } break;
         case LLM_ARCH_QWEN3MOE:
             {
@@ -1052,17 +1053,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_QWEN3VLMOE:
             {
-                ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, 0);
+                ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 switch (hparams.n_layer) {
                     case 48: type = LLM_TYPE_30B_A3B; break;
                     case 94: type = LLM_TYPE_235B_A22B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
-                // for deepstack patch, we consider the embd to be [main_embd, deepstack_embd_1, deepstack_embd_2, ...]
-                hparams.n_embd = hparams.n_embd * (hparams.n_deepstack_layers + 1);
+                // since vision model stacks deepstack features along feature dim
+                // we also create a fake "n_embd" for text model to be the main embd + deepstack embds
+                hparams.n_embd *= hparams.n_deepstack_layers + 1;
             } break;
         case LLM_ARCH_PHI2:
             {
@@ -3307,11 +3309,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_QWEN3:
             case LLM_ARCH_QWEN3VL:
                 {
-                    int64_t n_embd = hparams.n_embd;
-                    // for deepstack features, we consider the embd to be [main_embd, deepstack_embd_1, deepstack_embd_2, ...]
-                    if (arch == LLM_ARCH_QWEN3VL) { 
-                        n_embd = hparams.n_embd / (hparams.n_deepstack_layers + 1);
-                    }
+                    // for model loading, the weights only have the main embd
+                    // so we need to divide by the number of deepstack layers + 1
+                    // n_embd is const int so we declare a new variable
+                    int64_t n_embd = hparams.n_embd / (hparams.n_deepstack_layers + 1);
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
                     // output
@@ -3347,11 +3348,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_QWEN3MOE:
             case LLM_ARCH_QWEN3VLMOE:
                 {
-                    // for deepstack features, we consider the embd to be [main_embd, deepstack_embd_1, deepstack_embd_2, ...]
-                    int64_t n_embd = hparams.n_embd;
-                    if (arch == LLM_ARCH_QWEN3VLMOE) { 
-                        n_embd = hparams.n_embd / (hparams.n_deepstack_layers + 1);
-                    }
+                    // for model loading, the weights only have the main embd
+                    // so we need to divide by the number of deepstack layers + 1
+                    // n_embd is const int so we declare a new variable
+                    int64_t n_embd = hparams.n_embd / (hparams.n_deepstack_layers + 1);
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
                     // output
