@@ -196,8 +196,6 @@ struct clip_hparams {
     int32_t n_wa_pattern = 0;
     int32_t spatial_merge_size = 0;
 
-    std::vector<bool> is_deepstack_layers; // qwen3vl: whether the layer is a deepstack layer
-
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor
     int32_t proj_stack_factor = 0; // ultravox
@@ -251,6 +249,10 @@ struct clip_layer {
     ggml_tensor * deepstack_fc1_b = nullptr;
     ggml_tensor * deepstack_fc2_w = nullptr;
     ggml_tensor * deepstack_fc2_b = nullptr;
+
+    bool has_deepstack() const {
+        return deepstack_fc1_w != nullptr;
+    }
 };
 
 struct clip_model {
@@ -269,6 +271,8 @@ struct clip_model {
     ggml_tensor * pre_ln_b = nullptr;
 
     std::vector<clip_layer> layers;
+
+    int32_t n_deepstack_layers = 0; // used by Qwen3-VL, calculated from clip_layer
 
     ggml_tensor * post_ln_w;
     ggml_tensor * post_ln_b;
@@ -983,7 +987,7 @@ struct clip_graph {
             cur = ggml_add(ctx0, inpL, cur);
             cb(cur, "layer_out", il);
             
-            if (hparams.is_deepstack_layers[il]) {
+            if (layer.has_deepstack()) {
                 ggml_tensor * feat = ggml_reshape_3d(ctx0, cur, n_embd * merge_factor, n_pos / merge_factor, batch_size);
                 feat = build_norm(feat, layer.deepstack_norm_w, layer.deepstack_norm_b, norm_t, eps, il);
                 feat = build_ffn(feat,
@@ -2565,9 +2569,6 @@ struct clip_model_loader {
                 hparams.vision_feature_layer.insert(layer);
             }
 
-            // set default deepstack layers to false
-            hparams.is_deepstack_layers.resize(hparams.n_layer, false);
-
             // model-specific params
             switch (model.proj_type) {
                 case PROJECTOR_TYPE_MINICPMV:
@@ -2630,7 +2631,6 @@ struct clip_model_loader {
                         hparams.image_size = 1024; // still need this?
                         hparams.warmup_image_size = hparams.patch_size * 8;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.spatial_merge_size, false);
-                        get_arr_bool(KEY_IS_DEEPSTACK_LAYERS, hparams.is_deepstack_layers, false);
                     } break;
                 case PROJECTOR_TYPE_LLAMA4:
                     {
@@ -2672,21 +2672,6 @@ struct clip_model_loader {
                 LOG_INF("%s: n_wa_pattern:       %d\n", __func__, hparams.n_wa_pattern);
                 if (hparams.spatial_merge_size > 0) {
                     LOG_INF("%s: spatial_merge_size: %d\n", __func__, hparams.spatial_merge_size);
-                }
-                if (!hparams.is_deepstack_layers.empty()) {
-                    LOG_INF("%s: deepstack enabled layers: ", __func__);
-                    bool first = true;
-                    for (size_t i = 0; i < hparams.is_deepstack_layers.size(); ++i) {
-                        if (hparams.is_deepstack_layers[i]) {
-                            LOG_CNT("%s%zu", first ? "" : ", ", i);
-                            first = false;
-                        }
-                    }
-                    if (first) {
-                        LOG_CNT("none\n");
-                    } else {
-                        LOG_CNT("\n");
-                    }
                 }
             } else if (is_audio) {
                 LOG_INF("\n--- audio hparams ---\n");
@@ -2789,13 +2774,14 @@ struct clip_model_loader {
 
 
             // qwen3vl deepstack layer
-            if (hparams.is_deepstack_layers[il]) {
-                layer.deepstack_norm_w = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "weight"), false);
-                layer.deepstack_norm_b = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "bias"), false);
-                layer.deepstack_fc1_w = get_tensor(string_format(TN_DEEPSTACK_FC1, il, "weight"), false);
-                layer.deepstack_fc1_b = get_tensor(string_format(TN_DEEPSTACK_FC1, il, "bias"), false);
-                layer.deepstack_fc2_w = get_tensor(string_format(TN_DEEPSTACK_FC2, il, "weight"), false);
-                layer.deepstack_fc2_b = get_tensor(string_format(TN_DEEPSTACK_FC2, il, "bias"), false);
+            layer.deepstack_norm_w = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "weight"), false);
+            layer.deepstack_norm_b = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "bias"), false);
+            layer.deepstack_fc1_w  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "weight"), false);
+            layer.deepstack_fc1_b  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "bias"), false);
+            layer.deepstack_fc2_w  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "weight"), false);
+            layer.deepstack_fc2_b  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "bias"), false);
+            if (layer.has_deepstack()) {
+                model.n_deepstack_layers++;
             }
 
             // some models already exported with legacy (incorrect) naming which is quite messy, let's fix it here
@@ -3150,21 +3136,6 @@ struct clip_model_loader {
         int n = gguf_get_arr_n(ctx_gguf.get(), i);
         output.resize(n);
         const int32_t * values = (const int32_t *)gguf_get_arr_data(ctx_gguf.get(), i);
-        for (int i = 0; i < n; ++i) {
-            output[i] = values[i];
-        }
-    }
-
-    void get_arr_bool(const std::string & key, std::vector<bool> & output, bool required = true) {
-        const int i = gguf_find_key(ctx_gguf.get(), key.c_str());
-        if (i < 0) {
-            if (required) throw std::runtime_error("Key not found: " + key);
-            return;
-        }
-
-        const int n = gguf_get_arr_n(ctx_gguf.get(), i);
-        output.resize(n);
-        const bool * values = (const bool *)gguf_get_arr_data(ctx_gguf.get(), i);
         for (int i = 0; i < n; ++i) {
             output[i] = values[i];
         }
@@ -4676,7 +4647,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN25VL:
             return ctx->model.mm_1_b->ne[0];
         case PROJECTOR_TYPE_QWEN3VL:
-            return ctx->model.mm_1_b->ne[0] * (1 + std::count(ctx->model.hparams.is_deepstack_layers.begin(), ctx->model.hparams.is_deepstack_layers.end(), true)); // main path + deepstack paths
+            // main path + deepstack paths
+            return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);
         case PROJECTOR_TYPE_GEMMA3:
             return ctx->model.mm_input_proj_w->ne[0];
         case PROJECTOR_TYPE_IDEFICS3:
