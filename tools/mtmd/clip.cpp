@@ -846,9 +846,12 @@ struct clip_graph {
         GGML_ASSERT(model.patch_bias != nullptr);
         GGML_ASSERT(model.position_embeddings != nullptr);
         GGML_ASSERT(model.class_embedding == nullptr);
+        GGML_ASSERT(hparams.spatial_merge_size == 2);
 
         const int batch_size       = 1;
+        const int merge_factor     = 4;
         const int n_pos            = n_patches;
+        const int n_pos_merged     = n_pos / merge_factor;
         const int num_position_ids = n_pos * 4; // m-rope requires 4 dim per position
 
         norm_type norm_t = NORM_TYPE_NORMAL;
@@ -911,9 +914,23 @@ struct clip_graph {
             inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, norm_t, eps, -1);
         }
 
-        // deepstack features (stack along the feature dimension), [n_embd * len(deepstack_layers), n_patches_x * n_patches_y, batch_size]
-        ggml_tensor * deepstack_features = nullptr;
-        const int merge_factor = hparams.spatial_merge_size > 0 ? hparams.spatial_merge_size * hparams.spatial_merge_size : 4; // default 2x2=4 for qwen3vl
+        int deepstack_layer_idx = 1; // begin with 1 to jump main feature
+        const int llm_n_embd = model.mm_1_w->ne[1]; // llm token dim
+        const int n_deepstack_layers = std::count(hparams.is_deepstack_layers.begin(), hparams.is_deepstack_layers.end(), true);
+
+        const size_t element_size = ggml_type_size(inpL->type);
+        const size_t slice_offsets = llm_n_embd * n_pos_merged * batch_size * element_size;
+
+        ggml_tensor * final_embedding = ggml_new_tensor_3d(ctx0, inpL->type,
+            llm_n_embd * (n_deepstack_layers + 1), n_pos_merged, batch_size);
+
+        auto make_deepstack_slice = [&](int idx) {
+            return ggml_view_3d(ctx0, final_embedding,
+                llm_n_embd, n_pos_merged, batch_size,
+                llm_n_embd * element_size,
+                slice_offsets,
+                idx * slice_offsets);
+        };
 
         // loop over layers
         for (int il = 0; il < n_layer; il++) {
@@ -990,13 +1007,7 @@ struct clip_graph {
                     nullptr, nullptr,
                     layer.deepstack_fc2_w, layer.deepstack_fc2_b,
                     ffn_op_type::FFN_GELU, il);
-
-                if(!deepstack_features) {
-                    deepstack_features = feat;
-                } else {
-                    // concat along the feature dimension
-                    deepstack_features = ggml_concat(ctx0, deepstack_features, feat, 0);
-                }
+                ggml_cpy(ctx0, feat, make_deepstack_slice(deepstack_layer_idx++));
             }
 
             inpL = cur;
@@ -1017,7 +1028,7 @@ struct clip_graph {
             model.mm_1_w, model.mm_1_b,
             ffn_op_type::FFN_GELU, -1);
 
-        embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0); // concat along the feature dimension
+        ggml_cpy(ctx0, embeddings, make_deepstack_slice(0));
 
         // build the graph
         ggml_build_forward_expand(gf, embeddings);
