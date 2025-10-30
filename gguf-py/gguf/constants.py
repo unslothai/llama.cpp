@@ -424,6 +424,7 @@ class MODEL_ARCH(IntEnum):
     SEED_OSS         = auto()
     GROVEMOE         = auto()
     APERTUS          = auto()
+    COGVLM           = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -435,6 +436,7 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     MERGER    = auto()
     GEMMA3    = auto()
     QWEN3VL   = auto()
+    COGVLM    = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -605,6 +607,11 @@ class MODEL_TENSOR(IntEnum):
     SHORTCONV_CONV       = auto()
     SHORTCONV_INPROJ     = auto()
     SHORTCONV_OUTPROJ    = auto()
+    VISEXP_ATTN_QKV      = auto()
+    VISEXP_ATTN_OUT      = auto()
+    VISEXP_GATE          = auto()
+    VISEXP_DOWN          = auto()
+    VISEXP_UP            = auto()
     # vision
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
@@ -649,6 +656,12 @@ class MODEL_TENSOR(IntEnum):
     V_DS_NORM            = auto() # qwen3vl
     V_DS_FC1             = auto() # qwen3vl
     V_DS_FC2             = auto() # qwen3vl
+    V_MM_POST_FC_NORM    = auto() # cogvlm
+    V_MM_UP              = auto() # cogvlm
+    V_MM_DOWN            = auto() # cogvlm
+    V_MM_GATE            = auto() # cogvlm
+    V_TOK_BOI            = auto() # cogvlm
+    V_TOK_EOI            = auto() # cogvlm
     # audio (mtmd)
     A_ENC_EMBD_POS       = auto()
     A_ENC_CONV1D         = auto()
@@ -777,6 +790,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.SEED_OSS:         "seed_oss",
     MODEL_ARCH.GROVEMOE:         "grovemoe",
     MODEL_ARCH.APERTUS:          "apertus",
+    MODEL_ARCH.COGVLM:           "cogvlm",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -957,6 +971,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SHORTCONV_CONV:            "blk.{bid}.shortconv.conv",
     MODEL_TENSOR.SHORTCONV_INPROJ:          "blk.{bid}.shortconv.in_proj",
     MODEL_TENSOR.SHORTCONV_OUTPROJ:         "blk.{bid}.shortconv.out_proj",
+    MODEL_TENSOR.VISEXP_ATTN_QKV:           "blk.{bid}.vis_attn_qkv",
+    MODEL_TENSOR.VISEXP_ATTN_OUT:           "blk.{bid}.vis_attn_output",
+    MODEL_TENSOR.VISEXP_GATE:               "blk.{bid}.vis_gate",
+    MODEL_TENSOR.VISEXP_DOWN:               "blk.{bid}.vis_down",
+    MODEL_TENSOR.VISEXP_UP:                 "blk.{bid}.vis_up",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_MMPROJ_FC:               "mm.model.fc",
@@ -1001,6 +1020,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_DS_NORM:                 "v.deepstack.{bid}.norm",
     MODEL_TENSOR.V_DS_FC1:                  "v.deepstack.{bid}.fc1",
     MODEL_TENSOR.V_DS_FC2:                  "v.deepstack.{bid}.fc2",
+    MODEL_TENSOR.V_MM_POST_FC_NORM:         "mm.post_fc_norm", # cogvlm
+    MODEL_TENSOR.V_MM_UP:                   "mm.up",
+    MODEL_TENSOR.V_MM_DOWN:                 "mm.down",
+    MODEL_TENSOR.V_MM_GATE:                 "mm.gate",
+    MODEL_TENSOR.V_TOK_BOI:                 "v.boi",
+    MODEL_TENSOR.V_TOK_EOI:                 "v.eoi",
     # audio (mtmd)
     MODEL_TENSOR.A_ENC_EMBD_POS:            "a.position_embd",
     MODEL_TENSOR.A_ENC_CONV1D:              "a.conv1d.{bid}",
@@ -1073,6 +1098,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_DS_NORM,
         MODEL_TENSOR.V_DS_FC1,
         MODEL_TENSOR.V_DS_FC2,
+        MODEL_TENSOR.V_MM_POST_FC_NORM,
+        MODEL_TENSOR.V_MM_UP,
+        MODEL_TENSOR.V_MM_DOWN,
+        MODEL_TENSOR.V_MM_GATE,
+        MODEL_TENSOR.V_TOK_BOI,
+        MODEL_TENSOR.V_TOK_EOI,
         # audio
         MODEL_TENSOR.A_ENC_EMBD_POS,
         MODEL_TENSOR.A_ENC_CONV1D,
@@ -2890,6 +2921,23 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_CHEXP,
         MODEL_TENSOR.FFN_UP_CHEXP,
     ],
+    MODEL_ARCH.COGVLM: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.VISEXP_ATTN_QKV,
+        MODEL_TENSOR.VISEXP_ATTN_OUT,
+        MODEL_TENSOR.VISEXP_GATE,
+        MODEL_TENSOR.VISEXP_UP,
+        MODEL_TENSOR.VISEXP_DOWN,
+    ],
     # TODO
 }
 
@@ -3117,6 +3165,7 @@ class VisionProjectorType:
     LFM2 = "lfm2"
     KIMIVL = "kimivl"
     LIGHTONOCR = "lightonocr"
+    COGVLM = "cogvlm"
 
 
 # Items here are (block size, type size)
