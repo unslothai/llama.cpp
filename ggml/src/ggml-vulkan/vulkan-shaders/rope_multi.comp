@@ -32,7 +32,7 @@ void main() {
     const uint sector = (i0 / 2) % sect_dims;
 
     float theta_base = 0.0;
-    if (p.is_imrope) {
+    if (p.is_imrope != 0) {
         if (sector % 3 == 1 && sector < 3 * p.sections[1]) {
             theta_base = data_pos[channel_x + ne2 * 1]*pow(p.theta_scale, i0/2.0f);
         } else if (sector % 3 == 2 && sector < 3 * p.sections[2]) {
