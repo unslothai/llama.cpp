@@ -4085,7 +4085,7 @@ class Qwen3VLVisionModel(MmprojModel):
         # Skip text model tensors - they go in the text model file
         if name.startswith("model.language_model.") or name.startswith("lm_head."):
             return []
-        
+
         if name.startswith("model.visual."):
             name = name.replace("model.visual.", "visual.", 1)
 
@@ -4174,7 +4174,7 @@ class Qwen3VLTextModel(Qwen3Model):
             self.gguf_writer.add_rope_dimension_sections(mrope_section[:4])
 
             logger.info(f"MRoPE sections: {mrope_section[:4]}")
-        
+
         vision_config = self.hparams.get("vision_config", {})
         deepstack_layer_num = len(vision_config.get("deepstack_visual_indexes", []))
         self.gguf_writer.add_num_deepstack_layers(deepstack_layer_num)
@@ -4183,7 +4183,7 @@ class Qwen3VLTextModel(Qwen3Model):
         # Skip vision tensors - they go in the mmproj file
         if name.startswith("model.visual."):
             return []
-        
+
         return super().modify_tensors(data_torch, name, bid)
 
 
@@ -4217,7 +4217,7 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
         # Skip vision tensors - they go in the mmproj file
         if name.startswith("model.visual."):
             return []
-        
+
         return super().modify_tensors(data_torch, name, bid)
 
 

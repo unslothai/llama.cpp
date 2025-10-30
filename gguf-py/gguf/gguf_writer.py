@@ -1073,7 +1073,7 @@ class GGUFWriter:
 
     def add_vision_n_wa_pattern(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.N_WA_PATTERN, value)
-    
+
     def add_vision_is_deepstack_layers(self, layers: Sequence[bool]) -> None:
         self.add_array(Keys.ClipVision.IS_DEEPSTACK_LAYERS, layers)
 
