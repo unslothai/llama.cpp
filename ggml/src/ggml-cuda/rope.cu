@@ -157,8 +157,10 @@ static __global__ void rope_multi(
             theta_base = pos[channel_x + ne2 * 1]*powf(theta_scale, i0/2.0f);
         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) { // w
             theta_base = pos[channel_x + ne2 * 2]*powf(theta_scale, i0/2.0f);
-        } else { // t
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) { // t
             theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
+        } else {
+            theta_base = pos[channel_x + ne2 * 3]*powf(theta_scale, i0/2.0f);
         }
     } else {
         if (sector < sections.v[0]) {

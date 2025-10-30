@@ -5514,6 +5514,8 @@ static void ggml_mrope_cache_init(
                 theta = theta_h;
             } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
                 theta = theta_w;
+            } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+                theta = theta_t;
             } else {
                 theta = theta_e;
             }
