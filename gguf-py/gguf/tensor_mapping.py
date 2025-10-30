@@ -1455,6 +1455,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_DS_FC2: (
             "model.visual.deepstack_merger_list.{bid}.linear_fc2", # deepstack in qwen3vl
+        ),
 
         MODEL_TENSOR.V_MM_POST_FC_NORM: (
             "model.vision.linear_proj.norm1", # cogvlm
