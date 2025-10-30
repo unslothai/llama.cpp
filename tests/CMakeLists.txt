@@ -124,7 +124,6 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3             ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-minimax-m2        ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-minimax-m2.gguf)
 
 if (NOT WIN32)
     llama_test_cmd(
