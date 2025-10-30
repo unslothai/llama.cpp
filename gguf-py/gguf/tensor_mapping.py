@@ -1216,14 +1216,11 @@ class TensorNameMap:
             "vision_model.positional_embedding_vlm", # llama 4
             "vision_tower.patch_embed.pos_emb", # kimi-vl
             "visual.pos_embed", # qwen3vl
-        ),
-
-        MODEL_TENSOR.V_ENC_ATTN_QKV: (
-            "visual.blocks.{bid}.attn.qkv", # qwen3vl
             "model.vision.patch_embedding.position_embedding", # cogvlm
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_QKV: (
+            "visual.blocks.{bid}.attn.qkv", # qwen3vl
             "model.vision.transformer.layers.{bid}.attention.query_key_value", # cogvlm
         ),
 
