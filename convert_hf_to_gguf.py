@@ -7147,28 +7147,10 @@ class MiniMaxM2Model(TextModel):
             raise ValueError(f"Unsupported scoring_func value: {self.hparams['scoring_func']}")
 
         block_count = self.find_hparam(["num_hidden_layers", "n_layer"])
-        n_embd = self.find_hparam(["hidden_size", "n_embd"])
-        n_head = self.find_hparam(["num_attention_heads", "n_head"])
-        n_head_kv = self.find_hparam(["num_key_value_heads", "n_head_kv"])
-        rms_eps = self.find_hparam(["rms_norm_eps"])
-        max_pos_embds = self.find_hparam(["n_positions", "max_position_embeddings"])
-        head_dim = self.find_hparam(["head_dim"])
-
-        self.gguf_writer.add_context_length(max_pos_embds)
-        self.gguf_writer.add_embedding_length(n_embd)
-        self.gguf_writer.add_feed_forward_length(self.find_hparam(["intermediate_size"]))
         self.gguf_writer.add_expert_feed_forward_length(self.find_hparam(["intermediate_size"]))
-        self.gguf_writer.add_expert_count(self.find_hparam(["num_local_experts"]))
-        self.gguf_writer.add_expert_used_count(self.find_hparam(["num_experts_per_tok"]))
         self.gguf_writer.add_block_count(block_count)
-        self.gguf_writer.add_head_count(n_head)
-        self.gguf_writer.add_head_count_kv(n_head_kv)
-        self.gguf_writer.add_layer_norm_rms_eps(rms_eps)
-        self.gguf_writer.add_layer_norm_eps(rms_eps)
-        self.gguf_writer.add_key_length(head_dim)
-        self.gguf_writer.add_value_length(head_dim)
         self.gguf_writer.add_rope_dimension_count(self.find_hparam(["rotary_dim"]))
-        self.gguf_writer.add_rope_freq_base(self.find_hparam(["rope_theta"]))
+        super().set_gguf_parameters()
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         if name.endswith("e_score_correction_bias"):
