@@ -364,7 +364,7 @@ class ModelBase:
                 unpacked = unpacked.reshape(shape[0], (unpacked.shape[-1] + group_size - 1) // group_size, group_size)
                 unpacked = unpacked - offset
 
-                return (unpacked * scale.unsqueeze(-1)).reshape(shape)
+                return (unpacked * scale.unsqueeze(-1).float()).reshape(shape)
 
             if quant_method == "bitnet":
                 for name in self.model_tensors.keys():
