@@ -411,9 +411,11 @@ class ModelBase:
                 if len(groups) > 1:
                     raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
                 weight_config = tuple(groups.values())[0]["weights"]
-                if quant_format == "float-quantized":
+
+                if quant_format == "float-quantized" or quant_format == "int-quantized":
                     block_size = weight_config.get("block_structure", None)
-                    assert weight_config.get("strategy") == "channel"
+                    strategy = weight_config.get("strategy")
+                    assert strategy == "channel" or strategy == "block"
                     assert weight_config.get("group_size") == None  # didn't find a model using this yet
                     for name in self.model_tensors.keys():
                         if name.endswith(".weight_scale"):
@@ -444,6 +446,8 @@ class ModelBase:
                             tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
+                else:
+                    raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             else:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
