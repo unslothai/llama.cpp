@@ -50,7 +50,7 @@ class LazyMeta(ABCMeta):
         for binary_op in (
             "lt", "le", "eq", "ne", "ge", "gt",
             "add", "and", "floordiv", "lshift", "mod", "mul", "matmul",
-            "or", "pos", "pow", "rshift", "sub", "truediv", "xor",
+            "or", "pow", "rshift", "sub", "truediv", "xor",
             "iadd", "iand", "ifloordiv", "ilshift", "imod", "imul", "ior", "irshift", "isub", "ixor",
             "radd", "rand", "rfloordiv", "rmul", "ror", "rpow", "rsub", "rtruediv", "rxor",
         ):
@@ -58,7 +58,7 @@ class LazyMeta(ABCMeta):
             # evaluation on the meta tensor is needed in case there's broadcasting
             namespace[attr_name] = mk_wrap(attr_name, meta_noop=False)
 
-        for unary_op in ("not", "abs", "invert", "neg"):
+        for unary_op in ("not", "abs", "invert", "neg", "pos"):
             attr_name = f"__{unary_op}__"
             # the result of these operators usually has the same shape and dtype as the input,
             # so evaluation on the meta tensor can be skipped.
