@@ -4,11 +4,7 @@
 #define CHUNK_SIZE 64
 
 llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_graph_params & params) :
-    llm_graph_context_mamba(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v;
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
-    //GGML_ASSERT(n_embd_head == hparams.n_rot);
-
+    llm_graph_context_mamba(params), model(model) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -37,10 +33,10 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recurrent(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_qwen3next_linear_attn_layer(inp->get_recr(), cur, model, ubatch, causal_mask, identity, il);
+            cur = buil_layer_attn_linear(inp->get_recr(), cur, causal_mask, identity, il);
         } else {
             // Full attention layer
-            cur = build_qwen3next_attention_layer(cur, inp_pos, inp->get_attn(), model, n_embd_head, il);
+            cur = build_layer_attn(cur, inp_pos, inp->get_attn(), il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
@@ -60,7 +56,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         cb(attn_post_norm, "attn_post_norm", il);
 
         // FFN layer (MoE or dense) - without residual connection
-        cur = build_layer_ffn(attn_post_norm, model, il);
+        cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
@@ -87,7 +83,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
     ggml_build_forward_expand(gf, cur);
 }
 
-ggml_tensor * llm_build_qwen3next::delta_net_chunking(
+ggml_tensor * llm_build_qwen3next::build_delta_net_chunking(
         ggml_tensor * q,
         ggml_tensor * k,
         ggml_tensor * v,
@@ -96,8 +92,6 @@ ggml_tensor * llm_build_qwen3next::delta_net_chunking(
         ggml_tensor * state,
         ggml_tensor * causal_mask,
         ggml_tensor * identity,
-        bool          use_qk_l2norm,
-        float         eps_norm,
         int           il) {
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(k));
@@ -125,13 +119,19 @@ ggml_tensor * llm_build_qwen3next::delta_net_chunking(
 
     GGML_ASSERT(H_k == H_v);  // we did a repeat to make sure this is the case
 
+    // TODO: can this ever be false?
+    const bool use_qk_l2norm = true;
+
     if (use_qk_l2norm) {
+        const float eps_norm = hparams.f_norm_rms_eps;
+
         q = ggml_l2_norm(ctx0, q, eps_norm);
         k = ggml_l2_norm(ctx0, k, eps_norm);
     }
 
-    float scale = 1.0f / sqrtf(S_v);
-    q           = ggml_scale(ctx0, q, scale);
+    const float scale = 1.0f / sqrtf(S_v);
+
+    q = ggml_scale(ctx0, q, scale);
 
     beta = ggml_sigmoid(ctx0, beta);
 
@@ -350,7 +350,7 @@ ggml_tensor * llm_build_qwen3next::delta_net_chunking(
     return ggml_concat(ctx0, flat_output, flat_state, 0);
 }
 
-ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
+ggml_tensor * llm_build_qwen3next::build_delta_net_recurrent(
         ggml_tensor * q,
         ggml_tensor * k,
         ggml_tensor * v,
@@ -359,8 +359,6 @@ ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
         ggml_tensor * state,
         ggml_tensor * causal_mask,
         ggml_tensor * identity,
-        bool          use_qk_l2norm,
-        float         eps_norm,
         int           il) {
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(k));
@@ -388,7 +386,12 @@ ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
 
     GGML_ASSERT(H_k == H_v);  // we did a repeat to make sure this is the case
 
+    // TODO: can this ever be false?
+    const bool use_qk_l2norm = true;
+
     if (use_qk_l2norm) {
+        const float eps_norm = hparams.f_norm_rms_eps;
+
         q = ggml_l2_norm(ctx0, q, eps_norm);
         k = ggml_l2_norm(ctx0, k, eps_norm);
     }
@@ -611,12 +614,14 @@ ggml_tensor * llm_build_qwen3next::build_q3n_gated_norm(struct ggml_tensor * inp
     return ggml_mul(ctx0, normalized, gated_silu);
 }
 
-ggml_tensor * llm_build_qwen3next::build_qwen3next_attention_layer(ggml_tensor *             cur,
-                                                                   ggml_tensor *             inp_pos,
-                                                                   llm_graph_input_attn_kv * inp_attn,
-                                                                   const llama_model &       model,
-                                                                   const int64_t             n_embd_head,
-                                                                   const int                 il) {
+ggml_tensor * llm_build_qwen3next::build_layer_attn(
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        llm_graph_input_attn_kv * inp_attn,
+        const int                 il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v;
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
@@ -695,13 +700,12 @@ ggml_tensor * llm_build_qwen3next::build_qwen3next_attention_layer(ggml_tensor *
     return cur;
 }
 
-ggml_tensor * llm_build_qwen3next::build_qwen3next_linear_attn_layer(llm_graph_input_rs * inp,
-                                                                     ggml_tensor *        cur,
-                                                                     const llama_model &  model,
-                                                                     const llama_ubatch & ubatch,
-                                                                     ggml_tensor *        causal_mask,
-                                                                     ggml_tensor *        identity,
-                                                                     int                  il) {
+ggml_tensor * llm_build_qwen3next::buil_layer_attn_linear(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        ggml_tensor *        causal_mask,
+        ggml_tensor *        identity,
+        int                  il) {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t d_inner      = hparams.ssm_d_inner;
@@ -914,10 +918,10 @@ ggml_tensor * llm_build_qwen3next::build_qwen3next_linear_attn_layer(llm_graph_i
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // Choose between delta_net_chunking and delta_net_recurrent based on n_tokens
+    // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
     ggml_tensor * attn_out = n_seq_tokens > CHUNK_SIZE ?
-        delta_net_chunking (q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, true, hparams.f_norm_rms_eps, il) :
-        delta_net_recurrent(q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, true, hparams.f_norm_rms_eps, il);
+        build_delta_net_chunking (q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, il) :
+        build_delta_net_recurrent(q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, il);
     cb(attn_out, "attn_out", il);
 
     // The tensors were concatenated 1d, so we need to extract them 1d as well
@@ -968,7 +972,7 @@ ggml_tensor * llm_build_qwen3next::build_qwen3next_linear_attn_layer(llm_graph_i
     return cur;
 }
 
-ggml_tensor * llm_build_qwen3next::build_layer_ffn(ggml_tensor * cur, const llama_model & model, const int il) {
+ggml_tensor * llm_build_qwen3next::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Check if this is an MoE layer
     if (model.layers[il].ffn_gate_inp != nullptr) {
         // MoE branch
