@@ -30,7 +30,8 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
 
     for (int il = 0; il < n_layer; ++il) {
         struct ggml_tensor * inpSA = inpL;
-        cur                        = build_q3n_norm(inpL, model.layers[il].attn_norm, il);
+
+        cur = build_q3n_norm(inpL, model.layers[il].attn_norm, il);
         cb(cur, "attn_norm", il);
 
         // Determine layer type and build appropriate attention mechanism
