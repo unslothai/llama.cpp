@@ -625,7 +625,7 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
-        const int                 il) {
+        int                       il) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
