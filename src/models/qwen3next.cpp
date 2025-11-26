@@ -34,7 +34,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recurrent(il)) {
             // Linear attention layer (gated delta net)
-            cur = buil_layer_attn_linear(inp->get_recr(), cur, causal_mask, identity, il);
+            cur = build_layer_attn_linear(inp->get_recr(), cur, causal_mask, identity, il);
         } else {
             // Full attention layer
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
@@ -707,7 +707,7 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
     return cur;
 }
 
-ggml_tensor * llm_build_qwen3next::buil_layer_attn_linear(
+ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
         ggml_tensor *        causal_mask,

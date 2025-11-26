@@ -431,7 +431,7 @@ private:
                 ggml_tensor * inp_pos,
                         int   il);
 
-    ggml_tensor * buil_layer_attn_linear(
+    ggml_tensor * build_layer_attn_linear(
          llm_graph_input_rs * inp,
                 ggml_tensor * cur,
                 ggml_tensor * causal_mask,
