@@ -3,8 +3,9 @@
 #include "../llama-model.h"
 #include "../llama-graph.h"
 
-// TODO: remove in follow-up PR
+// TODO: remove in follow-up PR - move to .cpp files
 #include "../llama-memory-recurrent.h"
+#include <cmath>
 
 struct llm_graph_context_mamba : public llm_graph_context {
     llm_graph_context_mamba(const llm_graph_params & params);
