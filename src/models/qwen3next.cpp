@@ -19,6 +19,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
     ggml_tensor * causal_mask =
         ggml_tri(ctx0, ggml_fill_inplace(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ubatch.n_seq_tokens, ubatch.n_seq_tokens), 1.0f),
                     GGML_TRI_TYPE_LOWER);
+
     ggml_tensor * identity = ggml_diag(ctx0, ggml_fill_inplace(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ubatch.n_seq_tokens), 1.0f));
 
     ggml_build_forward_expand(gf, causal_mask);
@@ -36,7 +37,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
             cur = buil_layer_attn_linear(inp->get_recr(), cur, causal_mask, identity, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(cur, inp_pos, inp->get_attn(), il);
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
@@ -164,9 +165,10 @@ ggml_tensor * llm_build_qwen3next::build_delta_net_chunking(
     GGML_ASSERT(beta->ne[1] == n_tokens && beta->ne[2] == H_k && beta->ne[0] == 1 && beta->ne[3] == n_seqs);
 
     // Do padding
-    const int64_t chunk_size = 64;
-    int64_t pad = (chunk_size - n_tokens % chunk_size) % chunk_size;
-    int64_t n_chunks = (n_tokens + pad) / chunk_size;
+    const int64_t chunk_size = CHUNK_SIZE;
+
+    const int64_t pad = (chunk_size - n_tokens % chunk_size) % chunk_size;
+    const int64_t n_chunks = (n_tokens + pad) / chunk_size;
 
     q = ggml_pad(ctx0, q, 0, pad, 0, 0);
     k = ggml_pad(ctx0, k, 0, pad, 0, 0);
@@ -186,19 +188,28 @@ ggml_tensor * llm_build_qwen3next::build_delta_net_chunking(
     cb(v_beta, "v_beta", il);
     cb(k_beta, "k_beta", il);
 
-    ggml_tensor * chunked_mask = ggml_view_4d(ctx0, causal_mask, chunk_size, chunk_size, causal_mask->ne[2], causal_mask->ne[3],
-        causal_mask->nb[1], causal_mask->nb[2], causal_mask->nb[3], 0);
-    ggml_tensor * chunked_diag_mask = ggml_view_4d(ctx0, causal_diag_mask, chunk_size, chunk_size, causal_diag_mask->ne[2], causal_diag_mask->ne[3],
-        causal_diag_mask->nb[1], causal_diag_mask->nb[2], causal_diag_mask->nb[3], 0);
-    ggml_tensor * chunked_identity = ggml_view_4d(ctx0, identity, chunk_size, chunk_size, identity->ne[2], identity->ne[3],
-        identity->nb[1], identity->nb[2], identity->nb[3], 0);
+    ggml_tensor * chunked_mask =
+        ggml_view_4d(ctx0, causal_mask, chunk_size,
+                chunk_size,         causal_mask->ne[2], causal_mask->ne[3],
+                causal_mask->nb[1], causal_mask->nb[2], causal_mask->nb[3], 0);
 
-    q = ggml_cont_4d(ctx0, q, S_k, chunk_size, n_chunks, H_k * n_seqs);
-    k = ggml_cont_4d(ctx0, k, S_k, chunk_size, n_chunks, H_k * n_seqs);
+    ggml_tensor * chunked_diag_mask =
+        ggml_view_4d(ctx0, causal_diag_mask, chunk_size,
+                chunk_size,              causal_diag_mask->ne[2], causal_diag_mask->ne[3],
+                causal_diag_mask->nb[1], causal_diag_mask->nb[2], causal_diag_mask->nb[3], 0);
+
+    ggml_tensor * chunked_identity =
+        ggml_view_4d(ctx0, identity, chunk_size,
+            chunk_size,      identity->ne[2], identity->ne[3],
+            identity->nb[1], identity->nb[2], identity->nb[3], 0);
+
+    q      = ggml_cont_4d(ctx0, q,      S_k, chunk_size, n_chunks, H_k * n_seqs);
+    k      = ggml_cont_4d(ctx0, k,      S_k, chunk_size, n_chunks, H_k * n_seqs);
     k_beta = ggml_cont_4d(ctx0, k_beta, S_k, chunk_size, n_chunks, H_k * n_seqs);
-    v = ggml_cont_4d(ctx0, v, S_v, chunk_size, n_chunks, H_v * n_seqs);
+    v      = ggml_cont_4d(ctx0, v,      S_v, chunk_size, n_chunks, H_v * n_seqs);
     v_beta = ggml_cont_4d(ctx0, v_beta, S_v, chunk_size, n_chunks, H_v * n_seqs);
-    g = ggml_cont_4d(ctx0, g, chunk_size, 1, n_chunks, H_k * n_seqs);
+
+    g    = ggml_cont_4d(ctx0, g, chunk_size, 1, n_chunks, H_k * n_seqs);
     beta = ggml_cont_4d(ctx0, beta, 1, chunk_size, n_chunks, H_k * n_seqs);
 
     ggml_tensor * g_cumsum = ggml_cumsum(ctx0, g);
@@ -396,8 +407,9 @@ ggml_tensor * llm_build_qwen3next::build_delta_net_recurrent(
         k = ggml_l2_norm(ctx0, k, eps_norm);
     }
 
-    float scale = 1.0f / sqrtf(S_v);
-    q           = ggml_scale(ctx0, q, scale);
+    const float scale = 1.0f / sqrtf(S_v);
+
+    q = ggml_scale(ctx0, q, scale);
 
     beta = ggml_sigmoid(ctx0, beta);
 
@@ -615,9 +627,9 @@ ggml_tensor * llm_build_qwen3next::build_q3n_gated_norm(struct ggml_tensor * inp
 }
 
 ggml_tensor * llm_build_qwen3next::build_layer_attn(
+        llm_graph_input_attn_kv * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
-        llm_graph_input_attn_kv * inp_attn,
         const int                 il) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
@@ -681,9 +693,9 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
     cb(Vcur, "Vcur", il);
 
     // Attention computation
-    const float kq_scale =
-        hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-    cur = build_attn(inp_attn,
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    cur = build_attn(inp,
                 nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);

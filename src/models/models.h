@@ -425,9 +425,9 @@ struct llm_build_qwen3next : public llm_graph_context_mamba {
     llm_build_qwen3next(const llama_model & model, const llm_graph_params & params);
 private:
     ggml_tensor * build_layer_attn(
+    llm_graph_input_attn_kv * inp_attn,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-    llm_graph_input_attn_kv * inp_attn,
                         int   il);
 
     ggml_tensor * buil_layer_attn_linear(
