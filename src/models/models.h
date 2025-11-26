@@ -431,6 +431,7 @@ private:
           const llama_model & model,
                     int64_t   n_embd_head,
                         int   il);
+
     ggml_tensor * build_qwen3next_linear_attn_layer(
          llm_graph_input_rs * inp,
                 ggml_tensor * cur,
@@ -439,12 +440,13 @@ private:
                 ggml_tensor * causal_mask,
                 ggml_tensor * identity,
                         int   il);
+
     ggml_tensor * build_layer_ffn(
                 ggml_tensor * cur,
           const llama_model & model,
                         int   il);
+
     ggml_tensor * delta_net_recurrent(
-               ggml_context * ctx,
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
@@ -456,8 +458,8 @@ private:
                       bool    use_qk_l2norm,
                      float    eps_norm,
                        int    il);
+
     ggml_tensor * delta_net_chunking(
-               ggml_context * ctx,
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
@@ -469,6 +471,7 @@ private:
                       bool    use_qk_l2norm,
                      float    eps_norm,
                        int    il);
+
     ggml_tensor * build_q3n_norm(
                 ggml_tensor * input,
                 ggml_tensor * weights,
