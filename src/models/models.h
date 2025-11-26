@@ -463,12 +463,7 @@ private:
                 ggml_tensor * identity,
                         int   il);
 
-    ggml_tensor * build_q3n_norm(
-                ggml_tensor * input,
-                ggml_tensor * weights,
-                        int   layer);
-
-    ggml_tensor * build_q3n_gated_norm(
+    ggml_tensor * build_norm_gated(
                 ggml_tensor * input,
                 ggml_tensor * weights,
                 ggml_tensor * gate,

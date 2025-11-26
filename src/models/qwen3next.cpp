@@ -26,9 +26,9 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
     ggml_build_forward_expand(gf, identity);
 
     for (int il = 0; il < n_layer; ++il) {
-        struct ggml_tensor * inpSA = inpL;
+        ggml_tensor * inpSA = inpL;
 
-        cur = build_q3n_norm(inpL, model.layers[il].attn_norm, il);
+        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // Determine layer type and build appropriate attention mechanism
@@ -53,7 +53,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         ggml_tensor * ffn_residual = cur;
 
         // Post-attention norm
-        ggml_tensor * attn_post_norm = build_q3n_norm(cur, model.layers[il].attn_post_norm, il);
+        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
         // FFN layer (MoE or dense) - without residual connection
@@ -70,7 +70,7 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
     cur = inpL;
 
     // Final norm
-    cur = build_q3n_norm(cur, model.output_norm, -1);
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -610,16 +610,11 @@ ggml_tensor * llm_build_qwen3next::build_delta_net_recurrent(
     return ggml_concat(ctx0, flat_output, flat_state, 0);
 }
 
-ggml_tensor * llm_build_qwen3next::build_q3n_norm(struct ggml_tensor * input, struct ggml_tensor * weights, int layer) {
-    // ggml_tensor * input_norm = ggml_scale_bias(ctx0, weights, 1.0f, 1.0f);
-    // EDIT: we moved the shifting part to the conversion, so we just call normal build_norm
-    return build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-}
-
-ggml_tensor * llm_build_qwen3next::build_q3n_gated_norm(struct ggml_tensor * input,
-                                                        struct ggml_tensor * weights,
-                                                        struct ggml_tensor * gate,
-                                                        int                  layer) {
+ggml_tensor * llm_build_qwen3next::build_norm_gated(
+        ggml_tensor * input,
+        ggml_tensor * weights,
+        ggml_tensor * gate,
+        int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
@@ -637,16 +632,16 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    struct ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur);
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur);
     cb(Qcur_full, "Qcur_full", il);
 
     Qcur_full = ggml_reshape_4d(ctx0, Qcur_full, n_embd_head * 2, n_head, n_tokens, 1);
 
     // Split Q projection into query and gate
     // The split should be along dimension 0 (the feature dimension)
-    struct ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
+    ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
                                              Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], 0);
-    struct ggml_tensor * gate =
+    ggml_tensor * gate =
         ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], n_embd_head * ggml_element_size(Qcur_full));
     cb(Qcur, "Qcur", il);
@@ -657,18 +652,18 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
-    Qcur = build_q3n_norm(Qcur, model.layers[il].attn_q_norm, il);
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    struct ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
     cb(Kcur, "Kcur", il);
 
-    struct ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_q3n_norm(Kcur, model.layers[il].attn_k_norm, il);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
     // Reshape gate to [n_embd, n_tokens] for the sigmoid gating (flatten the heads)
@@ -700,7 +695,7 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn(
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
 
-    struct ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
@@ -969,7 +964,7 @@ ggml_tensor * llm_build_qwen3next::buil_layer_attn_linear(
     ggml_tensor * z_2d = ggml_cont_2d(ctx0, z, head_v_dim, num_v_heads * n_seq_tokens * n_seqs);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
-    ggml_tensor * attn_out_norm = build_q3n_gated_norm(attn_out_2d_final, model.layers[il].ssm_norm, z_2d, il);
+    ggml_tensor * attn_out_norm = build_norm_gated(attn_out_2d_final, model.layers[il].ssm_norm, z_2d, il);
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
     ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
