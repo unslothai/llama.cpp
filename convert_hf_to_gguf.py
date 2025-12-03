@@ -1524,6 +1524,67 @@ class TextModel(ModelBase):
         special_vocab._set_special_token("bos", 151643)
         special_vocab.add_to_gguf(self.gguf_writer)
 
+    def _set_vocab_mistral(self):
+        if not _mistral_common_installed:
+            raise ImportError(_mistral_import_error_msg)
+
+        vocab = MistralVocab(self.dir_model)
+        logger.info(
+            f"Converting tokenizer {vocab.tokenizer_type} of size {vocab.vocab_size}."
+        )
+
+        self.gguf_writer.add_tokenizer_model(vocab.gguf_tokenizer_model)
+
+        tokens = []
+        scores = []
+        toktypes = []
+
+        for text, score, toktype in vocab.all_tokens():
+            tokens.append(text)
+            scores.append(score)
+            toktypes.append(toktype)
+
+        assert len(tokens) == vocab.vocab_size, (
+            f"token count ({len(tokens)}) != vocab size ({vocab.vocab_size})"
+        )
+
+        if vocab.tokenizer_type == MistralTokenizerType.tekken:
+            self.gguf_writer.add_tokenizer_pre("tekken")
+            self.gguf_writer.add_token_merges(
+                vocab.extract_vocab_merges_from_model()
+            )
+
+        logger.info(
+            f"Setting bos, eos, unk and pad token IDs to {vocab.bos_id}, {vocab.eos_id}, {vocab.unk_id}, {vocab.pad_id}."
+        )
+
+        self.gguf_writer.add_bos_token_id(vocab.bos_id)
+        self.gguf_writer.add_eos_token_id(vocab.eos_id)
+        self.gguf_writer.add_unk_token_id(vocab.unk_id)
+        self.gguf_writer.add_pad_token_id(vocab.pad_id)
+
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_vocab_size(vocab.vocab_size)
+
+        self.gguf_writer.add_add_bos_token(True)
+        self.gguf_writer.add_add_eos_token(False)
+
+        template_dir = Path(__file__).parent / "models/templates/"
+
+        if not self.is_mistral_format or not self.disable_mistral_community_chat_template:
+            # Log only for Mistral format that the official tokenization and detokenization is via `mistral-common`.
+            if self.is_mistral_format:
+                logger.info(
+                    "Using a Mistral community chat template. These templates can be subject to errors in early days or weeks after a release. "
+                    "Mistral recommends to use `mistral-common` to perform tokenization and detokenization."
+                )
+            template = MistralModel.get_community_chat_template(vocab, template_dir, self.is_mistral_format)
+            self.gguf_writer.add_chat_template(template)
+        else:
+            logger.info("Not using a Mistral community chat template. Ensure to perform the tokenization and detokenization via `mistral-common`.")
+
 
 class MmprojModel(ModelBase):
     model_type = ModelType.MMPROJ
@@ -2293,67 +2354,6 @@ class LlamaModel(TextModel):
         # fix for SmolVLM2, missing `num_attention_heads` in config.json
         if self.hf_arch == "VLlama3ForCausalLM":
             self.hparams["num_attention_heads"] = self.hparams.get("num_attention_heads", 32)
-
-    def _set_vocab_mistral(self):
-        if not _mistral_common_installed:
-            raise ImportError(_mistral_import_error_msg)
-
-        vocab = MistralVocab(self.dir_model)
-        logger.info(
-            f"Converting tokenizer {vocab.tokenizer_type} of size {vocab.vocab_size}."
-        )
-
-        self.gguf_writer.add_tokenizer_model(vocab.gguf_tokenizer_model)
-
-        tokens = []
-        scores = []
-        toktypes = []
-
-        for text, score, toktype in vocab.all_tokens():
-            tokens.append(text)
-            scores.append(score)
-            toktypes.append(toktype)
-
-        assert len(tokens) == vocab.vocab_size, (
-            f"token count ({len(tokens)}) != vocab size ({vocab.vocab_size})"
-        )
-
-        if vocab.tokenizer_type == MistralTokenizerType.tekken:
-            self.gguf_writer.add_tokenizer_pre("tekken")
-            self.gguf_writer.add_token_merges(
-                vocab.extract_vocab_merges_from_model()
-            )
-
-        logger.info(
-            f"Setting bos, eos, unk and pad token IDs to {vocab.bos_id}, {vocab.eos_id}, {vocab.unk_id}, {vocab.pad_id}."
-        )
-
-        self.gguf_writer.add_bos_token_id(vocab.bos_id)
-        self.gguf_writer.add_eos_token_id(vocab.eos_id)
-        self.gguf_writer.add_unk_token_id(vocab.unk_id)
-        self.gguf_writer.add_pad_token_id(vocab.pad_id)
-
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-        self.gguf_writer.add_vocab_size(vocab.vocab_size)
-
-        self.gguf_writer.add_add_bos_token(True)
-        self.gguf_writer.add_add_eos_token(False)
-
-        template_dir = Path(__file__).parent / "models/templates/"
-
-        if not self.is_mistral_format or not self.disable_mistral_community_chat_template:
-            # Log only for Mistral format that the official tokenization and detokenization is via `mistral-common`.
-            if self.is_mistral_format:
-                logger.info(
-                    "Using a Mistral community chat template. These templates can be subject to errors in early days or weeks after a release. "
-                    "Mistral recommends to use `mistral-common` to perform tokenization and detokenization."
-                )
-            template = MistralModel.get_community_chat_template(vocab, template_dir, self.is_mistral_format)
-            self.gguf_writer.add_chat_template(template)
-        else:
-            logger.info("Not using a Mistral community chat template. Ensure to perform the tokenization and detokenization via `mistral-common`.")
 
     def set_vocab(self):
         if self.is_mistral_format:
@@ -9934,11 +9934,12 @@ class MistralMoeModel(DeepseekV2Model):
     model_name = "Mistral"
     hf_arch = ""
     is_mistral_format = True
-    undo_permute = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         logger.info("Using MistralMoeModel")
+        # remap hparams from Mistral MoE format to DeepseekV2 format
+        # we do this way to be able to reuse DeepseekV2Model set_gguf_parameters logic
         # ref: https://github.com/vllm-project/vllm/blob/b294e28db2c5dee61bc25157664edcada8b90b31/vllm/transformers_utils/configs/mistral.py
         config = self.hparams
         # Mistral key -> HF key
@@ -9958,11 +9959,13 @@ class MistralMoeModel(DeepseekV2Model):
             "max_seq_len": ("max_seq_len", config.get("max_position_embeddings", 128_000)),
             "max_position_embeddings": ("max_position_embeddings", 128_000),
         }
+        # mapping top-level keys
         for key, new_key in config_mapping.items():
             if key in config:
                 config[new_key] = config[key]
         for new_key, (key, default_value) in top_level_mapping_with_default.items():
             config[new_key] = config.get(key, default_value)
+        # mapping MoE-specific keys
         moe_config_map = {
             "route_every_n": "moe_layer_freq",
             "first_k_dense_replace": "first_k_dense_replace",
@@ -9978,12 +9981,13 @@ class MistralMoeModel(DeepseekV2Model):
         for key, new_key in moe_config_map.items():
             if key in moe:
                 config[new_key] = moe[key]
+        # provide missing values
         config["topk_method"] = None
         config["norm_topk_prob"] = True
         config["scoring_func"] = "softmax"
 
     def set_vocab(self):
-        LlamaModel._set_vocab_mistral(self) # type: ignore
+        self._set_vocab_mistral()
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -9992,54 +9996,22 @@ class MistralMoeModel(DeepseekV2Model):
         self.gguf_writer.add_attn_temperature_length(yarn_params["original_max_position_embeddings"])
         self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1) # mscale_all_dim * 0.1
 
-    # TODO @ngxson : this should be in tensor_mapping, but I don't have time for now
-    # copied from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3.py
-    remapping = {
-        r"layers\.(\d+)\.attention_norm\.weight": r"model.layers.\1.input_layernorm.weight",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wq_a\.(\w+)": r"model.layers.\1.self_attn.q_a_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.attention\.q_a_norm\.weight": r"model.layers.\1.self_attn.q_a_layernorm.weight",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wq_b\.(\w+)": r"model.layers.\1.self_attn.q_b_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wkv_a_with_mqa\.(\w+)": r"model.layers.\1.self_attn.kv_a_proj_with_mqa.\2",  # noqa: E501
-        r"layers\.(\d+)\.attention\.kv_a_norm\.weight": r"model.layers.\1.self_attn.kv_a_layernorm.weight",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wkv_b\.(\w+)": r"model.layers.\1.self_attn.kv_b_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wo\.(\w+)": r"model.layers.\1.self_attn.o_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.ffn_norm\.weight": r"model.layers.\1.post_attention_layernorm.weight",  # noqa: E501
-        r"layers\.(\d+)\.feed_forward\.w1\.(\w+)": r"model.layers.\1.mlp.gate_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.feed_forward\.w2\.(\w+)": r"model.layers.\1.mlp.down_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.feed_forward\.w3\.(\w+)": r"model.layers.\1.mlp.up_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.gate\.weight": r"model.layers.\1.mlp.gate.weight",  # noqa: E501
-        r"layers\.(\d+)\.shared_experts\.w1\.(\w+)": r"model.layers.\1.mlp.shared_experts.gate_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.shared_experts\.w2\.(\w+)": r"model.layers.\1.mlp.shared_experts.down_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.shared_experts\.w3\.(\w+)": r"model.layers.\1.mlp.shared_experts.up_proj.\2",  # noqa: E501
-        r"layers\.(\d+)\.experts\.(\d+)\.w1\.(\w+)": r"model.layers.\1.mlp.experts.\2.gate_proj.\3",  # noqa: E501
-        r"layers\.(\d+)\.experts\.(\d+)\.w2\.(\w+)": r"model.layers.\1.mlp.experts.\2.down_proj.\3",  # noqa: E501
-        r"layers\.(\d+)\.experts\.(\d+)\.w3\.(\w+)": r"model.layers.\1.mlp.experts.\2.up_proj.\3",  # noqa: E501
-        r"norm\.weight": "model.norm.weight",  # noqa: E501
-        r"tok_embeddings\.weight": "model.embed_tokens.weight",  # noqa: E501
-        r"output\.weight": "lm_head.weight",  # noqa: E501
-    }
-
-    def _remap_mistral_to_ds(self, name: str) -> str:
-        for k, v in self.remapping.items():
-            match = re.fullmatch(k, name)
-            if match:
-                name = re.sub(k, v, name)
-                break
-        else:
-            raise ValueError(f"Cannot remap {name}")
-
-        # Remapping scale names. We could do this in the regex above but it
-        # would triple the number of lines for most layers.
-        if name.endswith(".qscale_act"):
-            name = re.sub(r"\.qscale_act$", ".input_scale", name)
-        elif name.endswith(".qscale_weight"):
-            name = re.sub(r"\.qscale_weight$", ".weight_scale", name)
-        return name
-
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         if name.startswith("vision_") or name.startswith("patch_merger.") or "mm_projector" in name:
             return []
-        name = self._remap_mistral_to_ds(name)
+
+        # rename certain tensors so that we can reuse DeepseekV2Model modify_tensors logic
+        if name.endswith(".qscale_act"):
+            name = name.replace(".qscale_act", ".input_scale")
+        if name.endswith(".qscale_weight"):
+            name = name.replace(".qscale_weight", ".weight_scale")
+        if ".experts." in name:
+            name = name.replace(".experts.", ".mlp.experts.")
+            name = name.replace(".w1.", ".gate_proj.")
+            name = name.replace(".w2.", ".down_proj.")
+            name = name.replace(".w3.", ".up_proj.")
+            name = "model." + name
+
         return super().modify_tensors(data_torch, name, bid)
 
 
