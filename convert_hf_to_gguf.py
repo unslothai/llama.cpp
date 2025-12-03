@@ -9990,6 +9990,7 @@ class MistralMoeModel(DeepseekV2Model):
         MistralModel.set_mistral_config(self.gguf_writer, self.hparams)
         yarn_params = self.hparams["yarn"]
         self.gguf_writer.add_attn_temperature_length(yarn_params["original_max_position_embeddings"])
+        self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1) # mscale_all_dim * 0.1
 
     # TODO @ngxson : this should be in tensor_mapping, but I don't have time for now
     # copied from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3.py
