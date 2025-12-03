@@ -9982,6 +9982,9 @@ class MistralMoeModel(DeepseekV2Model):
         config["norm_topk_prob"] = True
         config["scoring_func"] = "softmax"
 
+    def set_vocab(self):
+        LlamaModel._set_vocab_mistral(self) # type: ignore
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         MistralModel.set_mistral_config(self.gguf_writer, self.hparams)
