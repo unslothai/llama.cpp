@@ -9912,17 +9912,124 @@ class MistralModel(LlamaModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        if "yarn" in self.hparams:
-            yarn_params = self.hparams["yarn"]
-            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
-            self.gguf_writer.add_rope_scaling_factor(yarn_params["factor"])
-            self.gguf_writer.add_rope_scaling_yarn_beta_fast(yarn_params["beta"])
-            self.gguf_writer.add_rope_scaling_yarn_beta_slow(yarn_params["alpha"])
-            self.gguf_writer.add_rope_scaling_yarn_log_mul(1.0) # mscale_all_dim
-            self.gguf_writer.add_rope_scaling_orig_ctx_len(yarn_params["original_max_position_embeddings"])
+        MistralModel.set_mistral_config(self.gguf_writer, self.hparams)
 
-        if "llama_4_scaling" in self.hparams:
-            self.gguf_writer.add_attn_temperature_scale(self.hparams["llama_4_scaling"]["beta"])
+    @staticmethod
+    def set_mistral_config(gguf_writer: gguf.GGUFWriter, hparams: dict):
+        if "yarn" in hparams:
+            yarn_params = hparams["yarn"]
+            gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            gguf_writer.add_rope_scaling_factor(yarn_params["factor"])
+            gguf_writer.add_rope_scaling_yarn_beta_fast(yarn_params["beta"])
+            gguf_writer.add_rope_scaling_yarn_beta_slow(yarn_params["alpha"])
+            gguf_writer.add_rope_scaling_yarn_log_mul(1.0) # mscale_all_dim
+            gguf_writer.add_rope_scaling_orig_ctx_len(yarn_params["original_max_position_embeddings"])
+
+        if "llama_4_scaling" in hparams:
+            gguf_writer.add_attn_temperature_scale(hparams["llama_4_scaling"]["beta"])
+
+
+class MistralMoeModel(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK2
+    model_name = "Mistral"
+    hf_arch = ""
+    is_mistral_format = True
+    undo_permute = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        logger.info("Using MistralMoeModel")
+        # ref: https://github.com/vllm-project/vllm/blob/b294e28db2c5dee61bc25157664edcada8b90b31/vllm/transformers_utils/configs/mistral.py
+        config = self.hparams
+        # Mistral key -> HF key
+        config_mapping = {
+            "dim": "hidden_size",
+            "norm_eps": "rms_norm_eps",
+            "n_kv_heads": "num_key_value_heads",
+            "n_layers": "num_hidden_layers",
+            "n_heads": "num_attention_heads",
+            "hidden_dim": "intermediate_size",
+        }
+        # HF key -> (Mistral key, default value)
+        top_level_mapping_with_default = {
+            "model_type": ("model_type", "transformer"),
+            "hidden_act": ("activation", "silu"),
+            "tie_word_embeddings": ("tied_embeddings", False),
+            "max_seq_len": ("max_seq_len", config.get("max_position_embeddings", 128_000)),
+            "max_position_embeddings": ("max_position_embeddings", 128_000),
+        }
+        for key, new_key in config_mapping.items():
+            if key in config:
+                config[new_key] = config[key]
+        for new_key, (key, default_value) in top_level_mapping_with_default.items():
+            config[new_key] = config.get(key, default_value)
+        moe_config_map = {
+            "route_every_n": "moe_layer_freq",
+            "first_k_dense_replace": "first_k_dense_replace",
+            "num_experts_per_tok": "num_experts_per_tok",
+            "num_experts": "n_routed_experts",
+            "expert_hidden_dim": "moe_intermediate_size",
+            "routed_scale": "routed_scaling_factor",
+            "num_shared_experts": "n_shared_experts",
+            "num_expert_groups": "n_group",
+            "num_expert_groups_per_tok": "topk_group",
+        }
+        moe = config["moe"]
+        for key, new_key in moe_config_map.items():
+            if key in moe:
+                config[new_key] = moe[key]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        MistralModel.set_mistral_config(self.gguf_writer, self.hparams)
+
+    # TODO @ngxson : this should be in tensor_mapping, but I don't have time for now
+    # copied from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3.py
+    remapping = {
+        r"layers\.(\d+)\.attention_norm\.weight": r"model.layers.\1.input_layernorm.weight",  # noqa: E501
+        r"layers\.(\d+)\.attention\.wq_a\.(\w+)": r"model.layers.\1.self_attn.q_a_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.attention\.q_a_norm\.weight": r"model.layers.\1.self_attn.q_a_layernorm.weight",  # noqa: E501
+        r"layers\.(\d+)\.attention\.wq_b\.(\w+)": r"model.layers.\1.self_attn.q_b_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.attention\.wkv_a_with_mqa\.(\w+)": r"model.layers.\1.self_attn.kv_a_proj_with_mqa.\2",  # noqa: E501
+        r"layers\.(\d+)\.attention\.kv_a_norm\.weight": r"model.layers.\1.self_attn.kv_a_layernorm.weight",  # noqa: E501
+        r"layers\.(\d+)\.attention\.wkv_b\.(\w+)": r"model.layers.\1.self_attn.kv_b_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.attention\.wo\.(\w+)": r"model.layers.\1.self_attn.o_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.ffn_norm\.weight": r"model.layers.\1.post_attention_layernorm.weight",  # noqa: E501
+        r"layers\.(\d+)\.feed_forward\.w1\.(\w+)": r"model.layers.\1.mlp.gate_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.feed_forward\.w2\.(\w+)": r"model.layers.\1.mlp.down_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.feed_forward\.w3\.(\w+)": r"model.layers.\1.mlp.up_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.gate\.weight": r"model.layers.\1.mlp.gate.weight",  # noqa: E501
+        r"layers\.(\d+)\.shared_experts\.w1\.(\w+)": r"model.layers.\1.mlp.shared_experts.gate_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.shared_experts\.w2\.(\w+)": r"model.layers.\1.mlp.shared_experts.down_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.shared_experts\.w3\.(\w+)": r"model.layers.\1.mlp.shared_experts.up_proj.\2",  # noqa: E501
+        r"layers\.(\d+)\.experts\.(\d+)\.w1\.(\w+)": r"model.layers.\1.mlp.experts.\2.gate_proj.\3",  # noqa: E501
+        r"layers\.(\d+)\.experts\.(\d+)\.w2\.(\w+)": r"model.layers.\1.mlp.experts.\2.down_proj.\3",  # noqa: E501
+        r"layers\.(\d+)\.experts\.(\d+)\.w3\.(\w+)": r"model.layers.\1.mlp.experts.\2.up_proj.\3",  # noqa: E501
+        r"norm\.weight": "model.norm.weight",  # noqa: E501
+        r"tok_embeddings\.weight": "model.embed_tokens.weight",  # noqa: E501
+        r"output\.weight": "lm_head.weight",  # noqa: E501
+    }
+
+    def _remap_mistral_to_ds(self, name: str) -> str:
+        for k, v in self.remapping.items():
+            match = re.fullmatch(k, name)
+            if match:
+                name = re.sub(k, v, name)
+                break
+        else:
+            raise ValueError(f"Cannot remap {name}")
+
+        # Remapping scale names. We could do this in the regex above but it
+        # would triple the number of lines for most layers.
+        if name.endswith(".qscale_act"):
+            name = re.sub(r"\.qscale_act$", ".input_scale", name)
+        elif name.endswith(".qscale_weight"):
+            name = re.sub(r"\.qscale_weight$", ".weight_scale", name)
+        return name
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        name = self._remap_mistral_to_ds(name)
+        return super().modify_tensors(data_torch, name, bid)
 
 
 class PixtralModel(LlavaVisionModel):
@@ -10478,6 +10585,8 @@ def main() -> None:
         elif args.mmproj:
             assert hparams.get("vision_encoder") is not None, "This model does not support multimodal"
             model_class = PixtralModel
+        elif "moe" in hparams:
+            model_class = MistralMoeModel
         else:
             model_class = MistralModel
 
