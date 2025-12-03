@@ -9978,6 +9978,9 @@ class MistralMoeModel(DeepseekV2Model):
         for key, new_key in moe_config_map.items():
             if key in moe:
                 config[new_key] = moe[key]
+        config["topk_method"] = None
+        config["norm_topk_prob"] = True
+        config["scoring_func"] = "softmax"
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -10028,6 +10031,8 @@ class MistralMoeModel(DeepseekV2Model):
         return name
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        if name.startswith("vision_") or name.startswith("patch_merger.") or "mm_projector" in name:
+            return []
         name = self._remap_mistral_to_ds(name)
         return super().modify_tensors(data_torch, name, bid)
 
