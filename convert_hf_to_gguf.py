@@ -10017,6 +10017,8 @@ class MistralMoeModel(DeepseekV2Model):
             name = name.replace(".qscale_act", ".input_scale")
         if name.endswith(".qscale_weight"):
             name = name.replace(".qscale_weight", ".weight_scale")
+        if ".wkv_b." in name:
+            name = name.replace(".wkv_b.", ".kv_b_proj.")
         if ".experts." in name:
             name = name.replace(".experts.", ".mlp.experts.")
             name = name.replace(".w1.", ".gate_proj.")
