@@ -943,7 +943,6 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_KV_B: (
             "model.layers.{bid}.self_attn.kv_b_proj", # deepseek2
-            "layers.{bid}.attention.wkv_b",           # mistral-large
         ),
 
         MODEL_TENSOR.ATTN_K_B: (
