@@ -2859,7 +2859,7 @@ class Mistral3Model(LlamaModel):
             return []
 
         if name.endswith(".activation_scale") or name.endswith(".weight_scale_inv"):
-            assert data_torch.nelement() == 0 # unused by the model
+            assert data_torch.ndim == 0 # unused by the model
             return []
 
         return super().modify_tensors(data_torch, name, bid)
@@ -9958,7 +9958,7 @@ class MistralModel(LlamaModel):
 
     def modify_tensors(self, data_torch, name, bid):
         if name.endswith(".qscale_act") or name.endswith(".qscale_weight"):
-            assert data_torch.nelement() == 0 # unused by the model
+            assert data_torch.ndim == 0 # unused by the model
             return []
         return super().modify_tensors(data_torch, name, bid)
 
