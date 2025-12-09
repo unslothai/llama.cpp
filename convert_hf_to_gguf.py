@@ -2854,13 +2854,14 @@ class Mistral3Model(LlamaModel):
             self.gguf_writer.add_attn_temperature_scale(rope_params["llama_4_scaling_beta"])
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
-        # TODO: probably not worth supporting quantized weight, as official BF16 is also available
-        if name.endswith("weight_scale_inv"):
-            raise ValueError("This is a quantized weight, please use BF16 weight instead")
-
         name = name.replace("language_model.", "")
         if "multi_modal_projector" in name or "vision_tower" in name:
             return []
+
+        if name.endswith(".activation_scale") or name.endswith(".weight_scale_inv"):
+            assert data_torch.nelement() == 0 # unused by the model
+            return []
+
         return super().modify_tensors(data_torch, name, bid)
 
 
@@ -9954,6 +9955,12 @@ class MistralModel(LlamaModel):
 
         if "llama_4_scaling" in hparams:
             gguf_writer.add_attn_temperature_scale(hparams["llama_4_scaling"]["beta"])
+
+    def modify_tensors(self, data_torch, name, bid):
+        if name.endswith(".qscale_act") or name.endswith(".qscale_weight"):
+            assert data_torch.nelement() == 0 # unused by the model
+            return []
+        return super().modify_tensors(data_torch, name, bid)
 
 
 class MistralMoeModel(DeepseekV2Model):
