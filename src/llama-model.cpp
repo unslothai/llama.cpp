@@ -120,6 +120,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_16B_A1B:       return "16B.A1B";
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
+        case LLM_TYPE_80B_A3B:       return "80B.A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
@@ -667,6 +668,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.n_swa                   = 8192;
                     hparams.n_attn_temp_floor_scale = 8192;
                     hparams.f_attn_temp_scale       = 0.1f;
+                    hparams.f_attn_temp_offset      = 1.0f;
                     hparams.set_swa_pattern(4);   // pattern: 3 chunked - 1 full
                 }
 
@@ -1634,11 +1636,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     // that have no expert_gating_func model parameter set
                     hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX;
                 }
-                ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, false);
+
+                if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, 0.0f)) {
+                    // [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
+                    // cancel the factor from the convert script
+                    hparams.rope_yarn_log_mul /= 0.1f;
+                }
 
                 // (optional) temperature tuning - used by mistral-large
                 ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_SCALE,  hparams.f_attn_temp_scale,       false);
                 ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_LENGTH, hparams.n_attn_temp_floor_scale, false);
+
+                hparams.f_attn_temp_offset = 0.0f;
 
                 switch (hparams.n_layer) {
                     case 27: type = LLM_TYPE_16B; break;
@@ -2257,7 +2266,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 }
 
                 switch (hparams.n_layer) {
-                    case 80: type = LLM_TYPE_80B_A3B; break;
+                    case 48: type = LLM_TYPE_80B_A3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -2266,9 +2275,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_SCALE, hparams.f_attn_temp_scale, false);
 
-                ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST,   hparams.yarn_beta_fast, false);
-                ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW,   hparams.yarn_beta_slow, false);
-                ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL,     hparams.rope_yarn_log_mul, false);
+                ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, hparams.yarn_beta_fast,    false);
+                ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, hparams.yarn_beta_slow,    false);
+                ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL,   hparams.rope_yarn_log_mul, 0.0f);
+
+                hparams.f_attn_temp_offset = 0.0f;
 
                 // TODO: maybe add n_attn_temp_floor_scale as a separate KV?
                 if (hparams.f_attn_temp_scale != 0.0f) {
@@ -2276,18 +2287,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     if (hparams.n_attn_temp_floor_scale == 0) {
                         throw std::runtime_error("invalid n_ctx_orig_yarn for attention temperature scaling");
                     }
-                }
-
-                // TODO: this seems to be correct with the case of mscale == mscale_all_dims == 1.0f
-                //       but may need further verification with other values
-                if (hparams.rope_yarn_log_mul != 0.0f) {
-                    float factor = 1.0f / hparams.rope_freq_scale_train;
-                    float mscale = 1.0f;
-                    float mscale_all_dims = hparams.rope_yarn_log_mul;
-                    static auto get_mscale = [](float scale, float mscale) {
-                        return scale <= 1.0f ? 1.0f : (0.1f * mscale * logf(scale) + 1.0f);
-                    };
-                    hparams.yarn_attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dims);
                 }
 
                 switch (hparams.n_layer) {
@@ -6607,9 +6606,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+            GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
+                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
+                //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
                 void * addr = nullptr;
                 size_t first, last; // NOLINT
@@ -6625,9 +6626,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        }
-        else {
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        } else {
+            ggml_backend_buffer_t buf;
+            if (ml.no_alloc) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                }
+            } else {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+            }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
@@ -6682,6 +6690,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (ml.no_alloc) {
+        return true;
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -6724,9 +6736,18 @@ size_t llama_model::n_devices() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (const auto & buf : bufs) {
-            ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (hparams.no_alloc) {
+            GGML_ASSERT(bufs.size() == 1);
+            ggml_backend_buffer_t buf = bufs[0].get();
+            GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else {
+            for (const auto & buf : bufs) {
+                // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
+                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+            }
         }
     }
     return ret;
@@ -6771,6 +6792,7 @@ void llama_model::print_info() const {
     // hparams
     LLAMA_LOG_INFO("%s: arch             = %s\n",     __func__, arch_name().c_str());
     LLAMA_LOG_INFO("%s: vocab_only       = %d\n",     __func__, hparams.vocab_only);
+    LLAMA_LOG_INFO("%s: no_alloc         = %d\n",     __func__, hparams.no_alloc);
 
     if (!hparams.vocab_only) {
         LLAMA_LOG_INFO("%s: n_ctx_train      = %u\n",     __func__, hparams.n_ctx_train);
@@ -6805,6 +6827,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: freq_base_train  = %.1f\n",   __func__, hparams.rope_freq_base_train);
         LLAMA_LOG_INFO("%s: freq_scale_train = %g\n",     __func__, hparams.rope_freq_scale_train);
         LLAMA_LOG_INFO("%s: n_ctx_orig_yarn  = %u\n",     __func__, hparams.n_ctx_orig_yarn);
+        LLAMA_LOG_INFO("%s: rope_yarn_log_mul= %.4f\n",   __func__, hparams.rope_yarn_log_mul);
         LLAMA_LOG_INFO("%s: rope_finetuned   = %s\n",     __func__, hparams.rope_finetuned ? "yes" : "unknown");
         // MRoPE (Multi-axis Rotary Position Embedding) sections
         if (const auto & s = hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
@@ -6868,7 +6891,6 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: expert_weights_scale = %.1f\n",   __func__, hparams.expert_weights_scale);
         LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n",     __func__, hparams.expert_weights_norm);
         LLAMA_LOG_INFO("%s: expert_gating_func   = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
-        LLAMA_LOG_INFO("%s: rope_yarn_log_mul    = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
     }
 
     if (arch == LLM_ARCH_QWEN2MOE) {
@@ -7619,6 +7641,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.no_alloc                    =*/ false,
     };
 
     return result;
