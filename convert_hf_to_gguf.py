@@ -8564,16 +8564,16 @@ class Glm4MoeModel(TextModel):
 
     # using staticmethod here to allow re-using it in other classes
     @staticmethod
-    def set_vocab_glm(self: TextModel):
+    def set_vocab_glm(model: TextModel):
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        tokens, toktypes, tokpre = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
+        tokenizer = AutoTokenizer.from_pretrained(model.dir_model)
+        special_vocab = gguf.SpecialVocab(model.dir_model, load_merges=True)
+        tokens, toktypes, tokpre = model.get_vocab_base()
+        model.gguf_writer.add_tokenizer_model("gpt2")
+        model.gguf_writer.add_tokenizer_pre(tokpre)
+        model.gguf_writer.add_token_list(tokens)
+        model.gguf_writer.add_token_types(toktypes)
         # Special tokens
         # Note: Using <|endoftext|> (151329) for eot causes endless generation
         special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])  # 151331
@@ -8581,7 +8581,7 @@ class Glm4MoeModel(TextModel):
         special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"]) # 151329
         special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # 151338
 
-        special_vocab.add_to_gguf(self.gguf_writer)
+        special_vocab.add_to_gguf(model.gguf_writer)
 
     def set_vocab(self):
         Glm4MoeModel.set_vocab_glm(self)
