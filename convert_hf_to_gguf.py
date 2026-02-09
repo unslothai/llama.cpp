@@ -8698,6 +8698,19 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         special_vocab.add_to_gguf(self.gguf_writer)
 
 
+@ModelBase.register("GlmMoeDsaForCausalLM")
+class GlmMoeDsaModel(DeepseekV2Model, Glm4MoeModel):
+    model_arch = gguf.MODEL_ARCH.GLM_DSA
+
+    def set_gguf_parameters(self):
+        # combine DeepseekV2Model + GLM4MoeModel parameters
+        super().set_gguf_parameters()
+
+    def modify_tensors(self, data_torch, name, bid):
+        # note: skip Glm4MoeModel super method
+        return super(DeepseekV2Model).modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("GlmForCausalLM", "ChatGLMModel", "ChatGLMForConditionalGeneration")
 class ChatGLMModel(TextModel):
     model_arch = gguf.MODEL_ARCH.CHATGLM
