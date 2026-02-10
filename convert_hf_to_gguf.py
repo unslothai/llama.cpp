@@ -4137,7 +4137,8 @@ class Qwen2MoeModel(TextModel):
             # skip visual tensors
             return
         if name.find("experts") != -1:
-            n_experts = self.hparams["num_experts"]
+            # Qwen3MoE seems to use num_local_experts instead of num_experts
+            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')
             assert bid is not None
 
             if self._experts is None:
