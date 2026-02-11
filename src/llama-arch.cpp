@@ -513,6 +513,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_VISEXP_FFN_GATE,                        "blk.%d.vis_gate" },
     { LLM_TENSOR_VISEXP_FFN_DOWN,                        "blk.%d.vis_down" },
     { LLM_TENSOR_VISEXP_FFN_UP,                          "blk.%d.vis_up" },
+    { LLM_TENSOR_INDEXER_K_NORM,                         "blk.%d.indexer.k_norm" },
+    { LLM_TENSOR_INDEXER_PROJ,                           "blk.%d.indexer.proj" },
+    { LLM_TENSOR_INDEXER_ATTN_K,                         "blk.%d.indexer.attn_k" },
+    { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
 };
 
 static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
@@ -1627,6 +1631,10 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_FFN_DOWN_SHEXP,
                 LLM_TENSOR_FFN_UP_SHEXP,
                 LLM_TENSOR_FFN_EXP_PROBS_B,
+                LLM_TENSOR_INDEXER_K_NORM,
+                LLM_TENSOR_INDEXER_PROJ,
+                LLM_TENSOR_INDEXER_ATTN_K,
+                LLM_TENSOR_INDEXER_ATTN_Q_B,
                 LLM_TENSOR_NEXTN_EH_PROJ,
                 LLM_TENSOR_NEXTN_EMBED_TOKENS,
                 LLM_TENSOR_NEXTN_ENORM,

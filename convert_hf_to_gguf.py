@@ -8706,7 +8706,7 @@ class GlmMoeDsaModel(DeepseekV2Model):
         super().set_gguf_parameters()
 
         rope_dim = self.hparams["qk_rope_head_dim"]
-        partial_rotary_factor = self.hparams["partial_rotary_factor"]
+        partial_rotary_factor = self.hparams.get("partial_rotary_factor", 1.0)
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * partial_rotary_factor))
 
         # Expert gating function (sigmoid for GLM4_MOE)
