@@ -3805,6 +3805,7 @@ class VisionProjectorType:
     VOXTRAL = "voxtral"
     LFM2 = "lfm2"
     KIMIVL = "kimivl"
+    KIMIK25 = "kimik25"
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
     JANUS_PRO = "janus_pro"
