@@ -8716,6 +8716,11 @@ class GlmMoeDsaModel(DeepseekV2Model):
         if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
+        # DSA indexer parameters
+        self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+
     def modify_tensors(self, data_torch, name, bid):
         yield from super().modify_tensors(data_torch, name, bid)
 

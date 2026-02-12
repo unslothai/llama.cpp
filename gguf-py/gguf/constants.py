@@ -180,6 +180,11 @@ class Keys:
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
 
+        class Indexer:
+            HEAD_COUNT = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH = "{arch}.attention.indexer.key_length"
+            TOP_K      = "{arch}.attention.indexer.top_k"
+
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
