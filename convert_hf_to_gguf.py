@@ -8830,8 +8830,10 @@ class GlmMoeDsaModel(DeepseekV2Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
+        self.gguf_writer.add_leading_dense_block_count(3) # TODO: not to hard-code this for future models
+
         rope_dim = self.hparams["qk_rope_head_dim"]
-        partial_rotary_factor = self.hparams["partial_rotary_factor"]
+        partial_rotary_factor = self.hparams.get("partial_rotary_factor", 1.0)
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * partial_rotary_factor))
 
         # Expert gating function (sigmoid for GLM4_MOE)
@@ -8840,6 +8842,11 @@ class GlmMoeDsaModel(DeepseekV2Model):
         # NextN/MTP prediction layers
         if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+
+        # DSA indexer parameters
+        self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
     def modify_tensors(self, data_torch, name, bid):
         yield from super().modify_tensors(data_torch, name, bid)
