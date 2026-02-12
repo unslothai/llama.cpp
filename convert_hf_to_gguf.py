@@ -8705,6 +8705,8 @@ class GlmMoeDsaModel(DeepseekV2Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
+        self.gguf_writer.add_leading_dense_block_count(3) # TODO: not to hard-code this for future models
+
         rope_dim = self.hparams["qk_rope_head_dim"]
         partial_rotary_factor = self.hparams.get("partial_rotary_factor", 1.0)
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * partial_rotary_factor))
