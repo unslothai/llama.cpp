@@ -8,6 +8,7 @@ import torch
 import numpy as np
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig
+from transformers import BitsAndBytesConfig
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -83,12 +84,16 @@ def load_model_and_tokenizer(model_path, device="auto"):
                     config=full_config
             )
         else:
+            nf4_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
             model = AutoModelForCausalLM.from_pretrained(
                     model_path,
-                    device_map=device_map,
-                    offload_folder="offload",
+                    device_map="cuda:0",
                     trust_remote_code=True,
-                    config=config
+                    config=config,
+                    quantization_config=nf4_config
             )
 
     print(f"Model class: {model.__class__.__name__}")
@@ -144,7 +149,7 @@ def main():
             print(f"Processing chunk with tokens {i} to {i + batch_size}")
             chunk = input_ids[:, i:i + batch_size]
             outputs = model(chunk.to(model.device), past_key_values=past, use_cache=True)
-            past = outputs.past_key_values
+            past = outputs.cache_params
 
         logits = outputs.logits # type: ignore
 
