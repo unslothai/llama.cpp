@@ -1873,11 +1873,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_TALKIE:
             {
-                // Talkie's RMSNorm has no learnable weight; eps comes from the
-                // converter (defaults to torch's F.rms_norm default 1e-5).
+                // Talkie's RMSNorm has no learnable weight; eps must be tiny
+                // to match PyTorch's F.rms_norm default behavior (effective
+                // eps ~ 0). See TalkieModel.set_gguf_parameters in the
+                // converter for the rationale.
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
                 if (hparams.f_norm_rms_eps == 0.0f) {
-                    hparams.f_norm_rms_eps = 1e-5f;
+                    hparams.f_norm_rms_eps = 1e-9f;
                 }
                 hparams.swa_type = LLAMA_SWA_TYPE_NONE;
                 switch (hparams.n_layer) {

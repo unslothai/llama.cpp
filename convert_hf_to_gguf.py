@@ -8602,8 +8602,14 @@ class TalkieModel(TextModel):
             self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         )
         self.gguf_writer.add_rope_dimension_count(head_dim)
-        # Talkie uses F.rms_norm with default eps (1e-5).
-        self.gguf_writer.add_layer_norm_rms_eps(1e-5)
+        # Talkie uses F.rms_norm with default eps. The PyTorch default eps
+        # for F.rms_norm is effectively ~0 (output rms == 1.0 to fp32 noise),
+        # NOT torch.finfo(input.dtype).eps as the docstring suggests. Using
+        # eps=1e-5 attenuates the output rms by ~2% per norm site, which
+        # compounds across 40 layers and 5 norm sites per layer (especially
+        # via the per-layer embed-skip add of `e_x`). Match PyTorch by using
+        # a tiny eps.
+        self.gguf_writer.add_layer_norm_rms_eps(1e-9)
 
     def set_vocab(self):
         # Custom: read tiktoken vocab.txt directly. No tokenizer.json upstream.
@@ -8706,11 +8712,16 @@ class TalkieModel(TextModel):
             w[:, head_dim // 2 :, :] = -w[:, head_dim // 2 :, :]
             data_torch = w.view(n_head * head_dim, -1)
 
-        # Scalar tensors are stored as shape [1] in the HF state dict; keep
-        # them 1-D so create_tensor on the C++ side allocates {1}. Same for
-        # head_gain which is shape [n_head].
-        # Default routing handles everything else.
-        return [(self.map_tensor_name(name), data_torch)]
+        # Talkie's HF state-dict has scalar/gain Parameters whose names do NOT
+        # end in .weight (raw nn.Parameter). The GGUF tensor-name convention
+        # requires .weight or .bias suffixes - the C++ loader looks up
+        # tn(LLM_TENSOR_OUTPUT, "weight") -> "output.weight". Add the suffix
+        # synthetically so map_tensor_name routes via try_suffixes.
+        canonical = name
+        if not canonical.endswith((".weight", ".bias")):
+            canonical = canonical + ".weight"
+        new_name = self.map_tensor_name(canonical)
+        return [(new_name, data_torch)]
 
 
 @ModelBase.register("OlmoeForCausalLM")
