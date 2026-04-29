@@ -9585,9 +9585,10 @@ class DeepseekV4Model(TextModel):
 
         # tid2eid: write as I32 directly via gguf_writer.add_tensor, return [].
         # (loader cast int64 → fp32 at line 783-784 of the prepare_tensors loop;
-        # we cast back to int32 and write as raw I32 GGML quant type.)
+        # we materialize to a real numpy array of int32, then write as raw I32.)
         if logical.endswith("ffn_gate_tid2eid.weight"):
-            arr = data.to(torch.int32).contiguous().numpy()
+            eager = LazyTorchTensor.to_eager(data)
+            arr = eager.to(torch.int32).contiguous().numpy()
             self.gguf_writer.add_tensor(logical, arr, raw_dtype=gguf.GGMLQuantizationType.I32)
             return
 
@@ -13701,6 +13702,8 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        # DeepSeek-V4-Flash hash-routing LUT (ffn_gate_tid2eid) is stored as I32.
+        torch.int32: np.int32,
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -13720,6 +13723,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.bool: np.uint8,
         torch.float8_e4m3fn: np.uint8,
         torch.float8_e5m2: np.uint8,
+        torch.float8_e8m0fnu: np.uint8,
     }
 
     # used for safetensors slices
@@ -13741,6 +13745,9 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
+        # DeepSeek-V4-Flash uses UE8M0 scale tensors alongside FP8 e4m3 / FP4 e2m1
+        # weights. ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json
+        "F8_E8M0": torch.float8_e8m0fnu,
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:
