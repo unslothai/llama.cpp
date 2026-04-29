@@ -913,6 +913,31 @@ class GGUFWriter:
     def add_q_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.Q_LORA_RANK.format(arch=self.arch), length)
 
+    # DeepSeek-V4-Flash specific
+    def add_o_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.O_LORA_RANK.format(arch=self.arch), length)
+
+    def add_o_groups(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.O_GROUPS.format(arch=self.arch), count)
+
+    def add_compress_ratios(self, ratios: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.COMPRESS_RATIOS.format(arch=self.arch), list(ratios))
+
+    def add_compress_rope_freq_base(self, base: float) -> None:
+        self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), base)
+
+    def add_n_hash_layers(self, n: int) -> None:
+        self.add_uint32(Keys.LLM.N_HASH_LAYERS.format(arch=self.arch), n)
+
+    def add_hc_mult(self, n: int) -> None:
+        self.add_uint32(Keys.LLM.HC_MULT.format(arch=self.arch), n)
+
+    def add_hc_sinkhorn_iters(self, n: int) -> None:
+        self.add_uint32(Keys.LLM.HC_SINKHORN_ITERS.format(arch=self.arch), n)
+
+    def add_hc_eps(self, eps: float) -> None:
+        self.add_float32(Keys.LLM.HC_EPS.format(arch=self.arch), eps)
+
     def add_kv_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KV_LORA_RANK.format(arch=self.arch), length)
 
