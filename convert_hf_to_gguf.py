@@ -8581,18 +8581,7 @@ class Olmo2Model(TextModel):
 
 @ModelBase.register("TalkieForCausalLM")
 class TalkieModel(TextModel):
-    """Convert talkie-lm/talkie-1930-13b-{base,it} to GGUF.
-
-    The architecture mirrors talkie/src/talkie/model.py: weightless RMSNorm at
-    every site, per-block ActGain scalars on attn/mlp branches, embed-skip
-    scalar, per-head HeadGain on Q, scalar lm_head_gain on lm_head, untied
-    raw nn.Parameter lm_head, no biases anywhere.
-
-    The reference RoPE rotates by -theta (sign-flipped vs HF Llama / NEOX).
-    To absorb that without a new RoPE flavor in ggml, we pre-flip the second
-    half of head_dim of W_q and W_k at convert time. Then llama.cpp's NEOX
-    RoPE produces identical attention scores.
-    """
+    """Convert talkie-lm/talkie-1930-13b-{base,it} to GGUF."""
     model_arch = gguf.MODEL_ARCH.TALKIE
 
     def set_gguf_parameters(self):
@@ -8602,34 +8591,21 @@ class TalkieModel(TextModel):
             self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         )
         self.gguf_writer.add_rope_dimension_count(head_dim)
-        # Talkie uses F.rms_norm with default eps. The PyTorch default eps
-        # for F.rms_norm is effectively ~0 (output rms == 1.0 to fp32 noise),
-        # NOT torch.finfo(input.dtype).eps as the docstring suggests. Using
-        # eps=1e-5 attenuates the output rms by ~2% per norm site, which
-        # compounds across 40 layers and 5 norm sites per layer (especially
-        # via the per-layer embed-skip add of `e_x`). Match PyTorch by using
-        # a tiny eps.
+        # Match PyTorch F.rms_norm default (effective eps ~0 on bf16).
         self.gguf_writer.add_layer_norm_rms_eps(1e-9)
 
     def set_vocab(self):
-        # Custom: read tiktoken vocab.txt directly. No tokenizer.json upstream.
+        # Read tiktoken vocab.txt directly (no tokenizer.json upstream).
         from tiktoken.load import load_tiktoken_bpe
 
         vocab_path = self.dir_model / "vocab.txt"
         if not vocab_path.exists():
-            raise FileNotFoundError(
-                f"talkie vocab.txt not found at {vocab_path}. The original "
-                "talkie repo ships vocab.txt alongside the checkpoint; the "
-                "converter expects it in the HF safetensors directory."
-            )
+            raise FileNotFoundError(f"vocab.txt not found at {vocab_path}")
         mergeable_ranks = load_tiktoken_bpe(str(vocab_path))
-        # Filter ranks >= 65535 to leave room for IT specials. Mirrors
-        # talkie/src/talkie/tokenizer.py:54.
+        # Drop ranks >= 65535 (specials live there). See tokenizer.py:54.
         mergeable_ranks = {k: v for k, v in mergeable_ranks.items() if v < 65535}
 
-        # Reverse-engineer merges via QwenModel's helpers (already vendored
-        # in this file). This is the same pattern as _set_vocab_qwen and
-        # HunYuanMoE / KimiLinear / Deepseek-K2.
+        # Reverse-engineer merges via QwenModel helpers.
         merges: list[str] = []
         vocab: dict[str, int] = {}
         for token_bytes, rank in mergeable_ranks.items():
@@ -8642,8 +8618,7 @@ class TalkieModel(TextModel):
                     " ".join(map(QwenModel.token_bytes_to_string, merged))
                 )
 
-        # IT special tokens at fixed ids 65535..65539. The base model only
-        # uses 65535 (<|endoftext|>); IT adds the four chat tokens.
+        # IT specials at fixed ids; base only uses <|endoftext|>.
         special_tokens = {
             "<|endoftext|>": 65535,
             "<|end|>": 65536,
@@ -8651,10 +8626,7 @@ class TalkieModel(TextModel):
             "<|assistant|>": 65538,
             "<|system|>": 65539,
         }
-        # Decide vocab_size: read from config.json (65540 IT, 65536 base).
         vocab_size = self.hparams["vocab_size"]
-        # If we are converting the base model, drop the IT-specific specials
-        # whose ids are >= base vocab_size.
         special_tokens = {k: v for k, v in special_tokens.items() if v < vocab_size}
 
         reverse_vocab = {idx: tok for tok, idx in {**vocab, **special_tokens}.items()}
@@ -8678,7 +8650,6 @@ class TalkieModel(TextModel):
         self.gguf_writer.add_token_types(toktypes)
         self.gguf_writer.add_token_merges(merges)
 
-        # Special-token ids. EOS = <|end|> for IT, <|endoftext|> for base.
         eos_id = special_tokens.get("<|end|>", special_tokens["<|endoftext|>"])
         self.gguf_writer.add_eos_token_id(eos_id)
         self.gguf_writer.add_eot_token_id(eos_id)
@@ -8687,8 +8658,6 @@ class TalkieModel(TextModel):
         self.gguf_writer.add_add_bos_token(False)
         self.gguf_writer.add_add_eos_token(False)
 
-        # Chat template: <|user|>{content}<|end|><|assistant|>{content}<|end|>...
-        # No newlines, no BOS - matches talkie/src/talkie/chat.py:format_chat.
         chat_template = (
             "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}<|end|>{% endfor %}"
             "{% if add_generation_prompt %}<|assistant|>{% endif %}"
@@ -8696,32 +8665,19 @@ class TalkieModel(TextModel):
         self.gguf_writer.add_chat_template(chat_template)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # RoPE sign correction for q_proj / k_proj.
-        # Talkie rotates by -theta (sign-flipped sin); llama.cpp NEOX rotates by +theta.
-        # Pre-multiplying the second-half of head_dim (output dim) by -1 absorbs
-        # the difference: <NEOX(D q), NEOX(D k)> == <Talkie(q), Talkie(k)>
-        # for D = diag(+1...+1, -1...-1) on head_dim halves.
+        # RoPE -theta: negate second half of head_dim of W_q/W_k so NEOX matches.
         n_head = self.hparams["num_attention_heads"]
         head_dim = self.hparams.get("head_dim") or (
             self.hparams["hidden_size"] // n_head
         )
         if name.endswith(("self_attn.q_proj.weight", "self_attn.k_proj.weight")):
-            w = data_torch
-            # shape [n_head*head_dim, hidden]
-            w = w.view(n_head, head_dim, w.shape[-1]).clone()
+            w = data_torch.view(n_head, head_dim, data_torch.shape[-1]).clone()
             w[:, head_dim // 2 :, :] = -w[:, head_dim // 2 :, :]
             data_torch = w.view(n_head * head_dim, -1)
 
-        # Talkie's HF state-dict has scalar/gain Parameters whose names do NOT
-        # end in .weight (raw nn.Parameter). The GGUF tensor-name convention
-        # requires .weight or .bias suffixes - the C++ loader looks up
-        # tn(LLM_TENSOR_OUTPUT, "weight") -> "output.weight". Add the suffix
-        # synthetically so map_tensor_name routes via try_suffixes.
-        canonical = name
-        if not canonical.endswith((".weight", ".bias")):
-            canonical = canonical + ".weight"
-        new_name = self.map_tensor_name(canonical)
-        return [(new_name, data_torch)]
+        # Raw nn.Parameter scalars have no .weight suffix; add one for map_tensor_name.
+        canonical = name if name.endswith((".weight", ".bias")) else name + ".weight"
+        return [(self.map_tensor_name(canonical), data_torch)]
 
 
 @ModelBase.register("OlmoeForCausalLM")

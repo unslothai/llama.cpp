@@ -1873,10 +1873,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_TALKIE:
             {
-                // Talkie's RMSNorm has no learnable weight; eps must be tiny
-                // to match PyTorch's F.rms_norm default behavior (effective
-                // eps ~ 0). See TalkieModel.set_gguf_parameters in the
-                // converter for the rationale.
+                // Match PyTorch F.rms_norm default (effective eps ~0).
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
                 if (hparams.f_norm_rms_eps == 0.0f) {
                     hparams.f_norm_rms_eps = 1e-9f;
@@ -5080,10 +5077,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 } break;
             case LLM_ARCH_TALKIE:
                 {
-                    // Talkie has no learnable RMSNorm weights anywhere. Per-block
-                    // tensors: q/k/v/o, ffn_gate/up/down, head_gain, attn_act_gain,
-                    // ffn_act_gain, embed_skip_scale. Globals: tok_embd, output (untied),
-                    // lm_head_gain.
+                    // No learnable RMSNorm weights; lm_head untied.
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
                     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, 0);
                     lm_head_gain = create_tensor(tn(LLM_TENSOR_LM_HEAD_GAIN, "weight"), {1}, 0);

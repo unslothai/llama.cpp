@@ -567,11 +567,11 @@ class MODEL_TENSOR(IntEnum):
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
-    ATTN_HEAD_GAIN       = auto() # talkie - per-head learnable gain on Q after Q-RMSnorm
-    ATTN_ACT_GAIN        = auto() # talkie - per-block learnable scalar on attn-residual branch
-    FFN_ACT_GAIN         = auto() # talkie - per-block learnable scalar on mlp-residual branch
-    EMBED_SKIP_SCALE     = auto() # talkie - per-block learnable scalar on embedding-skip branch
-    LM_HEAD_GAIN         = auto() # talkie - global learnable scalar on lm_head matrix
+    ATTN_HEAD_GAIN       = auto() # talkie
+    ATTN_ACT_GAIN        = auto() # talkie
+    FFN_ACT_GAIN         = auto() # talkie
+    EMBED_SKIP_SCALE     = auto() # talkie
+    LM_HEAD_GAIN         = auto() # talkie
     PER_LAYER_TOKEN_EMBD = auto() # gemma3n
     PER_LAYER_MODEL_PROJ = auto() # gemma3n
     PER_LAYER_INP_GATE   = auto() # gemma3n

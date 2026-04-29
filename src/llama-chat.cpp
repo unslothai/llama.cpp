@@ -138,9 +138,7 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
             }
         }
     } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|end|>")) {
-        // Talkie's chat template uses the same role markers as Phi-3 but
-        // omits the newlines: "<|user|>{c}<|end|><|assistant|>". Detect by
-        // the absence of "|>\n" sequences.
+        // Talkie shares Phi-3's role markers but has no newlines.
         if (tmpl_contains("|>{{ message['content'] }}<|end|>")
                 || tmpl_contains("|>{{ m.content }}<|end|>")) {
             return LLM_CHAT_TEMPLATE_TALKIE;
@@ -928,8 +926,7 @@ int32_t llm_chat_apply_template(
             ss << "<|begin|>assistant";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_TALKIE) {
-        // Talkie 1930 IT chat template: <|role|>content<|end|>... no newlines, no BOS.
-        // Matches talkie/src/talkie/chat.py:format_chat exactly.
+        // <|role|>content<|end|>... no newlines, no BOS.
         for (auto message : chat) {
             std::string role(message->role);
             ss << "<|" << role << "|>" << message->content << "<|end|>";

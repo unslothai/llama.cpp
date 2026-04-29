@@ -369,10 +369,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 break;
             case LLAMA_VOCAB_PRE_TYPE_TALKIE:
-                // Talkie tiktoken pre-tokenizer (talkie/src/talkie/tokenizer.py:11-21).
-                // Note: ordering of alternatives is significant - case-aware leading-cap
-                // and trailing-cap fragments first, then digits, then punctuation, then
-                // whitespace fallbacks.
+                // talkie/src/talkie/tokenizer.py:11-21
                 regex_exprs = {
                     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
