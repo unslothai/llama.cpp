@@ -9388,14 +9388,33 @@ class DeepseekV4Model(TextModel):
         out = decoded.view(M, Kb, b) * scale_f32.view(M, Kb, 1)
         return out.reshape(M, K).to(torch.bfloat16)
 
+    # Source-name suffixes that come with a sibling `.scale` and need FP8 dequant.
+    # Determined by inspection of the V4-Flash safetensors index. Routed-expert
+    # weights are FP4 (handled by _consume_expert) and are NOT in this set.
+    _FP8_PACKED_SUFFIXES = (
+        "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
+        "attn.indexer.wq_b",
+        "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3",
+        "e_proj", "h_proj",
+    )
+
+    def _is_fp8_packed(self, name: str) -> bool:
+        if not name.endswith(".weight"):
+            return False
+        base = name[:-len(".weight")]
+        return any(base.endswith(suffix) for suffix in self._FP8_PACKED_SUFFIXES)
+
     def _maybe_pair(self, name: str, data: Tensor):
-        """If `name` ends with .weight or .scale, buffer it and return the
-        completed (weight, scale) pair if both halves have arrived. Returns
-        (None, None) otherwise."""
+        """For FP8-packed tensors only: buffer the .weight or .scale half and
+        return the completed (weight, scale) pair when both have arrived.
+        Non-FP8 tensors return (None, None) so the caller emits them directly."""
         if name.endswith(".scale"):
             base = name[:-len(".scale")]
             self._fp_scale_buf[base] = data
         elif name.endswith(".weight"):
+            if not self._is_fp8_packed(name):
+                # not paired -- caller treats as a single tensor.
+                return None, None
             base = name[:-len(".weight")]
             self._fp_weight_buf[base] = data
         else:
@@ -9525,18 +9544,21 @@ class DeepseekV4Model(TextModel):
 
         # === everything else: detect FP8 weight/scale pairing ===
         weight, scale = self._maybe_pair(name, data_torch)
-        if name.endswith(".scale") and weight is None:
-            # scale arrived without its weight — buffer; nothing to emit yet
-            return []
-        if weight is None and scale is None:
-            # not a scale/weight pair — single tensor to emit directly
-            return list(self._emit_single(name, data_torch, bid))
-        if weight is None:
-            # weight buffered, waiting for scale
-            return []
-        # both present: dequant FP8 → BF16
-        deq = self._fp8_dequant(weight, scale)
-        return list(self._emit_single(name, deq, bid, dequant=True))
+        if name.endswith(".scale"):
+            if weight is None:
+                # scale arrived without its weight — buffer; nothing to emit yet
+                return []
+            # both present: dequant FP8 → BF16
+            deq = self._fp8_dequant(weight, scale)
+            return list(self._emit_single(name, deq, bid, dequant=True))
+        if name.endswith(".weight") and self._is_fp8_packed(name):
+            # FP8-packed weight: buffered until scale arrives. Nothing to emit yet.
+            if weight is None:
+                return []
+            deq = self._fp8_dequant(weight, scale)
+            return list(self._emit_single(name, deq, bid, dequant=True))
+        # Plain non-paired tensor (BF16/F32 norm, attn_sink, hc_*, ape, tid2eid, etc.)
+        return list(self._emit_single(name, data_torch, bid))
 
     def _emit_single(self, source_name: str, data: Tensor, bid: int | None, dequant: bool = False) -> Iterable[tuple[str, Tensor]]:
         """Emit a single non-expert tensor with its logical name + dtype fixups."""
