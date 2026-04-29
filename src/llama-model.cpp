@@ -2014,6 +2014,61 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK_V4:
+            {
+                // DeepSeek-V4-Flash: hybrid SWA/CSA/HCA attention, mHC residuals,
+                // hash-routed MoE, MQA-style single shared K=V.
+                // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_O_LORA_RANK,       hparams.v4_o_lora_rank);
+                ml.get_key(LLM_KV_ATTENTION_O_GROUPS,          hparams.v4_o_groups);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa, false);
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+
+                // V4 indexer (used in CSA layers; loaded but unused in MVP graph - dense fallback)
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     false);
+
+                // mHC + V4-specific
+                ml.get_key(LLM_KV_HC_MULT,                      hparams.v4_hc_mult);
+                ml.get_key(LLM_KV_HC_SINKHORN_ITERS,            hparams.v4_hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_HC_EPS,                       hparams.v4_hc_eps,        false);
+                ml.get_key(LLM_KV_N_HASH_LAYERS,                hparams.v4_n_hash_layers, false);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,         hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.v4_compress_rope_freq_base, false);
+
+                // compress_ratios is a uint32 array of length (n_layer + nextn_predict_layers)
+                {
+                    std::array<uint32_t, LLAMA_MAX_LAYERS> ratios_u32{};
+                    if (ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios_u32, false)) {
+                        const uint32_t n = hparams.n_layer + hparams.nextn_predict_layers;
+                        for (uint32_t i = 0; i < n && i < ratios_u32.size(); ++i) {
+                            hparams.v4_compress_ratios[i] = (uint8_t) ratios_u32[i];
+                        }
+                    }
+                }
+
+                // swiglu_limit applied to both routed and shared experts (per SGLang #23776)
+                ml.get_key(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp[0],   false);
+                ml.get_key(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp[0], false);
+                for (uint32_t i = 1; i < hparams.n_layer; ++i) {
+                    hparams.swiglu_clamp_exp[i]   = hparams.swiglu_clamp_exp[0];
+                    hparams.swiglu_clamp_shexp[i] = hparams.swiglu_clamp_shexp[0];
+                }
+
+                switch (hparams.n_layer) {
+                    case 43: type = LLM_TYPE_236B; break; // V4-Flash variant
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_DEEPSEEK2OCR:
             {
                 // similar to deepseek2, but without MLA
@@ -5359,6 +5414,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
                         }
                     }
+                } break;
+            case LLM_ARCH_DEEPSEEK_V4:
+                {
+                    // DeepSeek-V4-Flash. PR1 minimal loader: only top-level tensors are wired
+                    // for the stub graph; per-layer wiring lands in a follow-up commit.
+                    // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (!output) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+                    // Per-layer V4 tensors (attn_q_a/_q_b/_kv/_kv_norm/_o_a/_o_b, hc_*,
+                    // compressor_*, indexer_*, ffn_* experts, MTP_*) are not loaded yet.
+                    // The stub graph below only needs token_embd + output_norm + output.
                 } break;
             case LLM_ARCH_DEEPSEEK2OCR:
                 {
@@ -8839,6 +8909,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_MISTRAL4:
             {
                 llm = std::make_unique<llm_build_deepseek2>(*this, params);
+            } break;
+        case LLM_ARCH_DEEPSEEK_V4:
+            {
+                llm = std::make_unique<llm_build_deepseek_v4>(*this, params);
             } break;
         case LLM_ARCH_CHATGLM:
             {
