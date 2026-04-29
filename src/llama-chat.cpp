@@ -79,6 +79,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "grok-2",            LLM_CHAT_TEMPLATE_GROK_2            },
     { "pangu-embedded",    LLM_CHAT_TEMPLATE_PANGU_EMBED       },
     { "solar-open",        LLM_CHAT_TEMPLATE_SOLAR_OPEN        },
+    { "talkie",            LLM_CHAT_TEMPLATE_TALKIE            },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
@@ -137,6 +138,13 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
             }
         }
     } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|end|>")) {
+        // Talkie's chat template uses the same role markers as Phi-3 but
+        // omits the newlines: "<|user|>{c}<|end|><|assistant|>". Detect by
+        // the absence of "|>\n" sequences.
+        if (tmpl_contains("|>{{ message['content'] }}<|end|>")
+                || tmpl_contains("|>{{ m.content }}<|end|>")) {
+            return LLM_CHAT_TEMPLATE_TALKIE;
+        }
         return LLM_CHAT_TEMPLATE_PHI_3;
     } else if (tmpl_contains("[gMASK]<sop>")) {
         return LLM_CHAT_TEMPLATE_CHATGLM_4;
@@ -918,6 +926,16 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << "<|begin|>assistant";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_TALKIE) {
+        // Talkie 1930 IT chat template: <|role|>content<|end|>... no newlines, no BOS.
+        // Matches talkie/src/talkie/chat.py:format_chat exactly.
+        for (auto message : chat) {
+            std::string role(message->role);
+            ss << "<|" << role << "|>" << message->content << "<|end|>";
+        }
+        if (add_ass) {
+            ss << "<|assistant|>";
         }
     } else {
         // template not supported

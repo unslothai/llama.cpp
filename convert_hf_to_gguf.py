@@ -8579,6 +8579,140 @@ class Olmo2Model(TextModel):
             self.gguf_writer.add_sliding_window_pattern(sliding_window_pattern)
 
 
+@ModelBase.register("TalkieForCausalLM")
+class TalkieModel(TextModel):
+    """Convert talkie-lm/talkie-1930-13b-{base,it} to GGUF.
+
+    The architecture mirrors talkie/src/talkie/model.py: weightless RMSNorm at
+    every site, per-block ActGain scalars on attn/mlp branches, embed-skip
+    scalar, per-head HeadGain on Q, scalar lm_head_gain on lm_head, untied
+    raw nn.Parameter lm_head, no biases anywhere.
+
+    The reference RoPE rotates by -theta (sign-flipped vs HF Llama / NEOX).
+    To absorb that without a new RoPE flavor in ggml, we pre-flip the second
+    half of head_dim of W_q and W_k at convert time. Then llama.cpp's NEOX
+    RoPE produces identical attention scores.
+    """
+    model_arch = gguf.MODEL_ARCH.TALKIE
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+        head_dim = self.hparams.get("head_dim") or (
+            self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+        )
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+        # Talkie uses F.rms_norm with default eps (1e-5).
+        self.gguf_writer.add_layer_norm_rms_eps(1e-5)
+
+    def set_vocab(self):
+        # Custom: read tiktoken vocab.txt directly. No tokenizer.json upstream.
+        from tiktoken.load import load_tiktoken_bpe
+
+        vocab_path = self.dir_model / "vocab.txt"
+        if not vocab_path.exists():
+            raise FileNotFoundError(
+                f"talkie vocab.txt not found at {vocab_path}. The original "
+                "talkie repo ships vocab.txt alongside the checkpoint; the "
+                "converter expects it in the HF safetensors directory."
+            )
+        mergeable_ranks = load_tiktoken_bpe(str(vocab_path))
+        # Filter ranks >= 65535 to leave room for IT specials. Mirrors
+        # talkie/src/talkie/tokenizer.py:54.
+        mergeable_ranks = {k: v for k, v in mergeable_ranks.items() if v < 65535}
+
+        # Reverse-engineer merges via QwenModel's helpers (already vendored
+        # in this file). This is the same pattern as _set_vocab_qwen and
+        # HunYuanMoE / KimiLinear / Deepseek-K2.
+        merges: list[str] = []
+        vocab: dict[str, int] = {}
+        for token_bytes, rank in mergeable_ranks.items():
+            vocab[QwenModel.token_bytes_to_string(token_bytes)] = rank
+            if len(token_bytes) == 1:
+                continue
+            merged = QwenModel.bpe(mergeable_ranks, token_bytes, max_rank=rank)
+            if len(merged) == 2:
+                merges.append(
+                    " ".join(map(QwenModel.token_bytes_to_string, merged))
+                )
+
+        # IT special tokens at fixed ids 65535..65539. The base model only
+        # uses 65535 (<|endoftext|>); IT adds the four chat tokens.
+        special_tokens = {
+            "<|endoftext|>": 65535,
+            "<|end|>": 65536,
+            "<|user|>": 65537,
+            "<|assistant|>": 65538,
+            "<|system|>": 65539,
+        }
+        # Decide vocab_size: read from config.json (65540 IT, 65536 base).
+        vocab_size = self.hparams["vocab_size"]
+        # If we are converting the base model, drop the IT-specific specials
+        # whose ids are >= base vocab_size.
+        special_tokens = {k: v for k, v in special_tokens.items() if v < vocab_size}
+
+        reverse_vocab = {idx: tok for tok, idx in {**vocab, **special_tokens}.items()}
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+            else:
+                tok = reverse_vocab[i]
+                tokens.append(tok)
+                if i in special_tokens.values():
+                    toktypes.append(gguf.TokenType.CONTROL)
+                else:
+                    toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre("talkie")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_token_merges(merges)
+
+        # Special-token ids. EOS = <|end|> for IT, <|endoftext|> for base.
+        eos_id = special_tokens.get("<|end|>", special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_eos_token_id(eos_id)
+        self.gguf_writer.add_eot_token_id(eos_id)
+        self.gguf_writer.add_unk_token_id(special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_pad_token_id(special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(False)
+
+        # Chat template: <|user|>{content}<|end|><|assistant|>{content}<|end|>...
+        # No newlines, no BOS - matches talkie/src/talkie/chat.py:format_chat.
+        chat_template = (
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}<|end|>{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+        )
+        self.gguf_writer.add_chat_template(chat_template)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # RoPE sign correction for q_proj / k_proj.
+        # Talkie rotates by -theta (sign-flipped sin); llama.cpp NEOX rotates by +theta.
+        # Pre-multiplying the second-half of head_dim (output dim) by -1 absorbs
+        # the difference: <NEOX(D q), NEOX(D k)> == <Talkie(q), Talkie(k)>
+        # for D = diag(+1...+1, -1...-1) on head_dim halves.
+        n_head = self.hparams["num_attention_heads"]
+        head_dim = self.hparams.get("head_dim") or (
+            self.hparams["hidden_size"] // n_head
+        )
+        if name.endswith(("self_attn.q_proj.weight", "self_attn.k_proj.weight")):
+            w = data_torch
+            # shape [n_head*head_dim, hidden]
+            w = w.view(n_head, head_dim, w.shape[-1]).clone()
+            w[:, head_dim // 2 :, :] = -w[:, head_dim // 2 :, :]
+            data_torch = w.view(n_head * head_dim, -1)
+
+        # Scalar tensors are stored as shape [1] in the HF state dict; keep
+        # them 1-D so create_tensor on the C++ side allocates {1}. Same for
+        # head_gain which is shape [n_head].
+        # Default routing handles everything else.
+        return [(self.map_tensor_name(name), data_torch)]
+
+
 @ModelBase.register("OlmoeForCausalLM")
 class OlmoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.OLMOE

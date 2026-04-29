@@ -494,6 +494,12 @@ struct llama_layer {
     struct llama_layer_shortconv shortconv;
 
     struct llama_layer_nextn nextn;
+
+    // talkie - per-block scalars and per-head Q gain
+    struct ggml_tensor * attn_head_gain   = nullptr;  // [n_head]
+    struct ggml_tensor * attn_act_gain    = nullptr;  // [1]
+    struct ggml_tensor * ffn_act_gain     = nullptr;  // [1]
+    struct ggml_tensor * embed_skip_scale = nullptr;  // [1]
 };
 
 struct llama_device {
@@ -549,6 +555,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // talkie - global learnable scalar that multiplies the lm_head matrix.
+    struct ggml_tensor * lm_head_gain         = nullptr;  // [1]
 
     std::vector<llama_layer> layers;
 

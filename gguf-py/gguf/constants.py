@@ -437,6 +437,7 @@ class MODEL_ARCH(IntEnum):
     OLMO             = auto()
     OLMO2            = auto()
     OLMOE            = auto()
+    TALKIE           = auto()
     OPENELM          = auto()
     ARCTIC           = auto()
     DEEPSEEK         = auto()
@@ -566,6 +567,11 @@ class MODEL_TENSOR(IntEnum):
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
+    ATTN_HEAD_GAIN       = auto() # talkie - per-head learnable gain on Q after Q-RMSnorm
+    ATTN_ACT_GAIN        = auto() # talkie - per-block learnable scalar on attn-residual branch
+    FFN_ACT_GAIN         = auto() # talkie - per-block learnable scalar on mlp-residual branch
+    EMBED_SKIP_SCALE     = auto() # talkie - per-block learnable scalar on embedding-skip branch
+    LM_HEAD_GAIN         = auto() # talkie - global learnable scalar on lm_head matrix
     PER_LAYER_TOKEN_EMBD = auto() # gemma3n
     PER_LAYER_MODEL_PROJ = auto() # gemma3n
     PER_LAYER_INP_GATE   = auto() # gemma3n
@@ -923,6 +929,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.OLMO:             "olmo",
     MODEL_ARCH.OLMO2:            "olmo2",
     MODEL_ARCH.OLMOE:            "olmoe",
+    MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.OPENELM:          "openelm",
     MODEL_ARCH.ARCTIC:           "arctic",
     MODEL_ARCH.DEEPSEEK:         "deepseek",
@@ -1021,6 +1028,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_GATE:                 "blk.{bid}.attn_gate",
     MODEL_TENSOR.ATTN_Q_NORM:               "blk.{bid}.attn_q_norm",
     MODEL_TENSOR.ATTN_K_NORM:               "blk.{bid}.attn_k_norm",
+    MODEL_TENSOR.ATTN_HEAD_GAIN:            "blk.{bid}.attn_head_gain",
+    MODEL_TENSOR.ATTN_ACT_GAIN:             "blk.{bid}.attn_act_gain",
+    MODEL_TENSOR.FFN_ACT_GAIN:              "blk.{bid}.ffn_act_gain",
+    MODEL_TENSOR.EMBED_SKIP_SCALE:          "blk.{bid}.embed_skip_scale",
+    MODEL_TENSOR.LM_HEAD_GAIN:              "lm_head_gain",
     MODEL_TENSOR.ATTN_OUT_NORM:             "blk.{bid}.attn_output_norm",
     MODEL_TENSOR.ATTN_POST_NORM:            "blk.{bid}.post_attention_norm",
     MODEL_TENSOR.FFN_GATE_INP:              "blk.{bid}.ffn_gate_inp",
@@ -2662,6 +2674,22 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.TALKIE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.ATTN_HEAD_GAIN,
+        MODEL_TENSOR.ATTN_ACT_GAIN,
+        MODEL_TENSOR.FFN_ACT_GAIN,
+        MODEL_TENSOR.EMBED_SKIP_SCALE,
+        MODEL_TENSOR.LM_HEAD_GAIN,
     ],
     MODEL_ARCH.SEED_OSS: [
         MODEL_TENSOR.TOKEN_EMBD,
