@@ -9423,19 +9423,26 @@ class DeepseekV4Model(TextModel):
             "embed.weight":     "token_embd.weight",
             "norm.weight":      "output_norm.weight",
             "head.weight":      "output.weight",
-            "hc_head_fn":       "hc_head.fn.weight",
-            "hc_head_base":     "hc_head.base.weight",
-            "hc_head_scale":    "hc_head.scale.weight",
+            # Model-level hc_head (matches gguf-py constants.py: output.hc_head.{fn,base,scale}).
+            "hc_head_fn":       "output.hc_head.fn.weight",
+            "hc_head_base":     "output.hc_head.base.weight",
+            "hc_head_scale":    "output.hc_head.scale.weight",
         }
         if source in m:
             return m[source]
         return None
 
     def _v4_block_name(self, tail: str, bid: int, mtp: bool) -> str | None:
-        """Translate a per-block tail like 'attn.wq_a.weight' to logical name."""
-        prefix = f"blk.{bid}.mtp." if mtp else f"blk.{bid}."
+        """Translate a per-block tail like 'attn.wq_a.weight' to logical name.
 
-        # mHC residual mapping (per-block)
+        For MTP (bid == self._mtp_bid), the standard attention / FFN tensors share
+        the same names as a regular block at bid=N so they slot into the existing
+        per-layer table; only the MTP-specific extras (e_proj, h_proj, enorm,
+        hnorm, norm, hc_head_*) carry the `.mtp.` infix.
+        """
+        prefix = f"blk.{bid}."
+
+        # mHC residual mapping (per-block; same names for MTP and main blocks)
         m = {
             "hc_attn_fn":     prefix + "hc_attn.fn.weight",
             "hc_attn_base":   prefix + "hc_attn.base.weight",
@@ -9450,14 +9457,14 @@ class DeepseekV4Model(TextModel):
         # MTP-only mappings
         if mtp:
             mtp_m = {
-                "hc_head_fn":     f"blk.{bid}.mtp.hc_head.fn.weight",
-                "hc_head_base":   f"blk.{bid}.mtp.hc_head.base.weight",
-                "hc_head_scale":  f"blk.{bid}.mtp.hc_head.scale.weight",
-                "e_proj.weight":  f"blk.{bid}.mtp.e_proj.weight",
-                "h_proj.weight":  f"blk.{bid}.mtp.h_proj.weight",
-                "enorm.weight":   f"blk.{bid}.mtp.enorm.weight",
-                "hnorm.weight":   f"blk.{bid}.mtp.hnorm.weight",
-                "norm.weight":    f"blk.{bid}.mtp.norm.weight",
+                "hc_head_fn":     prefix + "mtp.hc_head.fn.weight",
+                "hc_head_base":   prefix + "mtp.hc_head.base.weight",
+                "hc_head_scale":  prefix + "mtp.hc_head.scale.weight",
+                "e_proj.weight":  prefix + "mtp.e_proj.weight",
+                "h_proj.weight":  prefix + "mtp.h_proj.weight",
+                "enorm.weight":   prefix + "mtp.enorm.weight",
+                "hnorm.weight":   prefix + "mtp.hnorm.weight",
+                "norm.weight":    prefix + "mtp.norm.weight",
             }
             if tail in mtp_m:
                 return mtp_m[tail]
@@ -9486,7 +9493,7 @@ class DeepseekV4Model(TextModel):
 
         # indexer (ratio==4 layers only)
         i = a + "indexer."
-        if tail == i + "wq_b.weight":           return prefix + "indexer.wq_b.weight"
+        if tail == i + "wq_b.weight":           return prefix + "indexer.attn_q_b.weight"
         if tail == i + "weights_proj.weight":   return prefix + "indexer.weights_proj.weight"
         ic = i + "compressor."
         if tail == ic + "wkv.weight":           return prefix + "indexer.compressor.wkv.weight"
