@@ -78,15 +78,18 @@ llm_build_talkie::llm_build_talkie(const llama_model & model, const llm_graph_pa
             cb(Qcur, "Qcur_post_rope", il);
             cb(Kcur, "Kcur_post_rope", il);
 
-            // Weightless Q/K RMSnorm (talkie line 102).
-            Qcur = build_norm(Qcur, NULL, NULL, LLM_NORM_RMS, il);
-            cb(Qcur, "Qcur_post_qknorm", il);
+            // Weightless K-RMSnorm (talkie line 102).
             Kcur = build_norm(Kcur, NULL, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_post_qknorm", il);
 
-            // HeadGain on Q: broadcast [1, n_head, 1] over [head_dim, n_head, n_tokens].
+            // Q-RMSnorm fused with HeadGain: rms-norm then multiply by per-head
+            // gain broadcast [1, n_head, 1] over [head_dim, n_head, n_tokens].
+            // build_norm emits ggml_rms_norm + ggml_mul as consecutive nodes,
+            // matching the CUDA RMS_NORM+MUL fusion pattern in
+            // ggml-cuda::ggml_cuda_op_rms_norm_fused. Same graph as a separate
+            // ggml_mul; this form keeps the two ops adjacent in the cgraph.
             ggml_tensor * head_gain = ggml_reshape_3d(ctx0, model.layers[il].attn_head_gain, 1, n_head, 1);
-            Qcur = ggml_mul(ctx0, Qcur, head_gain);
+            Qcur = build_norm(Qcur, head_gain, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_post_headgain", il);
 
             cur = build_attn(inp_attn,
