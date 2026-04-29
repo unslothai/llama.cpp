@@ -4160,8 +4160,10 @@ class GGMLQuantizationType(IntEnum):
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX  = 1
-    SIGMOID  = 2
+    SOFTMAX        = 1
+    SIGMOID        = 2
+    SOFTMAX_WEIGHT = 3   # applied to the router weights instead of the logits
+    SQRT_SOFTPLUS  = 4   # DeepSeek-V4-Flash: probs = sqrt(softplus(logits))
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

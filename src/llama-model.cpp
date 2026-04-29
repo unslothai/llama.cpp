@@ -2056,13 +2056,10 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     }
                 }
 
-                // swiglu_limit applied to both routed and shared experts (per SGLang #23776)
-                ml.get_key(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp[0],   false);
-                ml.get_key(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp[0], false);
-                for (uint32_t i = 1; i < hparams.n_layer; ++i) {
-                    hparams.swiglu_clamp_exp[i]   = hparams.swiglu_clamp_exp[0];
-                    hparams.swiglu_clamp_shexp[i] = hparams.swiglu_clamp_shexp[0];
-                }
+                // swiglu_limit applied to both routed and shared experts (per SGLang #23776).
+                // Writer emits an array of length n_layer so the value is read via get_key_or_arr.
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp,   hparams.n_layer, false);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
 
                 switch (hparams.n_layer) {
                     case 43: type = LLM_TYPE_236B; break; // V4-Flash variant
