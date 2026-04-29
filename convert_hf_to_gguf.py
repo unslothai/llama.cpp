@@ -9237,9 +9237,36 @@ class DeepseekV4Model(TextModel):
         self._exp_weight_buf: dict[int, dict[str, list[Tensor | None]]] = {}
         self._exp_scale_buf:  dict[int, dict[str, list[Tensor | None]]] = {}
 
+    # Chat-mode Jinja template equivalent to encoding_dsv4.encode_messages
+    # (thinking_mode="chat"). BOS is emitted by the template (V4's
+    # tokenizer_config sets add_bos_token=False, so the tokenizer does not
+    # auto-prepend it). Detection on the C++ side keys on the four markers
+    # <｜User｜>, <｜Assistant｜>, <｜end▁of▁sentence｜>, </think>.
+    _V4_CHAT_TEMPLATE = (
+        "{{- '<｜begin▁of▁sentence｜>' -}}"
+        "{%- for message in messages -%}"
+        "{%- if message['role'] == 'system' -%}"
+        "{{- message['content'] -}}"
+        "{%- elif message['role'] == 'user' or message['role'] == 'developer' -%}"
+        "{{- '<｜User｜>' + message['content'] -}}"
+        "{%- if not loop.last and messages[loop.index]['role'] == 'assistant' -%}"
+        "{{- '<｜Assistant｜></think>' -}}"
+        "{%- endif -%}"
+        "{%- elif message['role'] == 'assistant' -%}"
+        "{{- message['content'] + '<｜end▁of▁sentence｜>' -}}"
+        "{%- endif -%}"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "{{- '<｜Assistant｜></think>' -}}"
+        "{%- endif -%}"
+    )
+
     def set_vocab(self):
         # tokenizer.json BPE
         self._set_vocab_gpt2()
+        # Emit a Jinja chat template that matches encoding_dsv4 chat-mode output.
+        # The C++ side auto-detects DEEPSEEK_V4 by the four markers in this string.
+        self.gguf_writer.add_chat_template(self._V4_CHAT_TEMPLATE)
 
     def set_gguf_parameters(self):
         h  = self.hparams
