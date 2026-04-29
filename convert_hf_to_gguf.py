@@ -9342,11 +9342,14 @@ class DeepseekV4Model(TextModel):
     # --- helpers -------------------------------------------------------------
 
     def _fp8_dequant(self, weight_f32: Tensor, scale_f32: Tensor) -> Tensor:
-        """Block-wise FP8 e4m3fn × UE8M0 scale → BF16.
+        """Block-wise FP8 e4m3fn × UE8M0 scale → F32.
 
         Mirrors inference/convert.py:140 and inference/kernel.py for fp8_gemm.
         weight: (M, K) already-decoded FP8 values (loader cast FP8 → FP32).
         scale:  (M/128, K/128) already-decoded UE8M0 values.
+
+        Returns F32; the GGUF writer downcasts to the requested ftype (BF16 by
+        default for --outtype bf16) at write time.
         """
         b = self._FP8_BLOCK
         M, K = weight_f32.shape
@@ -9356,14 +9359,14 @@ class DeepseekV4Model(TextModel):
             f"FP8 scale shape {tuple(scale_f32.shape)} != ({Mb}, {Kb})"
         out = (weight_f32.view(Mb, b, Kb, b)
                          * scale_f32.view(Mb, 1, Kb, 1)).reshape(M, K)
-        return out.to(torch.bfloat16)
+        return out.contiguous()
 
     def _fp4_dequant(self, packed_f32: Tensor, scale_f32: Tensor) -> Tensor:
-        """Block-wise FP4 e2m1 packed (2 nibbles / byte) × UE8M0 scale → BF16.
+        """Block-wise FP4 e2m1 packed (2 nibbles / byte) × UE8M0 scale → F32.
 
         Mirrors inference/convert.py:cast_e2m1fn_to_e4m3fn (the fp8 path) but
-        emits BF16 directly (PR1 BF16 routed-expert path; native MXFP4
-        passthrough is PR3).
+        emits F32 directly (PR1 BF16 routed-expert path; native MXFP4
+        passthrough is PR3). The writer downcasts F32 → BF16 at write time.
         packed: (M, K_packed) where K_packed = K/2; loader cast int8 → FP32 so
         each value is a signed byte in [-128, 127].
         scale:  (M, K/32)     UE8M0 → already-decoded scale floats.
@@ -9386,7 +9389,7 @@ class DeepseekV4Model(TextModel):
         assert scale_f32.shape == (M, Kb), \
             f"FP4 scale shape {tuple(scale_f32.shape)} != ({M}, {Kb})"
         out = decoded.view(M, Kb, b) * scale_f32.view(M, Kb, 1)
-        return out.reshape(M, K).to(torch.bfloat16)
+        return out.reshape(M, K).contiguous()
 
     # Source-name suffixes that come with a sibling `.scale` and need FP8 dequant.
     # Determined by inspection of the V4-Flash safetensors index. Routed-expert
@@ -9561,7 +9564,13 @@ class DeepseekV4Model(TextModel):
         return list(self._emit_single(name, data_torch, bid))
 
     def _emit_single(self, source_name: str, data: Tensor, bid: int | None, dequant: bool = False) -> Iterable[tuple[str, Tensor]]:
-        """Emit a single non-expert tensor with its logical name + dtype fixups."""
+        """Emit a single non-expert tensor with its logical name + dtype fixups.
+
+        All weights are emitted as F32; the GGUF writer's tensor_force_quant
+        path downcasts to BF16 (or other ftype) at write time. The single
+        exception is ffn_gate_tid2eid which is written directly as I32 via
+        gguf_writer.add_tensor with raw_dtype=I32.
+        """
         # If the source name ends with .weight, build the logical name from the
         # original .weight name (so dequant doesn't change which entry we map).
         # If it ends with .scale, use the .weight entry instead.
@@ -9574,9 +9583,12 @@ class DeepseekV4Model(TextModel):
             # Unmapped — error loudly so we notice silent drops.
             raise ValueError(f"DeepseekV4Model: unmapped source tensor {source_name!r} (bid={bid})")
 
-        # tid2eid: int64 → int32, no shape change.
+        # tid2eid: write as I32 directly via gguf_writer.add_tensor, return [].
+        # (loader cast int64 → fp32 at line 783-784 of the prepare_tensors loop;
+        # we cast back to int32 and write as raw I32 GGML quant type.)
         if logical.endswith("ffn_gate_tid2eid.weight"):
-            yield logical, data.to(torch.int32)
+            arr = data.to(torch.int32).contiguous().numpy()
+            self.gguf_writer.add_tensor(logical, arr, raw_dtype=gguf.GGMLQuantizationType.I32)
             return
 
         # wo_a: reshape (n_groups*o_lora_rank, dim_per_group)
@@ -9586,21 +9598,11 @@ class DeepseekV4Model(TextModel):
             o_lora   = self.hparams["o_lora_rank"]
             assert data.shape[0] == n_groups * o_lora, \
                 f"attn_o_a expected first dim {n_groups*o_lora}, got {tuple(data.shape)}"
-            data = data.view(n_groups, o_lora, data.shape[1])
-            yield logical, data
-            return
+            data = data.view(n_groups, o_lora, data.shape[1]).contiguous()
 
-        # tid2eid is i32; everything else: prefer BF16 for non-norm 2D tensors.
-        # (norms / 1D tensors are forced to F32 by the parent prepare_tensors loop.)
-        if not dequant and data.dtype == torch.float32 and data.ndim >= 2:
-            # Only downcast known-BF16-source weights. hc_*, attn_sink, ape are F32 → keep F32.
-            keep_f32 = any(s in logical for s in (
-                "hc_attn.", "hc_ffn.", "hc_head.", "attn_sinks", "compressor.ape", "exp_probs_b",
-            ))
-            if not keep_f32:
-                # Source was BF16 (q_norm, kv_norm, ffn_gate_inp, compressor.norm, etc.)
-                # — keep current value but cast back to BF16 to match on-disk.
-                data = data.to(torch.bfloat16)
+        # Ensure F32 for the rest of the pipeline (writer handles BF16 cast).
+        if data.dtype != torch.float32:
+            data = data.to(torch.float32)
 
         yield logical, data
 
