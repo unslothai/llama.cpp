@@ -14,6 +14,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4, // DeepSeek-V4: probs = sqrt(softplus(logits))
 };
 
 enum llama_swa_type {
@@ -206,6 +207,16 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+
+    // DeepSeek-V4-Flash specific
+    uint32_t v4_o_lora_rank   = 0;     // wo_a low-rank dim per group
+    uint32_t v4_o_groups      = 0;     // grouped low-rank wo (n_groups)
+    float    v4_compress_rope_freq_base = 0.0f;  // distinct from rope_freq_base; CSA/HCA layers use this
+    uint32_t v4_hc_mult       = 0;     // mHC stream count (4 for V4-Flash)
+    uint32_t v4_hc_sinkhorn_iters = 0;
+    float    v4_hc_eps        = 1e-6f;
+    uint32_t v4_n_hash_layers = 0;     // first N layers use tid2eid hash routing
+    std::array<uint8_t, LLAMA_MAX_LAYERS> v4_compress_ratios;  // 0=SWA, 4=CSA, 128=HCA
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;

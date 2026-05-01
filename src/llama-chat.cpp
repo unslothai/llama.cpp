@@ -49,6 +49,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "deepseek",          LLM_CHAT_TEMPLATE_DEEPSEEK          },
     { "deepseek2",         LLM_CHAT_TEMPLATE_DEEPSEEK_2        },
     { "deepseek3",         LLM_CHAT_TEMPLATE_DEEPSEEK_3        },
+    { "deepseek-v4",       LLM_CHAT_TEMPLATE_DEEPSEEK_V4       },
     { "deepseek-ocr",      LLM_CHAT_TEMPLATE_DEEPSEEK_OCR      },
     { "command-r",         LLM_CHAT_TEMPLATE_COMMAND_R         },
     { "llama3",            LLM_CHAT_TEMPLATE_LLAMA_3           },
@@ -181,6 +182,11 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_MINICPM;
     } else if (tmpl_contains("'Assistant: ' + message['content'] + eos_token")) {
         return LLM_CHAT_TEMPLATE_DEEPSEEK_2;
+    } else if (tmpl_contains(LU8("<｜Assistant｜>")) && tmpl_contains(LU8("<｜User｜>")) && tmpl_contains(LU8("<｜end▁of▁sentence｜>")) && tmpl_contains("</think>")) {
+        // DeepSeek-V4-Flash: chat-mode appends </think> after <|Assistant|>;
+        // distinguished from V3 (which has no </think> in its template).
+        // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py
+        return LLM_CHAT_TEMPLATE_DEEPSEEK_V4;
     } else if (tmpl_contains(LU8("<｜Assistant｜>")) && tmpl_contains(LU8("<｜User｜>")) && tmpl_contains(LU8("<｜end▁of▁sentence｜>"))) {
         return LLM_CHAT_TEMPLATE_DEEPSEEK_3;
     } else if (tmpl_contains("[|system|]") && tmpl_contains("[|assistant|]") && tmpl_contains("[|endofturn|]")) {
@@ -555,6 +561,54 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << LU8("<｜Assistant｜>");
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_DEEPSEEK_V4) {
+        // DeepSeek-V4-Flash, chat mode (encoding_dsv4.encode_messages with thinking_mode="chat").
+        //
+        // Layout:
+        //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user1}<｜Assistant｜></think>{assistant1}<｜end▁of▁sentence｜>...<｜Assistant｜></think>
+        //
+        // Key differences from V3:
+        //   - BOS is emitted by the template (V4's tokenizer_config sets add_bos_token=False,
+        //     so the tokenizer does not prepend it; encoding_dsv4 lines 17, 546 prepend it
+        //     explicitly).
+        //   - assistant content has NO <｜Assistant｜> prefix (the prefix is emitted as
+        //     a turn-transition suffix after every user/developer message, then closed
+        //     with </think> for chat mode).
+        //   - system_msg_template is "{content}" with no separator.
+        //   - The </think> sentinel after <｜Assistant｜> tells the model to skip
+        //     thinking-mode reasoning and emit the chat-mode response directly.
+        //
+        // Refs:
+        //   - encoding/encoding_dsv4.py:render_message (handles "system", "user", "assistant", task suffixes)
+        //   - encoding/encoding_dsv4.py:encode_messages (BOS handling, multi-turn)
+        ss << LU8("<｜begin▁of▁sentence｜>");
+        const size_t n = chat.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto * message = chat[i];
+            std::string role(message->role);
+            if (role == "system") {
+                ss << message->content;
+            } else if (role == "user") {
+                ss << LU8("<｜User｜>") << message->content;
+                // Mid-conversation user→assistant turn transition: emit Assistant + </think>
+                // before the next assistant content (matches encoding_dsv4 line 384-392 chat-mode path).
+                if (i + 1 < n && std::string(chat[i + 1]->role) == "assistant") {
+                    ss << LU8("<｜Assistant｜>") << "</think>";
+                }
+            } else if (role == "developer") {
+                // V4 "developer" role: rendered as a user message prefixed with <｜User｜>
+                // (encoding_dsv4 line 272-283, chat-mode subset, no tools/response_format).
+                ss << LU8("<｜User｜>") << message->content;
+                if (i + 1 < n && std::string(chat[i + 1]->role) == "assistant") {
+                    ss << LU8("<｜Assistant｜>") << "</think>";
+                }
+            } else if (role == "assistant") {
+                ss << message->content << LU8("<｜end▁of▁sentence｜>");
+            }
+        }
+        if (add_ass) {
+            ss << LU8("<｜Assistant｜>") << "</think>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_DEEPSEEK_OCR) {
         for (auto message : chat) {

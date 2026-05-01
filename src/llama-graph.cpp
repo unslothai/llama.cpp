@@ -1269,6 +1269,25 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_reglu(ctx0, cur);
                 cb(cur, "ffn_reglu", il);
             } break;
+        case LLM_FFN_SWIGLU_CLAMPED_PRE:
+            {
+                // DeepSeek-V4-Flash: gate.clamp(-INF, lim) → silu, up.clamp(±lim), gate*up.
+                // Limit per-layer is read from hparams.swiglu_clamp_{exp,shexp}; the
+                // shared-expert path uses swiglu_clamp_shexp, the (rare) dense FFN path
+                // uses swiglu_clamp_exp[0]. Routed-expert path is handled inside build_moe_ffn.
+                // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py:600-602
+                GGML_ASSERT(gate != nullptr && type_gate == LLM_FFN_PAR && "SWIGLU_CLAMPED_PRE expects parallel gate/up");
+                const float limit = (il >= 0) ? hparams.swiglu_clamp_shexp[il] : hparams.swiglu_clamp_exp[0];
+                ggml_tensor * gate_clamped = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                cb(gate_clamped, "ffn_gate_clamped", il);
+                gate_clamped = ggml_silu(ctx0, gate_clamped);
+                cb(gate_clamped, "ffn_gate_silu", il);
+                ggml_tensor * up_clamped = ggml_clamp(ctx0, tmp, -limit, limit);
+                cb(up_clamped, "ffn_up_clamped", il);
+                cur = ggml_mul(ctx0, gate_clamped, up_clamped);
+                cb(cur, "ffn_swiglu_clamped_pre", il);
+                type_gate = LLM_FFN_SEQ;
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -1399,6 +1418,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            {
+                // DeepSeek-V4-Flash: probs = sqrt(softplus(logits))
+                // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py:565,571
+                ggml_tensor * sp = ggml_softplus(ctx0, logits);
+                probs = ggml_sqrt(ctx0, sp);
             } break;
         default:
             GGML_ABORT("fatal error");
@@ -1638,6 +1664,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cur = ggml_relu(ctx0, cur);
                 cur = ggml_sqr(ctx0, cur);
                 cb(cur, "ffn_moe_relu_sqr", il);
+            } break;
+        case LLM_FFN_SWIGLU_CLAMPED_PRE:
+            {
+                // DeepSeek-V4-Flash routed experts: clamp(gate, -inf, lim) → silu, clamp(up, ±lim), gate*up.
+                // Note: unlike the post-silu-clamp variant above (Step35-style) which clamps AFTER silu,
+                // V4 clamps BEFORE silu — see SGLang #23776 / inference/model.py:600-602.
+                GGML_ASSERT(has_gate);
+                const float limit = hparams.swiglu_clamp_exp[il];
+                ggml_tensor * gate_clamped = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                cb(gate_clamped, "ffn_moe_gate_clamped", il);
+                gate_clamped = ggml_silu(ctx0, gate_clamped);
+                cb(gate_clamped, "ffn_moe_gate_silu", il);
+                ggml_tensor * up_clamped = ggml_clamp(ctx0, up, -limit, limit);
+                cb(up_clamped, "ffn_moe_up_clamped", il);
+                cur = ggml_mul(ctx0, gate_clamped, up_clamped);
+                cb(cur, "ffn_moe_swiglu_clamped_pre", il);
             } break;
         default:
             GGML_ABORT("fatal error");

@@ -2014,6 +2014,58 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK_V4:
+            {
+                // DeepSeek-V4-Flash: hybrid SWA/CSA/HCA attention, mHC residuals,
+                // hash-routed MoE, MQA-style single shared K=V.
+                // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_O_LORA_RANK,       hparams.v4_o_lora_rank);
+                ml.get_key(LLM_KV_ATTENTION_O_GROUPS,          hparams.v4_o_groups);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa, false);
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+
+                // V4 indexer (used in CSA layers; loaded but unused in MVP graph - dense fallback)
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     false);
+
+                // mHC + V4-specific
+                ml.get_key(LLM_KV_HC_MULT,                      hparams.v4_hc_mult);
+                ml.get_key(LLM_KV_HC_SINKHORN_ITERS,            hparams.v4_hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_HC_EPS,                       hparams.v4_hc_eps,        false);
+                ml.get_key(LLM_KV_N_HASH_LAYERS,                hparams.v4_n_hash_layers, false);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,         hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.v4_compress_rope_freq_base, false);
+
+                // compress_ratios is a uint32 array of length (n_layer + nextn_predict_layers)
+                {
+                    std::array<uint32_t, LLAMA_MAX_LAYERS> ratios_u32{};
+                    if (ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios_u32, false)) {
+                        const uint32_t n = hparams.n_layer + hparams.nextn_predict_layers;
+                        for (uint32_t i = 0; i < n && i < ratios_u32.size(); ++i) {
+                            hparams.v4_compress_ratios[i] = (uint8_t) ratios_u32[i];
+                        }
+                    }
+                }
+
+                // swiglu_limit applied to both routed and shared experts (per SGLang #23776).
+                // Writer emits an array of length n_layer so the value is read via get_key_or_arr.
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp,   hparams.n_layer, false);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
+
+                switch (hparams.n_layer) {
+                    case 43: type = LLM_TYPE_236B; break; // V4-Flash variant
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_DEEPSEEK2OCR:
             {
                 // similar to deepseek2, but without MLA
@@ -5357,6 +5409,131 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
                             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, 0);
                             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+                        }
+                    }
+                } break;
+            case LLM_ARCH_DEEPSEEK_V4:
+                {
+                    // DeepSeek-V4-Flash. PR1: full per-layer tensor declaration so the
+                    // converter's GGUF loads end-to-end; the stub graph still uses only
+                    // token_embd + output_norm + output (junk logits). All per-layer
+                    // tensors are TENSOR_NOT_REQUIRED so partial / pre-PR2 GGUFs still load.
+                    //
+                    // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+                    const int64_t q_lora_rank = hparams.n_lora_q;
+                    const int64_t o_lora_rank = hparams.v4_o_lora_rank;
+                    const int64_t n_groups    = hparams.v4_o_groups;
+                    const int64_t head_dim    = (int64_t) hparams.n_embd_head_k(0);  // 512
+                    const int64_t rope_dim    = (int64_t) hparams.n_rot(0);          // 64
+                    (void) rope_dim;                                                  // unused in PR1 loader
+                    const int64_t hc_mult     = hparams.v4_hc_mult;        // 4
+                    const int64_t idx_n_heads = hparams.indexer_n_head;    // 64
+                    const int64_t idx_head_dim = hparams.indexer_head_size;// 128
+                    const int64_t n_layer_main = hparams.n_layer - hparams.nextn_predict_layers;
+                    const int64_t n_hash_layers = (int64_t) hparams.v4_n_hash_layers;
+                    // Shadowed-as-int64 for clean brace-list deductions in {ne[0], ne[1], ...}.
+                    const int64_t n_ff_exp        = (int64_t) hparams.n_ff_exp;
+                    const int64_t n_expert_shared = (int64_t) hparams.n_expert_shared;
+
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (!output) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    // Model-level mHC head (collapses hc_mult streams to 1 before lm_head).
+                    v4_hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_mult * n_embd, hc_mult}, TENSOR_NOT_REQUIRED);
+                    v4_hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult},                    TENSOR_NOT_REQUIRED);
+                    v4_hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1},                            TENSOR_NOT_REQUIRED);
+
+                    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+                        auto & layer = layers[i];
+                        const bool is_mtp = (i >= n_layer_main);
+                        const uint8_t cr  = hparams.v4_compress_ratios[i];
+                        const bool has_compressor = (cr != 0);
+                        const bool has_indexer    = (cr == 4);
+                        // First n_hash_layers are hash-routed (tid2eid LUT, no router bias).
+                        const bool is_hash_layer  = (i < n_hash_layers);
+
+                        // Norms (attn_norm, ffn_norm, attn_q_a_norm, attn_kv_norm).
+                        layer.attn_norm       = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd},     TENSOR_NOT_REQUIRED);
+                        layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd},     TENSOR_NOT_REQUIRED);
+                        layer.attn_q_a_norm   = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, TENSOR_NOT_REQUIRED);
+                        layer.v4_attn_kv_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,   "weight", i), {head_dim},   TENSOR_NOT_REQUIRED);
+
+                        // Attention parameters.
+                        layer.attn_sinks      = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head},     TENSOR_NOT_REQUIRED);
+                        layer.wq_a            = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,       "weight", i), {n_embd,      q_lora_rank},     TENSOR_NOT_REQUIRED);
+                        layer.wq_b            = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,       "weight", i), {q_lora_rank, n_head * head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.v4_attn_kv      = create_tensor(tn(LLM_TENSOR_ATTN_KV,        "weight", i), {n_embd,      head_dim},        TENSOR_NOT_REQUIRED);
+                        // attn_o_a is stored as a 3D tensor [dim_per_group, o_lora_rank, n_groups]
+                        // so the C++ side can use mul_mat_id on the n_groups axis.
+                        layer.v4_attn_o_a     = create_tensor(tn(LLM_TENSOR_ATTN_O_A,       "weight", i),
+                                                              {(n_head * head_dim) / n_groups, o_lora_rank, n_groups}, TENSOR_NOT_REQUIRED);
+                        layer.v4_attn_o_b     = create_tensor(tn(LLM_TENSOR_ATTN_O_B,       "weight", i),
+                                                              {n_groups * o_lora_rank, n_embd}, TENSOR_NOT_REQUIRED);
+
+                        // mHC (per-block).
+                        // shape note: hc_attn_fn comes from inference/model.py:660-663
+                        //   nn.Linear(hc_mult*n_embd, (2+hc_mult)*hc_mult)  →  weight [(2+hc_mult)*hc_mult, hc_mult*n_embd]
+                        layer.v4_hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i),
+                                                               {hc_mult * n_embd, (2 + hc_mult) * hc_mult}, TENSOR_NOT_REQUIRED);
+                        layer.v4_hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {(2 + hc_mult) * hc_mult}, TENSOR_NOT_REQUIRED);
+                        layer.v4_hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, TENSOR_NOT_REQUIRED);
+                        layer.v4_hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i),
+                                                               {hc_mult * n_embd, (2 + hc_mult) * hc_mult}, TENSOR_NOT_REQUIRED);
+                        layer.v4_hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {(2 + hc_mult) * hc_mult}, TENSOR_NOT_REQUIRED);
+                        layer.v4_hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, TENSOR_NOT_REQUIRED);
+
+                        // Compressor (CSA + HCA layers). coff=2 if ratio==4 (overlap_transform), else 1.
+                        if (has_compressor) {
+                            const int64_t coff = (cr == 4) ? 2 : 1;
+                            layer.v4_compressor_wkv   = create_tensor(tn(LLM_TENSOR_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * head_dim}, TENSOR_NOT_REQUIRED);
+                            layer.v4_compressor_wgate = create_tensor(tn(LLM_TENSOR_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * head_dim}, TENSOR_NOT_REQUIRED);
+                            layer.v4_compressor_ape   = create_tensor(tn(LLM_TENSOR_COMPRESSOR_APE,   "weight", i), {coff * head_dim, (int64_t) cr}, TENSOR_NOT_REQUIRED);
+                            layer.v4_compressor_norm  = create_tensor(tn(LLM_TENSOR_COMPRESSOR_NORM,  "weight", i), {head_dim}, TENSOR_NOT_REQUIRED);
+                        }
+
+                        // Indexer (CSA layers only). Indexer's compressor uses ratio==4 (coff=2).
+                        if (has_indexer) {
+                            layer.indexer_attn_q_b      = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B,    "weight", i), {q_lora_rank, idx_n_heads * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_proj          = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,        "weight", i), {n_embd, idx_n_heads},                       TENSOR_NOT_REQUIRED);
+                            const int64_t idx_coff = 2;
+                            layer.v4_idx_compressor_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, idx_coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                            layer.v4_idx_compressor_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, idx_coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                            layer.v4_idx_compressor_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {idx_coff * idx_head_dim, 4}, TENSOR_NOT_REQUIRED);
+                            layer.v4_idx_compressor_norm  = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                        }
+
+                        // MoE: gate_inp + (hash routing OR router bias) + experts + shared expert.
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+                        if (is_hash_layer) {
+                            // hash-route layers: tid2eid LUT [vocab_size, n_expert_used], stored as I32.
+                            layer.v4_ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {(int64_t) n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
+                        } else {
+                            // score-routed layers: have a router bias for top-k selection only.
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        }
+                        // Stacked routed experts (shape [moe_inter, n_embd, n_expert] etc., matching DeepSeek-V2 conv).
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i), {n_embd,    n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i), {n_ff_exp,  n_embd,   n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i), {n_embd,    n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+                        // Shared expert (n_expert_shared==1 for V4-Flash).
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, TENSOR_NOT_REQUIRED);
+
+                        // MTP block extras.
+                        if (is_mtp) {
+                            layer.v4_mtp_e_proj       = create_tensor(tn(LLM_TENSOR_MTP_E_PROJ,        "weight", i), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_h_proj       = create_tensor(tn(LLM_TENSOR_MTP_H_PROJ,        "weight", i), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_enorm        = create_tensor(tn(LLM_TENSOR_MTP_ENORM,         "weight", i), {n_embd},          TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_hnorm        = create_tensor(tn(LLM_TENSOR_MTP_HNORM,         "weight", i), {n_embd},          TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_norm         = create_tensor(tn(LLM_TENSOR_MTP_NORM,          "weight", i), {n_embd},          TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_hc_head_fn    = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_FN,    "weight", i), {hc_mult * n_embd, hc_mult}, TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_hc_head_base  = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_BASE,  "weight", i), {hc_mult},                    TENSOR_NOT_REQUIRED);
+                            layer.v4_mtp_hc_head_scale = create_tensor(tn(LLM_TENSOR_MTP_HC_HEAD_SCALE, "weight", i), {1},                            TENSOR_NOT_REQUIRED);
                         }
                     }
                 } break;
@@ -8840,6 +9017,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_deepseek2>(*this, params);
             } break;
+        case LLM_ARCH_DEEPSEEK_V4:
+            {
+                llm = std::make_unique<llm_build_deepseek_v4>(*this, params);
+            } break;
         case LLM_ARCH_CHATGLM:
             {
                 llm = std::make_unique<llm_build_chatglm>(*this, params);
@@ -9236,6 +9417,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
+        case LLM_ARCH_DEEPSEEK_V4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

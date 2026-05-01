@@ -43,6 +43,10 @@ enum llm_ffn_op_type {
     LLM_FFN_GEGLU,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
+    // DeepSeek-V4-Flash: gate.clamp(-INF, lim) → silu, up.clamp(±lim), gate*up.
+    // Limit per-layer is read from hparams.swiglu_clamp_{exp,shexp}.
+    // ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py:600-602
+    LLM_FFN_SWIGLU_CLAMPED_PRE,
 };
 
 enum llm_ffn_gate_type {

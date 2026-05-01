@@ -9199,6 +9199,479 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(TextModel):
+    """DeepSeek-V4-Flash converter (PR1 BF16 path).
+
+    Reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+    Dequant patterns mirror inference/convert.py and inference/kernel.py.
+    """
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK_V4
+
+    # FP4 e2m1 dequant lookup table (matches inference/convert.py:11-14)
+    _FP4_TABLE = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ], dtype=torch.float32)
+
+    # FP8 dequant block size (matches config.json: weight_block_size=[128,128])
+    _FP8_BLOCK = 128
+    # FP4 dequant block size along K (matches inference/convert.py:26)
+    _FP4_BLOCK = 32
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # MTP block joins the regular block array at index num_hidden_layers.
+        n_main = self.hparams["num_hidden_layers"]
+        n_mtp  = self.hparams.get("num_nextn_predict_layers", 0)
+        self.block_count = n_main + n_mtp
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._mtp_bid = n_main  # MTP block lands at this bid
+
+        # Buffers for paired weight/.scale streaming dequant.
+        self._fp_weight_buf: dict[str, Tensor] = {}
+        self._fp_scale_buf:  dict[str, Tensor] = {}
+
+        # Buffer for stacking 256 routed experts per layer into 3D tensors.
+        # _experts[bid][param_name] = stacked Tensor once all experts arrived.
+        self._exp_weight_buf: dict[int, dict[str, list[Tensor | None]]] = {}
+        self._exp_scale_buf:  dict[int, dict[str, list[Tensor | None]]] = {}
+
+    # Chat-mode Jinja template equivalent to encoding_dsv4.encode_messages
+    # (thinking_mode="chat"). BOS is emitted by the template (V4's
+    # tokenizer_config sets add_bos_token=False, so the tokenizer does not
+    # auto-prepend it). Detection on the C++ side keys on the four markers
+    # <｜User｜>, <｜Assistant｜>, <｜end▁of▁sentence｜>, </think>.
+    _V4_CHAT_TEMPLATE = (
+        "{{- '<｜begin▁of▁sentence｜>' -}}"
+        "{%- for message in messages -%}"
+        "{%- if message['role'] == 'system' -%}"
+        "{{- message['content'] -}}"
+        "{%- elif message['role'] == 'user' or message['role'] == 'developer' -%}"
+        "{{- '<｜User｜>' + message['content'] -}}"
+        "{%- if not loop.last and messages[loop.index]['role'] == 'assistant' -%}"
+        "{{- '<｜Assistant｜></think>' -}}"
+        "{%- endif -%}"
+        "{%- elif message['role'] == 'assistant' -%}"
+        "{{- message['content'] + '<｜end▁of▁sentence｜>' -}}"
+        "{%- endif -%}"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "{{- '<｜Assistant｜></think>' -}}"
+        "{%- endif -%}"
+    )
+
+    def set_vocab(self):
+        # tokenizer.json BPE
+        self._set_vocab_gpt2()
+        # Emit a Jinja chat template that matches encoding_dsv4 chat-mode output.
+        # The C++ side auto-detects DEEPSEEK_V4 by the four markers in this string.
+        self.gguf_writer.add_chat_template(self._V4_CHAT_TEMPLATE)
+
+    def set_gguf_parameters(self):
+        h  = self.hparams
+        gw = self.gguf_writer
+
+        # standard
+        gw.add_block_count(self.block_count)
+        gw.add_embedding_length(h["hidden_size"])
+        gw.add_feed_forward_length(h["moe_intermediate_size"])  # dense FFN feature unused
+        gw.add_head_count(h["num_attention_heads"])
+        gw.add_head_count_kv(h["num_key_value_heads"])  # =1 (MQA)
+        gw.add_layer_norm_rms_eps(h["rms_norm_eps"])
+        gw.add_vocab_size(h["vocab_size"])
+        gw.add_context_length(h["max_position_embeddings"])
+
+        # RoPE
+        gw.add_rope_freq_base(h["rope_theta"])           # 10000 (SWA layers)
+        gw.add_rope_dimension_count(h["qk_rope_head_dim"])  # 64
+        gw.add_key_length(h["head_dim"])                  # 512
+        gw.add_value_length(h["head_dim"])
+
+        # YaRN (used on CSA/HCA layers; SWA layers ignore it via compress_ratio==0)
+        rs = h.get("rope_scaling") or {}
+        if rs.get("type") == "yarn":
+            gw.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            gw.add_rope_scaling_factor(rs["factor"])
+            gw.add_rope_scaling_orig_ctx_len(rs["original_max_position_embeddings"])
+            if "beta_fast" in rs:
+                gw.add_rope_scaling_yarn_beta_fast(rs["beta_fast"])
+            if "beta_slow" in rs:
+                gw.add_rope_scaling_yarn_beta_slow(rs["beta_slow"])
+
+        # V4 attention
+        gw.add_q_lora_rank(h["q_lora_rank"])
+        gw.add_o_lora_rank(h["o_lora_rank"])
+        gw.add_o_groups(h["o_groups"])
+        gw.add_sliding_window(h["sliding_window"])             # 128
+        gw.add_compress_ratios(h["compress_ratios"])            # length 44 (43 + MTP)
+        gw.add_compress_rope_freq_base(h["compress_rope_theta"])  # 160000
+
+        # Indexer (CSA layers only)
+        gw.add_indexer_head_count(h["index_n_heads"])
+        gw.add_indexer_key_length(h["index_head_dim"])
+        gw.add_indexer_top_k(h["index_topk"])
+
+        # mHC (manifold-constrained Hyper-Connections)
+        gw.add_hc_mult(h["hc_mult"])
+        gw.add_hc_sinkhorn_iters(h["hc_sinkhorn_iters"])
+        gw.add_hc_eps(h["hc_eps"])
+        gw.add_n_hash_layers(h["num_hash_layers"])
+
+        # MTP / NextN
+        gw.add_nextn_predict_layers(h.get("num_nextn_predict_layers", 0))
+
+        # MoE
+        gw.add_expert_feed_forward_length(h["moe_intermediate_size"])
+        gw.add_expert_count(h["n_routed_experts"])
+        gw.add_expert_used_count(h["num_experts_per_tok"])
+        gw.add_expert_shared_count(h["n_shared_experts"])
+        gw.add_expert_weights_scale(h["routed_scaling_factor"])
+        if h.get("norm_topk_prob"):
+            gw.add_expert_weights_norm(True)
+        # 4 = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS
+        gw.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRT_SOFTPLUS)
+
+        # SwiGLU clamp (= swiglu_limit) on routed AND shared experts
+        # (per inference/model.py:600-602 and SGLang #23776). Per-layer array
+        # of length block_count so the C++ side reads via get_key_or_arr.
+        sw = float(h["swiglu_limit"])
+        gw.add_swiglu_clamp_exp([sw] * self.block_count)
+        gw.add_swiglu_clamp_shexp([sw] * self.block_count)
+
+    # --- helpers -------------------------------------------------------------
+
+    def _fp8_dequant(self, weight_f32: Tensor, scale_f32: Tensor) -> Tensor:
+        """Block-wise FP8 e4m3fn × UE8M0 scale → F32.
+
+        Mirrors inference/convert.py:140 and inference/kernel.py for fp8_gemm.
+        weight: (M, K) already-decoded FP8 values (loader cast FP8 → FP32).
+        scale:  (M/128, K/128) already-decoded UE8M0 values.
+
+        Returns F32; the GGUF writer downcasts to the requested ftype (BF16 by
+        default for --outtype bf16) at write time.
+        """
+        b = self._FP8_BLOCK
+        M, K = weight_f32.shape
+        assert M % b == 0 and K % b == 0, f"FP8 dequant: shape {weight_f32.shape} not divisible by {b}"
+        Mb, Kb = M // b, K // b
+        assert scale_f32.shape == (Mb, Kb), \
+            f"FP8 scale shape {tuple(scale_f32.shape)} != ({Mb}, {Kb})"
+        out = (weight_f32.view(Mb, b, Kb, b)
+                         * scale_f32.view(Mb, 1, Kb, 1)).reshape(M, K)
+        return out.contiguous()
+
+    def _fp4_dequant(self, packed_f32: Tensor, scale_f32: Tensor) -> Tensor:
+        """Block-wise FP4 e2m1 packed (2 nibbles / byte) × UE8M0 scale → F32.
+
+        Mirrors inference/convert.py:cast_e2m1fn_to_e4m3fn (the fp8 path) but
+        emits F32 directly (PR1 BF16 routed-expert path; native MXFP4
+        passthrough is PR3). The writer downcasts F32 → BF16 at write time.
+        packed: (M, K_packed) where K_packed = K/2; loader cast int8 → FP32 so
+        each value is a signed byte in [-128, 127].
+        scale:  (M, K/32)     UE8M0 → already-decoded scale floats.
+        """
+        b = self._FP4_BLOCK
+        M, Kp = packed_f32.shape
+        K = Kp * 2
+        assert K % b == 0, f"FP4 dequant: K={K} not divisible by {b}"
+        # recover unsigned bytes from the signed-int8-cast-to-float32
+        u8 = (packed_f32.to(torch.int32) & 0xFF)
+        low  = u8 & 0x0F
+        high = (u8 >> 4) & 0x0F
+        # Stack [low, high] → (M, Kp, 2) → flatten to (M, K)
+        # The on-disk layout matches inference/convert.py:30-33: low nibble at
+        # even index, high nibble at odd index.
+        nibbles = torch.stack([low, high], dim=-1).flatten(1)              # (M, K) int32
+        decoded = self._FP4_TABLE[nibbles.long()]                           # (M, K) fp32
+        # Scale per block of 32 along K
+        Kb = K // b
+        assert scale_f32.shape == (M, Kb), \
+            f"FP4 scale shape {tuple(scale_f32.shape)} != ({M}, {Kb})"
+        out = decoded.view(M, Kb, b) * scale_f32.view(M, Kb, 1)
+        return out.reshape(M, K).contiguous()
+
+    # Source-name suffixes that come with a sibling `.scale` and need FP8 dequant.
+    # Determined by inspection of the V4-Flash safetensors index. Routed-expert
+    # weights are FP4 (handled by _consume_expert) and are NOT in this set.
+    _FP8_PACKED_SUFFIXES = (
+        "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
+        "attn.indexer.wq_b",
+        "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3",
+        "e_proj", "h_proj",
+    )
+
+    def _is_fp8_packed(self, name: str) -> bool:
+        if not name.endswith(".weight"):
+            return False
+        base = name[:-len(".weight")]
+        return any(base.endswith(suffix) for suffix in self._FP8_PACKED_SUFFIXES)
+
+    def _maybe_pair(self, name: str, data: Tensor):
+        """For FP8-packed tensors only: buffer the .weight or .scale half and
+        return the completed (weight, scale) pair when both have arrived.
+        Non-FP8 tensors return (None, None) so the caller emits them directly."""
+        if name.endswith(".scale"):
+            base = name[:-len(".scale")]
+            self._fp_scale_buf[base] = data
+        elif name.endswith(".weight"):
+            if not self._is_fp8_packed(name):
+                # not paired -- caller treats as a single tensor.
+                return None, None
+            base = name[:-len(".weight")]
+            self._fp_weight_buf[base] = data
+        else:
+            return None, None
+        if base in self._fp_weight_buf and base in self._fp_scale_buf:
+            return self._fp_weight_buf.pop(base), self._fp_scale_buf.pop(base)
+        return None, None
+
+    def _v4_logical_name(self, source: str, bid: int | None) -> str | None:
+        """Map V4 source-name → llama.cpp logical name. Returns None if the
+        tensor should be silently dropped (e.g. .scale once consumed)."""
+        # mtp.0.* → block index = num_hidden_layers
+        if source.startswith("mtp.0."):
+            assert bid == 0
+            bid = self._mtp_bid
+            tail = source[len("mtp.0."):]
+            return self._v4_block_name(tail, bid, mtp=True)
+
+        if source.startswith("layers.") and bid is not None:
+            tail = source[len(f"layers.{bid}."):]
+            return self._v4_block_name(tail, bid, mtp=False)
+
+        # Top-level
+        m = {
+            "embed.weight":     "token_embd.weight",
+            "norm.weight":      "output_norm.weight",
+            "head.weight":      "output.weight",
+            # Model-level hc_head (matches gguf-py constants.py: output.hc_head.{fn,base,scale}).
+            "hc_head_fn":       "output.hc_head.fn.weight",
+            "hc_head_base":     "output.hc_head.base.weight",
+            "hc_head_scale":    "output.hc_head.scale.weight",
+        }
+        if source in m:
+            return m[source]
+        return None
+
+    def _v4_block_name(self, tail: str, bid: int, mtp: bool) -> str | None:
+        """Translate a per-block tail like 'attn.wq_a.weight' to logical name.
+
+        For MTP (bid == self._mtp_bid), the standard attention / FFN tensors share
+        the same names as a regular block at bid=N so they slot into the existing
+        per-layer table; only the MTP-specific extras (e_proj, h_proj, enorm,
+        hnorm, norm, hc_head_*) carry the `.mtp.` infix.
+        """
+        prefix = f"blk.{bid}."
+
+        # mHC residual mapping (per-block; same names for MTP and main blocks)
+        m = {
+            "hc_attn_fn":     prefix + "hc_attn.fn.weight",
+            "hc_attn_base":   prefix + "hc_attn.base.weight",
+            "hc_attn_scale":  prefix + "hc_attn.scale.weight",
+            "hc_ffn_fn":      prefix + "hc_ffn.fn.weight",
+            "hc_ffn_base":    prefix + "hc_ffn.base.weight",
+            "hc_ffn_scale":   prefix + "hc_ffn.scale.weight",
+        }
+        if tail in m:
+            return m[tail]
+
+        # MTP-only mappings
+        if mtp:
+            mtp_m = {
+                "hc_head_fn":     prefix + "mtp.hc_head.fn.weight",
+                "hc_head_base":   prefix + "mtp.hc_head.base.weight",
+                "hc_head_scale":  prefix + "mtp.hc_head.scale.weight",
+                "e_proj.weight":  prefix + "mtp.e_proj.weight",
+                "h_proj.weight":  prefix + "mtp.h_proj.weight",
+                "enorm.weight":   prefix + "mtp.enorm.weight",
+                "hnorm.weight":   prefix + "mtp.hnorm.weight",
+                "norm.weight":    prefix + "mtp.norm.weight",
+            }
+            if tail in mtp_m:
+                return mtp_m[tail]
+
+        # attn / ffn norms
+        if tail == "attn_norm.weight":  return prefix + "attn_norm.weight"
+        if tail == "ffn_norm.weight":   return prefix + "ffn_norm.weight"
+
+        # attention parameters
+        a = "attn."
+        if tail == a + "attn_sink":         return prefix + "attn_sinks.weight"
+        if tail == a + "wq_a.weight":       return prefix + "attn_q_a.weight"
+        if tail == a + "wq_b.weight":       return prefix + "attn_q_b.weight"
+        if tail == a + "q_norm.weight":     return prefix + "attn_q_a_norm.weight"
+        if tail == a + "wkv.weight":        return prefix + "attn_kv.weight"
+        if tail == a + "kv_norm.weight":    return prefix + "attn_kv_norm.weight"
+        if tail == a + "wo_a.weight":       return prefix + "attn_o_a.weight"
+        if tail == a + "wo_b.weight":       return prefix + "attn_o_b.weight"
+
+        # compressor (ratio>0 layers only)
+        c = a + "compressor."
+        if tail == c + "wkv.weight":        return prefix + "compressor.wkv.weight"
+        if tail == c + "wgate.weight":      return prefix + "compressor.wgate.weight"
+        if tail == c + "ape":               return prefix + "compressor.ape.weight"
+        if tail == c + "norm.weight":       return prefix + "compressor.norm.weight"
+
+        # indexer (ratio==4 layers only)
+        i = a + "indexer."
+        if tail == i + "wq_b.weight":           return prefix + "indexer.attn_q_b.weight"
+        if tail == i + "weights_proj.weight":   return prefix + "indexer.weights_proj.weight"
+        ic = i + "compressor."
+        if tail == ic + "wkv.weight":           return prefix + "indexer.compressor.wkv.weight"
+        if tail == ic + "wgate.weight":         return prefix + "indexer.compressor.wgate.weight"
+        if tail == ic + "ape":                  return prefix + "indexer.compressor.ape.weight"
+        if tail == ic + "norm.weight":          return prefix + "indexer.compressor.norm.weight"
+
+        # FFN router
+        if tail == "ffn.gate.weight":       return prefix + "ffn_gate_inp.weight"
+        if tail == "ffn.gate.bias":         return prefix + "exp_probs_b.bias"
+        if tail == "ffn.gate.tid2eid":      return prefix + "ffn_gate_tid2eid.weight"
+
+        # Shared expert
+        if tail == "ffn.shared_experts.w1.weight": return prefix + "ffn_gate_shexp.weight"
+        if tail == "ffn.shared_experts.w2.weight": return prefix + "ffn_down_shexp.weight"
+        if tail == "ffn.shared_experts.w3.weight": return prefix + "ffn_up_shexp.weight"
+
+        # Routed experts -- handled by stacking path in modify_tensors
+        return None
+
+    # --- main hook -----------------------------------------------------------
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # === routed-expert stacking path ===
+        # Source: layers.{bid}.ffn.experts.{xid}.{w1|w2|w3}.{weight|scale}
+        m = re.match(r"^(?:layers\.(\d+)|mtp\.0)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$", name)
+        if m:
+            return self._consume_expert(m, name, data_torch)
+
+        # === everything else: detect FP8 weight/scale pairing ===
+        weight, scale = self._maybe_pair(name, data_torch)
+        if name.endswith(".scale"):
+            if weight is None:
+                # scale arrived without its weight — buffer; nothing to emit yet
+                return []
+            # both present: dequant FP8 → BF16
+            deq = self._fp8_dequant(weight, scale)
+            return list(self._emit_single(name, deq, bid, dequant=True))
+        if name.endswith(".weight") and self._is_fp8_packed(name):
+            # FP8-packed weight: buffered until scale arrives. Nothing to emit yet.
+            if weight is None:
+                return []
+            deq = self._fp8_dequant(weight, scale)
+            return list(self._emit_single(name, deq, bid, dequant=True))
+        # Plain non-paired tensor (BF16/F32 norm, attn_sink, hc_*, ape, tid2eid, etc.)
+        return list(self._emit_single(name, data_torch, bid))
+
+    def _emit_single(self, source_name: str, data: Tensor, bid: int | None, dequant: bool = False) -> Iterable[tuple[str, Tensor]]:
+        """Emit a single non-expert tensor with its logical name + dtype fixups.
+
+        All weights are emitted as F32; the GGUF writer's tensor_force_quant
+        path downcasts to BF16 (or other ftype) at write time. The single
+        exception is ffn_gate_tid2eid which is written directly as I32 via
+        gguf_writer.add_tensor with raw_dtype=I32.
+        """
+        # If the source name ends with .weight, build the logical name from the
+        # original .weight name (so dequant doesn't change which entry we map).
+        # If it ends with .scale, use the .weight entry instead.
+        lookup = source_name
+        if source_name.endswith(".scale"):
+            lookup = source_name[:-len(".scale")] + ".weight"
+
+        logical = self._v4_logical_name(lookup, bid)
+        if logical is None:
+            # Unmapped — error loudly so we notice silent drops.
+            raise ValueError(f"DeepseekV4Model: unmapped source tensor {source_name!r} (bid={bid})")
+
+        # tid2eid: write as I32 directly via gguf_writer.add_tensor, return [].
+        # (loader cast int64 → fp32 at line 783-784 of the prepare_tensors loop;
+        # we materialize to a real numpy array of int32, then write as raw I32.)
+        if logical.endswith("ffn_gate_tid2eid.weight"):
+            eager = LazyTorchTensor.to_eager(data)
+            arr = eager.to(torch.int32).contiguous().numpy()
+            self.gguf_writer.add_tensor(logical, arr, raw_dtype=gguf.GGMLQuantizationType.I32)
+            return
+
+        # wo_a: reshape (n_groups*o_lora_rank, dim_per_group)
+        # → (n_groups, o_lora_rank, dim_per_group) for grouped einsum on C++ side.
+        if logical.endswith("attn_o_a.weight"):
+            n_groups = self.hparams["o_groups"]
+            o_lora   = self.hparams["o_lora_rank"]
+            assert data.shape[0] == n_groups * o_lora, \
+                f"attn_o_a expected first dim {n_groups*o_lora}, got {tuple(data.shape)}"
+            data = data.view(n_groups, o_lora, data.shape[1]).contiguous()
+
+        # Ensure F32 for the rest of the pipeline (writer handles BF16 cast).
+        if data.dtype != torch.float32:
+            data = data.to(torch.float32)
+
+        yield logical, data
+
+    def _consume_expert(self, m: re.Match, source_name: str, data: Tensor) -> Iterable[tuple[str, Tensor]]:
+        """Buffer expert tensors per (block, w_name); when all 256 experts arrive
+        for a (block, w_name, kind) triple, dequant FP4 → BF16 and stack."""
+        layer_grp, xid_str, wname, kind = m.groups()
+        if layer_grp is None:
+            bid = self._mtp_bid
+        else:
+            bid = int(layer_grp)
+        xid = int(xid_str)
+        n_experts = self.hparams["n_routed_experts"]
+
+        if kind == "weight":
+            buf = self._exp_weight_buf.setdefault(bid, {})
+        else:
+            buf = self._exp_scale_buf.setdefault(bid, {})
+        slots = buf.setdefault(wname, [None] * n_experts)
+        slots[xid] = data
+
+        # Emit only when all 256 experts have BOTH weight and scale.
+        wbuf = self._exp_weight_buf.get(bid, {}).get(wname, [])
+        sbuf = self._exp_scale_buf.get(bid, {}).get(wname, [])
+        if len(wbuf) != n_experts or len(sbuf) != n_experts:
+            return []
+        if any(t is None for t in wbuf) or any(t is None for t in sbuf):
+            return []
+
+        # All 256 experts ready. Dequant each FP4 → BF16, stack into 3D.
+        deq_list = [self._fp4_dequant(wbuf[i], sbuf[i]) for i in range(n_experts)]
+        # PR2 graph expects per-expert shape (out_features, in_features); stack on dim 0.
+        stacked = torch.stack(deq_list, dim=0)   # (n_experts, out, in)
+
+        # Free the buffer
+        del self._exp_weight_buf[bid][wname]
+        del self._exp_scale_buf[bid][wname]
+
+        # Map w1/w2/w3 → ffn_{gate,down,up}_exps
+        # inference/model.py:Expert: w1=gate, w2=down, w3=up; gate(x).silu * up(x), then down
+        wmap = {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"}
+        suffix = wmap[wname]
+        logical = f"blk.{bid}.{suffix}.weight"
+        return [(logical, stacked)]
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        # Unprocessed buffers indicate a name our converter didn't map.
+        leftover_w = {k for k in self._fp_weight_buf if not k.endswith("scale")}
+        leftover_s = list(self._fp_scale_buf.keys())
+        if leftover_w or leftover_s:
+            raise ValueError(
+                f"DeepseekV4Model: unmatched FP8 weight/scale pairs:\n"
+                f"  weights without scales: {sorted(leftover_w)}\n"
+                f"  scales without weights: {sorted(leftover_s)}"
+            )
+        for bid, by_w in self._exp_weight_buf.items():
+            for wname, slots in by_w.items():
+                missing = [i for i, t in enumerate(slots) if t is None]
+                if missing:
+                    raise ValueError(f"layer {bid} {wname}.weight: missing experts {missing[:8]}...")
+        for bid, by_w in self._exp_scale_buf.items():
+            for wname, slots in by_w.items():
+                missing = [i for i, t in enumerate(slots) if t is None]
+                if missing:
+                    raise ValueError(f"layer {bid} {wname}.scale: missing experts {missing[:8]}...")
+
+
 @ModelBase.register(
     "Mistral3ForConditionalGeneration",
     "Ministral3ForCausalLM",
@@ -13229,6 +13702,8 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        # DeepSeek-V4-Flash hash-routing LUT (ffn_gate_tid2eid) is stored as I32.
+        torch.int32: np.int32,
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -13248,6 +13723,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.bool: np.uint8,
         torch.float8_e4m3fn: np.uint8,
         torch.float8_e5m2: np.uint8,
+        torch.float8_e8m0fnu: np.uint8,
     }
 
     # used for safetensors slices
@@ -13269,6 +13745,9 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
+        # DeepSeek-V4-Flash uses UE8M0 scale tensors alongside FP8 e4m3 / FP4 e2m1
+        # weights. ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json
+        "F8_E8M0": torch.float8_e8m0fnu,
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:

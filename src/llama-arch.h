@@ -79,6 +79,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK,
     LLM_ARCH_DEEPSEEK2,
     LLM_ARCH_DEEPSEEK2OCR,
+    LLM_ARCH_DEEPSEEK_V4,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -246,6 +247,14 @@ enum llm_kv {
     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
     LLM_KV_ATTENTION_INDEXER_TOP_K,
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
+    LLM_KV_ATTENTION_O_LORA_RANK,
+    LLM_KV_ATTENTION_O_GROUPS,
+    LLM_KV_ATTENTION_COMPRESS_RATIOS,
+    LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
+    LLM_KV_HC_MULT,
+    LLM_KV_HC_SINKHORN_ITERS,
+    LLM_KV_HC_EPS,
+    LLM_KV_N_HASH_LAYERS,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
@@ -554,6 +563,37 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // DeepSeek-V4-Flash specific tensors
+    LLM_TENSOR_ATTN_KV,                  // V4 single shared K=V projection (MQA), distinct from KV_A_MQA + KV_B
+    LLM_TENSOR_ATTN_KV_NORM,             // V4 RMSNorm on shared KV, distinct from KV_A_NORM (MLA two-stage)
+    LLM_TENSOR_ATTN_O_A,                 // V4 grouped low-rank wo_a [n_groups, o_lora_rank, n_heads*head_dim/n_groups]
+    LLM_TENSOR_ATTN_O_B,                 // V4 wo_b [n_groups*o_lora_rank, n_embd]
+    LLM_TENSOR_COMPRESSOR_WKV,           // V4 KV compression linear (CSA + HCA)
+    LLM_TENSOR_COMPRESSOR_WGATE,         // V4 KV compression gate
+    LLM_TENSOR_COMPRESSOR_APE,           // V4 additive positional embedding for compression
+    LLM_TENSOR_COMPRESSOR_NORM,          // V4 RMSNorm post-compression
+    LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   // V4 indexer compressor (separate state from main compressor)
+    LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,
+    LLM_TENSOR_INDEXER_COMPRESSOR_APE,
+    LLM_TENSOR_INDEXER_COMPRESSOR_NORM,
+    LLM_TENSOR_HC_ATTN_FN,               // mHC linear projection for attn block split
+    LLM_TENSOR_HC_ATTN_BASE,
+    LLM_TENSOR_HC_ATTN_SCALE,
+    LLM_TENSOR_HC_FFN_FN,
+    LLM_TENSOR_HC_FFN_BASE,
+    LLM_TENSOR_HC_FFN_SCALE,
+    LLM_TENSOR_HC_HEAD_FN,               // model-level mHC head projection (sigmoid+eps reduce only)
+    LLM_TENSOR_HC_HEAD_BASE,
+    LLM_TENSOR_HC_HEAD_SCALE,
+    LLM_TENSOR_FFN_GATE_TID2EID,         // hash routing LUT for first n_hash_layers
+    LLM_TENSOR_MTP_E_PROJ,               // MTP next-token-embedding projection
+    LLM_TENSOR_MTP_H_PROJ,               // MTP hidden-state projection
+    LLM_TENSOR_MTP_ENORM,                // MTP RMSNorm on embedded next-token
+    LLM_TENSOR_MTP_HNORM,                // MTP RMSNorm on hidden state
+    LLM_TENSOR_MTP_NORM,                 // MTP final norm before head
+    LLM_TENSOR_MTP_HC_HEAD_FN,           // MTP-specific hc_head projection
+    LLM_TENSOR_MTP_HC_HEAD_BASE,
+    LLM_TENSOR_MTP_HC_HEAD_SCALE,
 };
 
 enum llm_tensor_layer {

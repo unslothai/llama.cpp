@@ -484,6 +484,45 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // DeepSeek-V4-Flash. ref: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py
+    struct ggml_tensor * v4_attn_kv          = nullptr; // single shared K=V matmul (MQA)
+    struct ggml_tensor * v4_attn_kv_norm     = nullptr; // RMSNorm over head_dim after wkv
+    struct ggml_tensor * v4_attn_o_a         = nullptr; // grouped low-rank: 3D [n_heads*head_dim/n_groups, o_lora_rank, n_groups]
+    struct ggml_tensor * v4_attn_o_b         = nullptr; // [n_groups*o_lora_rank, n_embd]
+
+    // mHC residual mapping (per-block, plus separate model-level + per-MTP).
+    struct ggml_tensor * v4_hc_attn_fn       = nullptr; // F32 [(2+hc)*hc, hc*n_embd]
+    struct ggml_tensor * v4_hc_attn_base     = nullptr; // F32 [(2+hc)*hc]
+    struct ggml_tensor * v4_hc_attn_scale    = nullptr; // F32 [3]
+    struct ggml_tensor * v4_hc_ffn_fn        = nullptr;
+    struct ggml_tensor * v4_hc_ffn_base      = nullptr;
+    struct ggml_tensor * v4_hc_ffn_scale     = nullptr;
+
+    // Compressor (CSA + HCA layers). For HCA ratio==128 coff=1; for CSA ratio==4 coff=2.
+    struct ggml_tensor * v4_compressor_wkv   = nullptr; // [coff*head_dim, n_embd]
+    struct ggml_tensor * v4_compressor_wgate = nullptr;
+    struct ggml_tensor * v4_compressor_ape   = nullptr; // F32 [coff*head_dim, ratio]
+    struct ggml_tensor * v4_compressor_norm  = nullptr; // [head_dim]
+
+    // Indexer (CSA layers only). Loaded but unused by MVP graph (dense fallback).
+    struct ggml_tensor * v4_idx_compressor_wkv   = nullptr;
+    struct ggml_tensor * v4_idx_compressor_wgate = nullptr;
+    struct ggml_tensor * v4_idx_compressor_ape   = nullptr;
+    struct ggml_tensor * v4_idx_compressor_norm  = nullptr;
+
+    // Hash-routing LUT (first n_hash_layers only). I32 [vocab_size, n_expert_used].
+    struct ggml_tensor * v4_ffn_gate_tid2eid = nullptr;
+
+    // MTP block (last layer only).
+    struct ggml_tensor * v4_mtp_e_proj       = nullptr;
+    struct ggml_tensor * v4_mtp_h_proj       = nullptr;
+    struct ggml_tensor * v4_mtp_enorm        = nullptr;
+    struct ggml_tensor * v4_mtp_hnorm        = nullptr;
+    struct ggml_tensor * v4_mtp_norm         = nullptr;
+    struct ggml_tensor * v4_mtp_hc_head_fn    = nullptr;
+    struct ggml_tensor * v4_mtp_hc_head_base  = nullptr;
+    struct ggml_tensor * v4_mtp_hc_head_scale = nullptr;
+
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -549,6 +588,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // DeepSeek-V4-Flash model-level mHC head (collapses hc_mult streams to 1 before lm_head).
+    struct ggml_tensor * v4_hc_head_fn    = nullptr; // F32 [hc_mult, hc_mult * n_embd]
+    struct ggml_tensor * v4_hc_head_base  = nullptr; // F32 [hc_mult]
+    struct ggml_tensor * v4_hc_head_scale = nullptr; // F32 [1]
 
     std::vector<llama_layer> layers;
 

@@ -75,6 +75,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DEEPSEEK,         "deepseek"         },
     { LLM_ARCH_DEEPSEEK2,        "deepseek2"        },
     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
+    { LLM_ARCH_DEEPSEEK_V4,      "deepseek-v4"      },
     { LLM_ARCH_CHATGLM,          "chatglm"          },
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
@@ -241,6 +242,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.attention.indexer.head_count"           },
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
+    { LLM_KV_ATTENTION_O_LORA_RANK,                  "%s.attention.o_lora_rank"                  },
+    { LLM_KV_ATTENTION_O_GROUPS,                     "%s.attention.o_groups"                     },
+    { LLM_KV_ATTENTION_COMPRESS_RATIOS,              "%s.attention.compress_ratios"              },
+    { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
+    { LLM_KV_HC_MULT,                                "%s.hyperconnections.mult"                  },
+    { LLM_KV_HC_SINKHORN_ITERS,                      "%s.hyperconnections.sinkhorn_iters"        },
+    { LLM_KV_HC_EPS,                                 "%s.hyperconnections.eps"                   },
+    { LLM_KV_N_HASH_LAYERS,                          "%s.n_hash_layers"                          },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,             "%s.attention.shared_kv_layers"             },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
@@ -547,6 +556,37 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_PROJ,                           "blk.%d.indexer.proj" },
     { LLM_TENSOR_INDEXER_ATTN_K,                         "blk.%d.indexer.attn_k" },
     { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
+    // DeepSeek-V4-Flash specific tensors
+    { LLM_TENSOR_ATTN_KV,                                "blk.%d.attn_kv" },
+    { LLM_TENSOR_ATTN_KV_NORM,                           "blk.%d.attn_kv_norm" },
+    { LLM_TENSOR_ATTN_O_A,                               "blk.%d.attn_o_a" },
+    { LLM_TENSOR_ATTN_O_B,                               "blk.%d.attn_o_b" },
+    { LLM_TENSOR_COMPRESSOR_WKV,                         "blk.%d.compressor.wkv" },
+    { LLM_TENSOR_COMPRESSOR_WGATE,                       "blk.%d.compressor.wgate" },
+    { LLM_TENSOR_COMPRESSOR_APE,                         "blk.%d.compressor.ape" },
+    { LLM_TENSOR_COMPRESSOR_NORM,                        "blk.%d.compressor.norm" },
+    { LLM_TENSOR_INDEXER_COMPRESSOR_WKV,                 "blk.%d.indexer.compressor.wkv" },
+    { LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,               "blk.%d.indexer.compressor.wgate" },
+    { LLM_TENSOR_INDEXER_COMPRESSOR_APE,                 "blk.%d.indexer.compressor.ape" },
+    { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer.compressor.norm" },
+    { LLM_TENSOR_HC_ATTN_FN,                             "blk.%d.hc_attn.fn" },
+    { LLM_TENSOR_HC_ATTN_BASE,                           "blk.%d.hc_attn.base" },
+    { LLM_TENSOR_HC_ATTN_SCALE,                          "blk.%d.hc_attn.scale" },
+    { LLM_TENSOR_HC_FFN_FN,                              "blk.%d.hc_ffn.fn" },
+    { LLM_TENSOR_HC_FFN_BASE,                            "blk.%d.hc_ffn.base" },
+    { LLM_TENSOR_HC_FFN_SCALE,                           "blk.%d.hc_ffn.scale" },
+    { LLM_TENSOR_HC_HEAD_FN,                             "output.hc_head.fn" },
+    { LLM_TENSOR_HC_HEAD_BASE,                           "output.hc_head.base" },
+    { LLM_TENSOR_HC_HEAD_SCALE,                          "output.hc_head.scale" },
+    { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
+    { LLM_TENSOR_MTP_E_PROJ,                             "blk.%d.mtp.e_proj" },
+    { LLM_TENSOR_MTP_H_PROJ,                             "blk.%d.mtp.h_proj" },
+    { LLM_TENSOR_MTP_ENORM,                              "blk.%d.mtp.enorm" },
+    { LLM_TENSOR_MTP_HNORM,                              "blk.%d.mtp.hnorm" },
+    { LLM_TENSOR_MTP_NORM,                               "blk.%d.mtp.norm" },
+    { LLM_TENSOR_MTP_HC_HEAD_FN,                         "blk.%d.mtp.hc_head.fn" },
+    { LLM_TENSOR_MTP_HC_HEAD_BASE,                       "blk.%d.mtp.hc_head.base" },
+    { LLM_TENSOR_MTP_HC_HEAD_SCALE,                      "blk.%d.mtp.hc_head.scale" },
 };
 
 // declare information about the model weight tensors:
@@ -767,6 +807,37 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // Nemotron 3 Super
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    // DeepSeek-V4-Flash
+    {LLM_TENSOR_ATTN_KV,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_KV_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_O_A,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_O_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_COMPRESSOR_WKV,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_COMPRESSOR_WGATE,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_COMPRESSOR_APE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_COMPRESSOR_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INDEXER_COMPRESSOR_WKV,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_INDEXER_COMPRESSOR_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_HC_ATTN_FN,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HC_ATTN_BASE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_HC_ATTN_SCALE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_HC_FFN_FN,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HC_FFN_BASE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_HC_FFN_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_HC_HEAD_FN,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HC_HEAD_BASE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
+    {LLM_TENSOR_HC_HEAD_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_MTP_E_PROJ,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_H_PROJ,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_ENORM,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_MTP_HNORM,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_MTP_NORM,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_MTP_HC_HEAD_FN,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_HC_HEAD_BASE,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
+    {LLM_TENSOR_MTP_HC_HEAD_SCALE,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -890,6 +961,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK_V4:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
