@@ -8579,6 +8579,107 @@ class Olmo2Model(TextModel):
             self.gguf_writer.add_sliding_window_pattern(sliding_window_pattern)
 
 
+@ModelBase.register("TalkieForCausalLM")
+class TalkieModel(TextModel):
+    """Convert talkie-lm/talkie-1930-13b-{base,it} to GGUF."""
+    model_arch = gguf.MODEL_ARCH.TALKIE
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+        head_dim = self.hparams.get("head_dim") or (
+            self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+        )
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+        # Match PyTorch F.rms_norm default (effective eps ~0 on bf16).
+        self.gguf_writer.add_layer_norm_rms_eps(1e-9)
+
+    def set_vocab(self):
+        # Read tiktoken vocab.txt directly (no tokenizer.json upstream).
+        from tiktoken.load import load_tiktoken_bpe
+
+        vocab_path = self.dir_model / "vocab.txt"
+        if not vocab_path.exists():
+            raise FileNotFoundError(f"vocab.txt not found at {vocab_path}")
+        mergeable_ranks = load_tiktoken_bpe(str(vocab_path))
+        # Drop ranks >= 65535 (specials live there). See tokenizer.py:54.
+        mergeable_ranks = {k: v for k, v in mergeable_ranks.items() if v < 65535}
+
+        # Reverse-engineer merges via QwenModel helpers.
+        merges: list[str] = []
+        vocab: dict[str, int] = {}
+        for token_bytes, rank in mergeable_ranks.items():
+            vocab[QwenModel.token_bytes_to_string(token_bytes)] = rank
+            if len(token_bytes) == 1:
+                continue
+            merged = QwenModel.bpe(mergeable_ranks, token_bytes, max_rank=rank)
+            if len(merged) == 2:
+                merges.append(
+                    " ".join(map(QwenModel.token_bytes_to_string, merged))
+                )
+
+        # IT specials at fixed ids; base only uses <|endoftext|>.
+        special_tokens = {
+            "<|endoftext|>": 65535,
+            "<|end|>": 65536,
+            "<|user|>": 65537,
+            "<|assistant|>": 65538,
+            "<|system|>": 65539,
+        }
+        vocab_size = self.hparams["vocab_size"]
+        special_tokens = {k: v for k, v in special_tokens.items() if v < vocab_size}
+
+        reverse_vocab = {idx: tok for tok, idx in {**vocab, **special_tokens}.items()}
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+            else:
+                tok = reverse_vocab[i]
+                tokens.append(tok)
+                if i in special_tokens.values():
+                    toktypes.append(gguf.TokenType.CONTROL)
+                else:
+                    toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre("talkie")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_token_merges(merges)
+
+        eos_id = special_tokens.get("<|end|>", special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_eos_token_id(eos_id)
+        self.gguf_writer.add_eot_token_id(eos_id)
+        self.gguf_writer.add_unk_token_id(special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_pad_token_id(special_tokens["<|endoftext|>"])
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(False)
+
+        chat_template = (
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}<|end|>{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+        )
+        self.gguf_writer.add_chat_template(chat_template)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # RoPE -theta: negate second half of head_dim of W_q/W_k so NEOX matches.
+        n_head = self.hparams["num_attention_heads"]
+        head_dim = self.hparams.get("head_dim") or (
+            self.hparams["hidden_size"] // n_head
+        )
+        if name.endswith(("self_attn.q_proj.weight", "self_attn.k_proj.weight")):
+            w = data_torch.view(n_head, head_dim, data_torch.shape[-1]).clone()
+            w[:, head_dim // 2 :, :] = -w[:, head_dim // 2 :, :]
+            data_torch = w.view(n_head * head_dim, -1)
+
+        # Raw nn.Parameter scalars have no .weight suffix; add one for map_tensor_name.
+        canonical = name if name.endswith((".weight", ".bias")) else name + ".weight"
+        return [(self.map_tensor_name(canonical), data_torch)]
+
+
 @ModelBase.register("OlmoeForCausalLM")
 class OlmoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.OLMOE

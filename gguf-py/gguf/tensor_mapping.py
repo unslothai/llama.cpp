@@ -80,6 +80,9 @@ class TensorNameMap:
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
         ),
+        MODEL_TENSOR.LM_HEAD_GAIN: (
+            "lm_head_gain",  # talkie
+        ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
         ),
@@ -2137,6 +2140,18 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+        ),
+        MODEL_TENSOR.ATTN_HEAD_GAIN: (
+            "model.layers.{bid}.self_attn.head_gain",  # talkie
+        ),
+        MODEL_TENSOR.ATTN_ACT_GAIN: (
+            "model.layers.{bid}.attn_gain",  # talkie
+        ),
+        MODEL_TENSOR.FFN_ACT_GAIN: (
+            "model.layers.{bid}.mlp_gain",  # talkie
+        ),
+        MODEL_TENSOR.EMBED_SKIP_SCALE: (
+            "model.layers.{bid}.embed_skip",  # talkie
         ),
     }
 

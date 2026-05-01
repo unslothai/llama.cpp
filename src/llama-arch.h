@@ -137,6 +137,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_TALKIE,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -554,6 +555,12 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // talkie - per-block scalars and per-head gain
+    LLM_TENSOR_ATTN_HEAD_GAIN,
+    LLM_TENSOR_ATTN_ACT_GAIN,
+    LLM_TENSOR_FFN_ACT_GAIN,
+    LLM_TENSOR_EMBED_SKIP_SCALE,
+    LLM_TENSOR_LM_HEAD_GAIN,
 };
 
 enum llm_tensor_layer {

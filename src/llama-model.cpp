@@ -1871,6 +1871,19 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_TALKIE:
+            {
+                // Match PyTorch F.rms_norm default (effective eps ~0).
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
+                if (hparams.f_norm_rms_eps == 0.0f) {
+                    hparams.f_norm_rms_eps = 1e-9f;
+                }
+                hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+                switch (hparams.n_layer) {
+                    case 40: type = LLM_TYPE_13B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_OLMOE:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -5060,6 +5073,29 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+                    }
+                } break;
+            case LLM_ARCH_TALKIE:
+                {
+                    // No learnable RMSNorm weights; lm_head untied.
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, 0);
+                    lm_head_gain = create_tensor(tn(LLM_TENSOR_LM_HEAD_GAIN, "weight"), {1}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff,   n_embd}, 0);
+
+                        layer.attn_head_gain     = create_tensor(tn(LLM_TENSOR_ATTN_HEAD_GAIN,     "weight", i), {n_head}, 0);
+                        layer.attn_act_gain      = create_tensor(tn(LLM_TENSOR_ATTN_ACT_GAIN,      "weight", i), {1}, 0);
+                        layer.ffn_act_gain       = create_tensor(tn(LLM_TENSOR_FFN_ACT_GAIN,       "weight", i), {1}, 0);
+                        layer.embed_skip_scale   = create_tensor(tn(LLM_TENSOR_EMBED_SKIP_SCALE,   "weight", i), {1}, 0);
                     }
                 } break;
             case LLM_ARCH_SEED_OSS:
@@ -8817,6 +8853,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_olmoe>(*this, params);
             } break;
+        case LLM_ARCH_TALKIE:
+            {
+                llm = std::make_unique<llm_build_talkie>(*this, params);
+            } break;
         case LLM_ARCH_OPENELM:
             {
                 llm = std::make_unique<llm_build_openelm>(*this, params);
@@ -9278,6 +9318,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_RND1:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
+        case LLM_ARCH_TALKIE:
         case LLM_ARCH_PHI2:
         case LLM_ARCH_PHI3:
         case LLM_ARCH_PHIMOE:
