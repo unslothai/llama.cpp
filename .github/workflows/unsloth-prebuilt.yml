@@ -1,0 +1,252 @@
+name: Unsloth prebuilt (CUDA Linux x64)
+
+# Builds the Linux x64 CUDA bundles that ggml-org upstream does not ship,
+# matching the contract consumed by unslothai/unsloth's install_llama_prebuilt.py:
+#   app-<b#>-linux-x64-cuda{12,13}-{older,newer,portable}.tar.gz
+#   llama-prebuilt-manifest.json + llama-prebuilt-sha256.json
+#
+# Source is always ggml-org/llama.cpp at the resolved b<N> tag (NOT this fork's
+# tree), so Windows/macOS/CPU assets pulled from upstream at the same tag stay
+# in lockstep. Compile recipe is reused from oobabooga/llama-cpp-binaries
+# (bare ubuntu-22.04 -> glibc 2.35, Jimver CUDA toolkit), minus the wheel step.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'        # daily; publishes if upstream has a newer b<N>
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'ggml-org release tag to build (b#### or "latest")'
+        default: 'latest'
+        required: true
+        type: string
+      only_profile:
+        description: 'Build a single profile (cheap test) or all'
+        default: 'all'
+        required: false
+        type: choice
+        options: [all, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
+      publish:
+        description: 'Publish a GitHub release (otherwise upload artifacts only)'
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      exists: ${{ steps.r.outputs.exists }}
+      matrix: ${{ steps.r.outputs.matrix }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: r
+        run: |
+          set -euo pipefail
+          REQ='${{ github.event.inputs.tag || 'latest' }}'
+          ONLY='${{ github.event.inputs.only_profile || 'all' }}'
+          if [ "$REQ" = "latest" ]; then
+            TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)"
+          else
+            TAG="$REQ"
+          fi
+          printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+          COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            EXISTS=true; else EXISTS=false; fi
+
+          ALL='[
+            {"profile":"cuda12-older",   "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
+            {"profile":"cuda12-newer",   "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
+            {"profile":"cuda12-portable","line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
+            {"profile":"cuda13-older",   "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89"},
+            {"profile":"cuda13-newer",   "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.0.0","toolkit_line":"13.0","archs":"86 89 90 100 120"},
+            {"profile":"cuda13-portable","line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89 90 100 120"}
+          ]'
+          if [ "$ONLY" = "all" ]; then
+            INCLUDE="$(echo "$ALL" | jq -c .)"
+          else
+            INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "exists=$EXISTS"
+            echo "matrix={\"include\":$INCLUDE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY"
+
+  build:
+    name: ${{ matrix.profile }}
+    needs: resolve
+    # Idempotent on schedule: skip when the release already exists. Dispatch
+    # always runs so it can be tested/forced.
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          large-packages: false
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Checkout upstream source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: src
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build libssl-dev python3
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with:
+          key: cuda-${{ matrix.cuda }}-${{ matrix.profile }}
+          variant: ccache
+          evict-old-files: 14d
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.30
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: 'network'
+
+      - name: Set up CUDA environment
+        run: |
+          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_RPC=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DLLAMA_OPENSSL=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -eux
+          # Default target: ensures every GGML_CPU_ALL_VARIANTS backend module +
+          # libggml-cuda.so is produced (building only llama-* skips them).
+          cmake --build build --config Release -j "$(nproc)"
+
+      - name: Package bundle
+        env:
+          PLATFORM: linux
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted ubuntu-22.04, CUDA ${{ matrix.cuda }} (Jimver)
+          ARCHS: ${{ matrix.archs }}
+        run: python3 tooling/ci/unsloth/package_bundle.py
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ needs.resolve.outputs.tag }}-linux-x64-${{ matrix.profile }}
+          path: dist/app-${{ needs.resolve.outputs.tag }}-linux-x64-${{ matrix.profile }}.tar.gz
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble metadata + publish
+    needs: [resolve, build]
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Download built bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: app-*
+          merge-multiple: true
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/ci/unsloth/assemble_metadata.py \
+            --tag '${{ needs.resolve.outputs.tag }}' \
+            --commit '${{ needs.resolve.outputs.commit }}' \
+            --dist dist --out dist \
+            --publish-repo "$GITHUB_REPOSITORY"
+          ls -la dist
+
+      - name: Upload full release set (artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "llama.cpp prebuilt $TAG" \
+            --notes "Automated Unsloth llama.cpp CUDA Linux prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            dist/*
