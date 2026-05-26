@@ -12,7 +12,7 @@ name: Unsloth prebuilt (CUDA Linux x64)
 
 on:
   schedule:
-    - cron: '0 6 * * *'        # daily; publishes if upstream has a newer b<N>
+    - cron: '30 2 * * *'       # 02:30 UTC: ggml-org's daily low-activity valley (~27 commits/h vs ~120 midday); off-the-hour also avoids GitHub's :00 cron backlog
   workflow_dispatch:
     inputs:
       tag:
