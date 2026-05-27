@@ -187,6 +187,8 @@ def main() -> int:
         (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
         (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
         (f"llama-{tag}-bin-win-vulkan-x64.zip",       "windows-vulkan-upstream"),
+        (f"llama-{tag}-bin-ubuntu-arm64.tar.gz",      "linux-arm64-upstream"),
+        (f"llama-{tag}-bin-win-cpu-arm64.zip",        "windows-arm64-upstream"),
     ):
         url = assets.get(name)
         if not url:
