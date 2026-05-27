@@ -175,9 +175,11 @@ jobs:
         working-directory: src
         run: |
           set -eux
-          # Default target: ensures every GGML_CPU_ALL_VARIANTS backend module +
-          # libggml-cuda.so is produced (building only llama-* skips them).
-          cmake --build build --config Release -j "$(nproc)"
+          # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
+          # so the server/quantize targets pull them in (matches prebuild_llama.cpp).
+          cmake --build build --config Release -j "$(nproc)" \
+            --target llama-server llama-quantize
+          strip build/bin/llama-server build/bin/llama-quantize || true
 
       - name: Package bundle
         env:

@@ -57,7 +57,7 @@ class PlatformStrategy:
     exe_suffix = ""
     archive_ext = ".tar.gz"
     rpath = ""
-    binaries = ["llama-cli", "llama-server", "llama-quantize"]
+    binaries = ["llama-server", "llama-quantize"]
 
     def shipped_binaries(self) -> list[str]:
         return [b + self.exe_suffix for b in self.binaries]
