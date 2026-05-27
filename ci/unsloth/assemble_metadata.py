@@ -181,10 +181,12 @@ def main() -> int:
         if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
             jobs.append((name, "windows-cuda-upstream", assets[name]))
     for name, kind in (
-        (f"llama-{tag}-bin-macos-arm64.tar.gz", "macos-arm64-upstream"),
-        (f"llama-{tag}-bin-macos-x64.tar.gz",   "macos-x64-upstream"),
-        (f"llama-{tag}-bin-ubuntu-x64.tar.gz",  "linux-cpu-upstream"),
-        (f"llama-{tag}-bin-win-cpu-x64.zip",    "windows-cpu-upstream"),
+        (f"llama-{tag}-bin-macos-arm64.tar.gz",       "macos-arm64-upstream"),
+        (f"llama-{tag}-bin-macos-x64.tar.gz",         "macos-x64-upstream"),
+        (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
+        (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
+        (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
+        (f"llama-{tag}-bin-win-vulkan-x64.zip",       "windows-vulkan-upstream"),
     ):
         url = assets.get(name)
         if not url:
