@@ -158,7 +158,20 @@ jobs:
         with:
           path: tooling
 
+      # The first download attempt occasionally hits a transient ECONNRESET
+      # on GitHub's ListArtifacts API. Retrying once is cheaper than
+      # re-running the whole hour-long build matrix.
       - name: Download built bundles
+        id: download
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          path: dist
+          pattern: app-*
+          merge-multiple: true
+
+      - name: Download built bundles (retry)
+        if: steps.download.outcome == 'failure'
         uses: actions/download-artifact@v6
         with:
           path: dist
