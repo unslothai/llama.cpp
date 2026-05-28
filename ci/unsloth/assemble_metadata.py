@@ -30,8 +30,17 @@ UPSTREAM_REPO = "ggml-org/llama.cpp"
 UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}"
 
 BUNDLE_RE = re.compile(
-    r"^app-(?P<tag>[^/]+)-linux-x64-(?P<profile>cuda1[23]-(?:older|newer|portable))\.tar\.gz$"
+    r"^app-(?P<tag>[^/]+)-linux-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable))\.tar\.gz$"
 )
+
+# Per-arch dispatch keys for the published manifest + sha256 index. x64 keeps
+# the historical "linux-cuda" so older unsloth installers stay compatible;
+# arm64 gets distinct kinds so those installers cleanly ignore it instead of
+# trying to run an arm64 binary on x86_64.
+KIND_BY_ARCH = {
+    "x64":   {"manifest": "linux-cuda",       "sha": "linux-cuda-app"},
+    "arm64": {"manifest": "linux-arm64-cuda", "sha": "linux-arm64-cuda-app"},
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -88,26 +97,39 @@ def sha256_url(url: str, token: str | None) -> str:
     return _with_retry(go)
 
 
-def upstream_assets(tag: str, token: str | None) -> dict[str, str]:
-    """name -> browser_download_url for the upstream release at `tag`."""
+def upstream_assets(tag: str, token: str | None) -> dict[str, dict]:
+    """name -> {url, digest} for the upstream release at `tag`."""
     data = http_json(f"https://api.github.com/repos/{UPSTREAM_REPO}/releases/tags/{tag}", token)
-    out: dict[str, str] = {}
+    out: dict[str, dict] = {}
     for asset in data.get("assets", []):  # type: ignore[union-attr]
-        out[asset["name"]] = asset["browser_download_url"]
+        out[asset["name"]] = {
+            "url": asset["browser_download_url"],
+            "digest": asset.get("digest"),  # "sha256:<hex>" since 2024, else None
+        }
     return out
 
 
-def build_manifest(tag: str, commit: str, bundles: list[tuple[str, dict]]) -> dict:
-    """bundles: list of (asset_name, embedded UNSLOTH_PREBUILT_INFO), sorted by name.
+def asset_digest_or_hash(asset: dict, token: str | None) -> str:
+    """Prefer GitHub's published asset digest; stream-hash as fallback."""
+    raw = (asset.get("digest") or "").strip().lower()
+    if raw.startswith("sha256:"):
+        h = raw.split(":", 1)[1]
+        if len(h) == 64 and all(c in "0123456789abcdef" for c in h):
+            return h
+    return sha256_url(asset["url"], token)
+
+
+def build_manifest(tag: str, commit: str, bundles: list[tuple[str, str, dict]]) -> dict:
+    """bundles: list of (asset_name, arch, embedded UNSLOTH_PREBUILT_INFO), sorted by name.
 
     Manifest fields come from each bundle's own embedded metadata, so the
     manifest can never disagree with what was actually compiled.
     """
     artifacts = []
-    for asset_name, info in bundles:
+    for asset_name, arch, info in bundles:
         artifacts.append({
             "asset_name": asset_name,
-            "install_kind": "linux-cuda",
+            "install_kind": KIND_BY_ARCH[arch]["manifest"],
             "bundle_profile": info["bundle_profile"],
             "runtime_line": info["runtime_line"],
             "coverage_class": info["coverage_class"],
@@ -160,26 +182,30 @@ def main() -> int:
 
     sha_artifacts: dict[str, dict] = {}
 
-    # 1) locally-built CUDA bundles
-    found = sorted(
-        ((p.name, read_bundle_info(p)) for p in args.dist.glob("app-*-linux-x64-*.tar.gz")
-         if BUNDLE_RE.match(p.name)),
-        key=lambda b: b[0],
-    )
+    # 1) locally-built CUDA bundles (both x64 and arm64): hash in parallel.
+    found: list[tuple[str, str, dict]] = []
+    for p in sorted(args.dist.glob("app-*-linux-*.tar.gz")):
+        m = BUNDLE_RE.match(p.name)
+        if not m:
+            continue
+        found.append((p.name, m.group("arch"), read_bundle_info(p)))
     if not found:
         print(f"ERROR: no app-*.tar.gz bundles in {args.dist}", file=sys.stderr)
         return 1
-    for name, _info in found:
-        sha_artifacts[name] = base_entry("linux-cuda-app", args.publish_repo, sha256_file(args.dist / name))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        local_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), found))
+    for (name, arch, _info), digest in zip(found, local_digests):
+        sha_artifacts[name] = base_entry(KIND_BY_ARCH[arch]["sha"], args.publish_repo, digest)
 
-    # 2) assets fetched from upstream (per-OS builds + source tarballs): gather,
-    #    then hash concurrently — independent network I/O. Order is preserved by
-    #    zipping results back onto the job list, so the index stays deterministic.
+    # 2) upstream per-OS bundles: GitHub now publishes a sha256 digest on each
+    #    release asset (since early 2024), so we read it from the API response
+    #    instead of re-downloading every bundle. ~2 GB of CI bandwidth saved
+    #    per run; falls back to streaming hash if a digest is missing.
     assets = upstream_assets(tag, token)
-    jobs: list[tuple[str, str, str]] = []  # (asset_name, kind, url)
+    wanted: list[tuple[str, str]] = []  # (name, kind)
     for name in sorted(assets):
         if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
-            jobs.append((name, "windows-cuda-upstream", assets[name]))
+            wanted.append((name, "windows-cuda-upstream"))
     for name, kind in (
         (f"llama-{tag}-bin-macos-arm64.tar.gz",       "macos-arm64-upstream"),
         (f"llama-{tag}-bin-macos-x64.tar.gz",         "macos-x64-upstream"),
@@ -190,19 +216,24 @@ def main() -> int:
         (f"llama-{tag}-bin-ubuntu-arm64.tar.gz",      "linux-arm64-upstream"),
         (f"llama-{tag}-bin-win-cpu-arm64.zip",        "windows-arm64-upstream"),
     ):
-        url = assets.get(name)
-        if not url:
+        if name not in assets:
             print(f"WARNING: upstream asset {name} not found at {tag}; skipping", file=sys.stderr)
             continue
-        jobs.append((name, kind, url))
-    jobs.append((f"llama.cpp-source-{tag}.tar.gz", "upstream-source",
-                 f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/refs/tags/{tag}"))
-    jobs.append((f"llama.cpp-source-commit-{commit}.tar.gz", "exact-source",
-                 f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{commit}"))
+        wanted.append((name, kind))
+    for name, kind in wanted:
+        sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, asset_digest_or_hash(assets[name], token))
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        digests = list(pool.map(lambda j: sha256_url(j[2], token), jobs))
-    for (name, kind, _url), digest in zip(jobs, digests):
+    # 3) source tarballs: codeload doesn't expose pre-computed digests, so
+    #    stream-hash both URLs in parallel.
+    source_jobs = [
+        (f"llama.cpp-source-{tag}.tar.gz", "upstream-source",
+         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/refs/tags/{tag}"),
+        (f"llama.cpp-source-commit-{commit}.tar.gz", "exact-source",
+         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{commit}"),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        source_digests = list(pool.map(lambda j: sha256_url(j[2], token), source_jobs))
+    for (name, kind, _url), digest in zip(source_jobs, source_digests):
         sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, digest)
 
     # 4) manifest, then hash it into the index

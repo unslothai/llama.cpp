@@ -67,13 +67,18 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             EXISTS=true; else EXISTS=false; fi
 
+          # ubuntu-22.04 is x64 (glibc 2.35). arm64 only has ubuntu-24.04-arm
+          # available on GitHub-hosted runners (glibc 2.39); Jimver's network
+          # installer ships CUDA 13 for SBSA but not CUDA 12, so arm64 is
+          # cuda13-only and we ship the single "portable" coverage class.
           ALL='[
-            {"profile":"cuda12-older",   "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
-            {"profile":"cuda12-newer",   "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
-            {"profile":"cuda12-portable","line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
-            {"profile":"cuda13-older",   "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89"},
-            {"profile":"cuda13-newer",   "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.0.0","toolkit_line":"13.0","archs":"86 89 90 100 120"},
-            {"profile":"cuda13-portable","line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89 90 100 120"}
+            {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
+            {"profile":"cuda12-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
+            {"profile":"cuda12-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
+            {"profile":"cuda13-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89"},
+            {"profile":"cuda13-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.0.0","toolkit_line":"13.0","archs":"86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"90 100 120 121"}
           ]'
           if [ "$ONLY" = "all" ]; then
             INCLUDE="$(echo "$ALL" | jq -c .)"
@@ -90,12 +95,12 @@ jobs:
           echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY"
 
   build:
-    name: ${{ matrix.profile }}
+    name: ${{ matrix.arch }}/${{ matrix.profile }}
     needs: resolve
     # Idempotent on schedule: skip when the release already exists. Dispatch
     # always runs so it can be tested/forced.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
@@ -104,32 +109,50 @@ jobs:
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
           large-packages: false
+          swap-storage: true
 
       - name: Checkout build tooling (this repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: tooling
 
       - name: Checkout upstream source @ ${{ needs.resolve.outputs.tag }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ggml-org/llama.cpp
           ref: ${{ needs.resolve.outputs.tag }}
           path: src
+          # Full history is required: cmake/build-info.cmake runs
+          # `git rev-list --count HEAD` to compute LLAMA_BUILD_NUMBER,
+          # which gets baked into llama-server --version as b<N>.
+          # Shallow clone (default depth=1) would bake in "b1" instead.
           fetch-depth: 0
 
       - name: Install build dependencies
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build libssl-dev python3
+          sudo apt-get install -y build-essential libssl-dev
+
+      - name: Install ARM64 host compiler (gcc-14)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          sudo apt-get install -y gcc-14 g++-14
+          {
+            echo "CC=gcc-14"
+            echo "CXX=g++-14"
+            echo "CUDAHOSTCXX=g++-14"
+          } >> "$GITHUB_ENV"
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: cuda-${{ matrix.cuda }}-${{ matrix.profile }}
+          key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
           variant: ccache
           evict-old-files: 14d
 
@@ -142,25 +165,36 @@ jobs:
 
       - name: Set up CUDA environment
         run: |
+          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
           echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA
+        run: nvcc --version
 
       - name: Configure
         working-directory: src
         run: |
           set -eux
+          # Flag set mirrors llama-cpp-binaries' build-wheels-cuda.yml. Three
+          # extras over that reference, all with reasons:
+          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: needed for the tar.gz
+          #    bundle layout (matches llama-cpp-binaries' setup.py per-platform
+          #    cmake_args block); reference's wheels get the same effect via
+          #    scikit-build packaging.
+          #  - CMAKE_CUDA_ARCHITECTURES: explicit per-profile arch list, the
+          #    whole point of our matrix.
+          #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
+          #    /usr/local/bin so the PATH-symlink trick the reference relies on
+          #    doesn't cache CUDA TUs. Explicit launchers ccache nvcc too.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_RPC=ON \
             -DGGML_CUDA=ON \
             -DGGML_CUDA_CUB_3DOT2=ON \
-            -DGGML_CUDA_NCCL=OFF \
-            -DLLAMA_OPENSSL=ON \
-            -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
@@ -177,14 +211,17 @@ jobs:
           set -eux
           # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
           # so the server/quantize targets pull them in (matches prebuild_llama.cpp).
-          cmake --build build --config Release -j "$(nproc)" \
+          # -j 2 mirrors llama-cpp-binaries' LLAMA_CPP_BUILD_JOBS=2 -- nvcc
+          # TUs with the full arch fanout can spike past 12 GB each, and the
+          # GitHub-hosted runners (x64 and arm64 alike) only have ~16 GB.
+          cmake --build build --config Release -j 2 \
             --target llama-server llama-quantize
           strip build/bin/llama-server build/bin/llama-quantize || true
 
       - name: Package bundle
         env:
           PLATFORM: linux
-          ARCH: x64
+          ARCH: ${{ matrix.arch }}
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           SRC_DIR: ${{ github.workspace }}/src
           OUT_DIR: ${{ github.workspace }}/dist
@@ -195,15 +232,15 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
-          DOCKER_IMAGE: github-hosted ubuntu-22.04, CUDA ${{ matrix.cuda }} (Jimver)
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} (Jimver)
           ARCHS: ${{ matrix.archs }}
         run: python3 tooling/ci/unsloth/package_bundle.py
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: app-${{ needs.resolve.outputs.tag }}-linux-x64-${{ matrix.profile }}
-          path: dist/app-${{ needs.resolve.outputs.tag }}-linux-x64-${{ matrix.profile }}.tar.gz
+          name: app-${{ needs.resolve.outputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
+          path: dist/app-${{ needs.resolve.outputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
           if-no-files-found: error
 
   assemble:
@@ -215,12 +252,12 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout build tooling (this repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: tooling
 
       - name: Download built bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: dist
           pattern: app-*
@@ -237,7 +274,7 @@ jobs:
           ls -la dist
 
       - name: Upload full release set (artifacts)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
           path: dist/*

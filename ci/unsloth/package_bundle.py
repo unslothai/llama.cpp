@@ -189,7 +189,6 @@ def curate(strategy: PlatformStrategy, bin_dir: Path, stage: Path) -> None:
                 queue.append(stage / need)
 
 
-# Metadata writers below emit the linux-x64-cuda bundle schema.
 def detect_nvcc_sms() -> tuple[str, list[str], str]:
     if not shutil.which("nvcc"):
         return "unavailable", [], "nvcc not found"
@@ -205,8 +204,6 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
     min_sm, max_sm = min(map(int, archs)), max(map(int, archs))
     nvcc_status, nvcc_sms, nvcc_msg = detect_nvcc_sms()
     note = f"CUDA {cfg['line'].removeprefix('cuda')} {cfg['klass']} bundle."
-    if cfg["line"] == "cuda13":
-        note += " CUDA 13 does not include SM70."
 
     licenses = [f"Third-party licenses bundled with this llama.cpp prebuilt ({cfg['tag']}).",
                 f"Source: https://github.com/{cfg['source_repo']} @ {cfg['commit']}", ""]
@@ -233,11 +230,9 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
         "bundle_profile": cfg["profile"],
         "runtime_line": cfg["line"],
         "coverage_class": cfg["klass"],
-        "bundle_kind": cfg["klass"],
         "bundle_rank": int(cfg["rank"]),
         "toolkit_line": cfg["toolkit_line"],
         "docker_image": cfg["docker_image"],
-        "cuda_archs": archs,
         "supported_sms": archs,
         "nvcc_validation_status": nvcc_status,
         "nvcc_detected_sms": nvcc_sms,
@@ -259,12 +254,10 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
         f"variant: {cfg['profile']}",
         f"runtime line: {cfg['line']}",
         f"coverage class: {cfg['klass']}",
-        f"bundle kind: {cfg['klass']}",
         f"bundle rank: {cfg['rank']}",
         f"docker image: {cfg['docker_image']}",
         "backend: CUDA",
         f"toolkit version: {cfg['toolkit_line']}",
-        f"cuda archs: {';'.join(archs)}",
         f"supported sms: {','.join(archs)}",
         f"nvcc validation: {nvcc_status}",
         f"min sm: {min_sm}",
@@ -310,7 +303,6 @@ def read_config() -> dict:
         "arch": os.environ.get("ARCH", "x64"),
         "docker_image": os.environ.get("DOCKER_IMAGE", ""),
         "source_repo": os.environ.get("SOURCE_REPO", "ggml-org/llama.cpp"),
-        "asset_name": os.environ.get("ASSET_NAME", ""),
     }
 
 
@@ -330,9 +322,7 @@ def main() -> int:
         curate(strategy, bin_dir, stage)
         write_metadata(stage, strategy, cfg, archs)
 
-        asset = cfg["asset_name"] or (
-            f"app-{cfg['tag']}-{strategy.name}-{cfg['arch']}-{cfg['profile']}{strategy.archive_ext}"
-        )
+        asset = f"app-{cfg['tag']}-{strategy.name}-{cfg['arch']}-{cfg['profile']}{strategy.archive_ext}"
         out_path = out_dir / asset
         strategy.archive(stage, out_path)
 
