@@ -1,4 +1,4 @@
-name: Unsloth prebuilt (CUDA + ROCm)
+name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
 # release per upstream b#### tag. Splits the heavy build work into two reusable

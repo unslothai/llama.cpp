@@ -1,4 +1,4 @@
-name: Unsloth prebuilt — CUDA (callable)
+name: "Unsloth prebuilt: CUDA"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA bundles
 # the parent's `resolve` job filtered into `matrix`. Each entry uploads a

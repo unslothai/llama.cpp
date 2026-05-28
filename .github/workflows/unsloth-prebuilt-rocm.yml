@@ -1,4 +1,4 @@
-name: Unsloth prebuilt — ROCm (callable)
+name: "Unsloth prebuilt: ROCm"
 
 # Reusable child of unsloth-prebuilt.yml. Per-gfx-target ROCm bundles on
 # Windows + Ubuntu.
