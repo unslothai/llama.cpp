@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Cross-platform packager for Unsloth llama.cpp prebuilt bundles.
 
-Curates the shipped executables + their local dynamic-library closure + the
-dynamically-loaded ggml backend modules, writes the in-bundle metadata
-(BUILD_INFO.txt / UNSLOTH_PREBUILT_INFO.json), and archives the result.
+Curates the shipped executables, their local dynamic-library closure, and the
+dynamically-loaded ggml backend modules; writes the in-bundle metadata
+(BUILD_INFO.txt / UNSLOTH_PREBUILT_INFO.json); archives the result.
 
-The curation + archive engine is OS-generic -- adding a new OS means
+The curation and archive engine is OS-generic: adding a new OS means
 implementing one PlatformStrategy (its dependency-walk tool, lib-name
 convention, backend glob, and archive format), not writing a new packaging
-script. This mirrors how llama-cpp-binaries' setup.py centralizes the
-per-platform packaging so each build workflow stays thin.
+script.
 
 The CUDA runtime (libcudart/libcublas, cudart DLLs) is intentionally NOT
 bundled: the installer pairs it with the user's PyTorch runtime, selected by
