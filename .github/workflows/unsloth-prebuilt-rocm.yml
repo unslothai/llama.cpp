@@ -26,15 +26,14 @@ on:
         description: 'Upstream llama.cpp release tag (b####), resolved by parent'
         required: true
         type: string
+      matrix:
+        description: 'gfx_target matrix JSON ({"gfx_target":[...]}), built by parent'
+        required: true
+        type: string
       operating_systems:
         description: 'OSes to build for (comma-separated: windows,ubuntu)'
         required: false
         default: 'windows,ubuntu'
-        type: string
-      gfx_target:
-        description: 'AMD GPU targets (comma-separated)'
-        required: false
-        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
         type: string
       rocm_version:
         description: 'TheRock ROCm version (e.g., 7.13.0a20260318) or "latest"'
@@ -46,34 +45,12 @@ permissions:
   contents: read
 
 jobs:
-  prepare-matrix:
-    runs-on: ubuntu-22.04
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - name: Set matrix
-        id: set-matrix
-        run: |
-          targets='${{ inputs.gfx_target }}'
-
-          # Convert targets to JSON array
-          matrix_targets=$(echo "$targets" \
-            | tr ',' '\n' \
-            | sed 's/^ *//;s/ *$//' \
-            | sed 's/^"//;s/"$//' \
-            | jq -R . \
-            | jq -s '{gfx_target: .}' \
-            | jq -c)
-
-          echo "matrix=$matrix_targets" >> "$GITHUB_OUTPUT"
-          echo "Matrix: $matrix_targets"
-
   build-windows:
+    name: windows/${{ matrix.gfx_target }}
     runs-on: windows-latest
-    needs: prepare-matrix
     if: contains(inputs.operating_systems, 'windows')
     strategy:
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(inputs.matrix) }}
       fail-fast: false
 
     steps:
@@ -385,11 +362,11 @@ jobs:
         if-no-files-found: error
 
   build-ubuntu:
+    name: linux/${{ matrix.gfx_target }}
     runs-on: ubuntu-22.04
-    needs: prepare-matrix
     if: contains(inputs.operating_systems, 'ubuntu')
     strategy:
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(inputs.matrix) }}
       fail-fast: false
 
     steps:

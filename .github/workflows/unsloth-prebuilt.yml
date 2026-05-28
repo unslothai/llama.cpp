@@ -65,6 +65,7 @@ jobs:
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
+      rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -73,6 +74,7 @@ jobs:
           set -euo pipefail
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
+          GFX='${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}'
           if [ "$REQ" = "latest" ]; then
             TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)"
           else
@@ -81,8 +83,12 @@ jobs:
           printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
           COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            EXISTS=true; else EXISTS=false; fi
+          # Only PUBLISHED releases count as "exists"; a leftover draft (from
+          # a failed prior publish) should not block today's rebuild.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
 
           # ubuntu-22.04 is x64 (glibc 2.35). arm64 only has ubuntu-24.04-arm
           # available on GitHub-hosted runners (glibc 2.39); Jimver's network
@@ -98,18 +104,21 @@ jobs:
             {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"90 100 120 121"}
           ]'
           if [ "$ONLY" = "all" ]; then
-            INCLUDE="$(echo "$ALL" | jq -c .)"
+            CUDA_INCLUDE="$(echo "$ALL" | jq -c .)"
           else
-            INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
+            CUDA_INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
           fi
+          [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
+          ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
           {
             echo "tag=$TAG"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
-            echo "cuda_matrix={\"include\":$INCLUDE}"
+            echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
+            echo "rocm_matrix=$ROCM_MATRIX"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY"
+          echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
   build-cuda:
     name: CUDA
@@ -128,8 +137,8 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
+      matrix: ${{ needs.resolve.outputs.rocm_matrix }}
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
-      gfx_target: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
 
   assemble:
@@ -172,13 +181,27 @@ jobs:
           name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
           path: dist/*
           if-no-files-found: error
+          # Short retention: the published GitHub release is the canonical
+          # storage; this artifact is just debug fallback for failed-publish
+          # runs. Default 90 days × ~8 GB/run is real storage cost.
+          retention-days: 7
 
       - name: Publish GitHub release
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+          REPO="$GITHUB_REPOSITORY"
+
+          # Atomic publish: upload as draft (hidden from the anon GitHub API
+          # the installer uses), then flip draft=false only once every asset
+          # landed. Leftover drafts from failed runs are detected as "not
+          # exists" by resolve and rebuilt on the next run.
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+          fi
+          gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
             --notes "Automated Unsloth llama.cpp CUDA + ROCm prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
             dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false
