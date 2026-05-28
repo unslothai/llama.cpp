@@ -18,33 +18,33 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'ggml-org release tag to build (b#### or "latest")'
+        description: 'ggml-org tag (b#### or "latest")'
         default: 'latest'
         required: true
         type: string
       only_profile:
-        description: 'CUDA: build a single profile (cheap test) or all'
+        description: 'CUDA profile to build'
         default: 'all'
         required: false
         type: choice
         options: [all, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
       operating_systems:
-        description: 'ROCm: OSes to build for (comma-separated: windows,ubuntu)'
+        description: 'OSes for ROCm builds'
         default: 'windows,ubuntu'
         required: false
         type: string
       gfx_target:
-        description: 'ROCm: AMD GPU targets (comma-separated)'
+        description: 'GPU targets for ROCm builds'
         default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
         required: false
         type: string
       rocm_version:
-        description: 'ROCm: TheRock version (e.g., 7.13.0a20260318) or "latest"'
+        description: 'ROCm version (or "latest")'
         default: 'latest'
         required: false
         type: string
       publish:
-        description: 'Publish a GitHub release (otherwise upload artifacts only)'
+        description: 'Publish to GitHub Releases'
         default: false
         required: false
         type: boolean
