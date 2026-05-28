@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Assemble the release-level sidecars for an Unsloth llama.cpp prebuilt release.
 
-Produces, matching the schema published at unslothai/llama.cpp:
-  - llama-prebuilt-manifest.json : describes the Linux CUDA bundles this repo
-    builds (profile -> runtime_line / coverage_class / supported SMs / rank).
+Produces, matching the schema consumed by unslothai/unsloth's installer:
+  - llama-prebuilt-manifest.json : describes every locally-built bundle in this
+    release (CUDA x64/arm64 profiles + ROCm Linux/Windows per gfx target),
+    with the dispatch metadata the installer needs to pick the right one.
   - llama-prebuilt-sha256.json   : a cross-OS integrity index covering both the
-    locally-built CUDA bundles AND the upstream ggml-org assets the installer
-    pulls for Windows/macOS/Linux-CPU + the source tarballs, each hashed.
+    locally-built bundles AND the upstream ggml-org assets the installer pulls
+    for Windows/macOS/Linux-CPU + the source tarballs.
 
-Run after the build matrix has dropped the app-*.tar.gz bundles into --dist.
+Run after the build matrix has dropped the app-*.{tar.gz,zip} bundles into --dist.
 """
 from __future__ import annotations
 
@@ -252,10 +253,8 @@ def main() -> int:
         # schedule always builds the full set, so this fires only on manual runs.
         print("WARNING: no app-*-rocm-*.{tar.gz,zip} bundles found", file=sys.stderr)
 
-    # 2) upstream per-OS bundles: GitHub now publishes a sha256 digest on each
-    #    release asset (since early 2024), so we read it from the API response
-    #    instead of re-downloading every bundle. ~2 GB of CI bandwidth saved
-    #    per run; falls back to streaming hash if a digest is missing.
+    # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
+    #    API response; fall back to a streaming hash if a digest is missing.
     assets = upstream_assets(tag, token)
     wanted: list[tuple[str, str]] = []  # (name, kind)
     for name in sorted(assets):

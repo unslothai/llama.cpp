@@ -102,17 +102,14 @@ jobs:
         working-directory: src
         run: |
           set -eux
-          # Flag set mirrors llama-cpp-binaries' build-wheels-cuda.yml. Three
-          # extras over that reference, all with reasons:
-          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: needed for the tar.gz
-          #    bundle layout (matches llama-cpp-binaries' setup.py per-platform
-          #    cmake_args block); reference's wheels get the same effect via
-          #    scikit-build packaging.
+          # Three non-obvious flags:
+          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: the tar.gz layout
+          #    ships sibling .so files in the same directory as the binaries.
           #  - CMAKE_CUDA_ARCHITECTURES: explicit per-profile arch list, the
-          #    whole point of our matrix.
+          #    whole point of the matrix.
           #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
-          #    /usr/local/bin so the PATH-symlink trick the reference relies on
-          #    doesn't cache CUDA TUs. Explicit launchers ccache nvcc too.
+          #    /usr/local/bin, so PATH-symlinked ccache misses CUDA TUs --
+          #    setting the launcher explicitly caches nvcc too.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_NATIVE=OFF \
@@ -136,10 +133,9 @@ jobs:
         run: |
           set -eux
           # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
-          # so the server/quantize targets pull them in (matches prebuild_llama.cpp).
-          # -j 2 mirrors llama-cpp-binaries' LLAMA_CPP_BUILD_JOBS=2 -- nvcc
-          # TUs with the full arch fanout can spike past 12 GB each, and the
-          # GitHub-hosted runners (x64 and arm64 alike) only have ~16 GB.
+          # so the server/quantize targets pull them in.
+          # -j 2: nvcc TUs with the full arch fanout can spike past 12 GB each,
+          # and the GitHub-hosted runners (x64 and arm64 alike) only have ~16 GB.
           cmake --build build --config Release -j 2 \
             --target llama-server llama-quantize
           strip build/bin/llama-server build/bin/llama-quantize || true
