@@ -128,7 +128,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      commit: ${{ needs.resolve.outputs.commit }}
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
       gfx_target: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}

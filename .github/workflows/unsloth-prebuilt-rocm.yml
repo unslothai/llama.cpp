@@ -26,10 +26,6 @@ on:
         description: 'Upstream llama.cpp release tag (b####), resolved by parent'
         required: true
         type: string
-      commit:
-        description: 'Upstream commit SHA for that tag, resolved by parent'
-        required: true
-        type: string
       operating_systems:
         description: 'OSes to build for (comma-separated: windows,ubuntu)'
         required: false

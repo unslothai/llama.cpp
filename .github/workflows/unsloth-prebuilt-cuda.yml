@@ -83,7 +83,7 @@ jobs:
           evict-old-files: 14d
 
       - name: Install CUDA toolkit ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.30
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda }}
