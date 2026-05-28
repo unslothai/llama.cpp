@@ -1,0 +1,719 @@
+name: Unsloth prebuilt — ROCm (callable)
+
+# Reusable child of unsloth-prebuilt.yml. Per-gfx-target ROCm bundles on
+# Windows + Ubuntu.
+#
+# Huge thanks to the lemonade-sdk team -- this is adapted from their workflow:
+#   https://github.com/lemonade-sdk/llamacpp-rocm/blob/main/.github/workflows/build-llamacpp-rocm.yml
+#
+# Build mechanics taken verbatim from that file: TheRock S3 nightly download
+# + version auto-detect, gfx target name mapping, HIP/clang cmake invocation,
+# the full hardcoded ROCm runtime lib copy list, patchelf RPATH.
+#
+# Local adaptations:
+#   - tag is passed in (the parent resolves it against ggml-org upstream)
+#     instead of lemonade's auto-incrementing b1000+ scheme.
+#   - artifacts pre-packaged into app-<tag>-<platform>-x64-rocm-<gfx>.{tar.gz|zip}
+#     so the parent assemble step picks them up via the same merge-multiple
+#     download pattern it uses for CUDA bundles.
+#   - test jobs (stx-halo, stx) dropped -- those need self-hosted AMD runners.
+#   - build-summary + post-build cleanup steps dropped (clutter).
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      operating_systems:
+        description: 'OSes to build for (comma-separated: windows,ubuntu)'
+        required: false
+        default: 'windows,ubuntu'
+        type: string
+      gfx_target:
+        description: 'AMD GPU targets (comma-separated)'
+        required: false
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+        type: string
+      rocm_version:
+        description: 'TheRock ROCm version (e.g., 7.13.0a20260318) or "latest"'
+        required: false
+        default: 'latest'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          targets='${{ inputs.gfx_target }}'
+
+          # Convert targets to JSON array
+          matrix_targets=$(echo "$targets" \
+            | tr ',' '\n' \
+            | sed 's/^ *//;s/ *$//' \
+            | sed 's/^"//;s/"$//' \
+            | jq -R . \
+            | jq -s '{gfx_target: .}' \
+            | jq -c)
+
+          echo "matrix=$matrix_targets" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $matrix_targets"
+
+  build-windows:
+    runs-on: windows-latest
+    needs: prepare-matrix
+    if: contains(inputs.operating_systems, 'windows')
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+    - name: Clean up existing directories (safety precaution)
+      run: |
+        # Remove existing llama.cpp directory if it exists
+        if (Test-Path "llama.cpp") {
+          Write-Host "Removing existing llama.cpp directory..."
+          Remove-Item -Recurse -Force "llama.cpp"
+        }
+
+        # Remove existing C:\opt\rocm directory if it exists
+        if (Test-Path "C:\opt\rocm") {
+          Write-Host "Removing existing C:\opt\rocm directory..."
+          Remove-Item -Recurse -Force "C:\opt\rocm"
+        }
+
+        # Remove any existing ROCm tarball
+        if (Test-Path "rocm.tar.gz") {
+          Write-Host "Removing existing rocm.tar.gz..."
+          Remove-Item -Force "rocm.tar.gz"
+        }
+
+        Write-Host "Cleanup completed successfully"
+
+    - name: Install Visual Studio Build Tools
+      run: |
+        # Download and install Visual Studio Build Tools
+        $vsInstallerUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe"
+        $vsInstallerPath = "$env:TEMP\vs_buildtools.exe"
+
+        Write-Host "Downloading Visual Studio Build Tools..."
+        Invoke-WebRequest -Uri $vsInstallerUrl -OutFile $vsInstallerPath
+
+        Write-Host "Installing Visual Studio Build Tools..."
+        Start-Process -FilePath $vsInstallerPath -ArgumentList "--quiet", "--wait", "--norestart", "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "--add", "Microsoft.VisualStudio.Component.VC.CMake.Project", "--add", "Microsoft.VisualStudio.Component.VC.ATL", "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621" -Wait
+
+        # Clean up installer
+        Remove-Item $vsInstallerPath -Force
+
+    - name: Install build dependencies
+      run: |
+        Write-Host "Installing build dependencies using manual methods..."
+
+        # Install Ninja
+        Write-Host "Installing Ninja..."
+        $ninjaUrl = "https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip"
+        $ninjaPath = "$env:TEMP\ninja-win.zip"
+        $ninjaDir = "C:\ninja"
+        New-Item -ItemType Directory -Force -Path $ninjaDir
+        Invoke-WebRequest -Uri $ninjaUrl -OutFile $ninjaPath
+        Expand-Archive -Path $ninjaPath -DestinationPath $ninjaDir -Force
+
+        # Install Strawberry Perl
+        Write-Host "Installing Strawberry Perl..."
+        $perlUrl = "http://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit.msi"
+        $perlPath = "$env:TEMP\strawberry-perl-5.32.1.1-64bit.msi"
+        Invoke-WebRequest -Uri $perlUrl -OutFile $perlPath
+        Start-Process msiexec.exe -ArgumentList "/i $perlPath /quiet /norestart" -Wait
+
+        # Verify installations
+        $env:PATH = "C:\ninja;C:\Strawberry\perl\bin;$env:PATH"
+        Write-Host "Verifying installations..."
+        ninja --version
+        perl --version
+
+        Write-Host "Manual installation of build dependencies completed"
+
+    - name: Download ROCm nightly tarball
+      run: |
+        # Determine ROCm version to use
+        $rocmVersion = "${{ inputs.rocm_version }}"
+        $currentTarget = "${{ matrix.gfx_target }}"
+
+        # Add appropriate suffixes for different GPU targets
+        $s3Target = $currentTarget
+        if ($currentTarget -eq "gfx103X") {
+          $s3Target = "$currentTarget-dgpu"
+          Write-Host "Using S3 target with -dgpu suffix: $s3Target"
+        } elseif ($currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
+          $s3Target = "$currentTarget-all"
+          Write-Host "Using S3 target with -all suffix: $s3Target"
+        }
+
+        if ($rocmVersion -eq "latest") {
+          Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+          $s3Response = (Invoke-WebRequest "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-windows-$s3Target-7").Content
+          $files = $s3Response -split '<Key>' | Where-Object {$_ -match '</Key>'} | ForEach-Object { ($_ -split '</Key>')[0] }
+
+          # Extract versions and sort them properly using semantic versioning
+          $versionFiles = @()
+          foreach ($file in $files) {
+            if ($file -match "therock-dist-windows-$s3Target-.*?(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+              $version = $matches[1]
+              $versionFiles += [PSCustomObject]@{
+                File = $file
+                Version = $version
+                Major = [int]($version -split '\.')[0]
+                Minor = [int]($version -split '\.')[1]
+                Patch = [int](($version -split '\.')[2] -replace '(?:a|rc).*', '')
+                RC = [int]($version -replace '.*(?:a|rc)', '')
+                IsAlpha = $version -match 'a'
+              }
+            }
+          }
+
+          # Sort by semantic version (major.minor.patch.rc, with alpha versions being newer than rc)
+          $latestFile = ($versionFiles | Sort-Object Major, Minor, Patch, @{Expression={if($_.IsAlpha){1}else{0}}}, RC | Select-Object -Last 1).File
+
+          Write-Host "Found latest file: $latestFile"
+
+          # Extract version from the filename for environment variable
+          if ($latestFile -match "therock-dist-windows-$s3Target-.*?(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+            $rocmVersion = $matches[1]
+            Write-Host "Detected latest ROCm version: $rocmVersion"
+          } else {
+            Write-Error "Failed to extract ROCm version from latest file: $latestFile"
+            Write-Error "Expected pattern: therock-dist-windows-$s3Target-*<version>.tar.gz"
+            exit 1
+          }
+
+          # Use the exact filename from S3 instead of reconstructing
+          $rocmUrl = "https://therock-nightly-tarball.s3.amazonaws.com/$latestFile"
+        } else {
+          # For specific versions, construct the URL as before
+          $rocmUrl = "https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-windows-$s3Target-$rocmVersion.tar.gz"
+        }
+
+        # Store the version for use in other steps
+        echo "DETECTED_ROCM_VERSION=$rocmVersion" >> $env:GITHUB_ENV
+
+        Write-Host "Downloading ROCm from: $rocmUrl"
+        Invoke-WebRequest -Uri $rocmUrl -OutFile "rocm.tar.gz"
+
+    - name: Extract ROCm to C:\opt\rocm
+      run: |
+        # Create directory if it doesn't exist
+        New-Item -ItemType Directory -Force -Path "C:\opt\rocm"
+
+        # Extract the tarball
+        tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
+
+    - name: Clone llama.cpp @ ${{ inputs.tag }}
+      run: |
+        $tag = "${{ inputs.tag }}"
+        Write-Host "Cloning llama.cpp version: $tag with shallow clone"
+        git clone --depth 1 --single-branch --branch $tag https://github.com/ggerganov/llama.cpp.git
+        cd llama.cpp
+
+        # Show current commit info
+        Write-Host "Current llama.cpp commit:"
+        git log --oneline -1
+
+    - name: Build Llama.cpp + ROCm
+      shell: cmd
+      run: |
+
+        REM Map GPU targets
+        set "current_target=${{ matrix.gfx_target }}"
+        echo Input target: %current_target%
+
+        if "%current_target%"=="gfx110X" (
+          set "mapped_target=gfx1100;gfx1101;gfx1102;gfx1103"
+        ) else if "%current_target%"=="gfx103X" (
+          set "mapped_target=gfx1030;gfx1031;gfx1032;gfx1034"
+        ) else if "%current_target%"=="gfx1151" (
+          set "mapped_target=gfx1151"
+        ) else if "%current_target%"=="gfx1150" (
+          set "mapped_target=gfx1150"
+        ) else if "%current_target%"=="gfx120X" (
+          set "mapped_target=gfx1200;gfx1201"
+        ) else (
+          set "mapped_target=%current_target%"
+        )
+        echo Mapped target: %mapped_target%
+
+        REM Set up environment variables and PATH
+        set HIP_PATH=C:\opt\rocm
+        set HIP_PLATFORM=amd
+        set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;%PATH%
+
+        REM Set up x64 Native Tools Command Prompt environment
+        call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+        set /p VS_PATH=<vs_path.txt
+        call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+        REM Create build directory
+        cd llama.cpp
+        mkdir build
+        cd build
+
+        REM Configure the project
+        cmake .. -G Ninja ^
+          -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+          -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+          -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+          -DCMAKE_CROSSCOMPILING=ON ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DGPU_TARGETS="%mapped_target%" ^
+          -DBUILD_SHARED_LIBS=ON ^
+          -DLLAMA_BUILD_TESTS=OFF ^
+          -DGGML_HIP=ON ^
+          -DGGML_OPENMP=OFF ^
+          -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+          -DGGML_RPC=ON ^
+          -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+          -DLLAMA_BUILD_BORINGSSL=ON ^
+          -DGGML_NATIVE=OFF ^
+          -DGGML_STATIC=OFF ^
+          -DCMAKE_SYSTEM_NAME=Windows
+
+        REM Build the project
+        cmake --build . -j %NUMBER_OF_PROCESSORS%
+
+    - name: Copy ROCm core DLLs to build directory
+      run: |
+        $rocmVersion = if ($env:DETECTED_ROCM_VERSION) { $env:DETECTED_ROCM_VERSION } else { "${{ inputs.rocm_version }}" }
+        $buildBinPath = "llama.cpp\build\bin"
+        $rocmBinPath = "C:\opt\rocm\bin"
+
+        Write-Host "Copying ROCm core DLL files to build directory..."
+        Write-Host "Source: $rocmBinPath"
+        Write-Host "Destination: $buildBinPath"
+
+        if (Test-Path $rocmBinPath) {
+          # Copy files matching patterns and specific names
+          $filesToCopy = @(
+            "amdhip64_*.dll",
+            "rocm_kpack.dll",
+            "amd_comgr*.dll",
+            "libhipblas.dll",
+            "rocblas.dll",
+            "rocsolver.dll",
+            "hipblaslt.dll",
+            "libhipblaslt.dll",
+            "hipblas.dll"
+          )
+
+          foreach ($pattern in $filesToCopy) {
+            $matchingFiles = Get-ChildItem -Path $rocmBinPath -Name $pattern -ErrorAction SilentlyContinue
+            if ($matchingFiles) {
+              foreach ($file in $matchingFiles) {
+                $sourcePath = Join-Path $rocmBinPath $file
+                $destPath = Join-Path $buildBinPath $file
+                Copy-Item $sourcePath $destPath
+                Write-Host "Copied: $file"
+              }
+            } else {
+              Write-Host "Warning: No files found matching pattern: $pattern"
+            }
+          }
+
+          # Copy the rocblas\library folder and all its contents
+          $rocblasLibPath = Join-Path $rocmBinPath "rocblas\library"
+          if (Test-Path $rocblasLibPath) {
+            Write-Host "Copying rocblas\library folder and all contents..."
+            $destRocblasPath = Join-Path $buildBinPath "rocblas\library"
+            Copy-Item -Path $rocblasLibPath -Destination $destRocblasPath -Recurse -Force
+            Write-Host "Copied: rocblas\library folder with all contents"
+
+            # List the contents of the copied rocblas\library folder
+            Write-Host "Contents of rocblas\library:"
+            Get-ChildItem $destRocblasPath -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          } else {
+            Write-Host "Warning: rocblas\library folder not found at: $rocblasLibPath"
+          }
+
+          # Copy the hipblaslt\library folder and all its contents
+          $hipblasltLibPath = Join-Path $rocmBinPath "hipblaslt\library"
+          if (Test-Path $hipblasltLibPath) {
+            Write-Host "Copying hipblaslt\library folder and all contents..."
+            $destHipblasltPath = Join-Path $buildBinPath "hipblaslt\library"
+            Copy-Item -Path $hipblasltLibPath -Destination $destHipblasltPath -Recurse -Force
+            Write-Host "Copied: hipblaslt\library folder with all contents"
+
+            # List the contents of the copied hipblaslt\library folder
+            Write-Host "Contents of hipblaslt\library:"
+            Get-ChildItem $destHipblasltPath -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          } else {
+            Write-Host "Warning: rocblas\library folder not found at: $rocblasLibPath"
+          }
+
+          Write-Host "ROCm core files successfully copied to build directory"
+        } else {
+          Write-Error "ROCm bin directory not found: $rocmBinPath"
+          exit 1
+        }
+
+    - name: List build artifacts (including ROCm files)
+      run: |
+        cd llama.cpp\build\bin
+        Write-Host "Final build artifacts (including ROCm core files):"
+        Get-ChildItem -Recurse | Format-Table Name, Length, LastWriteTime
+
+    - name: Package bundle (zip)
+      shell: bash
+      run: |
+        set -eux
+        ASSET="app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip"
+        mkdir -p dist
+        (cd llama.cpp/build/bin && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+        ls -la dist
+
+    - name: Upload bundle artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}
+        path: dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip
+        if-no-files-found: error
+
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    if: contains(inputs.operating_systems, 'ubuntu')
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+    - name: Free disk space
+      # Remove unused runner files to free up disk space
+      run: curl -fsSL https://raw.githubusercontent.com/kou/arrow/e49d8ae15583ceff03237571569099a6ad62be32/ci/scripts/util_free_space.sh | bash
+
+    - name: Clean up existing directories (safety precaution)
+      run: |
+        # Remove existing llama.cpp directory if it exists
+        if [ -d "llama.cpp" ]; then
+          echo "Removing existing llama.cpp directory..."
+          rm -rf llama.cpp
+        fi
+
+        # Remove existing /opt/rocm directory if it exists
+        if [ -d "/opt/rocm" ]; then
+          echo "Removing existing /opt/rocm directory..."
+          sudo rm -rf /opt/rocm
+        fi
+
+        # Remove any existing ROCm tarball
+        if [ -f "rocm.tar.gz" ]; then
+          echo "Removing existing rocm.tar.gz..."
+          rm -f rocm.tar.gz
+        fi
+
+        echo "Cleanup completed successfully"
+
+    - name: Install build dependencies
+      run: |
+        echo "Installing build dependencies..."
+        sudo apt update
+        sudo apt install -y cmake ninja-build unzip curl
+
+        # Verify installations
+        echo "Verifying installations..."
+        cmake --version
+        ninja --version
+        echo "Build dependencies installation completed"
+
+    - name: Download and extract ROCm directly to /opt/rocm
+      run: |
+        # Determine ROCm version to use
+        rocm_version="${{ inputs.rocm_version }}"
+        current_target="${{ matrix.gfx_target }}"
+
+        # Add appropriate suffixes for different GPU targets
+        s3_target="$current_target"
+        if [ "$current_target" = "gfx103X" ]; then
+          s3_target="${current_target}-dgpu"
+          echo "Using S3 target with -dgpu suffix: $s3_target"
+        elif [[ "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
+          s3_target="${current_target}-all"
+          echo "Using S3 target with -all suffix: $s3_target"
+        fi
+
+        if [ "$rocm_version" = "latest" ]; then
+          echo "Auto-detecting latest ROCm version for target: $current_target"
+          s3_response=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
+
+          # Extract all files and parse versions properly
+          files=$(echo "$s3_response" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-")
+
+          # Extract versions and sort them properly using semantic versioning
+          latest_file=""
+          latest_major=0
+          latest_minor=0
+          latest_patch=0
+          latest_rc=0
+          latest_is_alpha=false
+
+          while IFS= read -r file; do
+            if [[ "$file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+              version="${BASH_REMATCH[1]}"
+              major=$(echo "$version" | cut -d. -f1)
+              minor=$(echo "$version" | cut -d. -f2)
+              patch=$(echo "$version" | cut -d. -f3 | sed 's/\(a\|rc\).*//')
+              rc=$(echo "$version" | sed 's/.*\(a\|rc\)//')
+              is_alpha=false
+              if [[ "$version" =~ a ]]; then
+                is_alpha=true
+              fi
+
+              # Compare versions (alpha versions are newer than rc versions)
+              is_newer=false
+              if [ "$major" -gt "$latest_major" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -gt "$latest_minor" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -gt "$latest_patch" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -eq "$latest_patch" ]; then
+                # Same major.minor.patch, compare alpha vs rc
+                if [ "$is_alpha" = true ] && [ "$latest_is_alpha" = false ]; then
+                  is_newer=true
+                elif [ "$is_alpha" = "$latest_is_alpha" ] && [ "$rc" -gt "$latest_rc" ]; then
+                  is_newer=true
+                fi
+              fi
+
+              if [ "$is_newer" = true ]; then
+                latest_file="$file"
+                latest_major="$major"
+                latest_minor="$minor"
+                latest_patch="$patch"
+                latest_rc="$rc"
+                latest_is_alpha="$is_alpha"
+              fi
+            fi
+          done <<< "$files"
+
+          echo "Found latest file: $latest_file"
+
+          # Extract version from the filename for environment variable
+          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+            rocm_version="${BASH_REMATCH[1]}"
+            echo "Detected latest ROCm version: $rocm_version"
+          else
+            echo "Failed to extract ROCm version from latest file: $latest_file"
+            echo "Expected pattern: therock-dist-linux-${s3_target}-*<version>.tar.gz"
+            exit 1
+          fi
+
+          # Use the exact filename from S3 instead of reconstructing
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
+        else
+          # For specific versions, construct the URL as before
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+        fi
+
+        # Store the version for use in other steps
+        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
+
+        echo "Streaming ROCm from: $rocm_url directly to extraction"
+
+        # Create directory if it doesn't exist
+        sudo mkdir -p /opt/rocm
+
+        # Stream download directly into tar extraction (no intermediate file)
+        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+
+    - name: Set ROCm environment variables
+      run: |
+        echo "Setting ROCm environment variables..."
+
+        # Set environment variables for this step and subsequent steps
+        echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+        echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
+        echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
+        echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
+        echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+
+        # Update PATH
+        echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
+
+        # Set library paths
+        echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
+        echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+
+        echo "ROCm environment variables set successfully"
+
+    - name: Clone llama.cpp @ ${{ inputs.tag }}
+      run: |
+        tag="${{ inputs.tag }}"
+        echo "Cloning llama.cpp version: $tag with shallow clone"
+        git clone --depth 1 --single-branch --branch "$tag" https://github.com/ggerganov/llama.cpp.git
+        cd llama.cpp
+
+        # Show current commit info
+        echo "Current llama.cpp commit:"
+        git log --oneline -1
+
+    - name: Build Llama.cpp + ROCm
+      run: |
+        # Map GPU targets
+        current_target="${{ matrix.gfx_target }}"
+        echo "Input target: $current_target"
+
+        if [ "$current_target" = "gfx110X" ]; then
+          mapped_target="gfx1100;gfx1101;gfx1102;gfx1103"
+        elif [ "$current_target" = "gfx103X" ]; then
+          mapped_target="gfx1030;gfx1031;gfx1032;gfx1034"
+        elif [ "$current_target" = "gfx1151" ]; then
+          mapped_target="gfx1151"
+        elif [ "$current_target" = "gfx1150" ]; then
+          mapped_target="gfx1150"
+        elif [ "$current_target" = "gfx120X" ]; then
+          mapped_target="gfx1200;gfx1201"
+        else
+          mapped_target="$current_target"
+        fi
+        echo "Mapped target: $mapped_target"
+
+        # Create build directory
+        cd llama.cpp
+        mkdir build
+        cd build
+
+        # Configure the project
+        cmake .. -G Ninja \
+          -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+          -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+          -DCMAKE_CXX_FLAGS="-I/opt/rocm/include" \
+          -DCMAKE_CROSSCOMPILING=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DGPU_TARGETS="$mapped_target" \
+          -DBUILD_SHARED_LIBS=ON \
+          -DLLAMA_BUILD_TESTS=OFF \
+          -DGGML_HIP=ON \
+          -DGGML_OPENMP=OFF \
+          -DGGML_CUDA_FORCE_CUBLAS=OFF \
+          -DGGML_RPC=ON \
+          -DGGML_HIP_ROCWMMA_FATTN=OFF \
+          -DLLAMA_BUILD_BORINGSSL=ON \
+          -DGGML_NATIVE=OFF \
+          -DGGML_STATIC=OFF \
+          -DCMAKE_SYSTEM_NAME=Linux
+
+        # Build the project
+        cmake --build . -j $(nproc)
+
+    - name: Copy ROCm core libs to build directory
+      run: |
+        build_bin_path="llama.cpp/build/bin"
+        rocm_bin_path="/opt/rocm/bin"
+
+        # Copy the rocblas/library folder and all its contents
+        rocblas_lib_path="/opt/rocm/lib/rocblas/library"
+        if [ -d "$rocblas_lib_path" ]; then
+          echo "Copying rocblas/library folder and all contents..."
+          dest_rocblas_path="$build_bin_path/rocblas/library"
+          mkdir -p "$(dirname "$dest_rocblas_path")"
+          cp -r "$rocblas_lib_path" "$(dirname "$dest_rocblas_path")/"
+          echo "Copied: rocblas/library folder with all contents"
+
+          # List the contents of the copied rocblas/library folder
+          echo "Contents of rocblas/library:"
+          find "$dest_rocblas_path" -type f -exec ls -la {} \; | head -20
+        else
+          echo "Warning: rocblas/library folder not found at: $rocblas_lib_path"
+        fi
+
+        # Copy the hipblaslt/library folder and all its contents
+        hipblaslt_lib_path="/opt/rocm/lib/hipblaslt/library"
+        if [ -d "$hipblaslt_lib_path" ]; then
+          echo "Copying hipblaslt/library folder and all contents..."
+          dest_hipblaslt_path="$build_bin_path/hipblaslt/library"
+          mkdir -p "$(dirname "$dest_hipblaslt_path")"
+          cp -r "$hipblaslt_lib_path" "$(dirname "$dest_hipblaslt_path")/"
+          echo "Copied: hipblaslt/library folder with all contents"
+
+          # List the contents of the copied hipblaslt/library folder
+          echo "Contents of hipblaslt/library:"
+          find "$dest_hipblaslt_path" -type f -exec ls -la {} \; | head -20
+        else
+          echo "Warning: hipblaslt/library folder not found at: $hipblaslt_lib_path"
+        fi
+
+        # Copy required ROCm libraries to build directory
+        # If artifacts from ROCm or Llama.cpp change, you may need to update this list
+        # To get a new list of all libraries, run:
+        # gather_required_libs.py --rocm-dir /opt/rocm --dest-dir llama.cpp/build/bin
+        echo "Copying required ROCm libraries to build directory..."
+        cp -v /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
+        cp -v /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
+        cp -v /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
+        cp -v /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
+        cp -v /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
+        cp -v /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_liblzma.so* not found"
+        cp -v /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
+        cp -v /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
+        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
+        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
+        cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
+        cp -v /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
+        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
+        cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
+
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
+
+        echo "Finished copying required ROCm libraries"
+
+    - name: Set RPATH for portable distribution
+      run: |
+        sudo apt-get install -y patchelf
+        cd llama.cpp/build/bin
+        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
+        for file in *.so* llama-*; do
+          [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
+        done
+
+    - name: List build artifacts (including ROCm files)
+      run: |
+        cd llama.cpp/build/bin
+        echo "Final build artifacts (including ROCm library files):"
+        ls -la
+
+    - name: Package bundle (tar.gz)
+      run: |
+        set -eux
+        ASSET="app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz"
+        mkdir -p dist
+        (cd llama.cpp/build/bin && tar -czf "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+        ls -la dist
+
+    - name: Upload bundle artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}
+        path: dist/app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz
+        if-no-files-found: error

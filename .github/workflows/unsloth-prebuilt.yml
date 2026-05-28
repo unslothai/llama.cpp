@@ -1,14 +1,16 @@
-name: Unsloth prebuilt (CUDA Linux x64)
+name: Unsloth prebuilt (CUDA + ROCm)
 
-# Builds the Linux x64 CUDA bundles that ggml-org upstream does not ship,
-# matching the contract consumed by unslothai/unsloth's install_llama_prebuilt.py:
-#   app-<b#>-linux-x64-cuda{12,13}-{older,newer,portable}.tar.gz
-#   llama-prebuilt-manifest.json + llama-prebuilt-sha256.json
+# Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
+# release per upstream b#### tag. Splits the heavy build work into two reusable
+# children:
+#   unsloth-prebuilt-cuda.yml  -- CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-rocm.yml  -- ROCm bundles (Windows + Ubuntu, per gfx target)
 #
-# Source is always ggml-org/llama.cpp at the resolved b<N> tag (NOT this fork's
-# tree), so Windows/macOS/CPU assets pulled from upstream at the same tag stay
-# in lockstep. Compile recipe is reused from oobabooga/llama-cpp-binaries
-# (bare ubuntu-22.04 -> glibc 2.35, Jimver CUDA toolkit), minus the wheel step.
+# Atomicity: the `assemble` job depends on both children. GitHub's default
+# `needs` semantics require all needs to succeed -- if any matrix entry in
+# either child fails, `assemble` skips and no release is published. The
+# installer needs the full bundle set at the same tag or it'll dispatch to
+# something that isn't there.
 
 on:
   schedule:
@@ -21,11 +23,26 @@ on:
         required: true
         type: string
       only_profile:
-        description: 'Build a single profile (cheap test) or all'
+        description: 'CUDA: build a single profile (cheap test) or all'
         default: 'all'
         required: false
         type: choice
         options: [all, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
+      operating_systems:
+        description: 'ROCm: OSes to build for (comma-separated: windows,ubuntu)'
+        default: 'windows,ubuntu'
+        required: false
+        type: string
+      gfx_target:
+        description: 'ROCm: AMD GPU targets (comma-separated)'
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+        required: false
+        type: string
+      rocm_version:
+        description: 'ROCm: TheRock version (e.g., 7.13.0a20260318) or "latest"'
+        default: 'latest'
+        required: false
+        type: string
       publish:
         description: 'Publish a GitHub release (otherwise upload artifacts only)'
         default: false
@@ -47,7 +64,7 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
-      matrix: ${{ steps.r.outputs.matrix }}
+      cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -90,162 +107,39 @@ jobs:
             echo "tag=$TAG"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
-            echo "matrix={\"include\":$INCLUDE}"
+            echo "cuda_matrix={\"include\":$INCLUDE}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY"
 
-  build:
-    name: ${{ matrix.arch }}/${{ matrix.profile }}
+  build-cuda:
+    name: CUDA
     needs: resolve
-    # Idempotent on schedule: skip when the release already exists. Dispatch
-    # always runs so it can be tested/forced.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: true
+    uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      matrix: ${{ needs.resolve.outputs.cuda_matrix }}
 
-      - name: Checkout build tooling (this repo)
-        uses: actions/checkout@v6
-        with:
-          path: tooling
-
-      - name: Checkout upstream source @ ${{ needs.resolve.outputs.tag }}
-        uses: actions/checkout@v6
-        with:
-          repository: ggml-org/llama.cpp
-          ref: ${{ needs.resolve.outputs.tag }}
-          path: src
-          # Full history is required: cmake/build-info.cmake runs
-          # `git rev-list --count HEAD` to compute LLAMA_BUILD_NUMBER,
-          # which gets baked into llama-server --version as b<N>.
-          # Shallow clone (default depth=1) would bake in "b1" instead.
-          fetch-depth: 0
-
-      - name: Install build dependencies
-        run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev
-
-      - name: Install ARM64 host compiler (gcc-14)
-        if: matrix.arch == 'arm64'
-        run: |
-          set -eux
-          sudo apt-get install -y gcc-14 g++-14
-          {
-            echo "CC=gcc-14"
-            echo "CXX=g++-14"
-            echo "CUDAHOSTCXX=g++-14"
-          } >> "$GITHUB_ENV"
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.20
-        with:
-          key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
-          variant: ccache
-          evict-old-files: 14d
-
-      - name: Install CUDA toolkit ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.30
-        id: cuda-toolkit
-        with:
-          cuda: ${{ matrix.cuda }}
-          method: 'network'
-
-      - name: Set up CUDA environment
-        run: |
-          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-
-      - name: Verify CUDA
-        run: nvcc --version
-
-      - name: Configure
-        working-directory: src
-        run: |
-          set -eux
-          # Flag set mirrors llama-cpp-binaries' build-wheels-cuda.yml. Three
-          # extras over that reference, all with reasons:
-          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: needed for the tar.gz
-          #    bundle layout (matches llama-cpp-binaries' setup.py per-platform
-          #    cmake_args block); reference's wheels get the same effect via
-          #    scikit-build packaging.
-          #  - CMAKE_CUDA_ARCHITECTURES: explicit per-profile arch list, the
-          #    whole point of our matrix.
-          #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
-          #    /usr/local/bin so the PATH-symlink trick the reference relies on
-          #    doesn't cache CUDA TUs. Explicit launchers ccache nvcc too.
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=OFF \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DGGML_RPC=ON \
-            -DGGML_CUDA=ON \
-            -DGGML_CUDA_CUB_3DOT2=ON \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
-
-      - name: Build
-        working-directory: src
-        run: |
-          set -eux
-          # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
-          # so the server/quantize targets pull them in (matches prebuild_llama.cpp).
-          # -j 2 mirrors llama-cpp-binaries' LLAMA_CPP_BUILD_JOBS=2 -- nvcc
-          # TUs with the full arch fanout can spike past 12 GB each, and the
-          # GitHub-hosted runners (x64 and arm64 alike) only have ~16 GB.
-          cmake --build build --config Release -j 2 \
-            --target llama-server llama-quantize
-          strip build/bin/llama-server build/bin/llama-quantize || true
-
-      - name: Package bundle
-        env:
-          PLATFORM: linux
-          ARCH: ${{ matrix.arch }}
-          BIN_DIR: ${{ github.workspace }}/src/build/bin
-          SRC_DIR: ${{ github.workspace }}/src
-          OUT_DIR: ${{ github.workspace }}/dist
-          TAG: ${{ needs.resolve.outputs.tag }}
-          SOURCE_COMMIT: ${{ needs.resolve.outputs.commit }}
-          PROFILE: ${{ matrix.profile }}
-          LINE: ${{ matrix.line }}
-          KLASS: ${{ matrix.klass }}
-          RANK: ${{ matrix.rank }}
-          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
-          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} (Jimver)
-          ARCHS: ${{ matrix.archs }}
-        run: python3 tooling/ci/unsloth/package_bundle.py
-
-      - name: Upload bundle artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: app-${{ needs.resolve.outputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
-          path: dist/app-${{ needs.resolve.outputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
-          if-no-files-found: error
+  build-rocm:
+    name: ROCm
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
+      gfx_target: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}
+      rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
 
   assemble:
     name: Assemble metadata + publish
-    needs: [resolve, build]
+    needs: [resolve, build-cuda, build-rocm]
+    # No `if: always()`. Atomicity: if any matrix entry in either child
+    # workflow failed, the corresponding `build-*` job reports failure, the
+    # default `needs` success check skips this assemble job, and nothing is
+    # published. The installer needs the full bundle set or it'll fail.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
     env:
@@ -287,5 +181,5 @@ jobs:
           TAG='${{ needs.resolve.outputs.tag }}'
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA Linux prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA + ROCm prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
             dist/*
