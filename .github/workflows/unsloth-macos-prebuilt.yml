@@ -1,8 +1,9 @@
 # Build and publish Unsloth Studio's own macOS llama.cpp prebuilts once per day.
-# Source is ggml-org/llama.cpp (latest release tag); the only change over their
-# macos-cpu build is -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3, so the binaries load on
-# macOS 13.3+ instead of inheriting the runner OS as their minimum. Publishes a
-# macOS-only release on this fork that Unsloth Studio installs from.
+# Source is ggml-org/llama.cpp at the newest release that has been public for at
+# least UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS (supply-chain delay); the only change
+# over their macos-cpu build is -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3, so the
+# binaries load on macOS 13.3+ instead of inheriting the runner OS as their
+# minimum. Publishes a macOS-only release on this fork that Studio installs from.
 
 name: Unsloth macOS llama.cpp prebuilt
 
@@ -12,7 +13,11 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "ggml-org/llama.cpp release tag to build (blank = latest)"
+        description: "ggml-org/llama.cpp release tag to build (blank = newest aged release)"
+        required: false
+        default: ""
+      min_age_hours:
+        description: "Only build a release public for at least this many hours (blank = default)"
         required: false
         default: ""
 
@@ -22,6 +27,12 @@ concurrency:
 
 permissions:
   contents: write
+
+env:
+  # Supply-chain aging: build only upstream releases that have been public for
+  # at least this many hours, so a malicious or broken release has time to be
+  # caught and yanked before we compile and ship it. Per-run override above.
+  UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS: "6"
 
 jobs:
   resolve:
@@ -39,10 +50,20 @@ jobs:
         run: |
           set -euo pipefail
           REQ="${{ github.event.inputs.upstream_tag }}"
+          AGE_H="${{ github.event.inputs.min_age_hours }}"
+          [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ -n "$REQ" ]; then
-            TAG="$REQ"
+            TAG="$REQ"   # explicit override skips the aging filter
           else
-            TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)"
+            # Newest published release that has been public for >= AGE_H hours.
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | first | .tag_name")"
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "::error::no ggml-org release older than ${AGE_H}h found in the last 100 releases"
+              exit 1
+            fi
+            echo "selected $TAG (aged >= ${AGE_H}h)"
           fi
           SHA="$(gh api "repos/ggml-org/llama.cpp/commits/$TAG" --jq .sha)"
           RTAG="llama-prebuilt-macos-$TAG"
