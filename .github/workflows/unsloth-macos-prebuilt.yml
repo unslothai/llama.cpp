@@ -1,9 +1,12 @@
 # Build and publish Unsloth Studio's own macOS llama.cpp prebuilts once per day.
 # Source is ggml-org/llama.cpp at the newest release that has been public for at
 # least UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS (supply-chain delay); the only change
-# over their macos-cpu build is -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3, so the
-# binaries load on macOS 13.3+ instead of inheriting the runner OS as their
-# minimum. Publishes a macOS-only release on this fork that Studio installs from.
+# over their macos-cpu build is an explicit -DCMAKE_OSX_DEPLOYMENT_TARGET per
+# slice, so the binaries declare their load floor instead of inheriting the
+# runner OS: arm64 pins 14.0 (the floor of upstream's pre-macos-26 arm64
+# release), x64 pins 13.3 (matching upstream's own Intel leg, which still
+# covers 2017 Intel Macs capped at Ventura). Publishes a macOS-only release on
+# this fork that Studio installs from.
 
 name: Unsloth macOS llama.cpp prebuilt
 
@@ -90,10 +93,12 @@ jobs:
             runner: macos-14
             defines: "-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"
             expect_arch: arm64
+            deploy_target: "14.0"   # no Apple Silicon Mac is capped below 14
           - build: x64
             runner: macos-15-intel
             defines: "-DGGML_METAL=OFF"
             expect_arch: x86_64
+            deploy_target: "13.3"   # matches upstream; covers 2017 Intel (Ventura)
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -105,13 +110,13 @@ jobs:
           git clone --depth 1 --branch "${{ needs.resolve.outputs.upstream_tag }}" \
             https://github.com/ggml-org/llama.cpp src
 
-      - name: Build (deployment target 13.3)
+      - name: Build (deployment target ${{ matrix.deploy_target }})
         working-directory: src
         run: |
           set -euo pipefail
           cmake -B build \
             ${{ matrix.defines }} \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deploy_target }} \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
@@ -120,8 +125,8 @@ jobs:
             -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
 
-      - name: Load gate (minos <= 13.3, arch, launch)
-        run: bash scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.expect_arch }}" 13.3
+      - name: Load gate (minos <= ${{ matrix.deploy_target }}, arch, launch)
+        run: bash scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.expect_arch }}" "${{ matrix.deploy_target }}"
 
       - name: Package
         working-directory: src
