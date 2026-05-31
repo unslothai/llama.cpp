@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Pre-publish gate for the Unsloth macOS llama.cpp prebuilt. Fails the build
 # unless every shipped Mach-O declares a minimum macOS <= the pinned deployment
-# target (so it dyld-loads on macOS 13.3+), carries the expected arch slice, and
+# target (so it dyld-loads on that floor or newer), carries the expected arch slice, and
 # actually launches. This is what keeps a runner/SDK bump from silently shipping
 # a minos=26 binary that fails on older Macs.
 #
 # Usage: assert_macho_minos.sh <bin_dir> <expect_arch> [max_minos]
-#   expect_arch: arm64 | x86_64        max_minos: default 13.3
+#   expect_arch: arm64 | x86_64        max_minos: default 14.0
 set -uo pipefail
 
 BIN_DIR="${1:?bin dir required}"
 EXPECT_ARCH="${2:?expected arch required}"
-MAX_MINOS="${3:-13.3}"
+MAX_MINOS="${3:-14.0}"
 
 fail() { echo "::error::$*"; exit 1; }
-# Compare dotted major.minor as major*100+minor (13.3 -> 1303).
+# Compare dotted major.minor as major*100+minor (14.0 -> 1400).
 ver_key() { local v="${1%%-*}"; awk -F. '{printf "%d", $1*100 + ($2==""?0:$2)}' <<<"$v"; }
 MAX_KEY="$(ver_key "$MAX_MINOS")"
 
