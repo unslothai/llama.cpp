@@ -20,7 +20,9 @@ MAX_KEY="$(ver_key "$MAX_MINOS")"
 
 command -v vtool >/dev/null 2>&1 || fail "vtool not found (Xcode command line tools required)"
 
-mapfile -t MACHOS < <(find "$BIN_DIR" -type f \( -name '*.dylib' -o -name 'llama-server' -o -name 'llama-quantize' -o -name 'llama-cli' \) 2>/dev/null)
+# macOS ships bash 3.2, which has no `mapfile`; read into the array portably.
+MACHOS=()
+while IFS= read -r _macho; do MACHOS+=("$_macho"); done < <(find "$BIN_DIR" -type f \( -name '*.dylib' -o -name 'llama-server' -o -name 'llama-quantize' -o -name 'llama-cli' \) 2>/dev/null)
 [ "${#MACHOS[@]}" -gt 0 ] || fail "no Mach-O binaries found under $BIN_DIR"
 
 for macho in "${MACHOS[@]}"; do
