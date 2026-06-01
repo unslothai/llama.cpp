@@ -1,6 +1,6 @@
-name: "Unsloth prebuilt: Windows CUDA"
+name: "Unsloth prebuilt: CUDA Windows"
 
-# Reusable child of unsloth-prebuilt.yml. Builds the per-profile Windows CUDA
+# Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA Windows
 # bundles the parent's `resolve` job filtered into `matrix`. Each entry uploads
 # a single app-*.zip artifact for the parent's assemble step to pick up.
 #

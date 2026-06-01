@@ -4,7 +4,7 @@ name: Unsloth prebuilt (full release)
 # release per upstream b#### tag. Splits the heavy build work into four reusable
 # children:
 #   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-windows-cuda.yml  -- Windows CUDA bundles (x64, matrix profiles)
+#   unsloth-prebuilt-windows-cuda.yml  -- CUDA Windows bundles (x64, matrix profiles)
 #   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
 #   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
 #
@@ -139,8 +139,8 @@ jobs:
           else
             CUDA_INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
           fi
-          # Windows CUDA reuses the x64 profiles (same arch lists / CUDA
-          # versions), just on a Windows runner. arm64 has no Windows CUDA target.
+          # CUDA Windows reuses the x64 profiles (same arch lists / CUDA
+          # versions), just on a Windows runner. arm64 has no CUDA Windows target.
           WIN_CUDA_INCLUDE="$(echo "$CUDA_INCLUDE" | jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]')"
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
@@ -177,7 +177,7 @@ jobs:
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
 
   build-windows-cuda:
-    name: Windows CUDA
+    name: CUDA Windows
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-windows-cuda.yml
