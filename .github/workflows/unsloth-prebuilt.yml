@@ -16,13 +16,18 @@ name: Unsloth prebuilt (full release)
 
 on:
   schedule:
-    - cron: '30 2 * * *'       # 02:30 UTC: ggml-org's daily low-activity valley (~27 commits/h vs ~120 midday); off-the-hour also avoids GitHub's :00 cron backlog
+    - cron: '13 22 * * *'      # ~3PM San Francisco (UTC; not DST adjusted)
   workflow_dispatch:
     inputs:
       tag:
         description: 'ggml-org tag (b#### or "latest")'
         default: 'latest'
         required: true
+        type: string
+      min_age_hours:
+        description: 'For "latest": only build a release public for at least this many hours (blank = default 6)'
+        default: ''
+        required: false
         type: string
       only_profile:
         description: 'CUDA profile to build'
@@ -54,6 +59,13 @@ on:
 permissions:
   contents: write
 
+env:
+  # Supply-chain aging: when resolving "latest", only build an upstream release
+  # that has been public for at least this many hours, so a malicious or broken
+  # release has time to be caught and yanked before we compile and ship it. An
+  # explicit b#### tag (manual run) skips it. Per-run override via min_age_hours.
+  UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS: "6"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'scheduled' }}
   cancel-in-progress: false
@@ -79,10 +91,22 @@ jobs:
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
           GFX='${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}'
+          AGE_H='${{ github.event.inputs.min_age_hours }}'
+          [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ "$REQ" = "latest" ]; then
-            TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)"
+            # Newest published (non-draft, non-prerelease) release that has been
+            # public for >= AGE_H hours -- the supply-chain aging window. Releases
+            # come back newest-first, so `first` after the cutoff filter is it.
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | first | .tag_name")"
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
+              exit 1
+            fi
+            echo "selected $TAG (aged >= ${AGE_H}h)"
           else
-            TAG="$REQ"
+            TAG="$REQ"   # explicit b#### override skips the aging filter
           fi
           printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
           COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
