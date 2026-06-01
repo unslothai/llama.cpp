@@ -1,0 +1,88 @@
+name: "Unsloth prebuilt: macOS"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the macOS slices (arm64 Metal +
+# x64 CPU) the parent's `resolve` job placed in `matrix`. Each entry uploads a
+# single app-*.tar.gz artifact for the parent's assemble step to pick up.
+#
+# The only change over ggml-org's own macos build is an explicit
+# -DCMAKE_OSX_DEPLOYMENT_TARGET per slice, so the binaries declare their load
+# floor instead of inheriting the runner OS. Upstream stopped pinning this on
+# arm64 (their macos-26 runner stamps minos=26, which fails to dyld-load on
+# macOS < 26); owning the build is how we keep a loadable floor.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      matrix:
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.build }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Checkout upstream source @ ${{ inputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.tag }}
+          path: src
+          # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
+          # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.
+          # A shallow clone would bake in "b1" instead.
+          fetch-depth: 0
+
+      - name: Build (deployment target ${{ matrix.deploy_target }})
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            ${{ matrix.defines }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deploy_target }} \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+
+      - name: Load gate (minos <= ${{ matrix.deploy_target }}, arch, launch)
+        run: bash tooling/scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.expect_arch }}" "${{ matrix.deploy_target }}"
+
+      - name: Package bundle
+        working-directory: src
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          cp LICENSE build/bin/
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # BSD tar (-s) rewrites the leading ./ to llama-<tag>/ so the archive
+          # unpacks into a named dir, matching upstream's own macos tarball layout.
+          tar -czf "$GITHUB_WORKSPACE/dist/llama-${TAG}-bin-macos-${{ matrix.build }}.tar.gz" \
+            -s ",^\.,llama-${TAG}," -C build/bin .
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ inputs.tag }}-macos-${{ matrix.build }}
+          path: dist/llama-${{ inputs.tag }}-bin-macos-${{ matrix.build }}.tar.gz
+          if-no-files-found: error

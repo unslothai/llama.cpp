@@ -38,6 +38,14 @@ ROCM_BUNDLE_RE = re.compile(
     r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-x64-rocm-(?P<gfx>gfx[0-9a-zA-Z]+)\.(?P<ext>tar\.gz|zip)$"
 )
 
+# macOS slices are built by unsloth-prebuilt-macos.yml and land in dist/ under
+# upstream's own naming (the installer expects that name). They carry no
+# embedded UNSLOTH_PREBUILT_INFO.json, so -- like ROCm -- everything is derived
+# from the filename.
+MACOS_BUNDLE_RE = re.compile(
+    r"^llama-(?P<tag>[^/]+)-bin-macos-(?P<arch>arm64|x64)\.tar\.gz$"
+)
+
 # Per-arch dispatch keys for the published manifest + sha256 index. x64 keeps
 # the historical "linux-cuda" so older unsloth installers stay compatible;
 # arm64 gets distinct kinds so those installers cleanly ignore it instead of
@@ -50,6 +58,15 @@ KIND_BY_ARCH = {
 KIND_BY_ROCM_PLATFORM = {
     "linux":   {"manifest": "linux-rocm",   "sha": "linux-rocm-app"},
     "windows": {"manifest": "windows-rocm", "sha": "windows-rocm-app"},
+}
+
+# macOS slices: install_kind / sha-index kind / manifest bundle_profile per arch.
+# We build these ourselves now (upstream's arm64 release stamps minos=26 and
+# won't dyld-load on macOS < 26), so they are recorded as locally-built bundles
+# rather than upstream passthroughs.
+MACOS_SLICE = {
+    "arm64": {"manifest": "macos-arm64", "sha": "macos-arm64-app", "profile": "macos-metal-arm64"},
+    "x64":   {"manifest": "macos-x64",   "sha": "macos-x64-app",   "profile": "macos-cpu-x64"},
 }
 
 # Mapping from the umbrella gfx target name (as it appears in the asset
@@ -146,14 +163,16 @@ def build_manifest(
     commit: str,
     cuda_bundles: list[tuple[str, str, dict]],
     rocm_bundles: list[tuple[str, str, str]],
+    macos_bundles: list[tuple[str, str]],
 ) -> dict:
     """cuda_bundles: list of (asset_name, arch, embedded UNSLOTH_PREBUILT_INFO).
     rocm_bundles:    list of (asset_name, platform, gfx_target).
+    macos_bundles:   list of (asset_name, arch).
 
     CUDA fields come from each bundle's own embedded metadata, so the manifest
-    can never disagree with what was actually compiled. ROCm bundles are raw
-    archives (no embedded info), so their manifest entries are derived from
-    the filename + the ROCM_TARGET_MAP table.
+    can never disagree with what was actually compiled. ROCm and macOS bundles
+    are raw archives (no embedded info), so their manifest entries are derived
+    from the filename + the ROCM_TARGET_MAP / MACOS_SLICE tables.
     """
     artifacts = []
     for asset_name, arch, info in cuda_bundles:
@@ -175,6 +194,18 @@ def build_manifest(
             "install_kind": KIND_BY_ROCM_PLATFORM[platform]["manifest"],
             "gfx_target": gfx,
             "mapped_targets": ROCM_TARGET_MAP.get(gfx, [gfx]),
+        })
+    for asset_name, arch in macos_bundles:
+        # No runtime_line/coverage_class for macOS (no CUDA/ROCm runtime to
+        # match); emitted as explicit null so the key set stays stable, and a
+        # fixed rank since there is a single slice per arch.
+        artifacts.append({
+            "asset_name": asset_name,
+            "install_kind": MACOS_SLICE[arch]["manifest"],
+            "bundle_profile": MACOS_SLICE[arch]["profile"],
+            "runtime_line": None,
+            "coverage_class": None,
+            "rank": 50,
         })
     return {
         "schema_version": 1,
@@ -253,16 +284,35 @@ def main() -> int:
         # schedule always builds the full set, so this fires only on manual runs.
         print("WARNING: no app-*-rocm-*.{tar.gz,zip} bundles found", file=sys.stderr)
 
+    # 1c) locally-built macOS slices (arm64 Metal + x64 CPU): hash in parallel.
+    # No embedded metadata; we derive everything from the filename. We build
+    # these ourselves now, so they are NOT recorded as upstream passthroughs in
+    # section 2.
+    macos_found: list[tuple[str, str]] = []
+    for p in sorted(args.dist.glob("llama-*-bin-macos-*.tar.gz")):
+        m = MACOS_BUNDLE_RE.match(p.name)
+        if not m:
+            continue
+        macos_found.append((p.name, m.group("arch")))
+    if macos_found:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            macos_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), macos_found))
+        for (name, arch), digest in zip(macos_found, macos_digests):
+            sha_artifacts[name] = base_entry(MACOS_SLICE[arch]["sha"], args.publish_repo, digest)
+    else:
+        # Like ROCm: warn rather than error, so a partial dispatch run still
+        # assembles. The daily schedule always builds both slices.
+        print("WARNING: no llama-*-bin-macos-*.tar.gz bundles found", file=sys.stderr)
+
     # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
     #    API response; fall back to a streaming hash if a digest is missing.
+    #    macOS is absent here on purpose -- we build our own slices in 1c.
     assets = upstream_assets(tag, token)
     wanted: list[tuple[str, str]] = []  # (name, kind)
     for name in sorted(assets):
         if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
             wanted.append((name, "windows-cuda-upstream"))
     for name, kind in (
-        (f"llama-{tag}-bin-macos-arm64.tar.gz",       "macos-arm64-upstream"),
-        (f"llama-{tag}-bin-macos-x64.tar.gz",         "macos-x64-upstream"),
         (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
         (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
         (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
@@ -291,7 +341,7 @@ def main() -> int:
         sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, digest)
 
     # 4) manifest, then hash it into the index
-    manifest = build_manifest(tag, commit, found, rocm_found)
+    manifest = build_manifest(tag, commit, found, rocm_found, macos_found)
     manifest_path = args.out / "llama-prebuilt-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     sha_artifacts["llama-prebuilt-manifest.json"] = base_entry(

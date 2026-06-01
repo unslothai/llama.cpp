@@ -156,7 +156,7 @@ jobs:
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} (Jimver)
           ARCHS: ${{ matrix.archs }}
-        run: python3 tooling/ci/unsloth/package_bundle.py
+        run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v6

@@ -1,14 +1,15 @@
 name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
-# release per upstream b#### tag. Splits the heavy build work into two reusable
+# release per upstream b#### tag. Splits the heavy build work into three reusable
 # children:
-#   unsloth-prebuilt-cuda.yml  -- CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-rocm.yml  -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-cuda.yml   -- CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-rocm.yml   -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-macos.yml  -- macOS bundles (arm64 Metal + x64 CPU)
 #
-# Atomicity: the `assemble` job depends on both children. GitHub's default
+# Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
-# either child fails, `assemble` skips and no release is published. The
+# any child fails, `assemble` skips and no release is published. The
 # installer needs the full bundle set at the same tag or it'll dispatch to
 # something that isn't there.
 
@@ -66,6 +67,7 @@ jobs:
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
       rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
+      macos_matrix: ${{ steps.r.outputs.macos_matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -111,12 +113,23 @@ jobs:
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
+          # macOS slices are static: two fixed runners with per-slice deployment
+          # targets. arm64 pins 14.0 (floor of upstream's pre-macos-26 arm64
+          # release); x64 pins 13.3 (matches upstream's Intel leg, covers 2017
+          # Intel Macs capped at Ventura).
+          MACOS_INCLUDE='[
+            {"build":"arm64","runner":"macos-14",      "expect_arch":"arm64", "deploy_target":"14.0","defines":"-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"},
+            {"build":"x64",  "runner":"macos-15-intel","expect_arch":"x86_64","deploy_target":"13.3","defines":"-DGGML_METAL=OFF"}
+          ]'
+          MACOS_INCLUDE="$(echo "$MACOS_INCLUDE" | jq -c .)"
+
           {
             echo "tag=$TAG"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
             echo "rocm_matrix=$ROCM_MATRIX"
+            echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
@@ -141,10 +154,19 @@ jobs:
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
 
+  build-macos:
+    name: macOS
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-macos.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      matrix: ${{ needs.resolve.outputs.macos_matrix }}
+
   assemble:
     name: Assemble metadata + publish
-    needs: [resolve, build-cuda, build-rocm]
-    # No `if: always()`. Atomicity: if any matrix entry in either child
+    needs: [resolve, build-cuda, build-rocm, build-macos]
+    # No `if: always()`. Atomicity: if any matrix entry in any child
     # workflow failed, the corresponding `build-*` job reports failure, the
     # default `needs` success check skips this assemble job, and nothing is
     # published. The installer needs the full bundle set or it'll fail.
@@ -181,7 +203,7 @@ jobs:
       - name: Generate manifest + sha256 index
         run: |
           set -eux
-          python3 tooling/ci/unsloth/assemble_metadata.py \
+          python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
@@ -215,6 +237,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA + ROCm prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA + ROCm + macOS prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
