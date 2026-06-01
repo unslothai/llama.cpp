@@ -119,25 +119,27 @@ jobs:
           fi
 
           # ubuntu-22.04 is x64 (glibc 2.35). arm64 only has ubuntu-24.04-arm
-          # available on GitHub-hosted runners (glibc 2.39); Jimver's network
-          # installer ships CUDA 13 for SBSA but not CUDA 12, so arm64 is
-          # cuda13-only and we ship the single "portable" coverage class.
+          # available on GitHub-hosted runners (glibc 2.39). arm64 is cuda13-only
+          # (no cuda12 SBSA) and ships the single "portable" coverage class.
+          # cuda12 installs via Jimver; cuda13 is pinned to 13.3 (matching
+          # upstream) which Jimver lacks, so those install via NVIDIA redist in
+          # the build children -- on the same runners, so the glibc floor holds.
           ALL='[
             {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
             {"profile":"cuda12-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
             {"profile":"cuda12-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
-            {"profile":"cuda13-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89"},
-            {"profile":"cuda13-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.0.0","toolkit_line":"13.0","archs":"86 89 90 100 120"},
-            {"profile":"cuda13-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"75 80 86 89 90 100 120"},
-            {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","line":"cuda13","klass":"portable","rank":60,"cuda":"13.0.0","toolkit_line":"13.0","archs":"90 100 120 121"}
+            {"profile":"cuda13-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.3","toolkit_line":"13.3","archs":"75 80 86 89"},
+            {"profile":"cuda13-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.3","toolkit_line":"13.3","archs":"86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"portable","rank":60,"cuda":"13.3","toolkit_line":"13.3","archs":"75 80 86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","line":"cuda13","klass":"portable","rank":60,"cuda":"13.3","toolkit_line":"13.3","archs":"90 100 120 121"}
           ]'
           if [ "$ONLY" = "all" ]; then
             CUDA_INCLUDE="$(echo "$ALL" | jq -c .)"
           else
             CUDA_INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
           fi
-          # Windows CUDA reuses the x64 profiles (same arch lists / CUDA lines),
-          # just on a Windows runner. arm64 has no Windows CUDA target.
+          # Windows CUDA reuses the x64 profiles (same arch lists / CUDA
+          # versions), just on a Windows runner. arm64 has no Windows CUDA target.
           WIN_CUDA_INCLUDE="$(echo "$CUDA_INCLUDE" | jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]')"
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"

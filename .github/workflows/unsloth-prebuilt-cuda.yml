@@ -82,14 +82,53 @@ jobs:
           variant: ccache
           evict-old-files: 14d
 
-      - name: Install CUDA toolkit ${{ matrix.cuda }}
+      # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
+      # toolkit components straight from NVIDIA's redist CDN (same source Jimver
+      # and ggml-org use) and assemble a prefix by hand. Component versions are
+      # from NVIDIA's redistrib_13.3.0.json. Runs on the same ubuntu runner, so
+      # the glibc floor is unchanged. Any other version uses Jimver.
+      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
+        if: matrix.cuda == '13.3'
+        run: |
+          set -eux
+          case "${{ matrix.arch }}" in
+            x64)   PLAT=linux-x86_64 ;;
+            arm64) PLAT=linux-sbsa ;;
+            *) echo "unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          PREFIX="$HOME/cuda-13.3"
+          mkdir -p "$PREFIX"
+          BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+          for cv in \
+            cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 \
+            cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 \
+            cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1; do
+            comp="${cv%:*}"; ver="${cv#*:}"
+            name="${comp}-${PLAT}-${ver}-archive"
+            curl -fsSL -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
+            tar -xf comp.tar.xz
+            cp -a "${name}/." "$PREFIX"/
+            rm -rf comp.tar.xz "${name}"
+          done
+          # Redist ships libs under lib/; some CMake CUDA discovery expects lib64.
+          ln -sfn lib "$PREFIX/lib64"
+          {
+            echo "CUDA_PATH=$PREFIX"
+            echo "CUDA_HOME=$PREFIX"
+            echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
+        if: matrix.cuda != '13.3'
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda }}
           method: 'network'
 
-      - name: Set up CUDA environment
+      - name: Set up CUDA environment (Jimver)
+        if: matrix.cuda != '13.3'
         run: |
           echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
           echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
