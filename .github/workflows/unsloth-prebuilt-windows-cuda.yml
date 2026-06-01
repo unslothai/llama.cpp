@@ -1,0 +1,141 @@
+name: "Unsloth prebuilt: Windows CUDA"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the per-profile Windows CUDA
+# bundles the parent's `resolve` job filtered into `matrix`. Each entry uploads
+# a single app-*.zip artifact for the parent's assemble step to pick up.
+#
+# Mirrors unsloth-prebuilt-cuda.yml (Linux), adapted for Windows: MSVC + Ninja
+# toolchain, BoringSSL instead of system OpenSSL, no RPATH (Windows resolves
+# DLLs from the executable's directory), and a .zip archive. CUDA compiles
+# entirely in software here -- no GPU is present on the runner.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      matrix:
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: x64/${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+
+      - name: Checkout upstream source @ ${{ inputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.tag }}
+          path: src
+          # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
+          # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.
+          # A shallow clone would bake in "b1" instead.
+          fetch-depth: 0
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with:
+          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          variant: ccache
+          evict-old-files: 14d
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: 'network'
+
+      - name: Set up CUDA environment
+        run: |
+          echo "CUDA_PATH=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$env:CUDA_PATH" >> $env:GITHUB_ENV
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Configure
+        working-directory: src
+        run: |
+          # CMAKE_CUDA_ARCHITECTURES is the explicit per-profile arch list (the
+          # whole point of the matrix). ccache launchers cache nvcc + cl.exe;
+          # no RPATH knobs -- Windows loads sibling DLLs from the binary's dir.
+          $archs = "${{ matrix.archs }}".Replace(' ', ';')
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_CUB_3DOT2=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DCMAKE_CUDA_ARCHITECTURES="$archs" `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          # -j 2: nvcc TUs with the full arch fanout can spike past 12 GB each,
+          # and the GitHub-hosted runners only have ~16 GB.
+          cmake --build build --config Release -j 2 `
+            --target llama-server llama-quantize
+
+      - name: Package bundle
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} (Jimver)
+          ARCHS: ${{ matrix.archs }}
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
+          path: dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
+          if-no-files-found: error

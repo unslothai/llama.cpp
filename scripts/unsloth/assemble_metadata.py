@@ -31,7 +31,7 @@ UPSTREAM_REPO = "ggml-org/llama.cpp"
 UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}"
 
 BUNDLE_RE = re.compile(
-    r"^app-(?P<tag>[^/]+)-linux-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable))\.tar\.gz$"
+    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable))\.(?P<ext>tar\.gz|zip)$"
 )
 
 ROCM_BUNDLE_RE = re.compile(
@@ -46,13 +46,14 @@ MACOS_BUNDLE_RE = re.compile(
     r"^llama-(?P<tag>[^/]+)-bin-macos-(?P<arch>arm64|x64)\.tar\.gz$"
 )
 
-# Per-arch dispatch keys for the published manifest + sha256 index. x64 keeps
-# the historical "linux-cuda" so older unsloth installers stay compatible;
-# arm64 gets distinct kinds so those installers cleanly ignore it instead of
-# trying to run an arm64 binary on x86_64.
-KIND_BY_ARCH = {
-    "x64":   {"manifest": "linux-cuda",       "sha": "linux-cuda-app"},
-    "arm64": {"manifest": "linux-arm64-cuda", "sha": "linux-arm64-cuda-app"},
+# Per-(platform, arch) dispatch keys for the published manifest + sha256 index.
+# Linux x64 keeps the historical "linux-cuda" so older unsloth installers stay
+# compatible; the others get distinct kinds so installers cleanly ignore a
+# bundle they can't run instead of trying to launch the wrong binary.
+KIND_BY_CUDA = {
+    ("linux",   "x64"):   {"manifest": "linux-cuda",       "sha": "linux-cuda-app"},
+    ("linux",   "arm64"): {"manifest": "linux-arm64-cuda", "sha": "linux-arm64-cuda-app"},
+    ("windows", "x64"):   {"manifest": "windows-cuda",     "sha": "windows-cuda-app"},
 }
 
 KIND_BY_ROCM_PLATFORM = {
@@ -161,11 +162,11 @@ def asset_digest_or_hash(asset: dict, token: str | None) -> str:
 def build_manifest(
     tag: str,
     commit: str,
-    cuda_bundles: list[tuple[str, str, dict]],
+    cuda_bundles: list[tuple[str, str, str, dict]],
     rocm_bundles: list[tuple[str, str, str]],
     macos_bundles: list[tuple[str, str]],
 ) -> dict:
-    """cuda_bundles: list of (asset_name, arch, embedded UNSLOTH_PREBUILT_INFO).
+    """cuda_bundles: list of (asset_name, platform, arch, embedded UNSLOTH_PREBUILT_INFO).
     rocm_bundles:    list of (asset_name, platform, gfx_target).
     macos_bundles:   list of (asset_name, arch).
 
@@ -175,10 +176,10 @@ def build_manifest(
     from the filename + the ROCM_TARGET_MAP / MACOS_SLICE tables.
     """
     artifacts = []
-    for asset_name, arch, info in cuda_bundles:
+    for asset_name, platform, arch, info in cuda_bundles:
         artifacts.append({
             "asset_name": asset_name,
-            "install_kind": KIND_BY_ARCH[arch]["manifest"],
+            "install_kind": KIND_BY_CUDA[(platform, arch)]["manifest"],
             "bundle_profile": info["bundle_profile"],
             "runtime_line": info["runtime_line"],
             "coverage_class": info["coverage_class"],
@@ -250,20 +251,22 @@ def main() -> int:
 
     sha_artifacts: dict[str, dict] = {}
 
-    # 1a) locally-built CUDA bundles (both x64 and arm64): hash in parallel.
-    found: list[tuple[str, str, dict]] = []
-    for p in sorted(args.dist.glob("app-*-linux-*.tar.gz")):
+    # 1a) locally-built CUDA bundles (Linux x64/arm64 .tar.gz + Windows x64
+    # .zip): hash in parallel. All carry embedded UNSLOTH_PREBUILT_INFO.json.
+    found: list[tuple[str, str, str, dict]] = []
+    cuda_paths = sorted(args.dist.glob("app-*-linux-*.tar.gz")) + sorted(args.dist.glob("app-*-windows-*.zip"))
+    for p in cuda_paths:
         m = BUNDLE_RE.match(p.name)
         if not m:
             continue
-        found.append((p.name, m.group("arch"), read_bundle_info(p)))
+        found.append((p.name, m.group("platform"), m.group("arch"), read_bundle_info(p)))
     if not found:
-        print(f"ERROR: no app-*.tar.gz CUDA bundles in {args.dist}", file=sys.stderr)
+        print(f"ERROR: no app-* CUDA bundles in {args.dist}", file=sys.stderr)
         return 1
     with ThreadPoolExecutor(max_workers=4) as pool:
         local_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), found))
-    for (name, arch, _info), digest in zip(found, local_digests):
-        sha_artifacts[name] = base_entry(KIND_BY_ARCH[arch]["sha"], args.publish_repo, digest)
+    for (name, platform, arch, _info), digest in zip(found, local_digests):
+        sha_artifacts[name] = base_entry(KIND_BY_CUDA[(platform, arch)]["sha"], args.publish_repo, digest)
 
     # 1b) locally-built ROCm bundles (linux .tar.gz + windows .zip): hash in
     # parallel. No embedded metadata; we derive everything from the filename.

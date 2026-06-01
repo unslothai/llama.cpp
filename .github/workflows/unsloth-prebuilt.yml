@@ -1,11 +1,12 @@
 name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
-# release per upstream b#### tag. Splits the heavy build work into three reusable
+# release per upstream b#### tag. Splits the heavy build work into four reusable
 # children:
-#   unsloth-prebuilt-cuda.yml   -- CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-rocm.yml   -- ROCm bundles (Windows + Ubuntu, per gfx target)
-#   unsloth-prebuilt-macos.yml  -- macOS bundles (arm64 Metal + x64 CPU)
+#   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-windows-cuda.yml  -- Windows CUDA bundles (x64, matrix profiles)
+#   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
 #
 # Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
@@ -66,6 +67,7 @@ jobs:
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
+      win_cuda_matrix: ${{ steps.r.outputs.win_cuda_matrix }}
       rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
       macos_matrix: ${{ steps.r.outputs.macos_matrix }}
     env:
@@ -110,6 +112,9 @@ jobs:
           else
             CUDA_INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
           fi
+          # Windows CUDA reuses the x64 profiles (same arch lists / CUDA lines),
+          # just on a Windows runner. arm64 has no Windows CUDA target.
+          WIN_CUDA_INCLUDE="$(echo "$CUDA_INCLUDE" | jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]')"
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
@@ -128,6 +133,7 @@ jobs:
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
+            echo "win_cuda_matrix={\"include\":$WIN_CUDA_INCLUDE}"
             echo "rocm_matrix=$ROCM_MATRIX"
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
@@ -142,6 +148,16 @@ jobs:
       tag: ${{ needs.resolve.outputs.tag }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
+
+  build-windows-cuda:
+    name: Windows CUDA
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-windows-cuda.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
 
   build-rocm:
     name: ROCm
@@ -165,7 +181,7 @@ jobs:
 
   assemble:
     name: Assemble metadata + publish
-    needs: [resolve, build-cuda, build-rocm, build-macos]
+    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos]
     # No `if: always()`. Atomicity: if any matrix entry in any child
     # workflow failed, the corresponding `build-*` job reports failure, the
     # default `needs` success check skips this assemble job, and nothing is
@@ -237,6 +253,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA + ROCm + macOS prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
