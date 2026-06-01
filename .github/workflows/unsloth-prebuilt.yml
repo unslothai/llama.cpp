@@ -216,6 +216,21 @@ jobs:
           pattern: app-*
           merge-multiple: true
 
+      # Ship the upstream source tarballs as release assets so the installer's
+      # source-build fallback has a tree to fetch. Downloaded into dist/ (not
+      # self-tarred) so the published bytes match the sha256 index, which
+      # assemble_metadata records by hashing these exact local files.
+      - name: Fetch upstream source archives
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          SHA='${{ needs.resolve.outputs.commit }}'
+          mkdir -p dist
+          curl -fL --retry 3 -o "dist/llama.cpp-source-${TAG}.tar.gz" \
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/${TAG}"
+          curl -fL --retry 3 -o "dist/llama.cpp-source-commit-${SHA}.tar.gz" \
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${SHA}"
+
       - name: Generate manifest + sha256 index
         run: |
           set -eux

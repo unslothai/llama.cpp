@@ -330,16 +330,24 @@ def main() -> int:
     for name, kind in wanted:
         sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, asset_digest_or_hash(assets[name], token))
 
-    # 3) source tarballs: codeload doesn't expose pre-computed digests, so
-    #    stream-hash both URLs in parallel.
+    # 3) source tarballs: prefer a local copy in dist -- the workflow downloads
+    #    them from codeload so the published asset and its recorded checksum are
+    #    the exact same bytes. Fall back to stream-hashing codeload if absent
+    #    (e.g. a standalone/local run that didn't pre-fetch them). codeload
+    #    doesn't expose pre-computed digests, so we always hash the content.
     source_jobs = [
         (f"llama.cpp-source-{tag}.tar.gz", "upstream-source",
          f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/refs/tags/{tag}"),
         (f"llama.cpp-source-commit-{commit}.tar.gz", "exact-source",
          f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{commit}"),
     ]
+
+    def source_digest(name: str, url: str) -> str:
+        local = args.dist / name
+        return sha256_file(local) if local.is_file() else sha256_url(url, token)
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        source_digests = list(pool.map(lambda j: sha256_url(j[2], token), source_jobs))
+        source_digests = list(pool.map(lambda j: source_digest(j[0], j[2]), source_jobs))
     for (name, kind, _url), digest in zip(source_jobs, source_digests):
         sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, digest)
 
