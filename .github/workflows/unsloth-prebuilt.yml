@@ -95,11 +95,12 @@ jobs:
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ "$REQ" = "latest" ]; then
             # Newest published (non-draft, non-prerelease) release that has been
-            # public for >= AGE_H hours -- the supply-chain aging window. Releases
-            # come back newest-first, so `first` after the cutoff filter is it.
+            # public for >= AGE_H hours -- the supply-chain aging window. GitHub
+            # does not guarantee the list order, so pick the max by published_at
+            # explicitly rather than trusting `first`.
             CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
             TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
-              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | first | .tag_name")"
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
             if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
               echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
               exit 1

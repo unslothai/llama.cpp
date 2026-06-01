@@ -24,6 +24,7 @@ import tarfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -91,13 +92,24 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def read_bundle_info(tarball: Path) -> dict:
-    """Read the UNSLOTH_PREBUILT_INFO.json embedded in a built bundle."""
-    with tarfile.open(tarball, "r:gz") as tar:
-        for m in tar.getmembers():
-            if m.isfile() and m.name.endswith("UNSLOTH_PREBUILT_INFO.json"):
-                return json.loads(tar.extractfile(m).read())
-    sys.exit(f"ERROR: {tarball.name} has no UNSLOTH_PREBUILT_INFO.json")
+def read_bundle_info(bundle: Path) -> dict:
+    """Read the UNSLOTH_PREBUILT_INFO.json embedded in a built bundle.
+
+    Linux/macOS bundles are .tar.gz; Windows bundles are .zip -- dispatch on the
+    extension so the Windows CUDA bundles can be read too.
+    """
+    target = "UNSLOTH_PREBUILT_INFO.json"
+    if bundle.name.endswith(".zip"):
+        with zipfile.ZipFile(bundle) as zf:
+            for n in zf.namelist():
+                if n.endswith(target):
+                    return json.loads(zf.read(n))
+    else:
+        with tarfile.open(bundle, "r:gz") as tar:
+            for m in tar.getmembers():
+                if m.isfile() and m.name.endswith(target):
+                    return json.loads(tar.extractfile(m).read())
+    sys.exit(f"ERROR: {bundle.name} has no {target}")
 
 
 def _request(url: str, token: str | None) -> urllib.request.Request:

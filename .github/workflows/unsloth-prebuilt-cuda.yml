@@ -193,7 +193,7 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
-          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} (Jimver)
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
