@@ -202,6 +202,13 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
     short = cfg["commit"][:7]
     min_sm, max_sm = min(map(int, archs)), max(map(int, archs))
     nvcc_status, nvcc_sms, nvcc_msg = detect_nvcc_sms()
+    # sm_103 (B300 / GB300 Blackwell Ultra) has no native build, but it JIT-runs
+    # on the bundled compute_100 PTX, so any bundle that ships sm_100 also covers
+    # it. Declare it in supported_sms (not the native nvcc build) so every
+    # platform's manifest agrees -- Windows and arm64 reuse these x64 profiles.
+    supported_sms = list(archs)
+    if "100" in supported_sms and "103" not in supported_sms:
+        supported_sms = sorted([*supported_sms, "103"], key=int)
     note = f"CUDA {cfg['line'].removeprefix('cuda')} {cfg['klass']} bundle."
 
     licenses = [f"Third-party licenses bundled with this llama.cpp prebuilt ({cfg['tag']}).",
@@ -232,7 +239,7 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
         "bundle_rank": int(cfg["rank"]),
         "toolkit_line": cfg["toolkit_line"],
         "docker_image": cfg["docker_image"],
-        "supported_sms": archs,
+        "supported_sms": supported_sms,
         "nvcc_validation_status": nvcc_status,
         "nvcc_detected_sms": nvcc_sms,
         "nvcc_validation_message": nvcc_msg,
@@ -257,7 +264,7 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
         f"docker image: {cfg['docker_image']}",
         "backend: CUDA",
         f"toolkit version: {cfg['toolkit_line']}",
-        f"supported sms: {','.join(archs)}",
+        f"supported sms: {','.join(supported_sms)}",
         f"nvcc validation: {nvcc_status}",
         f"min sm: {min_sm}",
         f"max sm: {max_sm}",
