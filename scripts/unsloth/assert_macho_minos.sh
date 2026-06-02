@@ -45,5 +45,9 @@ done
 CLI="$(find "$BIN_DIR" -type f -name llama-cli | head -1)"
 QUANT="$(find "$BIN_DIR" -type f -name llama-quantize | head -1)"
 "$CLI" --version   >/dev/null 2>&1 || fail "llama-cli failed to launch (dyld load / symbol error)"
-"$QUANT" --help    >/dev/null 2>&1 || fail "llama-quantize failed to launch (dyld load / symbol error)"
+# llama-quantize's usage() ends in exit(1), so --help is non-zero by design.
+# A dyld/symbol failure dies before main and prints nothing, so verify the
+# binary actually reached main (printed usage) rather than trusting the code.
+q_out="$("$QUANT" --help 2>&1 || true)"
+printf '%s\n' "$q_out" | grep -q "usage:" || fail "llama-quantize failed to launch (dyld load / symbol error)"
 echo "runtime launch passed: llama-cli --version and llama-quantize --help both ran"
