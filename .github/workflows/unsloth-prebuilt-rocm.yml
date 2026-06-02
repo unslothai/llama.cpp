@@ -659,6 +659,15 @@ jobs:
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
 
+        # libatomic.so.1 is a transitive dependency of librocm_sysdeps_numa
+        # (libhsa-runtime64 -> numa -> libatomic) but it is a system GCC runtime
+        # library, not shipped under /opt/rocm. Bundle it so the runtime stays
+        # self-contained on hosts that lack it. lemonade-sdk/lemonade#1349 hit
+        # exactly this ("libatomic.so.1: cannot open shared object file").
+        sudo apt-get install -y libatomic1 >/dev/null 2>&1 || true
+        libatomic_path="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"
+        cp -v "$libatomic_path" "$build_bin_path/" 2>/dev/null || echo "libatomic.so.1 not found"
+
         echo "Finished copying required ROCm libraries"
 
     - name: Set RPATH for portable distribution
