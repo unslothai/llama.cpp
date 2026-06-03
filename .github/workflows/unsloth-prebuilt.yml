@@ -90,8 +90,24 @@ jobs:
           set -euo pipefail
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
-          GFX='${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X' }}'
+          GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+          GFX='${{ github.event.inputs.gfx_target }}'; GFX="${GFX:-$GFX_DEFAULT}"
+          OS_LIST='${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}'
           AGE_H='${{ github.event.inputs.min_age_hours }}'
+
+          # publish does delete-then-create on the whole release, and the installer
+          # treats the published manifest as the authoritative bundle set: a partial
+          # build drops bundles and silently downgrades uncovered hosts to slow
+          # source builds. Refuse to publish unless the full default set is built;
+          # publish=false test runs may use subsets.
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            [ "$ONLY" = "all" ] || { echo "refusing to publish only_profile=$ONLY: a partial CUDA set clobbers manifest coverage. Use only_profile=all to publish, or publish=false for an artifact-only test." >&2; exit 1; }
+            [ "$GFX" = "$GFX_DEFAULT" ] || { echo "refusing to publish gfx_target='$GFX': publish requires the full default set ($GFX_DEFAULT); use publish=false for a subset test." >&2; exit 1; }
+            case "$OS_LIST" in
+              *windows*ubuntu*|*ubuntu*windows*) : ;;
+              *) echo "refusing to publish operating_systems='$OS_LIST': both windows and ubuntu ROCm bundles are required. Use publish=false for a subset test." >&2; exit 1 ;;
+            esac
+          fi
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ "$REQ" = "latest" ]; then
             # Newest published (non-draft, non-prerelease) release that has been
