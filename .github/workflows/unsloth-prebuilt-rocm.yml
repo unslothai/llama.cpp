@@ -196,8 +196,8 @@ jobs:
     - name: Clone llama.cpp @ ${{ inputs.tag }}
       run: |
         $tag = "${{ inputs.tag }}"
-        Write-Host "Cloning llama.cpp version: $tag with shallow clone"
-        git clone --depth 1 --single-branch --branch $tag https://github.com/ggerganov/llama.cpp.git
+        Write-Host "Cloning llama.cpp version: $tag (full history so LLAMA_BUILD_NUMBER is correct)"
+        git clone --single-branch --branch $tag https://github.com/ggerganov/llama.cpp.git
         cd llama.cpp
 
         # Show current commit info
@@ -536,8 +536,8 @@ jobs:
     - name: Clone llama.cpp @ ${{ inputs.tag }}
       run: |
         tag="${{ inputs.tag }}"
-        echo "Cloning llama.cpp version: $tag with shallow clone"
-        git clone --depth 1 --single-branch --branch "$tag" https://github.com/ggerganov/llama.cpp.git
+        echo "Cloning llama.cpp version: $tag (full history so LLAMA_BUILD_NUMBER is correct)"
+        git clone --single-branch --branch "$tag" https://github.com/ggerganov/llama.cpp.git
         cd llama.cpp
 
         # Show current commit info
