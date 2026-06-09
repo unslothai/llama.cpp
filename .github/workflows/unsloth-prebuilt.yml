@@ -4,7 +4,7 @@ name: Unsloth prebuilt (full release)
 # release per upstream b#### tag. Splits the heavy build work into four reusable
 # children:
 #   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-windows-cuda.yml  -- CUDA Windows bundles (x64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows.yml  -- CUDA Windows bundles (x64, matrix profiles)
 #   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
 #   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
 #
@@ -196,7 +196,7 @@ jobs:
     name: CUDA Windows
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    uses: ./.github/workflows/unsloth-prebuilt-windows-cuda.yml
+    uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       commit: ${{ needs.resolve.outputs.commit }}
