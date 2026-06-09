@@ -297,6 +297,20 @@ jobs:
           # runs. Default 90 days × ~8 GB/run is real storage cost.
           retention-days: 7
 
+      - name: Verify cuda12/cuda13 coverage before publish
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eu
+          # A partial CUDA set (cuda13 without cuda12) silently strands the
+          # cuda12-runtime majority; require matching x64 coverage on both lines.
+          for os in linux windows; do
+            ext=$([ "$os" = windows ] && echo zip || echo tar.gz)
+            c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -E 's/.*cuda12-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
+            c13=$(ls dist/app-*-"$os"-x64-cuda13-*."$ext" 2>/dev/null | sed -E 's/.*cuda13-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
+            echo "$os x64 coverage: cuda12=[$c12] cuda13=[$c13]"
+            [ -n "$c12" ] && [ "$c12" = "$c13" ] || { echo "ERROR: $os x64 cuda12/cuda13 coverage mismatch; refusing to publish a partial release" >&2; exit 1; }
+          done
+
       - name: Publish GitHub release
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
