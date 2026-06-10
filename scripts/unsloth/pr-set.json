@@ -1,11 +1,13 @@
 {
   "_doc": [
-    "Upstream llama.cpp PRs to merge into the prebuilds (mix 'n match).",
-    "List ggml-org/llama.cpp PR urls. Only OPEN PRs are used; closed or merged ones are skipped automatically.",
-    "Track the PR head:   https://github.com/ggml-org/llama.cpp/pull/12345",
-    "Pin an exact commit: https://github.com/ggml-org/llama.cpp/pull/12345/commits/<full-40-char-sha>",
-    "PRs are merged onto the nightly base tag in the order listed; the build fails fast on a merge conflict.",
-    "Empty list = vanilla upstream build (tag b####); non-empty = tag b####-mix-<hash-of-pr-shas>."
+    "ggml-org/llama.cpp PRs to merge into the nightly prebuilds. Add their urls to the prs list below.",
+    "Both of these forms work:",
+    "  https://github.com/ggml-org/llama.cpp/pull/16334",
+    "  https://github.com/ggml-org/llama.cpp/pull/15926/commits/59a3d0cb8f611aa3110ecea3d0afd16b1b18ee06",
+    "The first builds whatever the PR head is at build time. The second (the url of a commit",
+    "inside the PR) stays on that exact commit even if the author keeps pushing.",
+    "Closed or merged PRs are skipped automatically, and an empty list is a plain upstream build."
   ],
-  "prs": []
+  "prs": [
+  ]
 }
