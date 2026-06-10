@@ -20,7 +20,9 @@ MAX_KEY="$(ver_key "$MAX_MINOS")"
 
 command -v vtool >/dev/null 2>&1 || fail "vtool not found (Xcode command line tools required)"
 
-mapfile -t MACHOS < <(find "$BIN_DIR" -type f \( -name '*.dylib' -o -name 'llama-server' -o -name 'llama-quantize' -o -name 'llama-cli' \) 2>/dev/null)
+# macOS ships bash 3.2, which has no `mapfile`; read into the array portably.
+MACHOS=()
+while IFS= read -r _macho; do MACHOS+=("$_macho"); done < <(find "$BIN_DIR" -type f \( -name '*.dylib' -o -name 'llama-server' -o -name 'llama-quantize' -o -name 'llama-cli' \) 2>/dev/null)
 [ "${#MACHOS[@]}" -gt 0 ] || fail "no Mach-O binaries found under $BIN_DIR"
 
 for macho in "${MACHOS[@]}"; do
@@ -43,5 +45,9 @@ done
 CLI="$(find "$BIN_DIR" -type f -name llama-cli | head -1)"
 QUANT="$(find "$BIN_DIR" -type f -name llama-quantize | head -1)"
 "$CLI" --version   >/dev/null 2>&1 || fail "llama-cli failed to launch (dyld load / symbol error)"
-"$QUANT" --help    >/dev/null 2>&1 || fail "llama-quantize failed to launch (dyld load / symbol error)"
+# llama-quantize's usage() ends in exit(1), so --help is non-zero by design.
+# A dyld/symbol failure dies before main and prints nothing, so verify the
+# binary actually reached main (printed usage) rather than trusting the code.
+q_out="$("$QUANT" --help 2>&1 || true)"
+printf '%s\n' "$q_out" | grep -q "usage:" || fail "llama-quantize failed to launch (dyld load / symbol error)"
 echo "runtime launch passed: llama-cli --version and llama-quantize --help both ran"

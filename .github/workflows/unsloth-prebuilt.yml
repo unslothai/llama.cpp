@@ -1,0 +1,332 @@
+name: Unsloth prebuilt (full release)
+
+# Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
+# release per upstream b#### tag. Splits the heavy build work into four reusable
+# children:
+#   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows.yml  -- CUDA Windows bundles (x64, matrix profiles)
+#   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
+#
+# Atomicity: the `assemble` job depends on all children. GitHub's default
+# `needs` semantics require all needs to succeed -- if any matrix entry in
+# any child fails, `assemble` skips and no release is published. The
+# installer needs the full bundle set at the same tag or it'll dispatch to
+# something that isn't there.
+
+on:
+  schedule:
+    - cron: '13 22 * * *'      # ~3PM San Francisco (UTC; not DST adjusted)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'ggml-org tag (b#### or "latest")'
+        default: 'latest'
+        required: true
+        type: string
+      min_age_hours:
+        description: 'For "latest": only build a release public for at least this many hours (blank = default 6)'
+        default: ''
+        required: false
+        type: string
+      only_profile:
+        description: 'CUDA profile to build'
+        default: 'all'
+        required: false
+        type: choice
+        options: [all, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
+      operating_systems:
+        description: 'OSes for ROCm builds'
+        default: 'windows,ubuntu'
+        required: false
+        type: string
+      gfx_target:
+        description: 'GPU targets for ROCm builds'
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+        required: false
+        type: string
+      rocm_version:
+        description: 'ROCm version (or "latest")'
+        default: 'latest'
+        required: false
+        type: string
+      publish:
+        description: 'Publish to GitHub Releases'
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  # Supply-chain aging: when resolving "latest", only build an upstream release
+  # that has been public for at least this many hours, so a malicious or broken
+  # release has time to be caught and yanked before we compile and ship it. An
+  # explicit b#### tag (manual run) skips it. Per-run override via min_age_hours.
+  UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS: "6"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      exists: ${{ steps.r.outputs.exists }}
+      cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
+      win_cuda_matrix: ${{ steps.r.outputs.win_cuda_matrix }}
+      rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
+      macos_matrix: ${{ steps.r.outputs.macos_matrix }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: r
+        run: |
+          set -euo pipefail
+          REQ='${{ github.event.inputs.tag || 'latest' }}'
+          ONLY='${{ github.event.inputs.only_profile || 'all' }}'
+          GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+          GFX='${{ github.event.inputs.gfx_target }}'; GFX="${GFX:-$GFX_DEFAULT}"
+          OS_LIST='${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}'
+          AGE_H='${{ github.event.inputs.min_age_hours }}'
+
+          # publish does delete-then-create on the whole release, and the installer
+          # treats the published manifest as the authoritative bundle set: a partial
+          # build drops bundles and silently downgrades uncovered hosts to slow
+          # source builds. Refuse to publish unless the full default set is built;
+          # publish=false test runs may use subsets.
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            [ "$ONLY" = "all" ] || { echo "refusing to publish only_profile=$ONLY: a partial CUDA set clobbers manifest coverage. Use only_profile=all to publish, or publish=false for an artifact-only test." >&2; exit 1; }
+            [ "$GFX" = "$GFX_DEFAULT" ] || { echo "refusing to publish gfx_target='$GFX': publish requires the full default set ($GFX_DEFAULT); use publish=false for a subset test." >&2; exit 1; }
+            case "$OS_LIST" in
+              *windows*ubuntu*|*ubuntu*windows*) : ;;
+              *) echo "refusing to publish operating_systems='$OS_LIST': both windows and ubuntu ROCm bundles are required. Use publish=false for a subset test." >&2; exit 1 ;;
+            esac
+          fi
+          [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
+          if [ "$REQ" = "latest" ]; then
+            # Newest published (non-draft, non-prerelease) release that has been
+            # public for >= AGE_H hours -- the supply-chain aging window. GitHub
+            # does not guarantee the list order, so pick the max by published_at
+            # explicitly rather than trusting `first`.
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
+              exit 1
+            fi
+            echo "selected $TAG (aged >= ${AGE_H}h)"
+          else
+            TAG="$REQ"   # explicit b#### override skips the aging filter
+          fi
+          printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+          COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
+
+          # Only PUBLISHED releases count as "exists"; a leftover draft (from
+          # a failed prior publish) should not block today's rebuild.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
+
+          # ubuntu-22.04 is x64 (glibc 2.35). arm64 only has ubuntu-24.04-arm
+          # available on GitHub-hosted runners (glibc 2.39). arm64 is cuda13-only
+          # (no cuda12 SBSA) and ships the single "portable" coverage class.
+          # cuda12 installs via Jimver; cuda13 is pinned to 13.3 (matching
+          # upstream) which Jimver lacks, so those install via NVIDIA redist in
+          # the build children -- on the same runners, so the glibc floor holds.
+          ALL='[
+            {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
+            {"profile":"cuda12-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
+            {"profile":"cuda12-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
+            {"profile":"cuda13-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"older",   "rank":40,"cuda":"13.3","toolkit_line":"13.3","archs":"75 80 86 89"},
+            {"profile":"cuda13-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"newer",   "rank":50,"cuda":"13.3","toolkit_line":"13.3","archs":"86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda13","klass":"portable","rank":60,"cuda":"13.3","toolkit_line":"13.3","archs":"75 80 86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","line":"cuda13","klass":"portable","rank":60,"cuda":"13.3","toolkit_line":"13.3","archs":"90 100 120 121"}
+          ]'
+          if [ "$ONLY" = "all" ]; then
+            CUDA_INCLUDE="$(echo "$ALL" | jq -c .)"
+          else
+            CUDA_INCLUDE="$(echo "$ALL" | jq -c --arg p "$ONLY" '[.[] | select(.profile==$p)]')"
+          fi
+          # CUDA Windows reuses the x64 profiles (same arch lists / CUDA
+          # versions), just on a Windows runner. arm64 has no CUDA Windows target.
+          WIN_CUDA_INCLUDE="$(echo "$CUDA_INCLUDE" | jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]')"
+          [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
+          ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
+
+          # macOS slices are static: two fixed runners with per-slice deployment
+          # targets. arm64 builds on macos-26 (newest Metal SDK; avoids the
+          # M5/A19 "error compiling source" the macos-14 SDK emits) yet pins
+          # minos 14.0 via deploy_target, so it still loads on macOS 14+. x64
+          # pins 13.3 (matches upstream's Intel leg, covers 2017 Intel Macs
+          # capped at Ventura).
+          MACOS_INCLUDE='[
+            {"build":"arm64","runner":"macos-26",      "expect_arch":"arm64", "deploy_target":"14.0","defines":"-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"},
+            {"build":"x64",  "runner":"macos-15-intel","expect_arch":"x86_64","deploy_target":"13.3","defines":"-DGGML_METAL=OFF"}
+          ]'
+          MACOS_INCLUDE="$(echo "$MACOS_INCLUDE" | jq -c .)"
+
+          {
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "exists=$EXISTS"
+            echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
+            echo "win_cuda_matrix={\"include\":$WIN_CUDA_INCLUDE}"
+            echo "rocm_matrix=$ROCM_MATRIX"
+            echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
+
+  build-cuda:
+    name: CUDA
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      matrix: ${{ needs.resolve.outputs.cuda_matrix }}
+
+  build-windows-cuda:
+    name: CUDA Windows
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
+
+  build-rocm:
+    name: ROCm
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      matrix: ${{ needs.resolve.outputs.rocm_matrix }}
+      operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
+      rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
+
+  build-macos:
+    name: macOS
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-macos.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      matrix: ${{ needs.resolve.outputs.macos_matrix }}
+
+  assemble:
+    name: Assemble metadata + publish
+    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos]
+    # No `if: always()`. Atomicity: if any matrix entry in any child
+    # workflow failed, the corresponding `build-*` job reports failure, the
+    # default `needs` success check skips this assemble job, and nothing is
+    # published. The installer needs the full bundle set or it'll fail.
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+
+      # The first download attempt occasionally hits a transient ECONNRESET
+      # on GitHub's ListArtifacts API. Retrying once is cheaper than
+      # re-running the whole hour-long build matrix.
+      - name: Download built bundles
+        id: download
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          path: dist
+          pattern: app-*
+          merge-multiple: true
+
+      - name: Download built bundles (retry)
+        if: steps.download.outcome == 'failure'
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: app-*
+          merge-multiple: true
+
+      # Ship the upstream source tarballs as release assets so the installer's
+      # source-build fallback has a tree to fetch. Downloaded into dist/ (not
+      # self-tarred) so the published bytes match the sha256 index, which
+      # assemble_metadata records by hashing these exact local files.
+      - name: Fetch upstream source archives
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          SHA='${{ needs.resolve.outputs.commit }}'
+          mkdir -p dist
+          curl -fL --retry 3 -o "dist/llama.cpp-source-${TAG}.tar.gz" \
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/${TAG}"
+          curl -fL --retry 3 -o "dist/llama.cpp-source-commit-${SHA}.tar.gz" \
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${SHA}"
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/assemble_metadata.py \
+            --tag '${{ needs.resolve.outputs.tag }}' \
+            --commit '${{ needs.resolve.outputs.commit }}' \
+            --dist dist --out dist \
+            --publish-repo "$GITHUB_REPOSITORY"
+          ls -la dist
+
+      - name: Upload full release set (artifacts)
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          if-no-files-found: error
+          # Short retention: the published GitHub release is the canonical
+          # storage; this artifact is just debug fallback for failed-publish
+          # runs. Default 90 days × ~8 GB/run is real storage cost.
+          retention-days: 7
+
+      - name: Verify cuda12/cuda13 coverage before publish
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eu
+          # A partial CUDA set (cuda13 without cuda12) silently strands the
+          # cuda12-runtime majority; require matching x64 coverage on both lines.
+          for os in linux windows; do
+            ext=$([ "$os" = windows ] && echo zip || echo tar.gz)
+            c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -E 's/.*cuda12-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
+            c13=$(ls dist/app-*-"$os"-x64-cuda13-*."$ext" 2>/dev/null | sed -E 's/.*cuda13-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
+            echo "$os x64 coverage: cuda12=[$c12] cuda13=[$c13]"
+            [ -n "$c12" ] && [ "$c12" = "$c13" ] || { echo "ERROR: $os x64 cuda12/cuda13 coverage mismatch; refusing to publish a partial release" >&2; exit 1; }
+          done
+
+      - name: Publish GitHub release
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          REPO="$GITHUB_REPOSITORY"
+
+          # Atomic publish: upload as draft (hidden from the anon GitHub API
+          # the installer uses), then flip draft=false only once every asset
+          # landed. Leftover drafts from failed runs are detected as "not
+          # exists" by resolve and rebuilt on the next run.
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+          fi
+          gh release create "$TAG" --repo "$REPO" --draft \
+            --title "llama.cpp prebuilt $TAG" \
+            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false

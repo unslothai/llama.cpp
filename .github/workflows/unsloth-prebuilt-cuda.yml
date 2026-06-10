@@ -1,0 +1,205 @@
+name: "Unsloth prebuilt: CUDA"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA bundles
+# the parent's `resolve` job filtered into `matrix`. Each entry uploads a
+# single app-*.tar.gz artifact for the parent's assemble step to pick up.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      matrix:
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}/${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+
+      - name: Checkout upstream source @ ${{ inputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.tag }}
+          path: src
+          # Full history is required: cmake/build-info.cmake runs
+          # `git rev-list --count HEAD` to compute LLAMA_BUILD_NUMBER,
+          # which gets baked into llama-server --version as b<N>.
+          # Shallow clone (default depth=1) would bake in "b1" instead.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+
+      - name: Install ARM64 host compiler (gcc-14)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          sudo apt-get install -y gcc-14 g++-14
+          {
+            echo "CC=gcc-14"
+            echo "CXX=g++-14"
+            echo "CUDAHOSTCXX=g++-14"
+          } >> "$GITHUB_ENV"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with:
+          key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
+          variant: ccache
+          evict-old-files: 14d
+
+      # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
+      # toolkit components straight from NVIDIA's redist CDN (same source Jimver
+      # and ggml-org use) and assemble a prefix by hand. Component versions are
+      # from NVIDIA's redistrib_13.3.0.json. Runs on the same ubuntu runner, so
+      # the glibc floor is unchanged. Any other version uses Jimver.
+      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
+        if: matrix.cuda == '13.3'
+        run: |
+          set -eux
+          case "${{ matrix.arch }}" in
+            x64)   PLAT=linux-x86_64 ;;
+            arm64) PLAT=linux-sbsa ;;
+            *) echo "unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          PREFIX="$HOME/cuda-13.3"
+          mkdir -p "$PREFIX"
+          BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+          for cv in \
+            cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 \
+            cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 \
+            cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1; do
+            comp="${cv%:*}"; ver="${cv#*:}"
+            name="${comp}-${PLAT}-${ver}-archive"
+            curl -fsSL -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
+            tar -xf comp.tar.xz
+            cp -a "${name}/." "$PREFIX"/
+            rm -rf comp.tar.xz "${name}"
+          done
+          # Redist ships libs under lib/; some CMake CUDA discovery expects lib64.
+          ln -sfn lib "$PREFIX/lib64"
+          {
+            echo "CUDA_PATH=$PREFIX"
+            echo "CUDA_HOME=$PREFIX"
+            echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
+        if: matrix.cuda != '13.3'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: 'network'
+
+      - name: Set up CUDA environment (Jimver)
+        if: matrix.cuda != '13.3'
+        run: |
+          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -eux
+          # Three non-obvious flags:
+          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: the tar.gz layout
+          #    ships sibling .so files in the same directory as the binaries.
+          #  - CMAKE_CUDA_ARCHITECTURES: explicit per-profile arch list, the
+          #    whole point of the matrix.
+          #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
+          #    /usr/local/bin, so PATH-symlinked ccache misses CUDA TUs --
+          #    setting the launcher explicitly caches nvcc too.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_RPC=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -eux
+          # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
+          # so the server/quantize targets pull them in.
+          # -j 2: nvcc TUs with the full arch fanout can spike past 12 GB each,
+          # and the GitHub-hosted runners (x64 and arm64 alike) only have ~16 GB.
+          cmake --build build --config Release -j 2 \
+            --target llama-server llama-quantize
+          strip build/bin/llama-server build/bin/llama-quantize || true
+
+      - name: Package bundle
+        env:
+          PLATFORM: linux
+          ARCH: ${{ matrix.arch }}
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
+          path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
+          if-no-files-found: error
