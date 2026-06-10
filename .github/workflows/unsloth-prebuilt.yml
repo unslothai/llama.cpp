@@ -297,10 +297,12 @@ jobs:
           # runs. Default 90 days × ~8 GB/run is real storage cost.
           retention-days: 7
 
-      - name: Verify cuda12/cuda13 coverage before publish
+      - name: Verify full bundle coverage before publish
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
           set -eu
+          TAG='${{ needs.resolve.outputs.tag }}'
+          fail=0
           # A partial CUDA set (cuda13 without cuda12) silently strands the
           # cuda12-runtime majority; require matching x64 coverage on both lines.
           for os in linux windows; do
@@ -308,8 +310,26 @@ jobs:
             c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -E 's/.*cuda12-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
             c13=$(ls dist/app-*-"$os"-x64-cuda13-*."$ext" 2>/dev/null | sed -E 's/.*cuda13-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
             echo "$os x64 coverage: cuda12=[$c12] cuda13=[$c13]"
-            [ -n "$c12" ] && [ "$c12" = "$c13" ] || { echo "ERROR: $os x64 cuda12/cuda13 coverage mismatch; refusing to publish a partial release" >&2; exit 1; }
+            [ -n "$c12" ] && [ "$c12" = "$c13" ] || { echo "ERROR: $os x64 cuda12/cuda13 coverage mismatch" >&2; fail=1; }
           done
+          # Children passing is not the same as files landing in dist/ (a
+          # download-artifact anomaly leaves green jobs and missing bundles),
+          # so assert presence of every non-CUDA-x64 line the installer
+          # selects from. The resolve-time input guard already pins publish
+          # runs to the full default matrix, so these names are exact.
+          for f in \
+            "llama-${TAG}-bin-macos-arm64.tar.gz" \
+            "llama-${TAG}-bin-macos-x64.tar.gz" \
+            "app-${TAG}-linux-arm64-cuda13-portable.tar.gz"; do
+            [ -s "dist/$f" ] || { echo "ERROR: missing $f in dist/" >&2; fail=1; }
+          done
+          # Default ROCm set (mirrors the gfx_target input default): both OSes
+          # per family, or AMD hosts of that family silently lose their bundle.
+          for gfx in gfx1151 gfx1150 gfx120X gfx110X gfx103X; do
+            [ -s "dist/app-${TAG}-linux-x64-rocm-${gfx}.tar.gz" ] || { echo "ERROR: missing linux rocm ${gfx} bundle in dist/" >&2; fail=1; }
+            [ -s "dist/app-${TAG}-windows-x64-rocm-${gfx}.zip" ]  || { echo "ERROR: missing windows rocm ${gfx} bundle in dist/" >&2; fail=1; }
+          done
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
 
       - name: Publish GitHub release
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
