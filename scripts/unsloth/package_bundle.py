@@ -227,7 +227,7 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: li
         "upstream_tag": cfg["tag"],
         "source_repo": cfg["source_repo"],
         "source_repo_url": f"https://github.com/{cfg['source_repo']}",
-        "source_ref_kind": "tag",
+        "source_ref_kind": cfg["source_ref_kind"],
         "requested_source_ref": cfg["tag"],
         "resolved_source_ref": cfg["tag"],
         "source_commit": cfg["commit"],
@@ -309,6 +309,7 @@ def read_config() -> dict:
         "arch": os.environ.get("ARCH", "x64"),
         "docker_image": os.environ.get("DOCKER_IMAGE", ""),
         "source_repo": os.environ.get("SOURCE_REPO", "ggml-org/llama.cpp"),
+        "source_ref_kind": os.environ.get("SOURCE_REF_KIND", "tag"),
     }
 
 

@@ -189,7 +189,11 @@ jobs:
             # rebuilding an already-published set.
             SETHASH="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
             TAG="${BASE}-mix-${SETHASH}"
-            REPO='ggml-org/llama.cpp'
+            # REPO names where this source is published, for provenance
+            # metadata: the merged tree exists only as this repo's release
+            # assets, never upstream. Children ignore repo in mix mode (they
+            # extract the artifact instead of cloning).
+            REPO="$GITHUB_REPOSITORY"
             REF=""
             SRC_ARTIFACT="app-source-${TAG}"
             if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then

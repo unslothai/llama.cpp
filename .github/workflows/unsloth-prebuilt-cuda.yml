@@ -222,6 +222,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           SOURCE_COMMIT: ${{ inputs.commit }}
           SOURCE_REPO: ${{ inputs.repo }}
+          SOURCE_REF_KIND: ${{ inputs.source_artifact != '' && 'mix' || 'tag' }}
           PROFILE: ${{ matrix.profile }}
           LINE: ${{ matrix.line }}
           KLASS: ${{ matrix.klass }}
