@@ -20,6 +20,11 @@ on:
         description: 'Upstream commit SHA for that tag, resolved by parent'
         required: true
         type: string
+      ref:
+        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        required: false
+        default: ''
+        type: string
       matrix:
         description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
         required: true
@@ -48,7 +53,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ggml-org/llama.cpp
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.ref || inputs.tag }}
           path: src
           # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
           # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.

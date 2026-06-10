@@ -177,6 +177,8 @@ def build_manifest(
     cuda_bundles: list[tuple[str, str, str, dict]],
     rocm_bundles: list[tuple[str, str, str]],
     macos_bundles: list[tuple[str, str]],
+    ref_kind: str,
+    source_ref: str,
 ) -> dict:
     """cuda_bundles: list of (asset_name, platform, arch, embedded UNSLOTH_PREBUILT_INFO).
     rocm_bundles:    list of (asset_name, platform, gfx_target).
@@ -225,9 +227,9 @@ def build_manifest(
         "component": "llama.cpp",
         "source_repo": UPSTREAM_REPO,
         "source_repo_url": UPSTREAM_URL,
-        "source_ref_kind": "tag",
-        "requested_source_ref": tag,
-        "resolved_source_ref": tag,
+        "source_ref_kind": ref_kind,
+        "requested_source_ref": source_ref,
+        "resolved_source_ref": source_ref,
         "source_commit": commit,
         "source_commit_short": commit[:7],
         "upstream_repo": UPSTREAM_REPO,
@@ -240,6 +242,10 @@ def build_manifest(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--ref", default=None,
+                    help="git ref the source was built from (refs/tags/<tag> or refs/pull/<n>/head); "
+                         "defaults to refs/tags/<tag>. A non-tag ref has no upstream release, so the "
+                         "upstream asset index entries are skipped.")
     ap.add_argument("--commit", required=True)
     ap.add_argument("--dist", required=True, type=Path, help="dir holding the built app-*.tar.gz bundles")
     ap.add_argument("--out", required=True, type=Path, help="dir to write the two JSON sidecars into")
@@ -249,6 +255,10 @@ def main() -> int:
 
     token = args.token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     tag, commit, short = args.tag, args.commit, args.commit[:7]
+    ref = args.ref or f"refs/tags/{tag}"
+    is_release_tag = ref == f"refs/tags/{tag}"
+    ref_kind = "tag" if is_release_tag else "pr" if ref.startswith("refs/pull/") else "ref"
+    source_ref = tag if is_release_tag else ref
     args.out.mkdir(parents=True, exist_ok=True)
 
     def base_entry(kind: str, repo: str, digest: str) -> dict:
@@ -322,34 +332,40 @@ def main() -> int:
     # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
     #    API response; fall back to a streaming hash if a digest is missing.
     #    macOS is absent here on purpose -- we build our own slices in 1c.
-    assets = upstream_assets(tag, token)
-    wanted: list[tuple[str, str]] = []  # (name, kind)
-    for name in sorted(assets):
-        if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
-            wanted.append((name, "windows-cuda-upstream"))
-        # The win-cuda BINARY zips must be recorded under their own names too:
-        # the installer resolves an attempt's hash by exact asset name first
-        # and only then falls back to the cudart alias, so without these
-        # entries every Windows CUDA binary gets paired with the cudart digest
-        # and fails download verification.
-        elif re.fullmatch(
-            rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
+    #    A non-tag ref (PR test build) has no upstream release to index, so the
+    #    whole section is skipped; such runs are never published anyway.
+    if not is_release_tag:
+        print(f"WARNING: source ref {ref} is not an upstream release tag; "
+              "skipping upstream asset index entries", file=sys.stderr)
+    else:
+        assets = upstream_assets(tag, token)
+        wanted: list[tuple[str, str]] = []  # (name, kind)
+        for name in sorted(assets):
+            if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
+                wanted.append((name, "windows-cuda-upstream"))
+            # The win-cuda BINARY zips must be recorded under their own names too:
+            # the installer resolves an attempt's hash by exact asset name first
+            # and only then falls back to the cudart alias, so without these
+            # entries every Windows CUDA binary gets paired with the cudart digest
+            # and fails download verification.
+            elif re.fullmatch(
+                rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
+            ):
+                wanted.append((name, "windows-cuda-upstream"))
+        for name, kind in (
+            (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
+            (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
+            (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
+            (f"llama-{tag}-bin-win-vulkan-x64.zip",       "windows-vulkan-upstream"),
+            (f"llama-{tag}-bin-ubuntu-arm64.tar.gz",      "linux-arm64-upstream"),
+            (f"llama-{tag}-bin-win-cpu-arm64.zip",        "windows-arm64-upstream"),
         ):
-            wanted.append((name, "windows-cuda-upstream"))
-    for name, kind in (
-        (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
-        (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
-        (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
-        (f"llama-{tag}-bin-win-vulkan-x64.zip",       "windows-vulkan-upstream"),
-        (f"llama-{tag}-bin-ubuntu-arm64.tar.gz",      "linux-arm64-upstream"),
-        (f"llama-{tag}-bin-win-cpu-arm64.zip",        "windows-arm64-upstream"),
-    ):
-        if name not in assets:
-            print(f"WARNING: upstream asset {name} not found at {tag}; skipping", file=sys.stderr)
-            continue
-        wanted.append((name, kind))
-    for name, kind in wanted:
-        sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, asset_digest_or_hash(assets[name], token))
+            if name not in assets:
+                print(f"WARNING: upstream asset {name} not found at {tag}; skipping", file=sys.stderr)
+                continue
+            wanted.append((name, kind))
+        for name, kind in wanted:
+            sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, asset_digest_or_hash(assets[name], token))
 
     # 3) source tarballs: prefer a local copy in dist -- the workflow downloads
     #    them from codeload so the published asset and its recorded checksum are
@@ -358,7 +374,7 @@ def main() -> int:
     #    doesn't expose pre-computed digests, so we always hash the content.
     source_jobs = [
         (f"llama.cpp-source-{tag}.tar.gz", "upstream-source",
-         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/refs/tags/{tag}"),
+         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{ref}"),
         (f"llama.cpp-source-commit-{commit}.tar.gz", "exact-source",
          f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{commit}"),
     ]
@@ -373,7 +389,7 @@ def main() -> int:
         sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, digest)
 
     # 4) manifest, then hash it into the index
-    manifest = build_manifest(tag, commit, found, rocm_found, macos_found)
+    manifest = build_manifest(tag, commit, found, rocm_found, macos_found, ref_kind, source_ref)
     manifest_path = args.out / "llama-prebuilt-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     sha_artifacts["llama-prebuilt-manifest.json"] = base_entry(
@@ -384,12 +400,12 @@ def main() -> int:
         "artifacts": sha_artifacts,
         "component": "llama.cpp",
         "release_tag": tag,
-        "requested_source_ref": tag,
-        "resolved_source_ref": tag,
+        "requested_source_ref": source_ref,
+        "resolved_source_ref": source_ref,
         "schema_version": 1,
         "source_commit": commit,
         "source_commit_short": short,
-        "source_ref_kind": "tag",
+        "source_ref_kind": ref_kind,
         "source_repo": UPSTREAM_REPO,
         "source_repo_url": UPSTREAM_URL,
         "upstream_tag": tag,

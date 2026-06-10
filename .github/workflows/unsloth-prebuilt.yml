@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'ggml-org tag (b#### or "latest")'
+        description: 'ggml-org tag (b####, "latest", or pr/<number> to build an upstream PR head)'
         default: 'latest'
         required: true
         type: string
@@ -76,6 +76,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       tag: ${{ steps.r.outputs.tag }}
+      ref: ${{ steps.r.outputs.ref }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
@@ -109,24 +110,39 @@ jobs:
             esac
           fi
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
-          if [ "$REQ" = "latest" ]; then
-            # Newest published (non-draft, non-prerelease) release that has been
-            # public for >= AGE_H hours -- the supply-chain aging window. GitHub
-            # does not guarantee the list order, so pick the max by published_at
-            # explicitly rather than trusting `first`.
-            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
-            TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
-              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
-            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
-              exit 1
-            fi
-            echo "selected $TAG (aged >= ${AGE_H}h)"
+          if [ "${REQ#pr/}" != "$REQ" ]; then
+            # pr/<number>: build the head of an upstream PR. The synthetic tag
+            # embeds the short head SHA so every pushed head gets its own
+            # release. Published PR builds become "latest" like any other
+            # release. Children fetch the pull ref, so a PR force-pushed
+            # mid-run builds the newer head.
+            PR="${REQ#pr/}"
+            printf '%s' "$PR" | grep -qE '^[0-9]+$' || { echo "refusing malformed PR request '$REQ' (expected pr/<number>)" >&2; exit 1; }
+            COMMIT="$(gh api repos/ggml-org/llama.cpp/pulls/"$PR" --jq .head.sha)"
+            TAG="pr${PR}-$(printf '%.7s' "$COMMIT")"
+            REF="refs/pull/${PR}/head"
+            echo "selected PR #${PR} head ${COMMIT}"
           else
-            TAG="$REQ"   # explicit b#### override skips the aging filter
+            if [ "$REQ" = "latest" ]; then
+              # Newest published (non-draft, non-prerelease) release that has been
+              # public for >= AGE_H hours -- the supply-chain aging window. GitHub
+              # does not guarantee the list order, so pick the max by published_at
+              # explicitly rather than trusting `first`.
+              CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+              TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+                --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+              if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+                echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
+                exit 1
+              fi
+              echo "selected $TAG (aged >= ${AGE_H}h)"
+            else
+              TAG="$REQ"   # explicit b#### override skips the aging filter
+            fi
+            printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+            REF="refs/tags/${TAG}"
+            COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
           fi
-          printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
-          COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
 
           # Only PUBLISHED releases count as "exists"; a leftover draft (from
           # a failed prior publish) should not block today's rebuild.
@@ -175,6 +191,7 @@ jobs:
 
           {
             echo "tag=$TAG"
+            echo "ref=$REF"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
@@ -182,7 +199,7 @@ jobs:
             echo "rocm_matrix=$ROCM_MATRIX"
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved $REQ -> $TAG ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
+          echo "Resolved $REQ -> $TAG at $REF ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
   build-cuda:
     name: CUDA
@@ -191,6 +208,7 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
 
@@ -201,6 +219,7 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
 
@@ -211,6 +230,7 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
       matrix: ${{ needs.resolve.outputs.rocm_matrix }}
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
@@ -222,6 +242,7 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-macos.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
       matrix: ${{ needs.resolve.outputs.macos_matrix }}
 
   assemble:
@@ -269,10 +290,11 @@ jobs:
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
+          REF='${{ needs.resolve.outputs.ref }}'
           SHA='${{ needs.resolve.outputs.commit }}'
           mkdir -p dist
           curl -fL --retry 3 -o "dist/llama.cpp-source-${TAG}.tar.gz" \
-            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/${TAG}"
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${REF}"
           curl -fL --retry 3 -o "dist/llama.cpp-source-commit-${SHA}.tar.gz" \
             "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${SHA}"
 
@@ -281,6 +303,7 @@ jobs:
           set -eux
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
+            --ref '${{ needs.resolve.outputs.ref }}' \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
             --publish-repo "$GITHUB_REPOSITORY"
@@ -336,7 +359,10 @@ jobs:
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
+          REF='${{ needs.resolve.outputs.ref }}'
           REPO="$GITHUB_REPOSITORY"
+          SRC="upstream $TAG"
+          case "$REF" in refs/pull/*) N="${REF#refs/pull/}"; SRC="upstream PR #${N%/head}" ;; esac
 
           # Atomic publish: upload as draft (hidden from the anon GitHub API
           # the installer uses), then flip draft=false only once every asset
@@ -347,6 +373,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for upstream $TAG (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for $SRC (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false

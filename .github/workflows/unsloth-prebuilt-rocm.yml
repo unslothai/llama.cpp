@@ -26,6 +26,11 @@ on:
         description: 'Upstream llama.cpp release tag (b####), resolved by parent'
         required: true
         type: string
+      ref:
+        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        required: false
+        default: ''
+        type: string
       matrix:
         description: 'gfx_target matrix JSON ({"gfx_target":[...]}), built by parent'
         required: true
@@ -193,12 +198,18 @@ jobs:
         # Extract the tarball
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
 
-    - name: Clone llama.cpp @ ${{ inputs.tag }}
+    - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
       run: |
-        $tag = "${{ inputs.tag }}"
-        Write-Host "Cloning llama.cpp version: $tag (full history so LLAMA_BUILD_NUMBER is correct)"
-        git clone --single-branch --branch $tag https://github.com/ggerganov/llama.cpp.git
+        $ref = "${{ inputs.ref || inputs.tag }}"
+        Write-Host "Cloning llama.cpp at ${ref} (full history so LLAMA_BUILD_NUMBER is correct)"
+        # fetch + detached checkout instead of clone --branch so pull refs
+        # (refs/pull/<n>/head) work too; those are not clonable as branches.
+        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
         cd llama.cpp
+        git fetch origin $ref
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        git checkout --detach FETCH_HEAD
+        if ($LASTEXITCODE -ne 0) { exit 1 }
 
         # Show current commit info
         Write-Host "Current llama.cpp commit:"
@@ -533,12 +544,16 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
-    - name: Clone llama.cpp @ ${{ inputs.tag }}
+    - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
       run: |
-        tag="${{ inputs.tag }}"
-        echo "Cloning llama.cpp version: $tag (full history so LLAMA_BUILD_NUMBER is correct)"
-        git clone --single-branch --branch "$tag" https://github.com/ggerganov/llama.cpp.git
+        ref="${{ inputs.ref || inputs.tag }}"
+        echo "Cloning llama.cpp at $ref (full history so LLAMA_BUILD_NUMBER is correct)"
+        # fetch + detached checkout instead of clone --branch so pull refs
+        # (refs/pull/<n>/head) work too; those are not clonable as branches.
+        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
         cd llama.cpp
+        git fetch origin "$ref"
+        git checkout --detach FETCH_HEAD
 
         # Show current commit info
         echo "Current llama.cpp commit:"
