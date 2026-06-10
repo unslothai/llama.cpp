@@ -245,8 +245,8 @@ def main() -> int:
     base_tag = args.base_tag or tag
     pr_set = json.loads(args.pr_set)
     # Upstream release assets exist only for a vanilla build of an upstream tag
-    # (a mix tag lives in the publish repo and has no upstream release).
-    is_upstream_release = source_repo == UPSTREAM_REPO and ref == f"refs/tags/{tag}"
+    # (a mix build's merged tree exists in no repo, only in its release assets).
+    is_upstream_release = source_repo == UPSTREAM_REPO and ref == f"refs/tags/{tag}" and not pr_set
     ref_kind = "tag" if is_upstream_release else "mix" if pr_set else "ref"
     source_ref = tag if ref == f"refs/tags/{tag}" else ref
     args.out.mkdir(parents=True, exist_ok=True)
