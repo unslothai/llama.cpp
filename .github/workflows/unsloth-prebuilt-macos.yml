@@ -18,9 +18,14 @@ on:
         required: true
         type: string
       ref:
-        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
         required: false
         default: ''
+        type: string
+      repo:
+        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
         type: string
       matrix:
         description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
@@ -47,7 +52,7 @@ jobs:
       - name: Checkout upstream source @ ${{ inputs.tag }}
         uses: actions/checkout@v6
         with:
-          repository: ggml-org/llama.cpp
+          repository: ${{ inputs.repo }}
           ref: ${{ inputs.ref || inputs.tag }}
           path: src
           # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`

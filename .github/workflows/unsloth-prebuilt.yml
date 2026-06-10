@@ -13,6 +13,11 @@ name: Unsloth prebuilt (full release)
 # any child fails, `assemble` skips and no release is published. The
 # installer needs the full bundle set at the same tag or it'll dispatch to
 # something that isn't there.
+#
+# Mix builds: scripts/unsloth/pr-set.json can list upstream PR urls to merge
+# into the build. `resolve` merges the open ones onto the base tag, pushes the
+# merged commit to this repo as tag b####-mix-<hash>, and the children build
+# that tag instead of the upstream one. Empty list = vanilla upstream build.
 
 on:
   schedule:
@@ -20,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'ggml-org tag (b####, "latest", or pr/<number> to build an upstream PR head)'
+        description: 'ggml-org tag (b#### or "latest")'
         default: 'latest'
         required: true
         type: string
@@ -77,6 +82,9 @@ jobs:
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       ref: ${{ steps.r.outputs.ref }}
+      repo: ${{ steps.r.outputs.repo }}
+      base: ${{ steps.r.outputs.base }}
+      prs: ${{ steps.r.outputs.prs }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
@@ -86,6 +94,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Shallow by default (only pr-set.json is needed); a mix build unshallows
+      # in-place to merge PRs and pushes the result back here, reusing this
+      # checkout's credentials.
+      - name: Checkout (pr-set.json + mix tag push access)
+        uses: actions/checkout@v6
       - id: r
         run: |
           set -euo pipefail
@@ -110,38 +123,88 @@ jobs:
             esac
           fi
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
-          if [ "${REQ#pr/}" != "$REQ" ]; then
-            # pr/<number>: build the head of an upstream PR. The synthetic tag
-            # embeds the short head SHA so every pushed head gets its own
-            # release. Published PR builds become "latest" like any other
-            # release. Children fetch the pull ref, so a PR force-pushed
-            # mid-run builds the newer head.
-            PR="${REQ#pr/}"
-            printf '%s' "$PR" | grep -qE '^[0-9]+$' || { echo "refusing malformed PR request '$REQ' (expected pr/<number>)" >&2; exit 1; }
-            COMMIT="$(gh api repos/ggml-org/llama.cpp/pulls/"$PR" --jq .head.sha)"
-            TAG="pr${PR}-$(printf '%.7s' "$COMMIT")"
-            REF="refs/pull/${PR}/head"
-            echo "selected PR #${PR} head ${COMMIT}"
-          else
-            if [ "$REQ" = "latest" ]; then
-              # Newest published (non-draft, non-prerelease) release that has been
-              # public for >= AGE_H hours -- the supply-chain aging window. GitHub
-              # does not guarantee the list order, so pick the max by published_at
-              # explicitly rather than trusting `first`.
-              CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
-              TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
-                --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
-              if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-                echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
-                exit 1
-              fi
-              echo "selected $TAG (aged >= ${AGE_H}h)"
-            else
-              TAG="$REQ"   # explicit b#### override skips the aging filter
+          if [ "$REQ" = "latest" ]; then
+            # Newest published (non-draft, non-prerelease) release that has been
+            # public for >= AGE_H hours -- the supply-chain aging window. GitHub
+            # does not guarantee the list order, so pick the max by published_at
+            # explicitly rather than trusting `first`.
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
+              echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
+              exit 1
             fi
-            printf '%s' "$TAG" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+            echo "selected $BASE (aged >= ${AGE_H}h)"
+          else
+            BASE="$REQ"   # explicit b#### override skips the aging filter
+          fi
+          printf '%s' "$BASE" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$BASE'" >&2; exit 1; }
+
+          # Resolve the PR mix set (scripts/unsloth/pr-set.json): upstream PR
+          # urls, optionally pinned to a commit via a .../pull/<n>/commits/<sha>
+          # url. Non-open PRs are skipped, so merged or abandoned entries rot
+          # away harmlessly instead of breaking the nightly.
+          jq -e '.prs | type == "array"' scripts/unsloth/pr-set.json >/dev/null \
+            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR urls" >&2; exit 1; }
+          PRS='[]'
+          URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)(/commits/([0-9a-f]{40}))?/?$'
+          for url in $(jq -r '.prs[]' scripts/unsloth/pr-set.json); do
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/ggml-org/llama.cpp/pull/<n> or .../pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            NUM="${BASH_REMATCH[1]}"; PIN="${BASH_REMATCH[3]}"
+            # plain assignment first so a gh failure aborts the run (set -e)
+            # instead of being swallowed by read and silently skipping the PR
+            STATE_HEAD="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}" --jq '.state + " " + .head.sha')"
+            read -r STATE HEAD <<<"$STATE_HEAD"
+            if [ "$STATE" != "open" ]; then
+              echo "skipping PR #${NUM} (${STATE}): $url"
+              continue
+            fi
+            SHA="${PIN:-$HEAD}"
+            [ -z "$PIN" ] || [ "$PIN" = "$HEAD" ] || echo "note: PR #${NUM} is pinned to ${PIN} but its head has moved to ${HEAD}"
+            echo "including PR #${NUM} @ ${SHA}${PIN:+ (pinned)}"
+            PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" '. + [{number: ($n|tonumber), sha: $s, url: $u}]' <<<"$PRS")"
+          done
+
+          if [ "$(jq length <<<"$PRS")" = 0 ]; then
+            TAG="$BASE"
+            REPO='ggml-org/llama.cpp'
             REF="refs/tags/${TAG}"
-            COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$TAG" --jq .sha)"
+            COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$BASE" --jq .sha)"
+          else
+            # Merge the set onto the base once, here, and push the result to
+            # this repo as a tag every build child fetches: one merge,
+            # identical trees everywhere, full history for LLAMA_BUILD_NUMBER,
+            # and codeload serves the real merged source for the release's
+            # source-tarball assets. The tag embeds a hash of the PR head SHAs,
+            # so a PR that diverges (force-push) yields a new tag and build,
+            # and an unchanged set reuses the already-pushed tag.
+            SETHASH="$(jq -r 'map("\(.number):\(.sha)") | sort | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
+            TAG="${BASE}-mix-${SETHASH}"
+            REPO="$GITHUB_REPOSITORY"
+            REF="refs/tags/${TAG}"
+            COMMIT="$(git ls-remote origin "$REF" | cut -f1)"
+            if [ -n "$COMMIT" ]; then
+              echo "reusing existing ${TAG} (${COMMIT})"
+            else
+              if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+                git fetch -q --unshallow --no-tags origin
+              fi
+              git remote add upstream https://github.com/ggml-org/llama.cpp.git
+              git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
+              git checkout -q --detach "refs/tags/${BASE}"
+              for pair in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
+                NUM="${pair%%:*}"; SHA="${pair##*:}"
+                git fetch -q --no-tags upstream "$SHA"
+                git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                  merge --no-ff --no-edit -m "Merge ggml-org/llama.cpp#${NUM} @ ${SHA}" "$SHA" \
+                  || { echo "PR #${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
+              done
+              COMMIT="$(git rev-parse HEAD)"
+              git tag "$TAG"
+              git push -q origin "$REF"
+              echo "pushed ${TAG} (${COMMIT})"
+            fi
           fi
 
           # Only PUBLISHED releases count as "exists"; a leftover draft (from
@@ -192,6 +255,9 @@ jobs:
           {
             echo "tag=$TAG"
             echo "ref=$REF"
+            echo "repo=$REPO"
+            echo "base=$BASE"
+            echo "prs=$PRS"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
@@ -199,7 +265,7 @@ jobs:
             echo "rocm_matrix=$ROCM_MATRIX"
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved $REQ -> $TAG at $REF ($COMMIT); release exists=$EXISTS; only=$ONLY; gfx=$GFX"
+          echo "Resolved $REQ -> $TAG at ${REPO}@${REF} ($COMMIT); prs=$PRS; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
   build-cuda:
     name: CUDA
@@ -209,6 +275,7 @@ jobs:
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
 
@@ -220,6 +287,7 @@ jobs:
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
 
@@ -231,6 +299,7 @@ jobs:
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
       matrix: ${{ needs.resolve.outputs.rocm_matrix }}
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'latest' }}
@@ -243,6 +312,7 @@ jobs:
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
       matrix: ${{ needs.resolve.outputs.macos_matrix }}
 
   assemble:
@@ -282,21 +352,23 @@ jobs:
           pattern: app-*
           merge-multiple: true
 
-      # Ship the upstream source tarballs as release assets so the installer's
-      # source-build fallback has a tree to fetch. Downloaded into dist/ (not
-      # self-tarred) so the published bytes match the sha256 index, which
-      # assemble_metadata records by hashing these exact local files.
-      - name: Fetch upstream source archives
+      # Ship the source tarballs (upstream tag, or this repo's merged mix tag)
+      # as release assets so the installer's source-build fallback has a tree
+      # to fetch. Downloaded into dist/ (not self-tarred) so the published
+      # bytes match the sha256 index, which assemble_metadata records by
+      # hashing these exact local files.
+      - name: Fetch source archives
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
           REF='${{ needs.resolve.outputs.ref }}'
+          REPO='${{ needs.resolve.outputs.repo }}'
           SHA='${{ needs.resolve.outputs.commit }}'
           mkdir -p dist
           curl -fL --retry 3 -o "dist/llama.cpp-source-${TAG}.tar.gz" \
-            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${REF}"
+            "https://codeload.github.com/${REPO}/tar.gz/${REF}"
           curl -fL --retry 3 -o "dist/llama.cpp-source-commit-${SHA}.tar.gz" \
-            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${SHA}"
+            "https://codeload.github.com/${REPO}/tar.gz/${SHA}"
 
       - name: Generate manifest + sha256 index
         run: |
@@ -304,6 +376,9 @@ jobs:
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
             --ref '${{ needs.resolve.outputs.ref }}' \
+            --source-repo '${{ needs.resolve.outputs.repo }}' \
+            --base-tag '${{ needs.resolve.outputs.base }}' \
+            --pr-set '${{ needs.resolve.outputs.prs }}' \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
             --publish-repo "$GITHUB_REPOSITORY"
@@ -359,10 +434,10 @@ jobs:
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
-          REF='${{ needs.resolve.outputs.ref }}'
           REPO="$GITHUB_REPOSITORY"
-          SRC="upstream $TAG"
-          case "$REF" in refs/pull/*) N="${REF#refs/pull/}"; SRC="upstream PR #${N%/head}" ;; esac
+          PRS='${{ needs.resolve.outputs.prs }}'
+          SRC="upstream ${{ needs.resolve.outputs.base }}"
+          [ "$(jq length <<<"$PRS")" = 0 ] || SRC="$SRC + $(jq -r 'map("PR #\(.number) @ \(.sha[0:7])") | join(", ")' <<<"$PRS")"
 
           # Atomic publish: upload as draft (hidden from the anon GitHub API
           # the installer uses), then flip draft=false only once every asset
@@ -373,6 +448,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for $SRC (ggml-org/llama.cpp@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for $SRC (${{ needs.resolve.outputs.repo }}@${{ needs.resolve.outputs.commit }})." \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false

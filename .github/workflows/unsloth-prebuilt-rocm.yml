@@ -27,9 +27,14 @@ on:
         required: true
         type: string
       ref:
-        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
         required: false
         default: ''
+        type: string
+      repo:
+        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
         type: string
       matrix:
         description: 'gfx_target matrix JSON ({"gfx_target":[...]}), built by parent'
@@ -202,9 +207,7 @@ jobs:
       run: |
         $ref = "${{ inputs.ref || inputs.tag }}"
         Write-Host "Cloning llama.cpp at ${ref} (full history so LLAMA_BUILD_NUMBER is correct)"
-        # fetch + detached checkout instead of clone --branch so pull refs
-        # (refs/pull/<n>/head) work too; those are not clonable as branches.
-        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
+        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
         cd llama.cpp
         git fetch origin $ref
         if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -548,9 +551,7 @@ jobs:
       run: |
         ref="${{ inputs.ref || inputs.tag }}"
         echo "Cloning llama.cpp at $ref (full history so LLAMA_BUILD_NUMBER is correct)"
-        # fetch + detached checkout instead of clone --branch so pull refs
-        # (refs/pull/<n>/head) work too; those are not clonable as branches.
-        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
+        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
         cd llama.cpp
         git fetch origin "$ref"
         git checkout --detach FETCH_HEAD
