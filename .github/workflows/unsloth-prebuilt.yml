@@ -176,10 +176,11 @@ jobs:
             # this repo as a tag every build child fetches: one merge,
             # identical trees everywhere, full history for LLAMA_BUILD_NUMBER,
             # and codeload serves the real merged source for the release's
-            # source-tarball assets. The tag embeds a hash of the PR head SHAs,
-            # so a PR that diverges (force-push) yields a new tag and build,
-            # and an unchanged set reuses the already-pushed tag.
-            SETHASH="$(jq -r 'map("\(.number):\(.sha)") | sort | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
+            # source-tarball assets. The tag embeds a hash of the PR head SHAs
+            # in listed order (merge order can matter for conflicts), so a
+            # force-pushed PR or a reorder yields a new tag and build, and an
+            # unchanged set reuses the already-pushed tag.
+            SETHASH="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
             TAG="${BASE}-mix-${SETHASH}"
             REPO="$GITHUB_REPOSITORY"
             REF="refs/tags/${TAG}"

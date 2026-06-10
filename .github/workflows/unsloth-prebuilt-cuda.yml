@@ -198,6 +198,7 @@ jobs:
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ inputs.tag }}
           SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
           PROFILE: ${{ matrix.profile }}
           LINE: ${{ matrix.line }}
           KLASS: ${{ matrix.klass }}
