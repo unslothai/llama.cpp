@@ -327,6 +327,15 @@ def main() -> int:
     for name in sorted(assets):
         if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
             wanted.append((name, "windows-cuda-upstream"))
+        # The win-cuda BINARY zips must be recorded under their own names too:
+        # the installer resolves an attempt's hash by exact asset name first
+        # and only then falls back to the cudart alias, so without these
+        # entries every Windows CUDA binary gets paired with the cudart digest
+        # and fails download verification.
+        elif re.fullmatch(
+            rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
+        ):
+            wanted.append((name, "windows-cuda-upstream"))
     for name, kind in (
         (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
         (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
