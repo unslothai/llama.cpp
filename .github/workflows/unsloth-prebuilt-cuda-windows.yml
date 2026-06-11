@@ -191,6 +191,30 @@ jobs:
           cmake --build build --config Release -j 2 `
             --target llama-server llama-quantize
 
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the Linux CUDA child for
+      # the rationale. package_bundle.py ships the .exe only if it was produced.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          if (-not (Test-Path "examples/diffusion-gemma-server")) {
+            Write-Host "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          }
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
+            exit 0
+          }
+          cmake --build build --config Release -j 2 `
+            --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          } else {
+            Write-Host "built DiffusionGemma binaries"
+          }
+          exit 0
+
       - name: Package bundle
         env:
           PLATFORM: windows

@@ -215,6 +215,30 @@ jobs:
             --target llama-server llama-quantize
           strip build/bin/llama-server build/bin/llama-quantize || true
 
+      # The DiffusionGemma visual server + cli are example targets that exist
+      # only when the source tree carries ggml-org/llama.cpp#24423 (a mix build).
+      # Build them best-effort and NEVER fail the job: the required server +
+      # quantize bundle above must publish even if these do not compile on a
+      # given toolchain. package_bundle.py ships them only if they were produced.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          set -u
+          if [ ! -d examples/diffusion-gemma-server ]; then
+            echo "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          fi
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON \
+            || { echo "reconfigure for examples failed; skipping DiffusionGemma binaries"; exit 0; }
+          if cmake --build build --config Release -j 2 \
+              --target llama-diffusion-gemma-visual-server llama-diffusion-cli; then
+            strip build/bin/llama-diffusion-gemma-visual-server build/bin/llama-diffusion-cli || true
+            echo "built DiffusionGemma binaries"
+          else
+            echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          fi
+          exit 0
+
       - name: Package bundle
         env:
           PLATFORM: linux

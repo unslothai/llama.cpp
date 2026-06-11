@@ -57,9 +57,17 @@ class PlatformStrategy:
     archive_ext = ".tar.gz"
     rpath = ""
     binaries = ["llama-server", "llama-quantize"]
+    # Extras shipped only when the build produced them (the DiffusionGemma
+    # binaries from a mix build that includes ggml-org/llama.cpp#24423). A plain
+    # upstream build never builds these, so -- unlike `binaries`, every one of
+    # which must exist -- their absence is not an error.
+    optional_binaries = ["llama-diffusion-gemma-visual-server", "llama-diffusion-cli"]
 
     def shipped_binaries(self) -> list[str]:
         return [b + self.exe_suffix for b in self.binaries]
+
+    def optional_shipped_binaries(self) -> list[str]:
+        return [b + self.exe_suffix for b in self.optional_binaries]
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
         """Names of dynamic libs `path` needs that are *local* (live in bin_dir)."""
@@ -170,6 +178,16 @@ def curate(strategy: PlatformStrategy, bin_dir: Path, stage: Path) -> None:
             sys.exit(f"ERROR: missing {bin_dir / b}")
         shutil.copy2(bin_dir / b, stage / b)
         roots.append(stage / b)
+
+    # Optional binaries: ship the ones this build produced, skip the rest. They
+    # become roots too, so any library only they need is pulled into the closure
+    # (the DiffusionGemma binaries need only libllama/libggml/libllama-common,
+    # which llama-server already pulls, but treat them as roots for safety).
+    for b in strategy.optional_shipped_binaries():
+        src = bin_dir / b
+        if src.exists():
+            shutil.copy2(src, stage / b)
+            roots.append(stage / b)
 
     # Backend modules are dlopen'd, so they never appear in the NEEDED graph;
     # copy them explicitly and treat them as extra roots so their own local

@@ -104,6 +104,29 @@ jobs:
       - name: Load gate (minos <= ${{ matrix.deploy_target }}, arch, launch)
         run: bash tooling/scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.expect_arch }}" "${{ matrix.deploy_target }}"
 
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. Built after the load gate so
+      # they do not affect the required-binary minos check; the same cached
+      # deployment target applies. The bundle tars all of build/bin, so anything
+      # produced here is shipped automatically.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          set -u
+          if [ ! -d examples/diffusion-gemma-server ]; then
+            echo "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          fi
+          cmake -B build -DLLAMA_BUILD_EXAMPLES=ON \
+            || { echo "reconfigure for examples failed; skipping DiffusionGemma binaries"; exit 0; }
+          if cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" \
+              --target llama-diffusion-gemma-visual-server llama-diffusion-cli; then
+            echo "built DiffusionGemma binaries"
+          else
+            echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          fi
+          exit 0
+
       - name: Package bundle
         working-directory: src
         run: |

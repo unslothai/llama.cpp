@@ -7,6 +7,6 @@
     "Closed or merged PRs are skipped automatically, and an empty list is a plain upstream build."
   ],
   "prs": [
-    "https://github.com/ggml-org/llama.cpp/pull/24423/commits/c84e85af61011f9fbfcf41479381d5ed1661a564"
+    "https://github.com/ggml-org/llama.cpp/pull/24423/commits/10a2613aa0b2686f7d0608520c4f0ea05219df03"
   ]
 }
