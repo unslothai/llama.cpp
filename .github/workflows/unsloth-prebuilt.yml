@@ -151,8 +151,9 @@ jobs:
           # is ever built, so a PR author pushing more commits cannot change
           # what the nightly ships. Non-open PRs are skipped, so merged or
           # abandoned entries rot away harmlessly instead of breaking the
-          # nightly. unsloth-pr-set-lint.yml runs these same checks (plus pin
-          # membership) on every push that edits the file.
+          # nightly. unsloth-pr-set-lint.yml runs the same checks on every
+          # push that edits the file, but that is only a tripwire -- a red
+          # lint does not stop the schedule, so the gate must live here.
           jq -e '.prs | type == "array" and all(.[]; type == "string")' scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings" >&2; exit 1; }
           PRS='[]'
@@ -162,11 +163,21 @@ jobs:
             NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
             # plain assignment first so a gh failure aborts the run (set -e)
             # instead of being swallowed by read and silently skipping the PR
-            STATE_HEAD="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}" --jq '.state + " " + .head.sha')"
-            read -r STATE HEAD <<<"$STATE_HEAD"
+            STATE_HEAD="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}" --jq '.state + " " + .head.sha + " " + (.commits|tostring)')"
+            read -r STATE HEAD N_COMMITS <<<"$STATE_HEAD"
             if [ "$STATE" != "open" ]; then
               echo "skipping PR #${NUM} (${STATE}): $url"
               continue
+            fi
+            # A pin pasted from the wrong PR would build arbitrary upstream
+            # code while the manifest blames PR #<num>; require the pinned
+            # commit to be a commit of that PR. The commits listing is capped
+            # at 250 by the API; past that, skip rather than false-fail.
+            if [ "$N_COMMITS" -gt 250 ]; then
+              echo "note: PR #${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/ggml-org/llama.cpp/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
+              echo "refusing PR #${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away); fix the pin in scripts/unsloth/pr-set.json" >&2
+              exit 1
             fi
             [ "$SHA" = "$HEAD" ] || echo "note: PR #${NUM} is pinned to ${SHA} but its head has moved to ${HEAD}"
             echo "including PR #${NUM} @ ${SHA}"
