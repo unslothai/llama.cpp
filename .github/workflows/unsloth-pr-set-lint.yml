@@ -1,0 +1,63 @@
+name: "Unsloth: lint pr-set.json"
+
+# Tripwire for edits to the mix-build PR set: validates the file the moment a
+# commit touching it is pushed (the team edits it by pushing to master, so
+# there is no PR gate to hook). A bad entry can never build -- the nightly's
+# resolve job re-runs the same structural checks -- but this surfaces the
+# mistake on the commit within seconds instead of failing the 3 AM build, and
+# adds the one check resolve skips: that each pinned commit actually belongs
+# to the PR it is listed under (a wrong paste would otherwise merge unreviewed
+# code while the manifest blames the named PR).
+
+on:
+  push:
+    paths:
+      - scripts/unsloth/pr-set.json
+  pull_request:
+    paths:
+      - scripts/unsloth/pr-set.json
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Validate pr-set.json
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          set -euo pipefail
+          FILE=scripts/unsloth/pr-set.json
+          jq -e '.prs | type == "array" and all(.[]; type == "string")' "$FILE" >/dev/null \
+            || { echo "::error file=$FILE::.prs must be an array of PR url strings" >&2; exit 1; }
+          URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          fail=0
+          for url in $(jq -r '.prs[]' "$FILE"); do
+            if ! [[ "$url" =~ $URL_RE ]]; then
+              echo "::error file=$FILE::malformed entry '$url' (expected https://github.com/ggml-org/llama.cpp/pull/<n>/commits/<40-hex-sha>)"
+              fail=1
+              continue
+            fi
+            NUM="${BASH_REMATCH[1]}"; PIN="${BASH_REMATCH[2]}"
+            PR_JSON="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}" --jq '{state: .state, commits: .commits, head: .head.sha}')"
+            STATE="$(jq -r .state <<<"$PR_JSON")"
+            COMMITS="$(jq -r .commits <<<"$PR_JSON")"
+            HEAD="$(jq -r .head <<<"$PR_JSON")"
+            [ "$STATE" = "open" ] || echo "::warning file=$FILE::PR #${NUM} is ${STATE}; the nightly will skip this entry"
+            # The commits listing is capped at 250 by the API; past that the
+            # membership check cannot be trusted, so skip it rather than
+            # false-fail a legitimate giant PR.
+            if [ "$COMMITS" -gt 250 ]; then
+              echo "::notice::PR #${NUM} has ${COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/ggml-org/llama.cpp/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$PIN"; then
+              echo "::error file=$FILE::pinned commit ${PIN} is not a commit of PR #${NUM}"
+              fail=1
+              continue
+            fi
+            [ "$PIN" = "$HEAD" ] || echo "::notice::PR #${NUM} pin ${PIN} is behind its head ${HEAD}"
+            echo "OK: PR #${NUM} @ ${PIN} (${STATE})"
+          done
+          exit "$fail"
