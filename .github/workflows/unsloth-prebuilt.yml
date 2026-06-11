@@ -150,8 +150,8 @@ jobs:
           # urls, optionally pinned to a commit via a .../pull/<n>/commits/<sha>
           # url. Non-open PRs are skipped, so merged or abandoned entries rot
           # away harmlessly instead of breaking the nightly.
-          jq -e '.prs | type == "array"' scripts/unsloth/pr-set.json >/dev/null \
-            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR urls" >&2; exit 1; }
+          jq -e '.prs | type == "array" and all(.[]; type == "string")' scripts/unsloth/pr-set.json >/dev/null \
+            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings" >&2; exit 1; }
           PRS='[]'
           URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)(/commits/([0-9a-f]{40}))?/?$'
           for url in $(jq -r '.prs[]' scripts/unsloth/pr-set.json); do
