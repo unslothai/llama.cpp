@@ -14,11 +14,11 @@ name: Unsloth prebuilt (full release)
 # installer needs the full bundle set at the same tag or it'll dispatch to
 # something that isn't there.
 #
-# Mix builds: scripts/unsloth/pr-set.json can list upstream PR urls to merge
-# into the build. `resolve` merges the open ones onto the base tag and uploads
-# the merged tree as a workflow artifact that the children extract instead of
-# cloning; the release is tagged b####-mix-<hash>. Empty list = vanilla
-# upstream build.
+# Mix builds: scripts/unsloth/pr-set.json can list upstream PRs (each pinned
+# to an exact commit) to merge into the build. `resolve` merges the open ones
+# onto the base tag and uploads the merged tree as a workflow artifact that
+# the children extract instead of cloning; the release is tagged
+# b####-mix-<hash>. Empty list = vanilla upstream build.
 
 on:
   schedule:
@@ -147,16 +147,19 @@ jobs:
           printf '%s' "$BASE" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$BASE'" >&2; exit 1; }
 
           # Resolve the PR mix set (scripts/unsloth/pr-set.json): upstream PR
-          # urls, optionally pinned to a commit via a .../pull/<n>/commits/<sha>
-          # url. Non-open PRs are skipped, so merged or abandoned entries rot
-          # away harmlessly instead of breaking the nightly.
+          # commit urls. Pins are mandatory -- only an exact, reviewed commit
+          # is ever built, so a PR author pushing more commits cannot change
+          # what the nightly ships. Non-open PRs are skipped, so merged or
+          # abandoned entries rot away harmlessly instead of breaking the
+          # nightly. unsloth-pr-set-lint.yml runs these same checks (plus pin
+          # membership) on every push that edits the file.
           jq -e '.prs | type == "array" and all(.[]; type == "string")' scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings" >&2; exit 1; }
           PRS='[]'
-          URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)(/commits/([0-9a-f]{40}))?/?$'
+          URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           for url in $(jq -r '.prs[]' scripts/unsloth/pr-set.json); do
-            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/ggml-org/llama.cpp/pull/<n> or .../pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
-            NUM="${BASH_REMATCH[1]}"; PIN="${BASH_REMATCH[3]}"
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/ggml-org/llama.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
             # plain assignment first so a gh failure aborts the run (set -e)
             # instead of being swallowed by read and silently skipping the PR
             STATE_HEAD="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}" --jq '.state + " " + .head.sha')"
@@ -165,9 +168,8 @@ jobs:
               echo "skipping PR #${NUM} (${STATE}): $url"
               continue
             fi
-            SHA="${PIN:-$HEAD}"
-            [ -z "$PIN" ] || [ "$PIN" = "$HEAD" ] || echo "note: PR #${NUM} is pinned to ${PIN} but its head has moved to ${HEAD}"
-            echo "including PR #${NUM} @ ${SHA}${PIN:+ (pinned)}"
+            [ "$SHA" = "$HEAD" ] || echo "note: PR #${NUM} is pinned to ${SHA} but its head has moved to ${HEAD}"
+            echo "including PR #${NUM} @ ${SHA}"
             PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" '. + [{number: ($n|tonumber), sha: $s, url: $u}]' <<<"$PRS")"
           done
 
@@ -183,9 +185,9 @@ jobs:
             # trees everywhere, nothing pushed to the repo (GITHUB_TOKEN may
             # never push commits touching .github/workflows, which upstream
             # history routinely does). The synthetic tag embeds a hash of the
-            # PR head SHAs in listed order (merge order can matter for
-            # conflicts), so a force-pushed PR or a reorder yields a new tag
-            # and build, while the release "exists" check below still skips
+            # pinned SHAs in listed order (merge order can matter for
+            # conflicts), so a pin update or a reorder yields a new tag and
+            # build, while the release "exists" check below still skips
             # rebuilding an already-published set.
             SETHASH="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
             TAG="${BASE}-mix-${SETHASH}"
