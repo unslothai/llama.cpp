@@ -204,7 +204,8 @@ jobs:
             git checkout -q --detach "refs/tags/${BASE}"
             for pair in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
               NUM="${pair%%:*}"; SHA="${pair##*:}"
-              git fetch -q --no-tags upstream "$SHA"
+              git fetch -q --no-tags upstream "$SHA" \
+                || { echo "could not fetch commit ${SHA} for PR #${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
               git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
                 merge --no-ff --no-edit -m "Merge ggml-org/llama.cpp#${NUM} @ ${SHA}" "$SHA" \
                 || { echo "PR #${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
