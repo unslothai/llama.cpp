@@ -30,7 +30,17 @@ on:
         required: true
         type: string
       ref:
-        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
+        required: false
+        default: ''
+        type: string
+      repo:
+        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact holding the merged source tarball (mix builds); empty = clone repo at ref'
         required: false
         default: ''
         type: string
@@ -202,12 +212,11 @@ jobs:
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
 
     - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
+      if: inputs.source_artifact == ''
       run: |
         $ref = "${{ inputs.ref || inputs.tag }}"
         Write-Host "Cloning llama.cpp at ${ref} (full history so LLAMA_BUILD_NUMBER is correct)"
-        # fetch + detached checkout instead of clone --branch so pull refs
-        # (refs/pull/<n>/head) work too; those are not clonable as branches.
-        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
+        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
         cd llama.cpp
         git fetch origin $ref
         if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -217,6 +226,23 @@ jobs:
         # Show current commit info
         Write-Host "Current llama.cpp commit:"
         git log --oneline -1
+
+    # Mix builds: the parent's resolve job merged the PR set and uploaded the
+    # tree (with build number/commit pre-baked into cmake/build-info.cmake,
+    # since there is no .git here) as an artifact.
+    - name: Download merged source @ ${{ inputs.tag }}
+      if: inputs.source_artifact != ''
+      uses: actions/download-artifact@v6
+      with:
+        name: ${{ inputs.source_artifact }}
+        path: srcpkg
+    - name: Extract merged source
+      if: inputs.source_artifact != ''
+      shell: bash
+      run: |
+        set -eux
+        mkdir -p llama.cpp
+        tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C llama.cpp --strip-components=1
 
     - name: Build Llama.cpp + ROCm
       shell: cmd
@@ -548,12 +574,11 @@ jobs:
         echo "ROCm environment variables set successfully"
 
     - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
+      if: inputs.source_artifact == ''
       run: |
         ref="${{ inputs.ref || inputs.tag }}"
         echo "Cloning llama.cpp at $ref (full history so LLAMA_BUILD_NUMBER is correct)"
-        # fetch + detached checkout instead of clone --branch so pull refs
-        # (refs/pull/<n>/head) work too; those are not clonable as branches.
-        git clone --single-branch --no-checkout https://github.com/ggerganov/llama.cpp.git
+        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
         cd llama.cpp
         git fetch origin "$ref"
         git checkout --detach FETCH_HEAD
@@ -561,6 +586,23 @@ jobs:
         # Show current commit info
         echo "Current llama.cpp commit:"
         git log --oneline -1
+
+    # Mix builds: the parent's resolve job merged the PR set and uploaded the
+    # tree (with build number/commit pre-baked into cmake/build-info.cmake,
+    # since there is no .git here) as an artifact.
+    - name: Download merged source @ ${{ inputs.tag }}
+      if: inputs.source_artifact != ''
+      uses: actions/download-artifact@v6
+      with:
+        name: ${{ inputs.source_artifact }}
+        path: srcpkg
+    - name: Extract merged source
+      if: inputs.source_artifact != ''
+      shell: bash
+      run: |
+        set -eux
+        mkdir -p llama.cpp
+        tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C llama.cpp --strip-components=1
 
     - name: Build Llama.cpp + ROCm
       run: |

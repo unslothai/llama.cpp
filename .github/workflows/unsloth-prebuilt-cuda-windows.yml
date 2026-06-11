@@ -24,7 +24,17 @@ on:
         required: true
         type: string
       ref:
-        description: 'Git ref to build (refs/tags/<tag> or refs/pull/<n>/head); defaults to tag'
+        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
+        required: false
+        default: ''
+        type: string
+      repo:
+        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact holding the merged source tarball (mix builds); empty = clone repo at ref'
         required: false
         default: ''
         type: string
@@ -53,15 +63,33 @@ jobs:
           path: tooling
 
       - name: Checkout upstream source @ ${{ inputs.tag }}
+        if: inputs.source_artifact == ''
         uses: actions/checkout@v6
         with:
-          repository: ggml-org/llama.cpp
+          repository: ${{ inputs.repo }}
           ref: ${{ inputs.ref || inputs.tag }}
           path: src
           # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
           # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.
           # A shallow clone would bake in "b1" instead.
           fetch-depth: 0
+
+      # Mix builds: the parent's resolve job merged the PR set and uploaded the
+      # tree (with build number/commit pre-baked into cmake/build-info.cmake,
+      # since there is no .git here) as an artifact.
+      - name: Download merged source @ ${{ inputs.tag }}
+        if: inputs.source_artifact != ''
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract merged source
+        if: inputs.source_artifact != ''
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
@@ -172,6 +200,8 @@ jobs:
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ inputs.tag }}
           SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+          SOURCE_REF_KIND: ${{ inputs.source_artifact != '' && 'mix' || 'tag' }}
           PROFILE: ${{ matrix.profile }}
           LINE: ${{ matrix.line }}
           KLASS: ${{ matrix.klass }}

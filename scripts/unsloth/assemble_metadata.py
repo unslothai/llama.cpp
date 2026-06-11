@@ -29,7 +29,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 UPSTREAM_REPO = "ggml-org/llama.cpp"
-UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}"
 
 BUNDLE_RE = re.compile(
     r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable))\.(?P<ext>tar\.gz|zip)$"
@@ -171,15 +170,11 @@ def asset_digest_or_hash(asset: dict, token: str | None) -> str:
     return sha256_url(asset["url"], token)
 
 
-def build_manifest(
-    tag: str,
-    commit: str,
+def build_artifacts(
     cuda_bundles: list[tuple[str, str, str, dict]],
     rocm_bundles: list[tuple[str, str, str]],
     macos_bundles: list[tuple[str, str]],
-    ref_kind: str,
-    source_ref: str,
-) -> dict:
+) -> list[dict]:
     """cuda_bundles: list of (asset_name, platform, arch, embedded UNSLOTH_PREBUILT_INFO).
     rocm_bundles:    list of (asset_name, platform, gfx_target).
     macos_bundles:   list of (asset_name, arch).
@@ -222,30 +217,20 @@ def build_manifest(
             "coverage_class": None,
             "rank": 50,
         })
-    return {
-        "schema_version": 1,
-        "component": "llama.cpp",
-        "source_repo": UPSTREAM_REPO,
-        "source_repo_url": UPSTREAM_URL,
-        "source_ref_kind": ref_kind,
-        "requested_source_ref": source_ref,
-        "resolved_source_ref": source_ref,
-        "source_commit": commit,
-        "source_commit_short": commit[:7],
-        "upstream_repo": UPSTREAM_REPO,
-        "upstream_tag": tag,
-        "generated_at_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "artifacts": artifacts,
-    }
+    return artifacts
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
     ap.add_argument("--ref", default=None,
-                    help="git ref the source was built from (refs/tags/<tag> or refs/pull/<n>/head); "
-                         "defaults to refs/tags/<tag>. A non-tag ref has no upstream release, so the "
-                         "upstream asset index entries are skipped.")
+                    help="git ref the source was built from; defaults to refs/tags/<tag>")
+    ap.add_argument("--source-repo", default=UPSTREAM_REPO,
+                    help="repo holding the source ref: upstream, or the publish repo for merged mix tags")
+    ap.add_argument("--base-tag", default=None,
+                    help="upstream release tag the build is based on; defaults to --tag (differs for mix builds)")
+    ap.add_argument("--pr-set", default="[]",
+                    help='JSON array of merged upstream PRs: [{"number":..,"sha":..,"url":..},..]')
     ap.add_argument("--commit", required=True)
     ap.add_argument("--dist", required=True, type=Path, help="dir holding the built app-*.tar.gz bundles")
     ap.add_argument("--out", required=True, type=Path, help="dir to write the two JSON sidecars into")
@@ -256,9 +241,14 @@ def main() -> int:
     token = args.token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     tag, commit, short = args.tag, args.commit, args.commit[:7]
     ref = args.ref or f"refs/tags/{tag}"
-    is_release_tag = ref == f"refs/tags/{tag}"
-    ref_kind = "tag" if is_release_tag else "pr" if ref.startswith("refs/pull/") else "ref"
-    source_ref = tag if is_release_tag else ref
+    source_repo = args.source_repo
+    base_tag = args.base_tag or tag
+    pr_set = json.loads(args.pr_set)
+    # Upstream release assets exist only for a vanilla build of an upstream tag
+    # (a mix build's merged tree exists in no repo, only in its release assets).
+    is_upstream_release = source_repo == UPSTREAM_REPO and ref == f"refs/tags/{tag}" and not pr_set
+    ref_kind = "tag" if is_upstream_release else "mix" if pr_set else "ref"
+    source_ref = tag if ref == f"refs/tags/{tag}" else ref
     args.out.mkdir(parents=True, exist_ok=True)
 
     def base_entry(kind: str, repo: str, digest: str) -> dict:
@@ -268,7 +258,7 @@ def main() -> int:
             "sha256": digest,
             "source_commit": commit,
             "source_commit_short": short,
-            "upstream_tag": tag,
+            "upstream_tag": base_tag,
         }
 
     sha_artifacts: dict[str, dict] = {}
@@ -332,10 +322,11 @@ def main() -> int:
     # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
     #    API response; fall back to a streaming hash if a digest is missing.
     #    macOS is absent here on purpose -- we build our own slices in 1c.
-    #    A non-tag ref (PR test build) has no upstream release to index, so the
-    #    whole section is skipped; such runs are never published anyway.
-    if not is_release_tag:
-        print(f"WARNING: source ref {ref} is not an upstream release tag; "
+    #    A mix build has no upstream release for its tag, so the whole section
+    #    is skipped; its uncovered hosts fall back to a source build of the
+    #    merged tree instead of a vanilla upstream binary missing the PRs.
+    if not is_upstream_release:
+        print(f"WARNING: {source_repo}@{ref} is not an upstream release tag; "
               "skipping upstream asset index entries", file=sys.stderr)
     else:
         assets = upstream_assets(tag, token)
@@ -374,9 +365,9 @@ def main() -> int:
     #    doesn't expose pre-computed digests, so we always hash the content.
     source_jobs = [
         (f"llama.cpp-source-{tag}.tar.gz", "upstream-source",
-         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{ref}"),
+         f"https://codeload.github.com/{source_repo}/tar.gz/{ref}"),
         (f"llama.cpp-source-commit-{commit}.tar.gz", "exact-source",
-         f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/{commit}"),
+         f"https://codeload.github.com/{source_repo}/tar.gz/{commit}"),
     ]
 
     def source_digest(name: str, url: str) -> str:
@@ -386,10 +377,30 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=2) as pool:
         source_digests = list(pool.map(lambda j: source_digest(j[0], j[2]), source_jobs))
     for (name, kind, _url), digest in zip(source_jobs, source_digests):
-        sha_artifacts[name] = base_entry(kind, UPSTREAM_REPO, digest)
+        sha_artifacts[name] = base_entry(kind, source_repo, digest)
 
-    # 4) manifest, then hash it into the index
-    manifest = build_manifest(tag, commit, found, rocm_found, macos_found, ref_kind, source_ref)
+    # 4) manifest, then hash it into the index. Both sidecars share the same
+    #    source-description header; merged_prs records the exact PR head SHAs
+    #    a mix build compiled (empty for vanilla builds).
+    common = {
+        "schema_version": 1,
+        "component": "llama.cpp",
+        "source_repo": source_repo,
+        "source_repo_url": f"https://github.com/{source_repo}",
+        "source_ref_kind": ref_kind,
+        "requested_source_ref": source_ref,
+        "resolved_source_ref": source_ref,
+        "source_commit": commit,
+        "source_commit_short": short,
+        "upstream_repo": UPSTREAM_REPO,
+        "upstream_tag": base_tag,
+        "merged_prs": pr_set,
+    }
+    manifest = {
+        **common,
+        "generated_at_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "artifacts": build_artifacts(found, rocm_found, macos_found),
+    }
     manifest_path = args.out / "llama-prebuilt-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     sha_artifacts["llama-prebuilt-manifest.json"] = base_entry(
@@ -397,18 +408,9 @@ def main() -> int:
     )
 
     sha256_doc = {
-        "artifacts": sha_artifacts,
-        "component": "llama.cpp",
+        **common,
         "release_tag": tag,
-        "requested_source_ref": source_ref,
-        "resolved_source_ref": source_ref,
-        "schema_version": 1,
-        "source_commit": commit,
-        "source_commit_short": short,
-        "source_ref_kind": ref_kind,
-        "source_repo": UPSTREAM_REPO,
-        "source_repo_url": UPSTREAM_URL,
-        "upstream_tag": tag,
+        "artifacts": sha_artifacts,
     }
     (args.out / "llama-prebuilt-sha256.json").write_text(json.dumps(sha256_doc, indent=2))
 

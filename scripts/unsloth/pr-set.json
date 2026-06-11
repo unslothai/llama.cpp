@@ -1,0 +1,11 @@
+{
+  "_doc": [
+    "ggml-org/llama.cpp PRs to merge into the nightly prebuilds. Each entry pins an exact",
+    "commit -- copy the url of the commit you reviewed from the PR's commits tab:",
+    "  https://github.com/ggml-org/llama.cpp/pull/15926/commits/59a3d0cb8f611aa3110ecea3d0afd16b1b18ee06",
+    "Only that commit is built, even if the author keeps pushing; update the pin to take newer code.",
+    "Closed or merged PRs are skipped automatically, and an empty list is a plain upstream build."
+  ],
+  "prs": [
+  ]
+}
