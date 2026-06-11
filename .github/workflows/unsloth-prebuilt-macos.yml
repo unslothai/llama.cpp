@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 name: "Unsloth prebuilt: macOS"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the macOS slices (arm64 Metal +
