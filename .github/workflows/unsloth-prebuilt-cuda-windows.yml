@@ -186,9 +186,11 @@ jobs:
       - name: Build
         working-directory: src
         run: |
-          # -j 2: nvcc TUs with the full arch fanout can spike past 12 GB each,
-          # and the GitHub-hosted runners only have ~16 GB.
-          cmake --build build --config Release -j 2 `
+          # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
+          # 4 vCPU / 16 GB GitHub-hosted runners (measured over a 1s sampler),
+          # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
+          # is ~2 physical cores + HT), so 3 is the sweet spot.
+          cmake --build build --config Release -j 3 `
             --target llama-server llama-quantize
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
@@ -206,7 +208,7 @@ jobs:
             Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
             exit 0
           }
-          cmake --build build --config Release -j 2 `
+          cmake --build build --config Release -j 3 `
             --target llama-diffusion-gemma-visual-server llama-diffusion-cli
           if ($LASTEXITCODE -ne 0) {
             Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
