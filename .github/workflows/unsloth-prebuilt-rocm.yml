@@ -272,8 +272,13 @@ jobs:
         set HIP_PLATFORM=amd
         set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;%PATH%
 
-        REM Set up x64 Native Tools Command Prompt environment
-        call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+        REM Set up x64 Native Tools Command Prompt environment.
+        REM Pin to the VS 2022 line (-version "[17.0,18.0)") so vswhere -latest does not
+        REM pick up the runner image's VS 2026 (MSVC 14.51), whose STL adds constexpr to
+        REM math builtins like isgreater; that constexpr (implicitly __host__ __device__)
+        REM collides with clang's HIP __device__ forward declares and breaks the ggml-cuda
+        REM .cu compile (ggml-org/llama.cpp#22570). VS 2022 (MSVC 14.44) is unaffected.
+        call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
         set /p VS_PATH=<vs_path.txt
         call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
 
