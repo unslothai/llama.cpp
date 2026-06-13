@@ -4,12 +4,14 @@
 name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
-# release per upstream b#### tag. Splits the heavy build work into four reusable
+# release per upstream b#### tag. Splits the heavy build work into six reusable
 # children:
 #   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
 #   unsloth-prebuilt-cuda-windows.yml  -- CUDA Windows bundles (x64, matrix profiles)
 #   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
 #   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
+#   unsloth-prebuilt-cpu.yml           -- CPU-only bundles (Linux + Windows, x64 + arm64)
+#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux + Windows, x64)
 #
 # Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
@@ -371,9 +373,31 @@ jobs:
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       matrix: ${{ needs.resolve.outputs.macos_matrix }}
 
+  build-cpu:
+    name: CPU
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cpu.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+
+  build-vulkan:
+    name: Vulkan
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-vulkan.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.ref }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+
   assemble:
     name: Assemble metadata + publish
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos]
+    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan]
     # No `if: always()`. Atomicity: if any matrix entry in any child
     # workflow failed, the corresponding `build-*` job reports failure, the
     # default `needs` success check skips this assemble job, and nothing is
@@ -480,7 +504,13 @@ jobs:
           for f in \
             "llama-${TAG}-bin-macos-arm64.tar.gz" \
             "llama-${TAG}-bin-macos-x64.tar.gz" \
-            "app-${TAG}-linux-arm64-cuda13-portable.tar.gz"; do
+            "app-${TAG}-linux-arm64-cuda13-portable.tar.gz" \
+            "app-${TAG}-linux-x64-cpu.tar.gz" \
+            "app-${TAG}-windows-x64-cpu.zip" \
+            "app-${TAG}-linux-arm64-cpu.tar.gz" \
+            "app-${TAG}-windows-arm64-cpu.zip" \
+            "app-${TAG}-linux-x64-vulkan.tar.gz" \
+            "app-${TAG}-windows-x64-vulkan.zip"; do
             [ -s "dist/$f" ] || { echo "ERROR: missing $f in dist/" >&2; fail=1; }
           done
           # Default ROCm set (mirrors the gfx_target input default): both OSes
@@ -510,6 +540,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for $SRC (${{ needs.resolve.outputs.repo }}@${{ needs.resolve.outputs.commit }})." \
+            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS + CPU (Linux + Windows) + Vulkan (Linux + Windows) prebuild for $SRC (${{ needs.resolve.outputs.repo }}@${{ needs.resolve.outputs.commit }})." \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
