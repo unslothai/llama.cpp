@@ -499,16 +499,19 @@ jobs:
           REPO="$GITHUB_REPOSITORY"
           PRS='${{ needs.resolve.outputs.prs }}'
           BASE='${{ needs.resolve.outputs.base }}'
-          # Link the base to the upstream release tag (always resolves). The PR
-          # links use each pin's own commit-in-PR URL, so they point at the exact
-          # SHA that was merged. We deliberately do not link the merged commit:
-          # in mix mode it is a throwaway merge made on the runner and never
-          # pushed anywhere, so any repo@sha URL for it 404s.
+          # Link the base to the upstream release tag (always resolves). Each PR
+          # is a bare ggml-org/llama.cpp#<n> reference, which GitHub renders as a
+          # link to the upstream PR (shown inline as ggml-org#<n>, title/state on
+          # hover) that resolves to upstream no matter which repo hosts the
+          # release; the short SHA links to that pin's commit-in-PR URL. We
+          # deliberately do not link the merged commit: in mix mode it is a
+          # throwaway merge made on the runner and never pushed anywhere, so any
+          # repo@sha URL for it 404s.
           NOTES="Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for upstream [${BASE}](https://github.com/ggml-org/llama.cpp/releases/tag/${BASE})"
           if [ "$(jq length <<<"$PRS")" = 0 ]; then
             NOTES="${NOTES}."
           else
-            PR_LIST="$(jq -r 'map("- [PR #\(.number) @ \(.sha[0:7])](\(.url))") | join("\n")' <<<"$PRS")"
+            PR_LIST="$(jq -r 'map("- ggml-org/llama.cpp#\(.number) @ [\(.sha[0:7])](\(.url))") | join("\n")' <<<"$PRS")"
             NOTES="$(printf '%s, merged with:\n\n%s' "$NOTES" "$PR_LIST")"
           fi
 
