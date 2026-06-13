@@ -498,8 +498,22 @@ jobs:
           TAG='${{ needs.resolve.outputs.tag }}'
           REPO="$GITHUB_REPOSITORY"
           PRS='${{ needs.resolve.outputs.prs }}'
-          SRC="upstream ${{ needs.resolve.outputs.base }}"
-          [ "$(jq length <<<"$PRS")" = 0 ] || SRC="$SRC + $(jq -r 'map("PR #\(.number) @ \(.sha[0:7])") | join(", ")' <<<"$PRS")"
+          BASE='${{ needs.resolve.outputs.base }}'
+          # Link the base to the upstream release tag (always resolves). Each PR
+          # is a bare ggml-org/llama.cpp#<n> reference, which GitHub renders as a
+          # link to the upstream PR (shown inline as ggml-org#<n>, title/state on
+          # hover) that resolves to upstream no matter which repo hosts the
+          # release; the short SHA links to that pin's commit-in-PR URL. We
+          # deliberately do not link the merged commit: in mix mode it is a
+          # throwaway merge made on the runner and never pushed anywhere, so any
+          # repo@sha URL for it 404s.
+          NOTES="Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for upstream [${BASE}](https://github.com/ggml-org/llama.cpp/releases/tag/${BASE})"
+          if [ "$(jq length <<<"$PRS")" = 0 ]; then
+            NOTES="${NOTES}."
+          else
+            PR_LIST="$(jq -r 'map("- ggml-org/llama.cpp#\(.number) @ [\(.sha[0:7])](\(.url))") | join("\n")' <<<"$PRS")"
+            NOTES="$(printf '%s, merged with:\n\n%s' "$NOTES" "$PR_LIST")"
+          fi
 
           # Atomic publish: upload as draft (hidden from the anon GitHub API
           # the installer uses), then flip draft=false only once every asset
@@ -510,6 +524,6 @@ jobs:
           fi
           gh release create "$TAG" --repo "$REPO" --draft \
             --title "llama.cpp prebuilt $TAG" \
-            --notes "Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS prebuild for $SRC (${{ needs.resolve.outputs.repo }}@${{ needs.resolve.outputs.commit }})." \
+            --notes "$NOTES" \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
