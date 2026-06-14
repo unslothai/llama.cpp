@@ -3,11 +3,12 @@
 
 Produces, matching the schema consumed by unslothai/unsloth's installer:
   - llama-prebuilt-manifest.json : describes every locally-built bundle in this
-    release (CUDA x64/arm64 profiles + ROCm Linux/Windows per gfx target),
+    release (CUDA x64/arm64 profiles + ROCm Linux/Windows per gfx target +
+    macOS arm64/x64 + CPU Linux/Windows x64+arm64 + Vulkan Linux/Windows x64),
     with the dispatch metadata the installer needs to pick the right one.
   - llama-prebuilt-sha256.json   : a cross-OS integrity index covering both the
-    locally-built bundles AND the upstream ggml-org assets the installer pulls
-    for Windows/macOS/Linux-CPU + the source tarballs.
+    locally-built bundles AND the upstream ggml-org assets the installer still
+    pulls (arm64 CPU + the Windows CUDA cudart/runtime) + the source tarballs.
 
 Run after the build matrix has dropped the app-*.{tar.gz,zip} bundles into --dist.
 """
@@ -38,6 +39,19 @@ ROCM_BUNDLE_RE = re.compile(
     r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-x64-rocm-(?P<gfx>gfx[0-9a-zA-Z]+)\.(?P<ext>tar\.gz|zip)$"
 )
 
+# CPU-only and Vulkan bundles, built locally by unsloth-prebuilt-cpu.yml /
+# unsloth-prebuilt-vulkan.yml. Like ROCm/macOS they are raw build/bin archives
+# with no embedded UNSLOTH_PREBUILT_INFO.json, so everything in the manifest
+# entry is derived from the filename. CPU covers x64 + arm64 (the arm64 slices
+# supersede the upstream ggml-org CPU passthroughs); Vulkan is x64-only.
+CPU_BUNDLE_RE = re.compile(
+    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-cpu\.(?P<ext>tar\.gz|zip)$"
+)
+
+VULKAN_BUNDLE_RE = re.compile(
+    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-x64-vulkan\.(?P<ext>tar\.gz|zip)$"
+)
+
 # macOS slices are built by unsloth-prebuilt-macos.yml and land in dist/ under
 # upstream's own naming (the installer expects that name). They carry no
 # embedded UNSLOTH_PREBUILT_INFO.json, so -- like ROCm -- everything is derived
@@ -59,6 +73,24 @@ KIND_BY_CUDA = {
 KIND_BY_ROCM_PLATFORM = {
     "linux":   {"manifest": "linux-rocm",   "sha": "linux-rocm-app"},
     "windows": {"manifest": "windows-rocm", "sha": "windows-rocm-app"},
+}
+
+# CPU + Vulkan slices. These supersede the upstream ggml-org CPU/Vulkan
+# passthroughs (we now build them ourselves). The manifest kinds match what the
+# installer selects per (platform, arch): x64 keeps the historical
+# linux-cpu/windows-cpu, arm64 uses linux-arm64/windows-arm64 (the same kinds
+# the installer's upstream-fallback path used). The "-app" sha kinds mark them
+# as locally-built bundles.
+KIND_BY_CPU = {
+    ("linux",   "x64"):   {"manifest": "linux-cpu",     "sha": "linux-cpu-app"},
+    ("linux",   "arm64"): {"manifest": "linux-arm64",   "sha": "linux-arm64-app"},
+    ("windows", "x64"):   {"manifest": "windows-cpu",   "sha": "windows-cpu-app"},
+    ("windows", "arm64"): {"manifest": "windows-arm64", "sha": "windows-arm64-app"},
+}
+
+KIND_BY_VULKAN_PLATFORM = {
+    "linux":   {"manifest": "linux-vulkan",   "sha": "linux-vulkan-app"},
+    "windows": {"manifest": "windows-vulkan", "sha": "windows-vulkan-app"},
 }
 
 # macOS slices: install_kind / sha-index kind / manifest bundle_profile per arch.
@@ -174,15 +206,20 @@ def build_artifacts(
     cuda_bundles: list[tuple[str, str, str, dict]],
     rocm_bundles: list[tuple[str, str, str]],
     macos_bundles: list[tuple[str, str]],
+    cpu_bundles: list[tuple[str, str, str]],
+    vulkan_bundles: list[tuple[str, str]],
 ) -> list[dict]:
     """cuda_bundles: list of (asset_name, platform, arch, embedded UNSLOTH_PREBUILT_INFO).
     rocm_bundles:    list of (asset_name, platform, gfx_target).
     macos_bundles:   list of (asset_name, arch).
+    cpu_bundles:     list of (asset_name, platform, arch).
+    vulkan_bundles:  list of (asset_name, platform).
 
     CUDA fields come from each bundle's own embedded metadata, so the manifest
-    can never disagree with what was actually compiled. ROCm and macOS bundles
-    are raw archives (no embedded info), so their manifest entries are derived
-    from the filename + the ROCM_TARGET_MAP / MACOS_SLICE tables.
+    can never disagree with what was actually compiled. ROCm, macOS, CPU and
+    Vulkan bundles are raw archives (no embedded info), so their manifest
+    entries are derived from the filename + the ROCM_TARGET_MAP / MACOS_SLICE
+    tables.
     """
     artifacts = []
     for asset_name, platform, arch, info in cuda_bundles:
@@ -216,6 +253,28 @@ def build_artifacts(
             "runtime_line": None,
             "coverage_class": None,
             "rank": 50,
+        })
+    # CPU + Vulkan: no CUDA/ROCm runtime to match, so runtime_line/coverage_class
+    # are explicit null (stable key set). A single slice per (backend, platform,
+    # arch), so a fixed rank; CPU ranks last (1000) as the universal fallback,
+    # matching the installer's own direct-scan rank for a CPU bundle.
+    for asset_name, platform, arch in cpu_bundles:
+        artifacts.append({
+            "asset_name": asset_name,
+            "install_kind": KIND_BY_CPU[(platform, arch)]["manifest"],
+            "bundle_profile": f"{platform}-cpu-{arch}",
+            "runtime_line": None,
+            "coverage_class": None,
+            "rank": 1000,
+        })
+    for asset_name, platform in vulkan_bundles:
+        artifacts.append({
+            "asset_name": asset_name,
+            "install_kind": KIND_BY_VULKAN_PLATFORM[platform]["manifest"],
+            "bundle_profile": f"{platform}-vulkan-x64",
+            "runtime_line": None,
+            "coverage_class": None,
+            "rank": 60,
         })
     return artifacts
 
@@ -319,9 +378,40 @@ def main() -> int:
         # assembles. The daily schedule always builds both slices.
         print("WARNING: no llama-*-bin-macos-*.tar.gz bundles found", file=sys.stderr)
 
+    # 1d) locally-built CPU + Vulkan bundles (Linux .tar.gz + Windows .zip).
+    # No embedded metadata; everything is derived from the filename. These
+    # replace the upstream ggml-org CPU/Vulkan passthroughs that section 2 used
+    # to record -- the release now ships our own builds for these slices.
+    def scan_bundles(regex) -> list[tuple[str, "re.Match[str]"]]:
+        out: list[tuple[str, "re.Match[str]"]] = []
+        for p in sorted(list(args.dist.glob("app-*.tar.gz")) + list(args.dist.glob("app-*.zip"))):
+            m = regex.match(p.name)
+            if m:
+                out.append((p.name, m))
+        return out
+
+    cpu_found = [(name, m.group("platform"), m.group("arch")) for name, m in scan_bundles(CPU_BUNDLE_RE)]
+    if cpu_found:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            cpu_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), cpu_found))
+        for (name, platform, arch), digest in zip(cpu_found, cpu_digests):
+            sha_artifacts[name] = base_entry(KIND_BY_CPU[(platform, arch)]["sha"], args.publish_repo, digest)
+    else:
+        print("WARNING: no app-*-cpu.{tar.gz,zip} bundles found", file=sys.stderr)
+
+    vulkan_found = [(name, m.group("platform")) for name, m in scan_bundles(VULKAN_BUNDLE_RE)]
+    if vulkan_found:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            vulkan_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), vulkan_found))
+        for (name, platform), digest in zip(vulkan_found, vulkan_digests):
+            sha_artifacts[name] = base_entry(KIND_BY_VULKAN_PLATFORM[platform]["sha"], args.publish_repo, digest)
+    else:
+        print("WARNING: no app-*-vulkan.{tar.gz,zip} bundles found", file=sys.stderr)
+
     # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
     #    API response; fall back to a streaming hash if a digest is missing.
-    #    macOS is absent here on purpose -- we build our own slices in 1c.
+    #    macOS + x64 CPU/Vulkan are absent here on purpose -- we build those
+    #    ourselves (1c/1d).
     #    A mix build has no upstream release for its tag, so the whole section
     #    is skipped; its uncovered hosts fall back to a source build of the
     #    merged tree instead of a vanilla upstream binary missing the PRs.
@@ -343,11 +433,13 @@ def main() -> int:
                 rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
             ):
                 wanted.append((name, "windows-cuda-upstream"))
+        # x64 CPU + Vulkan are no longer passthroughs -- we build them ourselves
+        # (sections 1d above). arm64 CPU is now built too (1d emits the
+        # locally-built linux-arm64/windows-arm64 bundles), but the installer
+        # still selects the upstream arm64 asset until it is switched over to
+        # those bundles; keep these passthrough checksums until that installer
+        # flip lands, then drop them.
         for name, kind in (
-            (f"llama-{tag}-bin-ubuntu-x64.tar.gz",        "linux-cpu-upstream"),
-            (f"llama-{tag}-bin-win-cpu-x64.zip",          "windows-cpu-upstream"),
-            (f"llama-{tag}-bin-ubuntu-vulkan-x64.tar.gz", "linux-vulkan-upstream"),
-            (f"llama-{tag}-bin-win-vulkan-x64.zip",       "windows-vulkan-upstream"),
             (f"llama-{tag}-bin-ubuntu-arm64.tar.gz",      "linux-arm64-upstream"),
             (f"llama-{tag}-bin-win-cpu-arm64.zip",        "windows-arm64-upstream"),
         ):
@@ -399,7 +491,7 @@ def main() -> int:
     manifest = {
         **common,
         "generated_at_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "artifacts": build_artifacts(found, rocm_found, macos_found),
+        "artifacts": build_artifacts(found, rocm_found, macos_found, cpu_found, vulkan_found),
     }
     manifest_path = args.out / "llama-prebuilt-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))

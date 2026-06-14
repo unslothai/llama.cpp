@@ -1,0 +1,308 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth prebuilt: CPU"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the CPU-only bundles for
+# Linux + Windows, each on x64 and arm64 (one matrix entry per arch). Every
+# matrix entry uploads a single app-*.{tar.gz|zip} artifact for the parent's
+# assemble step to pick up.
+#
+# The Linux build mirrors oobabooga/llama-cpp-binaries' build-wheels-cpu.yml
+# (GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS + GGML_RPC, no GPU backend). The
+# Windows build instead matches ggml-org/llama.cpp release.yml's windows-cpu
+# job (clang/LLVM toolchain file + "Ninja Multi-Config" + OpenMP + BoringSSL,
+# arm64 cross-compiled from x64) -- clang is upstream's proven CPU path, so we
+# follow it rather than llama-cpp-binaries' MSVC recipe; MSVC stays only where
+# it is mandatory (CUDA/nvcc). Adapted to this repo's conventions:
+# app-<tag>-<platform>-<arch>-cpu archives packaged straight from build/bin like
+# the ROCm/macOS children (no embedded UNSLOTH_PREBUILT_INFO.json --
+# assemble_metadata.py derives the manifest entry from the filename), $ORIGIN
+# RPATH on Linux. arm64 extends llama-cpp-binaries (x64-only) so the release
+# covers the arm64 CPU hosts that previously fell back to ggml-org upstream.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
+        required: false
+        default: ''
+        type: string
+      repo:
+        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact holding the merged source tarball (mix builds); empty = clone repo at ref'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Checkout upstream source @ ${{ inputs.tag }}
+        if: inputs.source_artifact == ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref || inputs.tag }}
+          path: src
+          # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
+          # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.
+          # A shallow clone would bake in "b1" instead.
+          fetch-depth: 0
+
+      # Mix builds: the parent's resolve job merged the PR set and uploaded the
+      # tree (with build number/commit pre-baked into cmake/build-info.cmake,
+      # since there is no .git here) as an artifact.
+      - name: Download merged source @ ${{ inputs.tag }}
+        if: inputs.source_artifact != ''
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract merged source
+        if: inputs.source_artifact != ''
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev ninja-build
+
+      # ggml-org's release.yml applies this GCC-14 workaround on every
+      # ubuntu-24.04 leg (our arm64 runner); the default toolchain there
+      # miscompiles ggml. Matches the gcc-14 step in our CUDA arm64 child.
+      - name: Toolchain workaround (GCC 14 on arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          sudo apt-get install -y gcc-14 g++-14
+          {
+            echo "CC=gcc-14"
+            echo "CXX=g++-14"
+          } >> "$GITHUB_ENV"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with:
+          key: cpu-linux-${{ matrix.arch }}
+          variant: ccache
+          evict-old-files: 14d
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -eux
+          # Build recipe mirrors llama-cpp-binaries' CPU wheel (backend-DL +
+          # all CPU variants + RPC, no GPU backend). RPATH=$ORIGIN so the
+          # bundle's sibling .so files resolve from the binary's own directory.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -eux
+          # Backend modules (CPU variants, RPC) build as ggml dependencies, so
+          # the server/quantize targets pull them in.
+          cmake --build build --config Release -j "$(nproc)" \
+            --target llama-server llama-quantize
+          strip build/bin/llama-server build/bin/llama-quantize || true
+
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the CUDA child for the
+      # rationale. The bundle tars all of build/bin, so anything produced here
+      # is shipped automatically.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          set -u
+          if [ ! -d examples/diffusion-gemma-server ]; then
+            echo "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          fi
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON \
+            || { echo "reconfigure for examples failed; skipping DiffusionGemma binaries"; exit 0; }
+          if cmake --build build --config Release -j "$(nproc)" \
+              --target llama-diffusion-gemma-visual-server llama-diffusion-cli; then
+            strip build/bin/llama-diffusion-gemma-visual-server build/bin/llama-diffusion-cli || true
+            echo "built DiffusionGemma binaries"
+          else
+            echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          fi
+          exit 0
+
+      - name: Package bundle (tar.gz)
+        run: |
+          set -eux
+          ASSET="app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz"
+          cp src/LICENSE src/build/bin/
+          mkdir -p dist
+          (cd src/build/bin && tar -czf "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -la dist
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu
+          path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: windows/${{ matrix.arch }}
+    # Single x64 runner for both arches: arm64 is cross-compiled with the clang
+    # toolchain (vcvars amd64_arm64), exactly like ggml-org's release.yml
+    # windows-cpu job. CUDA stays on MSVC (mandatory for nvcc on Windows), but
+    # the CPU build uses clang/LLVM to match upstream's proven CPU recipe.
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   vcvars: x64,         omp_arch: x86_64,  cpu_variants: 'ON' }
+          - { arch: arm64, vcvars: amd64_arm64, omp_arch: aarch64, cpu_variants: 'OFF' }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout upstream source @ ${{ inputs.tag }}
+        if: inputs.source_artifact == ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref || inputs.tag }}
+          path: src
+          # Full history: cmake/build-info.cmake runs `git rev-list --count HEAD`
+          # to bake LLAMA_BUILD_NUMBER into llama-server --version as b<N>.
+          fetch-depth: 0
+
+      # Mix builds: the parent's resolve job merged the PR set and uploaded the
+      # tree (with build number/commit pre-baked into cmake/build-info.cmake,
+      # since there is no .git here) as an artifact.
+      - name: Download merged source @ ${{ inputs.tag }}
+        if: inputs.source_artifact != ''
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract merged source
+        if: inputs.source_artifact != ''
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with:
+          key: cpu-windows-${{ matrix.arch }}
+          variant: ccache
+          evict-old-files: 14d
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      # Build recipe copied from ggml-org/llama.cpp release.yml (windows-cpu):
+      # clang via the per-arch LLVM toolchain file, "Ninja Multi-Config", OpenMP,
+      # BoringSSL, and GGML_CPU_ALL_VARIANTS only on x64 (it is an x86 microarch
+      # fan-out). vcvarsall sets the env (incl. the amd64_arm64 cross toolchain),
+      # so this runs in cmd. CMAKE_ARGS mirrors upstream's env.CMAKE_ARGS; we
+      # only narrow `--target` to the binaries we ship.
+      - name: Build
+        working-directory: src
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=${{ matrix.cpu_variants }} ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_RPC=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --target llama-server llama-quantize
+          if errorlevel 1 exit /b 1
+
+      # DiffusionGemma binaries (#24423 mix builds only): best-effort, never fail
+      # the job (trailing `exit /b 0`). vcvarsall is re-called -- step env does
+      # not persist -- and the reconfigure reuses the cached clang toolchain.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        shell: cmd
+        run: |
+          if not exist examples\diffusion-gemma-server (
+            echo no DiffusionGemma sources in this tree; skipping
+            exit /b 0
+          )
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }}
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build build --config Release --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          exit /b 0
+
+      # Ninja Multi-Config emits to build/bin/Release. Ship the OpenMP runtime
+      # (GGML_OPENMP=ON) from the VS LLVM redist -- exactly as upstream does --
+      # globbing the MSVC version dir so an image bump does not break the path.
+      - name: Package bundle (zip)
+        run: |
+          $rel = "src/build/bin/Release"
+          Copy-Item src/LICENSE $rel/
+          $omp = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\MSVC\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC*.OpenMP.LLVM\libomp140.${{ matrix.omp_arch }}.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $omp) { Write-Error "libomp140.${{ matrix.omp_arch }}.dll not found in the VS LLVM redist"; exit 1 }
+          Copy-Item $omp.FullName $rel/
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $asset = "app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip"
+          Push-Location $rel
+          7z a -tzip "$env:GITHUB_WORKSPACE/dist/$asset" .
+          Pop-Location
+          Get-ChildItem dist
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu
+          path: dist/app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip
+          if-no-files-found: error
