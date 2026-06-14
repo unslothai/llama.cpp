@@ -438,6 +438,11 @@ jobs:
           fi
 
       - name: Generate manifest + sha256 index
+        # prs carries upstream PR titles (arbitrary text), so pass it through env
+        # rather than inlining it: a title with a quote would otherwise break out
+        # of the shell command. Same handling in the publish step below.
+        env:
+          PRS_JSON: ${{ needs.resolve.outputs.prs }}
         run: |
           set -eux
           python3 tooling/scripts/unsloth/assemble_metadata.py \
@@ -445,7 +450,7 @@ jobs:
             --ref '${{ needs.resolve.outputs.ref }}' \
             --source-repo '${{ needs.resolve.outputs.repo }}' \
             --base-tag '${{ needs.resolve.outputs.base }}' \
-            --pr-set '${{ needs.resolve.outputs.prs }}' \
+            --pr-set "$PRS_JSON" \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
             --publish-repo "$GITHUB_REPOSITORY"
@@ -498,11 +503,16 @@ jobs:
 
       - name: Publish GitHub release
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        # prs carries upstream PR titles (arbitrary text), so pass it through env
+        # rather than inlining it: a title with a quote would otherwise break out
+        # of the shell command.
+        env:
+          PRS_JSON: ${{ needs.resolve.outputs.prs }}
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
           REPO="$GITHUB_REPOSITORY"
-          PRS='${{ needs.resolve.outputs.prs }}'
+          PRS="$PRS_JSON"
           BASE='${{ needs.resolve.outputs.base }}'
           # Link the base to the upstream release tag (always resolves). Each PR
           # line is "<title> (#<n>, commit <sha>)": GitHub does not expand a bare
