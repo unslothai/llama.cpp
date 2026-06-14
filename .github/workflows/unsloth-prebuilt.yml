@@ -553,7 +553,7 @@ jobs:
           # commit-in-PR URL. We deliberately do not link the merged commit: in
           # mix mode it is a throwaway merge made on the runner and never pushed
           # anywhere, so any repo@sha URL for it 404s.
-          NOTES="Automated Unsloth llama.cpp CUDA (Linux + Windows) + ROCm + macOS + CPU (Linux + Windows) + Vulkan (Linux + Windows) prebuild for upstream [${BASE}](https://github.com/ggml-org/llama.cpp/releases/tag/${BASE})"
+          NOTES="Automated Unsloth llama.cpp CUDA + ROCm + Vulkan + macOS + CPU prebuild for upstream [${BASE}](https://github.com/ggml-org/llama.cpp/releases/tag/${BASE})"
           if [ "$(jq length <<<"$PRS")" = 0 ]; then
             NOTES="${NOTES}."
           else
