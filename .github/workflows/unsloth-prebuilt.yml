@@ -27,7 +27,7 @@ name: Unsloth prebuilt (full release)
 
 on:
   schedule:
-    - cron: '13 22 * * *'      # ~3PM San Francisco (UTC; not DST adjusted)
+    - cron: '13 20 * * *'      # ~1PM San Francisco PDT / ~12PM PST (UTC; not DST adjusted)
   workflow_dispatch:
     inputs:
       tag:
