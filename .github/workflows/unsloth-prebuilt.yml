@@ -53,7 +53,7 @@ on:
         type: string
       gfx_target:
         description: 'GPU targets for ROCm builds'
-        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
         required: false
         type: string
       rocm_version:
@@ -114,7 +114,7 @@ jobs:
           set -euo pipefail
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
-          GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X'
+          GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
           GFX='${{ github.event.inputs.gfx_target }}'; GFX="${GFX:-$GFX_DEFAULT}"
           OS_LIST='${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}'
           AGE_H='${{ github.event.inputs.min_age_hours }}'
@@ -525,7 +525,7 @@ jobs:
           done
           # Default ROCm set (mirrors the gfx_target input default): both OSes
           # per family, or AMD hosts of that family silently lose their bundle.
-          for gfx in gfx1151 gfx1150 gfx120X gfx110X gfx103X; do
+          for gfx in gfx1151 gfx1150 gfx120X gfx110X gfx103X gfx90a gfx908; do
             [ -s "dist/app-${TAG}-linux-x64-rocm-${gfx}.tar.gz" ] || { echo "ERROR: missing linux rocm ${gfx} bundle in dist/" >&2; fail=1; }
             [ -s "dist/app-${TAG}-windows-x64-rocm-${gfx}.zip" ]  || { echo "ERROR: missing windows rocm ${gfx} bundle in dist/" >&2; fail=1; }
           done

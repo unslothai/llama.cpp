@@ -112,6 +112,8 @@ ROCM_TARGET_MAP = {
     "gfx120X": ["gfx1200", "gfx1201"],
     "gfx110X": ["gfx1100", "gfx1101", "gfx1102", "gfx1103"],
     "gfx103X": ["gfx1030", "gfx1031", "gfx1032", "gfx1034"],
+    "gfx90a": ["gfx90a"],
+    "gfx908": ["gfx908"],
 }
 
 
