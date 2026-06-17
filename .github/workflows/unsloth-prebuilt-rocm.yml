@@ -91,12 +91,30 @@ jobs:
 
     - name: Install Visual Studio Build Tools
       run: |
+        # Retry helper: Invoke-WebRequest's -MaximumRetryCount only retries on
+        # HTTP status failures (400-599/304), not on the TCP-level connection
+        # timeouts these download hosts intermittently throw, so wrap each
+        # download in an explicit catch-all retry with linear backoff.
+        function Invoke-DownloadWithRetry {
+          param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+          for ($i = 1; $i -le $Retries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+              return
+            } catch {
+              Write-Host "Download attempt $i/$Retries for $Uri failed: $($_.Exception.Message)"
+              if ($i -eq $Retries) { throw }
+              Start-Sleep -Seconds ($DelaySec * $i)
+            }
+          }
+        }
+
         # Download and install Visual Studio Build Tools
         $vsInstallerUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe"
         $vsInstallerPath = "$env:TEMP\vs_buildtools.exe"
 
         Write-Host "Downloading Visual Studio Build Tools..."
-        Invoke-WebRequest -Uri $vsInstallerUrl -OutFile $vsInstallerPath
+        Invoke-DownloadWithRetry -Uri $vsInstallerUrl -OutFile $vsInstallerPath
 
         Write-Host "Installing Visual Studio Build Tools..."
         Start-Process -FilePath $vsInstallerPath -ArgumentList "--quiet", "--wait", "--norestart", "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "--add", "Microsoft.VisualStudio.Component.VC.CMake.Project", "--add", "Microsoft.VisualStudio.Component.VC.ATL", "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621" -Wait
@@ -108,20 +126,38 @@ jobs:
       run: |
         Write-Host "Installing build dependencies using manual methods..."
 
+        # Retry helper: Invoke-WebRequest's -MaximumRetryCount only retries on
+        # HTTP status failures (400-599/304), not on the TCP-level connection
+        # timeouts these download hosts intermittently throw, so wrap each
+        # download in an explicit catch-all retry with linear backoff.
+        function Invoke-DownloadWithRetry {
+          param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+          for ($i = 1; $i -le $Retries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+              return
+            } catch {
+              Write-Host "Download attempt $i/$Retries for $Uri failed: $($_.Exception.Message)"
+              if ($i -eq $Retries) { throw }
+              Start-Sleep -Seconds ($DelaySec * $i)
+            }
+          }
+        }
+
         # Install Ninja
         Write-Host "Installing Ninja..."
         $ninjaUrl = "https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip"
         $ninjaPath = "$env:TEMP\ninja-win.zip"
         $ninjaDir = "C:\ninja"
         New-Item -ItemType Directory -Force -Path $ninjaDir
-        Invoke-WebRequest -Uri $ninjaUrl -OutFile $ninjaPath
+        Invoke-DownloadWithRetry -Uri $ninjaUrl -OutFile $ninjaPath
         Expand-Archive -Path $ninjaPath -DestinationPath $ninjaDir -Force
 
         # Install Strawberry Perl
         Write-Host "Installing Strawberry Perl..."
         $perlUrl = "http://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit.msi"
         $perlPath = "$env:TEMP\strawberry-perl-5.32.1.1-64bit.msi"
-        Invoke-WebRequest -Uri $perlUrl -OutFile $perlPath
+        Invoke-DownloadWithRetry -Uri $perlUrl -OutFile $perlPath
         Start-Process msiexec.exe -ArgumentList "/i $perlPath /quiet /norestart" -Wait
 
         # Verify installations
@@ -134,6 +170,24 @@ jobs:
 
     - name: Download ROCm nightly tarball
       run: |
+        # Retry helper: Invoke-WebRequest's -MaximumRetryCount only retries on
+        # HTTP status failures (400-599/304), not on the TCP-level connection
+        # timeouts these download hosts intermittently throw, so wrap each
+        # download in an explicit catch-all retry with linear backoff.
+        function Invoke-DownloadWithRetry {
+          param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+          for ($i = 1; $i -le $Retries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+              return
+            } catch {
+              Write-Host "Download attempt $i/$Retries for $Uri failed: $($_.Exception.Message)"
+              if ($i -eq $Retries) { throw }
+              Start-Sleep -Seconds ($DelaySec * $i)
+            }
+          }
+        }
+
         # Determine ROCm version to use
         $rocmVersion = "${{ inputs.rocm_version }}"
         $currentTarget = "${{ matrix.gfx_target }}"
@@ -196,7 +250,7 @@ jobs:
         echo "DETECTED_ROCM_VERSION=$rocmVersion" >> $env:GITHUB_ENV
 
         Write-Host "Downloading ROCm from: $rocmUrl"
-        Invoke-WebRequest -Uri $rocmUrl -OutFile "rocm.tar.gz"
+        Invoke-DownloadWithRetry -Uri $rocmUrl -OutFile "rocm.tar.gz"
 
     - name: Extract ROCm to C:\opt\rocm
       run: |
