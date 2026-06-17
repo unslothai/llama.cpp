@@ -29,18 +29,13 @@ on:
         description: 'Upstream llama.cpp release tag (b####), resolved by parent'
         required: true
         type: string
-      ref:
-        description: 'Git ref to build (refs/tags/<tag>); defaults to tag'
-        required: false
-        default: ''
-        type: string
       repo:
-        description: 'GitHub repository (owner/name) holding the ref: upstream, or the publish repo for merged mix tags'
+        description: 'Source repo (owner/name): ggml-org/llama.cpp for plain builds, or this repo for mix tags'
         required: false
         default: 'ggml-org/llama.cpp'
         type: string
       source_artifact:
-        description: 'Workflow artifact holding the merged source tarball (mix builds); empty = clone repo at ref'
+        description: 'Workflow artifact (app-source-*) holding the stamped source tree; set by resolve for every build'
         required: false
         default: ''
         type: string
@@ -211,33 +206,16 @@ jobs:
         # Extract the tarball
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
 
-    - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
-      if: inputs.source_artifact == ''
-      run: |
-        $ref = "${{ inputs.ref || inputs.tag }}"
-        Write-Host "Cloning llama.cpp at ${ref} (full history so LLAMA_BUILD_NUMBER is correct)"
-        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
-        cd llama.cpp
-        git fetch origin $ref
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        git checkout --detach FETCH_HEAD
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-
-        # Show current commit info
-        Write-Host "Current llama.cpp commit:"
-        git log --oneline -1
-
-    # Mix builds: the parent's resolve job merged the PR set and uploaded the
-    # tree (with build number/commit pre-baked into cmake/build-info.cmake,
-    # since there is no .git here) as an artifact.
-    - name: Download merged source @ ${{ inputs.tag }}
-      if: inputs.source_artifact != ''
+    # The parent's resolve job built the source tree (upstream base + any mix
+    # PRs, with the build number/commit and Unsloth fingerprint baked
+    # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
+    # instead of cloning -- no .git needed, the build number is already baked.
+    - name: Download source @ ${{ inputs.tag }}
       uses: actions/download-artifact@v6
       with:
         name: ${{ inputs.source_artifact }}
         path: srcpkg
-    - name: Extract merged source
-      if: inputs.source_artifact != ''
+    - name: Extract source
       shell: bash
       run: |
         set -eux
@@ -578,31 +556,16 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
-    - name: Clone llama.cpp @ ${{ inputs.ref || inputs.tag }}
-      if: inputs.source_artifact == ''
-      run: |
-        ref="${{ inputs.ref || inputs.tag }}"
-        echo "Cloning llama.cpp at $ref (full history so LLAMA_BUILD_NUMBER is correct)"
-        git clone --single-branch --no-checkout https://github.com/${{ inputs.repo }}.git llama.cpp
-        cd llama.cpp
-        git fetch origin "$ref"
-        git checkout --detach FETCH_HEAD
-
-        # Show current commit info
-        echo "Current llama.cpp commit:"
-        git log --oneline -1
-
-    # Mix builds: the parent's resolve job merged the PR set and uploaded the
-    # tree (with build number/commit pre-baked into cmake/build-info.cmake,
-    # since there is no .git here) as an artifact.
-    - name: Download merged source @ ${{ inputs.tag }}
-      if: inputs.source_artifact != ''
+    # The parent's resolve job built the source tree (upstream base + any mix
+    # PRs, with the build number/commit and Unsloth fingerprint baked
+    # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
+    # instead of cloning -- no .git needed, the build number is already baked.
+    - name: Download source @ ${{ inputs.tag }}
       uses: actions/download-artifact@v6
       with:
         name: ${{ inputs.source_artifact }}
         path: srcpkg
-    - name: Extract merged source
-      if: inputs.source_artifact != ''
+    - name: Extract source
       shell: bash
       run: |
         set -eux

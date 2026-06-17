@@ -91,7 +91,6 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.r.outputs.tag }}
-      ref: ${{ steps.r.outputs.ref }}
       repo: ${{ steps.r.outputs.repo }}
       base: ${{ steps.r.outputs.base }}
       prs: ${{ steps.r.outputs.prs }}
@@ -194,53 +193,74 @@ jobs:
             PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
           done
 
-          SRC_ARTIFACT=""
+          # Decide the tag and source repo first; the source tree is built
+          # further down, only if this release isn't already published.
           if [ "$(jq length <<<"$PRS")" = 0 ]; then
+            # Plain build: pristine upstream base, no merge. REPO stays the real
+            # upstream repo even though we ship our own stamped tarball.
             TAG="$BASE"
             REPO='ggml-org/llama.cpp'
-            REF="refs/tags/${TAG}"
-            COMMIT="$(gh api repos/ggml-org/llama.cpp/commits/"$BASE" --jq .sha)"
           else
-            # Merge the set onto the base once, here, and ship the merged tree
-            # to the build children as a workflow artifact: one merge, identical
-            # trees everywhere, nothing pushed to the repo (GITHUB_TOKEN may
-            # never push commits touching .github/workflows, which upstream
-            # history routinely does). The synthetic tag embeds a hash of the
-            # pinned SHAs in listed order (merge order can matter for
-            # conflicts), so a pin update or a reorder yields a new tag and
-            # build, while the release "exists" check below still skips
-            # rebuilding an already-published set.
+            # The synthetic tag embeds a hash of the pinned SHAs in listed order
+            # (merge order can matter for conflicts), so a pin update or a reorder
+            # yields a new tag and build, while the "exists" check below still
+            # skips rebuilding an already-published set. The merged tree exists
+            # only as this repo's release assets, never upstream.
             SETHASH="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
             TAG="${BASE}-mix-${SETHASH}"
-            # REPO names where this source is published, for provenance
-            # metadata: the merged tree exists only as this repo's release
-            # assets, never upstream. Children ignore repo in mix mode (they
-            # extract the artifact instead of cloning).
             REPO="$GITHUB_REPOSITORY"
-            REF=""
-            SRC_ARTIFACT="app-source-${TAG}"
-            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-              git fetch -q --unshallow --no-tags origin
-            fi
+          fi
+          SRC_ARTIFACT="app-source-${TAG}"
+          COMMIT=""
+
+          # Only PUBLISHED releases count as "exists"; a leftover draft (from
+          # a failed prior publish) should not block today's rebuild.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
+
+          # Build the source tree every child compiles, ONCE, here -- but only
+          # when something will actually be built. On a scheduled no-op (the aged
+          # "latest" was already published) skip the whole checkout/merge/tar +
+          # upload; a manual dispatch always rebuilds. Check out the upstream base,
+          # merge any pinned PRs (mix builds), then bake the build number/commit
+          # and the Unsloth fingerprint into cmake/build-info.cmake. The
+          # result is uploaded as the app-source-* artifact every child extracts --
+          # one identical tree everywhere, no child clones, fingerprint patch in one
+          # place. Nothing is pushed (GITHUB_TOKEN may never push commits touching
+          # .github/workflows, which upstream history routinely does).
+          if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
-            git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
-            git checkout -q --detach "refs/tags/${BASE}"
-            for pair in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
-              NUM="${pair%%:*}"; SHA="${pair##*:}"
-              git fetch -q --no-tags upstream "$SHA" \
-                || { echo "could not fetch commit ${SHA} for PR #${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
-              git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                merge --no-ff --no-edit -m "Merge ggml-org/llama.cpp#${NUM} @ ${SHA}" "$SHA" \
-                || { echo "PR #${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
-            done
+            if [ "$(jq length <<<"$PRS")" != 0 ]; then
+              # Merges need a merge-base, so unshallow first.
+              if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+                git fetch -q --unshallow --no-tags origin
+              fi
+              git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
+              git checkout -q --detach "refs/tags/${BASE}"
+              for pair in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
+                NUM="${pair%%:*}"; SHA="${pair##*:}"
+                git fetch -q --no-tags upstream "$SHA" \
+                  || { echo "could not fetch commit ${SHA} for PR #${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
+                git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                  merge --no-ff --no-edit -m "Merge ggml-org/llama.cpp#${NUM} @ ${SHA}" "$SHA" \
+                  || { echo "PR #${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
+              done
+            else
+              # Plain build: only the base tree is needed. Shallow is fine -- the
+              # build number is baked below, so no git history is needed at build time.
+              git fetch -q --depth 1 --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
+              git checkout -q --detach "refs/tags/${BASE}"
+            fi
             COMMIT="$(git rev-parse HEAD)"
 
             # The tarball ships without .git, where cmake/build-info.cmake falls
             # back to its defaults; bake real values into those defaults so
-            # llama-server --version doesn't report b0 (unknown). The build
-            # number stays the BASE's b#### number (not the merged commit
-            # count), so anything comparing versions against upstream releases
-            # keeps working; BUILD_COMMIT identifies the merged head.
+            # llama-server --version doesn't report b0 (unknown). The build number
+            # stays the BASE's b#### number (the upstream tag's commit count), so
+            # anything comparing versions against upstream releases keeps working;
+            # BUILD_COMMIT identifies the (possibly merged) head.
             COUNT="${BASE#b}"
             SHORT="$(git rev-parse --short HEAD)"
             sed -i "s/^set(BUILD_NUMBER 0)$/set(BUILD_NUMBER ${COUNT})/" cmake/build-info.cmake
@@ -249,15 +269,22 @@ jobs:
               && grep -q "set(BUILD_COMMIT \"${SHORT}\")" cmake/build-info.cmake \
               || { echo "cmake/build-info.cmake no longer has the expected fallback lines; cannot bake the build number into the source artifact" >&2; exit 1; }
 
-            tar -czf "${RUNNER_TEMP}/llama.cpp-source-${TAG}.tar.gz" --exclude-vcs --transform "s,^\.,llama.cpp-${TAG}," .
-            echo "merged ${TAG} (${COMMIT}, build ${COUNT})"
-          fi
+            # Unsloth fingerprint: fold "Compiled by the Unsloth team"
+            # into BUILD_TARGET, which cmake bakes into LLAMA_BUILD_TARGET, so it
+            # prints on llama-server --version ("built with ... for ...") and shows
+            # up in `strings` on every binary that links common. Append so it wraps
+            # whatever BUILD_TARGET the build computes. Keep this string byte-identical
+            # to MARK in the assemble job's verify gate, which re-checks it landed.
+            grep -q 'set(BUILD_TARGET' cmake/build-info.cmake \
+              || { echo "cmake/build-info.cmake has no BUILD_TARGET line to stamp" >&2; exit 1; }
+            printf '\n# Unsloth fingerprint: shows in --version and strings.\nset(BUILD_TARGET "${BUILD_TARGET} (Compiled by the Unsloth team)")\n' >> cmake/build-info.cmake
+            grep -q 'Compiled by the Unsloth team' cmake/build-info.cmake \
+              || { echo "failed to stamp the Unsloth fingerprint into cmake/build-info.cmake" >&2; exit 1; }
 
-          # Only PUBLISHED releases count as "exists"; a leftover draft (from
-          # a failed prior publish) should not block today's rebuild.
-          EXISTS=false
-          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
-            EXISTS=true
+            tar -czf "${RUNNER_TEMP}/llama.cpp-source-${TAG}.tar.gz" --exclude-vcs --transform "s,^\.,llama.cpp-${TAG}," .
+            echo "prepared ${TAG} (${COMMIT}, build ${COUNT})"
+          else
+            echo "release ${TAG} already published; skipping source prep (nothing to build)"
           fi
 
           # ubuntu-22.04 is x64 (glibc 2.35). arm64 only has ubuntu-24.04-arm
@@ -300,7 +327,6 @@ jobs:
 
           {
             echo "tag=$TAG"
-            echo "ref=$REF"
             echo "repo=$REPO"
             echo "base=$BASE"
             echo "prs=$PRS"
@@ -314,11 +340,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); prs=$PRS; source_artifact=${SRC_ARTIFACT:-none}; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
-      # The merged source for mix builds: every build child extracts this
-      # instead of cloning, and assemble ships it as the release's
-      # source-tarball asset (the merged commit exists in no repo).
-      - name: Upload merged source artifact
-        if: steps.r.outputs.source_artifact != ''
+      # The stamped source tree (every build): every build child extracts this
+      # instead of cloning, and assemble ships it as the release's source-tarball
+      # asset, so a source build reproduces the same fingerprinted binary. Only
+      # produced when we build, so guard on the same condition as the build jobs
+      # (resolve skips source prep on a scheduled no-op, leaving no tarball).
+      - name: Upload source artifact
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.r.outputs.source_artifact }}
@@ -333,7 +361,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       commit: ${{ needs.resolve.outputs.commit }}
@@ -346,7 +373,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       commit: ${{ needs.resolve.outputs.commit }}
@@ -359,7 +385,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       matrix: ${{ needs.resolve.outputs.rocm_matrix }}
@@ -373,7 +398,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-macos.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       matrix: ${{ needs.resolve.outputs.macos_matrix }}
@@ -385,7 +409,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-cpu.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
 
@@ -396,7 +419,6 @@ jobs:
     uses: ./.github/workflows/unsloth-prebuilt-vulkan.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
-      ref: ${{ needs.resolve.outputs.ref }}
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
 
@@ -437,29 +459,53 @@ jobs:
           pattern: app-*
           merge-multiple: true
 
-      # Ship the source tarballs as release assets so the installer's
-      # source-build fallback has a tree to fetch. Downloaded into dist/ (not
-      # self-tarred) so the published bytes match the sha256 index, which
-      # assemble_metadata records by hashing these exact local files. For mix
-      # builds the tag-named tarball arrives in dist/ via the resolve job's
-      # app-source-* artifact (the merged tree is in no repo); the exact-source
-      # asset is the same bytes under the commit name.
+      # Fingerprint gate: every bundle must carry the fingerprint the build children
+      # fold into BUILD_TARGET (-> LLAMA_BUILD_TARGET, printed by `--version`). That
+      # string is compiled into common (build-info.cpp); on Linux/macOS it lands in
+      # llama-server's own .rodata, but on a Windows shared build it can live in the
+      # sibling llama-common DLL instead -- so scan every file in the bundle, not
+      # just the exe. Nothing but a compiled binary carries this string (no metadata
+      # file does), so a hit means the brand shipped. Scan bytes rather than running
+      # `--version`: cross-compiled (ROCm) and Windows binaries can't run on this
+      # Linux runner. MARK must stay byte-identical to the resolve job's stamp string.
+      # Refuse to publish if any bundle is unbranded.
+      - name: Verify Unsloth fingerprint in every bundle
+        run: |
+          set -euo pipefail
+          MARK='Compiled by the Unsloth team'
+          shopt -s nullglob
+          tmp="$(mktemp -d)"
+          fail=0
+          checked=0
+          for arc in dist/app-*.tar.gz dist/app-*.zip dist/llama-*-bin-macos-*.tar.gz; do
+            d="$tmp/extract"
+            rm -rf "$d"; mkdir -p "$d"
+            case "$arc" in
+              *.zip)    unzip -qo "$arc" -d "$d" ;;
+              *.tar.gz) tar -xzf "$arc" -C "$d" ;;
+            esac
+            if grep -arq "$MARK" "$d"; then
+              checked=$((checked + 1))
+            else
+              echo "ERROR: $(basename "$arc"): no file carries the Unsloth fingerprint" >&2; fail=1
+            fi
+          done
+          rm -rf "$tmp"
+          [ "$checked" -gt 0 ] || { echo "ERROR: no bundles found to verify (expected app-*/llama-*-bin-macos-* in dist/)" >&2; exit 1; }
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish unbranded binaries" >&2; exit 1; }
+          echo "fingerprint verified in $checked bundles"
+
+      # Ship the stamped source tree as release assets so the installer's
+      # source-build fallback reproduces the same fingerprinted binary. The resolve
+      # job's app-source-* artifact lands the tag-named tarball in dist/ (via the
+      # app-* download above); copy it to the commit name too. Both are the exact
+      # local bytes assemble_metadata hashes into the sha256 index.
       - name: Fetch source archives
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
-          REF='${{ needs.resolve.outputs.ref }}'
-          REPO='${{ needs.resolve.outputs.repo }}'
           SHA='${{ needs.resolve.outputs.commit }}'
-          mkdir -p dist
-          if [ -n '${{ needs.resolve.outputs.source_artifact }}' ]; then
-            cp "dist/llama.cpp-source-${TAG}.tar.gz" "dist/llama.cpp-source-commit-${SHA}.tar.gz"
-          else
-            curl -fL --retry 3 -o "dist/llama.cpp-source-${TAG}.tar.gz" \
-              "https://codeload.github.com/${REPO}/tar.gz/${REF}"
-            curl -fL --retry 3 -o "dist/llama.cpp-source-commit-${SHA}.tar.gz" \
-              "https://codeload.github.com/${REPO}/tar.gz/${SHA}"
-          fi
+          cp "dist/llama.cpp-source-${TAG}.tar.gz" "dist/llama.cpp-source-commit-${SHA}.tar.gz"
 
       - name: Generate manifest + sha256 index
         # prs carries upstream PR titles (arbitrary text), so pass it through env
@@ -471,7 +517,6 @@ jobs:
           set -eux
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
-            --ref '${{ needs.resolve.outputs.ref }}' \
             --source-repo '${{ needs.resolve.outputs.repo }}' \
             --base-tag '${{ needs.resolve.outputs.base }}' \
             --pr-set "$PRS_JSON" \
