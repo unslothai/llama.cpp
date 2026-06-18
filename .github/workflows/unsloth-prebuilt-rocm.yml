@@ -153,15 +153,15 @@ jobs:
         Invoke-DownloadWithRetry -Uri $ninjaUrl -OutFile $ninjaPath
         Expand-Archive -Path $ninjaPath -DestinationPath $ninjaDir -Force
 
-        # Install Strawberry Perl
-        Write-Host "Installing Strawberry Perl..."
-        $perlUrl = "http://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit.msi"
-        $perlPath = "$env:TEMP\strawberry-perl-5.32.1.1-64bit.msi"
-        Invoke-DownloadWithRetry -Uri $perlUrl -OutFile $perlPath
-        Start-Process msiexec.exe -ArgumentList "/i $perlPath /quiet /norestart" -Wait
+        # Install Strawberry Perl via Chocolatey (already on the runner) instead
+        # of downloading the MSI from the frequently-unreachable strawberryperl.com
+        # host that was timing out and failing these builds. It ships preinstalled
+        # on the windows-latest image, so this is normally a fast no-op.
+        Write-Host "Installing Strawberry Perl via Chocolatey..."
+        choco install strawberryperl -y --no-progress
 
         # Verify installations
-        $env:PATH = "C:\ninja;C:\Strawberry\perl\bin;$env:PATH"
+        $env:PATH = "C:\ninja;C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
         Write-Host "Verifying installations..."
         ninja --version
         perl --version
