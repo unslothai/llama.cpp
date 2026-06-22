@@ -110,6 +110,8 @@ jobs:
             -DGGML_RPC=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
@@ -120,11 +122,10 @@ jobs:
         working-directory: src
         run: |
           set -eux
-          # Backend modules (CPU variants, RPC) build as ggml dependencies, so
-          # the server/quantize targets pull them in.
-          cmake --build build --config Release -j "$(nproc)" \
-            --target llama-server llama-quantize
-          strip build/bin/llama-server build/bin/llama-quantize || true
+          # Build the full tool + server set (no --target), matching the macOS
+          # bins. Backend modules (CPU variants, RPC) build as ggml deps.
+          cmake --build build --config Release -j "$(nproc)"
+          strip build/bin/llama-* || true
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the CUDA child for the
@@ -212,8 +213,8 @@ jobs:
       # clang via the per-arch LLVM toolchain file, "Ninja Multi-Config", OpenMP,
       # BoringSSL, and GGML_CPU_ALL_VARIANTS only on x64 (it is an x86 microarch
       # fan-out). vcvarsall sets the env (incl. the amd64_arm64 cross toolchain),
-      # so this runs in cmd. CMAKE_ARGS mirrors upstream's env.CMAKE_ARGS; we
-      # only narrow `--target` to the binaries we ship.
+      # so this runs in cmd. CMAKE_ARGS mirrors upstream's env.CMAKE_ARGS and
+      # builds the full tool + server set (no --target), matching the macOS bins.
       - name: Build
         working-directory: src
         shell: cmd
@@ -234,7 +235,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           if errorlevel 1 exit /b 1
-          cmake --build build --config Release --target llama-server llama-quantize
+          cmake --build build --config Release
           if errorlevel 1 exit /b 1
 
       # DiffusionGemma binaries (#24423 mix builds only): best-effort, never fail
