@@ -95,6 +95,8 @@ jobs:
             -DGGML_VULKAN=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
@@ -106,10 +108,9 @@ jobs:
         run: |
           set -eux
           # Backend modules (CPU variants, Vulkan, RPC) build as ggml
-          # dependencies, so the server/quantize targets pull them in.
-          cmake --build build --config Release -j "$(nproc)" \
-            --target llama-server llama-quantize
-          strip build/bin/llama-server build/bin/llama-quantize || true
+          # dependencies, so every tool pulls them in.
+          cmake --build build --config Release -j "$(nproc)"
+          strip build/bin/llama-* || true
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the CUDA child for the
@@ -217,6 +218,8 @@ jobs:
             -DGGML_VULKAN=ON `
             -DLLAMA_BUILD_TESTS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -224,8 +227,7 @@ jobs:
       - name: Build
         working-directory: src
         run: |
-          cmake --build build --config Release -j 3 `
-            --target llama-server llama-quantize
+          cmake --build build --config Release -j 3
 
       # DiffusionGemma binaries (#24423 mix builds only): best-effort, never
       # fail the job. See the CUDA child for the rationale.

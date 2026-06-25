@@ -58,18 +58,21 @@ class PlatformStrategy:
     exe_suffix = ""
     archive_ext = ".tar.gz"
     rpath = ""
-    binaries = ["llama-server", "llama-quantize"]
-    # Extras shipped only when the build produced them (the DiffusionGemma
-    # binaries from a mix build that includes ggml-org/llama.cpp#24423). A plain
-    # upstream build never builds these, so -- unlike `binaries`, every one of
-    # which must exist -- their absence is not an error.
-    optional_binaries = ["llama-diffusion-gemma-visual-server", "llama-diffusion-cli"]
+    # Required core: these must exist or packaging fails loudly. Every other
+    # executable the build produced is discovered and shipped too (see curate).
+    binaries = ["llama-server", "llama-cli", "llama-quantize"]
+    lib_suffix_re = r"\.so(\.\d+)*$"  # POSIX shared-lib suffix to exclude; Windows keys on .exe
 
     def shipped_binaries(self) -> list[str]:
         return [b + self.exe_suffix for b in self.binaries]
 
-    def optional_shipped_binaries(self) -> list[str]:
-        return [b + self.exe_suffix for b in self.optional_binaries]
+    def is_executable(self, path: Path) -> bool:
+        """True if `path` is a program to ship (not a shared library)."""
+        if not path.is_file():
+            return False
+        if self.exe_suffix:  # Windows: an executable is exactly a .exe
+            return path.suffix.lower() == self.exe_suffix
+        return not re.search(self.lib_suffix_re, path.name) and os.access(path, os.X_OK)
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
         """Names of dynamic libs `path` needs that are *local* (live in bin_dir)."""
@@ -106,6 +109,7 @@ class LinuxStrategy(PlatformStrategy):
 class MacOSStrategy(PlatformStrategy):
     name = "macos"
     rpath = "@loader_path"
+    lib_suffix_re = r"\.dylib$"
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
         out = _run(["otool", "-L", str(path)])
@@ -175,21 +179,24 @@ def _copy_one(strategy: PlatformStrategy, bin_dir: Path, stage: Path, name: str)
 
 def curate(strategy: PlatformStrategy, bin_dir: Path, stage: Path) -> None:
     roots: list[Path] = []
-    for b in strategy.shipped_binaries():
+    required = strategy.shipped_binaries()
+    for b in required:
         if not (bin_dir / b).exists():
             sys.exit(f"ERROR: missing {bin_dir / b}")
         shutil.copy2(bin_dir / b, stage / b)
         roots.append(stage / b)
 
-    # Optional binaries: ship the ones this build produced, skip the rest. They
-    # become roots too, so any library only they need is pulled into the closure
-    # (the DiffusionGemma binaries need only libllama/libggml/libllama-common,
-    # which llama-server already pulls, but treat them as roots for safety).
-    for b in strategy.optional_shipped_binaries():
-        src = bin_dir / b
-        if src.exists():
-            shutil.copy2(src, stage / b)
-            roots.append(stage / b)
+    # Ship every other executable the build produced, so a curated GPU bundle
+    # carries the same tool set as the full-build cpu/macos/rocm tarballs (which
+    # tar all of build/bin). Each becomes a root too, so any library only it
+    # needs is pulled into the closure. Runtime libraries that live outside
+    # bin_dir (e.g. the CUDA runtime) are never pulled in: the walk stays local.
+    required_set = set(required)
+    for p in sorted(bin_dir.iterdir()):
+        if p.name in required_set or not strategy.is_executable(p):
+            continue
+        _copy_one(strategy, bin_dir, stage, p.name)
+        roots.append(stage / p.name)
 
     # Backend modules are dlopen'd, so they never appear in the NEEDED graph;
     # copy them explicitly and treat them as extra roots so their own local
