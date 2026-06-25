@@ -159,6 +159,8 @@ jobs:
             -DGGML_CUDA_CUB_3DOT2=ON `
             -DLLAMA_BUILD_TESTS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
             -DCMAKE_CUDA_ARCHITECTURES="$archs" `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache `
@@ -172,8 +174,7 @@ jobs:
           # 4 vCPU / 16 GB GitHub-hosted runners (measured over a 1s sampler),
           # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
           # is ~2 physical cores + HT), so 3 is the sweet spot.
-          cmake --build build --config Release -j 3 `
-            --target llama-server llama-quantize
+          cmake --build build --config Release -j 3
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the Linux CUDA child for

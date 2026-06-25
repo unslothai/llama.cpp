@@ -176,6 +176,8 @@ jobs:
             -DGGML_CUDA_CUB_3DOT2=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
             -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -189,20 +191,19 @@ jobs:
         run: |
           set -eux
           # Backend modules (CPU variants, CUDA, RPC) build as ggml dependencies,
-          # so the server/quantize targets pull them in.
+          # so every tool pulls them in.
           # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
           # 4 vCPU / 16 GB GitHub-hosted runners (x64 and arm64 alike, measured
           # over a 1s sampler), so 3 parallel TUs leave ~13 GB free. -j 4 adds
           # no speed (the runner is ~2 physical cores + HT), so 3 is the sweet spot.
-          cmake --build build --config Release -j 3 \
-            --target llama-server llama-quantize
-          strip build/bin/llama-server build/bin/llama-quantize || true
+          cmake --build build --config Release -j 3
+          strip build/bin/llama-* || true
 
       # The DiffusionGemma visual server + cli are example targets that exist
       # only when the source tree carries ggml-org/llama.cpp#24423 (a mix build).
-      # Build them best-effort and NEVER fail the job: the required server +
-      # quantize bundle above must publish even if these do not compile on a
-      # given toolchain. package_bundle.py ships them only if they were produced.
+      # Build them best-effort and NEVER fail the job: the full tool bundle
+      # above must publish even if these do not compile on a given toolchain.
+      # package_bundle.py ships them only if they were produced.
       - name: Build DiffusionGemma binaries (best-effort; mix builds only)
         working-directory: src
         run: |
