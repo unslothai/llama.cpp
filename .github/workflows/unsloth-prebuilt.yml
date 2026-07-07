@@ -19,11 +19,12 @@ name: Unsloth prebuilt (full release)
 # installer needs the full bundle set at the same tag or it'll dispatch to
 # something that isn't there.
 #
-# Mix builds: scripts/unsloth/pr-set.json can list upstream PRs (each pinned
-# to an exact commit) to merge into the build. `resolve` merges the open ones
-# onto the base tag and uploads the merged tree as a workflow artifact that
-# the children extract instead of cloning; the release is tagged
-# b####-mix-<hash>. Empty list = vanilla upstream build.
+# Mix builds: scripts/unsloth/pr-set.json can list ggml-org/llama.cpp or
+# unslothai/llama.cpp PRs (each pinned to an exact commit) to merge into the
+# build. `resolve` merges the open ones onto the base tag and uploads the
+# merged tree as a workflow artifact that the children extract instead of
+# cloning; the release is tagged b####-mix-<hash>. Empty list = vanilla
+# upstream build.
 
 on:
   schedule:
@@ -150,47 +151,49 @@ jobs:
           fi
           printf '%s' "$BASE" | grep -qE '^b[0-9]+$' || { echo "refusing non-release tag '$BASE'" >&2; exit 1; }
 
-          # Resolve the PR mix set (scripts/unsloth/pr-set.json): upstream PR
-          # commit urls. Pins are mandatory -- only an exact, reviewed commit
+          # Resolve the PR mix set (scripts/unsloth/pr-set.json): PR commit
+          # urls from ggml-org/llama.cpp or unslothai/llama.cpp (no other
+          # repos). Pins are mandatory -- only an exact, reviewed commit
           # is ever built, so a PR author pushing more commits cannot change
           # what the nightly ships. Non-open PRs are skipped, so merged or
-          # abandoned entries rot away harmlessly instead of breaking the
-          # nightly. unsloth-pr-set-lint.yml runs the same checks on every
+          # abandoned entries rot away instead of breaking the nightly (but a
+          # merged unslothai pin drops out of the build entirely; see the
+          # pr-set.json _doc). unsloth-pr-set-lint.yml runs the same checks on every
           # push that edits the file, but that is only a tripwire -- a red
           # lint does not stop the schedule, so the gate must live here.
           jq -e '.prs | type == "array" and all(.[]; type == "string")' scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings" >&2; exit 1; }
           PRS='[]'
-          URL_RE='^https://github\.com/ggml-org/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           for url in $(jq -r '.prs[]' scripts/unsloth/pr-set.json); do
-            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/ggml-org/llama.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
-            NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
-            # plain assignment first so a gh failure aborts the run (set -e)
-            # instead of being swallowed by a later read's exit status. Title can
-            # contain spaces, so it can't ride a space-delimited read -- pull each
-            # field out on its own.
-            PR_JSON="$(gh api "repos/ggml-org/llama.cpp/pulls/${NUM}")"
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/{ggml-org,unslothai}/llama.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            SRC="${BASH_REMATCH[1]}/llama.cpp"; NUM="${BASH_REMATCH[2]}"; SHA="${BASH_REMATCH[3]}"
+            # Abort naming the entry on a gh failure (typo'd numbers 404).
+            # Title can contain spaces, so it can't ride a space-delimited
+            # read -- pull each field out on its own.
+            PR_JSON="$(gh api "repos/${SRC}/pulls/${NUM}")" \
+              || { echo "refusing ${SRC}#${NUM}: could not fetch PR metadata (nonexistent PR number in '$url', or a transient API failure); fix the pin in scripts/unsloth/pr-set.json or retry" >&2; exit 1; }
             STATE="$(jq -r '.state' <<<"$PR_JSON")"
             HEAD="$(jq -r '.head.sha' <<<"$PR_JSON")"
             N_COMMITS="$(jq -r '.commits' <<<"$PR_JSON")"
             TITLE="$(jq -r '.title' <<<"$PR_JSON")"
             if [ "$STATE" != "open" ]; then
-              echo "skipping PR #${NUM} (${STATE}): $url"
+              echo "skipping ${SRC}#${NUM} (${STATE}): $url"
               continue
             fi
-            # A pin pasted from the wrong PR would build arbitrary upstream
-            # code while the manifest blames PR #<num>; require the pinned
-            # commit to be a commit of that PR. The commits listing is capped
-            # at 250 by the API; past that, skip rather than false-fail.
+            # A pin pasted from the wrong PR would build arbitrary code while
+            # the manifest blames PR #<num>; require the pinned commit to be
+            # a commit of that PR. The commits listing is capped at 250 by
+            # the API; past that, skip rather than false-fail.
             if [ "$N_COMMITS" -gt 250 ]; then
-              echo "note: PR #${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
-            elif ! gh api "repos/ggml-org/llama.cpp/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
-              echo "refusing PR #${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away); fix the pin in scripts/unsloth/pr-set.json" >&2
+              echo "note: ${SRC}#${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
+              echo "refusing ${SRC}#${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away); fix the pin in scripts/unsloth/pr-set.json" >&2
               exit 1
             fi
-            [ "$SHA" = "$HEAD" ] || echo "note: PR #${NUM} is pinned to ${SHA} but its head has moved to ${HEAD}"
-            echo "including PR #${NUM} @ ${SHA}"
-            PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
+            [ "$SHA" = "$HEAD" ] || echo "note: ${SRC}#${NUM} is pinned to ${SHA} but its head has moved to ${HEAD}"
+            echo "including ${SRC}#${NUM} @ ${SHA}"
+            PRS="$(jq -c --arg r "$SRC" --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{repo: $r, number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
           done
 
           # Decide the tag and source repo first; the source tree is built
@@ -201,12 +204,14 @@ jobs:
             TAG="$BASE"
             REPO='ggml-org/llama.cpp'
           else
-            # The synthetic tag embeds a hash of the pinned SHAs in listed order
-            # (merge order can matter for conflicts), so a pin update or a reorder
-            # yields a new tag and build, while the "exists" check below still
-            # skips rebuilding an already-published set. The merged tree exists
-            # only as this repo's release assets, never upstream.
-            SETHASH="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
+            # The synthetic tag embeds a hash of the pinned repo#number:sha
+            # triples in listed order (merge order can matter for conflicts), so
+            # a pin update or a reorder yields a new tag and build, while the
+            # "exists" check below still skips rebuilding an already-published
+            # set. The repo is part of the key so PR #n in the two repos can't
+            # hash to the same set. The merged tree exists only as this repo's
+            # release assets, never upstream.
+            SETHASH="$(jq -r 'map("\(.repo)#\(.number):\(.sha)") | join("\n")' <<<"$PRS" | sha256sum | cut -c1-7)"
             TAG="${BASE}-mix-${SETHASH}"
             REPO="$GITHUB_REPOSITORY"
           fi
@@ -239,14 +244,16 @@ jobs:
               fi
               git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
               git checkout -q --detach "refs/tags/${BASE}"
-              for pair in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
-                NUM="${pair%%:*}"; SHA="${pair##*:}"
-                git fetch -q --no-tags upstream "$SHA" \
-                  || { echo "could not fetch commit ${SHA} for PR #${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
+              # Each pin is fetched from the repo its PR lives in (repo/number/
+              # sha are machine fields, so the space-delimited read is safe;
+              # titles stay out of this loop).
+              while read -r SRC NUM SHA; do
+                git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" \
+                  || { echo "could not fetch commit ${SHA} for ${SRC}#${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
                 git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                  merge --no-ff --no-edit -m "Merge ggml-org/llama.cpp#${NUM} @ ${SHA}" "$SHA" \
-                  || { echo "PR #${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
-              done
+                  merge --no-ff --no-edit -m "Merge ${SRC}#${NUM} @ ${SHA}" "$SHA" \
+                  || { echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
+              done < <(jq -r '.[] | "\(.repo) \(.number) \(.sha)"' <<<"$PRS")
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
               # build number is baked below, so no git history is needed at build time.
@@ -508,7 +515,7 @@ jobs:
           cp "dist/llama.cpp-source-${TAG}.tar.gz" "dist/llama.cpp-source-commit-${SHA}.tar.gz"
 
       - name: Generate manifest + sha256 index
-        # prs carries upstream PR titles (arbitrary text), so pass it through env
+        # prs carries PR titles (arbitrary text), so pass it through env
         # rather than inlining it: a title with a quote would otherwise break out
         # of the shell command. Same handling in the publish step below.
         env:
@@ -578,7 +585,7 @@ jobs:
 
       - name: Publish GitHub release
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
-        # prs carries upstream PR titles (arbitrary text), so pass it through env
+        # prs carries PR titles (arbitrary text), so pass it through env
         # rather than inlining it: a title with a quote would otherwise break out
         # of the shell command.
         env:
@@ -592,17 +599,18 @@ jobs:
           # Link the base to the upstream release tag (always resolves). Each PR
           # line is "<title> (#<n>, commit <sha>)": GitHub does not expand a bare
           # reference into the PR title inline (only on hover), so we bake the
-          # title in ourselves. #<n> links to the upstream PR (full URL, so it
-          # resolves to upstream no matter which repo hosts the release, and
-          # GitHub still attaches its hovercard), and <sha> links to that pin's
-          # commit-in-PR URL. We deliberately do not link the merged commit: in
-          # mix mode it is a throwaway merge made on the runner and never pushed
-          # anywhere, so any repo@sha URL for it 404s.
+          # title in ourselves. #<n> links to the PR in its home repo (full URL,
+          # so it resolves no matter which repo hosts the release, and GitHub
+          # still attaches its hovercard); non-upstream PRs spell the repo in
+          # the link text so an unslothai pin can't read as an upstream one.
+          # <sha> links to that pin's commit-in-PR URL. We deliberately do not
+          # link the merged commit: in mix mode it is a throwaway merge made on
+          # the runner and never pushed anywhere, so any repo@sha URL for it 404s.
           NOTES="Automated Unsloth llama.cpp CUDA + ROCm + Vulkan + macOS + CPU prebuild for upstream [${BASE}](https://github.com/ggml-org/llama.cpp/releases/tag/${BASE})"
           if [ "$(jq length <<<"$PRS")" = 0 ]; then
             NOTES="${NOTES}."
           else
-            PR_LIST="$(jq -r 'map("- \(.title) ([#\(.number)](https://github.com/ggml-org/llama.cpp/pull/\(.number)), commit [\(.sha[0:7])](\(.url)))") | join("\n")' <<<"$PRS")"
+            PR_LIST="$(jq -r 'map("- \(.title) ([\(if .repo == "ggml-org/llama.cpp" then "" else .repo end)#\(.number)](https://github.com/\(.repo)/pull/\(.number)), commit [\(.sha[0:7])](\(.url)))") | join("\n")' <<<"$PRS")"
             NOTES="$(printf '%s, merged with:\n\n%s' "$NOTES" "$PR_LIST")"
           fi
 

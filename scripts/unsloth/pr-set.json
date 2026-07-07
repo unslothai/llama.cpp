@@ -1,10 +1,16 @@
 {
   "_doc": [
-    "ggml-org/llama.cpp PRs to merge into the nightly prebuilds. Each entry pins an exact",
-    "commit -- copy the url of the commit you reviewed from the PR's commits tab:",
+    "ggml-org/llama.cpp or unslothai/llama.cpp PRs to merge into the nightly prebuilds (no",
+    "other repos). Each entry pins an exact commit -- copy the url of the commit you",
+    "reviewed from the PR's commits tab:",
     "  https://github.com/ggml-org/llama.cpp/pull/15926/commits/59a3d0cb8f611aa3110ecea3d0afd16b1b18ee06",
     "Only that commit is built, even if the author keeps pushing; update the pin to take newer code.",
-    "Closed or merged PRs are skipped automatically, and an empty list is a plain upstream build."
+    "Closed or merged PRs are skipped automatically, and an empty list is a plain upstream build.",
+    "An unslothai PR branched off this fork's master merges that ancestry in too (workflow/",
+    "script files, upstream commits synced past the base tag), not just its own diff.",
+    "Careful: the build tree is the upstream tag + pins, never fork master, so merging an",
+    "unslothai PR into master DROPS it from the nightly; keep the pin open until the change",
+    "lands upstream or is no longer needed."
   ],
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/1d2faac2d8248c3d5df999712c42fe0fc72e7f07",
