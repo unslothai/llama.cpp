@@ -257,12 +257,18 @@ jobs:
       # Ninja Multi-Config emits to build/bin/Release. Ship the OpenMP runtime
       # (GGML_OPENMP=ON) from the VS LLVM redist -- exactly as upstream does --
       # globbing the MSVC version dir so an image bump does not break the path.
+      # Sort newest-first: older toolsets' libomp lacks entry points current
+      # clang imports (__kmpc_dispatch_deinit -> STATUS_ENTRYPOINT_NOT_FOUND).
       - name: Package bundle (zip)
         run: |
           $rel = "src/build/bin/Release"
           Copy-Item src/LICENSE $rel/
-          $omp = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\MSVC\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC*.OpenMP.LLVM\libomp140.${{ matrix.omp_arch }}.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $redist = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\MSVC"
+          $omp = Get-ChildItem "$redist\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC*.OpenMP.LLVM\libomp140.${{ matrix.omp_arch }}.dll" -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Directory.Parent.Parent.Parent.Name } -Descending |
+            Select-Object -First 1
           if (-not $omp) { Write-Error "libomp140.${{ matrix.omp_arch }}.dll not found in the VS LLVM redist"; exit 1 }
+          Write-Host "shipping OpenMP runtime: $($omp.FullName)"
           Copy-Item $omp.FullName $rel/
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $asset = "app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip"
@@ -270,6 +276,18 @@ jobs:
           7z a -tzip "$env:GITHUB_WORKSPACE/dist/$asset" .
           Pop-Location
           Get-ChildItem dist
+
+      # Smoke the packaged x64 bundle: launching an exe loads ggml-base and the
+      # picked libomp, so --version fails on a bad pick. timeout-minutes bounds
+      # a loader hard-error that can block instead of exiting. arm64 is
+      # cross-compiled and cannot run here.
+      - name: Smoke test bundle (x64 only)
+        if: matrix.arch == 'x64'
+        timeout-minutes: 5
+        run: |
+          $rel = "src/build/bin/Release"
+          & "$rel\llama-server.exe" --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "llama-server --version failed: $LASTEXITCODE"; exit 1 }
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v6
