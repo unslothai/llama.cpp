@@ -8,6 +8,7 @@
   ],
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/1d2faac2d8248c3d5df999712c42fe0fc72e7f07",
-    "https://github.com/ggml-org/llama.cpp/pull/24523/commits/00f95bd2d59ed2d6408fa3777b43ff5bd5fdc79d"
+    "https://github.com/ggml-org/llama.cpp/pull/24523/commits/00f95bd2d59ed2d6408fa3777b43ff5bd5fdc79d",
+    "https://github.com/ggml-org/llama.cpp/pull/25402/commits/15f732183bc1029df4b41ae2118364c3ccb6c162"
   ]
 }
