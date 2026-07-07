@@ -293,7 +293,7 @@ def main() -> int:
     ap.add_argument("--base-tag", default=None,
                     help="upstream release tag the build is based on; defaults to --tag (differs for mix builds)")
     ap.add_argument("--pr-set", default="[]",
-                    help='JSON array of merged upstream PRs: [{"number":..,"sha":..,"url":..},..]')
+                    help='JSON array of merged PRs: [{"repo":..,"number":..,"sha":..,"url":..,"title":..},..]')
     ap.add_argument("--commit", required=True)
     ap.add_argument("--dist", required=True, type=Path, help="dir holding the built app-*.tar.gz bundles")
     ap.add_argument("--out", required=True, type=Path, help="dir to write the two JSON sidecars into")
@@ -476,7 +476,7 @@ def main() -> int:
         sha_artifacts[name] = base_entry(kind, source_repo, digest)
 
     # 4) manifest, then hash it into the index. Both sidecars share the same
-    #    source-description header; merged_prs records the exact PR head SHAs
+    #    source-description header; merged_prs records the exact pinned PR SHAs
     #    a mix build compiled (empty for vanilla builds).
     common = {
         "schema_version": 1,
