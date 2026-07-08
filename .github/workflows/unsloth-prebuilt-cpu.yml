@@ -20,6 +20,8 @@ name: "Unsloth prebuilt: CPU"
 # assemble_metadata.py derives the manifest entry from the filename), $ORIGIN
 # RPATH on Linux. arm64 extends llama-cpp-binaries (x64-only) so the release
 # covers the arm64 CPU hosts that previously fell back to ggml-org upstream.
+# Both Linux legs build on ubuntu-22.04 so the bundles keep a glibc 2.35 /
+# GLIBCXX <= 3.4.30 floor and load on Ubuntu 22.04 and Debian 12 hosts.
 
 on:
   workflow_call:
@@ -51,7 +53,7 @@ jobs:
       matrix:
         include:
           - { arch: x64,   runner: ubuntu-22.04 }
-          - { arch: arm64, runner: ubuntu-24.04-arm }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
     steps:
       # The parent's resolve job built the source tree (upstream base + any mix
       # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -75,17 +77,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libssl-dev ninja-build
 
-      # ggml-org's release.yml applies this GCC-14 workaround on every
-      # ubuntu-24.04 leg (our arm64 runner); the default toolchain there
-      # miscompiles ggml. Matches the gcc-14 step in our CUDA arm64 child.
-      - name: Toolchain workaround (GCC 14 on arm64)
+      # arm64 builds on ubuntu-22.04-arm so the bundle keeps the x64 leg's
+      # loader floor (a 24.04 build needs GLIBC_2.38 and fails to load on
+      # Ubuntu 22.04 / Debian 12). Jammy's gcc can't target armv9.2-a+sme and
+      # a PPA gcc would raise the libstdc++ floor back, so use clang, which
+      # links against the system libstdc++.
+      - name: Toolchain (clang 19 on arm64)
         if: matrix.arch == 'arm64'
         run: |
           set -eux
-          sudo apt-get install -y gcc-14 g++-14
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
           {
-            echo "CC=gcc-14"
-            echo "CXX=g++-14"
+            echo "CC=clang-19"
+            echo "CXX=clang++-19"
           } >> "$GITHUB_ENV"
 
       - name: ccache
