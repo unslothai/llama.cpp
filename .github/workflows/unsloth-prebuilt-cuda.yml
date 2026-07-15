@@ -40,6 +40,11 @@ jobs:
   build:
     name: ${{ matrix.arch }}/${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
+    # cuda12-legacy (Maxwell/Pascal PTX floors) is best-effort: the merged mix
+    # PRs may not compile for old archs, and a failure there must not sink the
+    # release. Every other profile stays hard-required so a partial set can't
+    # publish.
+    continue-on-error: ${{ matrix.klass == 'legacy' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}
@@ -241,6 +246,7 @@ jobs:
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
+          SMS: ${{ matrix.sms }}
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle artifact

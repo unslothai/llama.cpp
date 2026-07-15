@@ -34,7 +34,7 @@ from pathlib import Path
 UPSTREAM_REPO = "ggml-org/llama.cpp"
 
 BUNDLE_RE = re.compile(
-    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable))\.(?P<ext>tar\.gz|zip)$"
+    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-(?P<profile>cuda1[23]-(?:older|newer|portable|legacy))\.(?P<ext>tar\.gz|zip)$"
 )
 
 ROCM_BUNDLE_RE = re.compile(

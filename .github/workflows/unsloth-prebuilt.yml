@@ -46,7 +46,7 @@ on:
         default: 'all'
         required: false
         type: choice
-        options: [all, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
+        options: [all, cuda12-legacy, cuda12-older, cuda12-newer, cuda12-portable, cuda13-older, cuda13-newer, cuda13-portable]
       operating_systems:
         description: 'OSes for ROCm builds'
         default: 'windows,ubuntu'
@@ -301,6 +301,7 @@ jobs:
           # upstream) which Jimver lacks, so those install via NVIDIA redist in
           # the build children -- on the same runners, so the glibc floor holds.
           ALL='[
+            {"profile":"cuda12-legacy",  "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"legacy",  "rank":5, "cuda":"12.8.0","toolkit_line":"12.8","archs":"50-virtual 61-virtual","sms":"50 52 60 61"},
             {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
             {"profile":"cuda12-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"newer",   "rank":20,"cuda":"12.8.0","toolkit_line":"12.8","archs":"86 89 90 100 120"},
             {"profile":"cuda12-portable","arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"portable","rank":30,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89 90 100 120"},
@@ -551,10 +552,13 @@ jobs:
           fail=0
           # A partial CUDA set (cuda13 without cuda12) silently strands the
           # cuda12-runtime majority; require matching x64 coverage on both lines.
+          # Only the older/newer/portable classes are symmetric across lines:
+          # cuda12-legacy is cuda12-only (CUDA 13 dropped Maxwell/Pascal) and
+          # best-effort, so `-n ... p` drops it rather than counting it here.
           for os in linux windows; do
             ext=$([ "$os" = windows ] && echo zip || echo tar.gz)
-            c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -E 's/.*cuda12-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
-            c13=$(ls dist/app-*-"$os"-x64-cuda13-*."$ext" 2>/dev/null | sed -E 's/.*cuda13-(older|newer|portable)\..*/\1/' | sort -u | paste -sd, -)
+            c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -nE 's/.*cuda12-(older|newer|portable)\..*/\1/p' | sort -u | paste -sd, -)
+            c13=$(ls dist/app-*-"$os"-x64-cuda13-*."$ext" 2>/dev/null | sed -nE 's/.*cuda13-(older|newer|portable)\..*/\1/p' | sort -u | paste -sd, -)
             echo "$os x64 coverage: cuda12=[$c12] cuda13=[$c13]"
             [ -n "$c12" ] && [ "$c12" = "$c13" ] || { echo "ERROR: $os x64 cuda12/cuda13 coverage mismatch" >&2; fail=1; }
           done
