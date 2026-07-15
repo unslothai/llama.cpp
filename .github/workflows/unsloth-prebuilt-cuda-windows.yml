@@ -45,11 +45,6 @@ jobs:
   build:
     name: x64/${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
-    # cuda12-legacy (Maxwell/Pascal PTX floors) is best-effort: the merged mix
-    # PRs may not compile for old archs, and a failure there must not sink the
-    # release. Every other profile stays hard-required so a partial set can't
-    # publish.
-    continue-on-error: ${{ matrix.klass == 'legacy' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}

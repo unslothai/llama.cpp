@@ -552,9 +552,8 @@ jobs:
           fail=0
           # A partial CUDA set (cuda13 without cuda12) silently strands the
           # cuda12-runtime majority; require matching x64 coverage on both lines.
-          # Only the older/newer/portable classes are symmetric across lines:
-          # cuda12-legacy is cuda12-only (CUDA 13 dropped Maxwell/Pascal) and
-          # best-effort, so `-n ... p` drops it rather than counting it here.
+          # cuda12-legacy has no cuda13 sibling, so `-nE ... p` drops it from
+          # this cross-line parity check; its presence is required separately below.
           for os in linux windows; do
             ext=$([ "$os" = windows ] && echo zip || echo tar.gz)
             c12=$(ls dist/app-*-"$os"-x64-cuda12-*."$ext" 2>/dev/null | sed -nE 's/.*cuda12-(older|newer|portable)\..*/\1/p' | sort -u | paste -sd, -)
@@ -564,10 +563,13 @@ jobs:
           done
           # Children passing is not the same as files landing in dist/ (a
           # download-artifact anomaly leaves green jobs and missing bundles),
-          # so assert presence of every non-CUDA-x64 line the installer
-          # selects from. The resolve-time input guard already pins publish
-          # runs to the full default matrix, so these names are exact.
+          # so assert presence of every line not covered by the parity check
+          # above (the non-CUDA-x64 lines, plus cuda12-legacy). The resolve-time
+          # input guard already pins publish runs to the full default matrix, so
+          # these names are exact.
           for f in \
+            "app-${TAG}-linux-x64-cuda12-legacy.tar.gz" \
+            "app-${TAG}-windows-x64-cuda12-legacy.zip" \
             "llama-${TAG}-bin-macos-arm64.tar.gz" \
             "llama-${TAG}-bin-macos-x64.tar.gz" \
             "app-${TAG}-linux-arm64-cuda13-portable.tar.gz" \

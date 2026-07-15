@@ -332,10 +332,7 @@ def read_config() -> dict:
         "rank": need("RANK"),
         "toolkit_line": need("TOOLKIT_LINE"),
         "archs": need("ARCHS"),
-        # Advertised compute capabilities. Optional: all-real profiles derive it
-        # from ARCHS, but a profile that builds PTX floors (e.g. "50-virtual")
-        # must state the concrete SMs it JIT-covers, since the floor int is not
-        # the coverage set.
+        # Advertised compute capabilities; optional (empty -> derived from ARCHS in main()).
         "sms": os.environ.get("SMS", ""),
         "platform": os.environ.get("PLATFORM", "linux"),
         "arch": os.environ.get("ARCH", "x64"),
@@ -351,12 +348,10 @@ def main() -> int:
     if strategy is None:
         sys.exit(f"ERROR: unknown PLATFORM '{cfg['platform']}' (have {sorted(STRATEGIES)})")
 
-    # ARCHS is the nvcc build directive and may carry -real/-virtual/a/f
-    # suffixes (e.g. the cuda12-legacy profile builds "50-virtual 61-virtual"
-    # PTX floors). The manifest's supported_sms must instead be the concrete
-    # compute capabilities the bundle runs on -- wider than a PTX floor -- so a
-    # suffixed profile declares its coverage explicitly via SMS. All-real
-    # profiles omit SMS and fall back to each arch's leading SM integer.
+    # supported_sms is the concrete coverage, which for a PTX floor (e.g. the
+    # cuda12-legacy "50-virtual 61-virtual") is wider than the arch int itself.
+    # So suffixed profiles declare it via SMS; all-real profiles fall back to
+    # each ARCHS entry's leading SM number.
     if cfg["sms"]:
         sms = [s for s in re.split(r"[ ;,]+", cfg["sms"]) if s]
     else:
