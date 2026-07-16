@@ -218,6 +218,7 @@ jobs:
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
+          SMS: ${{ matrix.sms }}
         run: python tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle artifact

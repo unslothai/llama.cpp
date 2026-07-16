@@ -225,15 +225,15 @@ def detect_nvcc_sms() -> tuple[str, list[str], str]:
     return "available", sms, f"detected {len(sms)} SM targets"
 
 
-def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, archs: list[str]) -> None:
+def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list[str]) -> None:
     short = cfg["commit"][:7]
-    min_sm, max_sm = min(map(int, archs)), max(map(int, archs))
+    min_sm, max_sm = min(map(int, sms)), max(map(int, sms))
     nvcc_status, nvcc_sms, nvcc_msg = detect_nvcc_sms()
     # sm_103 (B300 / GB300 Blackwell Ultra) has no native build, but it JIT-runs
     # on the bundled compute_100 PTX, so any bundle that ships sm_100 also covers
     # it. Declare it in supported_sms (not the native nvcc build) so every
     # platform's manifest agrees -- Windows and arm64 reuse these x64 profiles.
-    supported_sms = list(archs)
+    supported_sms = list(sms)
     if "100" in supported_sms and "103" not in supported_sms:
         supported_sms = sorted([*supported_sms, "103"], key=int)
     note = f"CUDA {cfg['line'].removeprefix('cuda')} {cfg['klass']} bundle."
@@ -332,6 +332,8 @@ def read_config() -> dict:
         "rank": need("RANK"),
         "toolkit_line": need("TOOLKIT_LINE"),
         "archs": need("ARCHS"),
+        # Advertised compute capabilities; optional (empty -> derived from ARCHS in main()).
+        "sms": os.environ.get("SMS", ""),
         "platform": os.environ.get("PLATFORM", "linux"),
         "arch": os.environ.get("ARCH", "x64"),
         "docker_image": os.environ.get("DOCKER_IMAGE", ""),
@@ -346,7 +348,14 @@ def main() -> int:
     if strategy is None:
         sys.exit(f"ERROR: unknown PLATFORM '{cfg['platform']}' (have {sorted(STRATEGIES)})")
 
-    archs = [a for a in re.split(r"[ ;,]+", cfg["archs"]) if a]
+    # supported_sms is the concrete coverage, which for a PTX floor (e.g. the
+    # cuda12-legacy "50-virtual 61-virtual") is wider than the arch int itself.
+    # So suffixed profiles declare it via SMS; all-real profiles fall back to
+    # each ARCHS entry's leading SM number.
+    if cfg["sms"]:
+        sms = [s for s in re.split(r"[ ;,]+", cfg["sms"]) if s]
+    else:
+        sms = [re.match(r"\d+", a).group() for a in re.split(r"[ ;,]+", cfg["archs"]) if a]
     bin_dir = Path(cfg["bin_dir"])
     out_dir = Path(cfg["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -354,7 +363,7 @@ def main() -> int:
     stage = Path(tempfile.mkdtemp())
     try:
         curate(strategy, bin_dir, stage)
-        write_metadata(stage, strategy, cfg, archs)
+        write_metadata(stage, strategy, cfg, sms)
 
         asset = f"app-{cfg['tag']}-{strategy.name}-{cfg['arch']}-{cfg['profile']}{strategy.archive_ext}"
         out_path = out_dir / asset
