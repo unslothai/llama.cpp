@@ -97,7 +97,10 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: cpu-linux-${{ matrix.arch }}
+          key: cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}
+          restore-keys: |
+            cpu-linux-${{ matrix.arch }}
+          append-timestamp: false
           variant: ccache
           evict-old-files: 14d
 
@@ -208,7 +211,10 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: cpu-windows-${{ matrix.arch }}
+          key: cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}
+          restore-keys: |
+            cpu-windows-${{ matrix.arch }}
+          append-timestamp: false
           variant: ccache
           evict-old-files: 14d
 

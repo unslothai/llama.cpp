@@ -75,7 +75,10 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: vulkan-linux-x64
+          key: vulkan-linux-x64-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-linux-x64
+          append-timestamp: false
           variant: ccache
           evict-old-files: 14d
 
@@ -177,7 +180,10 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: vulkan-windows-x64
+          key: vulkan-windows-x64-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-windows-x64
+          append-timestamp: false
           variant: ccache
           evict-old-files: 14d
 

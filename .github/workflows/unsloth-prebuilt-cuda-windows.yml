@@ -76,7 +76,10 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}
+          restore-keys: |
+            cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          append-timestamp: false
           variant: ccache
           evict-old-files: 14d
 
