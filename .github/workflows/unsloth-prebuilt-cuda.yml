@@ -101,6 +101,7 @@ jobs:
           append-timestamp: false
           variant: ccache
           evict-old-files: 14d
+          max-size: 2G
 
       # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
       # toolkit components straight from NVIDIA's redist CDN (same source Jimver

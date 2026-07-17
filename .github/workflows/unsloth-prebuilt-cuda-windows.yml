@@ -82,6 +82,7 @@ jobs:
           append-timestamp: false
           variant: ccache
           evict-old-files: 14d
+          max-size: 2G
 
       - uses: actions/setup-python@v6
         with:
