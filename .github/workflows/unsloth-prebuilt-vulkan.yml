@@ -80,7 +80,7 @@ jobs:
             vulkan-linux-x64
           append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
+          save: false
 
       - name: Configure
         working-directory: src
@@ -154,6 +154,16 @@ jobs:
           path: dist/app-${{ inputs.tag }}-linux-x64-vulkan.tar.gz
           if-no-files-found: error
 
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-vulkan-linux-x64-${{ inputs.tag }}-
+
   build-windows:
     name: windows/x64
     runs-on: windows-2022
@@ -185,7 +195,7 @@ jobs:
             vulkan-windows-x64
           append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
+          save: false
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -274,3 +284,13 @@ jobs:
           name: app-${{ inputs.tag }}-windows-x64-vulkan
           path: dist/app-${{ inputs.tag }}-windows-x64-vulkan.zip
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-vulkan-windows-x64-${{ inputs.tag }}-

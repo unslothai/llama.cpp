@@ -102,7 +102,7 @@ jobs:
             cpu-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
+          save: false
 
       - name: Configure
         working-directory: src
@@ -175,6 +175,16 @@ jobs:
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz
           if-no-files-found: error
 
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-
+
   build-windows:
     name: windows/${{ matrix.arch }}
     # Single x64 runner for both arches: arm64 is cross-compiled with the clang
@@ -216,7 +226,7 @@ jobs:
             cpu-windows-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
+          save: false
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -307,3 +317,13 @@ jobs:
           name: app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu
           path: dist/app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}-

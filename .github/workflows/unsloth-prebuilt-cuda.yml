@@ -100,8 +100,7 @@ jobs:
             cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
           append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
-          max-size: 2G
+          save: false
 
       # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
       # toolkit components straight from NVIDIA's redist CDN (same source Jimver
@@ -254,3 +253,13 @@ jobs:
           name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
