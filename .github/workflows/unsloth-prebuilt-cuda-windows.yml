@@ -76,9 +76,12 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}
+          restore-keys: |
+            cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          append-timestamp: false
           variant: ccache
-          evict-old-files: 14d
+          save: false
 
       - uses: actions/setup-python@v6
         with:
@@ -227,3 +230,13 @@ jobs:
           name: app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
           path: dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
