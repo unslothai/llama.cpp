@@ -259,6 +259,7 @@ struct ggml_metal_device_props {
     bool has_tensor;
     bool use_residency_sets;
     bool use_shared_buffers;
+    bool use_mmap_buffers;
 
     bool supports_gpu_family_apple7;
 

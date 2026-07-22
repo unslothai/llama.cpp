@@ -841,6 +841,28 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 dev->props.use_shared_buffers = true;
             }
 
+            // mmap-backed model buffers (newBufferWithBytesNoCopy over a
+            // file-backed mapping) return stale data on the Apple Paravirtual
+            // device of macOS 14 virtual machines (e.g. GitHub macos-14
+            // runners): weights larger than a few hundred MiB read as garbage
+            // from the GPU and inference produces degenerate output, while the
+            // same binary works on macOS 15+ VMs and on bare metal. Refuse
+            // buffer_from_host_ptr there so llama.cpp falls back to copied
+            // weight buffers (equivalent to --no-mmap), which are correct.
+            dev->props.use_mmap_buffers = true;
+            if (getenv("GGML_METAL_MMAP_BUFFERS_DISABLE") != NULL) {
+                dev->props.use_mmap_buffers = false;
+            }
+#if TARGET_OS_OSX
+            if (dev->props.use_mmap_buffers &&
+                ![[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion) {15, 0, 0}] &&
+                [[dev->mtl_device name] rangeOfString:@"Paravirtual"].location != NSNotFound) {
+                GGML_LOG_WARN("%s: disabling mmap-backed buffers: '%s' on macOS < 15 returns stale data for file-backed buffers\n",
+                              __func__, [[dev->mtl_device name] UTF8String]);
+                dev->props.use_mmap_buffers = false;
+            }
+#endif
+
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
@@ -905,6 +927,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");
             GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
+            GGML_LOG_INFO("%s: use mmap buffers      = %s\n", __func__, dev->props.use_mmap_buffers        ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
             if (@available(macOS 10.12, iOS 16.0, *)) {

@@ -676,10 +676,12 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
     props->caps = {
         /* .async                = */ true,
         /* .host_buffer          = */ false,
-        /* .buffer_from_host_ptr = */ true,
+        /* .buffer_from_host_ptr = */ ggml_metal_device_get_props(ctx_dev)->use_mmap_buffers,
         /* .events               = */ true,
     };
 }
