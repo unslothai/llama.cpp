@@ -365,7 +365,7 @@ jobs:
   build-cuda:
     name: CUDA
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -377,7 +377,7 @@ jobs:
   build-windows-cuda:
     name: CUDA Windows
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -389,7 +389,7 @@ jobs:
   build-rocm:
     name: ROCm
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -413,7 +413,7 @@ jobs:
   build-cpu:
     name: CPU
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     uses: ./.github/workflows/unsloth-prebuilt-cpu.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -423,7 +423,7 @@ jobs:
   build-vulkan:
     name: Vulkan
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     uses: ./.github/workflows/unsloth-prebuilt-vulkan.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -437,7 +437,7 @@ jobs:
     # workflow failed, the corresponding `build-*` job reports failure, the
     # default `needs` success check skips this assemble job, and nothing is
     # published. The installer needs the full bundle set or it'll fail.
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ false }}  # disabled on this test branch (macOS-only candidate build)
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
