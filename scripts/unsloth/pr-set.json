@@ -11,6 +11,7 @@
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/c3fb97241295c196e09b783e705e84b96cd1bd74",
     "https://github.com/ggml-org/llama.cpp/pull/24523/commits/66f43aa655a07999c7746fe9ff5ede94835e921e",
-    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/ce16fff2ad1d1ddfb39365fedfb4fcfd6db178f1"
+    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/ce16fff2ad1d1ddfb39365fedfb4fcfd6db178f1",
+    "https://github.com/unslothai/llama.cpp/pull/37/commits/c417c7f2fd98e29048c4bdfd9482e759c11acfd2"
   ]
 }
