@@ -328,7 +328,7 @@ jobs:
           # pins 13.3 (matches upstream's Intel leg, covers 2017 Intel Macs
           # capped at Ventura).
           MACOS_INCLUDE='[
-            {"build":"arm64","runner":"macos-26",      "expect_arch":"arm64", "deploy_target":"14.0","defines":"-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"},
+            {"build":"arm64","runner":"macos-26",      "expect_arch":"arm64", "deploy_target":"14.0","defines":"-DGGML_METAL_EMBED_LIBRARY=ON"},
             {"build":"x64",  "runner":"macos-15-intel","expect_arch":"x86_64","deploy_target":"13.3","defines":"-DGGML_METAL=OFF"}
           ]'
           MACOS_INCLUDE="$(echo "$MACOS_INCLUDE" | jq -c .)"
