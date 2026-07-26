@@ -2291,7 +2291,7 @@ static common_chat_params common_chat_params_init_inkling(const common_chat_temp
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK;
-    data.thinking_end_tag   = END_MESSAGE;
+    data.thinking_end_tags  = {END_MESSAGE};
     data.preserved_tokens   = {
         MSG_MODEL, MSG_USER, MSG_SYSTEM, MSG_TOOL,
         THINK, TEXT, END_MESSAGE, END_SAMPLING, INVOKE_TOOL,
