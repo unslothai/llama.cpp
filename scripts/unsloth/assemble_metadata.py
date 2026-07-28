@@ -6,8 +6,9 @@
 Produces, matching the schema consumed by unslothai/unsloth's installer:
   - llama-prebuilt-manifest.json : describes every locally-built bundle in this
     release (CUDA x64/arm64 profiles + ROCm Linux/Windows per gfx target +
-    macOS arm64/x64 + CPU Linux/Windows x64+arm64 + Vulkan Linux/Windows x64),
-    with the dispatch metadata the installer needs to pick the right one.
+    macOS arm64/x64 + CPU Linux/Windows x64+arm64 + Vulkan Linux x64/arm64 and
+    Windows x64), with the dispatch metadata the installer needs to pick the
+    right one.
   - llama-prebuilt-sha256.json   : a cross-OS integrity index covering both the
     locally-built bundles AND the upstream ggml-org assets the installer still
     pulls (arm64 CPU + the Windows CUDA cudart/runtime) + the source tarballs.
@@ -44,14 +45,14 @@ ROCM_BUNDLE_RE = re.compile(
 # CPU-only and Vulkan bundles, built locally by unsloth-prebuilt-cpu.yml /
 # unsloth-prebuilt-vulkan.yml. Like ROCm/macOS they are raw build/bin archives
 # with no embedded UNSLOTH_PREBUILT_INFO.json, so everything in the manifest
-# entry is derived from the filename. CPU covers x64 + arm64 (the arm64 slices
-# supersede the upstream ggml-org CPU passthroughs); Vulkan is x64-only.
+# entry is derived from the filename. CPU covers Linux/Windows x64 + arm64;
+# Vulkan covers Linux x64 + arm64 and Windows x64.
 CPU_BUNDLE_RE = re.compile(
     r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-cpu\.(?P<ext>tar\.gz|zip)$"
 )
 
 VULKAN_BUNDLE_RE = re.compile(
-    r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-x64-vulkan\.(?P<ext>tar\.gz|zip)$"
+    r"^app-(?P<tag>[^/]+)-(?P<target>linux-(?:x64|arm64)|windows-x64)-vulkan\.(?P<ext>tar\.gz|zip)$"
 )
 
 # macOS slices are built by unsloth-prebuilt-macos.yml and land in dist/ under
@@ -90,9 +91,10 @@ KIND_BY_CPU = {
     ("windows", "arm64"): {"manifest": "windows-arm64", "sha": "windows-arm64-app"},
 }
 
-KIND_BY_VULKAN_PLATFORM = {
-    "linux":   {"manifest": "linux-vulkan",   "sha": "linux-vulkan-app"},
-    "windows": {"manifest": "windows-vulkan", "sha": "windows-vulkan-app"},
+KIND_BY_VULKAN_TARGET = {
+    "linux-x64":   {"manifest": "linux-vulkan",       "sha": "linux-vulkan-app"},
+    "linux-arm64": {"manifest": "linux-vulkan",       "sha": "linux-arm64-vulkan-app"},
+    "windows-x64": {"manifest": "windows-vulkan",     "sha": "windows-vulkan-app"},
 }
 
 # macOS slices: install_kind / sha-index kind / manifest bundle_profile per arch.
@@ -217,7 +219,7 @@ def build_artifacts(
     rocm_bundles:    list of (asset_name, platform, gfx_target).
     macos_bundles:   list of (asset_name, arch).
     cpu_bundles:     list of (asset_name, platform, arch).
-    vulkan_bundles:  list of (asset_name, platform).
+    vulkan_bundles:  list of (asset_name, target).
 
     CUDA fields come from each bundle's own embedded metadata, so the manifest
     can never disagree with what was actually compiled. ROCm, macOS, CPU and
@@ -271,11 +273,12 @@ def build_artifacts(
             "coverage_class": None,
             "rank": 1000,
         })
-    for asset_name, platform in vulkan_bundles:
+    for asset_name, target in vulkan_bundles:
+        platform, arch = target.rsplit("-", 1)
         artifacts.append({
             "asset_name": asset_name,
-            "install_kind": KIND_BY_VULKAN_PLATFORM[platform]["manifest"],
-            "bundle_profile": f"{platform}-vulkan-x64",
+            "install_kind": KIND_BY_VULKAN_TARGET[target]["manifest"],
+            "bundle_profile": f"{platform}-vulkan-{arch}",
             "runtime_line": None,
             "coverage_class": None,
             "rank": 60,
@@ -403,19 +406,21 @@ def main() -> int:
     else:
         print("WARNING: no app-*-cpu.{tar.gz,zip} bundles found", file=sys.stderr)
 
-    vulkan_found = [(name, m.group("platform")) for name, m in scan_bundles(VULKAN_BUNDLE_RE)]
+    vulkan_found = [(name, m.group("target")) for name, m in scan_bundles(VULKAN_BUNDLE_RE)]
     if vulkan_found:
         with ThreadPoolExecutor(max_workers=4) as pool:
             vulkan_digests = list(pool.map(lambda b: sha256_file(args.dist / b[0]), vulkan_found))
-        for (name, platform), digest in zip(vulkan_found, vulkan_digests):
-            sha_artifacts[name] = base_entry(KIND_BY_VULKAN_PLATFORM[platform]["sha"], args.publish_repo, digest)
+        for (name, target), digest in zip(vulkan_found, vulkan_digests):
+            sha_artifacts[name] = base_entry(
+                KIND_BY_VULKAN_TARGET[target]["sha"], args.publish_repo, digest
+            )
     else:
         print("WARNING: no app-*-vulkan.{tar.gz,zip} bundles found", file=sys.stderr)
 
     # 2) upstream per-OS bundles: read GitHub's published asset.digest from the
     #    API response; fall back to a streaming hash if a digest is missing.
-    #    macOS + x64 CPU/Vulkan are absent here on purpose -- we build those
-    #    ourselves (1c/1d).
+    #    macOS and the locally-built CPU/Vulkan slices are absent here on
+    #    purpose -- we build those ourselves (1c/1d).
     #    A mix build has no upstream release for its tag, so the whole section
     #    is skipped; its uncovered hosts fall back to a source build of the
     #    merged tree instead of a vanilla upstream binary missing the PRs.
@@ -437,10 +442,10 @@ def main() -> int:
                 rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
             ):
                 wanted.append((name, "windows-cuda-upstream"))
-        # x64 CPU + Vulkan are no longer passthroughs -- we build them ourselves
-        # (sections 1d above). arm64 CPU is now built too (1d emits the
-        # locally-built linux-arm64/windows-arm64 bundles), but the installer
-        # still selects the upstream arm64 asset until it is switched over to
+        # x64 CPU and all current Vulkan targets are no longer passthroughs --
+        # we build them ourselves (section 1d above). arm64 CPU is now built too
+        # (1d emits the locally-built linux-arm64/windows-arm64 bundles), but the
+        # installer still selects the upstream arm64 asset until it is switched to
         # those bundles; keep these passthrough checksums until that installer
         # flip lands, then drop them.
         for name, kind in (
