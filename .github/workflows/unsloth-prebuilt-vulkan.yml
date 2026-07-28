@@ -4,12 +4,12 @@
 name: "Unsloth prebuilt: Vulkan"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the Vulkan bundles for
-# Linux x64 + Windows x64. Each job uploads a single app-*.{tar.gz|zip}
-# artifact for the parent's assemble step to pick up.
+# Linux x64/arm64 + Windows x64. Each matrix entry uploads a single
+# app-*.{tar.gz|zip} artifact for the parent's assemble step to pick up.
 #
 # Mirrors oobabooga/llama-cpp-binaries' build-wheels-vulkan.yml build recipe
 # (the CPU recipe plus GGML_VULKAN=ON and a Vulkan SDK install), adapted to
-# this repo's conventions: app-<tag>-<platform>-x64-vulkan archives packaged
+# this repo's conventions: app-<tag>-<platform>-<arch>-vulkan archives packaged
 # straight from build/bin like the ROCm/macOS children (no embedded
 # UNSLOTH_PREBUILT_INFO.json -- assemble_metadata.py derives the manifest entry
 # from the filename), MSVC + BoringSSL on Windows, $ORIGIN RPATH on Linux.
@@ -17,6 +17,8 @@ name: "Unsloth prebuilt: Vulkan"
 # The Vulkan loader (libvulkan.so.1 / vulkan-1.dll) is a system/driver library
 # resolved by the OS at runtime, so -- like llama-cpp-binaries -- it is not
 # bundled; only ggml's own libggml-vulkan backend module ships in the archive.
+# Both Linux legs use ubuntu-22.04 to keep a glibc 2.35 / GLIBCXX <= 3.4.30
+# floor. The arm64 leg supplies newer header-only SDK pieces at build time.
 
 on:
   workflow_call:
@@ -45,8 +47,14 @@ env:
 
 jobs:
   build-linux:
-    name: linux/x64
-    runs-on: ubuntu-22.04
+    name: linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
     steps:
       # The parent's resolve job built the source tree (upstream base + any mix
       # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -67,20 +75,78 @@ jobs:
       - name: Install Vulkan SDK + build dependencies
         run: |
           set -eux
-          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
+          if [ "${{ matrix.arch }}" = x64 ]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
+          fi
+
+      # Match the CPU arm64 leg so the bundle retains Jammy's loader and
+      # libstdc++ floors. Jammy's gcc cannot target armv9.2-a+sme.
+      - name: Toolchain (clang 19 on arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          {
+            echo "CC=clang-19"
+            echo "CXX=clang++-19"
+          } >> "$GITHUB_ENV"
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
         with:
-          key: vulkan-linux-x64-${{ inputs.tag }}
+          key: vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
-            vulkan-linux-x64
+            vulkan-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
           save: false
+
+      # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
+      # the current backend and it has no glslc package. Install matching pinned
+      # headers and build the shader compiler shipped with the LunarG SDK.
+      - name: Install Vulkan headers (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          package="$RUNNER_TEMP/vulkan-headers.deb"
+          staging="$RUNNER_TEMP/vulkan-headers"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/v/vulkan-headers/vulkan-headers_1.4.313.0~rc1-1lunarg22.04-1_all.deb" \
+            -o "$package"
+          echo "587b2d8e79416b394170ab61557c98765570cd153730f819a917866d78f45e1a  $package" | sha256sum -c -
+          dpkg-deb -x "$package" "$staging"
+          sudo cp -a "$staging/usr/." /usr/local/
+
+      - name: Build glslc (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          archive="$RUNNER_TEMP/shaderc.tar.gz"
+          source="$RUNNER_TEMP/shaderc"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/s/shaderc/shaderc_2025.2~rc1-1lunarg22.04.orig.tar.gz" \
+            -o "$archive"
+          echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
+          mkdir -p "$source"
+          tar -xzf "$archive" -C "$source"
+          cmake -S "$source" -B "$source/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
+          sudo install -m 0755 "$source/build/glslc/glslc" /usr/local/bin/glslc
+          glslc --version
 
       - name: Configure
         working-directory: src
@@ -141,7 +207,7 @@ jobs:
       - name: Package bundle (tar.gz)
         run: |
           set -eux
-          ASSET="app-${{ inputs.tag }}-linux-x64-vulkan.tar.gz"
+          ASSET="app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz"
           cp src/LICENSE src/build/bin/
           mkdir -p dist
           (cd src/build/bin && tar -czf "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
@@ -150,8 +216,8 @@ jobs:
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v6
         with:
-          name: app-${{ inputs.tag }}-linux-x64-vulkan
-          path: dist/app-${{ inputs.tag }}-linux-x64-vulkan.tar.gz
+          name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan
+          path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz
           if-no-files-found: error
 
       - name: Evict stale ccache files
@@ -162,7 +228,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-vulkan-linux-x64-${{ inputs.tag }}-
+          key: ccache-vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}-
 
   build-windows:
     name: windows/x64

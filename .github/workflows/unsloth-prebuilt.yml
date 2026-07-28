@@ -11,7 +11,7 @@ name: Unsloth prebuilt (full release)
 #   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
 #   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
 #   unsloth-prebuilt-cpu.yml           -- CPU-only bundles (Linux + Windows, x64 + arm64)
-#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux + Windows, x64)
+#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux x64/arm64 + Windows x64)
 #
 # Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
@@ -578,6 +578,7 @@ jobs:
             "app-${TAG}-linux-arm64-cpu.tar.gz" \
             "app-${TAG}-windows-arm64-cpu.zip" \
             "app-${TAG}-linux-x64-vulkan.tar.gz" \
+            "app-${TAG}-linux-arm64-vulkan.tar.gz" \
             "app-${TAG}-windows-x64-vulkan.zip"; do
             [ -s "dist/$f" ] || { echo "ERROR: missing $f in dist/" >&2; fail=1; }
           done
