@@ -17,6 +17,8 @@ name: "Unsloth prebuilt: Vulkan"
 # The Vulkan loader (libvulkan.so.1 / vulkan-1.dll) is a system/driver library
 # resolved by the OS at runtime, so -- like llama-cpp-binaries -- it is not
 # bundled; only ggml's own libggml-vulkan backend module ships in the archive.
+# Both Linux legs use ubuntu-22.04 to keep a glibc 2.35 / GLIBCXX <= 3.4.30
+# floor. The arm64 leg supplies newer header-only SDK pieces at build time.
 
 on:
   workflow_call:
@@ -46,14 +48,13 @@ env:
 jobs:
   build-linux:
     name: linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: ubuntu-22.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+          - { arch: x64,   runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
     steps:
       # The parent's resolve job built the source tree (upstream base + any mix
       # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -81,10 +82,22 @@ jobs:
             sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
           else
             sudo apt-get update -y
-            sudo apt-get install -y gcc-14 g++-14 build-essential glslc libvulkan-dev spirv-headers libssl-dev ninja-build
-            echo "CC=gcc-14" >> "$GITHUB_ENV"
-            echo "CXX=g++-14" >> "$GITHUB_ENV"
+            sudo apt-get install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
           fi
+
+      # Match the CPU arm64 leg so the bundle retains Jammy's loader and
+      # libstdc++ floors. Jammy's gcc cannot target armv9.2-a+sme.
+      - name: Toolchain (clang 19 on arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          {
+            echo "CC=clang-19"
+            echo "CXX=clang++-19"
+          } >> "$GITHUB_ENV"
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.20
@@ -95,6 +108,45 @@ jobs:
           append-timestamp: false
           variant: ccache
           save: false
+
+      # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
+      # the current backend and it has no glslc package. Install matching pinned
+      # headers and build the shader compiler shipped with the LunarG SDK.
+      - name: Install Vulkan headers (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          package="$RUNNER_TEMP/vulkan-headers.deb"
+          staging="$RUNNER_TEMP/vulkan-headers"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/v/vulkan-headers/vulkan-headers_1.4.313.0~rc1-1lunarg22.04-1_all.deb" \
+            -o "$package"
+          echo "587b2d8e79416b394170ab61557c98765570cd153730f819a917866d78f45e1a  $package" | sha256sum -c -
+          dpkg-deb -x "$package" "$staging"
+          sudo cp -a "$staging/usr/." /usr/local/
+
+      - name: Build glslc (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          archive="$RUNNER_TEMP/shaderc.tar.gz"
+          source="$RUNNER_TEMP/shaderc"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/s/shaderc/shaderc_2025.2~rc1-1lunarg22.04.orig.tar.gz" \
+            -o "$archive"
+          echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
+          mkdir -p "$source"
+          tar -xzf "$archive" -C "$source"
+          cmake -S "$source" -B "$source/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
+          sudo install -m 0755 "$source/build/glslc/glslc" /usr/local/bin/glslc
+          glslc --version
 
       - name: Configure
         working-directory: src
