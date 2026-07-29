@@ -41,6 +41,7 @@
 #define KEY_PROJ_DIM            "clip.%s.projection_dim"
 #define KEY_N_HEAD              "clip.%s.attention.head_count"
 #define KEY_N_HEAD_KV           "clip.%s.attention.head_count_kv"
+#define KEY_N_EMBD_HEAD         "clip.%s.attention.head_dim"
 #define KEY_LAYER_NORM_EPS      "clip.%s.attention.layer_norm_epsilon"
 #define KEY_FEATURE_LAYERS      "clip.%s.feature_layer"
 
@@ -397,6 +398,7 @@ enum projector_type {
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
+    PROJECTOR_TYPE_KIMIK3,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_HUNYUANVL,
     PROJECTOR_TYPE_PARAKEET,
@@ -454,6 +456,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
+    { PROJECTOR_TYPE_KIMIK3,            "kimik3"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
     { PROJECTOR_TYPE_EXAONE4_5,         "exaone4_5"},
     { PROJECTOR_TYPE_HUNYUANVL,         "hunyuanvl"},
