@@ -10,7 +10,8 @@
   ],
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/c3fb97241295c196e09b783e705e84b96cd1bd74",
-    "https://github.com/ggml-org/llama.cpp/pull/24523/commits/baee0f5b24ec8ceac109ecf07988cb5440c03a6d",
-    "https://github.com/unslothai/llama.cpp/pull/40/commits/233cedbe9c37df1c9ca7b11634c580e45974b046"
+    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/79ca732e11e9b875f29c6a6cb65150978e6ec014",
+    "https://github.com/unslothai/llama.cpp/pull/44/commits/23fac110127ba3ac56bd8b370eb0205a67564d55",
+    "https://github.com/ggml-org/llama.cpp/pull/26185/commits/cf67f0d24511864d2d3da0769108fd6fc16d00d1"
   ]
 }
