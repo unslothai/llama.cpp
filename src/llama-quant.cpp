@@ -326,6 +326,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // do not quantize MiniMax's indexer projection weights, they are tiny
+    quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
+    quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
     // keep Inkling's shortconv kernels and rel-proj table unquantized; arch-gated so the
     // name substrings cannot hit another architecture
     if (arch == LLM_ARCH_INKLING) {
@@ -364,6 +367,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find(".rel_pos")       == std::string::npos;
     quantize &= name.find(".patch_embd")    == std::string::npos;
     quantize &= name.find(".patch_merger")  == std::string::npos;
+
+    // audio codebook
+    quantize &= name.find("a.rvq.codebook")  == std::string::npos;
+    quantize &= name.find("mm.a.code_embd")  == std::string::npos;
 
     return quantize;
 }
