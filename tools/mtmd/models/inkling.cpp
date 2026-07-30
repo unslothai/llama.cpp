@@ -74,13 +74,14 @@ ggml_cgraph * clip_graph_inkling::build_vision() {
 ggml_cgraph * clip_graph_inkling::build_audio() {
     static constexpr int n_mels = 80;
     static constexpr int mel_vocab_size = 16;
-    static constexpr int n_embd = 6144;
 
     GGML_ASSERT(img.ny() == n_mels);
     GGML_ASSERT(model.inkling_dmel_embd_w);
     GGML_ASSERT(model.inkling_dmel_final_norm_w);
-    GGML_ASSERT(model.inkling_dmel_embd_w->ne[0] == n_embd);
     GGML_ASSERT(model.inkling_dmel_embd_w->ne[1] == n_mels * mel_vocab_size);
+
+    // decoder width varies per checkpoint
+    const int64_t n_embd = model.inkling_dmel_embd_w->ne[0];
 
     const int64_t n_tokens = img.nx();
     // mtmd audio storage is mel-major and represented as [token, mel].

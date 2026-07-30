@@ -256,7 +256,6 @@ class InklingMmprojModel(MmprojModel):
             "temporal_patch_size": 2,
             "n_channels": 3,
             "n_layers": 4,
-            "decoder_dmodel": 6144,
             "use_vision_norm": True,
         }
         for key, want in expected.items():
@@ -265,12 +264,14 @@ class InklingMmprojModel(MmprojModel):
                 raise NotImplementedError(
                     f"Inkling mmproj requires vision_config.{key}={want!r}, got {got!r}"
                 )
+        # decoder_dmodel is the text model width, it varies per checkpoint
+        if not hp.get("decoder_dmodel"):
+            raise NotImplementedError("Inkling mmproj requires vision_config.decoder_dmodel")
 
         assert self.hparams_audio is not None
         ahp = self.hparams_audio
         audio_expected = {
             "audio_mode": "dmel",
-            "decoder_dmodel": 6144,
             "n_mel_bins": 80,
             "mel_vocab_size": 16,
             "use_audio_norm": True,
@@ -281,6 +282,8 @@ class InklingMmprojModel(MmprojModel):
                 raise NotImplementedError(
                     f"Inkling mmproj requires audio_config.{key}={want!r}, got {got!r}"
                 )
+        if not ahp.get("decoder_dmodel"):
+            raise NotImplementedError("Inkling mmproj requires audio_config.decoder_dmodel")
 
     def set_gguf_parameters(self):
         hp = self.hparams_vision
