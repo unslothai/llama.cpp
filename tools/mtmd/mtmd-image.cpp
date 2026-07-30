@@ -343,19 +343,20 @@ private:
         }
     }
 
-    // Bicubic resize function using Pillow's ImagingResample algorithm
+    // Pillow-compatible separable resampling (Bicubic and Lanczos)
     // Adapted from https://github.com/python-pillow/Pillow/blob/main/src/libImaging/Resample.c
     //
-    // Key Difference with resize_bicubic:
-    // 1. Uses separable filtering: horizontal pass followed by vertical pass
+    // Key properties:
+    // 1. Separable filtering: horizontal pass followed by vertical pass
     // 2. Pre-computes normalized filter coefficients for each output pixel
-    // 3. Applies convolution using fixed-point integer arithmetic for performance
+    // 3. Fixed-point integer arithmetic (22 fractional bits) for speed and determinism
     static bool resize_bicubic_pillow(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
-        return resize_pillow(img, dst, target_width, target_height, false);
+        return resize_pillow(img, dst, target_width, target_height, /*use_lanczos=*/false);
     }
 
+    // Lanczos-3 (support radius 3), matches Pillow's Image.LANCZOS
     static bool resize_lanczos_pillow(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
-        return resize_pillow(img, dst, target_width, target_height, true);
+        return resize_pillow(img, dst, target_width, target_height, /*use_lanczos=*/true);
     }
 
     static bool resize_pillow(
@@ -368,18 +369,18 @@ private:
         // This allows encoding fractional weights as integers: weight * 2^22
         const int PRECISION_BITS = 32 - 8 - 2;
 
-        // Bicubic filter function with a = -0.5 (Note that GGML/PyTorch takes a = -0.75)
+        // Resample filter: Lanczos-3 (support [-3, 3]) or bicubic with a = -0.5 (support [-2, 2])
+        // Note: GGML/PyTorch bicubic uses a = -0.75, Pillow uses a = -0.5
         // Returns filter weight for distance x from pixel center
-        // Support: [-2, 2], meaning the filter influences pixels within 2 units of distance
         auto resample_filter = [use_lanczos](double x) -> double {
             if (use_lanczos) {
                 if (-3.0 <= x && x < 3.0) {
-                    auto sinc = [](double value) {
-                        if (value == 0.0) {
+                    auto sinc = [](double v) {
+                        if (v == 0.0) {
                             return 1.0;
                         }
-                        const double pix = value * 3.141592653589793238462643383279502884;
-                        return std::sin(pix) / pix;
+                        const double pi_v = v * 3.141592653589793238462643383279502884;
+                        return std::sin(pi_v) / pi_v;
                     };
                     return sinc(x) * sinc(x / 3.0);
                 }
@@ -399,7 +400,7 @@ private:
             return 0.0;  // Zero outside [-2, 2]
         };
 
-        // Filter support radius: bicubic extends 2 pixels in each direction
+        // Filter support radius: 2 for bicubic, 3 for lanczos
         const double filter_support = use_lanczos ? 3.0 : 2.0;
 
         // Clipping function for 8-bit values
