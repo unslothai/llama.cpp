@@ -91,6 +91,13 @@ static __global__ void flash_attn_ext_banded_f32(
     const int64_t q_offset = n_kv - n_q;
 
     for (int64_t ik = 0; ik < n_kv; ++ik) {
+        // skip masked positions before touching K/V
+        if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
+                uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
+                uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
+            continue;
+        }
+
         const char * k_row = k + uint64_t(ik)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
         float dot = 0.0f;
 #pragma unroll
@@ -208,11 +215,8 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
 
-    // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel
-    if (k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
-        rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
-        // MMA ABI indexes rel by Q's batch: a singleton rel batch must take the stride-aware fallback
-        rel->ne[3] == q->ne[3] && rel->ne[0] <= (1 << 20)) {
+    // only the MMA kernel reads src[5]; delegating otherwise drops the bias
+    if (ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
         ggml_cuda_flash_attn_ext(ctx, dst);
         return;
     }

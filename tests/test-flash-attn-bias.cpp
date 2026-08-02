@@ -27,6 +27,8 @@ struct bias_test_config {
     int64_t n_batch = 1;
     int64_t rel_batch = 1;
     bool strided_rel = false;
+    float v_scale = 1.0f; // v = v_scale*(sin + v_bias)
+    float v_bias = 0.0f;
 };
 
 struct test_data {
@@ -88,7 +90,7 @@ static test_data make_data(const bias_test_config & c) {
     }
     for (size_t i = 0; i < data.k.size(); ++i) {
         data.k[i] = 0.25f*std::cos(float(i)*0.013f - 0.29f);
-        data.v[i] = 0.30f*std::sin(float(i)*0.019f + 0.71f);
+        data.v[i] = c.v_scale*(0.30f*std::sin(float(i)*0.019f + 0.71f) + c.v_bias);
     }
     for (int64_t ib = 0; ib < c.rel_batch; ++ib) {
         for (int64_t iq = 0; iq < c.nq; ++iq) {
@@ -311,18 +313,40 @@ static void error_stats(const std::vector<float> & got, const std::vector<float>
     rmse = std::sqrt(sq/got.size());
 }
 
+// MSVC has no __int128, so check the reference value in uint64_t instead
+static bool mul_checked(uint64_t a, uint64_t b, uint64_t & out) {
+    if (a != 0 && b > UINT64_MAX/a) {
+        return false;
+    }
+    out = a*b;
+    return true;
+}
+
+static bool add_checked(uint64_t a, uint64_t b, uint64_t & out) {
+    if (a > UINT64_MAX - b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
 static void overflow_arithmetic_self_test() {
-    // mirrors the scalar-path offset math; exact offset checked at 128 bits, lands past 2^31
+    // mirrors the scalar-path offset math; the offset lands past 2^31
     const uint64_t nb0 = sizeof(float);
     const uint64_t nb1 = 1024*nb0;
     const uint64_t nb2 = 64*nb1;
     const uint64_t nb3 = 131072*nb2;
     const uint64_t dist = 1023, head = 63, query = 131071, batch = 3;
     const uint64_t offset = dist*nb0 + head*nb1 + query*nb2 + batch*nb3;
-    __extension__ typedef unsigned __int128 uint128_t;
-    const uint128_t exact = uint128_t(dist)*nb0 + uint128_t(head)*nb1 +
-        uint128_t(query)*nb2 + uint128_t(batch)*nb3;
-    GGML_ASSERT(exact <= UINT64_MAX && offset == (uint64_t) exact && offset > INT32_MAX);
+
+    const uint64_t terms[4][2] = {{dist, nb0}, {head, nb1}, {query, nb2}, {batch, nb3}};
+    uint64_t exact = 0;
+    for (const auto & term : terms) {
+        uint64_t prod = 0;
+        GGML_ASSERT(mul_checked(term[0], term[1], prod));
+        GGML_ASSERT(add_checked(exact, prod, exact));
+    }
+    GGML_ASSERT(offset == exact && offset > INT32_MAX);
 
     const int64_t nq = int64_t(1) << 40;
     const int64_t nkv = nq + 8192;
@@ -479,6 +503,8 @@ int main(int argc, char ** argv) {
             {"medium_f16_e1024", 128, 1024, 1024, 8, 2, 1024, GGML_TYPE_F16,  true, false},
             {"medium_bf16_local", 64, 2048, 2048, 8, 2,  512, GGML_TYPE_BF16, true, true },
             {"decode_8k_e1024",  128,    1, 8192, 8, 1, 1024, GGML_TYPE_F16,  true, false},
+            // large single-signed V: saturates an FP16 VKQ accumulator, row turns into inf
+            {"large_v_16k",      128,   16, 16384, 8, 1, 1024, GGML_TYPE_F16, true, false, 1, 1, false, 512.0f, 1.0f},
         };
     } else if (suite == "hard") {
         configs = {
@@ -503,7 +529,7 @@ int main(int argc, char ** argv) {
         error_stats(flash.output, dense.output, abs_dense, mean_abs_dense, rel_dense, mean_rel_dense, rmse_dense);
         double abs_naive = 0.0, mean_abs_naive = 0.0, rel_naive = 0.0, mean_rel_naive = 0.0, rmse_naive = 0.0;
         error_stats(flash.output, naive, abs_naive, mean_abs_naive, rel_naive, mean_rel_naive, rmse_naive);
-        const double tol = c.type == GGML_TYPE_F32 ? 2e-5 : 2e-3;
+        const double tol = (c.type == GGML_TYPE_F32 ? 2e-5 : 2e-3)*std::max(1.0f, c.v_scale);
         const bool pass = abs_naive <= tol;
         ok = ok && pass;
         printf("%s type=%s D=%lld nq=%lld nkv=%lld hq=%lld hkv=%lld E=%lld mask=%d sliding=%d "
