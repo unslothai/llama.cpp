@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth pin preflight
+
+# Runs the nightly's merge a few hours early, on the same base tag it will
+# pick, and files the conflict before the schedule burns 39 build jobs on it.
+#
+# unsloth-pr-set-lint.yml checks that pins are well formed and belong to their
+# PR, which catches a bad edit. It cannot catch the failure that actually
+# recurs: a pin that was fine yesterday and stops merging today because the
+# base tag moved under it. That is what killed 08-02, and four nights in a
+# week between the two causes.
+
+on:
+  schedule:
+    - cron: '47 16 * * *'
+  push:
+    paths:
+      - scripts/unsloth/pr-set.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  preflight:
+    name: Dry-run the pin merges
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve base and dry-run the merges
+        id: p
+        run: |
+          set -uo pipefail
+          AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
+          CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+          BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+            --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+          if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
+            echo "::warning::no aged upstream release found; skipping"
+            echo "status=skip" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "base $BASE"
+
+          git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp.git scratch
+          cd scratch
+          git fetch -q --no-tags origin "refs/tags/${BASE}:refs/tags/${BASE}"
+          git checkout -q --detach "refs/tags/${BASE}"
+
+          PROBLEMS=""
+          while read -r url REQUIRED; do
+            SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
+            NUM="$(sed -E 's|.*/pull/([0-9]+)/commits/.*|\1|' <<<"$url")"
+            SHA="$(sed -E 's|.*/commits/([0-9a-f]{40})/?$|\1|' <<<"$url")"
+
+            STATE="$(gh api "repos/${SRC}/pulls/${NUM}" --jq .state 2>/dev/null || echo unknown)"
+            if [ "$STATE" != "open" ]; then
+              if [ "$REQUIRED" != "false" ]; then
+                PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` is **${STATE}** and is required; the nightly will refuse.\n"
+              fi
+              continue
+            fi
+            if ! git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
+              PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` pinned commit \`${SHA:0:10}\` cannot be fetched; it was probably force-pushed away.\n"
+              continue
+            fi
+            if git -c user.name=preflight -c user.email=preflight@local \
+                 merge --no-ff --no-edit -m "probe ${SRC}#${NUM}" "$SHA" >/dev/null 2>&1; then
+              echo "ok ${SRC}#${NUM}"
+              continue
+            fi
+            FILES="$(git diff --name-only --diff-filter=U | sed 's/^/  /')"
+            HUNKS="$(git diff --diff-filter=U -U0 2>/dev/null | grep -E '^\+|^-' | grep -vE '^(\+\+\+|---)' | head -20)"
+            git merge --abort 2>/dev/null
+            PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` (\`${SHA:0:10}\`) does not merge onto \`${BASE}\` + the pins before it.\n\n  Conflicting files:\n\n\`\`\`\n${FILES}\n\`\`\`\n\n  <details><summary>conflict hunks</summary>\n\n\`\`\`diff\n${HUNKS}\n\`\`\`\n\n  </details>\n"
+            # Stop here, like resolve does. Probing later pins against a tree
+            # missing this one reports conflicts that are consequences of it.
+            PROBLEMS="${PROBLEMS}\nLater pins were not probed; fix this one first.\n"
+            break
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' \
+                     ../scripts/unsloth/pr-set.json | tr '\t' ' ')
+
+          if [ -z "$PROBLEMS" ]; then
+            echo "all pins merge cleanly onto ${BASE}"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          {
+            echo 'details<<ALERT_EOF'
+            echo "Tonight's nightly will fail on base \`${BASE}\` unless \`scripts/unsloth/pr-set.json\` is repinned."
+            echo
+            printf '%b' "$PROBLEMS"
+            echo
+            echo "For a pin on a branch we control, merge \`${BASE}\` into it and repin. For a third-party PR, wait for the author to merge master or drop the pin."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        if: ${{ steps.p.outputs.status != 'skip' }}
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.p.outputs.status }}
+          key: llama-pin-preflight
+          title: 'Pinned PRs no longer merge onto the current base tag'
+          details: ${{ steps.p.outputs.details }}
+          token: ${{ github.token }}
