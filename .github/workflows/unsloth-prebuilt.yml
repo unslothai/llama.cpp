@@ -286,11 +286,15 @@ jobs:
             # not a ggml identity: it stays constant while the base tag moves.
             GGML_TREE="$(git rev-parse HEAD:ggml)"
             GGML_VERSION="$(sed -nE 's/^set\(GGML_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+)\)$/\2/p' ggml/CMakeLists.txt | paste -sd. -)"
+            # Warn, do not fail: these only tighten downstream pairing, and
+            # whisper falls back to the old comparison when they are absent.
+            # Killing a 39-job release over a metadata field would be worse
+            # than publishing without it.
             printf '%s' "$GGML_TREE" | grep -qE '^[0-9a-f]{40}$' \
-              || { echo "could not resolve the ggml tree id" >&2; exit 1; }
+              || { echo "::warning::could not resolve the ggml tree id"; GGML_TREE=""; }
             printf '%s' "$GGML_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
-              || { echo "could not parse GGML_VERSION from ggml/CMakeLists.txt" >&2; exit 1; }
-            echo "ggml tree ${GGML_TREE} (version ${GGML_VERSION})"
+              || { echo "::warning::could not parse GGML_VERSION from ggml/CMakeLists.txt"; GGML_VERSION=""; }
+            echo "ggml tree ${GGML_TREE:-unknown} (version ${GGML_VERSION:-unknown})"
 
             # The tarball ships without .git, where cmake/build-info.cmake falls
             # back to its defaults; bake real values into those defaults so
