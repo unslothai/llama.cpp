@@ -97,6 +97,8 @@ jobs:
       prs: ${{ steps.r.outputs.prs }}
       source_artifact: ${{ steps.r.outputs.source_artifact }}
       commit: ${{ steps.r.outputs.commit }}
+      ggml_tree: ${{ steps.r.outputs.ggml_tree }}
+      ggml_version: ${{ steps.r.outputs.ggml_version }}
       exists: ${{ steps.r.outputs.exists }}
       cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
       win_cuda_matrix: ${{ steps.r.outputs.win_cuda_matrix }}
@@ -231,6 +233,8 @@ jobs:
           fi
           SRC_ARTIFACT="app-source-${TAG}"
           COMMIT=""
+          GGML_TREE=""
+          GGML_VERSION=""
 
           # Only PUBLISHED releases count as "exists"; a leftover draft (from
           # a failed prior publish) should not block today's rebuild.
@@ -275,6 +279,18 @@ jobs:
               git checkout -q --detach "refs/tags/${BASE}"
             fi
             COMMIT="$(git rev-parse HEAD)"
+            # ABI key for anything compiled against our ggml (whisper.cpp slim
+            # bundles). The tree id changes only when ggml/ contents change, so
+            # a release that touches nothing under ggml/ does not force a
+            # rebuild downstream. The -mix- tag suffix is a hash of the PR set,
+            # not a ggml identity: it stays constant while the base tag moves.
+            GGML_TREE="$(git rev-parse HEAD:ggml)"
+            GGML_VERSION="$(sed -nE 's/^set\(GGML_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+)\)$/\2/p' ggml/CMakeLists.txt | paste -sd. -)"
+            printf '%s' "$GGML_TREE" | grep -qE '^[0-9a-f]{40}$' \
+              || { echo "could not resolve the ggml tree id" >&2; exit 1; }
+            printf '%s' "$GGML_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              || { echo "could not parse GGML_VERSION from ggml/CMakeLists.txt" >&2; exit 1; }
+            echo "ggml tree ${GGML_TREE} (version ${GGML_VERSION})"
 
             # The tarball ships without .git, where cmake/build-info.cmake falls
             # back to its defaults; bake real values into those defaults so
@@ -354,6 +370,8 @@ jobs:
             echo "prs=$PRS"
             echo "source_artifact=$SRC_ARTIFACT"
             echo "commit=$COMMIT"
+            echo "ggml_tree=$GGML_TREE"
+            echo "ggml_version=$GGML_VERSION"
             echo "exists=$EXISTS"
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
             echo "win_cuda_matrix={\"include\":$WIN_CUDA_INCLUDE}"
@@ -542,6 +560,8 @@ jobs:
             --source-repo '${{ needs.resolve.outputs.repo }}' \
             --base-tag '${{ needs.resolve.outputs.base }}' \
             --pr-set "$PRS_JSON" \
+            --ggml-tree '${{ needs.resolve.outputs.ggml_tree }}' \
+            --ggml-version '${{ needs.resolve.outputs.ggml_version }}' \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
             --publish-repo "$GITHUB_REPOSITORY"
