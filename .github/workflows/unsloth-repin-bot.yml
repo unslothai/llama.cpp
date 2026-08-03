@@ -1,0 +1,207 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth repin bot
+
+# Preflight says the pins stopped merging. This does the mechanical half of the
+# fix: merge the base tag into each pin branch we own, resolve the add/add
+# collisions that cause almost all of these, and open a PR moving the pins.
+#
+# It opens a PR and stops. It never merges it, never touches a branch belonging
+# to somebody else, and never repins past a commit a human reviewed -- the pin
+# file exists to guarantee that only reviewed code ships, and a bot that can
+# widen it on its own has removed the guarantee.
+
+on:
+  workflow_run:
+    workflows: ['Unsloth pin preflight']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: unsloth-repin-bot
+  cancel-in-progress: false
+
+env:
+  # Branch the bot parks its proposal on. Reused every run so a week of
+  # breakage is one PR to review, not seven.
+  REPIN_BRANCH: unsloth/auto-repin
+
+jobs:
+  repin:
+    name: Repin against the current base tag
+    # A preflight that passed has nothing to fix.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-22.04
+    steps:
+      # Without this, checkout leaves a github.com extraheader carrying
+      # GITHUB_TOKEN, which would win over the REPIN_TOKEN in our push URLs.
+      - uses: actions/checkout@v6
+        with: { persist-credentials: false }
+
+      - name: Resolve base tag
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
+          CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+          BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+            --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+          if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
+            echo "::warning::no aged upstream release found; nothing to repin onto"
+            echo "base=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "base $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Merge and repin
+        id: repin
+        if: ${{ steps.base.outputs.base != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          python3 scripts/unsloth/repin.py \
+            --pr-set scripts/unsloth/pr-set.json \
+            --base "${{ steps.base.outputs.base }}" \
+            --work "${RUNNER_TEMP}/repin" \
+            --report "${RUNNER_TEMP}/repin.json" \
+            --markdown "${RUNNER_TEMP}/repin.md"
+          CHANGED="$(jq -r '.changed' "${RUNNER_TEMP}/repin.json")"
+          BLOCKED="$(jq -r '[.results[] | select(.action == "conflict" or .action == "third-party")] | length' "${RUNNER_TEMP}/repin.json")"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "blocked=$BLOCKED" >> "$GITHUB_OUTPUT"
+
+      - name: Push the merged branches and open the PR
+        id: push
+        if: ${{ steps.repin.outputs.changed != '' && steps.repin.outputs.changed != '0' }}
+        env:
+          # Pushing to danielhanchen/llama.cpp is cross-repo, which GITHUB_TOKEN
+          # cannot do at all, and these merges carry upstream's own workflow
+          # changes, which needs workflow write. Without the secret the bot
+          # still reports; it just cannot act.
+          REPIN_TOKEN: ${{ secrets.REPIN_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -uo pipefail
+          if [ -z "${REPIN_TOKEN:-}" ]; then
+            echo "::warning::REPIN_TOKEN is not set; reporting the repin instead of pushing it"
+            echo "mode=report" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Push every merged branch before touching the pin file: a pin whose
+          # commit is not on a remote is a pin the nightly cannot fetch.
+          FAILED=""
+          while read -r path head_repo head_ref new_sha; do
+            echo "pushing ${new_sha:0:10} to ${head_repo}:${head_ref}"
+            # No -x anywhere in this step; the URL carries the token.
+            if ! git -C "$path" push \
+                 "https://x-access-token:${REPIN_TOKEN}@github.com/${head_repo}.git" \
+                 "HEAD:refs/heads/${head_ref}" 2>&1 | sed "s/${REPIN_TOKEN}/***/g"; then
+              FAILED="${FAILED} ${head_repo}:${head_ref}"
+            fi
+          done < <(jq -r '.results[] | select(.action == "repin")
+                          | "\(.repo_path) \(.head_repo) \(.head_ref) \(.new_sha)"' "${RUNNER_TEMP}/repin.json")
+
+          if [ -n "$FAILED" ]; then
+            echo "::error::could not push:${FAILED}"
+            echo "mode=pushfail" >> "$GITHUB_OUTPUT"
+            echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  'unsloth-repin-bot'
+          git config user.email 'unsloth-repin-bot@users.noreply.github.com'
+          git checkout -q -B "${REPIN_BRANCH}"
+          git add scripts/unsloth/pr-set.json
+          git commit -qm "Repin PR set onto ${BASE}"
+          # Force: the branch is a rolling proposal against whatever base tag is
+          # current, so yesterday's version is not worth preserving.
+          git push -q --force \
+            "https://x-access-token:${REPIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${REPIN_BRANCH}" 2>&1 | sed "s/${REPIN_TOKEN}/***/g"
+
+          {
+            cat "${RUNNER_TEMP}/repin.md"
+            echo
+            echo "Opened automatically after [pin preflight](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/unsloth-pin-preflight.yml) failed. Review the resolutions above before merging; the bot does not merge its own PRs."
+          } > "${RUNNER_TEMP}/body.md"
+
+          EXISTING="$(GH_TOKEN="${REPIN_TOKEN}" gh pr list --repo "${GITHUB_REPOSITORY}" \
+            --head "${REPIN_BRANCH}" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            GH_TOKEN="${REPIN_TOKEN}" gh pr edit "$EXISTING" --repo "${GITHUB_REPOSITORY}" \
+              --title "Repin PR set onto ${BASE}" --body-file "${RUNNER_TEMP}/body.md" >/dev/null
+            echo "updated PR #${EXISTING}"
+            echo "pr=${EXISTING}" >> "$GITHUB_OUTPUT"
+          else
+            URL="$(GH_TOKEN="${REPIN_TOKEN}" gh pr create --repo "${GITHUB_REPOSITORY}" \
+              --base master --head "${REPIN_BRANCH}" \
+              --title "Repin PR set onto ${BASE}" --body-file "${RUNNER_TEMP}/body.md" 2>&1 | tail -1)"
+            echo "opened ${URL}"
+            echo "pr=${URL}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "mode=pushed" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        id: report
+        if: ${{ always() && steps.base.outputs.base != '' }}
+        env:
+          CHANGED: ${{ steps.repin.outputs.changed }}
+          BLOCKED: ${{ steps.repin.outputs.blocked }}
+          OUTCOME: ${{ steps.repin.outcome }}
+          MODE: ${{ steps.push.outputs.mode }}
+          PR: ${{ steps.push.outputs.pr }}
+          FAILED: ${{ steps.push.outputs.failed }}
+        run: |
+          set -uo pipefail
+          # Only shout when a human has something to do. A run that repinned
+          # everything and opened a PR is already visible as a PR.
+          STATUS=success
+          # A crash in the repin step leaves no report at all, which must not
+          # read as "nothing to do" -- that is the green-run-does-nothing hole.
+          [ "${OUTCOME:-}" = "success" ] || STATUS=failure
+          {
+            echo 'details<<ALERT_EOF'
+            cat "${RUNNER_TEMP}/repin.md" 2>/dev/null \
+              || echo "The repin step did not finish (outcome: ${OUTCOME:-unknown}); no report was produced."
+            echo
+            case "${MODE:-}" in
+              pushed)   echo "Proposed in ${PR}." ;;
+              report)   STATUS=failure
+                        echo "\`REPIN_TOKEN\` is not configured, so nothing was pushed. Reproduce locally:"
+                        echo
+                        echo '```'
+                        echo "git checkout <pin sha> && git merge <base tag>"
+                        echo "python3 scripts/unsloth/additive_merge.py --repo ."
+                        echo '```' ;;
+              pushfail) STATUS=failure
+                        echo "Could not push:${FAILED}. \`REPIN_TOKEN\` likely lacks contents or workflow write on those repositories." ;;
+              *)        [ "${CHANGED:-0}" = "0" ] && echo "Nothing could be repinned automatically." ;;
+            esac
+            if [ "${BLOCKED:-0}" != "0" ]; then
+              STATUS=failure
+              echo
+              echo "${BLOCKED} pin(s) need a human, see the table above."
+            fi
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        if: ${{ always() && steps.report.outputs.status != '' }}
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.report.outputs.status }}
+          key: llama-repin-bot
+          title: 'Pins need a manual repin'
+          details: ${{ steps.report.outputs.details }}
+          token: ${{ github.token }}
