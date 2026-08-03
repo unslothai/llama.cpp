@@ -351,3 +351,8 @@
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #endif
+
+// no architecture has SIMD kernels for the narrow IQ1 types yet
+#define ggml_vec_dot_iq1_xs_q8_K_generic ggml_vec_dot_iq1_xs_q8_K
+#define ggml_vec_dot_iq1_xxs_q8_K_generic ggml_vec_dot_iq1_xxs_q8_K
+#define ggml_vec_dot_iq1_xxxs_q8_K_generic ggml_vec_dot_iq1_xxxs_q8_K

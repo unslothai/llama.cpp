@@ -216,6 +216,27 @@ static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_iq1_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_iq1_xs(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq1_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_iq1_xxs(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq1_xxxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_iq1_xxxs(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+template<typename dst_t>
 static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
 

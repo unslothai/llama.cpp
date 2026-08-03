@@ -156,6 +156,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        // fork-local ids, placed after every upstream file type so a future upstream addition does not collide
+        LLAMA_FTYPE_MOSTLY_IQ1_XS        = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXS       = 43, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXXS      = 44, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

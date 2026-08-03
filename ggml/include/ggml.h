@@ -430,7 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // Below IQ1_S: the same 8-d ternary codebook with a narrower index. Fork-local ids,
+        // deliberately placed after every upstream type so a future upstream addition does not
+        // collide. See block_iq1_xs / block_iq1_xxs / block_iq1_xxxs in ggml-common.h.
+        GGML_TYPE_IQ1_XS   = 43, // 1.4375 bpw, 1024-entry grid
+        GGML_TYPE_IQ1_XXS  = 44, // 1.3125 bpw,  512-entry grid
+        GGML_TYPE_IQ1_XXXS = 45, // 1.1875 bpw,  256-entry grid
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

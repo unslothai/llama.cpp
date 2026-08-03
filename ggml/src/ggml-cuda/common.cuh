@@ -22,6 +22,17 @@
 #endif
 #include "ggml-common.h"
 
+// The narrow IQ1 types are fork-local, so their QR/QI live here rather than in the frozen
+// ggml-common.h. They pack qs exactly like IQ1_S: 8 weights per byte, 4 bytes per sub-block.
+#define QI1_XS (QK_K / (4*QR1_XS))
+#define QR1_XS 8
+
+#define QI1_XXS (QK_K / (4*QR1_XXS))
+#define QR1_XXS 8
+
+#define QI1_XXXS (QK_K / (4*QR1_XXXS))
+#define QR1_XXXS 8
+
 #include <array>
 #include <algorithm>
 #include <cassert>
@@ -1101,6 +1112,27 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ1_M> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR1_M;
     static constexpr int qi = QI1_M;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XS;
+    static constexpr int qi = QI1_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XXS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XXS;
+    static constexpr int qi = QI1_XXS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XXXS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XXXS;
+    static constexpr int qi = QI1_XXXS;
 };
 
 template<>

@@ -362,6 +362,66 @@ static __device__ __forceinline__ void dequantize_iq1_s(const void * vx, const i
 }
 
 template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq1_xs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_iq1_xs * x = (const block_iq1_xs *) vx;
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 8*il;
+    const int nibble = (x[ibs].sc[ib/2] >> (4*(ib%2))) & 0xf;
+    const float delta = nibble & 0x8 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float)x[ibs].d * (2*(nibble & 0x7) + 1);
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1_xs_grid_gpu[x[ibs].qs[4*ib+il] | (((x[ibs].qh[ib] >> 2*il) & 3) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = ggml_cuda_cast<dst_t>(d * (q[j] + delta));
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq1_xxs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_iq1_xxs * x = (const block_iq1_xxs *) vx;
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 8*il;
+    const int qh = x[ibs].qh[ib];
+    const float delta = qh & 0x80 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float)x[ibs].d * (2*((qh >> 4) & 7) + 1);
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1_xxs_grid_gpu[x[ibs].qs[4*ib+il] | (((qh >> il) & 1) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = ggml_cuda_cast<dst_t>(d * (q[j] + delta));
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq1_xxxs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_iq1_xxxs * x = (const block_iq1_xxxs *) vx;
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 8*il;
+    const int nibble = (x[ibs].sc[ib/2] >> (4*(ib%2))) & 0xf;
+    const float delta = nibble & 0x8 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float)x[ibs].d * (2*(nibble & 0x7) + 1);
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1_xxxs_grid_gpu[x[ibs].qs[4*ib+il]];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = ggml_cuda_cast<dst_t>(d * (q[j] + delta));
+    }
+}
+
+template<typename dst_t>
 static __device__ __forceinline__ void dequantize_iq1_m(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 
     const block_iq1_m * x = (const block_iq1_m  *) vx;
