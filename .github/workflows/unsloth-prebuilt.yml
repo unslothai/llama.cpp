@@ -672,6 +672,40 @@ jobs:
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
 
+      # whisper.cpp slim bundles are compiled against this release's ggml and
+      # ship no libggml*, so a new ggml means whisper has to republish. Without
+      # this it only finds out on its own cron, and Studio reports "no
+      # compatible prebuilt" until then.
+      - name: Notify whisper.cpp
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        # Never fail a published release because the notification did not land.
+        continue-on-error: true
+        env:
+          DISPATCH_TOKEN: ${{ secrets.WHISPER_DISPATCH_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          GGML_TREE: ${{ needs.resolve.outputs.ggml_tree }}
+        run: |
+          # No -x here: it would trace the token into the log.
+          set -eu
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::WHISPER_DISPATCH_TOKEN is not set; whisper.cpp will only pick this up on its own schedule"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg t "$TAG" --arg g "$GGML_TREE" --arg r "$GITHUB_RUN_ID" \
+            '{event_type: "llama-published", client_payload: {llama_tag: $t, ggml_tree: $g, run_id: $r}}')"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/unslothai/whisper.cpp/dispatches \
+            -d "$PAYLOAD")"
+          # 204 is "event accepted", not "whisper republished". The dead-man
+          # check is what catches a dropped or ignored event.
+          if [ "$CODE" = "204" ]; then
+            echo "notified whisper.cpp of ${TAG}"
+          else
+            echo "::warning::whisper.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
+          fi
+
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.
   # Runs on publish-intent runs only, so subset test dispatches stay quiet.
