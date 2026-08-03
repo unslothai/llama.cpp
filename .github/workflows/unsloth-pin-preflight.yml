@@ -50,15 +50,17 @@ jobs:
 
           git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp.git scratch
           cd scratch
-          # GITHUB_TOKEN cannot write a ref whose tree carries .github/workflows,
-          # and upstream commits always do. Verified against the live remote:
+          # GITHUB_TOKEN mirrors most pins, but GitHub refuses any ref that ADDS
+          # a workflow file the repo does not already have. Observed on 08-03,
+          # three pins mirrored and the fourth rejected:
           #   ! [remote rejected] ... -> refs/pins/c3fb9724...
-          #   (refusing to allow a Personal Access Token to create or update
-          #    workflow `.github/workflows/build-self-hosted.yml` without
-          #    `workflow` scope)
-          # The check applies to any ref, not just branches. So use REPIN_TOKEN
-          # when it exists and say plainly what is unprotected when it does not.
-          MIRROR_TOKEN="${REPIN_TOKEN:-}"
+          #   (refusing to allow a GitHub App to create or update workflow
+          #    `.github/workflows/build-self-hosted.yml` without `workflows`
+          #    permission)
+          # The check applies to any ref, not just branches. REPIN_TOKEN has
+          # workflow scope and covers those; without it we still mirror what we
+          # can rather than nothing, and warn about the rest.
+          MIRROR_TOKEN="${REPIN_TOKEN:-$GH_TOKEN}"
           MIRROR="https://x-access-token:${MIRROR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch -q --no-tags origin "refs/tags/${BASE}:refs/tags/${BASE}"
           git checkout -q --detach "refs/tags/${BASE}"
@@ -71,10 +73,6 @@ jobs:
           # Done first, and past failures, so a conflict in an early pin does
           # not leave the later ones unmirrored.
           while read -r url; do
-            if [ -z "$MIRROR_TOKEN" ]; then
-              echo "::warning::REPIN_TOKEN is not set, so pins are not mirrored; a force-push can still delete reviewed code"
-              break
-            fi
             SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
             SHA="$(sed -E 's|.*/commits/([0-9a-f]{40})/?$|\1|' <<<"$url")"
             if git ls-remote --exit-code "$MIRROR" "refs/pins/${SHA}" >/dev/null 2>&1; then
@@ -88,7 +86,7 @@ jobs:
             if git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1 | sed "s|${GH_TOKEN}|***|g"; then
               echo "mirrored ${SHA:0:10}"
             else
-              echo "::warning::could not push refs/pins/${SHA:0:10}; REPIN_TOKEN needs workflow scope"
+              echo "::warning::could not mirror refs/pins/${SHA:0:10}; it adds a workflow file, which needs REPIN_TOKEN (workflow scope). That pin is still deletable by a force-push."
             fi
           done < <(jq -r '.prs[] | if type == "string" then . else .url end' \
                      ../scripts/unsloth/pr-set.json)
