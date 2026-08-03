@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth prebuilt dead-man check
+
+# Watches the output, not the process: a run can go green while publishing
+# nothing, which no failure-triggered alert can see. Upstream cuts releases
+# several times a day, so two days of silence here is a fault, not a quiet
+# upstream.
+
+on:
+  schedule:
+    - cron: '23 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  STALE_DAYS: '2'
+
+jobs:
+  deadman:
+    name: Check publish freshness
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (for the composite action)
+        uses: actions/checkout@v6
+        with: { persist-credentials: false }
+
+      - name: Check newest published release
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          LATEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
+            --jq '[.[] | select(.draft==false and .prerelease==false)]
+                  | max_by(.published_at|fromdateiso8601)
+                  | "\(.tag_name)\t\(.published_at)"' 2>/dev/null || true)"
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            # Do not manufacture an alert from an API hiccup.
+            echo "::warning::could not read the release list; skipping this check"
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="${LATEST%%$'\t'*}"
+          PUB="${LATEST##*$'\t'}"
+          AGE_D=$(( ( $(date -u +%s) - $(date -u -d "$PUB" +%s) ) / 86400 ))
+          echo "newest release ${TAG} published ${PUB} (${AGE_D}d ago); threshold ${STALE_DAYS}d"
+
+          if [ "$AGE_D" -le "${STALE_DAYS}" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          {
+            echo 'details<<ALERT_EOF'
+            echo "No prebuilt release has been published in **${AGE_D} days** (threshold ${STALE_DAYS})."
+            echo
+            echo "Newest release: \`${TAG}\`, published ${PUB}."
+            echo
+            echo "The nightly may be failing, or it may be completing green while"
+            echo "publishing nothing. Check the most recent runs of \`Unsloth prebuilt (full release)\`."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        if: ${{ steps.c.outputs.status != 'skip' }}
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.c.outputs.status }}
+          key: llama-prebuilt-stale
+          title: 'No llama.cpp prebuilt release published recently'
+          details: ${{ steps.c.outputs.details }}
+          token: ${{ github.token }}

@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Prebuilt failure alert
+description: Open, update or close a deduplicated issue tracking prebuilt pipeline health.
+
+inputs:
+  status:
+    description: 'failure or success'
+    required: true
+  key:
+    description: 'Dedup key; all alerts sharing it collapse onto one issue'
+    required: true
+  title:
+    description: 'Issue title'
+    required: true
+  details:
+    description: 'Markdown describing what broke'
+    required: false
+    default: ''
+  label:
+    description: 'Label applied to the issue'
+    required: false
+    default: 'prebuilt-failure'
+  token:
+    description: 'Token with issues:write'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Open, update or close the tracking issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        STATUS: ${{ inputs.status }}
+        KEY: ${{ inputs.key }}
+        TITLE: ${{ inputs.title }}
+        DETAILS: ${{ inputs.details }}
+        LABEL: ${{ inputs.label }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -uo pipefail
+
+        # Alerting must never fail the run it reports on, so gh calls are tolerated.
+        case "$STATUS" in
+          failure|success) ;;
+          *) echo "::warning::prebuilt-alert: unknown status '$STATUS'"; exit 0 ;;
+        esac
+
+        MARKER="<!-- prebuilt-alert:${KEY} -->"
+
+        # Scan open labelled issues rather than the search index, which lags by
+        # minutes and would double-open on back-to-back runs.
+        EXISTING=""
+        while read -r num; do
+          [ -n "$num" ] || continue
+          if gh issue view "$num" --repo "$REPO" --json body --jq .body 2>/dev/null | grep -qF "$MARKER"; then
+            EXISTING="$num"; break
+          fi
+        done < <(gh issue list --repo "$REPO" --label "$LABEL" --state open \
+                   --limit 100 --json number --jq '.[].number' 2>/dev/null || true)
+
+        if [ "$STATUS" = "success" ]; then
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" \
+              --body "Recovered: [\`${GITHUB_WORKFLOW}\` run](${RUN_URL}) succeeded. Closing." >/dev/null 2>&1 || true
+            gh issue close "$EXISTING" --repo "$REPO" >/dev/null 2>&1 \
+              || echo "::warning::prebuilt-alert: could not close #${EXISTING}"
+            echo "closed #${EXISTING} ($KEY)"
+          fi
+          exit 0
+        fi
+
+        BODY="$(printf '%s\n\n%s\n\n**Run:** %s\n\n%s\n' \
+          "$MARKER" \
+          "\`${GITHUB_WORKFLOW}\` failed on \`${GITHUB_EVENT_NAME}\`." \
+          "$RUN_URL" \
+          "$DETAILS")"
+
+        if [ -n "$EXISTING" ]; then
+          # Comment rather than open a second issue, so an outage is one thread.
+          gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY" >/dev/null 2>&1 \
+            || echo "::warning::prebuilt-alert: could not comment on #${EXISTING}"
+          echo "updated #${EXISTING} ($KEY)"
+        else
+          # gh refuses to create with a label that does not exist yet.
+          gh label create "$LABEL" --repo "$REPO" --color B60205 \
+            --description "Prebuilt release pipeline is failing" >/dev/null 2>&1 || true
+          NEW="$(gh issue create --repo "$REPO" --title "$TITLE" --label "$LABEL" \
+                   --body "$BODY" 2>/dev/null | tail -1)"
+          if [ -n "$NEW" ]; then
+            echo "opened $NEW ($KEY)"
+          else
+            # The one case worth shouting about: a real failure went unreported.
+            echo "::error::prebuilt-alert: could not open an issue for ${KEY}; the failure at ${RUN_URL} is unreported"
+          fi
+        fi
