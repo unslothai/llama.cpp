@@ -270,8 +270,16 @@ jobs:
               # sha are machine fields, so the space-delimited read is safe;
               # titles stay out of this loop).
               while read -r SRC NUM SHA; do
-                git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" \
-                  || { echo "could not fetch commit ${SHA} for ${SRC}#${NUM}; it may have been pruned after a force-push -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
+                # The PR's own repo first, then our refs/pins mirror, which is
+                # the only copy left once an author force-pushes the reviewed
+                # commit out of the PR. That is what took the nightly down on
+                # 07-31, and it is unrecoverable without a ref of our own.
+                git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null \
+                  || git fetch -q --no-tags origin "refs/pins/${SHA}" 2>/dev/null \
+                  || { echo "could not fetch commit ${SHA} for ${SRC}#${NUM}; it is gone from ${SRC} and was never mirrored to refs/pins -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
+                if ! git rev-parse --verify -q "${SHA}^{commit}" >/dev/null; then
+                  echo "fetched something for ${SRC}#${NUM} but ${SHA} is still missing" >&2; exit 1
+                fi
                 git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
                   merge --no-ff --no-edit -m "Merge ${SRC}#${NUM} @ ${SHA}" "$SHA" \
                   || { echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }

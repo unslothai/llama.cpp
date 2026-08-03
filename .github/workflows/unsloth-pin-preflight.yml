@@ -21,7 +21,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # write is only for the refs/pins/* mirror below; nothing here pushes a branch.
+  contents: write
   issues: write
 
 jobs:
@@ -49,8 +50,35 @@ jobs:
 
           git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp.git scratch
           cd scratch
+          MIRROR="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch -q --no-tags origin "refs/tags/${BASE}:refs/tags/${BASE}"
           git checkout -q --detach "refs/tags/${BASE}"
+
+          # Mirror every pin to refs/pins/<sha> before probing anything. The
+          # 07-31 outage was a reviewed commit pruned out of its PR by a force
+          # push, which no amount of checking can recover from after the fact.
+          # A ref of our own keeps the object alive; resolve falls back to it.
+          # All these repos are in one fork network, so this transfers nothing.
+          # Done first, and past failures, so a conflict in an early pin does
+          # not leave the later ones unmirrored.
+          while read -r url; do
+            SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
+            SHA="$(sed -E 's|.*/commits/([0-9a-f]{40})/?$|\1|' <<<"$url")"
+            if git ls-remote --exit-code "$MIRROR" "refs/pins/${SHA}" >/dev/null 2>&1; then
+              echo "mirrored already: ${SHA:0:10}"
+              continue
+            fi
+            if ! git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
+              echo "::warning::cannot mirror ${SHA:0:10}; it is already unfetchable from ${SRC}"
+              continue
+            fi
+            if git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1 | sed "s|${GH_TOKEN}|***|g"; then
+              echo "mirrored ${SHA:0:10}"
+            else
+              echo "::warning::could not push refs/pins/${SHA:0:10}"
+            fi
+          done < <(jq -r '.prs[] | if type == "string" then . else .url end' \
+                     ../scripts/unsloth/pr-set.json)
 
           PROBLEMS=""
           while read -r url REQUIRED; do
