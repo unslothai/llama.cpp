@@ -33,11 +33,17 @@ jobs:
       - run: |
           set -euo pipefail
           FILE=scripts/unsloth/pr-set.json
-          jq -e '.prs | type == "array" and all(.[]; type == "string")' "$FILE" >/dev/null \
-            || { echo "::error file=$FILE::.prs must be an array of PR url strings" >&2; exit 1; }
+          # Mirrors the resolve step's schema: a bare url string (required),
+          # or {"url": ..., "required": false} for a pin the release may ship
+          # without.
+          jq -e '.prs | type == "array" and all(.[];
+                   type == "string"
+                   or (type == "object" and (.url | type == "string")
+                       and ((if .required == null then true else .required end) | type == "boolean")))' "$FILE" >/dev/null \
+            || { echo "::error file=$FILE::.prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
           URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           fail=0
-          for url in $(jq -r '.prs[]' "$FILE"); do
+          while read -r url REQUIRED; do
             if ! [[ "$url" =~ $URL_RE ]]; then
               echo "::error file=$FILE::malformed entry '$url' (expected https://github.com/{ggml-org,unslothai}/llama.cpp/pull/<n>/commits/<40-hex-sha>)"
               fail=1
@@ -53,7 +59,14 @@ jobs:
             STATE="$(jq -r .state <<<"$PR_JSON")"
             COMMITS="$(jq -r .commits <<<"$PR_JSON")"
             HEAD="$(jq -r .head <<<"$PR_JSON")"
-            [ "$STATE" = "open" ] || echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will skip this entry"
+            if [ "$STATE" != "open" ]; then
+              if [ "$REQUIRED" != "false" ]; then
+                echo "::error file=$FILE::${SRC}#${NUM} is ${STATE} and is a required entry; the nightly will refuse rather than publish without its architecture"
+                fail=1
+              else
+                echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will skip this optional entry"
+              fi
+            fi
             # The commits listing is capped at 250 by the API; past that the
             # membership check cannot be trusted, so skip it rather than
             # false-fail a legitimate giant PR.
@@ -65,6 +78,7 @@ jobs:
               continue
             fi
             [ "$PIN" = "$HEAD" ] || echo "::notice::${SRC}#${NUM} pin ${PIN} is behind its head ${HEAD}"
-            echo "OK: ${SRC}#${NUM} @ ${PIN} (${STATE})"
-          done
+            echo "OK: ${SRC}#${NUM} @ ${PIN} (${STATE}, required=${REQUIRED})"
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' "$FILE" | tr '\t' ' ')
           exit "$fail"

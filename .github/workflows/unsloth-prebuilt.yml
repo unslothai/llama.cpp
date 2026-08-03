@@ -161,11 +161,17 @@ jobs:
           # pr-set.json _doc). unsloth-pr-set-lint.yml runs the same checks on every
           # push that edits the file, but that is only a tripwire -- a red
           # lint does not stop the schedule, so the gate must live here.
-          jq -e '.prs | type == "array" and all(.[]; type == "string")' scripts/unsloth/pr-set.json >/dev/null \
-            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings" >&2; exit 1; }
+          # An entry is a bare url string (required) or {"url", "required": false}.
+          # Bare strings stay valid, so the file needs no migration.
+          jq -e '.prs | type == "array" and all(.[];
+                   type == "string"
+                   or (type == "object" and (.url | type == "string")
+                       and ((if .required == null then true else .required end) | type == "boolean")))' \
+             scripts/unsloth/pr-set.json >/dev/null \
+            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
           PRS='[]'
           URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
-          for url in $(jq -r '.prs[]' scripts/unsloth/pr-set.json); do
+          while read -r url REQUIRED; do
             [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/{ggml-org,unslothai}/llama.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
             SRC="${BASH_REMATCH[1]}/llama.cpp"; NUM="${BASH_REMATCH[2]}"; SHA="${BASH_REMATCH[3]}"
             # Abort naming the entry on a gh failure (typo'd numbers 404).
@@ -178,7 +184,14 @@ jobs:
             N_COMMITS="$(jq -r '.commits' <<<"$PR_JSON")"
             TITLE="$(jq -r '.title' <<<"$PR_JSON")"
             if [ "$STATE" != "open" ]; then
-              echo "skipping ${SRC}#${NUM} (${STATE}): $url"
+              # A non-open pin drops out of $PRS, changing SETHASH and the tag, so
+              # the release would ship without that arch under a new tag. Refuse
+              # unless the entry is explicitly optional.
+              if [ "$REQUIRED" != "false" ]; then
+                echo "refusing ${SRC}#${NUM}: pin is ${STATE}, and it is a required entry; publishing without it would silently drop its architecture. Mark it \"required\": false in scripts/unsloth/pr-set.json to ship without it, or repin it." >&2
+                exit 1
+              fi
+              echo "::warning::skipping optional pin ${SRC}#${NUM} (${STATE}): $url"
               continue
             fi
             # A pin pasted from the wrong PR would build arbitrary code while
@@ -194,7 +207,8 @@ jobs:
             [ "$SHA" = "$HEAD" ] || echo "note: ${SRC}#${NUM} is pinned to ${SHA} but its head has moved to ${HEAD}"
             echo "including ${SRC}#${NUM} @ ${SHA}"
             PRS="$(jq -c --arg r "$SRC" --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{repo: $r, number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
-          done
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' scripts/unsloth/pr-set.json | tr '\t' ' ')
 
           # Decide the tag and source repo first; the source tree is built
           # further down, only if this release isn't already published.
@@ -633,3 +647,66 @@ jobs:
             --notes "$NOTES" \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
+
+  # Without this a failed scheduled run is silent: GitHub emails only whoever
+  # last touched the cron file, which is how three nightlies failed unnoticed.
+  # Runs on publish-intent runs only, so subset test dispatches stay quiet.
+  alert:
+    name: Report pipeline health
+    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
+    if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - name: Checkout (for the composite action)
+        uses: actions/checkout@v6
+        with: { persist-credentials: false }
+
+      - name: Summarise run
+        id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -uo pipefail
+          # 'skipped' is healthy: a scheduled no-op skips every build job.
+          FAILED="$(jq -r 'to_entries | map(select(.value.result == "failure") | .key) | join(", ")' <<<"$NEEDS_JSON")"
+          if [ -z "$FAILED" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+
+          # Quote the actual refusal so the issue says why, not just that a job failed.
+          REASON="$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed 2>/dev/null \
+            | grep -aE 'refusing |does not merge cleanly onto |could not fetch commit |ERROR: ' \
+            | sed -E 's/^[0-9-]+T[0-9:.]+Z //' | cut -c1-300 | head -5 || true)"
+
+          {
+            echo 'details<<ALERT_EOF'
+            echo "**Failed jobs:** ${FAILED}"
+            if [ -n "$REASON" ]; then
+              echo
+              echo 'Reported reason:'
+              echo
+              echo '```'
+              echo "$REASON"
+              echo '```'
+            fi
+            echo
+            echo "Nothing was published; the previous release remains \`Latest\`."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.s.outputs.status }}
+          key: llama-prebuilt-nightly
+          title: 'Nightly llama.cpp prebuilt is failing'
+          details: ${{ steps.s.outputs.details }}
+          token: ${{ github.token }}
