@@ -4935,27 +4935,43 @@ static void quantize_row_iq1_narrow_impl(enum ggml_type type, const float * GGML
             max_scale = MAX(max_scale, scale);
         }
 
-        float d = 0;
-        if (max_scale) {
-            d = max_scale/15;
-        }
-
+        // the index fields are written whatever the scales turn out to be, and the scale
+        // codes are left at zero when the whole super-block is degenerate, exactly as
+        // quantize_row_iq1_s_impl does
         switch (type) {
             case GGML_TYPE_IQ1_XS:
-                y_xs[ibl].d = GGML_FP32_TO_FP16(d*1.125f);
-                memset(y_xs[ibl].qs, 0, QK_K/8);
+                y_xs[ibl].d = GGML_FP32_TO_FP16(0.f);
                 memset(y_xs[ibl].qh, 0, QK_K/32);
                 memset(y_xs[ibl].sc, 0, QK_K/64);
+                for (int ib = 0; ib < QK_K/block_size; ++ib) {
+                    uint8_t h = 0;
+                    for (int k = 0; k < block_size/8; ++k) {
+                        const uint16_t gi = index[(block_size/8)*ib + k];
+                        y_xs[ibl].qs[(block_size/8)*ib + k] = gi & 255;
+                        h |= (gi >> 8) << 2*k;
+                    }
+                    y_xs[ibl].qh[ib] = h;
+                }
                 break;
             case GGML_TYPE_IQ1_XXS:
-                y_xxs[ibl].d = GGML_FP32_TO_FP16(d*1.125f);
-                memset(y_xxs[ibl].qs, 0, QK_K/8);
+                y_xxs[ibl].d = GGML_FP32_TO_FP16(0.f);
                 memset(y_xxs[ibl].qh, 0, QK_K/32);
+                for (int ib = 0; ib < QK_K/block_size; ++ib) {
+                    uint8_t h = 0;
+                    for (int k = 0; k < block_size/8; ++k) {
+                        const uint16_t gi = index[(block_size/8)*ib + k];
+                        y_xxs[ibl].qs[(block_size/8)*ib + k] = gi & 255;
+                        h |= (gi >> 8) << k;
+                    }
+                    y_xxs[ibl].qh[ib] = h;
+                }
                 break;
             case GGML_TYPE_IQ1_XXXS:
-                y_xxxs[ibl].d = GGML_FP32_TO_FP16(d*1.125f);
-                memset(y_xxxs[ibl].qs, 0, QK_K/8);
+                y_xxxs[ibl].d = GGML_FP32_TO_FP16(0.f);
                 memset(y_xxxs[ibl].sc, 0, QK_K/64);
+                for (int j = 0; j < QK_K/8; ++j) {
+                    y_xxxs[ibl].qs[j] = index[j] & 255;
+                }
                 break;
             default: GGML_ABORT("fatal error");
         }
@@ -4964,41 +4980,25 @@ static void quantize_row_iq1_narrow_impl(enum ggml_type type, const float * GGML
             continue;
         }
 
+        float d = max_scale/15;
         float id = 1/d;
         for (int ib = 0; ib < QK_K/block_size; ++ib) {
             int l = nearest_int(0.5f*(id*scales[ib]-1));
             l = MAX(0, MIN(7, l));
-            const int sign = shifts[ib] == -1;
-            const uint16_t * index_b = index + (block_size/8)*ib;
+            if (shifts[ib] == -1) l |= 8;
             switch (type) {
-                case GGML_TYPE_IQ1_XS:
-                    {
-                        uint8_t h = 0;
-                        for (int k = 0; k < block_size/8; ++k) {
-                            y_xs[ibl].qs[(block_size/8)*ib + k] = index_b[k] & 255;
-                            h |= (index_b[k] >> 8) << 2*k;
-                        }
-                        y_xs[ibl].qh[ib] = h;
-                        y_xs[ibl].sc[ib/2] |= (l | (sign << 3)) << (4*(ib&1));
-                    } break;
-                case GGML_TYPE_IQ1_XXS:
-                    {
-                        uint8_t h = 0;
-                        for (int k = 0; k < block_size/8; ++k) {
-                            y_xxs[ibl].qs[(block_size/8)*ib + k] = index_b[k] & 255;
-                            h |= (index_b[k] >> 8) << k;
-                        }
-                        y_xxs[ibl].qh[ib] = h | (l << 4) | (sign << 7);
-                    } break;
-                case GGML_TYPE_IQ1_XXXS:
-                    {
-                        for (int k = 0; k < block_size/8; ++k) {
-                            y_xxxs[ibl].qs[(block_size/8)*ib + k] = index_b[k] & 255;
-                        }
-                        y_xxxs[ibl].sc[ib/2] |= (l | (sign << 3)) << (4*(ib&1));
-                    } break;
+                case GGML_TYPE_IQ1_XS:   y_xs[ibl].sc[ib/2]   |= l << (4*(ib&1)); break;
+                case GGML_TYPE_IQ1_XXS:  y_xxs[ibl].qh[ib]    |= l << 4;          break;
+                case GGML_TYPE_IQ1_XXXS: y_xxxs[ibl].sc[ib/2] |= l << (4*(ib&1)); break;
                 default: GGML_ABORT("fatal error");
             }
+        }
+
+        switch (type) {
+            case GGML_TYPE_IQ1_XS:   y_xs[ibl].d   = GGML_FP32_TO_FP16(d*1.125f); break;
+            case GGML_TYPE_IQ1_XXS:  y_xxs[ibl].d  = GGML_FP32_TO_FP16(d*1.125f); break;
+            case GGML_TYPE_IQ1_XXXS: y_xxxs[ibl].d = GGML_FP32_TO_FP16(d*1.125f); break;
+            default: GGML_ABORT("fatal error");
         }
     }
 }
