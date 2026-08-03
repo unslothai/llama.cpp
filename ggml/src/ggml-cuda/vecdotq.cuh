@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common.cuh"
-#include "iq1-narrow-grids.cuh"
 
 #include <cstdint>
 

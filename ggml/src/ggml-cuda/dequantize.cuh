@@ -1,6 +1,5 @@
 #include "common.cuh"
 #include "convert.cuh"
-#include "iq1-narrow-grids.cuh"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
