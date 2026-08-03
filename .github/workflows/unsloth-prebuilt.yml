@@ -80,7 +80,11 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'scheduled' }}
-  cancel-in-progress: false
+  # A nightly still in flight when the next one starts is stuck, not busy: a
+  # healthy run finishes in a couple of hours. Leaving this false lets one
+  # wedged run block every following nightly with nothing to show for it.
+  # Only the schedule supersedes; a manual dispatch never kills a live nightly.
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
 
 jobs:
   resolve:
