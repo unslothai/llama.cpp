@@ -298,6 +298,9 @@ def main() -> int:
     ap.add_argument("--pr-set", default="[]",
                     help='JSON array of merged PRs: [{"repo":..,"number":..,"sha":..,"url":..,"title":..},..]')
     ap.add_argument("--commit", required=True)
+    ap.add_argument("--ggml-tree", default=None,
+                    help="git tree id of ggml/ in the built source; ABI key for paired builds")
+    ap.add_argument("--ggml-version", default=None)
     ap.add_argument("--dist", required=True, type=Path, help="dir holding the built app-*.tar.gz bundles")
     ap.add_argument("--out", required=True, type=Path, help="dir to write the two JSON sidecars into")
     ap.add_argument("--publish-repo", required=True, help="repo the bundles+manifest are published to")
@@ -496,6 +499,12 @@ def main() -> int:
         "upstream_repo": UPSTREAM_REPO,
         "upstream_tag": base_tag,
         "merged_prs": pr_set,
+        # ABI key for anything compiled against this release's ggml, e.g.
+        # whisper.cpp slim bundles. Changes only when ggml/ contents change.
+        # The -mix- tag suffix hashes the PR set, not ggml, so it stays
+        # constant while the base tag (and ggml with it) moves.
+        "ggml_tree": args.ggml_tree,
+        "ggml_version": args.ggml_version,
     }
     manifest = {
         **common,
