@@ -24,6 +24,13 @@ permissions:
   contents: read
   issues: write
 
+# Every run probes the same pins against the same base, so a second one adds
+# nothing and just competes for runners. On 08-04 a dispatch and the schedule
+# sat queued together for an hour. Newest wins: it sees the newest pr-set.json.
+concurrency:
+  group: unsloth-pin-preflight
+  cancel-in-progress: true
+
 jobs:
   preflight:
     name: Dry-run the pin merges
