@@ -41,9 +41,12 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         REPO: ${{ github.repository }}
       run: |
+        # GitHub runs `shell: bash` with -e, which `set -uo pipefail` does not
+        # undo. Alerting must never fail the run it reports on, so turn it off
+        # explicitly; every gh call below is already individually tolerated.
+        set +e
         set -uo pipefail
 
-        # Alerting must never fail the run it reports on, so gh calls are tolerated.
         case "$STATUS" in
           failure|success) ;;
           *) echo "::warning::prebuilt-alert: unknown status '$STATUS'"; exit 0 ;;
@@ -79,6 +82,16 @@ runs:
           "$RUN_URL" \
           "$DETAILS")"
 
+        # The run summary always works: no token, no permission, no repo
+        # setting. Issues can be disabled (they are on a fresh fork), and an
+        # alert nobody can read is the failure this whole pipeline keeps
+        # having, so write the details somewhere visible before trying.
+        {
+          echo "## ${TITLE}"
+          echo
+          echo "$DETAILS"
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
         if [ -n "$EXISTING" ]; then
           # Comment rather than open a second issue, so an outage is one thread.
           gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY" >/dev/null 2>&1 \
@@ -89,11 +102,18 @@ runs:
           gh label create "$LABEL" --repo "$REPO" --color B60205 \
             --description "Prebuilt release pipeline is failing" >/dev/null 2>&1 || true
           NEW="$(gh issue create --repo "$REPO" --title "$TITLE" --label "$LABEL" \
-                   --body "$BODY" 2>/dev/null | tail -1)"
-          if [ -n "$NEW" ]; then
-            echo "opened $NEW ($KEY)"
-          else
-            # The one case worth shouting about: a real failure went unreported.
-            echo "::error::prebuilt-alert: could not open an issue for ${KEY}; the failure at ${RUN_URL} is unreported"
-          fi
+                   --body "$BODY" 2>&1 | tail -1)"
+          case "$NEW" in
+            https://*) echo "opened $NEW ($KEY)" ;;
+            *)
+              # The one case worth shouting about: a real failure went
+              # unreported. Name the usual cause so it is actionable.
+              if [ "$(gh api "repos/${REPO}" --jq .has_issues 2>/dev/null)" = "false" ]; then
+                echo "::error::prebuilt-alert: issues are disabled on ${REPO}, so ${KEY} cannot be tracked; see the run summary for details"
+              else
+                echo "::error::prebuilt-alert: could not open an issue for ${KEY} (${NEW}); the failure at ${RUN_URL} is unreported"
+              fi
+              ;;
+          esac
         fi
+        exit 0
