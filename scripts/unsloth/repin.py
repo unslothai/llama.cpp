@@ -150,10 +150,18 @@ def repin_one(pin: dict, base: str, work: Path) -> dict:
         res = json.loads(report.read_text()) if report.exists() else {}
         if rc != 0:
             out["action"] = "conflict"
-            out["files"] = [x["file"] for x in res.get("refused", [])]
-            out["note"] = "; ".join(
-                f"`{x['file']}`: {x['reason']}" for x in res.get("refused", [])
-            ) or "merge conflicted"
+            refused = res.get("refused", [])
+            out["files"] = [x["file"] for x in refused if x["file"] != "-"]
+            if out["files"]:
+                out["note"] = "; ".join(f"`{x['file']}`: {x['reason']}" for x in refused)
+            else:
+                # git refused the merge without leaving a single conflicted
+                # file, so the conflict report explains nothing. Its stderr is
+                # the only thing that does, and discarding it turns a
+                # diagnosable failure into "no conflicted files".
+                tail = ((m.stderr or "") + (m.stdout or "")).strip().splitlines()
+                out["note"] = ("merge failed with no conflicts: " + " / ".join(tail[-3:])
+                               if tail else "merge failed and git said nothing")
             run(["git", "merge", "--abort"], cwd=repo, check=False)
             return out
         out["hunks"] = [
