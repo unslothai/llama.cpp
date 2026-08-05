@@ -158,3 +158,14 @@ jobs:
           title: 'Pinned PRs no longer merge onto the current base tag'
           details: ${{ steps.p.outputs.details }}
           token: ${{ github.token }}
+
+      # The probe reports through its output, so without this the run still
+      # ends green and unsloth-repin-bot.yml, which waits for a failed
+      # workflow_run, never fires. On 08-05 the Inkling pin stopped merging
+      # onto b10280, the alert said so, the run said success, and the bot
+      # skipped. Fails last so the alert is always posted first.
+      - name: Fail the run when a pin does not merge
+        if: ${{ steps.p.outputs.status == 'failure' }}
+        run: |
+          echo "::error::pins do not merge onto the current base tag; see the alert above"
+          exit 1
