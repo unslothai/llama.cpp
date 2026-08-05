@@ -743,7 +743,11 @@ jobs:
         run: |
           set -uo pipefail
           # 'skipped' is healthy: a scheduled no-op skips every build job.
-          FAILED="$(jq -r 'to_entries | map(select(.value.result == "failure") | .key) | join(", ")' <<<"$NEEDS_JSON")"
+          # 'cancelled' is not. On 08-05 every build passed and the publish job
+          # was cancelled 15s in by something outside the run, so nothing was
+          # released and this reported success: the silent no-publish we exist
+          # to catch. Anything that is not success or skipped counts.
+          FAILED="$(jq -r 'to_entries | map(select(.value.result != "success" and .value.result != "skipped") | "\(.key) (\(.value.result))") | join(", ")' <<<"$NEEDS_JSON")"
           if [ -z "$FAILED" ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
             echo "details=" >> "$GITHUB_OUTPUT"
