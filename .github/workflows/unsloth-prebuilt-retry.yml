@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth prebuilt retry
+
+# Re-runs a nightly whose jobs were cancelled by something outside the run.
+#
+# On 08-05 all 40 builds passed and the publish job was cancelled 15s in, with
+# no failing job, no superseding run and nothing in the workflow that cancels.
+# Every artifact was still there; one rerun published the release. Without this
+# the pipeline sits on a finished build set until a human notices, which is the
+# silent no-publish the alerting exists to catch, reached one step later.
+
+on:
+  workflow_run:
+    workflows: ['Unsloth prebuilt (full release)']
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  retry:
+    name: Rerun a cancelled run once
+    # run_attempt caps this at one retry: the rerun fires this workflow again
+    # as attempt 2, which no longer matches. A hand-cancelled workflow_dispatch
+    # is someone stopping their own build, so leave it stopped.
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled'
+      && github.event.workflow_run.run_attempt == 1
+      && github.event.workflow_run.event != 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Rerun the cancelled jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -uo pipefail
+          JOBS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+                    --jq '.jobs[] | .conclusion')"
+          # A cancellation that follows a real failure is a build problem to
+          # read, not to repeat. Requiring a success too skips a run cancelled
+          # before it did anything, where a rerun buys nothing.
+          if grep -qx 'failure' <<<"$JOBS"; then
+            echo "not retrying ${RUN_ID}: it has a failed job, so the cancel is a consequence"
+          elif ! grep -qx 'success' <<<"$JOBS"; then
+            echo "not retrying ${RUN_ID}: nothing succeeded, so there is no work to salvage"
+          elif gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
+            echo "rerunning cancelled jobs of ${RUN_URL}"
+          else
+            echo "::warning::could not rerun ${RUN_URL}; rerun it by hand"
+          fi | tee -a "$GITHUB_STEP_SUMMARY"
