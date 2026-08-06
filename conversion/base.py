@@ -104,6 +104,11 @@ def repack_mxfp4_blocks(packed: Tensor, scale: Tensor) -> np.ndarray:
     if tuple(s.shape) != (rows, n_blocks):
         raise ValueError(f"MXFP4 scale shape {tuple(s.shape)} does not match {(rows, n_blocks)}")
 
+    # 0xff is the NaN E8M0 exponent; caught later without the tensor name
+    n_bad = int((s == 0xFF).sum())
+    if n_bad:
+        raise ValueError(f"invalid E8M0 scale byte 0xff in {n_bad} MXFP4 block(s)")
+
     src = p.reshape(rows, n_blocks, 16)
     lo = src & 0x0F           # elements 0, 2, 4, ...
     hi = (src >> 4) & 0x0F    # elements 1, 3, 5, ...
