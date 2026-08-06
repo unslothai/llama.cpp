@@ -150,6 +150,7 @@ enum llm_arch {
     LLM_ARCH_DFLASH,
     LLM_ARCH_NANBEIGE,
     LLM_ARCH_INKLING,
+    LLM_ARCH_QWEN3TTS,
     LLM_ARCH_UNKNOWN,
 };
 
