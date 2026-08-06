@@ -96,7 +96,13 @@ void llama_model_kimi_k3::load_arch_tensors(llama_model_loader &) {
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
 
             // K3's A_log is a plain 1-D [n_head] parameter (kimi-linear's is padded);
-            layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, TENSOR_NOT_REQUIRED);
+            // NOSCAN because this A is consumed by a broadcast ggml_mul in build_kda, not
+            // by ggml_ssm_scan. Both spellings resolve to the same "blk.%d.ssm_a" name, so
+            // no GGUF changes, but LLM_TENSOR_SSM_A declares GGML_OP_SSM_SCAN and
+            // llama_model::create_tensor probes the buffer type with that op. No backend
+            // offers SSM_SCAN for a [n_head] tensor, so the probe fails, ssm_a is placed on
+            // the CPU, and every op that touches it follows.
+            layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head}, TENSOR_NOT_REQUIRED);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, 0);
 
             // K3 uses a single full-rank gate instead of kimi-linear's g_a/g_b pair
