@@ -21,7 +21,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # write, not read: the mirror step pushes refs/pins/<sha>. With read it
+  # failed every time with "Permission to unslothai/llama.cpp.git denied to
+  # github-actions[bot]" (403), and the only refs that existed were ones
+  # pushed by hand.
+  contents: write
   issues: write
 
 # Every run probes the same pins against the same base, so a second one adds
@@ -90,10 +94,12 @@ jobs:
               echo "::warning::cannot mirror ${SHA:0:10}; it is already unfetchable from ${SRC}"
               continue
             fi
-            if git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1 | sed "s|${GH_TOKEN}|***|g"; then
+            # Report git's own error. Guessing the cause hid a 403 behind a
+            # workflow-scope message for a week.
+            if ERR="$(git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1)"; then
               echo "mirrored ${SHA:0:10}"
             else
-              echo "::warning::could not mirror refs/pins/${SHA:0:10}; it adds a workflow file, which needs REPIN_TOKEN (workflow scope). That pin is still deletable by a force-push."
+              echo "::warning::could not mirror refs/pins/${SHA:0:10}: $(sed "s|${MIRROR_TOKEN}|***|g" <<<"$ERR" | tr '\n' ' '). A ref adding a workflow file needs REPIN_TOKEN (workflow scope); that pin stays deletable by a force-push."
             fi
           done < <(jq -r '.prs[] | if type == "string" then . else .url end' \
                      ../scripts/unsloth/pr-set.json)
