@@ -259,6 +259,11 @@ jobs:
           # .github/workflows, which upstream history routinely does).
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
+            # Checking out the upstream base replaces this working tree with
+            # upstream's, which has no scripts/unsloth/. Keep the resolver
+            # somewhere the checkout cannot take away.
+            ADDITIVE_MERGE="${RUNNER_TEMP}/additive_merge.py"
+            cp scripts/unsloth/additive_merge.py "$ADDITIVE_MERGE"
             if [ "$(jq length <<<"$PRS")" != 0 ]; then
               # Merges need a merge-base, so unshallow first.
               if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
@@ -290,7 +295,7 @@ jobs:
                   # additive_merge.py resolves only that, and refuses when
                   # either side edited existing text, so a real disagreement
                   # still hard-fails here rather than being papered over.
-                  if python3 scripts/unsloth/additive_merge.py \
+                  if python3 "$ADDITIVE_MERGE" \
                        && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
                     git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
                       commit -q --no-edit
