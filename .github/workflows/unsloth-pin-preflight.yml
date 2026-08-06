@@ -122,8 +122,18 @@ jobs:
               continue
             fi
             if git -c user.name=preflight -c user.email=preflight@local \
+                 -c merge.conflictStyle=diff3 \
                  merge --no-ff --no-edit -m "probe ${SRC}#${NUM}" "$SHA" >/dev/null 2>&1; then
               echo "ok ${SRC}#${NUM}"
+              continue
+            fi
+            # Mirror resolve: a pure add/add is what the nightly will merge
+            # automatically, so reporting it as a conflict here is a false
+            # alarm. Anything additive_merge.py refuses is still a conflict.
+            if python3 ../scripts/unsloth/additive_merge.py >/dev/null 2>&1 \
+                 && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              git -c user.name=preflight -c user.email=preflight@local commit -q --no-edit
+              echo "ok ${SRC}#${NUM} (additive resolve)"
               continue
             fi
             FILES="$(git diff --name-only --diff-filter=U | sed 's/^/  /')"

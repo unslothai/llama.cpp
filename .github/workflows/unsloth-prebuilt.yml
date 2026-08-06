@@ -280,9 +280,26 @@ jobs:
                 if ! git rev-parse --verify -q "${SHA}^{commit}" >/dev/null; then
                   echo "fetched something for ${SRC}#${NUM} but ${SHA} is still missing" >&2; exit 1
                 fi
-                git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                  merge --no-ff --no-edit -m "Merge ${SRC}#${NUM} @ ${SHA}" "$SHA" \
-                  || { echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1; }
+                # diff3 so additive_merge.py can see the merge base and refuse
+                # anything that is not a pure add/add.
+                if ! git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                       -c merge.conflictStyle=diff3 \
+                       merge --no-ff --no-edit -m "Merge ${SRC}#${NUM} @ ${SHA}" "$SHA"; then
+                  # The recurring conflict is two PRs adding a line to the same
+                  # architecture table, where the answer is always "keep both".
+                  # additive_merge.py resolves only that, and refuses when
+                  # either side edited existing text, so a real disagreement
+                  # still hard-fails here rather than being papered over.
+                  if python3 scripts/unsloth/additive_merge.py \
+                       && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                    git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                      commit -q --no-edit
+                    echo "::warning::${SRC}#${NUM} needed an additive merge; every conflict was a pure add/add and both sides were kept"
+                  else
+                    git merge --abort 2>/dev/null
+                    echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1
+                  fi
+                fi
               done < <(jq -r '.[] | "\(.repo) \(.number) \(.sha)"' <<<"$PRS")
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
