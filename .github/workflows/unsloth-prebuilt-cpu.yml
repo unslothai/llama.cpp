@@ -95,13 +95,14 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.20
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
             cpu-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
+          max-size: 2G
           save: false
 
       - name: Configure
@@ -219,13 +220,14 @@ jobs:
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.20
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
             cpu-windows-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
+          max-size: 2G
           save: false
 
       - name: Install Ninja

@@ -70,6 +70,15 @@ jobs:
 
           FAILED="$(awk -F'\t' '$2 == "failure"' <<<"$JOBS")"
 
+          # assemble waits on the build matrix from inside the job, so a leg
+          # that dies fails assemble too. Alongside another failure that is a
+          # consequence, not a cause; read it only when it failed alone.
+          # The name tracks assemble's `name:` in unsloth-prebuilt.yml.
+          INDEPENDENT="$(awk -F'\t' 'NF && $3 != "Assemble metadata + publish"' <<<"$FAILED")"
+          if [ -n "$INDEPENDENT" ]; then
+            FAILED="$INDEPENDENT"
+          fi
+
           # A cancellation that follows a real failure is a build problem to
           # read, not to repeat.
           if [ "$CONCLUSION" = cancelled ] && [ -n "$FAILED" ]; then

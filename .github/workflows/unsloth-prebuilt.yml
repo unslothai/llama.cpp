@@ -432,6 +432,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Ask unsloth to stand its scheduled CI down while this release builds.
+      # Fired here rather than at assemble time: the point is to free slots
+      # before the 39-job matrix queues, not after it has finished waiting.
+      # Guarded on the same condition as the build jobs, so a scheduled no-op
+      # never sweeps anything.
+      #
+      # workflow_dispatch, not repository_dispatch. Both would work, but
+      # POST /dispatches needs Contents: write on the target and this needs only
+      # Actions: write, so the token cannot push code to unsloth.
+      #
+      # unsloth decides what it is willing to cancel; this only asks. If the
+      # sweeper is not on unsloth's main yet, this 404s and warns, which is why
+      # the whole step is best-effort.
+      - name: Ask unsloth to free runner capacity
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        # A release must never fail because the request did not land.
+        continue-on-error: true
+        env:
+          DISPATCH_TOKEN: ${{ secrets.UNSLOTH_DISPATCH_TOKEN }}
+          TAG: ${{ steps.r.outputs.tag }}
+        run: |
+          # No -x here: it would trace the token into the log.
+          set -eu
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::UNSLOTH_DISPATCH_TOKEN is not set; not asking unsloth to free capacity"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg r "llama.cpp ${TAG} run ${GITHUB_RUN_ID}" \
+            '{ref: "main", inputs: {mode: "sweep", events: "schedule", classes: "linux,windows", reason: $r}}')"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/unslothai/unsloth/actions/workflows/ci-capacity.yml/dispatches \
+            -d "$PAYLOAD")"
+          # 204 is "request accepted", not "capacity freed". unsloth's sweeper
+          # ships inert, so until it is enabled there this is a no-op by design.
+          if [ "$CODE" = "204" ]; then
+            echo "asked unsloth to free linux/windows capacity for ${TAG}"
+          else
+            echo "::warning::unsloth ci-capacity dispatch returned HTTP ${CODE}; continuing without it"
+          fi
+
   build-cuda:
     name: CUDA
     needs: resolve
@@ -502,16 +544,127 @@ jobs:
 
   assemble:
     name: Assemble metadata + publish
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan]
-    # No `if: always()`. Atomicity: if any matrix entry in any child
-    # workflow failed, the corresponding `build-*` job reports failure, the
-    # default `needs` success check skips this assemble job, and nothing is
-    # published. The installer needs the full bundle set or it'll fail.
+    # Only `resolve`, so this job starts alongside the build matrix instead of
+    # after it. It used to `needs:` every build child, which meant it began
+    # queueing for a runner only once the last leg went green: on the reference
+    # run that queue wait was 109 minutes to then run a 10-second job. Starting
+    # early overlaps the wait with the build. The cost is one runner slot held
+    # for the length of the run.
+    needs: [resolve]
+    # No `if: always()`. Atomicity is unchanged in effect, but it is now
+    # enforced by the "Wait for the build matrix" step below rather than by
+    # `needs:`: that step blocks until every sibling build job is finished and
+    # exits non-zero unless all of them succeeded, so a failed leg still
+    # publishes nothing. The installer needs the full bundle set or it'll fail.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
+    # The waiter holds this job open for the whole build. GitHub's 6h job cap
+    # would kill it with no useful message; stop short of that deliberately,
+    # leaving room for the download/verify/publish steps that follow.
+    timeout-minutes: 350
+    # A job-level block replaces the workflow-level one, so contents:write has
+    # to be repeated here; actions:read is what lets the waiter read the run's
+    # job list (the `alert` job already needs it for the same reason).
+    permissions:
+      contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Reimplements the `needs:` success check that the trimmed-down `needs:`
+      # above gave away. It has to be at least as strict as `needs:` was --
+      # publishing a partial release is far worse than publishing late.
+      - name: Wait for the build matrix
+        env:
+          # Same expression that gates the verify/publish steps below.
+          PUBLISH_INTENT: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          # Build jobs live in called workflows, so they appear in this run's
+          # job list as "<caller job name> / <called job name>", e.g.
+          # "CUDA / x64/cuda12-legacy". One prefix per build child; every one of
+          # them must be represented or we are not looking at a complete run.
+          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
+          SELF='Assemble metadata + publish'
+          ALERT='Report pipeline health'
+
+          POLL=60
+          DEADLINE=$(( $(date +%s) + 330 * 60 ))
+          # Called-workflow job records do not all exist the moment the run
+          # starts, so a missing prefix is only fatal once this has passed.
+          STARTUP_DEADLINE=$(( $(date +%s) + 45 * 60 ))
+          API_FAILS=0
+
+          while :; do
+            if ! JOBS="$(gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+                  --jq '.jobs[] | [.name, .status, (.conclusion // "none")] | @tsv' 2>/dev/null)"; then
+              # A blip in the jobs API must not throw away a finished build.
+              API_FAILS=$(( API_FAILS + 1 ))
+              if [ "$API_FAILS" -ge 10 ]; then
+                echo "ERROR: the jobs API failed 10 times running; cannot confirm the build matrix finished" >&2
+                exit 1
+              fi
+              echo "jobs API call failed (${API_FAILS}/10); retrying in ${POLL}s"
+              sleep "$POLL"
+              continue
+            fi
+            API_FAILS=0
+
+            # Everything in the run except this job and the alert job that
+            # reports on it. `resolve` stays in the set; it is already a
+            # `needs:`, so it is a free consistency check.
+            SIBS="$(printf '%s\n' "$JOBS" | awk -F'\t' -v self="$SELF" -v alert="$ALERT" 'NF && $1 != self && $1 != alert')"
+
+            MISSING=""
+            for p in "${PREFIXES[@]}"; do
+              printf '%s\n' "$SIBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }' \
+                || MISSING="${MISSING} '${p}'"
+            done
+            if [ -n "$MISSING" ]; then
+              if [ "$(date +%s)" -gt "$STARTUP_DEADLINE" ]; then
+                echo "ERROR: no job records for build child(ren):${MISSING}; refusing to publish without confirming they ran" >&2
+                exit 1
+              fi
+              echo "waiting for job records to appear for:${MISSING}"
+              sleep "$POLL"
+              continue
+            fi
+
+            # Fail on the first finished leg that did not succeed rather than
+            # sitting on a runner for another hour to reach the same answer.
+            # `skipped` is the one conclusion that needs a judgement call: a
+            # publish run is pinned by `resolve` to the full default matrix, so
+            # a skipped leg there means something is wrong and must block, but a
+            # publish=false subset dispatch (say operating_systems=ubuntu) skips
+            # legs on purpose and `needs:` tolerated that before.
+            BAD="$(printf '%s\n' "$SIBS" | awk -F'\t' -v strict="$PUBLISH_INTENT" '
+              !NF || $2 != "completed" { next }
+              $3 == "success" { next }
+              $3 == "skipped" && strict != "true" { next }
+              { printf "  %s (%s)\n", $1, $3 }
+            ')"
+            if [ -n "$BAD" ]; then
+              echo "ERROR: refusing to publish, these build jobs did not succeed:" >&2
+              printf '%s\n' "$BAD" >&2
+              exit 1
+            fi
+
+            TOTAL="$(printf '%s\n' "$SIBS" | grep -c . || true)"
+            PENDING="$(printf '%s\n' "$SIBS" | awk -F'\t' 'NF && $2 != "completed"' | grep -c . || true)"
+            if [ "$PENDING" -eq 0 ]; then
+              echo "all ${TOTAL} build jobs finished and succeeded"
+              break
+            fi
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+              echo "ERROR: timed out waiting for the build matrix; ${PENDING} of ${TOTAL} jobs still running" >&2
+              exit 1
+            fi
+            echo "${PENDING} of ${TOTAL} build jobs still running; polling again in ${POLL}s"
+            sleep "$POLL"
+          done
+
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@v6
         with:
