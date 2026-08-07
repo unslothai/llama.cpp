@@ -52,6 +52,28 @@ jobs:
       run:
         shell: pwsh
     steps:
+      # Report both fixed volumes at job start. The work is split across two:
+      # the CUDA toolkit, the tool cache and Program Files land on C:, while
+      # GITHUB_WORKSPACE -- the source tree, the CMake build tree and the ccache
+      # -- is on D:. A leg that dies mid-build can only be read against the
+      # volume it was writing to, so both are printed here and again after the
+      # toolkit install.
+      #
+      # No cleanup step, deliberately. One was written and then measured on a
+      # live windows-2022 runner: D: starts at 147.0 GB free of 150.0 and C: at
+      # 84.3 of 255.4, and the CUDA 12.8 toolkit is 4.79 GB, so C: never drops
+      # below about 106 GB. Reclaiming ~33 GB of preinstalled SDKs on every leg
+      # would have freed the volume that was not under pressure, on every
+      # release, forever. The 87-minute "runner lost communication" failure was
+      # not disk exhaustion, and unsloth-prebuilt-retry.yml already covers that
+      # class of infrastructure loss.
+      - name: Report disk space
+        run: |
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          }
+
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@v6
         with:
@@ -145,6 +167,16 @@ jobs:
 
       - name: Verify CUDA
         run: nvcc --version
+
+      # Headroom going into the build, with the toolkit on C: and the restored
+      # ccache in the workspace on D:. First numbers to read if a leg dies
+      # mid-build; the build itself writes to the workspace volume.
+      - name: Report disk space before build
+        run: |
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          }
 
       - name: Configure
         working-directory: src
