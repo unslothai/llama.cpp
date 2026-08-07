@@ -291,8 +291,18 @@ def main() -> int:
             continue
         fe, me = c_enum_values(rb), c_enum_values(mb)
         for name, v in fe.items():
-            if me.get(name) != v:
-                enum_bad.append((f"{p} [vs {ref}]", name, v, me.get(name, "MISSING")))
+            now = me.get(name, "MISSING")
+            if now == v:
+                continue
+            # A _COUNT sentinel is not an id, it is one past the last one, so a branch that
+            # legitimately adds types must move it. Allow it to grow and require it to still
+            # bound every real id; anything else, including a shrink, is a violation.
+            if name.endswith("_COUNT") and isinstance(now, int) and now > v:
+                fam = name[:-len("_COUNT")]
+                real = [x for n2, x in me.items() if n2.startswith(fam) and n2 != name]
+                if real and now > max(real):
+                    continue
+            enum_bad.append((f"{p} [vs {ref}]", name, v, now))
         # two names sharing one id in the same enum family is a collision
         byfam: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
         for name, v in me.items():
