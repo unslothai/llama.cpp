@@ -432,6 +432,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Ask unsloth to stand its scheduled CI down while this release builds.
+      # Fired here rather than at assemble time: the point is to free slots
+      # before the 39-job matrix queues, not after it has finished waiting.
+      # Guarded on the same condition as the build jobs, so a scheduled no-op
+      # never sweeps anything.
+      #
+      # workflow_dispatch, not repository_dispatch. Both would work, but
+      # POST /dispatches needs Contents: write on the target and this needs only
+      # Actions: write, so the token cannot push code to unsloth.
+      #
+      # unsloth decides what it is willing to cancel; this only asks. If the
+      # sweeper is not on unsloth's main yet, this 404s and warns, which is why
+      # the whole step is best-effort.
+      - name: Ask unsloth to free runner capacity
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        # A release must never fail because the request did not land.
+        continue-on-error: true
+        env:
+          DISPATCH_TOKEN: ${{ secrets.UNSLOTH_DISPATCH_TOKEN }}
+          TAG: ${{ steps.r.outputs.tag }}
+        run: |
+          # No -x here: it would trace the token into the log.
+          set -eu
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::UNSLOTH_DISPATCH_TOKEN is not set; not asking unsloth to free capacity"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg r "llama.cpp ${TAG} run ${GITHUB_RUN_ID}" \
+            '{ref: "main", inputs: {mode: "sweep", events: "schedule", classes: "linux,windows", reason: $r}}')"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/unslothai/unsloth/actions/workflows/ci-capacity.yml/dispatches \
+            -d "$PAYLOAD")"
+          # 204 is "request accepted", not "capacity freed". unsloth's sweeper
+          # ships inert, so until it is enabled there this is a no-op by design.
+          if [ "$CODE" = "204" ]; then
+            echo "asked unsloth to free linux/windows capacity for ${TAG}"
+          else
+            echo "::warning::unsloth ci-capacity dispatch returned HTTP ${CODE}; continuing without it"
+          fi
+
   build-cuda:
     name: CUDA
     needs: resolve
