@@ -52,47 +52,27 @@ jobs:
       run:
         shell: pwsh
     steps:
-      # The only build legs with no disk management: the Linux CUDA legs run
-      # jlumbroso/free-disk-space first and there is no Windows equivalent, so
-      # remove the preinstalled SDKs this build never touches. Best-effort:
-      # a locked or already-absent path must not fail the job.
+      # Report both fixed volumes at job start. The work is split across two:
+      # the CUDA toolkit, the tool cache and Program Files land on C:, while
+      # GITHUB_WORKSPACE -- the source tree, the CMake build tree and the ccache
+      # -- is on D:. A leg that dies mid-build can only be read against the
+      # volume it was writing to, so both are printed here and again after the
+      # toolkit install.
       #
-      # The work is split across two volumes and every report here covers both,
-      # because a leg that dies mid-build can only be read against the volume it
-      # was writing to: the toolkit, the tool cache and Program Files are on C:,
-      # while GITHUB_WORKSPACE -- the source tree, the CMake build tree and the
-      # ccache -- is on D:. Only C: has anything worth reclaiming.
-      - name: Free disk space
-        continue-on-error: true
+      # No cleanup step, deliberately. One was written and then measured on a
+      # live windows-2022 runner: D: starts at 147.0 GB free of 150.0 and C: at
+      # 84.3 of 255.4, and the CUDA 12.8 toolkit is 4.79 GB, so C: never drops
+      # below about 106 GB. Reclaiming ~33 GB of preinstalled SDKs on every leg
+      # would have freed the volume that was not under pressure, on every
+      # release, forever. The 87-minute "runner lost communication" failure was
+      # not disk exhaustion, and unsloth-prebuilt-retry.yml already covers that
+      # class of infrastructure loss.
+      - name: Report disk space
         run: |
-          function Show-Free($when) {
-            Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
-              "{0}: {1} {2:N1} GB free of {3:N1} GB" -f $when, $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
-            }
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
           }
-          Show-Free "before"
-          # Nothing here is used by the MSVC + Ninja + CUDA + Python toolchain.
-          # hostedtoolcache Python is NOT in this list: setup-python needs it.
-          $paths = @(
-            "C:\Android",
-            "C:\Program Files (x86)\Android",
-            "C:\ghcup",
-            "C:\hostedtoolcache\windows\CodeQL",
-            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
-            "C:\hostedtoolcache\windows\Ruby",
-            "C:\hostedtoolcache\windows\go",
-            "C:\Program Files\Microsoft SDKs\Azure\CLI2",
-            "C:\Program Files\MongoDB",
-            "C:\Program Files\PostgreSQL",
-            "C:\Program Files\MySQL"
-          )
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Write-Host "removing $p"
-              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
-            }
-          }
-          Show-Free "after"
 
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@v6
