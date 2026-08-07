@@ -260,6 +260,22 @@ jobs:
         # Extract the tarball
         tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
 
+    # Keyed per gfx target and OS: the seven targets compile different device
+    # code from the same host sources, so a shared cache would mostly miss.
+    # save: false -- the explicit actions/cache/save step at the end of the job
+    # runs after packaging, so a failed package step does not persist a cache
+    # for a bundle that never shipped (same pattern as the CPU/CUDA children).
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2.23
+      with:
+        key: rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        restore-keys: |
+          rocm-windows-${{ matrix.gfx_target }}
+        append-timestamp: false
+        variant: ccache
+        max-size: 2G
+        save: false
+
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
     # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
@@ -320,6 +336,8 @@ jobs:
         cd build
 
         REM Configure the project
+        REM Only the C/CXX launchers here: ggml-hip forces CXX_IS_HIPCC on
+        REM WIN32, so the device sources compile as C++, not the HIP language.
         cmake .. -G Ninja ^
           -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
           -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
@@ -337,6 +355,8 @@ jobs:
           -DLLAMA_BUILD_BORINGSSL=ON ^
           -DGGML_NATIVE=OFF ^
           -DGGML_STATIC=OFF ^
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
           -DCMAKE_SYSTEM_NAME=Windows
 
         REM Build the project
@@ -437,6 +457,23 @@ jobs:
         name: app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}
         path: dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip
         if-no-files-found: error
+
+    # ROCm is the first backend here to run device code through ccache, so log
+    # the hit rate: a non-zero "unsupported source language" would mean the
+    # device TUs are falling through to the real compiler uncached.
+    - name: ccache stats
+      continue-on-error: true
+      run: ccache --show-stats -v
+
+    - name: Evict stale ccache files
+      continue-on-error: true
+      run: ccache --evict-older-than 14d
+
+    - name: Save ccache
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}\.ccache
+        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}-
 
   build-ubuntu:
     name: linux/${{ matrix.gfx_target }}
@@ -610,6 +647,18 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
+    # See the Windows job for why the key is per gfx target and why save: false.
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2.23
+      with:
+        key: rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        restore-keys: |
+          rocm-linux-${{ matrix.gfx_target }}
+        append-timestamp: false
+        variant: ccache
+        max-size: 2G
+        save: false
+
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
     # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
@@ -653,6 +702,10 @@ jobs:
         cd build
 
         # Configure the project
+        # CMAKE_HIP_COMPILER_LAUNCHER is needed here but not on Windows: the
+        # CXX compiler is ROCm's clang++ (not hipcc), so ggml-hip leaves
+        # CXX_IS_HIPCC false and calls enable_language(HIP), putting the device
+        # sources on the HIP language rather than CXX.
         cmake .. -G Ninja \
           -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
           -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
@@ -670,6 +723,9 @@ jobs:
           -DLLAMA_BUILD_BORINGSSL=ON \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
           -DCMAKE_SYSTEM_NAME=Linux
 
         # Build the project
@@ -781,3 +837,18 @@ jobs:
         name: app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}
         path: dist/app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz
         if-no-files-found: error
+
+    # See the Windows job: logs whether the HIP-language TUs actually cache.
+    - name: ccache stats
+      continue-on-error: true
+      run: ccache --show-stats -v
+
+    - name: Evict stale ccache files
+      continue-on-error: true
+      run: ccache --evict-older-than 14d
+
+    - name: Save ccache
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}-
