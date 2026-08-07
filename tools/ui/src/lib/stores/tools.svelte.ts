@@ -1,11 +1,19 @@
 import type { OpenAIToolDefinition, ToolEntry, ToolGroup } from '$lib/types';
 import { ToolsService } from '$lib/services/tools.service';
 import { mcpStore } from '$lib/stores/mcp.svelte';
-import { HealthCheckStatus, JsonSchemaType, ToolCallType, ToolSource } from '$lib/enums';
+import {
+	BuiltInTool,
+	GlobSearchType,
+	HealthCheckStatus,
+	JsonSchemaType,
+	ToolCallType,
+	ToolSource
+} from '$lib/enums';
 import { config } from '$lib/stores/settings.svelte';
 import {
 	DISABLED_TOOL_KEYS_LOCALSTORAGE_KEY,
-	SANDBOX_TOOL_DEFINITION,
+	buildSandboxToolDefinition,
+	HOME_TILDE,
 	TOOL_GROUP_LABELS,
 	TOOL_SERVER_LABELS
 } from '$lib/constants';
@@ -13,33 +21,6 @@ import {
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 /** Stable selection identity for a tool, shared by the disabled set and the permission store */
-function toolKey(source: ToolSource, name: string, serverId?: string): string {
-	switch (source) {
-		case ToolSource.MCP:
-			return serverId ? `mcp-${serverId}:${name}` : `mcp:${name}`;
-		case ToolSource.CUSTOM:
-			return `custom:${name}`;
-		case ToolSource.FRONTEND:
-			return `frontend:${name}`;
-		default:
-			return `builtin:${name}`;
-	}
-}
-
-function mcpDefinition(
-	name: string,
-	description: string | undefined,
-	schema?: Record<string, unknown>
-): OpenAIToolDefinition {
-	return {
-		type: ToolCallType.FUNCTION,
-		function: {
-			name,
-			description,
-			parameters: schema ?? { type: JsonSchemaType.OBJECT, properties: {}, required: [] }
-		}
-	};
-}
 
 class ToolsStore {
 	private _builtinTools = $state<OpenAIToolDefinition[]>([]);
@@ -47,6 +28,7 @@ class ToolsStore {
 	private _error = $state<string | null>(null);
 	private _disabledTools = $state(new SvelteSet<string>());
 	private _toolsEndpointUnreachable = $state(false);
+	private _serverHome = $state<string | null | undefined>(undefined);
 
 	constructor() {
 		try {
@@ -77,16 +59,106 @@ class ToolsStore {
 		}
 	}
 
+	private toolKey(source: ToolSource, name: string, serverId?: string): string {
+		switch (source) {
+			case ToolSource.MCP:
+				return serverId ? `mcp-${serverId}:${name}` : `mcp:${name}`;
+			case ToolSource.CUSTOM:
+				return `custom:${name}`;
+			case ToolSource.FRONTEND:
+				return `frontend:${name}`;
+			default:
+				return `builtin:${name}`;
+		}
+	}
+
+	private inferTypeFromDefault(value: unknown): string | undefined {
+		if (typeof value === 'string') return 'string';
+		if (typeof value === 'boolean') return 'boolean';
+		if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+		if (Array.isArray(value)) return 'array';
+		if (value !== null && typeof value === 'object') return 'object';
+		return undefined;
+	}
+
+	/**
+	 * Recursively normalize a JSON Schema object: infers `type` from `default`
+	 * for properties / items that omit it, and descends into nested `properties`
+	 * and `items`. Returns a new object -- does not mutate the input.
+	 */
+	private normalizeJsonSchema(schema: Record<string, unknown>): Record<string, unknown> {
+		if (!schema || typeof schema !== 'object') return schema;
+
+		const normalized: Record<string, unknown> = { ...schema };
+
+		if (normalized.properties && typeof normalized.properties === 'object') {
+			const props = normalized.properties as Record<string, Record<string, unknown>>;
+			const normalizedProps: Record<string, Record<string, unknown>> = {};
+			for (const [key, prop] of Object.entries(props)) {
+				if (!prop || typeof prop !== 'object') {
+					normalizedProps[key] = prop;
+					continue;
+				}
+
+				const normalizedProp: Record<string, unknown> = { ...prop };
+
+				if (!normalizedProp.type && normalizedProp.default !== undefined) {
+					const inferred = this.inferTypeFromDefault(normalizedProp.default);
+					if (inferred) normalizedProp.type = inferred;
+				}
+
+				if (normalizedProp.properties) {
+					Object.assign(
+						normalizedProp,
+						this.normalizeJsonSchema(normalizedProp as Record<string, unknown>)
+					);
+				}
+
+				if (normalizedProp.items && typeof normalizedProp.items === 'object') {
+					normalizedProp.items = this.normalizeJsonSchema(
+						normalizedProp.items as Record<string, unknown>
+					);
+				}
+
+				normalizedProps[key] = normalizedProp;
+			}
+			normalized.properties = normalizedProps;
+		}
+
+		return normalized;
+	}
+
+	private mcpDefinition(
+		name: string,
+		description: string | undefined,
+		schema?: Record<string, unknown>
+	): OpenAIToolDefinition {
+		return {
+			type: ToolCallType.FUNCTION,
+			function: {
+				name,
+				description,
+				parameters: schema ?? { type: JsonSchemaType.OBJECT, properties: {}, required: [] }
+			}
+		};
+	}
+
 	get builtinTools(): OpenAIToolDefinition[] {
 		return this._builtinTools;
 	}
 
+	get serverHome(): string | null {
+		return this._serverHome ?? null;
+	}
+
 	get mcpTools(): OpenAIToolDefinition[] {
-		return mcpStore.getToolDefinitionsForLLM();
+		return this.mcpEntries().map((e) => e.definition);
 	}
 
 	get frontendTools(): OpenAIToolDefinition[] {
-		return config().jsSandboxEnabled ? [SANDBOX_TOOL_DEFINITION] : [];
+		return config().jsSandboxEnabled
+			? [buildSandboxToolDefinition(!!config().symbolicMathEnabled)]
+			: [];
 	}
 
 	get customTools(): OpenAIToolDefinition[] {
@@ -124,11 +196,22 @@ class ToolsStore {
 			for (const [serverId, connection] of connections) {
 				const serverName = mcpStore.getServerDisplayName(serverId);
 				for (const tool of connection.tools) {
-					const schema = (tool.inputSchema as Record<string, unknown>) ?? undefined;
+					const rawSchema = (tool.inputSchema as Record<string, unknown>) ?? {
+						type: JsonSchemaType.OBJECT,
+						properties: {},
+						required: []
+					};
 					out.push({
 						serverId,
 						serverName,
-						definition: mcpDefinition(tool.name, tool.description, schema)
+						definition: {
+							type: ToolCallType.FUNCTION,
+							function: {
+								name: tool.name,
+								description: tool.description,
+								parameters: this.normalizeJsonSchema(rawSchema)
+							}
+						}
 					});
 				}
 			}
@@ -138,7 +221,7 @@ class ToolsStore {
 					out.push({
 						serverId,
 						serverName,
-						definition: mcpDefinition(tool.name, tool.description)
+						definition: this.mcpDefinition(tool.name, tool.description)
 					});
 				}
 			}
@@ -160,14 +243,18 @@ class ToolsStore {
 
 		for (const def of this._builtinTools) {
 			const name = def.function.name;
-			push({ source: ToolSource.BUILTIN, key: toolKey(ToolSource.BUILTIN, name), definition: def });
+			push({
+				source: ToolSource.BUILTIN,
+				key: this.toolKey(ToolSource.BUILTIN, name),
+				definition: def
+			});
 		}
 
 		for (const def of this.frontendTools) {
 			const name = def.function.name;
 			push({
 				source: ToolSource.FRONTEND,
-				key: toolKey(ToolSource.FRONTEND, name),
+				key: this.toolKey(ToolSource.FRONTEND, name),
 				definition: def
 			});
 		}
@@ -178,14 +265,18 @@ class ToolsStore {
 				source: ToolSource.MCP,
 				serverId,
 				serverName,
-				key: toolKey(ToolSource.MCP, name, serverId),
+				key: this.toolKey(ToolSource.MCP, name, serverId),
 				definition
 			});
 		}
 
 		for (const def of this.customTools) {
 			const name = def.function.name;
-			push({ source: ToolSource.CUSTOM, key: toolKey(ToolSource.CUSTOM, name), definition: def });
+			push({
+				source: ToolSource.CUSTOM,
+				key: this.toolKey(ToolSource.CUSTOM, name),
+				definition: def
+			});
 		}
 
 		return entries;
@@ -204,6 +295,7 @@ class ToolsStore {
 			if (!group) {
 				group = {
 					source: entry.source,
+					key: groupKey,
 					label: this.groupLabel(entry),
 					serverId: entry.serverId,
 					tools: []
@@ -233,7 +325,8 @@ class ToolsStore {
 
 	/**
 	 * Enabled tool definitions for sending to the LLM.
-	 * MCP tools keep their normalized schemas from mcpStore.
+	 * MCP tool schemas are normalized here so the wire payload is consistent
+	 * across all four sources (built-in, frontend/sandbox, MCP, custom JSON).
 	 * The API identifies tools by name, so a name is sent at most once.
 	 */
 	getEnabledToolsForLLM(): OpenAIToolDefinition[] {
@@ -256,7 +349,8 @@ class ToolsStore {
 
 		for (const def of this._builtinTools) take(def);
 		for (const def of this.frontendTools) take(def);
-		for (const def of mcpStore.getToolDefinitionsForLLM()) take(def);
+		// mcpEntries() over mcpStore directly so wire shape stays normalized and aligned with the tools UI.
+		for (const entry of this.mcpEntries()) take(entry.definition);
 		for (const def of this.customTools) take(def);
 
 		return result;
@@ -308,15 +402,17 @@ class ToolsStore {
 		const connection = mcpStore.getConnections().get(serverId);
 		if (!connection) return;
 		for (const tool of connection.tools) {
-			this._disabledTools.delete(toolKey(ToolSource.MCP, tool.name, serverId));
+			this._disabledTools.delete(this.toolKey(ToolSource.MCP, tool.name, serverId));
 		}
 		this.persistDisabledTools();
 	}
 
 	toggleGroup(group: ToolGroup): void {
 		const allEnabled = group.tools.every((t) => this.isToolEnabled(t.key));
+		const target = !allEnabled;
 		for (const tool of group.tools) {
-			this.setToolEnabled(tool.key, !allEnabled);
+			if (target) this._disabledTools.delete(tool.key);
+			else this._disabledTools.add(tool.key);
 		}
 		this.persistDisabledTools();
 	}
@@ -332,7 +428,8 @@ class ToolsStore {
 		tools: { name: string; description?: string }[];
 	}[] {
 		const result: ReturnType<ToolsStore['getMcpToolsFromHealthChecks']> = [];
-		for (const server of mcpStore.getServersSorted().filter((s) => s.enabled)) {
+		for (const server of mcpStore.getServers()) {
+			if (!server.enabled) continue;
 			const health = mcpStore.getHealthCheckState(server.id);
 			if (health.status === HealthCheckStatus.SUCCESS && health.tools.length > 0) {
 				result.push({
@@ -392,14 +489,40 @@ class ToolsStore {
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			this._error = errorMessage;
-			// 404 from /tools means the server was started without --tools
-			if (errorMessage.includes('404') || errorMessage.toLowerCase().includes('not found')) {
+			// 403 from /tools means the server was started without --tools
+			// TODO: check status code instead of relying on message
+			if (errorMessage.includes('this feature is disabled')) {
 				this._toolsEndpointUnreachable = true;
+				console.info('[ToolsStore] Built-in tools are disabled on the server');
+			} else {
+				console.error('[ToolsStore] Failed to fetch built-in tools:', err);
 			}
-			console.error('[ToolsStore] Failed to fetch built-in tools:', err);
 		} finally {
 			this._loading = false;
 		}
+	}
+
+	/**
+	 * Absolute home directory on the server, resolved once per session via
+	 * file_glob_search's `base` field (the server expands `~`). Anchors the
+	 * directory picker's search scope and the `~` abbreviation of cwd
+	 * displays. Returns null when tools are unavailable.
+	 */
+	async resolveServerHome(): Promise<string | null> {
+		if (this._serverHome !== undefined) return this._serverHome;
+		try {
+			const res = await ToolsService.executeToolRaw(BuiltInTool.FILE_GLOB_SEARCH, {
+				path: HOME_TILDE,
+				type: GlobSearchType.DIR,
+				max_depth: 1,
+				limit: 1
+			});
+			this._serverHome = typeof res.base === 'string' ? res.base : null;
+		} catch {
+			// searches still work via a literal `~`, only `~` abbreviation degrades
+			this._serverHome = null;
+		}
+		return this._serverHome;
 	}
 }
 
