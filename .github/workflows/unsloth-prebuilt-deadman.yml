@@ -23,7 +23,7 @@ env:
 jobs:
   deadman:
     name: Check publish freshness
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout (for the composite action)
         uses: actions/checkout@v6

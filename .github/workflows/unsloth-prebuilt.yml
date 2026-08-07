@@ -89,7 +89,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve tag
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     # Read-only: resolve merges third-party PR content but pushes nothing;
     # only assemble needs the workflow-level contents:write (publish).
     permissions:
@@ -557,7 +557,7 @@ jobs:
     # exits non-zero unless all of them succeeded, so a failed leg still
     # publishes nothing. The installer needs the full bundle set or it'll fail.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     # The waiter holds this job open for the whole build. GitHub's 6h job cap
     # would kill it with no useful message; stop short of that deliberately,
     # leaving room for the download/verify/publish steps that follow.
@@ -900,7 +900,7 @@ jobs:
     name: Report pipeline health
     needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       issues: write
