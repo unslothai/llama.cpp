@@ -10,6 +10,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
+#include "ggml.h"
+
 #include "concat.hpp"
 
 static inline size_t elem_size(ggml_type t) {
@@ -125,7 +127,15 @@ static void concat_T_sycl_non_cont(
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
   sycl::range<3> gridDim(ne3, ne2, ne1);
-  stream->parallel_for(sycl::nd_range<3>(gridDim, sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
+
+  // Avoid oversubscribing device when there is not enough elements along the innermost dim to
+  // fill a full SYCL_CONCAT_BLOCK_SIZE. For larger # of elements, the full SYCL_CONCAT_BLOCK_SIZE
+  // is used.
+  const int64_t ne0_pad   = GGML_PAD(ne0, WARP_SIZE);
+  const int64_t block_ne0 = ne0_pad < SYCL_CONCAT_BLOCK_SIZE ? ne0_pad : (int64_t) SYCL_CONCAT_BLOCK_SIZE;
+  sycl::range<3> blockDim(1, 1, block_ne0);
+
+  stream->parallel_for(sycl::nd_range<3>(gridDim * blockDim, blockDim), [=](sycl::nd_item<3> item_ct1) {
       int64_t i3 = item_ct1.get_group(0);
       int64_t i2 = item_ct1.get_group(1);
       int64_t i1 = item_ct1.get_group(2);
@@ -192,11 +202,29 @@ void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
     case GGML_TYPE_F32:
         concat_impl_sycl<float>(ctx, dst);
         break;
+    case GGML_TYPE_F16:
+        concat_impl_sycl<sycl::half>(ctx, dst);
+        break;
+#ifdef GGML_SYCL_HAS_BF16
+    case GGML_TYPE_BF16:
+        concat_impl_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst);
+        break;
+#endif
     case GGML_TYPE_I32:
         concat_impl_sycl<int32_t>(ctx, dst);
         break;
+    case GGML_TYPE_I16:
+        concat_impl_sycl<int16_t>(ctx, dst);
+        break;
+    case GGML_TYPE_I64:
+        concat_impl_sycl<int64_t>(ctx, dst);
+        break;
+    case GGML_TYPE_I8:
+        concat_impl_sycl<int8_t>(ctx, dst);
+        break;
     default:
-    GGML_ASSERT(false && "ggml_sycl_op_concat: unsupported type");
+        fprintf(stderr, "%s: unsupported types: dst: %s\n", __func__, ggml_type_name(dst->type));
+        GGML_ASSERT(false);
     break;
     }
 }

@@ -2,16 +2,17 @@
 	import { goto } from '$app/navigation';
 	import { getChatActionsContext, setMessageEditContext } from '$lib/contexts';
 	import { chatStore, pendingEditMessageId } from '$lib/stores/chat.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import { DatabaseService } from '$lib/services/database.service';
 	import { SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
 	import { REASONING_TAGS } from '$lib/constants/agentic';
 	import { MessageRole, AttachmentType, AgenticSectionType } from '$lib/enums';
-	import { fadeInView } from '$lib/actions/fade-in-view.svelte';
 	import {
 		ChatMessageAssistant,
 		ChatMessageUser,
 		ChatMessageSystem,
+		ChatMessageSynthetic,
 		ChatMessageMcpPrompt
 	} from '$lib/components/app/chat';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
@@ -24,6 +25,8 @@
 		message: DatabaseMessage;
 		toolMessages?: DatabaseMessage[];
 		isLastAssistantMessage?: boolean;
+		isLastUserMessage?: boolean;
+		nextAssistantMessage?: DatabaseMessage | null;
 		siblingInfo?: ChatMessageSiblingInfo | null;
 	}
 
@@ -32,6 +35,8 @@
 		message,
 		toolMessages = [],
 		isLastAssistantMessage = false,
+		isLastUserMessage = false,
+		nextAssistantMessage = null,
 		siblingInfo = null
 	}: Props = $props();
 
@@ -43,7 +48,18 @@
 		assistantMessages: number;
 		messageTypes: string[];
 	} | null>(null);
-	let editedContent = $derived(message.content);
+	// The system message placeholder must never surface as editable content; keeping
+	// it in the derived (not just in handleEdit) guards against prop invalidation
+	// reverting the override while editing
+	let editedContent = $derived(
+		message.role === MessageRole.SYSTEM && message.content === SYSTEM_MESSAGE_PLACEHOLDER
+			? ''
+			: message.content
+	);
+
+	// Synthetic cwd-change messages render with the folder-row UI instead
+	// of a user bubble. The persisted flag is the single source of truth.
+	let isSynthetic = $derived(Boolean(message.isSynthetic));
 
 	let rawEditContent = $derived.by(() => {
 		if (message.role !== MessageRole.ASSISTANT) return undefined;
@@ -231,7 +247,7 @@
 			editedContent = message.content;
 		}
 
-		textareaElement?.focus();
+		textareaElement?.focus({ preventScroll: true });
 		editedExtras = message.extra ? [...message.extra] : [];
 		editedUploadedFiles = [];
 
@@ -262,6 +278,12 @@
 		chatActions.navigateToSibling(siblingId);
 	}
 
+	// After the system message flow ends, hand focus to the main chat form
+	function focusMainChatForm() {
+		if (isMobile.current) return;
+		document.querySelector<HTMLTextAreaElement>('.chat-screen-form-wrapper textarea')?.focus();
+	}
+
 	async function handleSaveEdit() {
 		if (message.role === MessageRole.SYSTEM) {
 			// System messages: update in place without branching
@@ -273,6 +295,8 @@
 				isEditing = false;
 				if (conversationDeleted) {
 					goto(ROUTES.START);
+				} else {
+					focusMainChatForm();
 				}
 				return;
 			}
@@ -282,6 +306,7 @@
 			if (index !== -1) {
 				conversationsStore.updateMessageAtIndex(index, { content: newContent });
 			}
+			focusMainChatForm();
 		} else if (message.role === MessageRole.USER) {
 			const finalExtras = await getMergedExtras();
 			chatActions.editWithBranching(message, editedContent.trim(), finalExtras);
@@ -324,7 +349,7 @@
 	}
 </script>
 
-<div use:fadeInView>
+<div class="chat-message" class:chat-message--synthetic={isSynthetic}>
 	{#if message.role === MessageRole.SYSTEM}
 		<ChatMessageSystem
 			bind:textareaElement
@@ -355,11 +380,15 @@
 			{showDeleteDialog}
 			{siblingInfo}
 		/>
+	{:else if isSynthetic}
+		<ChatMessageSynthetic {message} class={className} />
 	{:else if message.role === MessageRole.USER}
 		<ChatMessageUser
 			class={className}
 			{deletionInfo}
+			{isLastUserMessage}
 			{message}
+			{nextAssistantMessage}
 			onConfirmDelete={handleConfirmDelete}
 			onCopy={handleCopy}
 			onDelete={handleDelete}
@@ -378,7 +407,6 @@
 			{isLastAssistantMessage}
 			{message}
 			{toolMessages}
-			messageContent={message.content}
 			onConfirmDelete={handleConfirmDelete}
 			onContinue={handleContinue}
 			onCopy={handleCopy}
@@ -393,3 +421,25 @@
 		/>
 	{/if}
 </div>
+
+<style>
+	/*
+	 * The browser skips layout and paint for messages outside the
+	 * viewport. contain-intrinsic-size reuses the last rendered size
+	 * once known; 500px sizes messages that have never been rendered.
+	 */
+	.chat-message {
+		--chat-message-intrinsic-size: 500px;
+		content-visibility: auto;
+		contain-intrinsic-size: auto var(--chat-message-intrinsic-size);
+	}
+
+	/*
+	 * Synthetic rows (e.g. the working-directory change) are small, so an
+	 * accurate placeholder keeps the injected row from inflating the
+	 * auto-scroll offset; the 500px default is for ordinary bubbles.
+	 */
+	.chat-message--synthetic {
+		--chat-message-intrinsic-size: 40px;
+	}
+</style>
