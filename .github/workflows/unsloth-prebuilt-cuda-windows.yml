@@ -52,21 +52,23 @@ jobs:
       run:
         shell: pwsh
     steps:
-      # The only build legs with no disk management: a 14 GB SSD that has to
-      # hold a full CUDA toolkit plus the largest object set in the matrix
-      # (7-8 architectures of nvcc output). The Linux CUDA legs already run
-      # jlumbroso/free-disk-space first; there is no Windows equivalent, so
+      # The only build legs with no disk management: the Linux CUDA legs run
+      # jlumbroso/free-disk-space first and there is no Windows equivalent, so
       # remove the preinstalled SDKs this build never touches. Best-effort:
-      # a locked or already-absent path must not fail the job. The before/after
-      # numbers are logged so the next runner death has evidence either way --
-      # `x64/cuda12-portable` ran 87 minutes and lost communication with the
-      # server, which skipped assemble and published nothing.
+      # a locked or already-absent path must not fail the job.
+      #
+      # The work is split across two volumes and every report here covers both,
+      # because a leg that dies mid-build can only be read against the volume it
+      # was writing to: the toolkit, the tool cache and Program Files are on C:,
+      # while GITHUB_WORKSPACE -- the source tree, the CMake build tree and the
+      # ccache -- is on D:. Only C: has anything worth reclaiming.
       - name: Free disk space
         continue-on-error: true
         run: |
           function Show-Free($when) {
-            $d = Get-PSDrive C
-            "{0}: C: {1:N1} GB free of {2:N1} GB" -f $when, ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB)
+            Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+              "{0}: {1} {2:N1} GB free of {3:N1} GB" -f $when, $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+            }
           }
           Show-Free "before"
           # Nothing here is used by the MSVC + Ninja + CUDA + Python toolchain.
@@ -185,13 +187,15 @@ jobs:
       - name: Verify CUDA
         run: nvcc --version
 
-      # Headroom going into the build, with the toolkit and the restored ccache
-      # already on disk. This is the number to look at first if a leg dies
-      # mid-build.
+      # Headroom going into the build, with the toolkit on C: and the restored
+      # ccache in the workspace on D:. First numbers to read if a leg dies
+      # mid-build; the build itself writes to the workspace volume.
       - name: Report disk space before build
         run: |
-          $d = Get-PSDrive C
-          "C: {0:N1} GB free of {1:N1} GB" -f ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB)
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          }
 
       - name: Configure
         working-directory: src
