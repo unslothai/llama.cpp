@@ -3,13 +3,25 @@
 
 name: Unsloth prebuilt retry
 
-# Re-runs a nightly whose jobs were cancelled by something outside the run.
+# Re-runs a nightly that stopped for a reason outside the build itself.
 #
-# On 08-05 all 40 builds passed and the publish job was cancelled 15s in, with
-# no failing job, no superseding run and nothing in the workflow that cancels.
-# Every artifact was still there; one rerun published the release. Without this
-# the pipeline sits on a finished build set until a human notices, which is the
-# silent no-publish the alerting exists to catch, reached one step later.
+# Two causes so far, both of which leave a finished build set unpublished:
+#
+#   Cancelled with nothing failing. On 08-05 all 40 builds passed and the
+#   publish job was cancelled 15s in, with no failing job, no superseding run
+#   and nothing in the workflow that cancels. Every artifact was still there;
+#   one rerun published the release.
+#
+#   A runner that dies mid-build. On 08-07 39 of 40 builds passed and
+#   `CUDA Windows / x64/cuda12-portable` failed after 78 minutes of nvcc with
+#   no compile error in its log, which simply stopped 46 minutes before the
+#   job ended. GitHub's own annotation was "The hosted runner lost
+#   communication with the server". assemble is `needs:` every build, so it
+#   skipped and no release was cut.
+#
+# Without this the pipeline sits on a finished build set until a human
+# notices, which is the silent no-publish the alerting exists to catch,
+# reached one step later.
 
 on:
   workflow_run:
@@ -19,37 +31,80 @@ on:
 permissions:
   contents: read
   actions: write
+  # The runner-loss test reads each failed job's annotation, which lives on
+  # the check run rather than in the job log.
+  checks: read
 
 jobs:
   retry:
-    name: Rerun a cancelled run once
+    name: Rerun an externally broken run once
     # run_attempt caps this at one retry: the rerun fires this workflow again
     # as attempt 2, which no longer matches. A hand-cancelled workflow_dispatch
     # is someone stopping their own build, so leave it stopped.
     if: >-
-      github.event.workflow_run.conclusion == 'cancelled'
+      (github.event.workflow_run.conclusion == 'cancelled'
+        || github.event.workflow_run.conclusion == 'failure')
       && github.event.workflow_run.run_attempt == 1
       && github.event.workflow_run.event != 'workflow_dispatch'
     runs-on: ubuntu-22.04
     steps:
-      - name: Rerun the cancelled jobs
+      - name: Rerun the run when nothing about the build actually failed
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -uo pipefail
+
           JOBS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
-                    --jq '.jobs[] | .conclusion')"
+                    --jq '.jobs[] | [.id, .conclusion, .name] | @tsv')"
+
+          # A rerun of a run where nothing succeeded buys nothing: there is no
+          # salvageable work, and whatever stopped it will stop it again.
+          if ! cut -f2 <<<"$JOBS" | grep -qx 'success'; then
+            echo "not retrying ${RUN_ID}: nothing succeeded, so there is no work to salvage" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          FAILED="$(awk -F'\t' '$2 == "failure"' <<<"$JOBS")"
+
           # A cancellation that follows a real failure is a build problem to
-          # read, not to repeat. Requiring a success too skips a run cancelled
-          # before it did anything, where a rerun buys nothing.
-          if grep -qx 'failure' <<<"$JOBS"; then
-            echo "not retrying ${RUN_ID}: it has a failed job, so the cancel is a consequence"
-          elif ! grep -qx 'success' <<<"$JOBS"; then
-            echo "not retrying ${RUN_ID}: nothing succeeded, so there is no work to salvage"
-          elif gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
-            echo "rerunning cancelled jobs of ${RUN_URL}"
+          # read, not to repeat.
+          if [ "$CONCLUSION" = cancelled ] && [ -n "$FAILED" ]; then
+            echo "not retrying ${RUN_ID}: it has a failed job, so the cancel is a consequence" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # For an outright failure, retry only when every failed job died
+          # because its runner went away. A compile error repeats identically
+          # and must be read, not rerun; a lost runner is infrastructure and a
+          # rerun is the whole fix. Anything we cannot positively identify as
+          # runner loss counts as a real failure, so an unreadable annotation
+          # fails closed and the run stays put.
+          if [ "$CONCLUSION" = failure ]; then
+            if [ -z "$FAILED" ]; then
+              echo "not retrying ${RUN_ID}: it concluded failure with no failed job, so there is nothing to rerun" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            while IFS=$'\t' read -r JOB_ID _ JOB_NAME; do
+              [ -n "${JOB_ID:-}" ] || continue
+              NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs/${JOB_ID}/annotations" \
+                         --jq '.[].message' 2>/dev/null)"
+              if ! grep -qF 'lost communication with the server' <<<"$NOTES"; then
+                echo "not retrying ${RUN_ID}: \`${JOB_NAME}\` failed for a reason other than runner loss, so read it rather than repeat it" \
+                  | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "runner loss: ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+            done <<<"$FAILED"
+          fi
+
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
+            echo "rerunning ${CONCLUSION} jobs of ${RUN_URL}" | tee -a "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::could not rerun ${RUN_URL}; rerun it by hand"
-          fi | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::warning::could not rerun ${RUN_URL}; rerun it by hand" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
