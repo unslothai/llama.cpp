@@ -52,6 +52,46 @@ jobs:
       run:
         shell: pwsh
     steps:
+      # The only build legs with no disk management: a 14 GB SSD that has to
+      # hold a full CUDA toolkit plus the largest object set in the matrix
+      # (7-8 architectures of nvcc output). The Linux CUDA legs already run
+      # jlumbroso/free-disk-space first; there is no Windows equivalent, so
+      # remove the preinstalled SDKs this build never touches. Best-effort:
+      # a locked or already-absent path must not fail the job. The before/after
+      # numbers are logged so the next runner death has evidence either way --
+      # `x64/cuda12-portable` ran 87 minutes and lost communication with the
+      # server, which skipped assemble and published nothing.
+      - name: Free disk space
+        continue-on-error: true
+        run: |
+          function Show-Free($when) {
+            $d = Get-PSDrive C
+            "{0}: C: {1:N1} GB free of {2:N1} GB" -f $when, ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB)
+          }
+          Show-Free "before"
+          # Nothing here is used by the MSVC + Ninja + CUDA + Python toolchain.
+          # hostedtoolcache Python is NOT in this list: setup-python needs it.
+          $paths = @(
+            "C:\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\ghcup",
+            "C:\hostedtoolcache\windows\CodeQL",
+            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
+            "C:\hostedtoolcache\windows\Ruby",
+            "C:\hostedtoolcache\windows\go",
+            "C:\Program Files\Microsoft SDKs\Azure\CLI2",
+            "C:\Program Files\MongoDB",
+            "C:\Program Files\PostgreSQL",
+            "C:\Program Files\MySQL"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Write-Host "removing $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+          Show-Free "after"
+
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@v6
         with:
@@ -144,6 +184,14 @@ jobs:
 
       - name: Verify CUDA
         run: nvcc --version
+
+      # Headroom going into the build, with the toolkit and the restored ccache
+      # already on disk. This is the number to look at first if a leg dies
+      # mid-build.
+      - name: Report disk space before build
+        run: |
+          $d = Get-PSDrive C
+          "C: {0:N1} GB free of {1:N1} GB" -f ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB)
 
       - name: Configure
         working-directory: src
