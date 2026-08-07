@@ -1263,6 +1263,110 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
     return d1q * (ds.x*sumi + ds.y*delta);
 }
 
+// The narrow IQ1 types below differ from IQ1_S only in how the grid index is reassembled and where
+// the per-sub-block scale/sign nibble is stored. Everything else, including the 4-bit grid packing
+// and the (grid + delta) offset trick, is inherited unchanged.
+
+#define VDR_IQ1_XS_Q8_1_MMVQ 1
+#define VDR_IQ1_XS_Q8_1_MMQ  1
+
+static __device__ __forceinline__ float vec_dot_iq1_xs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_iq1_xs * bq1 = (const block_iq1_xs *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh  = bq1->qh[iqs];
+    const int nib = (bq1->sc[iqs/2] >> (4*(iqs%2))) & 0x0F;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1_xs_grid_gpu[qs[l0/2] | (((qh >> 2*(l0/2)) & 0x03) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (2*(nib & 0x07) + 1);
+    const float  delta = nib & 0x08 ? -1.0f - IQ1S_DELTA : -1.0f + IQ1S_DELTA;
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
+}
+
+#define VDR_IQ1_XXS_Q8_1_MMVQ 1
+#define VDR_IQ1_XXS_Q8_1_MMQ  1
+
+static __device__ __forceinline__ float vec_dot_iq1_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_iq1_xxs * bq1 = (const block_iq1_xxs *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq1->qh[iqs];
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1_xxs_grid_gpu[qs[l0/2] | (((qh >> (l0/2)) & 0x01) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (2*((qh >> 4) & 0x07) + 1);
+    const float  delta = qh & 0x80 ? -1.0f - IQ1S_DELTA : -1.0f + IQ1S_DELTA;
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
+}
+
+#define VDR_IQ1_XXXS_Q8_1_MMVQ 1
+#define VDR_IQ1_XXXS_Q8_1_MMQ  1
+
+static __device__ __forceinline__ float vec_dot_iq1_xxxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_iq1_xxxs * bq1 = (const block_iq1_xxxs *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int nib = (bq1->sc[iqs/2] >> (4*(iqs%2))) & 0x0F;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1_xxxs_grid_gpu[qs[l0/2]];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (2*(nib & 0x07) + 1);
+    const float  delta = nib & 0x08 ? -1.0f - IQ1S_DELTA : -1.0f + IQ1S_DELTA;
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
+}
+
 #define VDR_IQ1_M_Q8_1_MMVQ 1
 #define VDR_IQ1_M_Q8_1_MMQ  1
 
