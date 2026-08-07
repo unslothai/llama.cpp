@@ -74,13 +74,14 @@ jobs:
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.20
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}
           restore-keys: |
             cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
           append-timestamp: false
           variant: ccache
+          max-size: 2G
           save: false
 
       - uses: actions/setup-python@v6

@@ -68,12 +68,32 @@ jobs:
           mkdir -p src
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
+      # The macOS legs were the last build jobs without a compiler cache. Metal's
+      # backend is Objective-C, and the arm64 leg is the only one that builds it
+      # (the x64 leg passes -DGGML_METAL=OFF), so the OBJC launchers matter here
+      # in a way they do not elsewhere. Setting a launcher for a language this
+      # build never enables is inert, so both are set unconditionally.
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: macos-${{ matrix.build }}-${{ matrix.deploy_target }}-${{ inputs.tag }}
+          restore-keys: |
+            macos-${{ matrix.build }}-${{ matrix.deploy_target }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
       - name: Build (deployment target ${{ matrix.deploy_target }})
         working-directory: src
         run: |
           set -euo pipefail
           cmake -B build \
             ${{ matrix.defines }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deploy_target }} \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -127,3 +147,13 @@ jobs:
           name: app-${{ inputs.tag }}-macos-${{ matrix.build }}
           path: dist/llama-${{ inputs.tag }}-bin-macos-${{ matrix.build }}.tar.gz
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-${{ matrix.build }}-${{ matrix.deploy_target }}-${{ inputs.tag }}-

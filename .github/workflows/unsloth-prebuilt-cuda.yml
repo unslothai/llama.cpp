@@ -93,13 +93,14 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.20
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}
           restore-keys: |
             cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
           append-timestamp: false
           variant: ccache
+          max-size: 2G
           save: false
 
       # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
