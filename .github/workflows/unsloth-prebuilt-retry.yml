@@ -46,7 +46,7 @@ jobs:
         || github.event.workflow_run.conclusion == 'failure')
       && github.event.workflow_run.run_attempt == 1
       && github.event.workflow_run.event != 'workflow_dispatch'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Rerun the run when nothing about the build actually failed
         env:

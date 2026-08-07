@@ -36,7 +36,7 @@ jobs:
     name: Repin against the current base tag
     # A preflight that passed has nothing to fix.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       # Without this, checkout leaves a github.com extraheader carrying
       # GITHUB_TOKEN, which would win over the REPIN_TOKEN in our push URLs.
