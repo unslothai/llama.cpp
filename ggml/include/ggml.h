@@ -430,7 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // IQ1_S's 8-element ternary codebook with a narrower index; see ggml-common.h.
+        // 42..63 stay reserved for upstream (42 is already Q2_0), so fork-local types start
+        // at 64 and a stock build rejects these files instead of misreading them.
+        GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
+        GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
+        GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
+        GGML_TYPE_COUNT   = 67,
     };
 
     // precision
@@ -475,6 +481,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        // 28..39 are reserved for upstream ggml, which is already using 28 for Q2_0.
+        GGML_FTYPE_MOSTLY_IQ1_XS   = 40, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXS  = 41, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXXS = 42, // except 1d tensors
     };
 
     // available tensor operations:
