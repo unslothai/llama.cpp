@@ -100,7 +100,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
@@ -271,7 +271,7 @@ jobs:
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: vulkan-windows-x64-${{ inputs.tag }}
           restore-keys: |
@@ -285,7 +285,7 @@ jobs:
         run: choco install ninja --no-progress
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
       - name: Install Vulkan SDK
         run: |

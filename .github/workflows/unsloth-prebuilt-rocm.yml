@@ -266,7 +266,7 @@ jobs:
     # runs after packaging, so a failed package step does not persist a cache
     # for a bundle that never shipped (same pattern as the CPU/CUDA children).
     - name: ccache
-      uses: hendrikmuhs/ccache-action@v1.2.23
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
         key: rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}
         restore-keys: |
@@ -665,7 +665,7 @@ jobs:
 
     # See the Windows job for why the key is per gfx target and why save: false.
     - name: ccache
-      uses: hendrikmuhs/ccache-action@v1.2.23
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
         key: rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}
         restore-keys: |

@@ -95,7 +95,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
@@ -236,7 +236,7 @@ jobs:
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}
           restore-keys: |
