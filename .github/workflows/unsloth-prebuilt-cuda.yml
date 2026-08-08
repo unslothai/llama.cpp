@@ -45,7 +45,7 @@ jobs:
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           tool-cache: true
           android: true
@@ -93,7 +93,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}
           restore-keys: |
@@ -142,7 +142,7 @@ jobs:
 
       - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
         if: matrix.cuda != '13.3'
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76  # v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda }}
