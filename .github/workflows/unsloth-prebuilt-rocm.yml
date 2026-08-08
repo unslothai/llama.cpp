@@ -192,11 +192,11 @@ jobs:
         $rocmVersion = "${{ inputs.rocm_version }}"
         $currentTarget = "${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
-        $s3Target = $currentTarget
+        # Map the build target to the matching TheRock archive family
+        $archiveTarget = $currentTarget
         if ($currentTarget -eq "gfx103X" -or $currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
-          $s3Target = "$currentTarget-all"
-          Write-Host "Using target with -all suffix: $s3Target"
+          $archiveTarget = "$currentTarget-all"
+          Write-Host "Using target with -all suffix: $archiveTarget"
         }
 
         # TheRock publishes nightlies to the multi-arch tarball index. The
@@ -213,7 +213,7 @@ jobs:
 
           # Pick the newest build date and exclude sibling test archives.
           $allFiles = $filesMatch.Groups[1].Value | ConvertFrom-Json
-          $prefix = "therock-dist-windows-$s3Target-"
+          $prefix = "therock-dist-windows-$archiveTarget-"
           $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
           $latest = $allFiles |
             Where-Object { $_.name -match $versionPattern } |
@@ -227,18 +227,18 @@ jobs:
           Write-Host "Found latest file: $latestFile"
 
           # Extract version from the filename for environment variable
-          if ($latestFile -match "therock-dist-windows-$s3Target-(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+          if ($latestFile -match "therock-dist-windows-$archiveTarget-(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
             $rocmVersion = $matches[1]
             Write-Host "Detected latest ROCm version: $rocmVersion"
           } else {
             Write-Error "Failed to extract ROCm version from latest file: $latestFile"
-            Write-Error "Expected pattern: therock-dist-windows-$s3Target-<version>.tar.gz"
+            Write-Error "Expected pattern: therock-dist-windows-$archiveTarget-<version>.tar.gz"
             exit 1
           }
 
           $rocmUrl = "$baseUrl/$latestFile"
         } else {
-          $rocmUrl = "$baseUrl/therock-dist-windows-$s3Target-$rocmVersion.tar.gz"
+          $rocmUrl = "$baseUrl/therock-dist-windows-$archiveTarget-$rocmVersion.tar.gz"
         }
 
         # Store the version for use in other steps
@@ -540,11 +540,11 @@ jobs:
         rocm_version="${{ inputs.rocm_version }}"
         current_target="${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
-        s3_target="$current_target"
+        # Map the build target to the matching TheRock archive family
+        archive_target="$current_target"
         if [[ "$current_target" = "gfx103X" || "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
-          s3_target="${current_target}-all"
-          echo "Using target with -all suffix: $s3_target"
+          archive_target="${current_target}-all"
+          echo "Using target with -all suffix: $archive_target"
         fi
 
         # TheRock publishes nightlies to the multi-arch tarball index. The
@@ -552,7 +552,7 @@ jobs:
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
         if [ "$rocm_version" = "latest" ]; then
           echo "Auto-detecting latest ROCm version for target: $current_target"
-          prefix="therock-dist-linux-${s3_target}-"
+          prefix="therock-dist-linux-${archive_target}-"
           files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
           if [ -z "$files_json" ]; then
             echo "Failed to parse file index from $base_url/"
@@ -569,18 +569,18 @@ jobs:
           echo "Found latest file: $latest_file"
 
           # Extract version from the filename for environment variable
-          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+          if [[ "$latest_file" =~ therock-dist-linux-${archive_target}-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
             rocm_version="${BASH_REMATCH[1]}"
             echo "Detected latest ROCm version: $rocm_version"
           else
             echo "Failed to extract ROCm version from latest file: $latest_file"
-            echo "Expected pattern: therock-dist-linux-${s3_target}-<version>.tar.gz"
+            echo "Expected pattern: therock-dist-linux-${archive_target}-<version>.tar.gz"
             exit 1
           fi
 
           rocm_url="$base_url/$latest_file"
         else
-          rocm_url="$base_url/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+          rocm_url="$base_url/therock-dist-linux-${archive_target}-${rocm_version}.tar.gz"
         fi
 
         # Store the version for use in other steps
