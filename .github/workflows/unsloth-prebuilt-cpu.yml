@@ -48,12 +48,13 @@ jobs:
   build-linux:
     name: linux/${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   runner: ubuntu-22.04 }
-          - { arch: arm64, runner: ubuntu-22.04-arm }
+          - { arch: x64,   runner: ubuntu-24.04,     container: 'ubuntu:22.04' }
+          - { arch: arm64, runner: ubuntu-24.04-arm, container: 'ubuntu:22.04' }
     steps:
       # The parent's resolve job built the source tree (upstream base + any mix
       # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -71,11 +72,17 @@ jobs:
           mkdir -p src
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
+      # The container runs as root and the base image ships no sudo, so the
+      # privilege prefix is dropped. ca-certificates, wget, gnupg and lsb-release
+      # are present on the host runner image but not in ubuntu:22.04, and
+      # llvm.sh below needs all four.
       - name: Install build dependencies
         run: |
           set -eux
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev ninja-build
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential libssl-dev ninja-build cmake \
+            ca-certificates wget gnupg lsb-release xz-utils
 
       # arm64 builds on ubuntu-22.04-arm so the bundle keeps the x64 leg's
       # loader floor (a 24.04 build needs GLIBC_2.38 and fails to load on
@@ -88,7 +95,7 @@ jobs:
           set -eux
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 19
+          ./llvm.sh 19
           {
             echo "CC=clang-19"
             echo "CXX=clang++-19"
@@ -159,6 +166,32 @@ jobs:
             echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
           fi
           exit 0
+
+      # The whole point of the container is this number, so assert it rather
+      # than trusting that the image did its job. objdump reports the highest
+      # GLIBC_x.y any binary asks the loader for; on a 22.04 userspace that is
+      # 2.35, and a 24.04 build would show 2.38 or higher and fail here.
+      #
+      # This is the check the runner label was silently standing in for. It was
+      # never asserted while the floor came from the runner image, which is why
+      # nothing would have caught the label drifting.
+      - name: Assert the glibc floor
+        run: |
+          set -euo pipefail
+          MAX=0.0
+          for b in src/build/bin/*; do
+            [ -f "$b" ] && [ -x "$b" ] || continue
+            v="$(objdump -T "$b" 2>/dev/null \
+                 | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                 | sort -V | tail -1)" || true
+            [ -n "$v" ] || continue
+            if [ "$(printf '%s\n%s\n' "$MAX" "$v" | sort -V | tail -1)" = "$v" ]; then MAX="$v"; fi
+          done
+          echo "highest GLIBC requirement across bin/: ${MAX}"
+          if [ "$(printf '2.35\n%s\n' "$MAX" | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::binaries require GLIBC_${MAX}, above the 2.35 floor: they will not load on Ubuntu 22.04 or Debian 12"
+            exit 1
+          fi
 
       - name: Package bundle (tar.gz)
         run: |
