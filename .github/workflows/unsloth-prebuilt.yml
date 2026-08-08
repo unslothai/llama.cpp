@@ -1050,6 +1050,75 @@ jobs:
             echo "| delete failures | $failed |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ── Keep the ccache budget inside the repo limit ──
+      #
+      # ccache entries are immutable, so every run writes a NEW cache per
+      # (cuda, os, profile) and finds the previous one by restore-keys prefix.
+      # restore-keys returns only the MOST RECENT match, so older generations can
+      # never be selected again -- they are pure landfill. Measured 2026-08-08:
+      # 122 caches / 31.72 GiB, of which only 40 / 9.13 GiB were reachable.
+      #
+      # That matters for build time, not tidiness. The repo cache limit is 50 GB
+      # and there are ~40 prefixes; once the total hits the limit GitHub evicts by
+      # its own LRU, which can take a LIVE cache. A partial cache is far worse
+      # than none: measured locally over 513 real translation units, capping a
+      # cache to 30% of what the build needs drops the hit rate to 14.2% and
+      # flips hits from direct to preprocessed -- the exact 3-direct /
+      # 52-preprocessed signature seen in CI when the cap was 500 MB, which cost
+      # a 204-minute build instead of 54.
+      #
+      # Keeping 2 rather than 1: the second generation is the fallback when a job
+      # dies before saving, which is precisely the hole that forces a cold build.
+      - name: Prune superseded ccache generations
+        # Never fail a published release over cache housekeeping.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: 2
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          all="$RUNNER_TEMP/caches.tsv"
+          gh api --paginate "repos/$repo/actions/caches?per_page=100" \
+            -q '.actions_caches[] | "\(.id)\t\(.created_at)\t\(.size_in_bytes)\t\(.key)"' > "$all" || true
+          total=$(awk -F'\t' '{s+=$3} END {printf "%d", s+0}' "$all")
+          echo "$(grep -c . "$all" || true) caches, $(( total / 1073741824 )) GiB"
+
+          # Group by the restore-keys prefix: the key minus its -<tag>- suffix.
+          # Newest first, so anything past $KEEP is unreachable by restore-keys.
+          freed=0; deleted=0
+          while IFS=$'\t' read -r id created size key; do
+            [ -z "${id:-}" ] && continue
+            pre="$(printf '%s' "$key" | sed -E 's/-b[0-9]+-mix-[0-9a-f]+-?$//')"
+            printf '%s\t%s\t%s\t%s\n' "$pre" "$created" "$id" "$size"
+          done < "$all" | sort -t"$(printf '\t')" -k1,1 -k2,2r > "$RUNNER_TEMP/grouped.tsv"
+
+          prev=""; n=0
+          while IFS=$'\t' read -r pre created id size; do
+            [ -z "${pre:-}" ] && continue
+            if [ "$pre" != "$prev" ]; then prev="$pre"; n=1; else n=$(( n + 1 )); fi
+            [ "$n" -le "$KEEP" ] && continue
+            if gh api -X DELETE "repos/$repo/actions/caches/$id" --silent < /dev/null 2>/dev/null; then
+              freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+            fi
+          done < "$RUNNER_TEMP/grouped.tsv"
+
+          after=$(( total - freed ))
+          echo "pruned $deleted superseded caches, freed $(( freed / 1073741824 )) GiB"
+          {
+            echo "### ccache budget"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| kept per prefix | $KEEP |"
+            echo "| caches pruned | $deleted |"
+            echo "| freed | $(( freed / 1073741824 )) GiB |"
+            echo "| cache total after | $(( after / 1073741824 )) GiB of 50 GB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$after" -gt 42949672960 ]; then
+            echo "::warning::ccache total is $(( after / 1073741824 )) GiB of the 50 GB repo limit; at the limit GitHub evicts by LRU and a partially evicted cache collapses the hit rate. Lower KEEP to 1, or raise the limit."
+          fi
+
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.
   # Runs on publish-intent runs only, so subset test dispatches stay quiet.
