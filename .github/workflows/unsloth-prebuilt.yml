@@ -758,17 +758,6 @@ jobs:
             --publish-repo "$GITHUB_REPOSITORY"
           ls -la dist
 
-      - name: Upload full release set (artifacts)
-        uses: actions/upload-artifact@v6
-        with:
-          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
-          path: dist/*
-          if-no-files-found: error
-          # Short retention: the published GitHub release is the canonical
-          # storage; this artifact is just debug fallback for failed-publish
-          # runs. Default 90 days × ~8 GB/run is real storage cost.
-          retention-days: 7
-
       - name: Verify full bundle coverage before publish
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
@@ -863,6 +852,31 @@ jobs:
       # ship no libggml*, so a new ggml means whisper has to republish. Without
       # this it only finds out on its own cron, and Studio reports "no
       # compatible prebuilt" until then.
+      # Debug fallback for a failed publish. This used to upload on EVERY run,
+      # ahead of the publish gate, which cost ~688 MiB of Actions artifact
+      # storage per run for a bundle nothing reads: no download-artifact in this
+      # repo references it, an org-wide code search for `actions/artifacts`
+      # returns nothing, and Studio's installer resolves release ASSETS
+      # (install_llama_prebuilt.py -> release_asset_download_url). Uploading
+      # ahead of the gate also published unverified builds -- on a public repo
+      # any signed-in user can download an artifact -- for runs that
+      # deliberately never released.
+      #
+      # Kept but moved after publish and gated on failure(), so it still rescues
+      # a failed-publish run without re-running the 40-job matrix, and costs
+      # nothing when the run is green.
+      - name: Upload full release set (artifacts)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          # warn, not error: an early failure can leave dist/ absent, and a
+          # missing debug bundle must not turn a diagnosable failure into a
+          # confusing second one.
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Notify whisper.cpp
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         # Never fail a published release because the notification did not land.
