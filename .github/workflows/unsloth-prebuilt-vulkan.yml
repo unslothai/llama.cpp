@@ -42,8 +42,8 @@ permissions:
   contents: read
 
 env:
-  # LunarG SDK version, matching llama-cpp-binaries' build-wheels-vulkan.yml.
-  VULKAN_VERSION: 1.4.313.2
+  # LunarG SDK version used by ggml-org's Windows release build.
+  VULKAN_VERSION: 1.4.357.0
 
 jobs:
   build-linux:
@@ -94,6 +94,7 @@ jobs:
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 19
+          sudo apt-get install -y libomp-19-dev
           {
             echo "CC=clang-19"
             echo "CXX=clang++-19"
@@ -181,6 +182,10 @@ jobs:
           # dependencies, so every tool pulls them in.
           cmake --build build --config Release -j "$(nproc)"
           strip build/bin/llama-* || true
+
+      - name: Bundle OpenMP runtime (arm64)
+        if: matrix.arch == 'arm64'
+        run: cp /usr/lib/llvm-19/lib/libomp.so.5 src/build/bin/
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the CUDA child for the

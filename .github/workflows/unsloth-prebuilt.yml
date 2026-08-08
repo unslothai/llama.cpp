@@ -391,12 +391,10 @@ jobs:
 
           # macOS slices are static: two fixed runners with per-slice deployment
           # targets. arm64 builds on macos-26 (newest Metal SDK; avoids the
-          # M5/A19 "error compiling source" the macos-14 SDK emits) yet pins
-          # minos 14.0 via deploy_target, so it still loads on macOS 14+. x64
-          # pins 13.3 (matches upstream's Intel leg, covers 2017 Intel Macs
-          # capped at Ventura).
+          # M5/A19 "error compiling source" the macos-14 SDK emits) while both
+          # slices pin 13.3 to match upstream's Ventura compatibility floor.
           MACOS_INCLUDE='[
-            {"build":"arm64","runner":"macos-26",      "expect_arch":"arm64", "deploy_target":"14.0","defines":"-DGGML_METAL_EMBED_LIBRARY=ON"},
+            {"build":"arm64","runner":"macos-26",      "expect_arch":"arm64", "deploy_target":"13.3","defines":"-DGGML_METAL_EMBED_LIBRARY=ON"},
             {"build":"x64",  "runner":"macos-15-intel","expect_arch":"x86_64","deploy_target":"13.3","defines":"-DGGML_METAL=OFF"}
           ]'
           MACOS_INCLUDE="$(echo "$MACOS_INCLUDE" | jq -c .)"
