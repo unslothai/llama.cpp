@@ -862,7 +862,13 @@ jobs:
       # a failed-publish run without re-running the 40-job matrix, and costs
       # nothing when the run is green.
       - name: Upload full release set (artifacts)
-        if: ${{ failure() }}
+        # always() && !success(), not failure(): a cancelled assemble -- its own
+        # timeout, or a superseding nightly -- is not on the failure path, so
+        # failure() would skip the rescue bundle on exactly the runs a human
+        # most wants it for. Nothing else in this job competes for the teardown
+        # window, so attempting the upload there is free; if dist/ was never
+        # populated, if-no-files-found: warn keeps that quiet.
+        if: ${{ always() && !success() }}
         uses: actions/upload-artifact@v6
         with:
           name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}

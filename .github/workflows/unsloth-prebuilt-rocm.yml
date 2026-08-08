@@ -466,7 +466,12 @@ jobs:
       run: ccache --show-stats -v
 
     - name: Evict stale ccache files
-      if: ${{ always() }}
+      # !cancelled(), unlike the save below: on a timeout the job gets a
+      # single ~5 minute teardown window (measured ~4m50s after process
+      # kill), shared by every remaining step and not replenished. Evicting
+      # spends that window on housekeeping; the save is what actually needs
+      # it, and a 2 GB cache is not quick to write.
+      if: ${{ !cancelled() }}
       continue-on-error: true
       run: ccache --evict-older-than 14d
 
@@ -855,7 +860,12 @@ jobs:
       run: ccache --show-stats -v
 
     - name: Evict stale ccache files
-      if: ${{ always() }}
+      # !cancelled(), unlike the save below: on a timeout the job gets a
+      # single ~5 minute teardown window (measured ~4m50s after process
+      # kill), shared by every remaining step and not replenished. Evicting
+      # spends that window on housekeeping; the save is what actually needs
+      # it, and a 2 GB cache is not quick to write.
+      if: ${{ !cancelled() }}
       continue-on-error: true
       run: ccache --evict-older-than 14d
 
