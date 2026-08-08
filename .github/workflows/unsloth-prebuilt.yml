@@ -758,17 +758,6 @@ jobs:
             --publish-repo "$GITHUB_REPOSITORY"
           ls -la dist
 
-      - name: Upload full release set (artifacts)
-        uses: actions/upload-artifact@v6
-        with:
-          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
-          path: dist/*
-          if-no-files-found: error
-          # Short retention: the published GitHub release is the canonical
-          # storage; this artifact is just debug fallback for failed-publish
-          # runs. Default 90 days × ~8 GB/run is real storage cost.
-          retention-days: 7
-
       - name: Verify full bundle coverage before publish
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
@@ -858,6 +847,40 @@ jobs:
             --notes "$NOTES" \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
+
+      # Debug fallback for a failed publish. This used to upload on EVERY run,
+      # ahead of the publish gate, which cost ~688 MiB of Actions artifact
+      # storage per run for a bundle nothing reads: no download-artifact in this
+      # repo references it, an org-wide code search for `actions/artifacts`
+      # returns nothing, and Studio's installer resolves release ASSETS
+      # (install_llama_prebuilt.py -> release_asset_download_url). Uploading
+      # ahead of the gate also published unverified builds -- on a public repo
+      # any signed-in user can download an artifact -- for runs that
+      # deliberately never released.
+      #
+      # Kept but moved after publish and gated on failure(), so it still rescues
+      # a failed-publish run without re-running the 40-job matrix, and costs
+      # nothing when the run is green.
+      - name: Upload full release set (artifacts)
+        # always() && !success(), not failure(): a cancelled assemble -- its own
+        # timeout, or a superseding nightly -- is not on the failure path, so
+        # failure() would skip the rescue bundle on exactly the runs a human
+        # most wants it for. Nothing else in this job competes for the teardown
+        # window, so attempting the upload there is free; if dist/ was never
+        # populated, if-no-files-found: warn keeps that quiet.
+        if: ${{ always() && !success() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          # warn, not error: an early failure can leave dist/ absent, and a
+          # missing debug bundle must not turn a diagnosable failure into a
+          # confusing second one.
+          if-no-files-found: warn
+          # rerun-failed-jobs reuses the run id, and artifacts persist across
+          # attempts, so a second failed attempt would 409 on the duplicate name.
+          overwrite: true
+          retention-days: 7
 
       # whisper.cpp slim bundles are compiled against this release's ggml and
       # ship no libggml*, so a new ggml means whisper has to republish. Without

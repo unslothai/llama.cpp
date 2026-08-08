@@ -256,10 +256,26 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
+        # !cancelled(), unlike the save below: on a timeout the job gets a
+        # single ~5 minute teardown window (measured ~4m50s after process
+        # kill), shared by every remaining step and not replenished. Evicting
+        # spends that window on housekeeping; the save is what actually needs
+        # it, and a 2 GB cache is not quick to write.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: ccache --evict-older-than 14d
 
       - name: Save ccache
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.ccache
