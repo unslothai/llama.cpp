@@ -848,10 +848,6 @@ jobs:
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
 
-      # whisper.cpp slim bundles are compiled against this release's ggml and
-      # ship no libggml*, so a new ggml means whisper has to republish. Without
-      # this it only finds out on its own cron, and Studio reports "no
-      # compatible prebuilt" until then.
       # Debug fallback for a failed publish. This used to upload on EVERY run,
       # ahead of the publish gate, which cost ~688 MiB of Actions artifact
       # storage per run for a bundle nothing reads: no download-artifact in this
@@ -875,8 +871,15 @@ jobs:
           # missing debug bundle must not turn a diagnosable failure into a
           # confusing second one.
           if-no-files-found: warn
+          # rerun-failed-jobs reuses the run id, and artifacts persist across
+          # attempts, so a second failed attempt would 409 on the duplicate name.
+          overwrite: true
           retention-days: 7
 
+      # whisper.cpp slim bundles are compiled against this release's ggml and
+      # ship no libggml*, so a new ggml means whisper has to republish. Without
+      # this it only finds out on its own cron, and Studio reports "no
+      # compatible prebuilt" until then.
       - name: Notify whisper.cpp
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         # Never fail a published release because the notification did not land.

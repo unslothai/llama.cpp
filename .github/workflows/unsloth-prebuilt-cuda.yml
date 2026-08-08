@@ -256,6 +256,7 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
+        if: ${{ always() }}
         continue-on-error: true
         run: ccache --evict-older-than 14d
 
@@ -264,7 +265,12 @@ jobs:
         # failure are still worth keeping, and a job that saves nothing leaves
         # a hole in the cache lineage that widens the next run's tag gap.
         # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
-        if: ${{ !cancelled() }}
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.ccache

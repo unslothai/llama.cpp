@@ -45,12 +45,25 @@ jobs:
   build:
     name: x64/${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
-    # Must stay UNDER assemble's `timeout-minutes: 350` in unsloth-prebuilt.yml.
-    # Without this the job inherits GitHub's 360-minute default and outlives the
-    # assemble job that is waiting on it, so a long leg kills the publish ~11
-    # minutes before the build would have finished and the whole 40-job run is
-    # discarded. x64/cuda12-portable has already been observed at 214 minutes.
-    timeout-minutes: 300
+    # Hang guard only. Without it the job inherits GitHub's 360-minute default,
+    # which is above both assemble's `timeout-minutes: 350` and, more to the
+    # point, the "Wait for the build matrix" step's own 330-minute deadline in
+    # unsloth-prebuilt.yml -- so a wedged leg burns a runner for an hour after
+    # the publish it was feeding has already given up.
+    #
+    # 345, not something tighter: x64/cuda12-portable legitimately reaches the
+    # low 300s on a cold ccache. Run 27347317849 took 305.1 minutes and
+    # SUCCEEDED (286.9 of it genuine compile). Across 62 historical runs of this
+    # leg the max is 305.1 and nothing falls between 215 and 305, so a tighter
+    # cap buys no hang detection and would have destroyed that publish -- one
+    # killed leg fails the bundle-coverage gate and the whole night ships
+    # nothing.
+    #
+    # Note this cannot by itself rescue a slow run: the waiter's 330-minute
+    # deadline is wall-clock from assemble start and INCLUDES the child's queue
+    # wait, while timeout-minutes starts at job start and excludes it. Raising
+    # the waiter deadline is the separate change that would actually save runs.
+    timeout-minutes: 345
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}
@@ -271,6 +284,7 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
+        if: ${{ always() }}
         continue-on-error: true
         run: ccache --evict-older-than 14d
 
@@ -279,7 +293,12 @@ jobs:
         # failure are still worth keeping, and a job that saves nothing leaves
         # a hole in the cache lineage that widens the next run's tag gap.
         # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
-        if: ${{ !cancelled() }}
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}\.ccache
