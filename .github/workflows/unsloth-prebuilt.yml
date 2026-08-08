@@ -558,6 +558,10 @@ jobs:
     # publishes nothing. The installer needs the full bundle set or it'll fail.
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
+    # Consumed by the reclaim job below: 'true' only when THIS run's publish
+    # step actually ran and succeeded.
+    outputs:
+      published: ${{ steps.publish.outcome == 'success' }}
     # The waiter holds this job open for the whole build. GitHub's 6h job cap
     # would kill it with no useful message; stop short of that deliberately,
     # leaving room for the download/verify/publish steps that follow.
@@ -805,6 +809,7 @@ jobs:
           [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
 
       - name: Publish GitHub release
+        id: publish
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         # prs carries PR titles (arbitrary text), so pass it through env
         # rather than inlining it: a title with a quote would otherwise break out
@@ -915,6 +920,135 @@ jobs:
           else
             echo "::warning::whisper.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
           fi
+
+  # Reclaim this run's Actions artifact storage once the release is canonical.
+  #
+  # Every prebuilt is stored TWICE: as an Actions artifact (billed against the
+  # Actions storage quota) and as a release asset (not billed against it).
+  # Measured on run 31218133438: 36 of its 40 artifacts, 7.67 GiB, are byte-for
+  # -byte already on the release. On 2026-08-07 that duplication reached ~492
+  # GiB org-wide, 449 GiB of it here, and GitHub stopped scheduling Actions runs
+  # across unslothai/* while personal-account repos ran the same workflows
+  # normally. Deleting artifacts restored scheduling within ~45 seconds.
+  #
+  # Its OWN job rather than a step of assemble, for two reasons:
+  #
+  #  * Cancellation. As a trailing step, a cancel landing inside its ~13 second
+  #    window left assemble `cancelled` with a partial app-* set, and
+  #    unsloth-prebuilt-retry.yml reruns a cancelled run that has no failed job
+  #    -- rerunning assemble itself, which then restarts at "Download built
+  #    bundles", dies at the coverage gate, and reports "Nothing was published"
+  #    for a release that HAD published. As a separate job, assemble has already
+  #    succeeded, so a rerun re-runs only this job, and re-running it is a no-op:
+  #    deleted artifacts are simply absent from the second listing.
+  #  * Least privilege. `actions: write` also grants Actions CACHE deletion, so
+  #    holding it across assemble's unzip/tar/python steps would put every
+  #    ccache this pipeline depends on within reach of that job. Here it is
+  #    confined to a job whose only action is deleting artifacts.
+  #
+  # Skipped, not failed, when there is nothing to reclaim: `needs.assemble
+  # .outputs.published` is 'true' only when THIS run's publish step ran and
+  # succeeded, so a dispatch that skips publishing (publish:false, or the tag
+  # already released) never reaches the delete -- its artifacts would otherwise
+  # be name-matched against a DIFFERENT build's release assets, since artifact
+  # names are keyed only on the tag.
+  #
+  # Residual, accepted: `published` proves THIS run's publish step succeeded, not
+  # that the release object is this run's. A scheduled run and a same-tag
+  # dispatch sit in different concurrency groups, so a dispatch can delete the
+  # scheduled run's draft and create its own; the scheduled run's
+  # `gh release edit --draft=false` then succeeds against the dispatch's release.
+  # The payloads are equivalent -- the resolve guard pins every publish run to
+  # the full default matrix, and the tag encodes base plus pr-set hash -- so the
+  # assets match whichever run wrote them.
+  reclaim:
+    name: Reclaim artifact storage
+    needs: [resolve, assemble]
+    if: ${{ needs.assemble.outputs.published == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: write   # delete this run's artifacts
+      contents: read   # read the release asset list
+    steps:
+      - name: Delete artifacts already published as release assets
+        # Never fail a published release over cleanup.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+
+          if [ -z "${TAG:-}" ]; then
+            echo "no tag resolved; leaving artifacts untouched"
+            exit 0
+          fi
+
+          # Gate 1: the release must exist and be published, not a draft.
+          draft="$(gh release view "$TAG" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          if [ "$draft" != "false" ]; then
+            echo "release $TAG is '$draft', not a published release; leaving artifacts untouched"
+            exit 0
+          fi
+          assets="$RUNNER_TEMP/reclaim-assets.txt"
+          arts="$RUNNER_TEMP/reclaim-arts.tsv"
+          gh release view "$TAG" --repo "$repo" --json assets -q '.assets[].name' | sort > "$assets"
+          echo "release $TAG has $(wc -l < "$assets") assets"
+
+          # Gate 2: only THIS run's artifacts are even considered, so the step
+          # cannot reach another run's -- including a concurrent build's.
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
+          echo "this run has $(grep -c . "$arts" || true) live artifacts"
+
+          freed=0; deleted=0; kept=0; failed=0
+          while IFS="$(printf '\t')" read -r id size name; do
+            [ -z "${id:-}" ] && continue
+            # Gate 3: delete only what is provably already on the release.
+            # Build children upload `app-<tag>-<platform>`; assemble publishes
+            # it as `.tar.gz` (linux/macos) or `.zip` (windows). Anything that
+            # does not match is KEPT -- that is what protects a partial publish.
+            # By design this also keeps the macOS bundles (published under
+            # `llama-<tag>-bin-macos-*`) and the source tarball: 56 MiB of the
+            # 7.42 GiB, a cheap price for never deleting something early.
+            # -F: fixed string. Without it every `.` in the name is a regex
+            # wildcard, and gfx_target / only_profile are free-text
+            # workflow_dispatch inputs that flow into artifact names.
+            if grep -qxF -- "${name}.tar.gz" "$assets" || grep -qxF -- "${name}.zip" "$assets"; then
+              # < /dev/null so the command can never consume the loop's stdin
+              # and silently truncate the sweep to one artifact.
+              if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+                freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+              else
+                # Keep the reason: a 403 from a permissions regression and a
+                # transient blip need different responses, and this step is
+                # continue-on-error so nothing else surfaces it.
+                printf '  could not delete %s: %s\n' "$name" "$err"
+                failed=$(( failed + 1 ))
+              fi
+            else
+              printf '  KEEP %s (no matching release asset)\n' "$name"
+              kept=$(( kept + 1 ))
+            fi
+          done < "$arts"
+
+          echo "deleted $deleted artifacts, freed $(( freed / 1048576 )) MiB, kept $kept, failed $failed"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed artifact(s) could not be deleted; storage will be reclaimed by retention instead"
+          fi
+          {
+            echo "### Artifact storage reclaimed"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| release | \`$TAG\` |"
+            echo "| artifacts deleted | $deleted |"
+            echo "| storage freed | $(( freed / 1048576 )) MiB |"
+            echo "| kept (no release asset) | $kept |"
+            echo "| delete failures | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.
