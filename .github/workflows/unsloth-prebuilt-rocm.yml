@@ -9,9 +9,9 @@ name: "Unsloth prebuilt: ROCm"
 # Huge thanks to the lemonade-sdk team -- this is adapted from their workflow:
 #   https://github.com/lemonade-sdk/llamacpp-rocm/blob/main/.github/workflows/build-llamacpp-rocm.yml
 #
-# Build mechanics taken verbatim from that file: TheRock S3 nightly download
-# + version auto-detect, gfx target name mapping, HIP/clang cmake invocation,
-# the full hardcoded ROCm runtime lib copy list, patchelf RPATH.
+# Build mechanics taken from that file: TheRock multi-arch nightly download +
+# version auto-detect, gfx target name mapping, HIP/clang cmake invocation, the
+# full hardcoded ROCm runtime lib copy list, patchelf RPATH.
 #
 # Local adaptations:
 #   - tag is passed in (the parent resolves it against ggml-org upstream)
@@ -49,7 +49,7 @@ on:
         default: 'windows,ubuntu'
         type: string
       rocm_version:
-        description: 'TheRock ROCm version (e.g., 7.13.0a20260318) or "latest"'
+        description: 'TheRock ROCm version (e.g., 10.1.0a20260807) or "latest"'
         required: false
         default: 'latest'
         type: string
@@ -192,58 +192,53 @@ jobs:
         $rocmVersion = "${{ inputs.rocm_version }}"
         $currentTarget = "${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
-        $s3Target = $currentTarget
-        if ($currentTarget -eq "gfx103X") {
-          $s3Target = "$currentTarget-dgpu"
-          Write-Host "Using S3 target with -dgpu suffix: $s3Target"
-        } elseif ($currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
-          $s3Target = "$currentTarget-all"
-          Write-Host "Using S3 target with -all suffix: $s3Target"
+        # Map the build target to the matching TheRock archive family
+        $archiveTarget = $currentTarget
+        if ($currentTarget -eq "gfx103X" -or $currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
+          $archiveTarget = "$currentTarget-all"
+          Write-Host "Using target with -all suffix: $archiveTarget"
         }
 
+        # TheRock publishes nightlies to the multi-arch tarball index. The
+        # static HTML page embeds a JSON `files` array with names and mtimes.
+        $baseUrl = "https://rocm.nightlies.amd.com/tarball-multi-arch"
         if ($rocmVersion -eq "latest") {
           Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
-          $s3Response = (Invoke-WebRequest "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-windows-$s3Target-7").Content
-          $files = $s3Response -split '<Key>' | Where-Object {$_ -match '</Key>'} | ForEach-Object { ($_ -split '</Key>')[0] }
-
-          # Extract versions and sort them properly using semantic versioning
-          $versionFiles = @()
-          foreach ($file in $files) {
-            if ($file -match "therock-dist-windows-$s3Target-.*?(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
-              $version = $matches[1]
-              $versionFiles += [PSCustomObject]@{
-                File = $file
-                Version = $version
-                Major = [int]($version -split '\.')[0]
-                Minor = [int]($version -split '\.')[1]
-                Patch = [int](($version -split '\.')[2] -replace '(?:a|rc).*', '')
-                RC = [int]($version -replace '.*(?:a|rc)', '')
-                IsAlpha = $version -match 'a'
-              }
-            }
+          $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
+          $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          if (-not $filesMatch.Success) {
+            Write-Error "Failed to parse file index from $baseUrl/"
+            exit 1
           }
 
-          # Sort by semantic version (major.minor.patch.rc, with alpha versions being newer than rc)
-          $latestFile = ($versionFiles | Sort-Object Major, Minor, Patch, @{Expression={if($_.IsAlpha){1}else{0}}}, RC | Select-Object -Last 1).File
-
+          # Pick the newest build date and exclude sibling test archives.
+          $allFiles = $filesMatch.Groups[1].Value | ConvertFrom-Json
+          $prefix = "therock-dist-windows-$archiveTarget-"
+          $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
+          $latest = $allFiles |
+            Where-Object { $_.name -match $versionPattern } |
+            Sort-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value } |
+            Select-Object -Last 1
+          if (-not $latest) {
+            Write-Error "No tarball found for prefix '$prefix' at $baseUrl/"
+            exit 1
+          }
+          $latestFile = $latest.name
           Write-Host "Found latest file: $latestFile"
 
           # Extract version from the filename for environment variable
-          if ($latestFile -match "therock-dist-windows-$s3Target-.*?(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+          if ($latestFile -match "therock-dist-windows-$archiveTarget-(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
             $rocmVersion = $matches[1]
             Write-Host "Detected latest ROCm version: $rocmVersion"
           } else {
             Write-Error "Failed to extract ROCm version from latest file: $latestFile"
-            Write-Error "Expected pattern: therock-dist-windows-$s3Target-*<version>.tar.gz"
+            Write-Error "Expected pattern: therock-dist-windows-$archiveTarget-<version>.tar.gz"
             exit 1
           }
 
-          # Use the exact filename from S3 instead of reconstructing
-          $rocmUrl = "https://therock-nightly-tarball.s3.amazonaws.com/$latestFile"
+          $rocmUrl = "$baseUrl/$latestFile"
         } else {
-          # For specific versions, construct the URL as before
-          $rocmUrl = "https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-windows-$s3Target-$rocmVersion.tar.gz"
+          $rocmUrl = "$baseUrl/therock-dist-windows-$archiveTarget-$rocmVersion.tar.gz"
         }
 
         # Store the version for use in other steps
@@ -383,7 +378,8 @@ jobs:
             "rocsolver.dll",
             "hipblaslt.dll",
             "libhipblaslt.dll",
-            "hipblas.dll"
+            "hipblas.dll",
+            "origami.dll"
           )
 
           foreach ($pattern in $filesToCopy) {
@@ -544,88 +540,47 @@ jobs:
         rocm_version="${{ inputs.rocm_version }}"
         current_target="${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
-        s3_target="$current_target"
-        if [ "$current_target" = "gfx103X" ]; then
-          s3_target="${current_target}-dgpu"
-          echo "Using S3 target with -dgpu suffix: $s3_target"
-        elif [[ "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
-          s3_target="${current_target}-all"
-          echo "Using S3 target with -all suffix: $s3_target"
+        # Map the build target to the matching TheRock archive family
+        archive_target="$current_target"
+        if [[ "$current_target" = "gfx103X" || "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
+          archive_target="${current_target}-all"
+          echo "Using target with -all suffix: $archive_target"
         fi
 
+        # TheRock publishes nightlies to the multi-arch tarball index. The
+        # static HTML page embeds a JSON `files` array with names and mtimes.
+        base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
         if [ "$rocm_version" = "latest" ]; then
           echo "Auto-detecting latest ROCm version for target: $current_target"
-          s3_response=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
+          prefix="therock-dist-linux-${archive_target}-"
+          files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+          if [ -z "$files_json" ]; then
+            echo "Failed to parse file index from $base_url/"
+            exit 1
+          fi
 
-          # Extract all files and parse versions properly
-          files=$(echo "$s3_response" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-")
-
-          # Extract versions and sort them properly using semantic versioning
-          latest_file=""
-          latest_major=0
-          latest_minor=0
-          latest_patch=0
-          latest_rc=0
-          latest_is_alpha=false
-
-          while IFS= read -r file; do
-            if [[ "$file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
-              version="${BASH_REMATCH[1]}"
-              major=$(echo "$version" | cut -d. -f1)
-              minor=$(echo "$version" | cut -d. -f2)
-              patch=$(echo "$version" | cut -d. -f3 | sed 's/\(a\|rc\).*//')
-              rc=$(echo "$version" | sed 's/.*\(a\|rc\)//')
-              is_alpha=false
-              if [[ "$version" =~ a ]]; then
-                is_alpha=true
-              fi
-
-              # Compare versions (alpha versions are newer than rc versions)
-              is_newer=false
-              if [ "$major" -gt "$latest_major" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -gt "$latest_minor" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -gt "$latest_patch" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -eq "$latest_patch" ]; then
-                # Same major.minor.patch, compare alpha vs rc
-                if [ "$is_alpha" = true ] && [ "$latest_is_alpha" = false ]; then
-                  is_newer=true
-                elif [ "$is_alpha" = "$latest_is_alpha" ] && [ "$rc" -gt "$latest_rc" ]; then
-                  is_newer=true
-                fi
-              fi
-
-              if [ "$is_newer" = true ]; then
-                latest_file="$file"
-                latest_major="$major"
-                latest_minor="$minor"
-                latest_patch="$patch"
-                latest_rc="$rc"
-                latest_is_alpha="$is_alpha"
-              fi
-            fi
-          done <<< "$files"
-
+          # Pick the newest build date and exclude sibling test archives.
+          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
+            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+          if [ -z "$latest_file" ]; then
+            echo "No tarball found for prefix '$prefix' at $base_url/"
+            exit 1
+          fi
           echo "Found latest file: $latest_file"
 
           # Extract version from the filename for environment variable
-          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+          if [[ "$latest_file" =~ therock-dist-linux-${archive_target}-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
             rocm_version="${BASH_REMATCH[1]}"
             echo "Detected latest ROCm version: $rocm_version"
           else
             echo "Failed to extract ROCm version from latest file: $latest_file"
-            echo "Expected pattern: therock-dist-linux-${s3_target}-*<version>.tar.gz"
+            echo "Expected pattern: therock-dist-linux-${archive_target}-<version>.tar.gz"
             exit 1
           fi
 
-          # Use the exact filename from S3 instead of reconstructing
-          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
+          rocm_url="$base_url/$latest_file"
         else
-          # For specific versions, construct the URL as before
-          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+          rocm_url="$base_url/therock-dist-linux-${archive_target}-${rocm_version}.tar.gz"
         fi
 
         # Store the version for use in other steps
@@ -802,6 +757,7 @@ jobs:
         cp -v /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
         cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
+        cp -v /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
         cp -v /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
