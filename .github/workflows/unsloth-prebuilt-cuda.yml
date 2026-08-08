@@ -96,8 +96,16 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}
+          # The second, broader key is a fallback: when this profile has no
+          # cache of its own (first build of a new profile, or its last save was
+          # lost) it warms from a sibling profile of the same CUDA line and OS
+          # instead of starting cold. Only the CUDA arch list differs between
+          # profiles, and that affects .cu compilation only, so every plain C++
+          # translation unit -- the large majority -- has a byte-identical
+          # command line and hits.
           restore-keys: |
             cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
+            cuda-${{ matrix.cuda }}-${{ matrix.arch }}-
           append-timestamp: false
           variant: ccache
           max-size: 2G
