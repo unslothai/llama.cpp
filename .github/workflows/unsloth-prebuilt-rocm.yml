@@ -49,9 +49,9 @@ on:
         default: 'windows,ubuntu'
         type: string
       rocm_version:
-        description: 'TheRock ROCm version (e.g., 10.1.0a20260807) or "latest"'
+        description: 'TheRock ROCm version (e.g., 10.1.0a20260807), "weekly" or "latest"'
         required: false
-        default: 'latest'
+        default: 'weekly'
         type: string
 
 permissions:
@@ -202,8 +202,21 @@ jobs:
         # TheRock publishes nightlies to the multi-arch tarball index. The
         # static HTML page embeds a JSON `files` array with names and mtimes.
         $baseUrl = "https://rocm.nightlies.amd.com/tarball-multi-arch"
-        if ($rocmVersion -eq "latest") {
-          Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+        if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
+          # weekly: see the Linux job. Cutoff is the most recent Sunday in SF
+          # time, so the whole week resolves to one build and the ccache hits.
+          $cutoff = "99999999"
+          if ($rocmVersion -eq "weekly") {
+            # Windows uses its own zone ids; fall back to the IANA name so this
+            # keeps working if the step ever moves off a Windows runner.
+            try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
+            catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
+            $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+            $cutoff = $sf.Date.AddDays(-[int]$sf.DayOfWeek).ToString("yyyyMMdd")
+            Write-Host "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
+          } else {
+            Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+          }
           $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
           $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
           if (-not $filesMatch.Success) {
@@ -217,10 +230,11 @@ jobs:
           $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
           $latest = $allFiles |
             Where-Object { $_.name -match $versionPattern } |
+            Where-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value -le $cutoff } |
             Sort-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value } |
             Select-Object -Last 1
           if (-not $latest) {
-            Write-Error "No tarball found for prefix '$prefix' at $baseUrl/"
+            Write-Error "No tarball found for prefix '$prefix' at or before $cutoff at $baseUrl/"
             exit 1
           }
           $latestFile = $latest.name
@@ -555,8 +569,19 @@ jobs:
         # TheRock publishes nightlies to the multi-arch tarball index. The
         # static HTML page embeds a JSON `files` array with names and mtimes.
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
-        if [ "$rocm_version" = "latest" ]; then
-          echo "Auto-detecting latest ROCm version for target: $current_target"
+        if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
+          # weekly: hold one alpha for the whole week instead of taking a new
+          # toolchain every night. The cutoff is the most recent Sunday in SF
+          # time, so every run Sun-Sat resolves the same build and the ccache
+          # (keyed on this version) hits all week. TheRock never backfills a
+          # skipped day, so a later publish cannot change an earlier pick.
+          cutoff=99999999
+          if [ "$rocm_version" = "weekly" ]; then
+            cutoff="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
+            echo "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
+          else
+            echo "Auto-detecting latest ROCm version for target: $current_target"
+          fi
           prefix="therock-dist-linux-${archive_target}-"
           files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
           if [ -z "$files_json" ]; then
@@ -565,10 +590,10 @@ jobs:
           fi
 
           # Pick the newest build date and exclude sibling test archives.
-          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
-            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" --arg c "$cutoff" \
+            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$")) | select((.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) <= $c)] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
           if [ -z "$latest_file" ]; then
-            echo "No tarball found for prefix '$prefix' at $base_url/"
+            echo "No tarball found for prefix '$prefix' at or before $cutoff at $base_url/"
             exit 1
           fi
           echo "Found latest file: $latest_file"
