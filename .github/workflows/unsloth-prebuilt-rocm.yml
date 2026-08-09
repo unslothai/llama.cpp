@@ -49,9 +49,14 @@ on:
         default: 'windows,ubuntu'
         type: string
       rocm_version:
-        description: 'TheRock ROCm version (e.g., 10.1.0a20260807) or "latest"'
+        description: 'TheRock ROCm version (e.g., 10.1.0a20260807), "weekly" or "latest"'
         required: false
-        default: 'latest'
+        default: 'weekly'
+        type: string
+      rocm_cutoff:
+        description: 'For "weekly": YYYYMMDD cutoff resolved once by the parent. Blank means each leg computes its own.'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -202,8 +207,22 @@ jobs:
         # TheRock publishes nightlies to the multi-arch tarball index. The
         # static HTML page embeds a JSON `files` array with names and mtimes.
         $baseUrl = "https://rocm.nightlies.amd.com/tarball-multi-arch"
-        if ($rocmVersion -eq "latest") {
-          Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+        if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
+          # weekly: see the Linux job.
+          $cutoff = "99999999"
+          if ($rocmVersion -eq "weekly") {
+            $cutoff = "${{ inputs.rocm_cutoff }}"
+            if (-not $cutoff) {
+              # Windows uses its own zone ids; the IANA name is the fallback.
+              try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
+              catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
+              $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+              $cutoff = $sf.Date.AddDays(-([int]$sf.DayOfWeek + 1)).ToString("yyyyMMdd")
+            }
+            Write-Host "Weekly pin: newest build dated on or before $cutoff (week of the last SF Sunday)"
+          } else {
+            Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
+          }
           $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
           $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
           if (-not $filesMatch.Success) {
@@ -217,10 +236,11 @@ jobs:
           $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
           $latest = $allFiles |
             Where-Object { $_.name -match $versionPattern } |
+            Where-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value -le $cutoff } |
             Sort-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value } |
             Select-Object -Last 1
           if (-not $latest) {
-            Write-Error "No tarball found for prefix '$prefix' at $baseUrl/"
+            Write-Error "No tarball found for prefix '$prefix' at or before $cutoff at $baseUrl/"
             exit 1
           }
           $latestFile = $latest.name
@@ -260,12 +280,14 @@ jobs:
     # save: false -- the explicit actions/cache/save step at the end of the job
     # runs after packaging, so a failed package step does not persist a cache
     # for a bundle that never shipped (same pattern as the CPU/CUDA children).
+    #
+    # The ROCm version is in the key, and in the restore prefix, because ccache hashes the compiler into every entry: a cache from another nightly can never hit.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        key: rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-windows-${{ matrix.gfx_target }}
+          rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         max-size: 2G
@@ -485,7 +507,7 @@ jobs:
       uses: actions/cache/save@v6
       with:
         path: ${{ github.workspace }}\.ccache
-        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}-
+        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
 
   build-ubuntu:
     name: linux/${{ matrix.gfx_target }}
@@ -550,8 +572,18 @@ jobs:
         # TheRock publishes nightlies to the multi-arch tarball index. The
         # static HTML page embeds a JSON `files` array with names and mtimes.
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
-        if [ "$rocm_version" = "latest" ]; then
-          echo "Auto-detecting latest ROCm version for target: $current_target"
+        if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
+          # weekly: take the newest alpha up to the Saturday before the last SF Sunday, so a whole week uses one toolchain and the ccache hits.
+          # The cutoff day must be settled before the first run reads it: TheRock usually publishes the evening before, but has landed as late as 18:33 PT on the named day, which splits the week.
+          # The parent sends one cutoff for the run, so every leg agrees; the fallback is for a standalone call.
+          cutoff=99999999
+          if [ "$rocm_version" = "weekly" ]; then
+            cutoff="${{ inputs.rocm_cutoff }}"
+            [ -n "$cutoff" ] || cutoff="$(TZ=America/Los_Angeles date -d "-$(( $(TZ=America/Los_Angeles date +%w) + 1 )) days" +%Y%m%d)"
+            echo "Weekly pin: newest build dated on or before $cutoff (week of the last SF Sunday)"
+          else
+            echo "Auto-detecting latest ROCm version for target: $current_target"
+          fi
           prefix="therock-dist-linux-${archive_target}-"
           files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
           if [ -z "$files_json" ]; then
@@ -560,10 +592,10 @@ jobs:
           fi
 
           # Pick the newest build date and exclude sibling test archives.
-          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
-            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" --arg c "$cutoff" \
+            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$")) | select((.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) <= $c)] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
           if [ -z "$latest_file" ]; then
-            echo "No tarball found for prefix '$prefix' at $base_url/"
+            echo "No tarball found for prefix '$prefix' at or before $cutoff at $base_url/"
             exit 1
           fi
           echo "Found latest file: $latest_file"
@@ -618,17 +650,21 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
-    # See the Windows job for why the key is per gfx target and why save: false.
+    # See the Windows job for why the key is per gfx target and ROCm version, and why save: false.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        key: rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-linux-${{ matrix.gfx_target }}
+          rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         max-size: 2G
         save: false
+
+    # The action sets this on Windows and macOS but leaves Linux on mtime, and ROCm is re-extracted every run, so mtime is not a reliable compiler identity.
+    - name: Hash the compiler by content, not mtime
+      run: ccache --set-config=compiler_check=content
 
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -839,4 +875,4 @@ jobs:
       uses: actions/cache/save@v6
       with:
         path: ${{ github.workspace }}/.ccache
-        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}-
+        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
