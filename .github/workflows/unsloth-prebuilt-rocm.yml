@@ -574,7 +574,7 @@ jobs:
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
         if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
           # weekly: take the newest alpha up to the Saturday before the last SF Sunday, so a whole week uses one toolchain and the ccache hits.
-          # The cutoff day must be settled before the first run that uses it: TheRock names a build for the next day and usually publishes the evening before, but it has landed as late as 18:33 PT on the named day, which would split the week.
+          # The cutoff day must be settled before the first run reads it: TheRock usually publishes the evening before, but has landed as late as 18:33 PT on the named day, which splits the week.
           # The parent sends one cutoff for the run, so every leg agrees; the fallback is for a standalone call.
           cutoff=99999999
           if [ "$rocm_version" = "weekly" ]; then

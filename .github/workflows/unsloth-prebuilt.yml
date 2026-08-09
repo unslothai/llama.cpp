@@ -390,7 +390,7 @@ jobs:
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
-          # One weekly cutoff for the whole run, before fan-out, set to the Saturday before the last SF Sunday so the day is already settled when the first run of the week reads it.
+          # One weekly cutoff for the whole run, before fan-out. See the ROCm child for why it is the Saturday before.
           # Each leg reads its own clock otherwise, so a run crossing the SF Sat-to-Sun boundary would mix two toolchains in one release.
           ROCM_CUTOFF="$(TZ=America/Los_Angeles date -d "-$(( $(TZ=America/Los_Angeles date +%w) + 1 )) days" +%Y%m%d)"
 
