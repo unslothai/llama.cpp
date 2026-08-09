@@ -260,12 +260,17 @@ jobs:
     # save: false -- the explicit actions/cache/save step at the end of the job
     # runs after packaging, so a failed package step does not persist a cache
     # for a bundle that never shipped (same pattern as the CPU/CUDA children).
+    #
+    # The ROCm version is in the key because ccache hashes compiler identity
+    # into every entry: a cache written by a different nightly can never hit,
+    # so restoring one only costs a download and a re-save. The restore-key
+    # prefix stops at the version for the same reason.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        key: rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-windows-${{ matrix.gfx_target }}
+          rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         max-size: 2G
@@ -485,7 +490,7 @@ jobs:
       uses: actions/cache/save@v6
       with:
         path: ${{ github.workspace }}\.ccache
-        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ inputs.tag }}-
+        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
 
   build-ubuntu:
     name: linux/${{ matrix.gfx_target }}
@@ -618,17 +623,24 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
-    # See the Windows job for why the key is per gfx target and why save: false.
+    # See the Windows job for why the key is per gfx target and ROCm version,
+    # and why save: false.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}
+        key: rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-linux-${{ matrix.gfx_target }}
+          rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         max-size: 2G
         save: false
+
+    # The action already sets this on Windows and macOS but leaves Linux on the
+    # default mtime check. ROCm is re-extracted from the nightly tarball every
+    # run, so metadata alone is not a reliable compiler identity here.
+    - name: Hash the compiler by content, not mtime
+      run: ccache --set-config=compiler_check=content
 
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -839,4 +851,4 @@ jobs:
       uses: actions/cache/save@v6
       with:
         path: ${{ github.workspace }}/.ccache
-        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ inputs.tag }}-
+        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
