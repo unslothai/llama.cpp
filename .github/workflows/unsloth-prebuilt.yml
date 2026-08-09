@@ -390,9 +390,9 @@ jobs:
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
-          # One weekly cutoff for the whole run, before fan-out.
+          # One weekly cutoff for the whole run, before fan-out, set to the Saturday before the last SF Sunday so the day is already settled when the first run of the week reads it.
           # Each leg reads its own clock otherwise, so a run crossing the SF Sat-to-Sun boundary would mix two toolchains in one release.
-          ROCM_CUTOFF="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
+          ROCM_CUTOFF="$(TZ=America/Los_Angeles date -d "-$(( $(TZ=America/Los_Angeles date +%w) + 1 )) days" +%Y%m%d)"
 
           # macOS slices are static: two fixed runners with per-slice deployment
           # targets. arm64 builds on macos-26 (newest Metal SDK; avoids the
@@ -1095,7 +1095,7 @@ jobs:
           freed=0; deleted=0
           while IFS=$'\t' read -r id created size key; do
             [ -z "${id:-}" ] && continue
-            pre="$(printf '%s' "$key" | sed -E 's/-b[0-9]+-mix-[0-9a-f]+-?$//; s/-[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+$//')"
+            pre="$(printf '%s' "$key" | sed -E 's/-b[0-9]+(-mix-[0-9a-f]+)?-?$//; s/-[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+$//')"
             printf '%s\t%s\t%s\t%s\n' "$pre" "$created" "$id" "$size"
           done < "$all" | sort -t"$(printf '\t')" -k1,1 -k2,2r > "$RUNNER_TEMP/grouped.tsv"
 

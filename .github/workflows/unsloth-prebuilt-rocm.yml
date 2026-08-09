@@ -217,9 +217,9 @@ jobs:
               try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
               catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
               $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
-              $cutoff = $sf.Date.AddDays(-[int]$sf.DayOfWeek).ToString("yyyyMMdd")
+              $cutoff = $sf.Date.AddDays(-([int]$sf.DayOfWeek + 1)).ToString("yyyyMMdd")
             }
-            Write-Host "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
+            Write-Host "Weekly pin: newest build dated on or before $cutoff (week of the last SF Sunday)"
           } else {
             Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
           }
@@ -573,13 +573,14 @@ jobs:
         # static HTML page embeds a JSON `files` array with names and mtimes.
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
         if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
-          # weekly: take the newest alpha up to the last SF Sunday, so a whole week uses one toolchain and the ccache hits.
+          # weekly: take the newest alpha up to the Saturday before the last SF Sunday, so a whole week uses one toolchain and the ccache hits.
+          # The cutoff day must be settled before the first run that uses it: TheRock names a build for the next day and usually publishes the evening before, but it has landed as late as 18:33 PT on the named day, which would split the week.
           # The parent sends one cutoff for the run, so every leg agrees; the fallback is for a standalone call.
           cutoff=99999999
           if [ "$rocm_version" = "weekly" ]; then
             cutoff="${{ inputs.rocm_cutoff }}"
-            [ -n "$cutoff" ] || cutoff="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
-            echo "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
+            [ -n "$cutoff" ] || cutoff="$(TZ=America/Los_Angeles date -d "-$(( $(TZ=America/Los_Angeles date +%w) + 1 )) days" +%Y%m%d)"
+            echo "Weekly pin: newest build dated on or before $cutoff (week of the last SF Sunday)"
           else
             echo "Auto-detecting latest ROCm version for target: $current_target"
           fi
