@@ -53,6 +53,11 @@ on:
         required: false
         default: 'weekly'
         type: string
+      rocm_cutoff:
+        description: 'For "weekly": YYYYMMDD cutoff resolved once by the parent. Blank means each leg computes its own.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -203,16 +208,17 @@ jobs:
         # static HTML page embeds a JSON `files` array with names and mtimes.
         $baseUrl = "https://rocm.nightlies.amd.com/tarball-multi-arch"
         if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
-          # weekly: see the Linux job. Cutoff is the most recent Sunday in SF
-          # time, so the whole week resolves to one build and the ccache hits.
+          # weekly: see the Linux job. Cutoff is the most recent Sunday in SF time, so the whole week resolves to one build and the ccache hits.
           $cutoff = "99999999"
           if ($rocmVersion -eq "weekly") {
-            # Windows uses its own zone ids; fall back to the IANA name so this
-            # keeps working if the step ever moves off a Windows runner.
-            try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
-            catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
-            $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
-            $cutoff = $sf.Date.AddDays(-[int]$sf.DayOfWeek).ToString("yyyyMMdd")
+            $cutoff = "${{ inputs.rocm_cutoff }}"
+            if (-not $cutoff) {
+              # Windows uses its own zone ids; fall back to the IANA name so this keeps working if the step ever moves off a Windows runner.
+              try   { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time") }
+              catch { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("America/Los_Angeles") }
+              $sf = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+              $cutoff = $sf.Date.AddDays(-[int]$sf.DayOfWeek).ToString("yyyyMMdd")
+            }
             Write-Host "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
           } else {
             Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
@@ -275,10 +281,8 @@ jobs:
     # runs after packaging, so a failed package step does not persist a cache
     # for a bundle that never shipped (same pattern as the CPU/CUDA children).
     #
-    # The ROCm version is in the key because ccache hashes compiler identity
-    # into every entry: a cache written by a different nightly can never hit,
-    # so restoring one only costs a download and a re-save. The restore-key
-    # prefix stops at the version for the same reason.
+    # The ROCm version is in the key because ccache hashes compiler identity into every entry: a cache written by a different nightly can never hit, so restoring one only costs a download and a re-save.
+    # The restore-key prefix stops at the version for the same reason.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
@@ -570,14 +574,14 @@ jobs:
         # static HTML page embeds a JSON `files` array with names and mtimes.
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
         if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
-          # weekly: hold one alpha for the whole week instead of taking a new
-          # toolchain every night. The cutoff is the most recent Sunday in SF
-          # time, so every run Sun-Sat resolves the same build and the ccache
-          # (keyed on this version) hits all week. TheRock never backfills a
-          # skipped day, so a later publish cannot change an earlier pick.
+          # weekly: hold one alpha for the whole week instead of taking a new toolchain every night.
+          # The cutoff is the most recent Sunday in SF time, so every run Sun-Sat resolves the same build and the ccache (keyed on this version) hits all week.
+          # TheRock never backfills a skipped day, so a later publish cannot change an earlier pick.
+          # The parent resolves the cutoff once and passes it in, so all legs of one run agree even if the run crosses midnight; the fallback is for a standalone call.
           cutoff=99999999
           if [ "$rocm_version" = "weekly" ]; then
-            cutoff="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
+            cutoff="${{ inputs.rocm_cutoff }}"
+            [ -n "$cutoff" ] || cutoff="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
             echo "Weekly pin: newest build dated on or before $cutoff (SF Sunday)"
           else
             echo "Auto-detecting latest ROCm version for target: $current_target"
@@ -648,8 +652,7 @@ jobs:
 
         echo "ROCm environment variables set successfully"
 
-    # See the Windows job for why the key is per gfx target and ROCm version,
-    # and why save: false.
+    # See the Windows job for why the key is per gfx target and ROCm version, and why save: false.
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
@@ -661,9 +664,8 @@ jobs:
         max-size: 2G
         save: false
 
-    # The action already sets this on Windows and macOS but leaves Linux on the
-    # default mtime check. ROCm is re-extracted from the nightly tarball every
-    # run, so metadata alone is not a reliable compiler identity here.
+    # The action already sets this on Windows and macOS but leaves Linux on the default mtime check.
+    # ROCm is re-extracted from the nightly tarball every run, so metadata alone is not a reliable compiler identity here.
     - name: Hash the compiler by content, not mtime
       run: ccache --set-config=compiler_check=content
 
