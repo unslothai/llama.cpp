@@ -390,8 +390,8 @@ jobs:
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
-          # One weekly cutoff for the whole run, resolved here before fan-out.
-          # Each ROCm leg reads its own clock otherwise, so a run that crosses the SF Saturday-to-Sunday boundary would ship some bundles from last week's toolchain and some from this week's.
+          # One weekly cutoff for the whole run, before fan-out.
+          # Each leg reads its own clock otherwise, so a run crossing the SF Sat-to-Sun boundary would mix two toolchains in one release.
           ROCM_CUTOFF="$(TZ=America/Los_Angeles date -d "-$(TZ=America/Los_Angeles date +%w) days" +%Y%m%d)"
 
           # macOS slices are static: two fixed runners with per-slice deployment
@@ -1091,7 +1091,7 @@ jobs:
 
           # Group by the restore-keys prefix: the key minus its -<tag>- suffix.
           # Newest first, so anything past $KEEP is unreachable by restore-keys.
-          # The ROCm version comes off too: it is part of the restore prefix, so leaving it on would make every weekly toolchain its own group and keep 2 caches per group forever, none of which can ever hit again.
+          # The ROCm version comes off too, else every weekly toolchain becomes its own group and keeps 2 caches that can never hit again.
           freed=0; deleted=0
           while IFS=$'\t' read -r id created size key; do
             [ -z "${id:-}" ] && continue
