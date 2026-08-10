@@ -85,7 +85,7 @@ if [ "${1:-}" = "--upload-one" ]; then
   exit 1
 fi
 
-# ---------------------------------------------------------------- parent mode
+# Parent mode.
 TAG="" REPO="" DIST=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -132,11 +132,10 @@ pass_rc=0
 upload_pass "${FILES[@]}" || pass_rc=$?
 [ "$pass_rc" -eq 0 ] || log "upload pass reported failures (xargs exit ${pass_rc}); verification decides"
 
-# gh exiting 0 does not prove the asset is complete. Every local file must be
-# on the release with the same size and state "uploaded".
-# Sets BAD to the files the release does not hold. Reads the API in the current
-# shell: inside `< <(...)` a failed read exits only the subshell, so BAD would
-# come back empty and we would publish a release we never checked.
+# gh exiting 0 does not prove the asset is complete, so set BAD to every local
+# file the release does not hold at the same size and state "uploaded". Read the
+# API here, not inside `< <(...)`, where a failed read exits only the subshell
+# and leaves BAD empty, i.e. publishes a release we never checked.
 verify() {
   local remote f
   remote="$(gh release view "$TAG" --repo "$REPO" --json assets \
