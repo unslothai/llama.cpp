@@ -134,24 +134,28 @@ upload_pass "${FILES[@]}" || pass_rc=$?
 
 # gh exiting 0 does not prove the asset is complete. Every local file must be
 # on the release with the same size and state "uploaded".
-missing_files() {
-  local remote
+# Sets BAD to the files the release does not hold. Reads the API in the current
+# shell: inside `< <(...)` a failed read exits only the subshell, so BAD would
+# come back empty and we would publish a release we never checked.
+verify() {
+  local remote f
   remote="$(gh release view "$TAG" --repo "$REPO" --json assets \
     --jq '.assets[] | select(.state=="uploaded") | "\(.name)\t\(.size)"')" \
     || die "could not read release assets for verification"
+  BAD=()
   for f in "${FILES[@]}"; do
     if ! grep -qxF "$(asset_name "$f")	$(file_size "$f")" <<<"$remote"; then
-      printf '%s\0' "$f"
+      BAD+=("$f")
     fi
   done
 }
 
-mapfile -d '' -t BAD < <(missing_files)
+verify
 if [ "${#BAD[@]}" -gt 0 ]; then
   log "verification found ${#BAD[@]} missing or mismatched assets; re-uploading"
   for f in "${BAD[@]}"; do log "  - $(asset_name "$f")"; done
   upload_pass "${BAD[@]}" || true
-  mapfile -d '' -t BAD < <(missing_files)
+  verify
 fi
 
 if [ "${#BAD[@]}" -gt 0 ]; then

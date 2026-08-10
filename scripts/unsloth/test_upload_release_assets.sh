@@ -48,6 +48,7 @@ if [ "$1" = "release" ] && [ "$2" = "upload" ]; then
 fi
 
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  if [ "${STUB_VIEW_FAILS:-}" = 1 ]; then echo "stub: HTTP 503" >&2; exit 1; fi
   jqexpr=""
   for ((i=1;i<=$#;i++)); do
     if [ "${!i}" = "--jq" ]; then j=$((i+1)); jqexpr="${!j}"; fi
@@ -101,6 +102,9 @@ run_case "wrong size caught, re-uploaded" 0 STUB_WRONGSIZE="bundle-06.tar.gz"
 run_case "non-uploaded state re-uploaded" 0 STUB_NOTUPLOADED="bundle-02.tar.gz"
 run_case "gh exits 0, asset never lands"  1 STUB_SILENT_DROP="bundle-03.tar.gz"
 run_case "phase deadline aborts"          1 UPLOAD_DEADLINE_MINUTES=0 STUB_STALL_ALWAYS="bundle-01.tar.gz"
+# The verify read must fail the script, not just its subshell: a process
+# substitution would swallow this and report every asset as verified.
+run_case "verification API outage aborts" 1 STUB_VIEW_FAILS=1
 
 echo
 echo "${#FAILS[@]} failure(s)${FAILS[*]:+: ${FAILS[*]}}"
