@@ -162,10 +162,10 @@ jobs:
           # urls from ggml-org/llama.cpp or unslothai/llama.cpp (no other
           # repos). Pins are mandatory -- only an exact, reviewed commit
           # is ever built, so a PR author pushing more commits cannot change
-          # what the nightly ships. Non-open PRs are skipped, so merged or
-          # abandoned entries rot away instead of breaking the nightly (but a
-          # merged unslothai pin drops out of the build entirely; see the
-          # pr-set.json _doc). unsloth-pr-set-lint.yml runs the same checks on every
+          # what the nightly ships. Non-open PRs are still merged in -- upstream
+          # tags lag merges, so dropping a pin on merge leaves the arch in
+          # neither the base nor the mix; see the state gate below and the
+          # pr-set.json _doc. unsloth-pr-set-lint.yml runs the same checks on every
           # push that edits the file, but that is only a tripwire -- a red
           # lint does not stop the schedule, so the gate must live here.
           # An entry is a bare url string (required) or {"url", "required": false}.
@@ -190,16 +190,30 @@ jobs:
             HEAD="$(jq -r '.head.sha' <<<"$PR_JSON")"
             N_COMMITS="$(jq -r '.commits' <<<"$PR_JSON")"
             TITLE="$(jq -r '.title' <<<"$PR_JSON")"
+            MERGED_AT="$(jq -r '.merged_at // ""' <<<"$PR_JSON")"
             if [ "$STATE" != "open" ]; then
-              # A non-open pin drops out of $PRS, changing SETHASH and the tag, so
-              # the release would ship without that arch under a new tag. Refuse
-              # unless the entry is explicitly optional.
-              if [ "$REQUIRED" != "false" ]; then
-                echo "refusing ${SRC}#${NUM}: pin is ${STATE}, and it is a required entry; publishing without it would silently drop its architecture. Mark it \"required\": false in scripts/unsloth/pr-set.json to ship without it, or repin it." >&2
-                exit 1
+              # Merging upstream does NOT put an arch in the build: upstream tags
+              # lag their merges, and BASE is then aged a further
+              # UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS on top of that. 26841 merged
+              # at 11:07 with the newest tag cut at 07:53, so dropping the pin on
+              # merge left the arch in neither the base nor the mix, and repinning
+              # was impossible because the old gate refused a non-open pin. So a
+              # non-open pin keeps being merged: once BASE contains the commit the
+              # merge is an empty no-op, and the pin can be deleted at leisure.
+              # "required": false keeps the old rot-away behaviour for an entry
+              # that should disappear the moment it stops being open.
+              if [ "$REQUIRED" = "false" ]; then
+                echo "::warning::skipping optional pin ${SRC}#${NUM} (${STATE}): $url"
+                continue
               fi
-              echo "::warning::skipping optional pin ${SRC}#${NUM} (${STATE}): $url"
-              continue
+              if [ -n "$MERGED_AT" ]; then
+                echo "::warning::${SRC}#${NUM} merged upstream at ${MERGED_AT}; still mixing its pinned commit until a base tag contains it"
+              else
+                # Closed unmerged means upstream declined it. Nothing stops it
+                # shipping now, so the warning is the only signal -- drop the pin
+                # once you have decided you do not want that code.
+                echo "::warning::${SRC}#${NUM} is closed without being merged (upstream declined it); still mixing its pinned commit because the entry is required"
+              fi
             fi
             # A pin pasted from the wrong PR would build arbitrary code while
             # the manifest blames PR #<num>; require the pinned commit to be
