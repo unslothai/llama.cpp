@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 //
 // llama_context
@@ -29,6 +30,54 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+struct llm_fused_op_probe {
+    llm_fused_op op;
+    const char * name;
+    uint32_t n_tokens_per_seq;
+};
+
+static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
+    /*.name             =*/ "Flash Attention",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_AR,
+    /*.name             =*/ "fused Gated Delta Net (autoregressive)",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_CH,
+    /*.name             =*/ "fused Gated Delta Net (chunked)",
+    /*.n_tokens_per_seq =*/ 16,
+};
+
+static const llm_fused_op_probe llm_fused_op_lid_probe = {
+    /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
+    /*.name             =*/ "Lightning Indexer",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+    /*.name             =*/ "fused DeepSeek V4 HC pre",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
+    /*.name             =*/ "fused DeepSeek V4 HC comb",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+    /*.name             =*/ "fused DeepSeek V4 HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
 
 llama_context::llama_context(
         const llama_model & model,
@@ -71,8 +120,9 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // +1: id n_layer() taps the output of the last layer ("input" of the head)
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -200,6 +250,14 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+
+    cparams.fused_lid    = true;
+    cparams.auto_flid    = true;
+
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_comb = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -417,6 +475,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // wait for any pending asynchronous copies into the output buffers before they are freed
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -434,6 +495,83 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
+    const char * func = __func__;
+    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
+        if (!enabled) {
+            return;
+        }
+
+        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+
+        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        if (!gf) {
+            throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
+        }
+
+        bool device_mismatch = false;
+        for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+            if (node.op != probe.op) {
+                continue;
+            }
+
+            GGML_ASSERT(node.il >= 0);
+
+            ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+            ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
+
+            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+            // but is still wrong for cases like --no-kv-offload.
+            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+
+            if (device_fused != device_layer) {
+                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                        "is assigned to device %s (usually due to missing support)\n",
+                        func, node.il,
+                        device_layer ? ggml_backend_dev_name(device_layer) : "none",
+                        probe.name,
+                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                device_mismatch = true;
+                break;
+            }
+        }
+
+        if (device_mismatch) {
+            enabled = false;
+            LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
+        } else {
+            enabled = true;
+            LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
+        }
+    };
+
+    if (cparams.auto_fa) {
+        resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
+        cparams.auto_fa = false;
+    }
+
+    if (cparams.auto_fgdn) {
+        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
+        resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
+        resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+        cparams.auto_fgdn = false;
+    }
+
+    if (cparams.auto_flid) {
+        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
+        resolve(llm_fused_op_lid_probe, cparams.fused_lid);
+        cparams.auto_flid = false;
+    }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -475,128 +613,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
-    // resolve automatic Flash Attention use
-    if (cparams.auto_fa) {
-        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
-        if (!gf) {
-            throw std::runtime_error("failed to reserve graph for Flash Attention check");
-        }
-
-        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
-        bool fa_device_mismatch = false;
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            ggml_tensor * n = ggml_graph_node(gf, i);
-            if (n->op != GGML_OP_FLASH_ATTN_EXT) {
-                continue;
-            }
-            ggml_backend_dev_t device_fa = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
-
-            // TODO: instead of the tensor names, use a map to keep track of which (FA) tensors belong to which layer
-            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
-            const int il = std::stoi(n->name + prefix_len);
-            ggml_backend_dev_t device_kv = model.dev_layer(il);
-            if (device_fa != device_kv) {
-                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the Flash Attention tensor "
-                        "is assigned to device %s (usually due to missing support)\n",
-                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_fa));
-                // FIXME: fa_device_mismatch logic is wrong for --no-kv-offload, but this is broken anyways
-                fa_device_mismatch = true;
-                break;
-            }
-        }
-
-        if (fa_device_mismatch) {
-            cparams.flash_attn = false;
-            LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
-        } else {
-            cparams.flash_attn = true;
-            LLAMA_LOG_INFO("%s: Flash Attention was auto, set to enabled\n", __func__);
-        }
-
-        cparams.auto_fa = false;
-    }
-
-    if (cparams.auto_fgdn) {
-        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
-
-        if (cparams.fused_gdn_ar) {
-            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
-            if (!gf) {
-                throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (autoregressive)");
-            }
-
-            const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FGDN_AR) + 1;
-            bool gdn_device_mismatch = false;
-            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-                ggml_tensor * n = ggml_graph_node(gf, i);
-                if (n->op != GGML_OP_GATED_DELTA_NET) {
-                    continue;
-                }
-                ggml_backend_dev_t device_gdn = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
-
-                GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_AR "-", prefix_len) == 0);
-                const int il = std::stoi(n->name + prefix_len);
-                ggml_backend_dev_t device_kv = model.dev_layer(il);
-                if (device_gdn != device_kv) {
-                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
-                            "is assigned to device %s (usually due to missing support)\n",
-                            __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
-                    gdn_device_mismatch = true;
-                    break;
-                }
-            }
-
-            if (gdn_device_mismatch) {
-                cparams.fused_gdn_ar = false;
-                LLAMA_LOG_WARN("%s: fused Gated Delta Net (autoregressive) not supported, set to disabled\n", __func__);
-            } else {
-                LLAMA_LOG_INFO("%s: fused Gated Delta Net (autoregressive) enabled\n", __func__);
-            }
-        }
-
-        if (cparams.fused_gdn_ch) {
-            // more than one token in the batch per sequence in order to take the chunked path
-            // note: n_outputs must match n_tokens for embedding models with mean/rank pooling,
-            // because build_pooling creates inp_mean with shape [n_tokens, n_seqs] and multiplies
-            // it with t_embd which is reduced to [n_outputs, ...] via out_ids. if n_outputs != n_tokens,
-            // the ggml_mul_mat assertion fails.
-            const uint32_t n_tokens_ch = 16*n_seqs;
-            auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true);
-            if (!gf) {
-                throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (chunked)");
-            }
-
-            const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FGDN_CH) + 1;
-            bool gdn_device_mismatch = false;
-            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-                ggml_tensor * n = ggml_graph_node(gf, i);
-                if (n->op != GGML_OP_GATED_DELTA_NET) {
-                    continue;
-                }
-                ggml_backend_dev_t device_gdn = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
-
-                GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_CH "-", prefix_len) == 0);
-                const int il = std::stoi(n->name + prefix_len);
-                ggml_backend_dev_t device_kv = model.dev_layer(il);
-                if (device_gdn != device_kv) {
-                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
-                            "is assigned to device %s (usually due to missing support)\n",
-                            __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
-                    gdn_device_mismatch = true;
-                    break;
-                }
-            }
-
-            if (gdn_device_mismatch) {
-                cparams.fused_gdn_ch = false;
-                LLAMA_LOG_WARN("%s: fused Gated Delta Net (chunked) not supported, set to disabled\n", __func__);
-            } else {
-                LLAMA_LOG_INFO("%s: fused Gated Delta Net (chunked) enabled\n", __func__);
-            }
-        }
-
-        cparams.auto_fgdn = false;
-    }
+    resolve_fused_ops(mctx.get(), n_seqs);
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -1148,7 +1165,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1410,12 +1427,16 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
 
     sched_reserve();
 
@@ -1712,7 +1733,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1765,13 +1787,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
 
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
     output_swaps.clear();
 
     sched_reserve();
@@ -2266,8 +2293,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
-    const uint64_t n_vocab = model.vocab.n_tokens();
-    const uint64_t n_embd  = model.hparams.n_embd;
+    const uint64_t n_vocab     = model.vocab.n_tokens();
+    const uint64_t n_embd      = model.hparams.n_embd;
+    const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2280,14 +2308,14 @@ void llama_context::output_reorder() {
         }
 
         if (embd.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
             }
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
         }
 
@@ -2341,7 +2369,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_DEEPSEEK4) {
+        model.arch == LLM_ARCH_DEEPSEEK4 ||
+        (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
+        model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
@@ -2475,11 +2506,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
@@ -3541,6 +3573,22 @@ llama_context * llama_init_from_model(
         }
     }
 
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
@@ -3563,11 +3611,6 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-        return nullptr;
-    }
-
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
         params.pooling_type != model->hparams.pooling_type) {
         //user-specified pooling-type is different from the model default
@@ -3575,8 +3618,9 @@ llama_context * llama_init_from_model(
                        model->hparams.pooling_type, params.pooling_type);
     }
 
+    // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.n_layer_nextn == 0) {
+        (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }

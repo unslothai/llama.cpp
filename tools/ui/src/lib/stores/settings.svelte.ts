@@ -32,24 +32,24 @@
  */
 
 import { browser } from '$app/environment';
-import { ColorMode } from '$lib/enums';
-import type { SettingsExportType } from '$lib/types';
-import { setMode } from 'mode-watcher';
 import {
 	CONFIG_LOCALSTORAGE_KEY,
 	SETTING_CONFIG_DEFAULT,
 	SETTINGS_KEYS,
 	USER_OVERRIDES_LOCALSTORAGE_KEY
 } from '$lib/constants';
-import { isMobile } from '$lib/stores/viewport.svelte';
+import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { serverStore } from '$lib/stores/server.svelte';
+import { isMobile } from '$lib/stores/viewport.svelte';
+import type { SettingsExportType } from '$lib/types';
 import {
 	configToParameterRecord,
-	normalizeFloatingPoint,
 	getConfigValue,
+	normalizeFloatingPoint,
 	setConfigValue
 } from '$lib/utils';
+import { setMode } from 'mode-watcher';
 
 class SettingsStore {
 	/**
@@ -64,6 +64,10 @@ class SettingsStore {
 	isInitialized = $state(false);
 	userOverrides = $state<Set<string>>(new Set());
 
+	// True until a config exists in localStorage; gates the one-time
+	// application of server ui_settings defaults for new users.
+	private isFirstVisit = false;
+
 	/**
 	 *
 	 *
@@ -77,10 +81,7 @@ class SettingsStore {
 	 * Centralizes the pattern of getting and extracting server defaults
 	 */
 	private getServerDefaults(): Record<string, string | number | boolean> {
-		const serverParams = serverStore.defaultParams;
-		const uiSettings = serverStore.uiSettings;
-
-		return ParameterSyncService.extractServerDefaults(serverParams, uiSettings);
+		return ParameterSyncService.extractServerDefaults(serverStore.defaultParams);
 	}
 
 	constructor() {
@@ -121,6 +122,11 @@ class SettingsStore {
 
 		try {
 			const storedConfigRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+
+			// First visit: no stored config yet. Server ui_settings apply once in
+			// this state, then the user's config diverges freely.
+			this.isFirstVisit = storedConfigRaw === null;
+
 			const savedVal = JSON.parse(storedConfigRaw || '{}');
 
 			// Merge with defaults to prevent breaking changes
@@ -128,6 +134,32 @@ class SettingsStore {
 				...SETTING_CONFIG_DEFAULT,
 				...savedVal
 			};
+
+			// Migrate the legacy render keys into `renderContentAsRawText`
+			// (inverted semantics: the old keys opted INTO markdown). Any
+			// explicit raw-text preference wins when the legacy keys disagree.
+			const LEGACY_MARKDOWN_KEYS = ['renderUserContentAsMarkdown', 'renderThinkingAsMarkdown'];
+			const LEGACY_RAW_TEXT_KEY = 'renderUserContentAsRawText'; // this branch's intermediate key
+			const legacyKeys = [...LEGACY_MARKDOWN_KEYS, LEGACY_RAW_TEXT_KEY].filter(
+				(key) => key in savedVal
+			);
+
+			if (legacyKeys.length > 0) {
+				if (!(SETTINGS_KEYS.RENDER_CONTENT_AS_RAW_TEXT in savedVal)) {
+					if (LEGACY_RAW_TEXT_KEY in savedVal) {
+						this.config[SETTINGS_KEYS.RENDER_CONTENT_AS_RAW_TEXT] = savedVal[LEGACY_RAW_TEXT_KEY];
+					} else {
+						this.config[SETTINGS_KEYS.RENDER_CONTENT_AS_RAW_TEXT] = LEGACY_MARKDOWN_KEYS.filter(
+							(key) => key in savedVal
+						).some((key) => savedVal[key] === false);
+					}
+				}
+
+				for (const key of legacyKeys) {
+					delete (this.config as Record<string, unknown>)[key];
+				}
+				this.saveConfig();
+			}
 
 			// Default sendOnEnter to false on mobile when the user has no saved preference
 			if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {
@@ -140,6 +172,7 @@ class SettingsStore {
 			const savedOverrides = JSON.parse(
 				localStorage.getItem(USER_OVERRIDES_LOCALSTORAGE_KEY) || '[]'
 			);
+
 			this.userOverrides = new Set(savedOverrides);
 		} catch (error) {
 			console.warn('Failed to parse config from localStorage, using defaults:', error);
@@ -158,6 +191,7 @@ class SettingsStore {
 		if (!browser) return;
 
 		const legacyTheme = localStorage.getItem('theme');
+
 		if (legacyTheme) {
 			this.config[SETTINGS_KEYS.THEME] = legacyTheme;
 			localStorage.removeItem('theme');
@@ -328,6 +362,7 @@ class SettingsStore {
 	 */
 	syncWithServerDefaults(): void {
 		const propsDefaults = this.getServerDefaults();
+
 		if (Object.keys(propsDefaults).length === 0) return;
 
 		const uiSettings = serverStore.uiSettings;
@@ -335,7 +370,6 @@ class SettingsStore {
 
 		for (const [key, propsValue] of Object.entries(propsDefaults)) {
 			const currentValue = getConfigValue(this.config, key);
-
 			const normalizedCurrent = normalizeFloatingPoint(currentValue);
 			const normalizedDefault = normalizeFloatingPoint(propsValue);
 
@@ -349,9 +383,12 @@ class SettingsStore {
 			}
 		}
 
-		// UI settings need actual values in config (no placeholder mechanism),
-		// so write them for non-overridden keys
-		if (uiSettings) {
+		// UI settings are the admin's defaults for new users: applied once on
+		// the first visit, never on later loads, so the user's config can
+		// diverge. "Reset to Default" is the explicit way back to the baseline.
+		if (uiSettings && this.isFirstVisit) {
+			this.isFirstVisit = false;
+
 			for (const [key, value] of Object.entries(uiSettings)) {
 				if (!this.userOverrides.has(key) && value !== undefined) {
 					setConfigValue(this.config, key, value);
@@ -386,6 +423,27 @@ class SettingsStore {
 				setConfigValue(this.config, key, '');
 			} else if (key in SETTING_CONFIG_DEFAULT) {
 				setConfigValue(this.config, key, getConfigValue(SETTING_CONFIG_DEFAULT, key));
+			}
+
+			this.userOverrides.delete(key);
+		}
+
+		// Non-syncable keys: reset is a full return to the instance state, the
+		// admin baseline value when defined, the factory default otherwise.
+		for (const key of Object.keys(SETTING_CONFIG_DEFAULT)) {
+			if (ParameterSyncService.canSyncParameter(key)) {
+				continue;
+			}
+
+			const value =
+				uiSettings && key in uiSettings && uiSettings[key] !== undefined
+					? uiSettings[key]
+					: getConfigValue(SETTING_CONFIG_DEFAULT, key);
+
+			setConfigValue(this.config, key, value);
+
+			if (key === SETTINGS_KEYS.THEME) {
+				setMode(value as ColorMode);
 			}
 
 			this.userOverrides.delete(key);
@@ -443,6 +501,7 @@ class SettingsStore {
 	 */
 	getParameterDiff() {
 		const serverDefaults = this.getServerDefaults();
+
 		if (Object.keys(serverDefaults).length === 0) return {};
 
 		const configAsRecord = configToParameterRecord(
@@ -491,8 +550,10 @@ class SettingsStore {
 				>;
 				const safeServers = mcpServers.map((server) => {
 					delete server.headers;
+
 					return server;
 				});
+
 				configToExport.mcpServers = JSON.stringify(safeServers);
 			} catch {
 				// If parsing fails, just exclude the entire mcpServers field
@@ -501,10 +562,10 @@ class SettingsStore {
 		}
 
 		return {
-			version: 1,
-			timestamp: Date.now(),
 			config: configToExport,
-			userOverrides: Array.from(this.userOverrides)
+			timestamp: Date.now(),
+			userOverrides: Array.from(this.userOverrides),
+			version: 1
 		};
 	}
 
