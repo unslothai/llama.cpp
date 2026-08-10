@@ -65,7 +65,7 @@ permissions:
 jobs:
   build-windows:
     name: windows/${{ matrix.gfx_target }}
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: contains(inputs.operating_systems, 'windows')
     strategy:
       matrix: ${{ fromJson(inputs.matrix) }}
@@ -161,7 +161,7 @@ jobs:
         # Install Strawberry Perl via Chocolatey (already on the runner) instead
         # of downloading the MSI from the frequently-unreachable strawberryperl.com
         # host that was timing out and failing these builds. It ships preinstalled
-        # on the windows-latest image, so this is normally a fast no-op.
+        # on the windows-2022 image, so this is normally a fast no-op.
         Write-Host "Installing Strawberry Perl via Chocolatey..."
         choco install strawberryperl -y --no-progress
 
