@@ -61,8 +61,7 @@ jobs:
             HEAD="$(jq -r .head <<<"$PR_JSON")"
             if [ "$STATE" != "open" ]; then
               if [ "$REQUIRED" != "false" ]; then
-                echo "::error file=$FILE::${SRC}#${NUM} is ${STATE} and is a required entry; the nightly will refuse rather than publish without its architecture"
-                fail=1
+                echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will keep merging its pinned commit (a no-op once the base tag contains it), so drop the entry when you no longer want that code"
               else
                 echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will skip this optional entry"
               fi
