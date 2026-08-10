@@ -67,6 +67,11 @@ on:
         default: false
         required: false
         type: boolean
+      keep_artifacts:
+        description: 'Keep this run''s artifacts even if it publishes nothing (artifact-only test runs)'
+        default: false
+        required: false
+        type: boolean
 
 permissions:
   contents: write
@@ -1007,7 +1012,15 @@ jobs:
   reclaim:
     name: Reclaim artifact storage
     needs: [resolve, assemble]
-    if: ${{ needs.assemble.outputs.published == 'true' }}
+    # always(), so a run that publishes NOTHING still cleans up after itself.
+    # Gating this on `published` leaked every non-publishing run's bundles: a
+    # workflow_dispatch defaults to publish:false, and a cancelled run never
+    # reaches publish either. On 08-10 that was 5.9 GiB from one cancelled run
+    # plus 7.1 GiB from one publish:false run, both deleted by hand. The two
+    # cases are handled by different steps below -- a published run deletes only
+    # what is provably on the release, an unpublished one has nothing to match
+    # against and deletes its own bundles outright.
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -1015,6 +1028,7 @@ jobs:
       contents: read   # read the release asset list
     steps:
       - name: Delete artifacts already published as release assets
+        if: ${{ needs.assemble.outputs.published == 'true' }}
         # Never fail a published release over cleanup.
         continue-on-error: true
         env:
@@ -1093,6 +1107,59 @@ jobs:
             echo "| delete failures | $failed |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Delete artifacts of a run that published nothing
+        # The other step's name-match against release assets is meaningless
+        # here: either no release was written, or the tag belongs to a DIFFERENT
+        # run's release. So the rule is simply that nothing will ever consume
+        # these -- a publish:false dispatch is a test, and a cancelled or failed
+        # run is not resumable past the missing legs -- and they are deleted.
+        #
+        # Accepted: unsloth-prebuilt-retry.yml can rerun a cancelled run whose
+        # artifacts this step deleted. That rerun fails loudly at assemble's
+        # coverage gate rather than publishing a partial set, which is the
+        # failure mode this pipeline already prefers. Pass keep_artifacts:true
+        # on a dispatch whose bundles you intend to download by hand.
+        if: ${{ needs.assemble.outputs.published != 'true' && inputs.keep_artifacts != true }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          arts="$RUNNER_TEMP/reclaim-unpublished.tsv"
+
+          # Same containment as the published path: only THIS run's artifacts
+          # are listed, so the step cannot reach a concurrent build's.
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
+          n="$(grep -c . "$arts" || true)"
+          echo "run published nothing; deleting its $n live artifact(s)"
+
+          freed=0; deleted=0; failed=0
+          while IFS="$(printf '\t')" read -r id size name; do
+            [ -z "${id:-}" ] && continue
+            if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+              freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+            else
+              printf '  could not delete %s: %s\n' "$name" "$err"
+              failed=$(( failed + 1 ))
+            fi
+          done < "$arts"
+
+          echo "deleted $deleted artifacts, freed $(( freed / 1048576 )) MiB, failed $failed"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed artifact(s) could not be deleted; storage will be reclaimed by retention instead"
+          fi
+          {
+            echo "### Artifact storage reclaimed (unpublished run)"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| artifacts deleted | $deleted |"
+            echo "| storage freed | $(( freed / 1048576 )) MiB |"
+            echo "| delete failures | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ── Keep the ccache budget inside the repo limit ──
       #
       # ccache entries are immutable, so every run writes a NEW cache per
@@ -1113,6 +1180,12 @@ jobs:
       # Keeping 2 rather than 1: the second generation is the fallback when a job
       # dies before saving, which is precisely the hole that forces a cold build.
       - name: Prune superseded ccache generations
+        # Unchanged trigger: this job now runs on every outcome for artifact
+        # cleanup, but cache pruning stays on published runs only. A cancelled
+        # run's children may not have written their caches yet, and pruning
+        # "superseded" generations against a half-written set could drop a live
+        # one -- a partial cache is worse than a stale one.
+        if: ${{ needs.assemble.outputs.published == 'true' }}
         # Never fail a published release over cache housekeeping.
         continue-on-error: true
         env:
