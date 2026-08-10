@@ -112,10 +112,13 @@ jobs:
 
             STATE="$(gh api "repos/${SRC}/pulls/${NUM}" --jq .state 2>/dev/null || echo unknown)"
             if [ "$STATE" != "open" ]; then
-              if [ "$REQUIRED" != "false" ]; then
-                PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` is **${STATE}** and is required; the nightly will refuse.\n"
+              # Non-open required pins are still merged by the nightly, so keep
+              # probing them here rather than reporting them as a problem; an
+              # optional one is skipped there, so skip it here too.
+              if [ "$REQUIRED" = "false" ]; then
+                continue
               fi
-              continue
+              echo "note: ${SRC}#${NUM} is ${STATE}; still probing because required pins are merged regardless of state"
             fi
             if ! git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
               PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` pinned commit \`${SHA:0:10}\` cannot be fetched; it was probably force-pushed away.\n"
