@@ -1453,6 +1453,7 @@ struct clip_model_loader {
                         // use default llava-uhd preprocessing params
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        hparams.set_limit_image_tokens();
                     } break;
                 case PROJECTOR_TYPE_LFM2:
                     {
@@ -1490,6 +1491,7 @@ struct clip_model_loader {
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         hparams.image_longest_edge = hparams.image_size;
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        hparams.set_limit_image_tokens();
                         hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_DOTS_OCR:
@@ -1614,6 +1616,7 @@ struct clip_model_loader {
                         if (hparams.image_longest_edge == 0) {
                             hparams.image_longest_edge = 3024;
                         }
+                        // note: the step3vl preprocessor slices based on a fixed window grid, so it does not support custom min/max image tokens
                         hparams.warmup_image_size = hparams.image_size;
                     } break;
                 case PROJECTOR_TYPE_YOUTUVL:
