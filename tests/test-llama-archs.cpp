@@ -393,11 +393,8 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-        return false; // FIXME @ngxson
-    }
-    if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
-        return false; // block-diffusion arch on the Gemma4 backbone; needs canvas/ISWA fixture params
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        return false; // FIXME @ngxson; diffusion-gemma additionally needs canvas/ISWA fixture params
     }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
         return false; // FIXME Embedding (?) models produce inconsistent results.
