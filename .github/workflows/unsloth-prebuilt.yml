@@ -815,6 +815,11 @@ jobs:
 
       - name: Publish GitHub release
         id: publish
+        # Last resort cap. The uploader has its own 90m phase deadline; if that
+        # ever fails to trip, this still fails the step with hours of job budget
+        # left instead of letting the 350m job cap kill it with no message, and
+        # it lets the rescue artifact step below run.
+        timeout-minutes: 120
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         # prs carries PR titles (arbitrary text), so pass it through env
         # rather than inlining it: a title with a quote would otherwise break out
@@ -852,10 +857,29 @@ jobs:
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes
           fi
-          gh release create "$TAG" --repo "$REPO" --draft \
-            --title "llama.cpp prebuilt $TAG" \
-            --notes "$NOTES" \
-            dist/*
+          # Create the draft empty, then upload through the uploader instead of
+          # passing dist/* here. `gh release create` uses a fixed 5-worker pool
+          # with no per-connection timeout, so a few wedged PUTs block the whole
+          # set: in run 31335302864 six large bundles stalled at ~0.03 MB/s and
+          # held the pool for 3h45m, while the other 25 assets took 37s total.
+          for attempt in 1 2 3; do
+            if gh release create "$TAG" --repo "$REPO" --draft \
+                 --title "llama.cpp prebuilt $TAG" \
+                 --notes "$NOTES"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "ERROR: could not create draft release $TAG" >&2
+              exit 1
+            fi
+            sleep $(( attempt * 10 ))
+          done
+
+          bash tooling/scripts/unsloth/upload_release_assets.sh \
+            --tag "$TAG" --repo "$REPO" --dist dist
+
+          # Reached only after the uploader verified every asset is present,
+          # byte-identical and in state "uploaded".
           gh release edit "$TAG" --repo "$REPO" --draft=false
 
       # Debug fallback for a failed publish. This used to upload on EVERY run,
