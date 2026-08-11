@@ -8,7 +8,10 @@
     "Closed and merged PRs are STILL merged in. Upstream tags lag their merges and the base is",
     "aged a further UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS, so a pin dropped on merge leaves its arch",
     "in neither the base nor the mix. Once the base tag contains the commit the merge is an empty",
-    "no-op, so delete the entry whenever you like. A closed-unmerged pin ships code upstream",
+    "no-op ONLY if upstream took the PR as a merge commit. Upstream usually squashes, and a squash",
+    "is not an ancestor of the pinned commit, so the merge re-applies code the base already has and",
+    "the whole build stops on an unresolvable conflict. Delete the entry once a base tag carries the",
+    "work, do not wait for it to rot away. A closed-unmerged pin ships code upstream",
     "declined -- the resolve log warns, but nothing else stops it, so prune those deliberately.",
     "Use {\"url\": \"...\", \"required\": false} for an entry that should be skipped once it is not open.",
     "Merging an unslothai PR into fork master drops it from the nightly (the tree is the upstream",
@@ -17,7 +20,6 @@
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/daca8075d871483545dd85d58ce11970b304b541",
     "https://github.com/ggml-org/llama.cpp/pull/25731/commits/0a9841fa63edce1cd252ed6efea713715abb0cf2",
-    "https://github.com/unslothai/llama.cpp/pull/70/commits/06d2326acbf515b10f8d6abeada09123d361acde",
-    "https://github.com/ggml-org/llama.cpp/pull/26841/commits/56b32b3e944c461d783604a83beb2cc9b0ca2cf1"
+    "https://github.com/unslothai/llama.cpp/pull/70/commits/06d2326acbf515b10f8d6abeada09123d361acde"
   ]
 }
