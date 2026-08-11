@@ -229,6 +229,34 @@ static void test_penalties_reordered(
     }
 }
 
+// a cur_p that holds the same id twice must penalize both entries, so it cannot take the by-index path
+static void test_penalties_duplicate_ids(
+    const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
+    float repeat_penalty, float alpha_frequency, float alpha_presence
+) {
+    GGML_ASSERT(probs.size() > 1);
+
+    std::vector<llama_token_data> cur;
+    cur.reserve(probs.size());
+    for (llama_token token_id = 0; token_id < (llama_token) probs.size(); token_id++) {
+        cur.emplace_back(llama_token_data{token_id, logf(probs[token_id]), probs[token_id]});
+    }
+    cur.back() = cur.front();
+
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+    auto * sampler = llama_sampler_init_penalties((int32_t) probs.size(), (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
+    for (size_t i = 0; i < last_tokens.size(); i++) {
+        llama_sampler_accept(sampler, last_tokens[i]);
+    }
+
+    llama_sampler_apply(sampler, &cur_p);
+    llama_sampler_free(sampler);
+
+    GGML_ASSERT(cur_p.data[0].id == cur_p.data[cur_p.size - 1].id);
+    GGML_ASSERT(cur_p.data[0].logit == cur_p.data[cur_p.size - 1].logit);
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -429,6 +457,9 @@ int main(void) {
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 50.0f, 0.0f, 0.0f);
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.0f, 0.0f, 1.5f);
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.1f, 5.0f, 5.0f);
+
+    test_penalties_duplicate_ids({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 50.0f, 0.0f, 0.0f);
+    test_penalties_duplicate_ids({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.0f, 0.0f, 1.5f);
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});

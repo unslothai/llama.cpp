@@ -2969,17 +2969,17 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
     };
 
     // token_count holds at most penalty_last_n entries, so walking it is much cheaper than probing it once per candidate.
-    // This needs a token id to be its own index in cur_p, which holds while no earlier sampler has dropped or reordered candidates.
+    // This needs cur_p to still be the untouched candidate array, where a token id is its own index and appears once.
+    // The check is a compare per candidate, against a map probe per candidate, and it stops at the first mismatch.
     bool by_index = cur_p->size == (size_t) ctx->n_vocab;
 
-    for (const auto & it : ctx->token_count) {
-        if (!by_index) {
-            break;
+    if (by_index) {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id != (llama_token) i) {
+                by_index = false;
+                break;
+            }
         }
-
-        const llama_token token = it.first;
-
-        by_index = token >= 0 && (size_t) token < cur_p->size && cur_p->data[token].id == token;
     }
 
     // Apply frequency and presence penalties to the cur_p
