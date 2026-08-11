@@ -187,6 +187,48 @@ static void test_penalties(
     tester.check();
 }
 
+// penalties indexes cur_p by token id when it can, so a reordered cur_p must still give the same logits
+static void test_penalties_reordered(
+    const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
+    float repeat_penalty, float alpha_frequency, float alpha_presence
+) {
+    auto run = [&](bool reversed) {
+        std::vector<llama_token_data> cur;
+        cur.reserve(probs.size());
+        for (llama_token token_id = 0; token_id < (llama_token) probs.size(); token_id++) {
+            cur.emplace_back(llama_token_data{token_id, logf(probs[token_id]), probs[token_id]});
+        }
+
+        if (reversed) {
+            std::reverse(cur.begin(), cur.end());
+        }
+
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+        auto * sampler = llama_sampler_init_penalties((int32_t) probs.size(), (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
+        for (size_t i = 0; i < last_tokens.size(); i++) {
+            llama_sampler_accept(sampler, last_tokens[i]);
+        }
+
+        llama_sampler_apply(sampler, &cur_p);
+        llama_sampler_free(sampler);
+
+        std::vector<float> logits(probs.size());
+        for (size_t i = 0; i < cur_p.size; i++) {
+            logits[cur_p.data[i].id] = cur_p.data[i].logit;
+        }
+
+        return logits;
+    };
+
+    const std::vector<float> by_index = run(false);
+    const std::vector<float> by_lookup = run(true);
+
+    for (size_t i = 0; i < by_index.size(); i++) {
+        GGML_ASSERT(by_index[i] == by_lookup[i]);
+    }
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -383,6 +425,10 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+
+    test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 50.0f, 0.0f, 0.0f);
+    test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.0f, 0.0f, 1.5f);
+    test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.1f, 5.0f, 5.0f);
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});

@@ -2954,26 +2954,48 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    auto penalize = [ctx](llama_token_data & cand, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (cand.logit <= 0) {
+            cand.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            cand.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        cand.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // token_count holds at most penalty_last_n entries, so walking it is much cheaper than probing it once per candidate.
+    // This needs a token id to be its own index in cur_p, which holds while no earlier sampler has dropped or reordered candidates.
+    bool by_index = cur_p->size == (size_t) ctx->n_vocab;
+
+    for (const auto & it : ctx->token_count) {
+        if (!by_index) {
+            break;
+        }
+
+        const llama_token token = it.first;
+
+        by_index = token >= 0 && (size_t) token < cur_p->size && cur_p->data[token].id == token;
+    }
+
+    // Apply frequency and presence penalties to the cur_p
+    if (by_index) {
+        for (const auto & it : ctx->token_count) {
+            penalize(cur_p->data[it.first], it.second);
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+
+            penalize(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
