@@ -5040,6 +5040,10 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # 42..63 reserved for upstream ggml (42 is Q2_0); fork-local types start at 64
+    IQ1_XS   = 64
+    IQ1_XXS  = 65
+    IQ1_XXXS = 66
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5096,6 +5100,10 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # 41..63 reserved for upstream llama.cpp (41 is Q2_0); fork-local ftypes start at 64
+    MOSTLY_IQ1_XS        = 64  # except 1d tensors
+    MOSTLY_IQ1_XXS       = 65  # except 1d tensors
+    MOSTLY_IQ1_XXXS      = 66  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5221,6 +5229,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.I64:     (1, 8),
     GGMLQuantizationType.F64:     (1, 8),
     GGMLQuantizationType.IQ1_M:   (256, QK_K // 8 + QK_K // 16  + QK_K // 32),
+    GGMLQuantizationType.IQ1_XS:   (256, 2 + QK_K // 8 + QK_K // 32 + QK_K // 64),
+    GGMLQuantizationType.IQ1_XXS:  (256, 2 + QK_K // 8 + QK_K // 32),
+    GGMLQuantizationType.IQ1_XXXS: (256, 2 + QK_K // 8 + QK_K // 64),
     GGMLQuantizationType.BF16:    (1, 2),
     GGMLQuantizationType.TQ1_0:   (256, 2 + 4 * 13),
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
