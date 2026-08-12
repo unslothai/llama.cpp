@@ -4843,6 +4843,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .host_buffer           = */ host_buffer,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
+        /* .mmap_support          = */ props->type != GGML_BACKEND_DEVICE_TYPE_IGPU,
     };
 }
 
@@ -5227,7 +5228,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return max_bias == 0.0f;
         }
         case GGML_OP_ROLL:
-            if(op->src[0]->type == GGML_TYPE_F32) {
+            if(op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0])) {
                 return true;
             }
             return false;
