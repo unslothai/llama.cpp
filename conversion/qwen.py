@@ -289,19 +289,14 @@ class _QwenMtpMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # HF configs for Qwen3.5/3.6 text variants may nest the text hyperparameters
-        # under `text_config`. Reuse the same merge `index_tensors` already applies
-        # so `num_hidden_layers` and `mtp_num_hidden_layers` are visible here.
+        # text_config may nest the text hyperparameters; merge them like index_tensors does
         hparams = {**self.hparams, **self.hparams.get("text_config", {})}
         self.block_count = hparams["num_hidden_layers"]
         if not self.no_mtp:
             n_mtp = hparams.get("mtp_num_hidden_layers", 0)
-            # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
+            # Qwen-3-Next doesn't include mtp_num_hidden_layers in config.
             if n_mtp == 0:
-                # The count is recovered from tensor names in `filter_tensors`, which
-                # runs during `index_tensors` - strictly after __init__. On a cold
-                # process the class attribute is still 0, so the old assert gave the
-                # user nothing actionable. Fail with a clear message instead.
+                # The count is recovered from tensor names later; fail clearly instead of asserting.
                 if self.opt_num_mtp_layers == 0:
                     raise ValueError(
                         "MTP layer count not found in config (checked top level and "
