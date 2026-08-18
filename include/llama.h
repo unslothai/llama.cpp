@@ -156,6 +156,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        // 41..63 reserved for upstream (41 is Q2_0); this is written as general.file_type,
+        // so a collision would make a stock build report the wrong quantization.
+        LLAMA_FTYPE_MOSTLY_IQ1_XS        = 64, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXS       = 65, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXXS      = 66, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
