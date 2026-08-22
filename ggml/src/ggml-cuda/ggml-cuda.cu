@@ -2060,11 +2060,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // The permutation that groups the tokens by expert is the same one the MMQ/MMF paths need, so
     // reuse their device-side helper instead of copying the ids to the host and bucketing them there.
-    // mm_ids_helper keeps one 32 bit entry per token in shared memory, fall back to the host loop if
-    // that does not fit or if the ids tensor is laid out in a way the helper cannot address.
-    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    // The helper picks between a single-warp-per-expert kernel and a counting sort depending on the
+    // shape; ask it what it can handle rather than duplicating either one's limits here. Fall back
+    // to the host loop for that answer or for an ids layout the helper cannot address.
     const bool sort_on_device = ids->type == GGML_TYPE_I32 && ids->nb[0] == ggml_element_size(ids) &&
-        ne12*sizeof(int32_t) <= smpbo && ne12 < (1 << 22) && n_expert_used < (1 << 10);
+        ggml_cuda_mm_ids_helper_supported(ne02, ne12);
 
     if (sort_on_device) {
         ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 1);
@@ -2073,7 +2073,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const int sis1 = nb12 / nb11;
         GGML_ASSERT(sis1 > 0);
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_to_sorted, ids_dst_compact, expert_bounds_dev.ptr,
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_to_sorted, ids_dst_compact, expert_bounds_dev.ptr,
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
 
