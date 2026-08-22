@@ -147,6 +147,30 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+// ids_dst[ic] is the token slot that compact row ic was gathered from, and the mapping is a
+// permutation of [0, n), so inverting it is a plain scatter.
+static __global__ void mm_ids_invert(
+        const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n) {
+    const int ic = blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (ic >= n) {
+        return;
+    }
+
+    ids_inverse[ids_dst[ic]] = ic;
+}
+
+void ggml_cuda_launch_mm_ids_invert(
+        const int32_t * ids_dst, int32_t * ids_inverse, const int n, cudaStream_t stream) {
+    if (n <= 0) {
+        return;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+    mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
+}
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
