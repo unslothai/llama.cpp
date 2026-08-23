@@ -2084,8 +2084,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Would only trip if a token selected the same expert twice, which the host loop also rejects.
+        // this trips on the legacy single-warp path, which takes at most one slot per (token, expert),
+        // and on out-of-range ids, which the helper drops. the counting sort counts every assignment,
+        // so a repeated expert still totals ne_get_rows and passes here; mm_ids_invert bounds it instead
         GGML_ASSERT(expert_bounds_host[ne02] == ne_get_rows);
+        GGML_ASSERT(expert_bounds_host[0] == 0);
 
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             tokens_per_expert[i02] = expert_bounds_host[i02 + 1] - expert_bounds_host[i02];
@@ -2106,7 +2109,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
                 for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                     const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                    assert(expert_to_use >= 0 && expert_to_use < ne02);
+                    // GGML_ASSERT, not assert: plain assert compiles out in a release build
+                    GGML_ASSERT(expert_to_use >= 0 && expert_to_use < ne02);
                     if (expert_to_use == i02) {
                         ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                         ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);

@@ -23,6 +23,15 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
 template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+// HIP has no __syncwarp. every kernel below that needs this runs one warp per block, so a block
+// barrier is an exact substitute there
+static __device__ __forceinline__ void mm_ids_warp_sync() {
+#ifdef GGML_USE_HIP
+    __syncthreads();
+#else
+    __syncwarp();
+#endif // GGML_USE_HIP
+}
 
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
@@ -190,7 +199,7 @@ static __global__ void mm_ids_hist(
     for (int e = threadIdx.x; e < n_experts; e += warp_size) {
         counts[e] = 0;
     }
-    __syncwarp();
+    mm_ids_warp_sync();
 
     const int npairs = (it1 - it0)*n_expert_used;
     for (int p = threadIdx.x; p < npairs; p += warp_size) {
@@ -204,7 +213,7 @@ static __global__ void mm_ids_hist(
             atomicAdd(&counts[expert_used], 1);
         }
     }
-    __syncwarp();
+    mm_ids_warp_sync();
 
     for (int e = threadIdx.x; e < n_experts; e += warp_size) {
         hist[(size_t) e*W + w] = counts[e];
@@ -322,7 +331,7 @@ static __global__ void mm_ids_scatter(
     for (int e = lane; e < n_experts; e += warp_size) {
         cursor[e] = expert_bounds[e] + hist[(size_t) e*W + w];
     }
-    __syncwarp();
+    mm_ids_warp_sync();
 
     const int npairs = (it1 - it0)*n_expert_used;
     for (int p0 = 0; p0 < npairs; p0 += warp_size) {
@@ -358,11 +367,11 @@ static __global__ void mm_ids_scatter(
         if (expert_used >= 0) {
             pos = cursor[expert_used] + rank;
         }
-        __syncwarp(); // every lane has read its cursor before the leader advances it
+        mm_ids_warp_sync(); // every lane has read its cursor before the leader advances it
         if (expert_used >= 0 && rank == 0) {
             cursor[expert_used] += cnt;
         }
-        __syncwarp();
+        mm_ids_warp_sync();
 
         if (expert_used >= 0) {
             ids_dst[pos] = it*n_expert_used + iex;
@@ -467,7 +476,14 @@ static __global__ void mm_ids_invert(
         return;
     }
 
-    ids_inverse[ids_dst[ic]] = ic;
+    // the legacy single-warp path leaves holes in ids_dst if a token selects one expert twice, and a
+    // hole holds recycled pool memory. bound the index so bad ids give a wrong answer, not an OOB write
+    const int32_t id = ids_dst[ic];
+    if (id < 0 || id >= n) {
+        return;
+    }
+
+    ids_inverse[id] = ic;
 }
 
 void ggml_cuda_launch_mm_ids_invert(
