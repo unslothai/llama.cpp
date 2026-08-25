@@ -55,7 +55,7 @@ jobs:
           swap-storage: true
 
       - name: Checkout build tooling (this repo)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           path: tooling
 
@@ -64,7 +64,7 @@ jobs:
       # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
       # instead of cloning -- no .git needed, the build number is already baked.
       - name: Download source @ ${{ inputs.tag }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         with:
           name: ${{ inputs.source_artifact }}
           path: srcpkg
@@ -249,7 +249,7 @@ jobs:
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
@@ -276,7 +276,7 @@ jobs:
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
         if: ${{ always() }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
