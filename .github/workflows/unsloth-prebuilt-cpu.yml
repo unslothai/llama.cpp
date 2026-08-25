@@ -60,7 +60,7 @@ jobs:
       # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
       # instead of cloning -- no .git needed, the build number is already baked.
       - name: Download source @ ${{ inputs.tag }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         with:
           name: ${{ inputs.source_artifact }}
           path: srcpkg
@@ -175,7 +175,7 @@ jobs:
           ls -la dist
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz
@@ -202,7 +202,7 @@ jobs:
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
         if: ${{ always() }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-
@@ -229,7 +229,7 @@ jobs:
       # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
       # instead of cloning -- no .git needed, the build number is already baked.
       - name: Download source @ ${{ inputs.tag }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         with:
           name: ${{ inputs.source_artifact }}
           path: srcpkg
@@ -335,7 +335,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "llama-server --version failed: $LASTEXITCODE"; exit 1 }
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu
           path: dist/app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip
@@ -362,7 +362,7 @@ jobs:
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
         if: ${{ always() }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
           key: ccache-cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}-

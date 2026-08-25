@@ -120,7 +120,7 @@ jobs:
       # Shallow by default (only pr-set.json is needed); a mix build unshallows
       # in-place to merge the PRs.
       - name: Checkout (pr-set.json + mix merge workspace)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       - id: r
         run: |
           set -euo pipefail
@@ -448,7 +448,7 @@ jobs:
       # (resolve skips source prep on a scheduled no-op, leaving no tarball).
       - name: Upload source artifact
         if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: ${{ steps.r.outputs.source_artifact }}
           path: ${{ runner.temp }}/llama.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
@@ -652,7 +652,7 @@ jobs:
           done
 
       - name: Checkout build tooling (this repo)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           path: tooling
 
@@ -661,7 +661,7 @@ jobs:
       # re-running the whole hour-long build matrix.
       - name: Download built bundles
         id: download
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         continue-on-error: true
         with:
           path: dist
@@ -670,7 +670,7 @@ jobs:
 
       - name: Download built bundles (retry)
         if: steps.download.outcome == 'failure'
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         with:
           path: dist
           pattern: app-*
@@ -880,7 +880,7 @@ jobs:
         # window, so attempting the upload there is free; if dist/ was never
         # populated, if-no-files-found: warn keeps that quiet.
         if: ${{ always() && !success() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: unsloth-prebuilt-${{ needs.resolve.outputs.tag }}
           path: dist/*
@@ -1208,7 +1208,7 @@ jobs:
       actions: read
     steps:
       - name: Checkout (for the composite action)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with: { persist-credentials: false }
 
       - name: Summarise run
