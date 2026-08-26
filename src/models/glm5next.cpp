@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-memory-recurrent.h"
+
 //
 // GLM-5.3-Flash: hybrid KDA (linear) + DSA (nope-only MLA) attention, mHC
 // hyper-connections, and a NextN block that is a full DSA decoder layer.
@@ -21,9 +23,13 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_lora_q > 0 && "glm5next requires a q LoRA");
     GGML_ASSERT(hparams.n_rot() == 0 && "glm5next MLA is nope-only");
 
-    // KDA
+    // KDA. no GGUF key for linear_num_heads, so the KDA head count is
+    // attention.head_count, which also sizes the recurrent state via n_embd_r/s().
+    // conversion/glm5next.py refuses a checkpoint where the two differ
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,      hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,         hparams.n_embd_head_kda);
+    GGML_ASSERT(hparams.ssm_d_conv > 1);
+    GGML_ASSERT(hparams.n_embd_head_kda > 0);
     // required: absent, kimi-k3 selects the softplus branch, a different
     // function, not a missing clamp
     ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound);
@@ -212,18 +218,128 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-// sublayers stubbed until the KDA and DSA commits, which must widen these
-// signatures and add the position and memory inputs the ctor does not build yet
+//
+// KDA layer
+//
+// one depthwise conv over the concatenated q|k|v channels, as in the reference: it
+// leaves the conv state one contiguous block, which is what build_conv_state needs to
+// snapshot for recurrent-state rollback. three separate convs would be numerically
+// identical but would restate the rollback write three times
+//
+ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
+        const llama_layer & layer,
+        llm_graph_input_rs * inp_rs,
+        ggml_tensor * cur,
+        int il) {
+    const int64_t head_dim     = hparams.n_embd_head_kda;
+    const int64_t d_inner      = head_dim * n_head;
+    const int64_t d_conv       = hparams.ssm_d_conv;
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    const auto * mctx_cur = inp_rs->mctx;
+
+    // f, g and beta read the layer input, NOT the convolved q/k/v
+    ggml_tensor * inp = cur;
+
+    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, inp);
+    ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.wk, inp);
+    ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.wv, inp);
+
+    ggml_tensor * qkv = ggml_concat(ctx0, ggml_concat(ctx0, Qcur, Kcur, 0), Vcur, 0);
+    qkv = ggml_reshape_3d(ctx0, qkv, 3*d_inner, n_seq_tokens, n_seqs);
+    cb(qkv, "kda_qkv", il);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * conv_in = build_conv_state(inp_rs, conv_states_all, qkv, d_conv, 3*d_inner, il);
+
+    // stored separately (kimi-linear, kimi-k3), stacked back into the single kernel
+    ggml_tensor * conv_w = ggml_concat(ctx0,
+            ggml_concat(ctx0,
+                ggml_reshape_2d(ctx0, layer.ssm_q_conv, d_conv, d_inner),
+                ggml_reshape_2d(ctx0, layer.ssm_k_conv, d_conv, d_inner), 1),
+            ggml_reshape_2d(ctx0, layer.ssm_v_conv, d_conv, d_inner), 1);
+
+    // SiLU is applied to the conv output, not to the projections
+    ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_in, conv_w));
+    cb(conv_out, "kda_conv", il);
+
+    const size_t nb_qkv  = ggml_row_size(conv_out->type, 3*d_inner);
+    const size_t nb_head = ggml_row_size(conv_out->type, head_dim);
+
+    Qcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+            nb_head, nb_qkv, nb_qkv*n_seq_tokens, 0);
+    Kcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+            nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, d_inner));
+    Vcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+            nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
+
+    // 1e-6 is the reference's own constant, not the model's norm eps. ggml_l2_norm
+    // divides by max(sqrt(sum), eps) where the reference uses sqrt(sum + eps); at
+    // head_dim 128 the clamp never binds, so close but not bit-exact
+    Qcur = ggml_l2_norm(ctx0, Qcur, 1e-6f);
+    Kcur = ggml_l2_norm(ctx0, Kcur, 1e-6f);
+    cb(Qcur, "kda_q_norm", il);
+    cb(Kcur, "kda_k_norm", il);
+
+    // the 1/sqrt(head_dim) query scale is applied inside build_delta_net, after this norm
+
+    // forget gate. gate_lower_bound is a multiplicative scale, not a clamp:
+    //   g = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))
+    // ssm_a holds -exp(A_log), so exp(A_log) * y == -(y * ssm_a)
+    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+    g = ggml_add(ctx0, g, layer.ssm_dt_b);
+    g = ggml_reshape_3d(ctx0, g, head_dim, n_head, n_tokens);
+    g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
+    g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
+    g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
+    g = ggml_reshape_4d(ctx0, g, head_dim, n_head, n_seq_tokens, n_seqs);
+    cb(g, "kda_gate", il);
+
+    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, inp);
+    beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs));
+    cb(beta, "kda_beta", il);
+
+    ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
+    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
+
+    ggml_tensor * out = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g, beta, state, il);
+
+    // the fallbacks return a permuted view, the fused op a contiguous one; cont
+    // either way rather than depend on which ran
+    ggml_tensor * o = ggml_cont_3d(ctx0, out, head_dim, n_head, n_tokens);
+    cb(o, "kda_scan_out", il);
+
+    // low-rank output gate (kimi-k3 has a single full-rank ssm_g instead)
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
+    gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
+
+    // RMS over head_dim only, one weight shared by every head, then a plain sigmoid
+    // gate: not the SiLU that FusedRMSNormGated defaults to
+    ggml_tensor * normed = build_norm(o, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
+    cb(gated, "kda_normed", il);
+
+    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, gated, d_inner, n_tokens));
+    cb(cur, "kda_out", il);
+
+    return cur;
+}
+
+// DSA is stubbed until its own commit; the mHC wiring around both sublayers is final
 ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
         const llama_model & model,
+        llm_graph_input_rs * inp_rs,
         ggml_tensor * cur,
-        int il) const {
-    GGML_UNUSED(model);
+        int il) {
+    if (hparams.is_recr(il)) {
+        return build_kda_layer(model.layers[il], inp_rs, cur, il);
+    }
+
     GGML_UNUSED(cur);
 
-    throw std::runtime_error(hparams.is_recr(il)
-            ? "glm5next: KDA attention not implemented yet"
-            : "glm5next: DSA attention not implemented yet");
+    throw std::runtime_error("glm5next: DSA attention not implemented yet");
 }
 
 ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
@@ -243,6 +359,13 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp         = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // recurrent half of the hybrid memory; the attention half is unused until DSA
+    llm_graph_input_rs * inp_rs = build_inp_mem_hybrid()->get_recr();
+
+    GGML_ASSERT(ubatch.n_seqs != 0);
+    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(ubatch.n_tokens == ubatch.n_seq_tokens * ubatch.n_seqs);
 
     const int64_t hc = hparams.dsv4_hc_mult;
 
@@ -272,7 +395,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_layer_attn(model, cur, il);
+        cur = build_layer_attn(model, inp_rs, cur, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);

@@ -1173,8 +1173,12 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context {
-        graph(const llm_graph_params & params) : llm_graph_context(params) {}
+    // llm_build_delta_net_base is a method-only mixin over llm_graph_context (no data
+    // members, no new virtuals), so this graph's layout and behaviour are unchanged.
+    // deepseek4 has no recurrent layers; it is here so glm5next, which derives from
+    // this graph for the mHC residual, can reach build_delta_net for its KDA layers
+    struct graph : public llm_build_delta_net_base {
+        graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_hc_pre(
@@ -1347,10 +1351,18 @@ struct llama_model_glm5next : public llama_model_base {
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // not const: the delta-net helpers append to the graph through the base
         ggml_tensor * build_layer_attn(
                 const llama_model & model,
+                llm_graph_input_rs * inp_rs,
                 ggml_tensor * cur,
-                int il) const;
+                int il);
+
+        ggml_tensor * build_kda_layer(
+                const llama_layer & layer,
+                llm_graph_input_rs * inp_rs,
+                ggml_tensor * cur,
+                int il);
 
         ggml_tensor * build_layer_ffn(
                 const llama_model & model,
