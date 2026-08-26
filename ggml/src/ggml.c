@@ -5515,7 +5515,6 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
 
     float params[] = { scale, 0.0f, 0.0f };
     ggml_set_op_params(result, params, sizeof(params));
-    memcpy(result->op_params + 16, &rel_extent, sizeof(rel_extent));
 
     result->op     = GGML_OP_FLASH_ATTN_EXT_BANDED;
     result->src[0] = q;
