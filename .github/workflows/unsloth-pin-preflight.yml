@@ -19,6 +19,11 @@ on:
     paths:
       - scripts/unsloth/pr-set.json
   workflow_dispatch:
+    inputs:
+      cmake_extra:
+        description: 'Extra cmake flags for the compile gate, e.g. -DGGML_CUDA=ON'
+        required: false
+        default: ''
 
 permissions:
   # write, not read: the mirror step pushes refs/pins/<sha>. With read it
@@ -60,6 +65,7 @@ jobs:
             echo "status=skip" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "base $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
           git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp.git scratch
           cd scratch
@@ -170,6 +176,78 @@ jobs:
             echo 'ALERT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # Merging is not building. Upstream deleting an enum value a pin still
+      # names, or changing a signature a pin still calls the old way, merges
+      # perfectly cleanly and then does not compile. Both shipped on 08-26, and
+      # the nightly is otherwise the first thing that ever compiles the mix --
+      # 3.5h after this job, with 39 build jobs already burning.
+      - name: ccache
+        if: ${{ steps.p.outputs.status == 'success' }}
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: preflight-cpu-${{ steps.p.outputs.base }}
+          restore-keys: |
+            preflight-cpu
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+
+      - name: Compile the merged tree
+        id: compile
+        if: ${{ steps.p.outputs.status == 'success' }}
+        working-directory: scratch
+        env:
+          # CUDA/Metal/Vulkan/HIP are deliberately off: this is a 4 vCPU runner
+          # and the point is a fast answer, not full coverage. See the summary
+          # the alert prints for what that leaves uncovered.
+          EXTRA: ${{ github.event.inputs.cmake_extra }}
+        run: |
+          set -uo pipefail
+          # EXAMPLES=ON and TOOLS=ON are both load-bearing: the two real breaks
+          # were in tools/mtmd/clip.cpp and examples/diffusion-gemma-server/.
+          # The nightly's own CPU child builds with EXAMPLES=OFF and compiles
+          # the diffusion targets in a step that never fails the job, which is
+          # exactly why one of them would have shipped silently.
+          if ! cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_NATIVE=OFF \
+              -DGGML_CUDA=OFF \
+              -DGGML_CPU_ALL_VARIANTS=OFF \
+              -DGGML_RPC=ON \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DLLAMA_BUILD_EXAMPLES=ON \
+              -DLLAMA_BUILD_TOOLS=ON \
+              -DLLAMA_BUILD_SERVER=ON \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              ${EXTRA:-} > configure.log 2>&1; then
+            # A configure failure is usually the runner, not the code. Say so
+            # and stay green: a gate that cries wolf is a gate people mute.
+            echo "::warning::preflight compile could not configure; not treating this as a pin failure"
+            tail -30 configure.log
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if cmake --build build --config Release 2>&1 | tee build.log | tail -40; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          {
+            echo 'details<<ALERT_EOF'
+            echo "The pins merge onto \`${{ steps.p.outputs.base }}\` but the merged tree does not compile."
+            echo "Tonight's nightly will fail unless a pin is fixed or dropped."
+            echo
+            echo '```'
+            grep -E 'error|Error' build.log | head -20
+            echo '```'
+            echo
+            echo "Checked: CPU only, examples + tools + server, RPC on."
+            echo "NOT checked: CUDA, Metal, Vulkan, HIP, SYCL, any runtime behaviour."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Alert
         if: ${{ steps.p.outputs.status != 'skip' }}
         uses: ./.github/actions/prebuilt-alert
@@ -178,6 +256,16 @@ jobs:
           key: llama-pin-preflight
           title: 'Pinned PRs no longer merge onto the current base tag'
           details: ${{ steps.p.outputs.details }}
+          token: ${{ github.token }}
+
+      - name: Alert on a merged tree that does not compile
+        if: ${{ steps.compile.outputs.status == 'success' || steps.compile.outputs.status == 'failure' }}
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.compile.outputs.status }}
+          key: llama-pin-compile
+          title: 'Pins merge but the merged tree does not compile'
+          details: ${{ steps.compile.outputs.details }}
           token: ${{ github.token }}
 
       # The probe reports through its output, so without this the run still
@@ -189,4 +277,12 @@ jobs:
         if: ${{ steps.p.outputs.status == 'failure' }}
         run: |
           echo "::error::pins do not merge onto the current base tag; see the alert above"
+          exit 1
+
+      # Same reason as above: prebuilt-alert always exits 0, so without this the
+      # run stays green and the repin bot never sees a failed workflow_run.
+      - name: Fail the run when the merged tree does not compile
+        if: ${{ steps.compile.outputs.status == 'failure' }}
+        run: |
+          echo "::error::pins merge but the merged tree does not compile; see the alert above"
           exit 1

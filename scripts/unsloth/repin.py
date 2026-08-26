@@ -112,9 +112,21 @@ def repin_one(pin: dict, base: str, work: Path) -> dict:
         return out
 
     repo = work / f"r{pin['num']}"
-    run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
+    # A full clone, not --filter=blob:none. A merge needs the blobs of both
+    # sides, and a partial clone re-fetches them one at a time from the
+    # promisor -- which fails outright when the branch history references an
+    # object that has since been force-pushed away, since nothing can serve it.
+    # That failure looked exactly like a conflict for weeks.
+    run(["git", "clone", "-q", "--no-checkout",
          f"https://github.com/{pin['src']}.git", str(repo)])
     run(["git", "fetch", "-q", "--no-tags", "origin", pin["sha"]], cwd=repo, check=False)
+    # A PR from a fork keeps its history in the fork. refs/pull/N/head on the
+    # upstream repo reaches the tip but not every object behind it, so fetch the
+    # branch from the head repo too.
+    if head_repo and head_repo != pin["src"]:
+        run(["git", "fetch", "-q", "--no-tags",
+             f"https://github.com/{head_repo}.git", head_ref or pin["sha"]],
+            cwd=repo, check=False)
     r = run(["git", "fetch", "-q", "--no-tags",
              "https://github.com/ggml-org/llama.cpp.git",
              f"refs/tags/{base}:refs/tags/{base}"], cwd=repo, check=False)
@@ -142,25 +154,31 @@ def repin_one(pin: dict, base: str, work: Path) -> dict:
 
     if m.returncode != 0:
         report = work / f"res{pin['num']}.json"
-        rc = subprocess.run(
+        am = subprocess.run(
             [sys.executable, str(HERE / "additive_merge.py"),
              "--repo", str(repo), "--report", str(report)],
             capture_output=True, text=True,
-        ).returncode
+        )
+        rc = am.returncode
         res = json.loads(report.read_text()) if report.exists() else {}
         if rc != 0:
-            out["action"] = "conflict"
             refused = res.get("refused", [])
             out["files"] = [x["file"] for x in refused if x["file"] != "-"]
             if out["files"]:
+                out["action"] = "conflict"
                 out["note"] = "; ".join(f"`{x['file']}`: {x['reason']}" for x in refused)
             else:
-                # git refused the merge without leaving a single conflicted
-                # file, so the conflict report explains nothing. Its stderr is
-                # the only thing that does, and discarding it turns a
-                # diagnosable failure into "no conflicted files".
+                # No conflicted file means git did not actually conflict, so
+                # this is not something a human can resolve by editing code:
+                # a missing object, unrelated histories, a broken index, or
+                # additive_merge itself crashing. Calling that a conflict sent
+                # people looking for a merge to fix and hid a real bug for
+                # weeks, so it gets its own action.
+                out["action"] = "error"
                 tail = ((m.stderr or "") + (m.stdout or "")).strip().splitlines()
-                out["note"] = ("merge failed with no conflicts: " + " / ".join(tail[-3:])
+                if not tail:
+                    tail = ((am.stderr or "") + (am.stdout or "")).strip().splitlines()
+                out["note"] = ("merge failed without conflicting: " + " / ".join(tail[-3:])
                                if tail else "merge failed and git said nothing")
             run(["git", "merge", "--abort"], cwd=repo, check=False)
             return out
@@ -193,6 +211,8 @@ def markdown(base: str, results: list[dict]) -> str:
                 what += f" ({len(r['hunks'])} add/add hunk(s) resolved)"
         elif r["action"] == "conflict":
             what = f"**conflict, not resolvable automatically** -- {r['note']}"
+        elif r["action"] == "error":
+            what = f"**failed, not a conflict** -- {r['note']}"
         elif r["action"] == "third-party":
             what = f"not ours -- {r['note']}"
         else:
@@ -237,7 +257,9 @@ def main() -> int:
         try:
             r = repin_one(pin, args.base, work)
         except RuntimeError as e:
-            r = dict(pin, action="skip", note=f"error: {e}", new_sha="", files=[], hunks=[])
+            # Clone or another checked git call blew up. Not a conflict, and not
+            # a deliberate skip either.
+            r = dict(pin, action="error", note=f"error: {e}", new_sha="", files=[], hunks=[])
         results.append(r)
         print(f"{r['src']}#{r['num']}: {r['action']} {r['note']}".rstrip())
 

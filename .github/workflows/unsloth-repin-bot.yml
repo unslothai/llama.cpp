@@ -77,8 +77,13 @@ jobs:
             --markdown "${RUNNER_TEMP}/repin.md"
           CHANGED="$(jq -r '.changed' "${RUNNER_TEMP}/repin.json")"
           BLOCKED="$(jq -r '[.results[] | select(.action == "conflict" or .action == "third-party")] | length' "${RUNNER_TEMP}/repin.json")"
+          # Kept apart from BLOCKED: these did not conflict, so there is no
+          # merge for anyone to resolve. Reporting them as pins-needing-a-human
+          # is what let a fetch bug look like ordinary churn for weeks.
+          ERRORED="$(jq -r '[.results[] | select(.action == "error")] | length' "${RUNNER_TEMP}/repin.json")"
           echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
           echo "blocked=$BLOCKED" >> "$GITHUB_OUTPUT"
+          echo "errored=$ERRORED" >> "$GITHUB_OUTPUT"
 
       - name: Push the merged branches and open the PR
         id: push
@@ -159,6 +164,7 @@ jobs:
         env:
           CHANGED: ${{ steps.repin.outputs.changed }}
           BLOCKED: ${{ steps.repin.outputs.blocked }}
+          ERRORED: ${{ steps.repin.outputs.errored }}
           OUTCOME: ${{ steps.repin.outcome }}
           MODE: ${{ steps.push.outputs.mode }}
           PR: ${{ steps.push.outputs.pr }}
@@ -193,6 +199,12 @@ jobs:
               STATUS=failure
               echo
               echo "${BLOCKED} pin(s) need a human, see the table above."
+            fi
+            if [ "${ERRORED:-0}" != "0" ]; then
+              STATUS=failure
+              echo
+              echo "${ERRORED} pin(s) failed without conflicting. That is a bug in the tooling or a"
+              echo "missing object, not a merge to resolve; read the message before hand-merging anything."
             fi
             echo 'ALERT_EOF'
           } >> "$GITHUB_OUTPUT"
