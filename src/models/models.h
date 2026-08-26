@@ -1240,6 +1240,11 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
+
+        // unweighted mean over the streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+        static ggml_tensor * build_hc_mean(
+                ggml_context * ctx,
+                ggml_tensor  * x);
     };
 
     struct graph_mtp : public graph {
@@ -1281,6 +1286,23 @@ struct llama_model_glm5next : public llama_model_base {
     llama_model_glm5next(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // glm5next's mHC is DeepSeek-V4's hyper-connection block (same wide residual,
+    // 24-row mixer split, activations, Sinkhorn); only the final collapse differs
+    // (unweighted mean, not a learned gated head), so derive rather than restate
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_layer_attn(
+                const llama_model & model,
+                ggml_tensor * cur,
+                int il) const;
+
+        ggml_tensor * build_layer_ffn(
+                const llama_model & model,
+                ggml_tensor * cur,
+                int il) const;
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
