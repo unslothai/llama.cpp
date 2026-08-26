@@ -2257,6 +2257,15 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 tokenizer_pre == "chatglm-bpe") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_CHATGLM4;
                 special_bos_id = LLAMA_TOKEN_NULL;
+                // glm4 tokenizer.json sets "ignore_merges": true. without it greedy BPE
+                // cannot reach some vocab entries: " 王" (Ġçİĭ, 102322) needs (Ġ,çİĭ)=242943
+                // but (Ġ,ç)=27944 wins first, so it stops three tokens short. triggered by
+                // whitespace before CJK, inflating mixed Chinese-English ~13%.
+                // NOT applied to chatglm-bpe, which shares this pre_type but is a different
+                // tokenizer (ChatGLM3) not confirmed to declare the flag.
+                if (tokenizer_pre == "glm4") {
+                    ignore_merges = true;
+                }
             } else if (
                 tokenizer_pre == "viking") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_VIKING;

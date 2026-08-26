@@ -32,6 +32,10 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+// defined in llama-kv-cache-kpool.h, which includes this header, so it can only
+// be forward declared here
+class llm_graph_input_kpool;
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -1343,6 +1347,48 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    //
+    // pooled (GLM-5-Next lightning) indexer
+    //
+
+    // one pooling map per ubatch, shared by every indexer layer. see
+    // llama-kv-cache-kpool.h for what the tensors mean and why they are built
+    // host side rather than derived in the graph.
+    //
+    // `scoring` false allocates only k_idxs: the indexer key and gate store is
+    // unconditional, the selection is not. An input tensor with no consumer is
+    // never backed by the allocator, so the rest must not be created either
+    llm_graph_input_kpool * build_inp_kpool(
+            const llama_memory_hybrid_context * mctx_cur,
+            ggml_tensor * kq_mask,
+            bool scoring) const;
+
+    // sparse (pooled top-k) variant of the llm_graph_input_attn_k build_attn.
+    //
+    // Identical to it except for the mask. `top_k` names the cells the pooled
+    // indexer selected, already expanded from whole pools; they are unmasked on
+    // top of `sel_mask`, which arrives already holding 0.0f on the query's own
+    // always-selected trailing pool. `cand_mask` is the reference's candidate
+    // set and is what makes an over-budget selection harmless: ggml_top_k
+    // returns a full budget of pool ordinals even when fewer pools carry a
+    // finite score, which during prefill is the normal state
+    ggml_tensor * build_attn_sparse(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,     // [n_head_q]
+            ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
+            ggml_tensor * sel_mask,  // F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * cand_mask, // F32 [n_kv, n_batch, 1, n_stream]
+                  float   kq_scale,
+                    int   il) const;
 
     //
     // pooling
