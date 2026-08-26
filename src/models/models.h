@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <map>
 
 //
 // base classes
@@ -2271,6 +2272,100 @@ struct llama_model_qwen35 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+
+struct llama_model_qwen4exp : public llama_model_base {
+    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    // PLE predecessors are absent from a decode ubatch, so remember them here
+    // (vLLM's ngram_context). next_pos guards it: a mismatch means the sequence
+    // was reset or rewound, and the hash falls back to EOS padding.
+    struct ple_history {
+        llama_pos                next_pos = -1;
+        std::vector<llama_token> toks;
+    };
+    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+    private:
+        // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
+        ggml_tensor * build_hc_mix(
+                    ggml_tensor * x,
+                    ggml_tensor * w_norm,
+                    ggml_tensor * w_down,
+                    ggml_tensor * w_up,
+                    ggml_tensor * w_inject,
+                    ggml_tensor ** inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * inject,
+                            int   il);
+
+        ggml_tensor * build_layer_attn(
+        llm_graph_input_attn_kv * inp_attn,
+  const llama_kv_cache_context * mctx_idx,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        ggml_tensor * build_qsa_top_k(
+  const llama_kv_cache_context * mctx_idx,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_layer_attn_linear(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
+        ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il);
+
+        ggml_tensor * build_norm_gated(
+                    ggml_tensor * input,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+
+        // build_rs writes the state tensor in place, so run it at most once per
+        // layer; both convolutions share this gather.
+        std::map<int, ggml_tensor *> rs_rows;
+
+        // conv history at an explicit offset: delta-net and PLE share the row
+        ggml_tensor * build_conv_state_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   row_offset,
+                            int   il);
+
+        ggml_tensor * build_ple(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * hidden,
+                            int   il);
+
+        // returns pair of qkv, z
+        std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
+                    ggml_tensor * input,
+                            int   il);
+
+        const llama_model & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
 
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}

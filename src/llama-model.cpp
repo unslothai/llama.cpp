@@ -319,6 +319,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
+        case LLM_ARCH_QWEN4EXP:
+            return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -927,6 +929,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
+        case LLM_TYPE_A3B:           return "A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
         case LLM_TYPE_102B_A12B:     return "102B.A12B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
@@ -2429,6 +2432,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
+                    // null for every architecture but the sparse-attention ones, which is what keeps
+                    // the indexer cache from existing
+                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
                     if (arch == LLM_ARCH_FALCON_H1) {
@@ -2441,13 +2447,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
+
+                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                            // QSA runs on the dense-attention layers only
+                            filter_idx = [&](uint32_t il) {
+                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                        }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2488,7 +2501,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* filter_idx        */ std::move(filter_idx));
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2891,6 +2905,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:
             return LLAMA_ROPE_TYPE_IMROPE;
 
