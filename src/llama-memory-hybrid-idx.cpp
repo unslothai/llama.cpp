@@ -59,9 +59,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // note: this repeats llama_memory_hybrid::init_batch because the indexer cache has to be
-    //       handed the attention cache's slot infos, and those are not reachable through the
-    //       llama_memory_hybrid_context that the base implementation returns
+    // note: this repeats llama_memory_hybrid::init_batch because the indexer cache needs the
+    //       slot infos of the attention cache, which the base context does not expose
     do {
         balloc.split_reset();
 
@@ -112,10 +111,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // The indexer cache is a side buffer addressed by the attention cache's cells, so it
-        // takes that slot layout rather than finding its own. Allocating separately let the
-        // two drift once context was rewritten between turns, pointing QSA top-k at the
-        // wrong cells.
+        // the indexer cache is addressed by the cells of the attention cache, so it takes that
+        // slot layout instead of finding its own; a separate layout can drift from it
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
@@ -148,8 +145,8 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // same order as llama_memory_hybrid::seq_rm: try the recurrent cache first since it is the
-    // one that may refuse, and if it does the caches are left untouched
+    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it
+    // first and leave the other caches untouched if it does
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
@@ -218,13 +215,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 //
 // [TAG_PLE_HISTORY] per-sequence PLE n-gram history
 //
-// The window is only meaningful while it is contiguous with the position the sequence is
-// about to decode, so every operation below either rewrites it exactly or invalidates it.
-// Invalidating means next_pos = -1, which set_input turns into full EOS padding - the same
-// thing a fresh sequence gets, and the same thing this code did before it followed the
-// sequence operations at all. It is therefore never worse than the previous behaviour, and
-// it is exact in the cases that matter (a rewind to a prefix, a copied sequence, a context
-// shift).
+// The window is only usable while it is contiguous with the position the sequence decodes next,
+// so each operation below either rewrites it exactly or invalidates it with next_pos = -1.
+// An invalid window makes set_input pad with EOS, which is what a fresh sequence also gets.
 //
 
 llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx::ple_hist_get(llama_seq_id seq_id) const {
@@ -275,16 +268,15 @@ void llama_memory_hybrid_idx::ple_hist_rm(llama_seq_id seq_id, llama_pos p0, lla
     }
 
     if (p1 < 0) {
-        // a rewind: the sequence now ends at p0 and the surviving prefix of the window is
-        // still contiguous with it, which is the case a session rollback actually hits
+        // a rewind: the sequence ends at p0 and the remaining prefix is still contiguous
         if (p0 < h.next_pos) {
             ple_hist_truncate(h, p0);
         }
         return;
     }
 
-    // a hole punched somewhere in the middle. seq_rm does not renumber what follows, so a
-    // window that overlaps the hole is no longer a run of consecutive positions
+    // a hole in the middle: seq_rm does not renumber what follows, so an overlapping
+    // window is no longer a run of consecutive positions
     if (p1 > ple_hist_beg(h) && p0 < h.next_pos) {
         ple_hist_invalidate(h);
     }
@@ -309,8 +301,8 @@ void llama_memory_hybrid_idx::ple_hist_cp(llama_seq_id seq_id_src, llama_seq_id 
         ple_hist_truncate(h, p1);
     }
 
-    // positions below p0 were not copied, so for the destination they are before the start
-    // of the sequence, which the hash already reads as EOS
+    // positions below p0 were not copied, so for the destination they are before the
+    // sequence start, which the hash already reads as EOS
     const llama_pos lo = p0 < 0 ? 0 : p0;
     if (lo > ple_hist_beg(h)) {
         const llama_pos drop = std::min<llama_pos>(lo - ple_hist_beg(h), (llama_pos) h.toks.size());
@@ -352,8 +344,7 @@ void llama_memory_hybrid_idx::ple_hist_add(llama_seq_id seq_id, llama_pos p0, ll
         return;
     }
     if (lo <= beg && (p1 < 0 || p1 >= h.next_pos)) {
-        // the whole window moves as one, so it stays a run of consecutive positions.
-        // this is the context-shift case
+        // the context-shift case: the whole window moves as one and stays consecutive
         if (beg + shift < 0) {
             ple_hist_invalidate(h);
         } else {
@@ -382,9 +373,7 @@ void llama_memory_hybrid_idx::ple_hist_div(llama_seq_id seq_id, llama_pos p0, ll
 
     const llama_pos lo = p0 < 0 ? 0 : p0;
 
-    // dividing positions makes them non-consecutive, so any overlap ends the window. no
-    // caller in tree divides positions of an architecture that has a PLE table, but leaving
-    // this out would silently keep a window whose positions no longer line up
+    // division makes the positions non-consecutive, so any overlap ends the window
     if ((p1 < 0 || p1 > ple_hist_beg(h)) && lo < h.next_pos) {
         ple_hist_invalidate(h);
     }
@@ -427,8 +416,8 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
     uint32_t n_entries = 0;
     io.read(&n_entries, sizeof(n_entries));
 
-    // a single-sequence restore replaces only that sequence's window; a whole-context one
-    // replaces the lot, matching what the caches around it do
+    // a single-sequence restore replaces one window, a whole-context one replaces them all,
+    // as the caches around it do
     if (seq_id >= 0) {
         ple_hist.erase(seq_id);
     } else {
@@ -444,8 +433,8 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
         io.read(&next_pos, sizeof(next_pos));
         io.read(&n_toks,   sizeof(n_toks));
 
-        // the window is never longer than ple_ngram_size - 1; anything else is a corrupt or
-        // mismatched blob, and reading it would size an allocation from the file
+        // the window is never longer than ple_ngram_size - 1, so a larger count is a corrupt
+        // blob and would size an allocation from the file
         if (n_toks > 64) {
             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
         }
@@ -455,8 +444,7 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
             io.read(toks.data(), n_toks*sizeof(llama_token));
         }
 
-        // a single-sequence restore may target a different seq_id than the one it was saved
-        // from, so the destination wins over the stored id
+        // a single-sequence restore can target a different seq_id, so the destination wins
         const llama_seq_id dst = seq_id >= 0 ? seq_id : (llama_seq_id) id;
 
         auto & h = ple_hist[dst];
@@ -468,43 +456,27 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
-    // [TAG_HYBRID_IDX_STATE]
-    // the indexer cache is written last so that its payload is a pure suffix of the
-    //   attn+recr layout every other hybrid model already produces. Placing it between
-    //   the two would make a reader that does not expect it parse the indexer bytes as
-    //   recurrent state, which can succeed and restore silent garbage; as a suffix, a
-    //   reader that does not expect it just stops early and the trailing bytes are
-    //   caught by the size check in llama_context::state_load_file.
-    // the indexer mirrors the attention cache, so it follows the same PARTIAL_ONLY
-    //   gate: a partial checkpoint deliberately skips the token-level attention caches.
+    // [TAG_HYBRID_IDX_STATE] the indexer section is written last, so it is a pure suffix of the
+    // attn+recr layout: a reader that does not expect it stops early instead of misparsing it.
+    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
             mem_idx->state_write(io, seq_id, flags);
         }
     }
 
-    // [TAG_PLE_HISTORY]
-    // last again, for the same reason the indexer section is: a pure suffix, so a reader
-    //   that does not expect it stops early rather than parsing these bytes as something
-    //   else. This is written after the indexer section because it is the newer of the two.
-    // unlike the indexer this is NOT under the PARTIAL_ONLY gate. The n-gram window is
-    //   recurrent state, not a token-level cache - it is the input the PLE convolution's
-    //   own recurrent state is derived from - and the recurrent cache next to it is written
-    //   for partial checkpoints too. Skipping it would leave the server's speculative
-    //   decoding checkpoints restoring the conv state without the window that produced it.
+    // [TAG_PLE_HISTORY] last again, so this section is also a pure suffix.
+    // It is not under the PARTIAL_ONLY gate: the window is recurrent state, the input the PLE
+    // conv state comes from, and the recurrent cache is written for partial checkpoints too.
     ple_hist_state_write(io, seq_id);
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_memory_hybrid::state_read(io, seq_id, flags);
 
-    // [TAG_HYBRID_IDX_STATE]
-    // must mirror the write order above.
-    // the indexer restores its own cells rather than being handed the attention
-    //   cache's restored slots, which is safe because the two caches are kept in
-    //   lockstep - same size, same n_pad, same seq_* operations, and init_batch hands
-    //   the indexer the attention cache's slot infos - so both state_read_meta calls
-    //   run find_slot over identical occupancy and land on identical cells.
+    // [TAG_HYBRID_IDX_STATE] must mirror the write order above.
+    // The indexer finds its own cells, which is safe because the two caches stay in lockstep:
+    // both state_read_meta calls run find_slot over the same occupancy and land on the same cells.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
             mem_idx->state_read(io, seq_id, flags);
@@ -623,8 +595,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
-    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio. All three
-    // mrope sections carry it: exact for text, approximate for images. Positions repeat per stream.
+    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
+    // all mrope sections carry it: exact for text, approximate for images
     for (int64_t sec = 0; sec < 4; ++sec) {
         for (int64_t s = 0; s < n_ns; ++s) {
             for (int64_t b = 0; b < n_blocks; ++b) {
@@ -633,8 +605,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         }
     }
 
-    // One pass per stream: cell j is a different token in each, so no mapping is shared.
-    // n_ns == 1 is the single-stream behaviour this replaced.
+    // one pass per stream: cell j is a different token in each, so no mapping is shared
     std::vector<int32_t> blk_of(n_kv);
     std::vector<int32_t> filled(n_blocks);
 
@@ -646,8 +617,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
-        // an incomplete block cannot be pooled: those tail cells are forced in by the bias
-        // below, so block 0 only keeps the gather in range. -1 = no usable block.
+        // an incomplete block cannot be pooled; the bias below forces those tail cells in
+        // -1 means no usable block, and block 0 only keeps the gather in range
         std::fill(blk_of.begin(),  blk_of.end(),  -1);
         std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
@@ -681,8 +652,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
             const llama_pos    q      = ubatch->pos[i];
 
-            // the rest is an incomplete block, always attended to, which is what lands the
-            // selection on block boundaries like the reference
+            // the tail is an incomplete block and is always visible, as in the reference
             const llama_pos tail_start = (q + 1)/r*r;
 
             float * cur_bias = dst_bias + i*n_kv;
