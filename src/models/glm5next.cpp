@@ -11,6 +11,27 @@
 // load time, so conversion/glm5next.py is the only place the sign is checked.
 //
 
+// how many positions the indexer keeps: index_topk/index_kpool whole pools, plus the
+// always-selected tail pool minus one. below this many cached tokens every position is
+// selected and the sparse path is exactly the dense one built here.
+//
+// asserted rather than measured. an off-by-one here is invisible to every output
+// comparison there is: the reference's own seeded off-by-one on this width is
+// bit-identical on both the dense and the sparse fixtures. the second form below is the
+// independent spelling the parity harness uses, so the two have to agree
+static uint32_t glm5next_n_select(const llama_hparams & hparams) {
+    GGML_ASSERT(hparams.indexer_kpool > 0);
+    GGML_ASSERT(hparams.indexer_top_k >= hparams.indexer_kpool);
+    GGML_ASSERT(hparams.indexer_top_k % hparams.indexer_kpool == 0);
+
+    const uint32_t n_select = hparams.indexer_top_k + hparams.indexer_kpool - 1;
+
+    GGML_ASSERT(n_select > hparams.indexer_top_k);
+    GGML_ASSERT(n_select == (hparams.indexer_top_k/hparams.indexer_kpool + 1)*hparams.indexer_kpool - 1);
+
+    return n_select;
+}
+
 void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0
@@ -42,6 +63,12 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,      hparams.indexer_kpool);
     GGML_ASSERT(hparams.indexer_kpool > 0);
     GGML_ASSERT(hparams.indexer_top_k % hparams.indexer_kpool == 0);
+
+    const uint32_t n_select = glm5next_n_select(hparams);
+    if (hparams.n_ctx_train > n_select) {
+        LLAMA_LOG_WARN("%s: attention is dense above %u cached tokens, but this checkpoint trains to %u. "
+                "the sparse selection is not implemented yet\n", __func__, n_select, hparams.n_ctx_train);
+    }
 
     // mHC
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
