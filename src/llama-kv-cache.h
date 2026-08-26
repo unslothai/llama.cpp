@@ -366,17 +366,14 @@ public:
 
     uint32_t get_n_kv() const;
 
-    // streams covered by the current slot info, matching the `ns` that get_k and
-    // get_v use for their stream dimension. 1 for a unified cache.
-    //
-    // note: this is the stream RANGE s1 - s0 + 1, not the number of sequences in
-    // the ubatch. They differ when the active sequences are not a contiguous run
-    // of slots, which is exactly when a per-cell input sized from this would stop
-    // agreeing with a KQ mask, sized from n_seqs_unq
+    // streams covered by the current slot info, matching the `ns` get_k/get_v use for
+    // their stream dimension. 1 for a unified cache. note: this is the stream RANGE
+    // s1 - s0 + 1, not n_seqs_unq; they differ when the active sequences are not a
+    // contiguous run of slots, i.e. exactly when a per-cell input sized from this would
+    // stop agreeing with a KQ mask
     uint32_t get_n_stream() const;
 
-    // the cache this context is a view of, for host-side inputs that have to
-    // resolve cell -> position through the cells themselves
+    // the cache this context views, for host-side inputs that resolve cell -> position
     const llama_kv_cache * get_kv() const;
 
     ggml_type type_k() const;

@@ -1,13 +1,11 @@
-// The GLM-5-Next hybrid memory.
+// The GLM-5-Next hybrid memory: the memory object holds all three halves (KDA
+// recurrent + conv state, MLA latent KV, pooled indexer key cache) at the sizes the
+// reference implies, one ggml graph reaches every one of them, and the pooled top-k
+// cuts on a pool boundary and agrees between CPU and CUDA. The indexer graph itself is
+// not built here.
 //
-// Bar: the memory object can be created for a real glm5next GGUF, it holds all
-// three halves (KDA recurrent + conv state, MLA latent KV, pooled indexer key
-// cache), the sizes are the ones the reference implies, a trivial ggml graph can
-// reach every one of them, and the pooled top-k cuts on a pool boundary and
-// agrees between CPU and CUDA. The indexer graph itself is not built here.
-//
-// Run as:  test-glm5next-memory <tiny-glm5next.gguf>
-// The GGUF is the one tests/glm5next_make_tiny_gguf.py writes.
+// Run as:  test-glm5next-memory <tiny-glm5next.gguf>, as written by
+// tests/glm5next_make_tiny_gguf.py
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -50,15 +48,12 @@ static int n_fail = 0;
     } while (0)
 
 //
-// numeric evidence for the top-k width, independent of any model
-//
-// The claim: running ggml_top_k at exactly indexer_top_k with the trailing
-// incomplete pool biased to -INFINITY cuts on a pool boundary and gives the same
-// selection on CPU and on CUDA, where the reference's own output width
-// (indexer_top_k + kpool - 1) with the tail forced in by a +1e9 score does not.
+// numeric evidence for the top-k width, independent of any model: ggml_top_k at exactly
+// indexer_top_k with the trailing incomplete pool biased to -INFINITY cuts on a pool
+// boundary and agrees between CPU and CUDA, where the reference's output width
+// (indexer_top_k + kpool - 1) with the tail forced in at +1e9 does not
 //
 
-// run ggml_top_k(scores, width) on one backend and return the selected indices
 static std::vector<int32_t> run_top_k(
         ggml_backend_t backend,
         const std::vector<float> & scores,
@@ -105,7 +100,6 @@ static std::vector<int32_t> run_top_k(
     return out;
 }
 
-// how many pools of the selection are only partly present
 static int64_t n_partial_pools(const std::vector<int32_t> & sel, int64_t off, int64_t width, int64_t kpool) {
     std::map<int32_t, int32_t> cnt;
     for (int64_t i = 0; i < width; ++i) {
@@ -128,9 +122,8 @@ static void test_top_k_boundary() {
     const int64_t n_kv   = 8192;
     const int64_t n_rows = 4;            // queries
 
-    // pool p's score. all kpool members of a pool carry it bit-identically, which
-    // is what makes an intra-pool tie harmless: the pool is taken whole or not at
-    // all as long as the budget ends on a pool boundary
+    // all kpool members of a pool carry the pool score bit-identically, so an
+    // intra-pool tie is harmless as long as the budget ends on a pool boundary
     const int64_t n_pools = n_kv/kpool;
 
     std::vector<float> pool_score(n_pools);
@@ -151,8 +144,8 @@ static void test_top_k_boundary() {
     printf("%s  GPU backend for the top-k comparison: %s\n",
             backend_gpu ? "ok  " : "note", backend_gpu ? ggml_backend_name(backend_gpu) : "none, CPU only");
 
-    // t = (q + 1) %% kpool cells of trailing incomplete pool. t == 3 is the one
-    // residue for which the reference's own width happens to stay pool-aligned
+    // t = (q + 1) %% kpool cells of trailing incomplete pool. t == 3 is the one residue
+    // where the reference's own width happens to stay pool-aligned
     for (int64_t t = 0; t < kpool; ++t) {
         const int64_t n_tail = t;
         const int64_t n_full = n_kv - n_tail;   // cells belonging to complete pools
@@ -223,8 +216,8 @@ static void test_top_k_boundary() {
                 std::set<int32_t> b(sel_old_gpu.begin() + r*w_old, sel_old_gpu.begin() + (r + 1)*w_old);
                 same_old = a == b;
             }
-            // reported, not asserted: whether the arbitrary intra-pool pick
-            // actually diverges depends on each backend's partial sort
+            // reported, not asserted: whether the arbitrary pick actually diverges
+            // depends on each backend's partial sort
             printf("note t=%d: CPU and %s %s at width %d\n",
                     (int) t, ggml_backend_name(backend_gpu),
                     same_old ? "happen to agree" : "DISAGREE", (int) w_old);
@@ -321,12 +314,10 @@ int main(int argc, char ** argv) {
 
     // ---- a multi-sequence unified cache is rejected at create time ----------
     //
-    // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]. Pools group cells by position, and a
-    // unified cache gives every sequence the same cells array, so two sequences
-    // at the same position would pool each other's keys. -kvu with --parallel is
-    // reachable (llama-perplexity forces it for hellaswag / winogrande /
-    // multiple-choice), so this has to fail at startup rather than abort inside
-    // a set_input several thousand tokens in.
+    // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]. pools group cells by position and a unified
+    // cache shares one cells array, so two sequences at the same position would pool
+    // each other's keys. -kvu with --parallel is reachable (llama-perplexity forces it
+    // for hellaswag / winogrande / multiple-choice), so this must fail at startup.
     {
         llama_cparams cp = {};
         cp.n_ctx       = 256;
@@ -350,8 +341,8 @@ int main(int argc, char ** argv) {
         }
         CHECK(threw, "-kvu with n_seq_max 2 is refused when the model has a pooling indexer");
 
-        // one sequence in flight is fine: the shared cells array holds only that
-        // sequence's keys, and the map filters on seq_has anyway
+        // one sequence in flight is fine: the shared cells array holds only its keys,
+        // and the map filters on seq_has anyway
         cp.n_seq_max = 1;
         llama_memory_i * raw = nullptr;
         try {
@@ -481,8 +472,7 @@ int main(int argc, char ** argv) {
         CHECK(k_mla->ne[1] == k_idx->ne[1], "MLA and indexer caches have the same cell count (%d)", (int) k_mla->ne[1]);
         CHECK(k_mla->ne[2] == k_idx->ne[2], "MLA and indexer caches have the same stream count (%d)", (int) k_mla->ne[2]);
 
-        // is_mla() stays true for the indexer hparams copy, which is what keeps
-        // it from allocating a V tensor it would never read
+        // is_mla() stays true for the indexer hparams copy, so no V is allocated
         {
             size_t bytes = 0;
             for (const auto & b : kv_idx->memory_breakdown()) {
@@ -491,9 +481,7 @@ int main(int argc, char ** argv) {
 
             const size_t k_only = (size_t) ggml_nbytes(k_idx)*kv_idx->get_layer_ids().size();
 
-            // is_mla() is what suppresses the V allocation, and the indexer
-            // hparams copy does not touch the fields it reads, so the byte count
-            // is the observable: K only, no V
+            // the byte count is the observable: K only, no V
             CHECK(hparams.is_mla() && bytes == k_only,
                     "indexer cache allocates K and no V: %zu bytes for %zu layers",
                     bytes, kv_idx->get_layer_ids().size());
@@ -563,12 +551,11 @@ int main(int argc, char ** argv) {
             CHECK(ctx_recr != nullptr, "context exposes the recurrent half");
             CHECK(ctx_idx  != nullptr, "context exposes the indexer half");
 
-            // n_kv is only valid once the context has been applied. apply() also
-            // asserts the two caches agree
+            // n_kv is only valid once applied; apply() also asserts the caches agree
             mctx->apply();
 
-            // apply() asserts both of these itself, so reaching this line at all
-            // is the result; printed rather than CHECKed so the count stays honest
+            // apply() asserts both itself, so reaching this line is the result; printed
+            // rather than CHECKed so the count stays honest
             printf("note indexer and attention caches agree on n_kv (%u) and n_stream (%u)\n",
                     ctx_idx->get_n_kv(), ctx_idx->get_n_stream());
             CHECK(ctx_idx && ctx_idx->get_kv() == kv_idx, "the indexer context is a view of the indexer cache");
@@ -616,15 +603,15 @@ int main(int argc, char ** argv) {
                     "graph reaches the KDA conv state [%d x %d] and recurrent state [%d x %d]",
                     (int) r_kda->ne[0], (int) r_kda->ne[1], (int) s_kda->ne[0], (int) s_kda->ne[1]);
 
-            // 4. host-side pool map, the piece the indexer needs and nothing else has
+            // 4. host-side pool map
             const int64_t kpool   = hparams.indexer_kpool;
             const int64_t n_pools = llama_kpool_n_pools((uint32_t) n_kv, (uint32_t) kpool);
             const int64_t n_padq  = n_tps;   // this tree does not pad the KQ mask
 
             kpool_tensors kt = alloc_kpool_tensors(ctx0, n_kv, n_tps, n_padq, n_stream, kpool, n_pools);
 
-            // the shape of the real thing: gather the pool members, mix them,
-            // score, broadcast the pool score back onto its member cells, top-k.
+            // shape of the real thing: gather pool members, mix, score, broadcast the
+            // pool score back onto its member cells, top-k
             ggml_tensor * members = ggml_get_rows(ctx0, k_idx_v, kt.pool_cells);
             ggml_tensor * gates   = ggml_get_rows(ctx0, g_idx_v, kt.pool_cells);
             members = ggml_reshape_4d(ctx0, members, d_idx, kpool, n_pools, n_stream);
@@ -650,8 +637,8 @@ int main(int argc, char ** argv) {
 
             printf("note top-k over replicated per-cell scores yields %d I32 CELL indices\n", (int) width);
 
-            // 5. the scatter the mask is built from, starting at sel_mask rather
-            //    than at an all -INFINITY fill, which is what forces the tail in
+            // 5. the scatter the mask is built from, starting at sel_mask rather than
+            //    an all -INFINITY fill, which is what forces the tail in
             ggml_tensor * top_k_4d = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
             ggml_tensor * base = ggml_view_4d(ctx0, kt.sel_mask, 1, n_kv, n_padq, n_stream,
                     kt.sel_mask->nb[0], kt.sel_mask->nb[1], kt.sel_mask->nb[2], 0);
@@ -668,7 +655,7 @@ int main(int argc, char ** argv) {
 
             printf("note one graph reaches all three halves in %d nodes\n", ggml_graph_n_nodes(gf));
 
-            // 6. the host-side pool map itself, on a real allocated buffer
+            // 6. fill the pool map on a real allocated buffer
             ggml_backend_t         backend = ggml_backend_cpu_init();
             ggml_backend_buffer_t  buf     = ggml_backend_alloc_ctx_tensors(ctx0, backend);
             CHECK(buf != nullptr, "allocated the graph's input tensors on the CPU backend");
@@ -701,11 +688,9 @@ int main(int argc, char ** argv) {
                 }
                 CHECK(finite, "bias and sel_mask hold only 0 and -INFINITY: no +1e9 to meet a -inf");
 
-                // every query of every stream: (q+1) %% kpool cells sit in its own
-                // incomplete pool and must be forced in, the q+1-minus-that cells
-                // below it must be scored, and nothing else may be either. Both
-                // streams, so that the per-stream strides are covered and not
-                // just stream 0's, which is the one at offset 0
+                // per query: (q+1) %% kpool cells sit in its own incomplete pool and
+                // must be forced in, the q+1-minus-that below must be scored, and
+                // nothing else either. both streams, to cover the per-stream strides
                 {
                     const llama_ubatch & u = mctx->get_ubatch();
 
@@ -738,10 +723,9 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                // pool origin: while the window starts at position 0, pos/kpool
-                // and the reference's first-resident-key anchor are the same
-                // grouping, so the map must reproduce it exactly. Cells whose
-                // pool is not complete carry slot 0 and are masked instead
+                // while the window starts at position 0, pos/kpool and the reference's
+                // first-resident-key anchor are the same grouping, so the map must
+                // reproduce it. incomplete pools carry slot 0 and are masked instead
                 {
                     const llama_ubatch & u = mctx->get_ubatch();
                     bool agree = true;
@@ -773,7 +757,6 @@ int main(int argc, char ** argv) {
                     CHECK(agree, "pool ordinals match the reference anchor while the window starts at position 0");
                 }
 
-                // the graph actually runs, and nothing in it trips an assert
                 {
                     ggml_status st = ggml_backend_graph_compute(backend, gf);
                     CHECK(st == GGML_STATUS_SUCCESS, "the pooled-indexer-shaped graph computes (%d)", (int) st);
@@ -789,17 +772,15 @@ int main(int argc, char ** argv) {
 
     // ---- pool origin across a front eviction --------------------------------
     //
-    // The reference anchors a pool at the first *resident* key
-    // (valid_keys.argmax(-1)); this port anchors at pos/kpool, as vLLM and SGLang
-    // do. They are the same grouping until the front of the window is dropped by
-    // a non-multiple of kpool, and then they differ: the reference regroups every
-    // surviving key, this port does not. Regrouping is what a cache cannot
-    // afford, since the pooled key a decode step scores was built during prefill.
+    // the reference anchors a pool at the first *resident* key (valid_keys.argmax(-1));
+    // this port anchors at pos/kpool, as vLLM and SGLang do. same grouping until the
+    // window front is dropped by a non-multiple of kpool, when the reference regroups
+    // every surviving key and this port does not. a cache cannot afford regrouping: the
+    // pooled key a decode step scores was built during prefill.
     {
         printf("\n--- pool origin ---\n");
 
-        // seq 0 currently holds positions 0..9. drop 0..1, which is not a
-        // multiple of kpool = 4
+        // seq 0 holds positions 0..9. drop 0..1, not a multiple of kpool = 4
         const llama_pos n_drop = 2;
         mem->seq_rm(0, 0, n_drop);
 
@@ -848,9 +829,8 @@ int main(int argc, char ** argv) {
                     const int32_t * cp = (const int32_t *) kt.cell_pool->data;
                     const auto & cells = kv_attn->get_cells(0);
 
-                    // positions 4..7 were one pool before the eviction and must
-                    // still be one pool, or the pooled key built during prefill no
-                    // longer describes the cells it is scored against
+                    // positions 4..7 must stay one pool, or the pooled key built during
+                    // prefill no longer describes the cells it is scored against
                     std::map<llama_pos, int32_t> slot_of;
                     for (int64_t j = 0; j < n_kv; ++j) {
                         if (!cells.is_empty(j) && cells.seq_has(j, 0)) {
@@ -864,15 +844,13 @@ int main(int argc, char ** argv) {
                     CHECK(grouped, "positions 4..7 stay one pool after the eviction (slot %d)",
                             grouped ? (int) slot_of[4] : -1);
 
-                    // the reference's anchor would have made positions 2..5 the
-                    // first pool instead. checked, not implemented: this port
-                    // deliberately differs here
+                    // the reference's anchor would make 2..5 the first pool; this port
+                    // deliberately differs, so the difference is pinned rather than fixed
                     const bool differs = !slot_of.count(2) || slot_of[2] != slot_of[4];
                     CHECK(differs, "positions 2 and 4 are NOT pooled together, where the reference anchor would");
 
-                    // the leading remnant 2..3 is an incomplete pool, so it is not
-                    // scored. it is also not in the query's tail, which is the one
-                    // case where a cell visible to the query is neither
+                    // the leading remnant 2..3 is an incomplete pool and not in the
+                    // query's tail, the one case where a visible cell is neither
                     const float * bi = (const float *) kt.bias->data;
                     const float * sm = (const float *) kt.sel_mask->data;
                     int64_t n_orphan = 0;
@@ -990,7 +968,7 @@ int main(int argc, char ** argv) {
                     const llama_ubatch & ub = mctx->get_ubatch();
 
                     // first pass faults in 60+ MiB of fresh pages; time the steady
-                    // state, which is what a prefill actually pays per ubatch
+                    // state, which is what a prefill pays per ubatch
                     double ms = 1e9;
                     for (int rep = 0; rep < 4; ++rep) {
                         const auto t0 = std::chrono::steady_clock::now();
