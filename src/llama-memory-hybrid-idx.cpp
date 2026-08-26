@@ -199,6 +199,42 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    llama_memory_hybrid::state_write(io, seq_id, flags);
+
+    // [TAG_HYBRID_IDX_STATE]
+    // the indexer cache is written last so that its payload is a pure suffix of the
+    //   attn+recr layout every other hybrid model already produces. Placing it between
+    //   the two would make a reader that does not expect it parse the indexer bytes as
+    //   recurrent state, which can succeed and restore silent garbage; as a suffix, a
+    //   reader that does not expect it just stops early and the trailing bytes are
+    //   caught by the size check in llama_context::state_load_file.
+    // the indexer mirrors the attention cache, so it follows the same PARTIAL_ONLY
+    //   gate: a partial checkpoint deliberately skips the token-level attention caches.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (mem_idx) {
+            mem_idx->state_write(io, seq_id, flags);
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    llama_memory_hybrid::state_read(io, seq_id, flags);
+
+    // [TAG_HYBRID_IDX_STATE]
+    // must mirror the write order above.
+    // the indexer restores its own cells rather than being handed the attention
+    //   cache's restored slots, which is safe because the two caches are kept in
+    //   lockstep - same size, same n_pad, same seq_* operations, and init_batch hands
+    //   the indexer the attention cache's slot infos - so both state_read_meta calls
+    //   run find_slot over identical occupancy and land on identical cells.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (mem_idx) {
+            mem_idx->state_read(io, seq_id, flags);
+        }
+    }
+}
+
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
