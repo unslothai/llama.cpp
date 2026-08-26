@@ -681,6 +681,10 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // qwen4exp: the MTP block's shared-head norm is a hyper-connection mixer, so the
+    // norm above comes with the low-rank gate pair that collapses the streams
+    LLM_TENSOR_NEXTN_SHARED_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_SHARED_HEAD_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,

@@ -25,9 +25,62 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
+    # The MTP block is exported into the same file, at block index num_hidden_layers, and
+    # is skipped at load time unless a context asks for it (llama_model_loader::load_mtp).
+    # `--no-mtp` drops it again; a standalone MTP-only file is not supported, because the
+    # block borrows the trunk's token embedding and LM head and has no vocabulary of its own.
     supports_mtp_export = False
-    no_mtp = True
+    no_mtp = False
+
+    # mtp.hyper_connection_mixer.* is the MTP block's own final mixer. It stands in the
+    # place a plain nextn shared-head norm would, so it is remapped onto that name (plus
+    # the two low-rank halves the mixer needs) rather than onto the model-level
+    # `hyper_connection_mixer`, which already belongs to the trunk and would collide.
+    _MTP_MIXER_SUFFIX = {
+        "hc_norm.weight":                  "norm.weight",
+        "input_mix_weight_down.weight":    "input_mix_weight_down.weight",
+        "input_mix_weight_up.weight":      "input_mix_weight_up.weight",
+    }
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name = item[0]
+        prefix = "mtp.hyper_connection_mixer."
+        if name.startswith(prefix):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            suffix = cls._MTP_MIXER_SUFFIX[name[len(prefix):]]
+            return (f"model.layers.{cls._original_block_count}.shared_head.{suffix}", item[1])
+        return super().filter_tensors(item)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        # The MTP block fuses the token embedding and the target's hidden state with two
+        # separate projections. fc_e(e) + fc_h(h) == [fc_e|fc_h] * concat(e, h), so they
+        # join into the single eh_proj the nextn tensor map already knows, exactly as
+        # DeepSeek-V4's pair does. The graph concatenates e first, so cat on the input axis.
+        e_name = "mtp.fc_embedding.weight"
+        h_name = "mtp.fc_hidden.weight"
+
+        have_e = e_name in self.model_tensors
+        have_h = h_name in self.model_tensors
+        if not have_e and not have_h:
+            return
+        if not have_e or not have_h:
+            raise KeyError(f"unpaired MTP input projection: need both {e_name} and {h_name}")
+
+        from .base import LazyTorchTensor
+
+        e = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+        h = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+                                       self.hparams["num_hidden_layers"]),
+               torch.cat([e, h], dim=1).contiguous())
+
+        del self.model_tensors[e_name]
+        del self.model_tensors[h_name]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -67,8 +120,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # one entry per block, which includes the MTP block(s): llama.cpp reads this with
+        # get_key_or_arr(.., n_layer_all) and rejects any other length. The MTP block runs
+        # dense attention, so its ratio is 0
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [0] * (self.block_count - n_layer)
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,

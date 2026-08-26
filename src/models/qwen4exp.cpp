@@ -6,6 +6,20 @@
 #include <algorithm>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+    // Read first: everything below counts layers, and n_layer() is n_layer_all minus this.
+    // Absent in every file converted before MTP support, which is what keeps those loading
+    // exactly as they did - n_layer_nextn stays 0 and no MTP tensor is ever asked for.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    if (hparams.n_layer_nextn > 0) {
+        // A file may declare the block and then not carry it (--no-mtp after the fact, or a
+        // hand-edited KV). Trust the tensors, not the key. Same probe as deepseek4.
+        const std::string probe = "blk." + std::to_string(hparams.n_layer_all - hparams.n_layer_nextn) + ".nextn.eh_proj.weight";
+        if (ml.get_weight(probe.c_str()) == nullptr) {
+            hparams.n_layer_nextn = 0;
+        }
+    }
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
+
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -176,10 +190,212 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
     }
+
+    // The MTP (nextn) block sits at index n_layer. It is a full-attention layer with the
+    // same hyper-connections and MoE as the trunk, no PLE, plus its own input fusion and
+    // its own final mixer. The loop body runs only when the file declares one, so a GGUF
+    // without MTP tensors loads exactly as before.
+    //
+    // TENSOR_SKIP is the in-tree way to say "present in the file, not needed by this
+    // context": the main context leaves the weights on disk, and only a context opened
+    // with load_mtp (the draft context of speculative decoding) materialises them.
+    for (int il = n_layer; il < n_layer + n_layer_nextn; ++il) {
+        auto & layer = layers[il];
+
+        const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
+
+        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
+        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
+        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
+        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, flags);
+        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
+        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
+        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
+
+        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+
+        // The reference runs the MTP attention through the same QSA indexer as the trunk;
+        // this graph runs it dense, so these are carried in the file but never read. They
+        // stay declared so a later QSA-in-MTP change is a graph change only, and so the
+        // loader does not report them as unexpected.
+        const int64_t idx_dim = hparams.indexer_head_size;
+        const int idx_flags = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, idx_flags);
+        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, idx_flags);
+        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, idx_flags);
+        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, idx_flags);
+
+        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+
+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
+        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
+
+        // Input fusion. enorm is a plain RMS norm over one embedding; hnorm spans the whole
+        // hyper-connection row, because the reference norms the 4 streams together here -
+        // unlike hc_attn_norm/hc_ffn_norm above, which are grouped per stream.
+        // eh_proj is the converter's join of fc_embedding and fc_hidden.
+        layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
+        layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
+        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+
+        // The MTP block's own final hyper-connection mixer. It occupies the slot a plain
+        // nextn shared-head norm would, and like the trunk's mixer it has no injection.
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { hc_dim }, flags);
+        layer.nextn.shared_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
+        layer.nextn.shared_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
+
     return std::make_unique<graph>(*this, params);
+}
+
+// The MTP (nextn) draft head. It predicts the token after next from two things: the
+// target's hyper-connection streams for the current position, and the embedding of the
+// token the target just produced.
+//
+//   e = fc_embedding(enorm(embed(tok)))                  [n_embd]
+//   h = fc_hidden(hnorm(h_streams)_s)                    per stream s
+//   x_s = e + h_s                                        the embedding joins every stream
+//
+// The converter joined fc_embedding and fc_hidden into one eh_proj, because
+// fc_e(e) + fc_h(h_s) is [fc_e|fc_h] applied to concat(e, h_s) - the same trick
+// deepseek4 uses for its pair. From there the block is an ordinary qwen4exp layer:
+// hyper-connection mix, attention, scatter back, mix, MoE, scatter back. Its own mixer
+// then stands in for the output norm, and the LM head is the target's.
+//
+// Note hnorm spans the whole hc*n_embd row: the reference normalises the four streams
+// together here, with a single variance, unlike every other hyper-connection norm in this
+// model. ref: sglang qwen4_exp_mtp.py _fuse_residual_linear_shared, vllm qwen4_exp mtp.py
+llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : graph(model, params, true) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP supports a single MTP block");
+    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+    GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "QWEN4EXP MTP hidden width mismatch");
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj          && "MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm            && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm            && "MTP block missing nextn.hnorm");
+    GGML_ASSERT(layer.nextn.shared_head_norm && "MTP block missing nextn.shared_head_norm");
+    GGML_ASSERT(layer.ffn_gate_inp           && "MTP block missing ffn_gate_inp");
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * h = inp->h;
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    auto * inp_attn = build_attn_inp_kv();
+
+    // one variance over the whole row, then split into streams
+    ggml_tensor * h_norm = build_norm(h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
+    cb(h_norm, "mtp_hnorm", il);
+
+    // the embedding term is shared by every stream
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj,
+            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    cb(res_hc, "mtp_eh_proj", il);
+
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = build_hc_mix(res_hc,
+            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
+            &inject, il);
+
+    ggml_build_forward_expand(gf, cur);
+
+    // Dense, unlike the trunk: the draft context has no indexer cache to score blocks
+    // against. QSA is exactly dense below indexer_top_k + compress_ratio - 1 cached
+    // tokens, so this is exact for short contexts and an approximation past that.
+    cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    cur = build_hc_mix(res_hc,
+            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
+            &inject, il);
+
+    cur = build_layer_ffn(cur, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+    cb(res_hc, "mtp_l_out", il);
+
+    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, hc * n_embd, n_tokens);
+    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+
+    // A chained head reads the streams back, exactly as the trunk hands them over
+    if (cparams.embeddings_nextn) {
+        ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : res_hc;
+        cb(h_nextn, "h_nextn", -1);
+        res->t_h_nextn = h_nextn;
+    }
+
+    if (inp_out_ids) {
+        res_hc = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
+    }
+
+    // the MTP block's own mixer is its output norm; there is no separate one
+    cur = build_hc_mix(res_hc,
+            layer.nextn.shared_head_norm, layer.nextn.shared_head_down, layer.nextn.shared_head_up,
+            nullptr, nullptr, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    // no MTP vocabulary of its own: the head is the target's
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head");
+
+    cur = build_lora_mm(head_w, cur, head_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
@@ -326,6 +542,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    // The MTP block consumes the hyper-connection streams, not the collapsed hidden state,
+    // so hand them over here, before the mixer. Emitted only when a context asked for them
+    // (the draft context of speculative decoding), which leaves the ordinary decode graph
+    // byte for byte what it was. ref: deepseek4.cpp, the other hyper-connection MTP.
+    if (cparams.embeddings_nextn) {
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, hc * n_embd, n_tokens);
+        ggml_tensor * h_nextn = res_hc;
+        if (cparams.embeddings_nextn_masked && inp_out_ids) {
+            h_nextn = ggml_get_rows(ctx0, flat, inp_out_ids);
+        }
+        cb(h_nextn, "h_nextn", -1);
+        res->t_h_nextn = h_nextn;
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -603,8 +833,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // indexer reads the same block input as q/k/v; no cache or no ratio means dense.
+    // The MTP draft head has no hybrid context at all and passes null here.
+    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, sections, il) : nullptr;
 
