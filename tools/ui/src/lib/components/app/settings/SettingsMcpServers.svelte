@@ -10,9 +10,7 @@
 	import * as Empty from '$lib/components/ui/empty';
 	import { ROUTES } from '$lib/constants';
 	import { HealthCheckStatus } from '$lib/enums';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import { toolsStore } from '$lib/stores/tools.svelte';
+	import { conversationsStore, mcpStore, toolsStore } from '$lib/stores';
 	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 
@@ -75,7 +73,7 @@
 
 <div in:fade={{ duration: 150 }} class="flex min-h-[calc(100dvh-4rem)] flex-col">
 	<div class="fixed top-4.5 right-4 z-50 md:hidden">
-		<ActionIcon icon={X} tooltip="Close" onclick={handleClose} />
+		<ActionIcon icon={X} onclick={handleClose} tooltip="Close" />
 	</div>
 
 	<div
@@ -104,7 +102,7 @@
 				</Empty.Header>
 
 				<Empty.Content>
-					<Button size="sm" onclick={() => (isAddingServer = true)}>
+					<Button onclick={() => (isAddingServer = true)} size="sm">
 						<Plus />
 
 						Add New Server
@@ -122,12 +120,14 @@
 					<McpServerCardSkeleton />
 				{:else}
 					<McpServerCard
-						{server}
-						enabled={conversationsStore.isMcpServerEnabledForChat(server.id)}
+						enabled={conversationsStore.preferences.isMcpServerEnabledForChat(server.id)}
+						onDelete={() => mcpStore.removeServer(server.id)}
 						onToggle={async () => {
-							const wasEnabled = conversationsStore.isMcpServerEnabledForChat(server.id);
+							const wasEnabled = conversationsStore.preferences.isMcpServerEnabledForChat(
+								server.id
+							);
 
-							await conversationsStore.toggleMcpServerForChat(server.id);
+							await conversationsStore.preferences.toggleMcpServerForChat(server.id);
 
 							if (!wasEnabled) {
 								// Promote the connection so tools/prompts/resources become
@@ -137,7 +137,7 @@
 							}
 						}}
 						onUpdate={(updates) => mcpStore.updateServer(server.id, updates)}
-						onDelete={() => mcpStore.removeServer(server.id)}
+						{server}
 					/>
 				{/if}
 			{/each}
@@ -155,7 +155,7 @@
 					</Empty.Header>
 
 					<Empty.Content>
-						<Button size="sm" onclick={() => (isAddingServer = true)}>
+						<Button onclick={() => (isAddingServer = true)} size="sm">
 							<Plus />
 
 							Add New Server
