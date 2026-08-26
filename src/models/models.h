@@ -2308,9 +2308,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells named by top_k. arch-local rather
-        // than a build_attn overload so that no shared attention path changes: the sparse
-        // MLA architectures keep their own copy of the same mask construction.
+        // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
@@ -2343,8 +2341,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
-        // build_rs writes the state tensor in place, so run it at most once per
-        // layer; both convolutions share this gather.
+        // build_rs writes the state tensor in place, so both convolutions share one gather per layer
         std::map<int, ggml_tensor *> rs_rows;
 
         // conv history at an explicit offset: delta-net and PLE share the row

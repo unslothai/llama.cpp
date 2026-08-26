@@ -203,9 +203,8 @@ uint32_t llama_hparams::n_embd_r() const {
     // Corresponds to Mamba's conv_states size
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
-    // qwen4exp puts a PLE module on a delta-net layer, so the row carries a second
-    // dilated conv state. Rows are uniform, so every recurrent layer reserves it;
-    // ple_n_heads is 0 elsewhere, leaving n_conv alone.
+    // qwen4exp puts a PLE module on a delta-net layer, so the row holds a second dilated conv
+    // state; the rows are uniform, so every recurrent layer reserves it
     return n_conv + ple_conv_state();
 }
 
