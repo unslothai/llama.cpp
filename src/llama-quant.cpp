@@ -474,7 +474,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
-        if (tensor->ne[2] > 1) {
+        // absorbed MLA projections are also 3D, so match expert tensor roles explicitly.
+        const bool has_3d_mla = arch == LLM_ARCH_GLM5NEXT;
+        const bool is_expert = category == tensor_category::FFN_UP ||
+                               category == tensor_category::FFN_GATE ||
+                               category == tensor_category::FFN_DOWN;
+        if (tensor->ne[2] > 1 && (!has_3d_mla || is_expert)) {
             new_type = GGML_TYPE_MXFP4;
         } else {
             new_type = GGML_TYPE_Q8_0;

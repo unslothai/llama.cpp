@@ -803,6 +803,9 @@ class GGUFWriter:
     def add_indexer_local_blocks(self, local_blocks: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.LOCAL_BLOCKS.format(arch=self.arch), local_blocks)
 
+    def add_indexer_kpool(self, kpool: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.KPOOL.format(arch=self.arch), kpool)
+
     def add_indexer_types(self, value: Sequence[bool]) -> None:
         key = Keys.Attention.Indexer.TYPES.format(arch=self.arch)
         self.add_array(key, value)
