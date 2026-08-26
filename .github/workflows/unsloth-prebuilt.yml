@@ -146,15 +146,18 @@ jobs:
           fi
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ "$REQ" = "latest" ]; then
-            # Newest published (non-draft, non-prerelease) release that has been
-            # public for >= AGE_H hours -- the supply-chain aging window. GitHub
-            # does not guarantee the list order, so pick the max by published_at
+            # Newest published b#### build release that has been public for
+            # >= AGE_H hours -- the supply-chain aging window. GitHub does not
+            # guarantee the list order, so pick the max by published_at
             # explicitly rather than trusting `first`.
+            # Select on the tag shape, not on prerelease: since 08-21 upstream
+            # marks the b#### builds prerelease and keeps that flag clear only
+            # for the semver v#.#.# releases, which are not what we build.
             CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
             BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
-              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+              | jq -r --argjson cutoff "$CUTOFF" '[.[] | select(.draft==false) | select(.tag_name|test("^b[0-9]+$")) | select((.published_at|fromdateiso8601) <= $cutoff)] | max_by(.published_at|fromdateiso8601) | .tag_name')"
             if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
-              echo "refusing: no ggml-org release older than ${AGE_H}h in the last 100 releases" >&2
+              echo "refusing: no ggml-org b#### release older than ${AGE_H}h in the last 100 releases" >&2
               exit 1
             fi
             echo "selected $BASE (aged >= ${AGE_H}h)"

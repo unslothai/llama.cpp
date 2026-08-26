@@ -51,8 +51,10 @@ jobs:
           set -uo pipefail
           AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+          # Same base tag the nightly resolves: newest aged b#### build.
+          # Upstream marks those prerelease since 08-21, so match the tag shape.
           BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
-            --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            | jq -r --argjson cutoff "$CUTOFF" '[.[] | select(.draft==false) | select(.tag_name|test("^b[0-9]+$")) | select((.published_at|fromdateiso8601) <= $cutoff)] | max_by(.published_at|fromdateiso8601) | .tag_name')"
           if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
             echo "::warning::no aged upstream release found; skipping"
             echo "status=skip" >> "$GITHUB_OUTPUT"; exit 0
