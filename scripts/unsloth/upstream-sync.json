@@ -1,0 +1,26 @@
+{
+  "_doc": [
+    "The upstream commit master was last synced to, and the invariant that keeps the sync cheap.",
+    "",
+    "Update BOTH fields in the same commit as the sync merge. unsloth-upstream-sync-guard.yml",
+    "reads this file and fails master if either invariant breaks:",
+    "",
+    "  1. `commit` must be an ancestor of master. This is the check that would have caught the",
+    "     08-07 sync (PR #80), which was squash-merged: its content landed but git never learned",
+    "     upstream had been incorporated, so the merge base stayed at 2026-06-10 and every later",
+    "     merge three-way merged against it. Merging b10632 conflicted in 539 files with that",
+    "     base and in 21 with the true one. ALWAYS merge a sync PR with a merge commit.",
+    "",
+    "  2. The diff from `commit` to master must touch only .github/ and scripts/unsloth/. This",
+    "     fork deliberately owns no llama.cpp source; that is what makes a sync provably additive",
+    "     and lets scripts/unsloth/verify_upstream_sync.py check it exactly rather than by eye.",
+    "     If this ever fails, the fork has acquired source divergence and syncs stop being cheap.",
+    "",
+    "Note for whoever runs the next sync: verify_upstream_sync.py derives its base from",
+    "merge-base(--fork, --upstream). Pass a --fork ref whose ancestry is already correct, or it",
+    "measures the stale set and reports failures that are artefacts of the bad base."
+  ],
+  "tag": "b10632",
+  "commit": "11cd98842874cc1b87ac274bd2d5cceb38102bb2",
+  "synced_at": "2026-08-26"
+}
