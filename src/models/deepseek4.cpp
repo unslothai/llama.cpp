@@ -1272,7 +1272,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 }
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_graph_context(params) {
+    llm_build_delta_net_base(params) {
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
