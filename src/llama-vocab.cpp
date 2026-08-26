@@ -2244,6 +2244,30 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 tokenizer_pre == "chatglm-bpe") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_CHATGLM4;
                 special_bos_id = LLAMA_TOKEN_NULL;
+                // glm4 tokenizer.json sets "ignore_merges": true, i.e. a pre-token that is
+                // already a vocab entry is emitted directly and the merge loop never runs.
+                // without it the merges are applied - correctly - and reach a different
+                // answer, because greedy BPE cannot always reconstruct a vocab entry from
+                // its bytes.
+                //
+                // " 王" (Ġçİĭ, id 102322) is the case that exposed this. From Ġ ç İ ĭ the
+                // only merges that exist are (Ġ,ç)=27944, (ç,İ)=76417 and (çİ,ĭ)=239209;
+                // the lowest rank wins first, giving Ġç İ ĭ, and then neither (Ġç,İ) nor
+                // (İ,ĭ) exists, so it stops three tokens short. Reaching Ġçİĭ needs
+                // (Ġ,çİĭ) at 242943, which requires never taking (Ġ,ç) at 27944.
+                //
+                // Trigger is whitespace before a CJK character, so pure Chinese is
+                // unaffected and mixed Chinese-English inflates ~13%.
+                //
+                // Deliberately NOT applied to chatglm-bpe, which shares this pre_type but
+                // is a different tokenizer (ChatGLM3). I have no ChatGLM3 checkpoint here
+                // to confirm it declares the flag, and turning it on where the tokenizer
+                // does not set it would silently change that model's tokenization in the
+                // same invisible way this bug did. Someone with the checkpoint should
+                // check tokenizer.json and widen this if it applies.
+                if (tokenizer_pre == "glm4") {
+                    ignore_merges = true;
+                }
             } else if (
                 tokenizer_pre == "viking") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_VIKING;
