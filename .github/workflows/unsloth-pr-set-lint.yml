@@ -15,9 +15,13 @@ on:
   push:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/test_additive_merge.py
   pull_request:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/test_additive_merge.py
 
 permissions:
   contents: read
@@ -81,3 +85,14 @@ jobs:
           done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
                           | "\(.url)\t\(if .required == null then true else .required end)"' "$FILE" | tr '\t' ' ')
           exit "$fail"
+
+  resolver-tests:
+    name: additive_merge self-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      # additive_merge.py auto-resolves conflicts in the nightly's own merge
+      # loop, so a regression here lands in a release build. The suite builds
+      # real git conflicts and asserts on both what it resolves and what it
+      # must keep refusing.
+      - run: python3 scripts/unsloth/test_additive_merge.py

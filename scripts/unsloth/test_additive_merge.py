@@ -61,7 +61,7 @@ txt = f.read_text()
 check("add/add resolves", rc == 0 and rep["ok"], rep)
 check("add/add unions both labels",
       "LLM_ARCH_DEEPSEEK4" in txt and "LLM_ARCH_INKLING" in txt and "<<<<" not in txt, txt)
-check("add/add puts upstream first (matches hand repin)",
+check("add/add puts upstream first (order is arbitrary, this pins it)",
       txt.index("DEEPSEEK4") < txt.index("INKLING"), txt)
 check("add/add stages the file",
       git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip() == "")
@@ -125,6 +125,100 @@ before = f.read_text()
 rc, rep = run(repo, "--dry-run")
 check("dry-run reports ok", rc == 0 and rep["ok"])
 check("dry-run does not touch the file", f.read_text() == before)
+
+# --- 6. both sides append a block, colliding only on `};` -------------------
+# The real shape from tools/mtmd/clip-model.h and ggml/src/ggml-backend-meta.cpp:
+# two unrelated structs added at the same anchor. Only the closing brace is shared.
+base = "struct keep {\n    int a;\n};\n"
+ours = "struct keep {\n    int a;\n};\n\nstruct mine {\n    int m;\n};\n"
+theirs = "struct keep {\n    int a;\n};\n\nstruct theirs {\n    int t;\n};\n"
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+txt = f.read_text()
+check("block append sharing only `};` resolves", rc == 0 and rep["ok"], rep)
+check("block append keeps both structs",
+      "struct mine" in txt and "struct theirs" in txt and "<<<<" not in txt, txt)
+check("block append does not duplicate the shared brace",
+      txt.count("struct mine") == 1 and txt.count("struct theirs") == 1, txt)
+
+# --- 7. shared line is boilerplate the file already repeats -----------------
+# common/chat.cpp: every init function opens with the same two lines, so both
+# sides adding a new one collide on boilerplate, not on one construct twice.
+boiler = "    common_chat_params data;\n    auto parser = mk();\n"
+base = ("static params init_a() {\n" + boiler + "}\n"
+        "static params init_b() {\n" + boiler + "}\n")
+ours = base + "static params init_mine() {\n" + boiler + "}\n"
+theirs = base + "static params init_theirs() {\n" + boiler + "}\n"
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+txt = f.read_text()
+check("shared boilerplate resolves", rc == 0 and rep["ok"], rep)
+check("shared boilerplate keeps both functions",
+      "init_mine" in txt and "init_theirs" in txt and "<<<<" not in txt, txt)
+
+# --- 8. one construct added twice: must STILL refuse ------------------------
+# tools/mtmd/mtmd-image.cpp: upstream landed its own copy of a helper we had
+# already written. The signature line appears nowhere else, so it is distinctive.
+base = "static void other() {\n}\n"
+ours = base + "static bool resize_pillow(\n        const img & i,\n        bool use_lanczos) {\n    return a;\n}\n"
+theirs = base + "static bool resize_pillow(\n        const img & i,\n        bool use_lanczos) {\n    return b;\n}\n"
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+check("one construct added twice still refuses", rc == 1 and not rep["ok"], rep)
+check("refusal names the distinctive line",
+      "use_lanczos" in json.dumps(rep) or "resize_pillow" in json.dumps(rep), rep)
+check("refused file keeps its markers", "<<<<" in f.read_text())
+
+# --- 9. RPC version triple: three-way merge per field -----------------------
+HDR = "#define RPC_PROTO_MAJOR_VERSION    5\n#define RPC_PROTO_MINOR_VERSION    {}\n#define RPC_PROTO_PATCH_VERSION    {}\n"
+
+
+def make_rpc_conflict(ours_v, theirs_v, base_v=(0, 0), ops=3):
+    """Same as make_conflict but the file is ggml-rpc.h next to a real ggml.h."""
+    d = Path(tempfile.mkdtemp(prefix="am_rpc_"))
+    git(d, "init", "-q", "-b", "main")
+    inc = d / "ggml" / "include"
+    inc.mkdir(parents=True)
+    members = "".join(f"        GGML_OP_{i},\n" for i in range(ops))
+    (inc / "ggml.h").write_text("    enum ggml_op {\n" + members + "        GGML_OP_COUNT,\n    };\n")
+    f = inc / "ggml-rpc.h"
+    tail = f'\nstatic_assert(GGML_OP_COUNT == {ops}, "x");\n'
+    f.write_text(HDR.format(*base_v) + tail)
+    git(d, "add", "-A"); git(d, "commit", "-qm", "base")
+    git(d, "checkout", "-qb", "side")
+    f.write_text(HDR.format(*theirs_v) + tail)
+    git(d, "add", "-A"); git(d, "commit", "-qm", "theirs")
+    git(d, "checkout", "-q", "main")
+    f.write_text(HDR.format(*ours_v) + tail)
+    git(d, "add", "-A"); git(d, "commit", "-qm", "ours")
+    git(d, "-c", "merge.conflictStyle=diff3", "merge", "side")
+    return d, f
+
+
+# upstream bumped minor, we bumped patch: each field moved on one side only
+repo, f = make_rpc_conflict(ours_v=(0, 1), theirs_v=(1, 0))
+rc, rep = run(repo)
+txt = f.read_text()
+check("rpc version triple resolves", rc == 0 and rep["ok"], rep)
+check("rpc takes minor from upstream and patch from us",
+      "MINOR_VERSION    1" in txt and "PATCH_VERSION    1" in txt and "<<<<" not in txt, txt)
+check("rpc keeps the major untouched", "MAJOR_VERSION    5" in txt, txt)
+
+# both sides moved the same field: nothing to merge, must refuse
+repo, f = make_rpc_conflict(ours_v=(0, 4), theirs_v=(0, 2))
+rc, rep = run(repo)
+check("rpc refuses when one field moved on both sides", rc == 1 and not rep["ok"], rep)
+check("rpc refusal says which field", "PATCH_VERSION" in json.dumps(rep), rep)
+
+# a stale op count is the silent wire mismatch this header exists to prevent
+repo, f = make_rpc_conflict(ours_v=(0, 1), theirs_v=(1, 0), ops=3)
+(repo / "ggml" / "include" / "ggml.h").write_text(
+    "    enum ggml_op {\n" + "".join(f"        GGML_OP_{i},\n" for i in range(4))
+    + "        GGML_OP_COUNT,\n    };\n")
+rc, rep = run(repo)
+check("rpc refuses when static_assert disagrees with the merged enum",
+      rc == 1 and not rep["ok"], rep)
+check("rpc says the count is stale", "GGML_OP_COUNT" in json.dumps(rep), rep)
 
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
