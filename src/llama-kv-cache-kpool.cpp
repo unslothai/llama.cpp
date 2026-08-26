@@ -37,9 +37,8 @@ void llama_kv_cache_set_input_kpool(
     GGML_ASSERT(ggml_backend_buffer_is_host(bias      ->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask  ->buffer));
 
-    // sel_mask is KQ-mask shaped, and every KQ mask in the tree is f16 under
-    // flash attention. writing floats into one would overrun the allocation by
-    // 2x, so refuse rather than trust the caller
+    // sel_mask is KQ-mask shaped, and KQ masks are f16 under flash attention; writing
+    // floats into one would overrun the allocation 2x, so check rather than trust
     GGML_ASSERT(cell_pool ->type == GGML_TYPE_I32);
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(bias      ->type == GGML_TYPE_F32);
@@ -74,26 +73,23 @@ void llama_kv_cache_set_input_kpool(
     float   * dst_bias       = (float   *) bias      ->data;
     float   * dst_sel_mask   = (float   *) sel_mask  ->data;
 
-    // -1 marks a cell with no usable pool. Kept host side only: it is never
-    // copied into cell_pool, which ggml_get_rows would read as an index
+    // -1 marks a cell with no usable pool. host side only: never copied into cell_pool,
+    // where ggml_get_rows would read it as an index
     std::vector<int32_t>   pool_of(n_kv);
     std::vector<int32_t>   filled(n_pools);
     std::vector<llama_pos> pos_at;
 
     // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]
-    // A pool is a set of cells grouped by position, and cell positions are only
-    // unambiguous within one sequence. Under a unified cache all sequences share
-    // one cells array, so two sequences holding the same position would collide
-    // in pool_cells and silently pool each other's keys. The pooled indexer
-    // therefore needs one sequence per stream: either a non-unified cache
-    // (n_stream == n_seq_max, the default) or a single sequence in flight.
-    // qwen4exp's set_input_qsa has the same requirement and no check.
+    // positions are unambiguous only within one sequence, and a unified cache shares one
+    // cells array, so two sequences at the same position would collide in pool_cells and
+    // silently pool each other's keys. hence one sequence per stream: a non-unified cache
+    // (n_stream == n_seq_max, the default) or a single sequence in flight. qwen4exp's
+    // set_input_qsa has the same requirement and no check.
     GGML_ASSERT((int64_t) ubatch->n_seqs_unq == n_ns &&
             "the pooled indexer needs one sequence per stream; use a non-unified KV cache");
 
     for (int64_t s = 0; s < n_ns; ++s) {
-        // the token at ubatch index s*n_tps belongs to this stream; ask the cache
-        // which cells array that sequence actually uses. same convention as
+        // which cells array this stream's sequence uses; same convention as
         // llama_kv_cache::set_input_kq_mask
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = kv->get_cells(seq_of_stream);
@@ -105,31 +101,27 @@ void llama_kv_cache_set_input_kpool(
         std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
 
-        // hoist occupancy and sequence membership out of the O(n_kv * n_tokens)
-        // loop below: neither depends on the query, and this stream holds exactly
-        // one sequence. -1 means the cell holds nothing this stream may pool or
-        // attend to. under a unified cache `cells` is shared with the sequences
-        // that are not in this ubatch, and seq_has is what keeps their keys out
+        // hoist occupancy and sequence membership out of the O(n_kv * n_tokens) loop
+        // below; neither depends on the query. -1 means the cell holds nothing this
+        // stream may pool or attend to. under a unified cache `cells` is shared with
+        // sequences outside this ubatch, and seq_has is what keeps their keys out
         pos_at.resize(n_kv);
         for (int64_t j = 0; j < n_kv; ++j) {
             pos_at[j] = cells.is_empty(j) || !cells.seq_has(j, seq_of_stream) ? -1 : cells.pos_get(j);
         }
 
-        // Pools are cut out of the position line, so a pool ordinal is p/kpool -
-        // an absolute number that can be far larger than n_kv/kpool. The array
-        // slot is a separate thing, so rebase on the lowest resident pool of this
-        // stream. Grouping is untouched: every member of a pool shifts together.
+        // a pool ordinal is the absolute p/kpool, which can far exceed n_kv/kpool, so
+        // rebase on this stream's lowest resident pool. grouping is untouched, every
+        // member shifts together.
         //
-        // Not the reference's anchor. HF pools from the first *resident* key
-        // (valid_keys.argmax(-1)), which for a left-padded batch differs from
-        // p/kpool; vLLM and SGLang both anchor at p/kpool exactly as here, and
-        // that is the only choice that keeps a pool's identity stable between the
-        // prefill that built it and the decode steps that read it.
+        // anchoring at p/kpool follows vLLM and SGLang, not HF (which pools from the
+        // first *resident* key, valid_keys.argmax(-1), differing under left padding).
+        // it is the only anchor that keeps a pool's identity stable between the prefill
+        // that built it and the decodes that read it.
         //
-        // The window is n_pools wide. Positions are contiguous in any batch the
-        // model actually sees, so the whole resident range fits and the base is
-        // just the lowest pool. seq_rm can leave a hole large enough that it does
-        // not, and then the newest pools are the ones worth keeping.
+        // the window is n_pools wide; positions are contiguous in any real batch so the
+        // resident range fits. seq_rm can leave a hole large enough that it does not,
+        // and then the newest pools are the ones worth keeping.
         int64_t b_base = 0;
         {
             int64_t b_min = 0;
@@ -166,14 +158,13 @@ void llama_kv_cache_set_input_kpool(
             filled[bo]++;
         }
 
-        // a pool that is not completely resident cannot be pooled: the learned
-        // compressor consumes all r member keys, and the reference demands
-        // pool_valid = grouped_valid_keys.all(-1). Those cells are the tail of
-        // the sequence, which sel_mask forces in below whatever score they carry,
-        // so they are pointed at pool slot 0 only to keep the gather in range
+        // an incompletely resident pool cannot be pooled: the compressor consumes all r
+        // member keys, and the reference demands pool_valid = grouped_valid_keys.all(-1).
+        // such cells are the sequence tail, which sel_mask forces in below regardless of
+        // score, so they point at pool slot 0 purely to keep the gather in range
         for (int64_t j = 0; j < n_kv; ++j) {
-            // != rather than <: two cells claiming one position would overwrite
-            // each other in pool_cells, so such a pool is not usable either
+            // != rather than <: two cells claiming one position overwrite each other in
+            // pool_cells, so an over-filled pool is not usable either
             if (pool_of[j] >= 0 && filled[pool_of[j]] != (int32_t) r) {
                 pool_of[j] = -1;
             }
@@ -182,8 +173,7 @@ void llama_kv_cache_set_input_kpool(
 
         float * cur_sel_mask = dst_sel_mask + s*(n_padq*n_kv);
 
-        // the rows below n_tps are written in full by the loop; only the KQ mask's
-        // padding rows need clearing
+        // the loop below writes rows < n_tps in full; only the padding rows need clearing
         std::fill(cur_sel_mask + n_tps*n_kv, cur_sel_mask + n_padq*n_kv, -INFINITY);
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -193,24 +183,21 @@ void llama_kv_cache_set_input_kpool(
             // q >= 0 is what makes the unsigned range test below a range test
             GGML_ASSERT(q >= 0 && ubatch->seq_id[i][0] == seq_of_stream);
 
-            // everything from here on is inside the query's own incomplete pool
-            // and is always attended to (index_kpool_always_select_tail), which
-            // is what makes the selection land on pool boundaries. (q + 1) % r
-            // cells, the query's own token included
+            // the query's own incomplete pool ((q + 1) % r cells, its own token
+            // included) is always attended to (index_kpool_always_select_tail), which is
+            // what makes the selection land on pool boundaries
             const llama_pos tail_start = (q + 1)/r*r;
 
             // the reference tests visibility at a pool's LAST member, so a pool
-            // that straddles the query is dropped whole rather than partially
-            // masked. Pools are position-aligned here, so pool b's last member is
-            // position b*r + r - 1 and the test collapses to b*r < tail_start
+            // straddling the query is dropped whole. pools are position-aligned here, so
+            // that test collapses to b*r < tail_start
             const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
 
             float * cur_bias = dst_bias     + i*n_kv;
             float * cur_sel  = cur_sel_mask + ii*n_kv;
 
-            // the unsigned compares fold "empty or another sequence" (pos_at -1)
-            // and "no usable pool" (pool_of -1) into the same branch as the range
-            // test, which is what lets this vectorise
+            // the unsigned compares fold "empty or another sequence" (pos_at -1) and "no
+            // usable pool" (pool_of -1) into the range test, which lets this vectorise
             for (int64_t j = 0; j < n_kv; ++j) {
                 const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
                 const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;

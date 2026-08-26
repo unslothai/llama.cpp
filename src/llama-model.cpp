@@ -2246,8 +2246,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    // left null for every architecture but the sparse-attention
-                    // ones, which is what keeps the indexer cache from existing
+                    // null for every arch but the sparse-attention ones, which is what
+                    // keeps the indexer cache from existing
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     ggml_type type_idx = GGML_TYPE_F16;
                     if (arch == LLM_ARCH_FALCON_H1) {
@@ -2270,25 +2270,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
                             // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]
-                            // the indexer pools cells by position, and a unified
-                            // cache gives every sequence the same cells array, so
-                            // two sequences at the same position would pool each
-                            // other's keys. Refuse here rather than aborting deep
-                            // inside a set_input several thousand tokens in
+                            // the indexer pools cells by position and a unified cache
+                            // shares one cells array, so two sequences at the same
+                            // position would pool each other's keys. refuse here rather
+                            // than abort inside a set_input thousands of tokens in
                             if (cparams.kv_unified && cparams.n_seq_max > 1) {
                                 throw std::runtime_error("glm5next: the pooled indexer needs one sequence per stream, so a unified KV cache is only supported with a single sequence");
                             }
 
-                            // the DSA layers carry a lightning-indexer key cache;
-                            // the KDA layers and the NextN block do not
+                            // only the DSA layers carry an indexer key cache
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
 
-                            // the pooling indexer caches the compressor gate score
-                            // next to the key, and the gate feeds a softmax, so
-                            // -ctk q8_0 would quantise something far more
-                            // sensitive than a key. keep the indexer float
+                            // the gate cached next to the key feeds a softmax, so -ctk
+                            // q8_0 would quantise something far more sensitive than a
+                            // key. keep the indexer float
                             type_idx = params.type_k;
                             if (ggml_is_quantized(type_idx)) {
                                 LLAMA_LOG_WARN("%s: indexer key cache stays %s rather than %s: it also holds the compressor gates\n",
@@ -2299,9 +2296,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        // llama_memory_hybrid_iswa has no indexer cache. glm5next
-                        // is swa_type NONE so it never lands here, but a sparse
-                        // hybrid with SWA would silently lose its indexer
+                        // llama_memory_hybrid_iswa has no indexer cache; glm5next is
+                        // swa_type NONE, but a sparse hybrid with SWA would silently
+                        // lose its indexer
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
 
                         // Use hybrid-iswa for hybrid models with SWA
