@@ -239,3 +239,22 @@ struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
+
+// GLM-5-Next / GLM-5.3-Flash dynamic resize
+// ref: Glm5NextImageProcessor.{smart_resize,resize} of the 2026-08-26 adaptation
+//
+// unlike the Qwen-style smart_resize in mtmd_image_preprocessor_dyn_size, an over-budget image is fitted
+// by binary search on the content height, then pasted top-left rather than centred and stretched to fill
+struct mtmd_image_preprocessor_glm5next : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_glm5next(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+
+    struct geometry {
+        clip_image_size canvas;  // aligned, padded output size
+        clip_image_size content; // resized image, placed at the top-left of the canvas
+    };
+
+    // pure arithmetic, exposed so tests can reach it without a clip_ctx
+    static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & size);
+    static geometry        get_geometry(const clip_hparams & hparams, const clip_image_size & size);
+};
