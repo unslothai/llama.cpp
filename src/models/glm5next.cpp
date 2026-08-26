@@ -346,11 +346,42 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
         const llama_model & model,
         ggml_tensor * cur,
         int il) const {
-    GGML_UNUSED(model);
-    GGML_UNUSED(cur);
-    GGML_UNUSED(il);
+    const auto & layer = model.layers[il];
 
-    throw std::runtime_error("glm5next: feed-forward not implemented yet");
+    // the leading dense layers clamp the same way the experts do: the reference
+    // routes both through one Glm5NextTextMLP, so swiglu_limit is not MoE-only
+    if (il < (int) hparams.n_layer_dense_lead) {
+        return build_ffn(cur,
+                layer.ffn_up,   nullptr, nullptr,
+                layer.ffn_gate, nullptr, nullptr,
+                layer.ffn_down, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    }
+
+    // noaux_tc: exp_probs_b biases top-k selection only, the weights are the
+    // unbiased sigmoid scores. n_group is 1, so the group mask is a no-op
+    ggml_tensor * moe_out = build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_exp_probs_b,
+            n_expert, hparams.n_expert_used,
+            LLM_FFN_SILU, hparams.expert_weights_norm,
+            hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) hparams.expert_gating_func,
+            il);
+
+    ggml_tensor * shexp = build_ffn(cur,
+            layer.ffn_up_shexp,   nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr,
+            layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(shexp, "ffn_shexp", il);
+
+    // shared expert unscaled: routed_scaling_factor is applied inside build_moe_ffn,
+    // after norm_topk_prob, to the routed weights only
+    return ggml_add(ctx0, moe_out, shexp);
 }
 
 llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_params & params) :
