@@ -2,6 +2,8 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -298,7 +300,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), res_hc, il);
+            res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
         }
 
         ggml_tensor * inject = nullptr;
@@ -887,7 +889,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
-    llm_graph_input_ple(const llama_model_qwen4exp & pmodel) : pmodel(pmodel) {}
+    llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
+                        const llama_memory_hybrid_idx_context * mctx) : pmodel(pmodel), mctx(mctx) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -895,6 +898,12 @@ public:
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
     const llama_model_qwen4exp & pmodel;
+
+    // [TAG_PLE_HISTORY] the token history lives on the memory, which is per context.
+    // On the model it was shared by every context that loaded the same weights, so two
+    // contexts running the same seq_id overwrote each other's window, and it took part in
+    // no state blob at all.
+    const llama_memory_hybrid_idx_context * mctx;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -928,23 +937,35 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     // Missing predecessors come from per-sequence history (vLLM's ngram_context),
     // trusted only when contiguous with the incoming position, else EOS padding.
-    auto & hist_map = pmodel.ple_hist;
+    GGML_ASSERT(mctx != nullptr);
 
     // Snapshot the incoming history before touching it. Reading and updating in
     // the same pass would let a token near the start of the ubatch pick up an
     // earlier token of this same ubatch as if it were prior context.
+    //
+    // The snapshot is always exactly n_gram - 1 long, EOS-padded at the FRONT, because
+    // prev() below indexes it with the most recent token last. A history shorter than
+    // n_gram - 1 - a sequence that has decoded only one or two tokens, or one rewound by
+    // seq_rm - used to be padded at the back by resize(), which put the EOS filler where
+    // the immediately preceding token belongs and read the real token as older than it is.
     std::unordered_map<llama_seq_id, std::vector<llama_token>> snap;
     for (int64_t i = 0; i < n_tokens; ++i) {
         const llama_seq_id seq = ubatch->seq_id[i][0];
         if (snap.count(seq)) {
             continue;
         }
-        auto & h = hist_map[seq];
+        auto & h = mctx->get_ple_hist(seq);
         if (h.next_pos != ubatch->pos[i]) {
-            h.toks.assign(n_gram - 1, eos);
+            h.next_pos = ubatch->pos[i];
+            h.toks.clear();
         }
-        h.toks.resize(n_gram - 1, eos);
-        snap[seq] = h.toks;
+        if ((int64_t) h.toks.size() > n_gram - 1) {
+            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+        }
+
+        std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
+        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
+        snap[seq] = std::move(padded);
     }
 
     for (int64_t i = 0; i < n_tokens; ++i) {
@@ -995,7 +1016,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
 
-        auto & h = hist_map[seq];
+        auto & h = mctx->get_ple_hist(seq);
         h.toks.push_back(tok_of(i));
         if ((int64_t) h.toks.size() > n_gram - 1) {
             h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
@@ -1066,6 +1087,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         llm_graph_input_rs * inp,
+        const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *        hidden,
         int                  il) {
     GGML_UNUSED(inp);
@@ -1075,7 +1097,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_heads = hparams.ple_n_heads;
 
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model));
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb);
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
