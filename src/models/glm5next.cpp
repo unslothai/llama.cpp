@@ -11,14 +11,13 @@
 // load time, so conversion/glm5next.py is the only place the sign is checked.
 //
 
-// how many positions the indexer keeps: index_topk/index_kpool whole pools, plus the
+// positions the indexer keeps: index_topk/index_kpool whole pools plus the
 // always-selected tail pool minus one. below this many cached tokens every position is
-// selected and the sparse path is exactly the dense one built here.
+// selected, so sparse selection is exactly the dense path built here.
 //
-// asserted rather than measured. an off-by-one here is invisible to every output
-// comparison there is: the reference's own seeded off-by-one on this width is
-// bit-identical on both the dense and the sparse fixtures. the second form below is the
-// independent spelling the parity harness uses, so the two have to agree
+// asserted, not measured: an off-by-one here is invisible to output comparison (the
+// reference's own off-by-one on this width is bit-identical on both fixtures). the
+// second assert is the parity harness's independent spelling, so the two must agree
 static uint32_t glm5next_n_select(const llama_hparams & hparams) {
     GGML_ASSERT(hparams.indexer_kpool > 0);
     GGML_ASSERT(hparams.indexer_top_k >= hparams.indexer_kpool);
@@ -355,17 +354,13 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 }
 
 //
-// DSA layer, dense
+// DSA layer, dense: full MLA over the whole cache, no indexer/kpool/top-k. this is the
+// limit the sparse path collapses to below glm5next_n_select() resident positions
 //
-// below index_topk + index_kpool - 1 resident positions the indexer selects every
-// position, so sparse selection is exactly full attention. this builds that limit:
-// correct MLA over the whole cache, no indexer, no kpool, no top-k
-//
-// the absorbed form is used, as in deepseek2/deepseek32/glm-dsa: q_nope is pushed
-// through wk_b so that q.k is taken against the 512-wide latent directly, which is
-// what the cache holds (is_mla() suppresses the V allocation and V becomes a view of
-// K). the naive form would have to expand the latent back to n_head 256-wide keys and
-// values on every step and would need a V cache this memory layout does not have
+// absorbed form, as in deepseek2/deepseek32/glm-dsa: q_nope is pushed through wk_b so
+// q.k is taken against the 512-wide latent the cache actually holds (is_mla() drops the
+// V allocation and V becomes a view of K). the naive form would re-expand the latent to
+// n_head 256-wide k/v every step and needs a V cache this layout does not have
 //
 ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         const llama_layer & layer,
@@ -375,14 +370,12 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     const int64_t qk_head_dim  = hparams.n_embd_head_k_mla();
     const int64_t kv_lora_rank = hparams.n_lora_kv;
 
-    // nope-only. every other MLA port splits q and k into a nope and a rope half and
-    // ropes the second one; here that half is zero-width, so there is no split, no
-    // concat and no ggml_rope_ext anywhere in the text tower
+    // nope-only: the rope half is zero-width, so no split, no concat and no rope
+    // anywhere in the text tower
     GGML_ASSERT(hparams.n_rot() == 0);
 
-    // the reference scales by qk_head_dim^-0.5, i.e. over the MLA head size, not over
-    // n_embd_head_k: after absorption q is kv_lora_rank wide and 1/sqrt(512) would be
-    // a different model
+    // scale is over the MLA head size, as in the reference, not over the post-absorption
+    // width: 1/sqrt(kv_lora_rank) = 1/sqrt(512) would be a different model
     const float kq_scale = 1.0f/sqrtf(float(qk_head_dim));
 
     ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
@@ -403,8 +396,8 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     // {qk_head_dim, kv_lora_rank, n_head} x {qk_head_dim, n_tokens, n_head}
     q = ggml_mul_mat(ctx0, layer.wk_b, q);
 
-    // {kv_lora_rank, n_head, n_tokens}. deepseek2 gets this contiguous for free out of
-    // the concat with the roped half, which does not exist here
+    // {kv_lora_rank, n_head, n_tokens}. deepseek2 gets this contiguous for free from the
+    // concat with the roped half, which does not exist here
     q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
     cb(q, "dsa_q_absorbed", il);
 
@@ -481,8 +474,8 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp         = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // MLA absorption leaves a K-only cache holding the kv_lora_rank latent, so the
-    // attention half of the hybrid memory is the _k variant, as in bailingmoe3
+    // MLA absorption leaves a K-only cache holding the latent, so the attention half of
+    // the hybrid memory is the _k variant, as in bailingmoe3
     llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
     GGML_ASSERT(ubatch.n_seqs != 0);

@@ -107,8 +107,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_GLM5NEXT
             || arch == LLM_ARCH_MISTRAL4) {
-        // MLA absorbs into MQA, so the K cache row is the latent: n_head_kv must be 1
-        // or the per-layer head_count_kv array below sizes it n_head times too wide
+        // MLA absorbs into MQA, so n_head_kv must be 1: otherwise the per-layer
+        // head_count_kv array below sizes the latent K row n_head times too wide
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
