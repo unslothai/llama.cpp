@@ -105,7 +105,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_GLM5NEXT
             || arch == LLM_ARCH_MISTRAL4) {
+        // MLA absorbs into MQA, so the K cache row is the latent: n_head_kv must be 1
+        // or the per-layer head_count_kv array below sizes it n_head times too wide
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
@@ -444,11 +447,6 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
     if (arch == LLM_ARCH_DEEPSEEK4) {
-        return false;
-    }
-    if (arch == LLM_ARCH_GLM5NEXT) {
-        // the DSA and feed-forward sublayers still throw, and an uncaught throw
-        // truncates the whole sweep. the fixture keys above are already complete
         return false;
     }
 
