@@ -4,11 +4,9 @@
 	import { DropdownMenuSearchable, McpLogo, McpServerIdentity } from '$lib/components/app';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import { Switch } from '$lib/components/ui/switch';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
-	import { ROUTES } from '$lib/constants/routes';
+	import { ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
 	import { HealthCheckStatus } from '$lib/enums';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { conversationsStore, mcpStore } from '$lib/stores';
 	import type { MCPServerSettingsEntry } from '$lib/types';
 
 	interface Props {
@@ -40,11 +38,11 @@
 	}
 
 	function isServerEnabledForChat(serverId: string): boolean {
-		return conversationsStore.isMcpServerEnabledForChat(serverId);
+		return conversationsStore.preferences.isMcpServerEnabledForChat(serverId);
 	}
 
 	async function toggleServerForChat(serverId: string) {
-		await conversationsStore.toggleMcpServerForChat(serverId);
+		await conversationsStore.preferences.toggleMcpServerForChat(serverId);
 	}
 
 	function handleMcpSubMenuOpen(open: boolean) {
@@ -72,10 +70,10 @@
 		<DropdownMenu.SubContent class="w-72 pt-0">
 			{#if hasMcpServers}
 				<DropdownMenuSearchable
-					placeholder="Search servers..."
 					bind:searchValue={mcpSearchQuery}
 					emptyMessage="No servers found"
 					isEmpty={filteredMcpServers.length === 0}
+					placeholder="Search servers..."
 				>
 					<div class="max-h-64 overflow-y-auto">
 						{#each filteredMcpServers as server (server.id)}
@@ -86,10 +84,10 @@
 							{@const faviconUrl = mcpStore.getServerFavicon(server.id)}
 
 							<button
-								type="button"
 								class="flex w-full items-center justify-between gap-2 rounded-sm px-2 py-2 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-								onclick={() => !hasError && toggleServerForChat(server.id)}
 								disabled={hasError}
+								onclick={() => !hasError && toggleServerForChat(server.id)}
+								type="button"
 							>
 								<div class="flex min-w-0 flex-1 items-center gap-2">
 									<div class="min-w-0 flex-1">
@@ -98,8 +96,8 @@
 											{faviconUrl}
 											iconClass={ICON_CLASS_DEFAULT}
 											iconRounded="rounded-sm"
-											showVersion={false}
 											nameClass="text-sm"
+											showVersion={false}
 										/>
 									</div>
 
@@ -115,8 +113,8 @@
 								<Switch
 									checked={isEnabledForChat}
 									disabled={hasError}
-									onclick={(e) => e.stopPropagation()}
 									onCheckedChange={() => toggleServerForChat(server.id)}
+									onclick={(e) => e.stopPropagation()}
 								/>
 							</button>
 						{/each}

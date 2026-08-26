@@ -1,20 +1,11 @@
 /**
- * Migration Service - Unified data migration hook
+ * MigrationService - Unified data migration hook
  *
- * Centralizes all data migrations (localStorage, IndexedDB, legacy formats) into a single
- * initialization point. Each migration copies data to new format WITHOUT deleting the old.
- *
- * **Architecture:**
- * - Migrations are defined as objects with `id` and `run()` methods
- * - Migration state is tracked in localStorage to avoid re-running
- * - `runAllMigrations()` should be called once at app startup
- * - All migrations are NON-DESTRUCTIVE - legacy data is preserved for downgrade compatibility
- *
- * **Current Migrations:**
- * 1. localStorage prefix: Copy LlamaCppWebui.* → LlamaUi.* (both preserved)
- * 2. IndexedDB database: Copy LlamacppWebui → LlamaUi (both preserved)
- * 3. Legacy message format: Transform in-place (preserves structure, migrates markers)
- * 4. Theme key: Copy standalone `theme` → config object (both preserved)
+ * Centralizes all data migrations (localStorage, IndexedDB, legacy formats)
+ * into a single initialization point. Each migration copies data to the new
+ * format WITHOUT deleting the old, and state is tracked in localStorage so
+ * `runAllMigrations()` (called once at startup) never re-runs a completed
+ * migration. All migrations are non-destructive for downgrade compatibility.
  */
 
 import {
@@ -22,13 +13,14 @@ import {
 	DB_APP_NAME_DEPRECATED,
 	IDXDB_STORES,
 	IDXDB_TABLES,
+	LEGACY_AGENTIC_REGEX,
+	LEGACY_REASONING_TAGS,
 	NEW_TO_DEPRECATED_MAP,
+	SETTINGS_KEYS,
 	STORAGE_APP_NAME,
 	STORAGE_APP_NAME_DEPRECATED
 } from '$lib/constants';
-import { LEGACY_AGENTIC_REGEX, LEGACY_REASONING_TAGS } from '$lib/constants/agentic';
-import { SETTINGS_KEYS } from '$lib/constants/settings-keys';
-import { MessageRole } from '$lib/enums';
+import { BooleanString, MessageRole } from '$lib/enums';
 import Dexie from 'dexie';
 
 // Types
@@ -612,10 +604,10 @@ const configTypesMigration: Migration = {
 		// schema rejects them. No config string field holds exactly "true"/"false", so the
 		// match is unambiguous.
 		for (const key of Object.keys(config)) {
-			if (config[key] === 'true') {
+			if (config[key] === BooleanString.TRUE) {
 				config[key] = true;
 				changed = true;
-			} else if (config[key] === 'false') {
+			} else if (config[key] === BooleanString.FALSE) {
 				config[key] = false;
 				changed = true;
 			}
@@ -627,6 +619,37 @@ const configTypesMigration: Migration = {
 
 		if (import.meta.env.DEV && import.meta.env.VITE_DEBUG)
 			console.log(`[Migration] Config types: coerced string booleans (changed=${changed})`);
+	}
+};
+const RENDER_KEYS_MIGRATION_ID = 'render-keys-unfold-v1';
+const LEGACY_RENDER_RAW_TEXT_KEY = 'renderContentAsRawText';
+const renderKeysMigration: Migration = {
+	description: 'Unfold the single raw text render toggle onto the per-surface render keys',
+	id: RENDER_KEYS_MIGRATION_ID,
+
+	async run(): Promise<void> {
+		const configRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+
+		if (configRaw === null) return;
+
+		const config = JSON.parse(configRaw);
+
+		if (!(LEGACY_RENDER_RAW_TEXT_KEY in config)) return;
+
+		// The toggle carried user content and thinking at once and cannot say which surface
+		// was chosen, so it only restores the user key and thinking keeps its own default.
+		if (!(SETTINGS_KEYS.RENDER_USER_CONTENT_AS_MARKDOWN in config)) {
+			config[SETTINGS_KEYS.RENDER_USER_CONTENT_AS_MARKDOWN] =
+				config[LEGACY_RENDER_RAW_TEXT_KEY] !== true;
+		}
+
+		// Dropped rather than preserved: the two render keys and the toggle describe the same
+		// surfaces, so leaving it behind would let a stale value fight the restored one.
+		delete config[LEGACY_RENDER_RAW_TEXT_KEY];
+		localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(config));
+
+		if (import.meta.env.DEV && import.meta.env.VITE_DEBUG)
+			console.log('[Migration] Render keys: unfolded the raw text toggle');
 	}
 };
 const MCP_DEFAULT_OVERRIDES_LEGACY_KEY = `${STORAGE_APP_NAME}.mcpDefaultServerOverrides`;
@@ -722,7 +745,8 @@ const migrations: Migration[] = [
 	customJsonKeyMigration,
 	mcpDefaultEnabledMigration,
 	mcpDefaultOverridesMergeMigration,
-	configTypesMigration
+	configTypesMigration,
+	renderKeysMigration
 ];
 
 export const MigrationService = {
