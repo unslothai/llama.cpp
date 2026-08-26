@@ -12,6 +12,7 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-kpool.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -3550,6 +3551,180 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
+        const llama_memory_hybrid_context * mctx_cur,
+        ggml_tensor * kq_mask,
+        bool scoring) const {
+    const auto * mctx_attn = mctx_cur->get_attn();
+    const auto * mctx_idx  = mctx_cur->get_idx();
+
+    GGML_ASSERT(mctx_idx != nullptr && "a pooled indexer needs the indexer KV cache");
+
+    const uint32_t kpool = hparams.indexer_kpool;
+    GGML_ASSERT(kpool > 0);
+
+    auto inp = std::make_unique<llm_graph_input_kpool>(mctx_attn, mctx_idx, kpool);
+
+    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    ggml_set_input(inp->k_idxs);
+    ggml_set_name(inp->k_idxs, "kpool_k_idxs");
+
+    if (scoring) {
+        const int64_t n_kv = mctx_attn->get_n_kv();
+
+        // spelled exactly as build_attn_inp_kq_mask spells it, so that sel_mask,
+        // cand_mask and the KQ mask are the same shape and add without a
+        // broadcast. get_n_stream() is the cache's stream RANGE and is a
+        // different number as soon as a server has non-contiguous slots busy
+        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        const int64_t n_tps    = ubatch.n_tokens/n_stream;
+
+        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool);
+
+        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
+
+        // this tree's build_attn_inp_kq_mask has no GGML_KQ_MASK_PAD, so the mask
+        // is exactly n_tps rows. the host side supports n_padq > n_tps, the graph
+        // below does not: the selection terms only exist for real queries
+        GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
+
+        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
+        ggml_set_input(inp->pool_cells);
+        ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+
+        inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
+        ggml_set_input(inp->pool_bias);
+        ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+
+        // f32 even under flash attention, where the KQ mask itself is f16: these
+        // are a scatter base and a mask addend, not the tensor the FA kernel sees
+        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tps, 1, n_stream);
+        ggml_set_input(inp->sel_mask);
+        ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+
+        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tps, 1, n_stream);
+        ggml_set_input(inp->cand_mask);
+        ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+    }
+
+    return (llm_graph_input_kpool *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn_sparse(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+        ggml_tensor * top_k,
+        ggml_tensor * sel_mask,
+        ggml_tensor * cand_mask,
+            float     kq_scale,
+            int       il) const {
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    }
+
+    const auto & kq_mask = inp->get_kq_mask();
+
+    GGML_ASSERT(sel_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(sel_mask, cand_mask));
+    GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
+                sel_mask->ne[3] == kq_mask->ne[3]);
+
+    // The dense DSA path (build_attn on llm_graph_input_attn_k_dsa) opens with
+    // ggml_fill(kq_mask, -INFINITY). Here the scatter starts from sel_mask
+    // instead, which already holds 0.0 on the query's own trailing incomplete
+    // pool: GLM always attends to that tail (index_kpool_always_select_tail), and
+    // keeping it out of the top-k budget is what lets the budget stay a whole
+    // number of pools.
+    //
+    // ggml_set_rows writes THROUGH to its destination and returns a view of it,
+    // and sel_mask is one shared per-ubatch input read by every indexer layer.
+    // Scattering into it directly makes each layer inherit the previous layer's
+    // unmasked cells: measured on TinySparse, layer 3 stayed inside its budget
+    // while layer 7, running second, reached 411 cells. The dense path never
+    // meets this because ggml_fill hands it a fresh tensor every layer. Take a
+    // private copy per layer.
+    ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
+
+    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+    mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
+            mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
+
+    // [n_select, n_tps, n_stream] -> [n_select, n_tps, n_stream, 1]
+    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
+            top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
+
+    // A constant 0, never the cell's own bias. The scatter must not be able to
+    // ERASE a zero sel_mask already granted: a tail cell can also be named by the
+    // top-k (through an over-budget pool whose unfilled slots point at it), and
+    // scattering that cell's -inf score bias would leave the query attending to
+    // nothing at all. Rejecting an over-budget selection is done additively,
+    // below, by cand_mask
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    ggml_tensor * mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
+
+    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
+    mask_top_k = ggml_view_4d(ctx0, mask_top_k, mask_top_k->ne[1], mask_top_k->ne[2], 1, mask_top_k->ne[3],
+            mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
+
+    // the reference's `selected_valid` gather, additively: a cell the top-k named
+    // that is not in the reference's candidate set goes back to -inf, and a tail
+    // cell that sel_mask granted stays at 0 because cand_mask is the UNION of the
+    // candidates and the tail
+    mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
+
+    // sel_mask and cand_mask are f32 by contract - llama_kv_cache_set_input_kpool
+    // writes floats through raw strides and refuses anything else - but the KQ
+    // mask is f16 whenever flash attention is on, which is the DEFAULT, and
+    // ggml_flash_attn_ext asserts its mask is f16. Cast rather than refuse: the
+    // only two values here are 0.0f and -INFINITY and both are exact in f16.
+    // Refusing instead aborts test-llama-archs, which runs with FA on
+    if (mask_top_k->type != kq_mask->type) {
+        mask_top_k = ggml_cast(ctx0, mask_top_k, kq_mask->type);
+    }
+
+    // and finally re-apply causality, occupancy and padding. load bearing: it is
+    // what keeps an empty, future or foreign-sequence cell masked no matter what
+    // the top-k returned
+    mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
+    cb(mask_top_k, "kpool_kq_mask", il);
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {

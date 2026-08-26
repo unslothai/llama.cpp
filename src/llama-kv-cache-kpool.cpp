@@ -14,11 +14,13 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool) {
     return n_kv/kpool + 2;
 }
 
-uint32_t llama_kpool_top_k_width(uint32_t n_kv, uint32_t indexer_top_k, uint32_t kpool) {
+uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool) {
     GGML_ASSERT(kpool > 0);
+    GGML_ASSERT(n_pools > 0);
     GGML_ASSERT(indexer_top_k % kpool == 0 && "indexer_top_k must be a whole number of pools");
 
-    return std::min(n_kv, indexer_top_k);
+    // min(index_topk // index_kpool, n_pools), exactly the reference's select_k
+    return std::min(n_pools, indexer_top_k/kpool);
 }
 
 void llama_kv_cache_set_input_kpool(
@@ -26,52 +28,74 @@ void llama_kv_cache_set_input_kpool(
               ggml_tensor    * cell_pool,
               ggml_tensor    * pool_cells,
               ggml_tensor    * bias,
+              ggml_tensor    * pool_bias,
               ggml_tensor    * sel_mask,
+              ggml_tensor    * cand_mask,
         const llama_ubatch   * ubatch,
               uint32_t         kpool) {
     GGML_ASSERT(kv != nullptr);
     GGML_ASSERT(kpool > 0);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool ->buffer));
+    // the per-CELL view is optional: the pooled graph does not consume it, and an
+    // input tensor with no consumer is never backed by the allocator
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(bias      ->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_bias ->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask  ->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(cand_mask ->buffer));
 
-    // sel_mask is KQ-mask shaped, and KQ masks are f16 under flash attention; writing
-    // floats into one would overrun the allocation 2x, so check rather than trust
-    GGML_ASSERT(cell_pool ->type == GGML_TYPE_I32);
+    // sel_mask and cand_mask are KQ-mask shaped, and KQ masks are f16 under flash
+    // attention; writing floats into one would overrun the allocation 2x, so check
+    // rather than trust
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(bias      ->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_bias ->type == GGML_TYPE_F32);
     GGML_ASSERT(sel_mask  ->type == GGML_TYPE_F32 && "sel_mask must be f32 even when the KQ mask is f16");
+    GGML_ASSERT(cand_mask ->type == GGML_TYPE_F32 && "cand_mask must be f32 even when the KQ mask is f16");
 
     // everything below is written through raw strides
-    GGML_ASSERT(ggml_is_contiguous(cell_pool));
     GGML_ASSERT(ggml_is_contiguous(pool_cells));
-    GGML_ASSERT(ggml_is_contiguous(bias));
+    GGML_ASSERT(ggml_is_contiguous(pool_bias));
     GGML_ASSERT(ggml_is_contiguous(sel_mask));
+    GGML_ASSERT(ggml_is_contiguous(cand_mask));
 
-    const int64_t n_kv     = cell_pool->ne[0];
-    const int64_t n_ns     = cell_pool->ne[1];          // streams in this ubatch
+    const int64_t n_kv     = sel_mask->ne[0];
+    const int64_t n_ns     = sel_mask->ne[3];           // streams in this ubatch
     const int64_t r        = kpool;
     const int64_t n_pools  = pool_cells->ne[0]/r;
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(pool_cells->ne[0] % r == 0);
     GGML_ASSERT(pool_cells->ne[1] == n_ns);
-    GGML_ASSERT(bias->ne[0] == n_kv && bias->ne[2] == n_ns);
-    GGML_ASSERT(sel_mask->ne[0] == n_kv && sel_mask->ne[2] == 1 && sel_mask->ne[3] == n_ns);
+    GGML_ASSERT(sel_mask->ne[2] == 1);
+    GGML_ASSERT(ggml_are_same_shape(cand_mask, sel_mask));
+    GGML_ASSERT(pool_bias->ne[0] == n_pools && pool_bias->ne[2] == n_ns);
     GGML_ASSERT(n_tokens % n_ns == 0);
 
     const int64_t n_tps  = n_tokens/n_ns;               // tokens per stream
     const int64_t n_padq = sel_mask->ne[1];             // KQ mask rows, >= n_tps
 
-    GGML_ASSERT(bias->ne[1] == n_tps);
+    GGML_ASSERT(pool_bias->ne[1] == n_tps);
     GGML_ASSERT(n_padq >= n_tps);
 
-    int32_t * dst_cell_pool  = (int32_t *) cell_pool ->data;
+    if (cell_pool) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
+        GGML_ASSERT(cell_pool->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(cell_pool));
+        GGML_ASSERT(cell_pool->ne[0] == n_kv && cell_pool->ne[1] == n_ns);
+    }
+
+    if (bias) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(bias));
+        GGML_ASSERT(bias->ne[0] == n_kv && bias->ne[1] == n_tps && bias->ne[2] == n_ns);
+    }
+
+    int32_t * dst_cell_pool  = cell_pool ? (int32_t *) cell_pool->data : nullptr;
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
-    float   * dst_bias       = (float   *) bias      ->data;
+    float   * dst_bias       = bias ? (float *) bias->data : nullptr;
+    float   * dst_pool_bias  = (float   *) pool_bias ->data;
     float   * dst_sel_mask   = (float   *) sel_mask  ->data;
+    float   * dst_cand_mask  = (float   *) cand_mask ->data;
 
     // -1 marks a cell with no usable pool. host side only: never copied into cell_pool,
     // where ggml_get_rows would read it as an index
@@ -94,7 +118,7 @@ void llama_kv_cache_set_input_kpool(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = kv->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_pool  = dst_cell_pool  + s*n_kv;
+        int32_t * cur_cell_pool  = dst_cell_pool ? dst_cell_pool + s*n_kv : nullptr;
         int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pools);
 
         std::fill(pool_of.begin(), pool_of.end(), -1);
@@ -168,13 +192,17 @@ void llama_kv_cache_set_input_kpool(
             if (pool_of[j] >= 0 && filled[pool_of[j]] != (int32_t) r) {
                 pool_of[j] = -1;
             }
-            cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
+            if (cur_cell_pool) {
+                cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
+            }
         }
 
-        float * cur_sel_mask = dst_sel_mask + s*(n_padq*n_kv);
+        float * cur_sel_mask  = dst_sel_mask  + s*(n_padq*n_kv);
+        float * cur_cand_mask = dst_cand_mask + s*(n_padq*n_kv);
 
         // the loop below writes rows < n_tps in full; only the padding rows need clearing
-        std::fill(cur_sel_mask + n_tps*n_kv, cur_sel_mask + n_padq*n_kv, -INFINITY);
+        std::fill(cur_sel_mask  + n_tps*n_kv, cur_sel_mask  + n_padq*n_kv, -INFINITY);
+        std::fill(cur_cand_mask + n_tps*n_kv, cur_cand_mask + n_padq*n_kv, -INFINITY);
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t   i = s*n_tps + ii;
@@ -193,8 +221,9 @@ void llama_kv_cache_set_input_kpool(
             // that test collapses to b*r < tail_start
             const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
 
-            float * cur_bias = dst_bias     + i*n_kv;
-            float * cur_sel  = cur_sel_mask + ii*n_kv;
+            float * cur_bias = dst_bias ? dst_bias + i*n_kv : nullptr;
+            float * cur_sel  = cur_sel_mask  + ii*n_kv;
+            float * cur_cand = cur_cand_mask + ii*n_kv;
 
             // the unsigned compares fold "empty or another sequence" (pos_at -1) and "no
             // usable pool" (pool_of -1) into the range test, which lets this vectorise
@@ -203,16 +232,61 @@ void llama_kv_cache_set_input_kpool(
                 const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
                 const bool tail   = pos_at[j] >= tail_start;
 
-                cur_bias[j] = vis && pooled ? 0.0f : -INFINITY;
                 cur_sel [j] = vis && tail   ? 0.0f : -INFINITY;
+                // max(bias, sel_mask): the reference's candidate set, which the
+                // top-k budget may overrun but must never escape
+                cur_cand[j] = vis && (pooled || tail) ? 0.0f : -INFINITY;
+            }
+
+            if (cur_bias) {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
+                    const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
+
+                    cur_bias[j] = vis && pooled ? 0.0f : -INFINITY;
+                }
+            }
+
+            // The same predicate, per POOL, which is where the reference applies
+            // it: pool_valid (completely resident) & pool_visible (its LAST
+            // member is visible, so a pool the query straddles is dropped whole).
+            // Pools are position-aligned here, so pool bo's last member is at
+            // position (b_base + bo)*r + r - 1 and "last member visible" collapses
+            // to bo < bo_vis.
+            //
+            // NOT gathered from `bias` at the last member cell: an incomplete or
+            // absent pool has no resident last member, pool_cells points that slot
+            // at cell 0, and the pool would inherit cell 0's validity.
+            float * cur_pool_bias = dst_pool_bias + (s*n_tps + ii)*n_pools;
+
+            for (int64_t p = 0; p < n_pools; ++p) {
+                const bool valid   = filled[p] == (int32_t) r;
+                const bool visible = p < bo_vis;
+
+                cur_pool_bias[p] = valid && visible ? 0.0f : -INFINITY;
             }
         }
     }
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
+    // unconditional: the indexer key and gate STORE runs on the dense path too,
+    // and k_idxs is what tells cpy_k where to put them. Gating the store the way
+    // the scoring is gated would leave every cell written below n_select - the
+    // first 2051 positions of every sequence on the real model - with no indexer
+    // state, and the first ubatch to cross n_select would pool cells that were
+    // never written
     mctx_idx->set_input_k_idxs(k_idxs, ubatch);
 
+    // the rest exists only when the graph scores. below n_select the indexer
+    // would select every visible position, so build_inp_kpool does not allocate
+    // these at all and there is nothing to fill
+    if (pool_cells == nullptr) {
+        return;
+    }
+
     llama_kv_cache_set_input_kpool(
-            mctx_attn->get_kv(), cell_pool, pool_cells, bias, sel_mask, ubatch, kpool);
+            mctx_attn->get_kv(),
+            /* cell_pool */ nullptr, pool_cells, /* bias */ nullptr, pool_bias,
+            sel_mask, cand_mask, ubatch, kpool);
 }
