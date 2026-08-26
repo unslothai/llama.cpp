@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { X } from '@lucide/svelte';
-	import { goto } from '$app/navigation';
 	import { browser } from '$app/environment';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ActionIcon } from '$lib/components/app';
-	import { SETTINGS_FALLBACK_EXIT_ROUTE } from '$lib/constants';
+	import { ROUTES } from '$lib/constants';
 
 	let { children } = $props();
 
@@ -12,6 +12,7 @@
 
 	$effect(() => {
 		const currentId = page.route.id;
+
 		return () => {
 			previousRouteId = currentId;
 		};
@@ -19,16 +20,17 @@
 
 	function handleClose() {
 		const prevIsSettings = previousRouteId?.startsWith('/settings');
+
 		if (browser && window.history.length > 1 && !prevIsSettings) {
 			history.back();
 		} else {
-			goto(SETTINGS_FALLBACK_EXIT_ROUTE);
+			goto(ROUTES.SETTINGS_EXIT);
 		}
 	}
 </script>
 
 <div class="fixed top-4.5 right-4 z-50 md:hidden">
-	<ActionIcon icon={X} tooltip="Close" onclick={handleClose} />
+	<ActionIcon icon={X} onclick={handleClose} tooltip="Close" />
 </div>
 
 <div class="min-h-full">

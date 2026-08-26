@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
-	import { Lightbulb, LightbulbOff, Check, Info } from '@lucide/svelte';
+	import { Check, Info, Lightbulb, LightbulbOff } from '@lucide/svelte';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
 
 	const reasoning = useReasoningMenu();
@@ -64,6 +64,7 @@
 							<Tooltip.Trigger>
 								<Info class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 							</Tooltip.Trigger>
+
 							<Tooltip.Content side="left">
 								<p>Maximum reasoning effort with extended context usage</p>
 							</Tooltip.Content>

@@ -25,6 +25,7 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsa-iswa.cpp
             llama-kv-cache-kpool.cpp
             llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
@@ -46,9 +47,14 @@ add_library(llama
             )
 
 set_target_properties(llama PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
+target_compile_definitions(llama PRIVATE
+    LLAMA_VERSION="${LLAMA_VERSION}"
+    LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
 target_include_directories(llama PRIVATE .)
