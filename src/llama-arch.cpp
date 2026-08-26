@@ -1012,8 +1012,8 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_MINIMAX_01:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_MINIMAX_01:
             return true;
         default:
             return false;
@@ -1037,12 +1037,12 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
-        case LLM_ARCH_GLM5NEXT:
             return true;
         default:
             return false;
@@ -1076,9 +1076,9 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
-        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_QWEN3TTS:
             return false;
         default:

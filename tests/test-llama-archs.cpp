@@ -116,9 +116,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_DOTS3NOTE
             || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_GLM5NEXT
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_GLM5NEXT
             || arch == LLM_ARCH_MISTRAL4) {
         // MLA absorbs into MQA, so n_head_kv must be 1: otherwise the per-layer
         // head_count_kv array below sizes the latent K row n_head times too wide
@@ -217,6 +217,20 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
     } else if (arch == LLM_ARCH_GLM5NEXT) {
+        // nope-only MLA: rope dimension count must be written as 0, not omitted, or
+        // the generic loader defaults it non-zero and load_arch_hparams rejects it
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,    uint32_t(4));
+        // build_hc_pre hard-codes a 4-wide residual
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1e-6f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -448,8 +462,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
-        case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -510,7 +524,6 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_GLM5NEXT) {
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
     if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE) {
