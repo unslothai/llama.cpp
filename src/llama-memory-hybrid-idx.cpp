@@ -2,11 +2,14 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-io.h"
 #include "llama-model.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <iterator>
+#include <stdexcept>
 
 //
 // llama_memory_hybrid_idx
@@ -139,6 +142,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+
+    // [TAG_PLE_HISTORY] every sequence is gone, so no window is trusted any more
+    ple_hist.clear();
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -152,6 +158,8 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
+    ple_hist_rm(seq_id, p0, p1);
+
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
@@ -161,6 +169,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
+
+    ple_hist_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -169,6 +179,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
     }
+
+    ple_hist_keep(seq_id);
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -177,6 +189,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
+
+    ple_hist_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -185,6 +199,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
     }
+
+    ple_hist_div(seq_id, p0, p1);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
@@ -197,6 +213,256 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     }
 
     return mb;
+}
+
+//
+// [TAG_PLE_HISTORY] per-sequence PLE n-gram history
+//
+// The window is only meaningful while it is contiguous with the position the sequence is
+// about to decode, so every operation below either rewrites it exactly or invalidates it.
+// Invalidating means next_pos = -1, which set_input turns into full EOS padding - the same
+// thing a fresh sequence gets, and the same thing this code did before it followed the
+// sequence operations at all. It is therefore never worse than the previous behaviour, and
+// it is exact in the cases that matter (a rewind to a prefix, a copied sequence, a context
+// shift).
+//
+
+llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx::ple_hist_get(llama_seq_id seq_id) const {
+    return ple_hist[seq_id];
+}
+
+// first position still remembered by h
+static llama_pos ple_hist_beg(const llama_memory_hybrid_idx::ple_history & h) {
+    return h.next_pos - (llama_pos) h.toks.size();
+}
+
+static void ple_hist_invalidate(llama_memory_hybrid_idx::ple_history & h) {
+    h.next_pos = -1;
+    h.toks.clear();
+}
+
+// drop everything at position >= p, so the sequence now ends just before p
+static void ple_hist_truncate(llama_memory_hybrid_idx::ple_history & h, llama_pos p) {
+    const llama_pos beg = ple_hist_beg(h);
+
+    if (p <= beg) {
+        h.toks.clear();
+    } else if (p < h.next_pos) {
+        h.toks.resize((size_t) (p - beg));
+    }
+
+    h.next_pos = p;
+}
+
+void llama_memory_hybrid_idx::ple_hist_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (seq_id < 0) {
+        for (auto & it : ple_hist) {
+            ple_hist_rm(it.first, p0, p1);
+        }
+        return;
+    }
+
+    auto it = ple_hist.find(seq_id);
+    if (it == ple_hist.end() || it->second.next_pos < 0) {
+        return;
+    }
+    auto & h = it->second;
+
+    if (p0 <= 0 && p1 < 0) {
+        // the whole sequence is gone
+        ple_hist.erase(it);
+        return;
+    }
+
+    if (p1 < 0) {
+        // a rewind: the sequence now ends at p0 and the surviving prefix of the window is
+        // still contiguous with it, which is the case a session rollback actually hits
+        if (p0 < h.next_pos) {
+            ple_hist_truncate(h, p0);
+        }
+        return;
+    }
+
+    // a hole punched somewhere in the middle. seq_rm does not renumber what follows, so a
+    // window that overlaps the hole is no longer a run of consecutive positions
+    if (p1 > ple_hist_beg(h) && p0 < h.next_pos) {
+        ple_hist_invalidate(h);
+    }
+}
+
+void llama_memory_hybrid_idx::ple_hist_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+
+    // whatever the destination had is replaced by the copied range, exactly as its cells are
+    ple_hist.erase(seq_id_dst);
+
+    auto it = ple_hist.find(seq_id_src);
+    if (it == ple_hist.end() || it->second.next_pos < 0) {
+        return;
+    }
+
+    ple_history h = it->second;
+
+    if (p1 >= 0 && p1 < h.next_pos) {
+        ple_hist_truncate(h, p1);
+    }
+
+    // positions below p0 were not copied, so for the destination they are before the start
+    // of the sequence, which the hash already reads as EOS
+    const llama_pos lo = p0 < 0 ? 0 : p0;
+    if (lo > ple_hist_beg(h)) {
+        const llama_pos drop = std::min<llama_pos>(lo - ple_hist_beg(h), (llama_pos) h.toks.size());
+        h.toks.erase(h.toks.begin(), h.toks.begin() + (size_t) drop);
+    }
+
+    ple_hist[seq_id_dst] = std::move(h);
+}
+
+void llama_memory_hybrid_idx::ple_hist_keep(llama_seq_id seq_id) {
+    for (auto it = ple_hist.begin(); it != ple_hist.end(); ) {
+        it = it->first == seq_id ? std::next(it) : ple_hist.erase(it);
+    }
+}
+
+void llama_memory_hybrid_idx::ple_hist_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (seq_id < 0) {
+        for (auto & it : ple_hist) {
+            ple_hist_add(it.first, p0, p1, shift);
+        }
+        return;
+    }
+
+    auto it = ple_hist.find(seq_id);
+    if (it == ple_hist.end() || it->second.next_pos < 0) {
+        return;
+    }
+    auto & h = it->second;
+
+    const llama_pos beg = ple_hist_beg(h);
+    const llama_pos lo  = p0 < 0 ? 0 : p0;
+
+    if (p1 >= 0 && p1 <= beg) {
+        // entirely below the window: the tokens we remember keep their positions
+        return;
+    }
+    if (lo >= h.next_pos) {
+        // entirely above the window: nothing we remember moves
+        return;
+    }
+    if (lo <= beg && (p1 < 0 || p1 >= h.next_pos)) {
+        // the whole window moves as one, so it stays a run of consecutive positions.
+        // this is the context-shift case
+        if (beg + shift < 0) {
+            ple_hist_invalidate(h);
+        } else {
+            h.next_pos += shift;
+        }
+        return;
+    }
+
+    // the shift cuts through the window and breaks its contiguity
+    ple_hist_invalidate(h);
+}
+
+void llama_memory_hybrid_idx::ple_hist_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (seq_id < 0) {
+        for (auto & it : ple_hist) {
+            ple_hist_div(it.first, p0, p1);
+        }
+        return;
+    }
+
+    auto it = ple_hist.find(seq_id);
+    if (it == ple_hist.end() || it->second.next_pos < 0) {
+        return;
+    }
+    auto & h = it->second;
+
+    const llama_pos lo = p0 < 0 ? 0 : p0;
+
+    // dividing positions makes them non-consecutive, so any overlap ends the window. no
+    // caller in tree divides positions of an architecture that has a PLE table, but leaving
+    // this out would silently keep a window whose positions no longer line up
+    if ((p1 < 0 || p1 > ple_hist_beg(h)) && lo < h.next_pos) {
+        ple_hist_invalidate(h);
+    }
+}
+
+// Serialised as a self-delimiting list so that seq_id == -1 (whole context) and a single
+// sequence share one format:
+//   u32 n_entries
+//   n_entries * { i32 seq_id, i32 next_pos, u32 n_toks, i32 toks[n_toks] }
+// n_toks is at most ple_ngram_size - 1, so an entry is a handful of bytes.
+void llama_memory_hybrid_idx::ple_hist_state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
+    uint32_t n_entries = 0;
+    for (const auto & it : ple_hist) {
+        if ((seq_id < 0 || it.first == seq_id) && it.second.next_pos >= 0) {
+            ++n_entries;
+        }
+    }
+
+    io.write(&n_entries, sizeof(n_entries));
+
+    for (const auto & it : ple_hist) {
+        if ((seq_id >= 0 && it.first != seq_id) || it.second.next_pos < 0) {
+            continue;
+        }
+
+        const int32_t  id       = it.first;
+        const int32_t  next_pos = it.second.next_pos;
+        const uint32_t n_toks   = (uint32_t) it.second.toks.size();
+
+        io.write(&id,       sizeof(id));
+        io.write(&next_pos, sizeof(next_pos));
+        io.write(&n_toks,   sizeof(n_toks));
+        if (n_toks > 0) {
+            io.write(it.second.toks.data(), n_toks*sizeof(llama_token));
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_seq_id seq_id) {
+    uint32_t n_entries = 0;
+    io.read(&n_entries, sizeof(n_entries));
+
+    // a single-sequence restore replaces only that sequence's window; a whole-context one
+    // replaces the lot, matching what the caches around it do
+    if (seq_id >= 0) {
+        ple_hist.erase(seq_id);
+    } else {
+        ple_hist.clear();
+    }
+
+    for (uint32_t i = 0; i < n_entries; ++i) {
+        int32_t  id       = 0;
+        int32_t  next_pos = 0;
+        uint32_t n_toks   = 0;
+
+        io.read(&id,       sizeof(id));
+        io.read(&next_pos, sizeof(next_pos));
+        io.read(&n_toks,   sizeof(n_toks));
+
+        // the window is never longer than ple_ngram_size - 1; anything else is a corrupt or
+        // mismatched blob, and reading it would size an allocation from the file
+        if (n_toks > 64) {
+            throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
+        }
+
+        std::vector<llama_token> toks(n_toks);
+        if (n_toks > 0) {
+            io.read(toks.data(), n_toks*sizeof(llama_token));
+        }
+
+        // a single-sequence restore may target a different seq_id than the one it was saved
+        // from, so the destination wins over the stored id
+        const llama_seq_id dst = seq_id >= 0 ? seq_id : (llama_seq_id) id;
+
+        auto & h = ple_hist[dst];
+        h.next_pos = next_pos;
+        h.toks     = std::move(toks);
+    }
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -216,6 +482,17 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
             mem_idx->state_write(io, seq_id, flags);
         }
     }
+
+    // [TAG_PLE_HISTORY]
+    // last again, for the same reason the indexer section is: a pure suffix, so a reader
+    //   that does not expect it stops early rather than parsing these bytes as something
+    //   else. This is written after the indexer section because it is the newer of the two.
+    // unlike the indexer this is NOT under the PARTIAL_ONLY gate. The n-gram window is
+    //   recurrent state, not a token-level cache - it is the input the PLE convolution's
+    //   own recurrent state is derived from - and the recurrent cache next to it is written
+    //   for partial checkpoints too. Skipping it would leave the server's speculative
+    //   decoding checkpoints restoring the conv state without the window that produced it.
+    ple_hist_state_write(io, seq_id);
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -233,6 +510,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             mem_idx->state_read(io, seq_id, flags);
         }
     }
+
+    // [TAG_PLE_HISTORY] must mirror the write order above
+    ple_hist_state_read(io, seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
@@ -309,6 +589,12 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     GGML_ASSERT(i_cur < ns_ubatch.size());
 
     return ns_ubatch[i_cur];
+}
+
+llama_memory_hybrid_idx::ple_history & llama_memory_hybrid_idx_context::get_ple_hist(llama_seq_id seq_id) const {
+    GGML_ASSERT(mem != nullptr);
+
+    return mem->ple_hist_get(seq_id);
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa(
