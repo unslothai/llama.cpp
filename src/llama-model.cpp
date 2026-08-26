@@ -2434,6 +2434,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
+                    // left null for every architecture but the sparse-attention
+                    // ones, which is what keeps the indexer cache from existing
+                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    ggml_type type_idx = GGML_TYPE_F16;
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -2451,9 +2455,43 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
+
+                        if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
+                            // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]
+                            // the indexer pools cells by position, and a unified
+                            // cache gives every sequence the same cells array, so
+                            // two sequences at the same position would pool each
+                            // other's keys. Refuse here rather than aborting deep
+                            // inside a set_input several thousand tokens in
+                            if (cparams.kv_unified && cparams.n_seq_max > 1) {
+                                throw std::runtime_error("glm5next: the pooled indexer needs one sequence per stream, so a unified KV cache is only supported with a single sequence");
+                            }
+
+                            // the DSA layers carry a lightning-indexer key cache;
+                            // the KDA layers and the NextN block do not
+                            filter_idx = [&](uint32_t il) {
+                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+
+                            // the pooling indexer caches the compressor gate score
+                            // next to the key, and the gate feeds a softmax, so
+                            // -ctk q8_0 would quantise something far more
+                            // sensitive than a key. keep the indexer float
+                            type_idx = params.type_k;
+                            if (ggml_is_quantized(type_idx)) {
+                                LLAMA_LOG_WARN("%s: indexer key cache stays %s rather than %s: it also holds the compressor gates\n",
+                                        __func__, ggml_type_name(GGML_TYPE_F16), ggml_type_name(type_idx));
+                                type_idx = GGML_TYPE_F16;
+                            }
+                        }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        // llama_memory_hybrid_iswa has no indexer cache. glm5next
+                        // is swa_type NONE so it never lands here, but a sparse
+                        // hybrid with SWA would silently lose its indexer
+                        GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
+
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -2491,7 +2529,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* type_idx          */ type_idx);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
