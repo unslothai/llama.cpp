@@ -1301,6 +1301,8 @@ struct llama_model_glm5next : public llama_model_base {
         ggml_tensor * build_layer_attn(
                 const llama_model & model,
                 llm_graph_input_mem_hybrid_k * inp_mem,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
                 ggml_tensor * cur,
                 int il);
 
@@ -1310,10 +1312,29 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il);
 
+        // `scoring` false keeps the dense path: at or below
+        // index_topk + index_kpool - 1 resident positions the indexer selects
+        // every visible position, so dense is not an approximation there, it is
+        // the same function without the pooling work. The indexer STORE still
+        // runs; only the selection is skipped
         ggml_tensor * build_dsa_layer(
                 const llama_layer & layer,
                 llm_graph_input_attn_k * inp_attn,
+                llm_graph_input_kpool * inp_kp,
+                bool scoring,
                 ggml_tensor * cur,
+                int il) const;
+
+        // writes this layer's indexer key and compressor gate into the indexer
+        // cache - always - and then, when `scoring`, returns the I32 attention
+        // cache CELL indices this layer's queries select, already expanded from
+        // whole pools: [kpool*select_k, n_tps, n_stream]
+        ggml_tensor * build_indexer(
+                const llama_layer & layer,
+                llm_graph_input_kpool * inp_kp,
+                ggml_tensor * cur,
+                ggml_tensor * qr,
+                bool scoring,
                 int il) const;
 
         ggml_tensor * build_layer_ffn(

@@ -1,6 +1,8 @@
 #include "models.h"
 
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache-kpool.h"
 
 //
 // GLM-5.3-Flash: hybrid KDA (linear) + DSA (nope-only MLA) attention, mHC
@@ -35,6 +37,18 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps);
+    // The reference HARDCODES nn.LayerNorm(index_head_dim, eps=1e-6); it does not
+    // read it from the config, and rms_norm_eps is 1e-5. Warned about rather than
+    // asserted, for two reasons. No output comparison can see it: seeding eps=1e-5
+    // into the reference leaves the logits BIT-IDENTICAL at 512 tokens and moves
+    // the index jaccard by 1.7e-5 at 2048, against a bf16 floor of 0.63. And an
+    // assert would abort test-llama-archs, whose synthetic models have no reason
+    // to carry a converter contract
+    if (hparams.f_norm_eps <= 0.0f || hparams.f_norm_eps > 2e-6f) {
+        LLAMA_LOG_WARN("%s: indexer k_norm eps is %g, but the reference hardcodes 1e-6. "
+                "this is invisible to every output comparison; check the converter\n",
+                __func__, (double) hparams.f_norm_eps);
+    }
 
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
@@ -63,11 +77,12 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.indexer_kpool > 0);
     GGML_ASSERT(hparams.indexer_top_k % hparams.indexer_kpool == 0);
 
+    // below n_select resident positions the indexer selects every visible one, so
+    // the dense path is not an approximation of the sparse one, it IS it
     const uint32_t n_select = glm5next_n_select(hparams);
-    if (hparams.n_ctx_train > n_select) {
-        LLAMA_LOG_WARN("%s: attention is dense above %u cached tokens, but this checkpoint trains to %u. "
-                "the sparse selection is not implemented yet\n", __func__, n_select, hparams.n_ctx_train);
-    }
+    LLAMA_LOG_INFO("%s: indexer selection width = %u cells (%u pools of %u, plus a %u-wide tail)\n",
+            __func__, n_select, hparams.indexer_top_k/hparams.indexer_kpool,
+            hparams.indexer_kpool, hparams.indexer_kpool - 1);
 
     // mHC
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
@@ -354,8 +369,213 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 }
 
 //
-// DSA layer, dense: full MLA over the whole cache, no indexer/kpool/top-k. this is the
-// limit the sparse path collapses to below glm5next_n_select() resident positions
+// the lightning indexer, pooled
+//
+// Writes this layer's indexer key and compressor gate into the indexer cache, and
+// then - when the cache is large enough for selection to bind - returns the I32
+// ATTENTION-cache cell indices this layer's queries select, ready for the scatter in
+// build_attn_sparse. `qr` is the shared q LoRA residual, i.e. q_a_norm(q_a_proj(x)),
+// which the indexer's own wq_b consumes; `cur` is the layer input.
+//
+// The store is NOT gated on the sparse path and the scoring is. Gating both the same
+// way leaves every cell written below n_select - the first 2051 positions of every
+// sequence on the real model - with no indexer state at all, and the first ubatch to
+// cross n_select then pools cells that were never written.
+//
+// Three points where the reference implementations disagree, resolved 2-of-3 by
+// reading transformers (modular_glm5_next.py Glm5NextTextIndexer), sglang
+// (dsa_indexer_kpool.py) and vLLM (glm5next/nvidia/attention.py):
+//
+//   * the weights_proj GEMM runs in fp32. sglang gives it params_dtype=fp32 and feeds
+//     x.float(); vLLM does the same and says why - bf16 head-gates move logits by
+//     ~1e-2, enough to flip near-tie pool rankings on long context. transformers is
+//     the outlier and rounds the activation to bf16.
+//   * k_norm is a LayerNorm WITH BIAS at eps 1e-6, hardcoded in transformers and in
+//     vLLM; sglang leaves torch's 1e-5 default. It is NOT f_norm_rms_eps (1e-5 here)
+//     and NOT ggml's 0 default. The value comes from the GGUF and load_arch_hparams
+//     warns when it is not 1e-6, because no output comparison can see it.
+//   * the ReLU between the QK dot and the head weighting is explicit in transformers
+//     and in sglang's non-pooled indexer; in the pooled path both engines hand it to
+//     the DeepGEMM MQA-logits kernel, so neither validates it. It is easy to drop and
+//     is written out here.
+//
+// No Hadamard rotation: sglang and vLLM rotate q and k by H128 before their fp8
+// kernel, but H is orthogonal so (Hq).(Hk) == q.k. It exists to spread magnitude ahead
+// of fp8 quantisation; scoring in f32 here it would only cost accuracy. transformers,
+// the semantic reference, has none.
+//
+ggml_tensor * llama_model_glm5next::graph::build_indexer(
+        const llama_layer & layer,
+        llm_graph_input_kpool * inp_kp,
+        ggml_tensor * cur,
+        ggml_tensor * qr,
+        bool scoring,
+        int il) const {
+    const int64_t d_idx   = hparams.indexer_head_size;
+    const int64_t n_ihead = hparams.indexer_n_head;
+    const int64_t r       = hparams.indexer_kpool;
+
+    const auto * mctx_idx = inp_kp->mctx_idx;
+
+    // a genuine LayerNorm: weight AND bias. glm-dsa runs this same norm at eps 0 today
+    GGML_ASSERT(layer.indexer_k_norm_b != nullptr && "the indexer k_norm is a LayerNorm with bias");
+
+    ggml_tensor * ik = build_norm(ggml_mul_mat(ctx0, layer.indexer_attn_k, cur),
+            layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
+    cb(ik, "indexer_k", il);
+
+    // the pooling gate is a SECOND, INDEPENDENT projection of the hidden state, not a
+    // reuse of the indexer key. it has to be cached beside the key: the compressor
+    // mixes a pool's member keys with a softmax over these gates, and a pool is only
+    // rebuilt once its members have left the batch
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.indexer_comp_wgate, cur);
+    cb(gate, "indexer_gate", il);
+
+    // {d_idx, 2, n_tokens}: head 0 is the key, head 1 the gate. llama_memory_hybrid
+    // allocates the second head exactly for this and only when indexer_kpool > 0
+    ggml_tensor * packed = ggml_concat(ctx0,
+            ggml_reshape_3d(ctx0, ik,   d_idx, 1, n_tokens),
+            ggml_reshape_3d(ctx0, gate, d_idx, 1, n_tokens), 1);
+    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kp->k_idxs, il));
+
+    if (!scoring) {
+        return nullptr;
+    }
+
+    // {d_idx, 2, n_kv, n_stream}
+    ggml_tensor * kbuf = mctx_idx->get_k(ctx0, il);
+
+    const int64_t n_kv     = kbuf->ne[2];
+    const int64_t n_stream = kbuf->ne[3];
+    const int64_t n_tps    = n_tokens/n_stream;
+    const int64_t n_pools  = inp_kp->pool_cells->ne[0]/r;
+
+    GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 2 &&
+            "the pooled indexer cache needs a key head and a gate head");
+    GGML_ASSERT(kbuf->nb[1] == (size_t) d_idx*kbuf->nb[0] && "key and gate must be adjacent in a cell");
+    GGML_ASSERT(n_tokens == n_tps*n_stream);
+
+    // one cell's key and gate as a single row, so that the members of a pool are
+    // gathered once rather than twice: {2*d_idx, n_kv, n_stream}
+    ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
+            kbuf->nb[2], kbuf->nb[3], 0);
+
+    // gather each pool's members. pool_cells names a cell per (pool, slot); slots that
+    // are not resident hold 0 rather than a negative sentinel, because ggml_get_rows
+    // has none. The resulting garbage pools are neutralised by pool_bias below, never
+    // by a NaN: unlike the reference, no -inf ever enters the compressor softmax.
+    // ggml_get_rows always yields F32, so the pooling runs in F32 even though the
+    // indexer cache is F16
+    ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->pool_cells);
+    cb(members, "indexer_pool_members", il);
+
+    const size_t nb_mem = members->nb[1];
+
+    ggml_tensor * mem_k = ggml_view_4d(ctx0, members, d_idx, r, n_pools, n_stream,
+            nb_mem, nb_mem*r, members->nb[2], 0);
+    ggml_tensor * mem_g = ggml_view_4d(ctx0, members, d_idx, r, n_pools, n_stream,
+            nb_mem, nb_mem*r, members->nb[2], d_idx*members->nb[0]);
+
+    // d_idx independent r-way softmaxes over the SLOT axis, so the slot axis has to be
+    // dim 0. ape is added PRE-softmax and is indexed by LOGICAL SLOT, so it broadcasts
+    // over pools and streams; pool_cells is built in position order, so slot m is
+    // position p % kpool and the two agree by construction
+    ggml_tensor * keys_t = ggml_cont(ctx0, ggml_permute(ctx0, mem_k, 1, 0, 2, 3));
+    ggml_tensor * gate_t = ggml_cont(ctx0, ggml_permute(ctx0, mem_g, 1, 0, 2, 3));
+
+    ggml_tensor * ape = ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
+    gate_t = ggml_add(ctx0, gate_t, ggml_reshape_4d(ctx0, ape, r, d_idx, 1, 1));
+
+    ggml_tensor * probs = ggml_soft_max(ctx0, gate_t);
+    cb(probs, "indexer_pool_probs", il);
+
+    // per-channel weighted average over the pool's members -> {d_idx, n_pools, 1, n_stream}
+    ggml_tensor * pool_k = ggml_sum_rows(ctx0, ggml_mul(ctx0, keys_t, probs));
+    pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
+    cb(pool_k, "indexer_pool_k", il);
+
+    // {d_idx, n_tps, n_ihead, n_stream}. no rope: n_rot() is 0 for the whole text tower
+    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+    iq = ggml_reshape_4d(ctx0, iq, d_idx, n_ihead, n_tps, n_stream);
+    iq = ggml_permute(ctx0, iq, 0, 2, 1, 3);
+    cb(iq, "indexer_q", il);
+
+    // {n_pools, n_tps, n_ihead, n_stream}: pool_k is MQA and broadcasts over the heads
+    ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, iq);
+
+    // {n_ihead, n_tps, n_pools, n_stream}, contiguous for the relu and the head sum.
+    // the ReLU sits BETWEEN the per-head dot product and the head weighting: moving it
+    // to either side is a different function, because the head weights are sign-free
+    // and the sum is not a convex combination
+    kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+    ggml_tensor * score = ggml_relu(ctx0, kq);
+    cb(score, "indexer_score", il);
+
+    // sign-unconstrained head weights: no softmax, no abs, no relu. Both scale
+    // constants - the reference's softmax_scale = d_idx^-0.5 and its n_heads^-0.5 head
+    // factor - are folded in here, on an {n_ihead, n_tokens} tensor rather than on the
+    // {n_pools, n_tps, n_ihead} score tensor. relu is positively homogeneous and both
+    // constants are positive, so this is exactly the same function, and it is what the
+    // engines and the in-tree glm-dsa both do
+    ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+    ggml_mul_mat_set_prec(w, GGML_PREC_F32);
+    w = ggml_reshape_4d(ctx0, w, n_ihead, n_tps, 1, n_stream);
+    w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
+    cb(w, "indexer_weights", il);
+
+    // {1, n_tps, n_pools, n_stream} -> {n_pools, n_tps, n_stream}
+    ggml_tensor * pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w));
+    pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
+    pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
+
+    // -INFINITY on every pool the reference's `pool_valid & pool_visible` rejects, the
+    // query's own trailing pool included, so that no budget is spent on it
+    pool_score = ggml_add(ctx0, pool_score, inp_kp->pool_bias);
+    cb(pool_score, "indexer_pool_score", il);
+
+    // Top-k over POOLS at index_topk/index_kpool, then expand each selected pool to its
+    // members. This is the reference's own two-step (topk over the pool axis, then
+    // selected_indices = pool_indices[batch_idx, selected]) and it is NOT
+    // interchangeable with a single top-k of width index_topk over member cells.
+    //
+    // The cell-level form is the tempting one and the argument for it is false. It says
+    // a pool's members carry its score bit-exactly, so the cut must land on a pool
+    // boundary. But F.relu drives most pool scores to exactly 0.0, so tie groups SPAN
+    // pools, the cut falls inside one, and ggml_top_k - explicitly unordered among
+    // equals - takes an arbitrary 1..kpool-1 members of the pool it lands in. A
+    // pool-aligned top-k WIDTH does not save it: the ties are not aligned to anything.
+    // Measured on TinySparse at 512 tokens, the cell-level form leaves a partial pool
+    // on 7.51% of query rows at L3 and 5.93% at L7 (70 and 47 partial pools); this form
+    // leaves none. The index-set jaccard does not separate them - it scored the broken
+    // form at 0.9958/0.9764 against a bf16 noise floor of 0.9779/0.8385, i.e. ABOVE the
+    // floor - which is why scripts/glm5next_pool_integrity.py exists
+    const int64_t select_k = llama_kpool_select_k(n_pools, hparams.indexer_top_k, r);
+    GGML_ASSERT(select_k > 0 && select_k <= n_pools);
+
+    // {select_k, n_tps, n_stream} of POOL ordinals
+    ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
+    cb(sel, "indexer_top_k_pools", il);
+
+    // Expand pools to members: gather whole rows of `kpool` cells out of pool_cells.
+    // The query axis folds into the gather's row axis, which is what lets ONE
+    // ggml_get_rows serve every query, while the stream axis stays where get_rows wants
+    // it (src0 dim 2 is indexed by the index tensor's dim 1)
+    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
+    ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
+
+    // {r, select_k*n_tps, n_stream} -> {r*select_k, n_tps, n_stream}
+    ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
+    top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
+    cb(top_k, "indexer_top_k", il);
+
+    return top_k;
+}
+
+//
+// DSA layer. `scoring` false takes the dense limit: full MLA over the whole cache, no
+// kpool, no top-k, which is what sparse selection collapses to below
+// glm5next_n_select() resident positions
 //
 // absorbed form, as in deepseek2/deepseek32/glm-dsa: q_nope is pushed through wk_b so
 // q.k is taken against the 512-wide latent the cache actually holds (is_mla() drops the
@@ -365,6 +585,8 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         const llama_layer & layer,
         llm_graph_input_attn_k * inp_attn,
+        llm_graph_input_kpool * inp_kp,
+        bool scoring,
         ggml_tensor * cur,
         int il) const {
     const int64_t qk_head_dim  = hparams.n_embd_head_k_mla();
@@ -378,11 +600,16 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     // width: 1/sqrt(kv_lora_rank) = 1/sqrt(512) would be a different model
     const float kq_scale = 1.0f/sqrtf(float(qk_head_dim));
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
-    q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    cb(q, "dsa_q_a_norm", il);
+    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(qr, "dsa_q_a_norm", il);
 
-    q = ggml_mul_mat(ctx0, layer.wq_b, q);
+    // the indexer shares this q LoRA residual with the main MLA path and consumes it
+    // with its own wq_b, so it is built here rather than being handed the layer input
+    // twice. it also writes the indexer cache, which happens on the dense path too
+    ggml_tensor * top_k = inp_kp ? build_indexer(layer, inp_kp, cur, qr, scoring, il) : nullptr;
+
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, qk_head_dim, n_head, n_tokens);
     cb(q, "dsa_q_b", il);
 
@@ -405,9 +632,16 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     ggml_tensor * k = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
     cb(k, "dsa_kv_latent", il);
 
-    cur = build_attn(inp_attn,
-            layer.wo, nullptr, nullptr,
-            q, k, k, nullptr, nullptr, layer.wv_b, kq_scale, il);
+    if (top_k) {
+        cur = build_attn_sparse(inp_attn,
+                layer.wo, nullptr, nullptr,
+                q, k, k, nullptr, nullptr, layer.wv_b,
+                top_k, inp_kp->sel_mask, inp_kp->cand_mask, kq_scale, il);
+    } else {
+        cur = build_attn(inp_attn,
+                layer.wo, nullptr, nullptr,
+                q, k, k, nullptr, nullptr, layer.wv_b, kq_scale, il);
+    }
     cb(cur, "dsa_out", il);
 
     return cur;
@@ -416,13 +650,15 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
 ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
         const llama_model & model,
         llm_graph_input_mem_hybrid_k * inp_mem,
+        llm_graph_input_kpool * inp_kp,
+        bool scoring,
         ggml_tensor * cur,
         int il) {
     if (hparams.is_recr(il)) {
         return build_kda_layer(model.layers[il], inp_mem->get_recr(), cur, il);
     }
 
-    return build_dsa_layer(model.layers[il], inp_mem->get_attn(), cur, il);
+    return build_dsa_layer(model.layers[il], inp_mem->get_attn(), inp_kp, scoring, cur, il);
 }
 
 ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
@@ -478,6 +714,37 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     // the hybrid memory is the _k variant, as in bailingmoe3
     llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
+    // One pooling map for the whole ubatch. pool_cells, pool_bias, sel_mask and
+    // cand_mask depend only on the cells and the ubatch, never on the layer, so
+    // rebuilding them per DSA layer would cost O(n_kv * n_tokens) host writes eleven
+    // times over - at 128 Ki cells and 512 tokens that dominates prefill on its own.
+    //
+    // The map is built whenever the model HAS an indexer cache, because the indexer
+    // key and gate store runs unconditionally. Only `scoring` is gated: below
+    // index_topk + index_kpool - 1 resident positions the reference selects every
+    // visible position, so the dense build_attn is not an approximation there, it is
+    // the same function.
+    //
+    // Gated on n_ctx and not on the ubatch's n_kv, even though n_kv is what actually
+    // decides whether the budget binds. n_kv grows as the cache fills, so gating on it
+    // would flip the graph's topology partway through a run. n_ctx is fixed for the
+    // lifetime of the context, so the topology is decided once. The cost is that a
+    // context configured larger than n_select runs the indexer even while the cache is
+    // still short, where it selects every visible pool: wasted work, never a wrong
+    // answer, and llama_kpool_select_k clamps the budget to the pools that exist.
+    llm_graph_input_kpool * inp_kp = nullptr;
+    bool indexer_scoring = false;
+    {
+        const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
+
+        if (mctx_hyb->get_idx() != nullptr) {
+            indexer_scoring = cparams.n_ctx > glm5next_n_select(hparams);
+
+            inp_kp = build_inp_kpool(mctx_hyb,
+                    inp_mem->get_attn()->get_kq_mask(), indexer_scoring);
+        }
+    }
+
     GGML_ASSERT(ubatch.n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == ubatch.n_seq_tokens * ubatch.n_seqs);
@@ -510,7 +777,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_layer_attn(model, inp_mem, cur, il);
+        cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);

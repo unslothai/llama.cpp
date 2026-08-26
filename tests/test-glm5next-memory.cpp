@@ -48,10 +48,20 @@ static int n_fail = 0;
     } while (0)
 
 //
-// numeric evidence for the top-k width, independent of any model: ggml_top_k at exactly
-// indexer_top_k with the trailing incomplete pool biased to -INFINITY cuts on a pool
-// boundary and agrees between CPU and CUDA, where the reference's output width
-// (indexer_top_k + kpool - 1) with the tail forced in at +1e9 does not
+// numeric evidence for WHERE the top-k runs, independent of any model
+//
+// The claim under test is the one that decides the whole design: a top-k over
+// CELLS cannot be made pool-aligned by choosing its width, and a top-k over
+// POOLS is pool-aligned by construction.
+//
+// The tempting argument for the cell-level form is that a pool's members carry
+// its score bit-exactly, so an intra-pool tie is harmless and a budget that is a
+// whole multiple of kpool must cut on a pool boundary. That argument silently
+// assumes tie groups never SPAN pools. F.relu drives most pool scores to exactly
+// 0.0, so they do, and ggml_top_k - explicitly unordered among equals - then
+// takes an arbitrary 1..kpool-1 members of the pool it lands in. This
+// reproduces that with no model at all: most pools at exactly 0.0, a minority
+// positive, fewer positive pools than the budget.
 //
 
 static std::vector<int32_t> run_top_k(
@@ -115,22 +125,27 @@ static int64_t n_partial_pools(const std::vector<int32_t> & sel, int64_t off, in
 }
 
 static void test_top_k_boundary() {
-    printf("\n--- top-k boundary, standalone ---\n");
+    printf("\n--- top-k granularity, standalone ---\n");
 
-    const int64_t kpool  = 4;
-    const int64_t top_k  = 2048;         // the reference requires top_k %% kpool == 0
-    const int64_t n_kv   = 8192;
-    const int64_t n_rows = 4;            // queries
-
-    // all kpool members of a pool carry the pool score bit-identically, so an
-    // intra-pool tie is harmless as long as the budget ends on a pool boundary
+    const int64_t kpool   = 4;
+    const int64_t top_k   = 2048;        // the reference requires top_k %% kpool == 0
+    const int64_t n_kv    = 8192;
+    const int64_t n_rows  = 4;           // queries
     const int64_t n_pools = n_kv/kpool;
 
-    std::vector<float> pool_score(n_pools);
-    for (int64_t p = 0; p < n_pools; ++p) {
-        // deterministic, distinct, no exact ties between pools
-        pool_score[p] = std::sin(0.7f*(float) p)*1000.0f + 0.001f*(float) p;
+    // the shape ReLU actually produces: a minority of pools with a positive score,
+    // every other pool at EXACTLY 0.0. Fewer positive pools than the budget, which
+    // during prefill is the normal state and not a corner case
+    const int64_t n_pos = 300;
+
+    std::vector<float> pool_score(n_pools, 0.0f);
+    for (int64_t p = 0; p < n_pos; ++p) {
+        // deterministic, distinct, strictly positive
+        pool_score[(p*7919) % n_pools] = 1.0f + std::fabs(std::sin(0.7f*(float) p))*1000.0f;
     }
+
+    const int64_t select_k = llama_kpool_select_k((uint32_t) n_pools, (uint32_t) top_k, (uint32_t) kpool);
+    CHECK(select_k == top_k/kpool, "llama_kpool_select_k is index_topk/index_kpool (%d pools)", (int) select_k);
 
     ggml_backend_t backend_cpu = ggml_backend_cpu_init();
     ggml_backend_t backend_gpu = nullptr;
@@ -144,83 +159,105 @@ static void test_top_k_boundary() {
     printf("%s  GPU backend for the top-k comparison: %s\n",
             backend_gpu ? "ok  " : "note", backend_gpu ? ggml_backend_name(backend_gpu) : "none, CPU only");
 
-    // t = (q + 1) %% kpool cells of trailing incomplete pool. t == 3 is the one residue
-    // where the reference's own width happens to stay pool-aligned
+    // t = (q + 1) %% kpool cells of trailing incomplete pool, biased out of the
+    // budget. swept so that the per-stream tail residue is covered, not just t == 0
     for (int64_t t = 0; t < kpool; ++t) {
         const int64_t n_tail = t;
         const int64_t n_full = n_kv - n_tail;   // cells belonging to complete pools
 
-        // ---- what this change does: budget = top_k, tail out of the budget ----
-        std::vector<float> s_fix((size_t) n_kv*n_rows);
-        // ---- what the prototype did: budget = top_k + kpool - 1, tail at +1e9 --
-        std::vector<float> s_old((size_t) n_kv*n_rows);
+        // ---- A: the WRONG design. one score per cell, top-k of width index_topk --
+        std::vector<float> s_cell((size_t) n_kv*n_rows);
+        // ---- B: what ships. one score per pool, top-k of width index_topk/kpool --
+        std::vector<float> s_pool((size_t) n_pools*n_rows);
 
         for (int64_t r = 0; r < n_rows; ++r) {
             for (int64_t j = 0; j < n_kv; ++j) {
-                const bool tail = j >= n_full;
-
-                s_fix[r*n_kv + j] = tail ? -INFINITY : pool_score[j/kpool];
-                s_old[r*n_kv + j] = tail ? 1e9f      : pool_score[j/kpool];
+                s_cell[r*n_kv + j] = j >= n_full ? -INFINITY : pool_score[j/kpool];
+            }
+            for (int64_t p = 0; p < n_pools; ++p) {
+                // a pool that the tail bites into is not a candidate at all
+                s_pool[r*n_pools + p] = (p + 1)*kpool > n_full ? -INFINITY : pool_score[p];
             }
         }
 
-        const int64_t w_fix = llama_kpool_top_k_width((uint32_t) n_kv, (uint32_t) top_k, (uint32_t) kpool);
-        const int64_t w_old = std::min<int64_t>(n_kv, top_k + kpool - 1);
+        const auto sel_cell = run_top_k(backend_cpu, s_cell, n_kv,    n_rows, top_k);
+        const auto sel_pool = run_top_k(backend_cpu, s_pool, n_pools, n_rows, select_k);
 
-        const auto sel_fix_cpu = run_top_k(backend_cpu, s_fix, n_kv, n_rows, w_fix);
-        const auto sel_old_cpu = run_top_k(backend_cpu, s_old, n_kv, n_rows, w_old);
-
-        CHECK(w_fix == top_k, "t=%d: top-k runs at exactly indexer_top_k (%d)", (int) t, (int) w_fix);
-
-        // 1. boundary exactness of the new scheme
-        int64_t partial_fix = 0;
-        int64_t tail_in_fix = 0;
+        // 1. the cell-level form, at a budget that IS a whole number of pools,
+        //    still splits pools. this is the measurement the design turns on
+        int64_t partial_cell = 0;
         for (int64_t r = 0; r < n_rows; ++r) {
-            partial_fix += n_partial_pools(sel_fix_cpu, r*w_fix, w_fix, kpool);
-            for (int64_t i = 0; i < w_fix; ++i) {
-                tail_in_fix += sel_fix_cpu[r*w_fix + i] >= n_full;
+            partial_cell += n_partial_pools(sel_cell, r*top_k, top_k, kpool);
+        }
+        CHECK(partial_cell > 0,
+                "t=%d: a CELL-level top-k at the pool-aligned width %d still leaves %d partial pool(s); "
+                "a pool-aligned WIDTH does not make a pool-aligned CUT",
+                (int) t, (int) top_k, (int) partial_cell);
+
+        // 2. the pool-level form: expand each selected pool ordinal to its kpool
+        //    member cells, exactly as the graph does through pool_cells
+        std::vector<int32_t> expanded((size_t) select_k*kpool*n_rows);
+        for (int64_t r = 0; r < n_rows; ++r) {
+            for (int64_t i = 0; i < select_k; ++i) {
+                const int32_t p = sel_pool[r*select_k + i];
+                for (int64_t m = 0; m < kpool; ++m) {
+                    expanded[r*select_k*kpool + i*kpool + m] = (int32_t) (p*kpool + m);
+                }
             }
         }
-        CHECK(partial_fix == 0, "t=%d: the %d-cell budget selects only whole pools (%d partial)",
-                (int) t, (int) w_fix, (int) partial_fix);
-        CHECK(tail_in_fix == 0, "t=%d: no tail cell consumes budget (%d did)", (int) t, (int) tail_in_fix);
 
-        // 2. the same run on the prototype's width
-        int64_t partial_old = 0;
+        int64_t partial_pool = 0;
+        int64_t tail_in_pool = 0;
         for (int64_t r = 0; r < n_rows; ++r) {
-            partial_old += n_partial_pools(sel_old_cpu, r*w_old, w_old, kpool);
+            partial_pool += n_partial_pools(expanded, r*select_k*kpool, select_k*kpool, kpool);
+            for (int64_t i = 0; i < select_k*kpool; ++i) {
+                tail_in_pool += expanded[r*select_k*kpool + i] >= n_full;
+            }
         }
-        // the tail itself is one partial pool by construction whenever t > 0
-        const int64_t expect_old = t == 3 ? (t > 0 ? 1 : 0) : (t > 0 ? 2 : 1);
-        CHECK(partial_old/n_rows == expect_old,
-                "t=%d: width %d leaves %d partial pool(s) per query, expected %d",
-                (int) t, (int) w_old, (int) (partial_old/n_rows), (int) expect_old);
+        CHECK(partial_pool == 0,
+                "t=%d: a POOL-level top-k of %d pools expands to only whole pools (%d partial)",
+                (int) t, (int) select_k, (int) partial_pool);
+        CHECK(tail_in_pool == 0, "t=%d: no tail cell consumes budget (%d did)", (int) t, (int) tail_in_pool);
 
         // 3. CPU vs CUDA on the same input
         if (backend_gpu) {
-            const auto sel_fix_gpu = run_top_k(backend_gpu, s_fix, n_kv, n_rows, w_fix);
-            const auto sel_old_gpu = run_top_k(backend_gpu, s_old, n_kv, n_rows, w_old);
+            const auto gpu_cell = run_top_k(backend_gpu, s_cell, n_kv,    n_rows, top_k);
+            const auto gpu_pool = run_top_k(backend_gpu, s_pool, n_pools, n_rows, select_k);
 
-            bool same_fix = sel_fix_gpu.size() == sel_fix_cpu.size();
-            for (int64_t r = 0; same_fix && r < n_rows; ++r) {
-                std::set<int32_t> a(sel_fix_cpu.begin() + r*w_fix, sel_fix_cpu.begin() + (r + 1)*w_fix);
-                std::set<int32_t> b(sel_fix_gpu.begin() + r*w_fix, sel_fix_gpu.begin() + (r + 1)*w_fix);
-                same_fix = a == b;
+            // the pool SET may legitimately differ between backends when the cut
+            // falls inside a tie group. What may not differ is pool integrity,
+            // and that is what is asserted
+            int64_t partial_gpu = 0;
+            bool ok_gpu = gpu_pool.size() == sel_pool.size();
+            for (int64_t r = 0; ok_gpu && r < n_rows; ++r) {
+                for (int64_t i = 0; i < select_k; ++i) {
+                    const int32_t p = gpu_pool[r*select_k + i];
+                    for (int64_t m = 0; m < kpool; ++m) {
+                        expanded[r*select_k*kpool + i*kpool + m] = (int32_t) (p*kpool + m);
+                    }
+                }
+                partial_gpu += n_partial_pools(expanded, r*select_k*kpool, select_k*kpool, kpool);
             }
-            CHECK(same_fix, "t=%d: CPU and %s select the same cell set at width %d",
-                    (int) t, ggml_backend_name(backend_gpu), (int) w_fix);
+            CHECK(ok_gpu && partial_gpu == 0,
+                    "t=%d: %s also expands to only whole pools (%d partial)",
+                    (int) t, ggml_backend_name(backend_gpu), (int) partial_gpu);
 
-            bool same_old = sel_old_gpu.size() == sel_old_cpu.size();
-            for (int64_t r = 0; same_old && r < n_rows; ++r) {
-                std::set<int32_t> a(sel_old_cpu.begin() + r*w_old, sel_old_cpu.begin() + (r + 1)*w_old);
-                std::set<int32_t> b(sel_old_gpu.begin() + r*w_old, sel_old_gpu.begin() + (r + 1)*w_old);
-                same_old = a == b;
+            bool same_pool = gpu_pool.size() == sel_pool.size();
+            for (int64_t r = 0; same_pool && r < n_rows; ++r) {
+                std::set<int32_t> a(sel_pool.begin() + r*select_k, sel_pool.begin() + (r + 1)*select_k);
+                std::set<int32_t> b(gpu_pool.begin() + r*select_k, gpu_pool.begin() + (r + 1)*select_k);
+                same_pool = a == b;
             }
-            // reported, not asserted: whether the arbitrary pick actually diverges
-            // depends on each backend's partial sort
-            printf("note t=%d: CPU and %s %s at width %d\n",
+            int64_t partial_gpu_cell = 0;
+            for (int64_t r = 0; r < n_rows; ++r) {
+                partial_gpu_cell += n_partial_pools(gpu_cell, r*top_k, top_k, kpool);
+            }
+            // reported, not asserted: which members of a cut pool each backend's
+            // partial sort happens to keep is not contractual
+            printf("note t=%d: CPU and %s %s on the selected POOL set; the cell-level form leaves "
+                   "%d partial pool(s) there too\n",
                     (int) t, ggml_backend_name(backend_gpu),
-                    same_old ? "happen to agree" : "DISAGREE", (int) w_old);
+                    same_pool ? "agree" : "DISAGREE", (int) partial_gpu_cell);
         }
     }
 
@@ -238,9 +275,14 @@ struct kpool_tensors {
     ggml_tensor * cell_pool  = nullptr;
     ggml_tensor * pool_cells = nullptr;
     ggml_tensor * bias       = nullptr;
+    ggml_tensor * pool_bias  = nullptr;
     ggml_tensor * sel_mask   = nullptr;
+    ggml_tensor * cand_mask  = nullptr;
 };
 
+// The test asks for all six, including the two the pooled graph does not consume.
+// cell_pool and bias are the per-CELL spelling of the same predicate, computed by a
+// different loop, and they are what pool_bias and cand_mask are checked against here
 static kpool_tensors alloc_kpool_tensors(
         ggml_context * ctx,
         int64_t n_kv,
@@ -254,12 +296,16 @@ static kpool_tensors alloc_kpool_tensors(
     t.cell_pool  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
     t.pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*n_pools, n_stream);
     t.bias       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+    t.pool_bias  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, n_tps, n_stream);
     t.sel_mask   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_padq, 1, n_stream);
+    t.cand_mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_padq, 1, n_stream);
 
     ggml_set_input(t.cell_pool);
     ggml_set_input(t.pool_cells);
     ggml_set_input(t.bias);
+    ggml_set_input(t.pool_bias);
     ggml_set_input(t.sel_mask);
+    ggml_set_input(t.cand_mask);
 
     return t;
 }
@@ -626,16 +672,26 @@ int main(int argc, char ** argv) {
                             pooled->nb[1], pooled->nb[2], 0)),
                     ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_idx, n_tps, n_stream));
 
-            // broadcast pool -> member cells, then top-k over CELL scores
-            ggml_tensor * expanded = ggml_get_rows(ctx0,
-                    ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), kt.cell_pool);
-            expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-            expanded = ggml_add(ctx0, expanded, kt.bias);
+            // mask the pools the reference rejects, then top-k over POOLS
+            score = ggml_add(ctx0, ggml_cont(ctx0, score), kt.pool_bias);
 
-            const int64_t width = llama_kpool_top_k_width((uint32_t) n_kv, hparams.indexer_top_k, (uint32_t) kpool);
-            ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, (int) width));
+            const int64_t select_k = llama_kpool_select_k((uint32_t) n_pools, hparams.indexer_top_k, (uint32_t) kpool);
+            ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, score, (int) select_k));
 
-            printf("note top-k over replicated per-cell scores yields %d I32 CELL indices\n", (int) width);
+            // expand each selected POOL ordinal into its kpool member CELLS, which is
+            // the reference's selected_indices = pool_indices[batch_idx, selected].
+            // the query axis folds into the gather's row axis so that one get_rows
+            // serves every query, while the stream axis stays where get_rows wants it
+            ggml_tensor * pc3      = ggml_reshape_3d(ctx0, kt.pool_cells, kpool, n_pools, n_stream);
+            ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
+
+            const int64_t width = kpool*select_k;
+            ggml_tensor * top_k = ggml_reshape_3d(ctx0,
+                    ggml_get_rows(ctx0, pc3, sel_flat), width, n_tps, n_stream);
+
+            CHECK(top_k->type == GGML_TYPE_I32, "the pool -> cell expansion stays I32 (pool_cells is I32)");
+            printf("note top-k over %d POOL scores expands to %d I32 CELL indices per query\n",
+                    (int) select_k, (int) width);
 
             // 5. the scatter the mask is built from, starting at sel_mask rather than
             //    an all -INFINITY fill, which is what forces the tail in
@@ -662,7 +718,7 @@ int main(int argc, char ** argv) {
 
             if (buf) {
                 const llama_ubatch & ub = mctx->get_ubatch();
-                llama_kv_cache_set_input_kpool(kv_attn, kt.cell_pool, kt.pool_cells, kt.bias, kt.sel_mask,
+                llama_kv_cache_set_input_kpool(kv_attn, kt.cell_pool, kt.pool_cells, kt.bias, kt.pool_bias, kt.sel_mask, kt.cand_mask,
                         &ub, (uint32_t) kpool);
 
                 const int32_t * cp = (const int32_t *) kt.cell_pool->data;
@@ -686,7 +742,114 @@ int main(int argc, char ** argv) {
                 for (int64_t i = 0; i < ggml_nelements(kt.sel_mask); ++i) {
                     finite &= sm[i] == 0.0f || sm[i] == -INFINITY;
                 }
-                CHECK(finite, "bias and sel_mask hold only 0 and -INFINITY: no +1e9 to meet a -inf");
+                for (int64_t i = 0; i < ggml_nelements(kt.pool_bias); ++i) {
+                    const float * pb = (const float *) kt.pool_bias->data;
+                    finite &= pb[i] == 0.0f || pb[i] == -INFINITY;
+                }
+                for (int64_t i = 0; i < ggml_nelements(kt.cand_mask); ++i) {
+                    const float * cm = (const float *) kt.cand_mask->data;
+                    finite &= cm[i] == 0.0f || cm[i] == -INFINITY;
+                }
+                CHECK(finite, "bias, pool_bias, sel_mask and cand_mask hold only 0 and -INFINITY: "
+                        "no +1e9 to meet a -inf");
+
+                // cand_mask is exactly max(bias, sel_mask) lifted to KQ shape, and it
+                // is what stops an over-budget top-k from escaping the reference's
+                // candidate set.
+                //
+                // ggml_top_k always returns select_k pool ordinals even when fewer
+                // than select_k pools are finite. During prefill the query at
+                // position q has only ~q/kpool complete visible pools against a
+                // budget of index_topk/kpool, so the budget spills into -INFINITY
+                // pools and picks among them arbitrarily. Adding the causal mask
+                // kills the expansions that are empty or in the future. What it does
+                // not kill is a resident, causally visible cell that sits in an
+                // INCOMPLETE pool below the tail: the reference never selects it
+                // (pool_valid = grouped_valid_keys.all(-1)), the graph would.
+                // Unreachable while positions are contiguous, reachable the moment a
+                // partial seq_rm leaves a hole.
+                {
+                    const float * cm = (const float *) kt.cand_mask->data;
+
+                    bool    is_union = true;
+                    int64_t n_spill  = 0;   // candidate pools strictly fewer than the budget
+
+                    const int64_t select_k =
+                        llama_kpool_select_k((uint32_t) n_pools, hparams.indexer_top_k, (uint32_t) kpool);
+
+                    for (int64_t s = 0; s < n_stream; ++s) {
+                        for (int64_t ii = 0; ii < n_tps; ++ii) {
+                            const float * rb = bi + (s*n_tps  + ii)*n_kv;
+                            const float * rs = sm + (s*n_padq + ii)*n_kv;
+                            const float * rc = cm + (s*n_padq + ii)*n_kv;
+
+                            for (int64_t j = 0; j < n_kv; ++j) {
+                                is_union &= rc[j] == std::max(rb[j], rs[j]);
+                            }
+
+                            const float * rp = (const float *) kt.pool_bias->data + (s*n_tps + ii)*n_pools;
+                            int64_t n_cand = 0;
+                            for (int64_t p = 0; p < n_pools; ++p) {
+                                n_cand += rp[p] == 0.0f;
+                            }
+                            n_spill += n_cand < select_k;
+                        }
+                    }
+
+                    CHECK(is_union, "cand_mask == max(bias, sel_mask): the reference's candidate set");
+
+                    // not a failure: it is the normal prefill state, and the whole
+                    // reason the gate has to exist. Printed so that a future change
+                    // making it zero cannot quietly turn the check above vacuous
+                    printf("note %d of %d (query, stream) rows have fewer candidate pools than the\n"
+                           "     top-k budget of %d, so the budget spills and cand_mask is load bearing\n",
+                            (int) n_spill, (int) (n_stream*n_tps), (int) select_k);
+                }
+
+                // pool_bias is the same predicate as bias, evaluated where the
+                // reference evaluates it. For a COMPLETE pool the two must agree
+                // cell for cell; for an incomplete or absent pool bias has no cell
+                // to speak for it, which is exactly why pool_bias is computed here
+                // rather than gathered from bias at each pool's last member
+                {
+                    const float * pb = (const float *) kt.pool_bias->data;
+
+                    bool agree = true;
+                    bool exact = true;
+
+                    for (int64_t s = 0; s < n_stream; ++s) {
+                        for (int64_t ii = 0; ii < n_tps; ++ii) {
+                            const float * rb = bi + (s*n_tps + ii)*n_kv;
+                            const float * rp = pb + (s*n_tps + ii)*n_pools;
+
+                            std::set<int32_t> pools_of_scored_cells;
+
+                            for (int64_t j = 0; j < n_kv; ++j) {
+                                if (rb[j] == 0.0f) {
+                                    // a scored cell's pool must be a candidate pool
+                                    agree &= rp[cp[s*n_kv + j]] == 0.0f;
+                                    pools_of_scored_cells.insert(cp[s*n_kv + j]);
+                                }
+                            }
+
+                            int64_t n_cand = 0;
+                            for (int64_t p = 0; p < n_pools; ++p) {
+                                n_cand += rp[p] == 0.0f;
+                            }
+
+                            // and nothing else may be one. an entirely absent pool
+                            // would pass the first check vacuously; this is what
+                            // catches it, and it is exactly the failure mode of
+                            // gathering pool_bias from bias at each pool's last
+                            // member instead of computing it
+                            exact &= n_cand == (int64_t) pools_of_scored_cells.size();
+                        }
+                    }
+
+                    CHECK(agree, "every cell bias scores lies in a pool pool_bias also accepts");
+                    CHECK(exact, "and pool_bias accepts no pool that has no scored cell "
+                            "(an absent pool must not become a candidate)");
+                }
 
                 // per query: (q+1) %% kpool cells sit in its own incomplete pool and
                 // must be forced in, the q+1-minus-that below must be scored, and
@@ -823,7 +986,7 @@ int main(int argc, char ** argv) {
                 ggml_backend_buffer_t buf     = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
                 if (buf) {
-                    llama_kv_cache_set_input_kpool(kv_attn, kt.cell_pool, kt.pool_cells, kt.bias, kt.sel_mask,
+                    llama_kv_cache_set_input_kpool(kv_attn, kt.cell_pool, kt.pool_cells, kt.bias, kt.pool_bias, kt.sel_mask, kt.cand_mask,
                             &mc->get_ubatch(), (uint32_t) kpool);
 
                     const int32_t * cp = (const int32_t *) kt.cell_pool->data;
@@ -972,7 +1135,7 @@ int main(int argc, char ** argv) {
                     double ms = 1e9;
                     for (int rep = 0; rep < 4; ++rep) {
                         const auto t0 = std::chrono::steady_clock::now();
-                        llama_kv_cache_set_input_kpool(kv, kt.cell_pool, kt.pool_cells, kt.bias, kt.sel_mask,
+                        llama_kv_cache_set_input_kpool(kv, kt.cell_pool, kt.pool_cells, kt.bias, kt.pool_bias, kt.sel_mask, kt.cand_mask,
                                 &ub, (uint32_t) kpool);
                         const auto t1 = std::chrono::steady_clock::now();
 
@@ -992,34 +1155,39 @@ int main(int argc, char ** argv) {
                             n_dsa, n_dsa);
 
                     {
-                        const float * sm = (const float *) kt.sel_mask->data;
+                        const float * sm = (const float *) kt.sel_mask ->data;
+                        const float * cm = (const float *) kt.cand_mask->data;
 
                         bool pad_masked = true;
                         for (int64_t ii = n_tps; ii < n_padq; ++ii) {
                             for (int64_t j = 0; j < n_kv; ++j) {
                                 pad_masked &= sm[ii*n_kv + j] == -INFINITY;
+                                pad_masked &= cm[ii*n_kv + j] == -INFINITY;
                             }
                         }
-                        CHECK(pad_masked, "the %d padding rows of a wider sel_mask stay -INFINITY",
+                        CHECK(pad_masked, "the %d padding rows of a wider sel_mask/cand_mask stay -INFINITY",
                                 (int) (n_padq - n_tps));
                     }
 
-                    // the shared object refills the same tensors deterministically
-                    std::vector<int32_t> first((size_t) ggml_nelements(kt.cell_pool));
-                    memcpy(first.data(), kt.cell_pool->data, first.size()*sizeof(int32_t));
+                    // the shared object refills the same tensors deterministically.
+                    // it fills only what the pooled graph consumes - cell_pool and
+                    // bias have no consumer there, so it passes nullptr for both and
+                    // pool_cells is what gets compared
+                    std::vector<int32_t> first((size_t) ggml_nelements(kt.pool_cells));
+                    memcpy(first.data(), kt.pool_cells->data, first.size()*sizeof(int32_t));
 
                     llm_graph_input_kpool inp(mctx->get_attn(), mctx->get_idx(), (uint32_t) kpool);
                     inp.k_idxs     = mctx->get_idx()->build_input_k_idxs(ctx, ub);
-                    inp.cell_pool  = kt.cell_pool;
                     inp.pool_cells = kt.pool_cells;
-                    inp.bias       = kt.bias;
+                    inp.pool_bias  = kt.pool_bias;
                     inp.sel_mask   = kt.sel_mask;
+                    inp.cand_mask  = kt.cand_mask;
 
                     ggml_backend_buffer_t buf2 = ggml_backend_alloc_ctx_tensors(ctx, backend);
                     if (buf2) {
                         inp.set_input(&ub);
 
-                        CHECK(memcmp(first.data(), kt.cell_pool->data, first.size()*sizeof(int32_t)) == 0,
+                        CHECK(memcmp(first.data(), kt.pool_cells->data, first.size()*sizeof(int32_t)) == 0,
                                 "llm_graph_input_kpool::set_input rebuilds the identical map, so one\n"
                                 "     object can back every indexer layer");
 
