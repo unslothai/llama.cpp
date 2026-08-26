@@ -1300,7 +1300,7 @@ struct llama_model_glm5next : public llama_model_base {
         // not const: the delta-net helpers append to the graph through the base
         ggml_tensor * build_layer_attn(
                 const llama_model & model,
-                llm_graph_input_rs * inp_rs,
+                llm_graph_input_mem_hybrid_k * inp_mem,
                 ggml_tensor * cur,
                 int il);
 
@@ -1309,6 +1309,12 @@ struct llama_model_glm5next : public llama_model_base {
                 llm_graph_input_rs * inp_rs,
                 ggml_tensor * cur,
                 int il);
+
+        ggml_tensor * build_dsa_layer(
+                const llama_layer & layer,
+                llm_graph_input_attn_k * inp_attn,
+                ggml_tensor * cur,
+                int il) const;
 
         ggml_tensor * build_layer_ffn(
                 const llama_model & model,

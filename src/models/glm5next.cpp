@@ -327,19 +327,82 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     return cur;
 }
 
-// DSA is stubbed until its own commit; the mHC wiring around both sublayers is final
+//
+// DSA layer, dense
+//
+// below index_topk + index_kpool - 1 resident positions the indexer selects every
+// position, so sparse selection is exactly full attention. this builds that limit:
+// correct MLA over the whole cache, no indexer, no kpool, no top-k
+//
+// the absorbed form is used, as in deepseek2/deepseek32/glm-dsa: q_nope is pushed
+// through wk_b so that q.k is taken against the 512-wide latent directly, which is
+// what the cache holds (is_mla() suppresses the V allocation and V becomes a view of
+// K). the naive form would have to expand the latent back to n_head 256-wide keys and
+// values on every step and would need a V cache this memory layout does not have
+//
+ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
+        const llama_layer & layer,
+        llm_graph_input_attn_k * inp_attn,
+        ggml_tensor * cur,
+        int il) const {
+    const int64_t qk_head_dim  = hparams.n_embd_head_k_mla();
+    const int64_t kv_lora_rank = hparams.n_lora_kv;
+
+    // nope-only. every other MLA port splits q and k into a nope and a rope half and
+    // ropes the second one; here that half is zero-width, so there is no split, no
+    // concat and no ggml_rope_ext anywhere in the text tower
+    GGML_ASSERT(hparams.n_rot() == 0);
+
+    // the reference scales by qk_head_dim^-0.5, i.e. over the MLA head size, not over
+    // n_embd_head_k: after absorption q is kv_lora_rank wide and 1/sqrt(512) would be
+    // a different model
+    const float kq_scale = 1.0f/sqrtf(float(qk_head_dim));
+
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(q, "dsa_q_a_norm", il);
+
+    q = ggml_mul_mat(ctx0, layer.wq_b, q);
+    q = ggml_reshape_3d(ctx0, q, qk_head_dim, n_head, n_tokens);
+    cb(q, "dsa_q_b", il);
+
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(kv, "dsa_kv_a_norm", il);
+
+    // {qk_head_dim, n_tokens, n_head}
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+    // {qk_head_dim, kv_lora_rank, n_head} x {qk_head_dim, n_tokens, n_head}
+    q = ggml_mul_mat(ctx0, layer.wk_b, q);
+
+    // {kv_lora_rank, n_head, n_tokens}. deepseek2 gets this contiguous for free out of
+    // the concat with the roped half, which does not exist here
+    q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
+    cb(q, "dsa_q_absorbed", il);
+
+    // absorbed MLA is MQA: one head of keys, and V is the same latent row as K
+    ggml_tensor * k = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
+    cb(k, "dsa_kv_latent", il);
+
+    cur = build_attn(inp_attn,
+            layer.wo, nullptr, nullptr,
+            q, k, k, nullptr, nullptr, layer.wv_b, kq_scale, il);
+    cb(cur, "dsa_out", il);
+
+    return cur;
+}
+
 ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
         const llama_model & model,
-        llm_graph_input_rs * inp_rs,
+        llm_graph_input_mem_hybrid_k * inp_mem,
         ggml_tensor * cur,
         int il) {
     if (hparams.is_recr(il)) {
-        return build_kda_layer(model.layers[il], inp_rs, cur, il);
+        return build_kda_layer(model.layers[il], inp_mem->get_recr(), cur, il);
     }
 
-    GGML_UNUSED(cur);
-
-    throw std::runtime_error("glm5next: DSA attention not implemented yet");
+    return build_dsa_layer(model.layers[il], inp_mem->get_attn(), cur, il);
 }
 
 ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
@@ -391,8 +454,9 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp         = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // recurrent half of the hybrid memory; the attention half is unused until DSA
-    llm_graph_input_rs * inp_rs = build_inp_mem_hybrid()->get_recr();
+    // MLA absorption leaves a K-only cache holding the kv_lora_rank latent, so the
+    // attention half of the hybrid memory is the _k variant, as in bailingmoe3
+    llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
 
     GGML_ASSERT(ubatch.n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
@@ -426,7 +490,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_layer_attn(model, inp_rs, cur, il);
+        cur = build_layer_attn(model, inp_mem, cur, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
