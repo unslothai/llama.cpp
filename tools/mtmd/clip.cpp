@@ -1655,7 +1655,10 @@ struct clip_model_loader {
                     {
                         hparams.rope_theta = 10000.0f;
                         hparams.n_merge = 2;
-                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        // the reference asks for BICUBIC (resample = PILImageResampling.BICUBIC);
+                        // the bilinear here came from the GLM-4V case this was copied from. neither
+                        // filter matches torchvision's exactly, so this is closer in kind, not exact
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         // drives the clamp in both the per-block MLP and the merger
                         get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
