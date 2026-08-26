@@ -43,6 +43,10 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     GGML_ASSERT(hparams.dsv4_hc_mult > 0);
 
+    // trunk residual is hc_mult streams wide (deepseek4); lm_head still sees
+    // n_embd, the streams are averaged first
+    hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+
     // MoE
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -208,7 +212,127 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// sublayers stubbed until the KDA and DSA commits, which must widen these
+// signatures and add the position and memory inputs the ctor does not build yet
+ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
+        const llama_model & model,
+        ggml_tensor * cur,
+        int il) const {
+    GGML_UNUSED(model);
+    GGML_UNUSED(cur);
+
+    throw std::runtime_error(hparams.is_recr(il)
+            ? "glm5next: KDA attention not implemented yet"
+            : "glm5next: DSA attention not implemented yet");
+}
+
+ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
+        const llama_model & model,
+        ggml_tensor * cur,
+        int il) const {
+    GGML_UNUSED(model);
+    GGML_UNUSED(cur);
+    GGML_UNUSED(il);
+
+    throw std::runtime_error("glm5next: feed-forward not implemented yet");
+}
+
+llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_params & params) :
+    llama_model_deepseek4::graph(params) {
+    ggml_tensor * cur;
+
+    ggml_tensor * inp         = build_inp_embd(model.tok_embd);
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+
+    // hc_mult exact copies of the embedding: no scaling, no one-hot into stream 0
+    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    cb(inpL, "hc_init", -1);
+
+    for (int il = 0; il < n_layer; ++il) {
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = build_hc_mean(ctx0, inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
+        ggml_tensor * residual = inpL;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+
+        cur = build_hc_pre(inpL,
+                model.layers[il].hc_attn_fn,
+                model.layers[il].hc_attn_scale,
+                model.layers[il].hc_attn_base,
+                &post, &comb, il);
+        cb(cur, "hc_attn_pre", il);
+
+        cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        cur = build_layer_attn(model, cur, il);
+
+        inpL = build_hc_post(cur, residual, post, comb, il);
+        cb(inpL, "hc_attn_post", il);
+
+        residual = inpL;
+        cur = build_hc_pre(inpL,
+                model.layers[il].hc_ffn_fn,
+                model.layers[il].hc_ffn_scale,
+                model.layers[il].hc_ffn_base,
+                &post, &comb, il);
+        cb(cur, "hc_ffn_pre", il);
+
+        // expand before the sublayer so op offload does not pull the mHC state
+        // onto the expert weights' backend, as in deepseek4
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, post);
+        ggml_build_forward_expand(gf, comb);
+
+        cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "ffn_norm", il);
+
+        cur = build_layer_ffn(model, cur, il);
+        cb(cur, "ffn_out", il);
+
+        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_cvec(inpL, il);
+        cb(inpL, "l_last", il);
+    }
+
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = build_hc_mean(ctx0, inpL);
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+    }
+
+    if (inp_out_ids) {
+        // flattened: get_rows needs one token's streams to be one contiguous row
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
+    }
+
+    // no hc_head tensor here: unweighted mean, not DeepSeek-V4's learned gated head
+    cur = build_hc_mean(ctx0, inpL);
+    cb(cur, "hc_mean", -1);
+
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
-    GGML_UNUSED(params);
-    throw std::runtime_error("glm5next: graph not implemented yet");
+    // llama_init_from_model accepts an MTP context whenever n_layer_nextn > 0,
+    // which every glm5next checkpoint has; without this it silently runs the trunk
+    GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "glm5next NextN graph not implemented yet");
+
+    return std::make_unique<graph>(*this, params);
 }
