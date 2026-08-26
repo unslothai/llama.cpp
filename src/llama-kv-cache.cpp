@@ -1787,6 +1787,24 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const auto n_rot = dst->ne[0];
+    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
+
+    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const auto n_rot = dst->ne[0];
+    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
+
+    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
 void llama_kv_cache::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -1888,24 +1906,6 @@ void llama_kv_cache::set_input_qsa(
             }
         }
     }
-}
-
-void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
-}
-
-void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2688,17 +2688,17 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
-uint32_t llama_kv_cache_context::get_n_stream() const {
-    // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
-    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
-}
-
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
@@ -2753,6 +2753,14 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
+void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
+    kv->set_input_k_rot(dst);
+}
+
+void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
+    kv->set_input_v_rot(dst);
+}
+
 void llama_kv_cache_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -2761,12 +2769,4 @@ void llama_kv_cache_context::set_input_qsa(
         const llama_ubatch * ubatch,
         uint32_t ratio) const {
     kv->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio);
-}
-
-void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
-    kv->set_input_k_rot(dst);
-}
-
-void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
-    kv->set_input_v_rot(dst);
 }
