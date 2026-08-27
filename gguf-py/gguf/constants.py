@@ -228,7 +228,7 @@ class Keys:
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
 
-    class PLE:
+    class PerLayerEmbedding:
         LAYERS             = "{arch}.ple.layers"
         NGRAM_SIZE         = "{arch}.ple.ngram_size"
         HEADS_PER_NGRAM    = "{arch}.ple.heads_per_ngram"
