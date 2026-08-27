@@ -1366,6 +1366,7 @@ class GGUFWriter:
 
     def add_vision_swiglu_limit(self, value: float) -> None:
         self.add_float32(Keys.ClipVision.SWIGLU_LIMIT, value)
+
     def add_vision_expert_count_per_layer(self, value: Sequence[int]) -> None:
         self.add_array(Keys.ClipVision.EXPERT_COUNT_PER_LAYER, value)
 
