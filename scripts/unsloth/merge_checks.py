@@ -31,6 +31,8 @@ Both are deliberately narrow, because a check that fires wrongly blocks a releas
     This is an accuracy fix, not a widening: measured over all 181 src/**/*.cpp, depth and indentation report the same zero findings, so nothing new fires and the good tree stays clean, but depth keeps 339 arms in chains against 260 and is right in both directions where they differ.
     Indentation drops the enclosing chain at any nested `if`, which silences the check on the exact 08-27 shape, and it glues two unrelated `if`s at one indent into a single chain whenever the second opener is a skipped multiline condition, which reports a reachable arm as dead and blocks a release on good code.
 
+  - The duplicate-key check compares keys by their source text, so it only looks at keys whose value cannot change between evaluations: literals, names, attributes and tuples of those. `{fresh(): 1, fresh(): 2}` reads as one key twice and is really two entries, and a finding here stops the nightly.
+
   - There is deliberately NO duplicate-C++-definition check.
     The obvious version keys on function name and flags legitimate overloads: it reported `llama_model_base::create_tensor`, which is two different signatures.
     A real duplicate is an ODR violation the compiler already rejects, so the only gain would be failing sooner, which does not justify a false positive on the release path.
@@ -56,6 +58,24 @@ PURE_TERM = re.compile(r"arch == LLM_ARCH_\w+")
 _RAW_PREFIX = ("", "L", "u", "U", "u8")
 
 
+# Node types whose value does not depend on when the expression is evaluated.
+# An allowlist, not a denylist, so an expression shape nobody thought about is
+# treated as unstable and simply not checked, rather than blocking a release.
+_STABLE = (ast.Constant, ast.Name, ast.Attribute, ast.Tuple, ast.Load,
+           ast.UnaryOp, ast.USub, ast.UAdd, ast.Invert)
+
+
+def _stable_key(node: ast.AST) -> bool:
+    """True when this key expression names the same object every evaluation.
+
+    `{fresh(): 1, fresh(): 2}` unparses to the same text twice and is still two
+    entries, so a call anywhere in the key means the two are not comparable by
+    text. The keys this check exists for, `MODEL_ARCH.GLM5NEXT` and plain
+    literals, are all stable.
+    """
+    return all(isinstance(n, _STABLE) for n in ast.walk(node))
+
+
 def duplicate_dict_keys(path: Path) -> list[str]:
     """Keys defined twice in one dict literal. Always at best dead code."""
     try:
@@ -66,7 +86,8 @@ def duplicate_dict_keys(path: Path) -> list[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Dict):
             continue
-        keys = [ast.unparse(k) for k in node.keys if k is not None]
+        keys = [ast.unparse(k) for k in node.keys
+                if k is not None and _stable_key(k)]
         for key, n in collections.Counter(keys).items():
             if n > 1:
                 out.append(f"{path}:{node.lineno}: key {key} defined {n} times "

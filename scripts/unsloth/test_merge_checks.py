@@ -301,6 +301,29 @@ void f() {
 }
 """
 
+# A key that is a CALL is a different object each evaluation, so repeating it is
+# two entries, not one. ast.unparse renders both the same, and a finding here
+# blocks the nightly, so an unstable key must not be compared by text at all.
+DYNAMIC_KEY = """
+MAP = {fresh(): 1, fresh(): 2}
+"""
+# A walrus rebinds between elements, so the same name is not the same value.
+WALRUS_KEY = """
+MAP = {(n := 1): "a", (n := 2): "b"}
+"""
+# Stable keys that are not enum attributes still have to be caught.
+DUP_LITERAL_KEY = """
+MAP = {"a": 1, "b": 2, "a": 3}
+"""
+
+rc, out = run(py=DYNAMIC_KEY)
+check("a repeated call key is not reported as a duplicate", rc == 0, out)
+rc, out = run(py=WALRUS_KEY)
+check("a walrus key is not reported as a duplicate", rc == 0, out)
+rc, out = run(py=DUP_LITERAL_KEY)
+check("a duplicate literal key is still caught",
+      rc == 1 and "defined 2 times" in out, out)
+
 rc, out = run(cpp=CONJUNCTION_AFTER_PLAIN)
 check("catches a conditioned arm after an unconditional match of the same arch",
       rc == 1 and "unreachable" in out, out)
