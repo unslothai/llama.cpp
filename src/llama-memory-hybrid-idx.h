@@ -137,6 +137,11 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools
+    uint32_t get_n_kpool(uint32_t kpool) const; // padded pool count, the last pool is always unused
+    void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs, ggml_tensor * cell_pool,
+                         const llama_ubatch * ubatch, uint32_t kpool) const;
+
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
