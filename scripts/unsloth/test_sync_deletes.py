@@ -109,6 +109,37 @@ check("says which rev it could not use",
 check("and leaves the added workflow in place to be dealt with",
       (d / ".github/workflows/build-wasm.yml").exists(), out)
 
+# 8. upstream RENAMES a workflow rather than adding one. Rename detection calls
+# the new path R, not A, so --diff-filter=A saw nothing and the script exited 0
+# with the renamed upstream workflow left live in the fork.
+def rename_scenario():
+    d = Path(tempfile.mkdtemp(prefix="sd_"))
+    git(d, "init", "-q", "-b", "main")
+    wf = d / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    # Long enough that git scores the move as a rename rather than add+delete.
+    (wf / "old.yml").write_text("".join(f"# line {i}\n" for i in range(40)))
+    (d / "src").mkdir()
+    (d / "src" / "model.cpp").write_text("int x;\n")
+    git(d, "add", "-A"); git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD").stdout.strip()
+
+    git(d, "checkout", "-qb", "upstream")
+    git(d, "mv", ".github/workflows/old.yml", ".github/workflows/new.yml")
+    git(d, "commit", "-qm", "upstream renames it")
+
+    git(d, "checkout", "-q", "main")
+    git(d, "merge", "--no-ff", "--no-edit", "upstream")
+    return d, base
+
+
+d, base = rename_scenario()
+rc, out = run(d, base)
+check("drops an upstream workflow that arrived by rename", rc == 0, out)
+check("the renamed workflow is gone",
+      not (d / ".github/workflows/new.yml").exists(), out)
+check("source is still untouched", (d / "src" / "model.cpp").exists(), out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all sync_deletes tests passed")
 sys.exit(1 if FAILS else 0)

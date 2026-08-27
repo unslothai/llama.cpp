@@ -98,8 +98,12 @@ def main() -> int:
         # Against the WORKING TREE, not HEAD: mid-merge, HEAD is still our
         # pre-merge commit, so merge_base..HEAD describes our side rather than
         # the merge result and finds nothing.
-        r = git("diff", "--name-status", "--diff-filter=A", a.merge_base,
-                "--", PREFIX, cwd=a.repo)
+        # --no-renames, or an upstream workflow that was RENAMED reads as R
+        # rather than A and this filter drops it. The fork would then carry the
+        # renamed workflow and it would start firing here, which is the exact
+        # thing this block exists to stop.
+        r = git("diff", "--name-status", "--diff-filter=A", "--no-renames",
+                a.merge_base, "--", PREFIX, cwd=a.repo)
         if r.returncode != 0:
             # An unusable --merge-base produces empty stdout, which is
             # indistinguishable from "upstream added nothing" if the exit code
