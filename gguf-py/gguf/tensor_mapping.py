@@ -2668,6 +2668,14 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_DOWN: (
+            "model.layers.{bid}.shared_head.input_mix_weight_down",  # qwen4exp
+        ),
+
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_UP: (
+            "model.layers.{bid}.shared_head.input_mix_weight_up",    # qwen4exp
+        ),
     }
 
     # architecture-specific block mappings

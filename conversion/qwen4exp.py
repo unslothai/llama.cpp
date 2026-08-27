@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Iterable
 
 import torch
@@ -26,9 +25,62 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
+    # The MTP block is exported into the same file, at block index num_hidden_layers, and
+    # is skipped at load time unless a context asks for it (llama_model_loader::load_mtp).
+    # `--no-mtp` drops it again; a standalone MTP-only file is not supported, because the
+    # block borrows the trunk's token embedding and LM head and has no vocabulary of its own.
     supports_mtp_export = False
-    no_mtp = True
+    no_mtp = False
+
+    # mtp.hyper_connection_mixer.* is the MTP block's own final mixer. It stands in the
+    # place a plain nextn shared-head norm would, so it is remapped onto that name (plus
+    # the two low-rank halves the mixer needs) rather than onto the model-level
+    # `hyper_connection_mixer`, which already belongs to the trunk and would collide.
+    _MTP_MIXER_SUFFIX = {
+        "hc_norm.weight":                  "norm.weight",
+        "input_mix_weight_down.weight":    "input_mix_weight_down.weight",
+        "input_mix_weight_up.weight":      "input_mix_weight_up.weight",
+    }
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name = item[0]
+        prefix = "mtp.hyper_connection_mixer."
+        if name.startswith(prefix):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            suffix = cls._MTP_MIXER_SUFFIX[name[len(prefix):]]
+            return (f"model.layers.{cls._original_block_count}.shared_head.{suffix}", item[1])
+        return super().filter_tensors(item)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        # The MTP block fuses the token embedding and the target's hidden state with two
+        # separate projections. fc_e(e) + fc_h(h) == [fc_e|fc_h] * concat(e, h), so they
+        # join into the single eh_proj the nextn tensor map already knows, exactly as
+        # DeepSeek-V4's pair does. The graph concatenates e first, so cat on the input axis.
+        e_name = "mtp.fc_embedding.weight"
+        h_name = "mtp.fc_hidden.weight"
+
+        have_e = e_name in self.model_tensors
+        have_h = h_name in self.model_tensors
+        if not have_e and not have_h:
+            return
+        if not have_e or not have_h:
+            raise KeyError(f"unpaired MTP input projection: need both {e_name} and {h_name}")
+
+        from .base import LazyTorchTensor
+
+        e = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+        h = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+                                       self.hparams["num_hidden_layers"]),
+               torch.cat([e, h], dim=1).contiguous())
+
+        del self.model_tensors[e_name]
+        del self.model_tensors[h_name]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -68,8 +120,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # one entry per block, which includes the MTP block(s): llama.cpp reads this with
+        # get_key_or_arr(.., n_layer_all) and rejects any other length. The MTP block runs
+        # dense attention, so its ratio is 0
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [0] * (self.block_count - n_layer)
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
@@ -82,9 +138,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_ple_heads_per_ngram(hp["heads_per_ngram"])
         self.gguf_writer.add_ple_conv_kernel(hp["ple_conv_kernel_size"])
         self.gguf_writer.add_ple_eos_token_id(self._eos_token_id())
-        # The PLE hash runs over token ids, but a multimodal batch arrives as embeddings
-        # with the placeholder consumed. Carry it so those positions hash what the
-        # reference sees in input_ids instead of being undefined.
+        # an image is decoded as an embeddings-only batch, so the graph has no placeholder
+        # ids to hash; carry the id and let it stand in for those positions
         _img = self._image_token_id()
         if _img is not None:
             self.gguf_writer.add_ple_image_token_id(int(_img))
@@ -99,16 +154,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
 
     def _image_token_id(self) -> int | None:
-        # image_token_id is top-level in config.json, not in self.hparams once that is
-        # narrowed to text_config, and the text model has no global_config; read the file
+        # base.py merges text_config into the root of hparams, where image_token_id already is
         img = self.hparams.get("image_token_id")
-        if img is not None:
-            return int(img)
-        try:
-            with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
-                img = json.load(f).get("image_token_id")
-        except Exception:
-            return None
         return None if img is None else int(img)
 
     def _eos_token_id(self) -> int:
@@ -155,16 +202,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     # -- the PLE table ----------------------------------------------------
     #
-    # 128 shards concatenate into one enormous tensor. Holding them all and then
-    # torch.cat-ing peaks near 300 GB of RSS, which most machines that can
-    # otherwise convert this model do not have. Each shard is instead written
-    # straight into a memory-mapped file at its final row offset and dropped, so
-    # the peak is one shard and the rest is the page cache's problem. The trade
-    # is a temporary file beside the output, removed when the write finishes.
-    #
-    # The file holds float32 because that is what base.py has already cast the
-    # shards to by the time modify_tensors sees them, and what it calls .numpy()
-    # on afterwards.
+    # The 128 shards concatenate into one enormous tensor, which peaks near 300 GB of RSS.
+    # Each shard is written straight into a memory-mapped file at its final row offset and
+    # then dropped, so only one shard is resident. The file is removed after the write.
+    # It holds float32 because base.py has already cast the shards to it.
 
     def _place_ple_shard(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
 
@@ -177,8 +218,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         if self._ple_map is None:
             if idx == n_parts - 1 and n_parts > 1:
-                # the last shard may be short, so it cannot set the stride. This
-                # only happens if the checkpoint yields shards out of order
+                # the last shard can be short, so it cannot set the stride
+                # this happens only if the checkpoint yields the shards out of order
                 self._ple_pending[idx] = data_torch
                 return []
             self._ple_rows_per_shard = rows
@@ -211,8 +252,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             )
 
         start = idx * self._ple_rows_per_shard
-        # the shard is still lazy here; force it, since the point of this path
-        # is that exactly one shard is resident at a time
+        # the shard is still lazy here; force it, so exactly one shard is resident
         from .base import LazyTorchTensor
 
         eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()

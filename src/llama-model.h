@@ -228,6 +228,10 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    // qwen4exp: shared_head_norm is the norm of a hyper-connection mixer, these are its
+    // low-rank gate. Null for every architecture whose shared head is a plain RMS norm
+    struct ggml_tensor * shared_head_down      = nullptr;
+    struct ggml_tensor * shared_head_up        = nullptr;
 };
 
 struct llama_layer_switch_lora {
