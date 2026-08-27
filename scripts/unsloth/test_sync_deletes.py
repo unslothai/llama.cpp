@@ -137,6 +137,14 @@ check("the renamed workflow is gone",
       not (d / ".github/workflows/new.yml").exists(), out)
 check("source is still untouched", (d / "src" / "model.cpp").exists(), out)
 
+# 9. --repo names something that is not a git repository. ls-files fails, its
+# empty stdout read as "no conflicts", and the script reported that it had
+# resolved everything it was asked to.
+notrepo = Path(tempfile.mkdtemp(prefix="sd_notrepo_"))
+rc, out = run(notrepo)
+check("fails when the unmerged listing cannot run", rc == 1, out)
+check("says what could not be listed", "ls-files" in out, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all sync_deletes tests passed")
 sys.exit(1 if FAILS else 0)

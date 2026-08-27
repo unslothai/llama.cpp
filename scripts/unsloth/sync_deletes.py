@@ -48,6 +48,11 @@ def unmerged(cwd: str) -> dict[str, set[int]]:
     """path -> set of stages present (1 base, 2 ours, 3 theirs)."""
     out: dict[str, set[int]] = {}
     r = git("ls-files", "-u", cwd=cwd)
+    # A listing that could not run gives empty stdout, which reads as "no
+    # conflicts" and makes this script report that it resolved everything it
+    # was asked to. Not a repo, or an unreadable index, has to be an error.
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-files -u in {cwd}: {r.stderr.strip()}")
     for line in r.stdout.split("\n"):
         if not line.strip():
             continue
@@ -65,7 +70,15 @@ def main() -> int:
     ap.add_argument("--report", metavar="PATH")
     a = ap.parse_args()
 
-    stages = unmerged(a.repo)
+    try:
+        stages = unmerged(a.repo)
+    except RuntimeError as e:
+        print(f"sync_deletes: {e}", file=sys.stderr)
+        if a.report:
+            Path(a.report).write_text(json.dumps(
+                {"ok": False, "resolved": [], "removed_added": [],
+                 "left": [str(e)]}, indent=2))
+        return 1
     resolved, left, added = [], [], []
     for path, st in sorted(stages.items()):
         name = path.rsplit("/", 1)[-1]
