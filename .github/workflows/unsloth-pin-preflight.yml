@@ -107,6 +107,7 @@ jobs:
                      ../scripts/unsloth/pr-set.json)
 
           PROBLEMS=""
+          MERGED=""
           while read -r url REQUIRED; do
             SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
             NUM="$(sed -E 's|.*/pull/([0-9]+)/commits/.*|\1|' <<<"$url")"
@@ -130,6 +131,7 @@ jobs:
                  -c merge.conflictStyle=diff3 \
                  merge --no-ff --no-edit -m "probe ${SRC}#${NUM}" "$SHA" >/dev/null 2>&1; then
               echo "ok ${SRC}#${NUM}"
+              MERGED=1
               continue
             fi
             # Mirror resolve: a pure add/add is what the nightly will merge
@@ -139,6 +141,7 @@ jobs:
                  && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
               git -c user.name=preflight -c user.email=preflight@local commit -q --no-edit
               echo "ok ${SRC}#${NUM} (additive resolve)"
+              MERGED=1
               continue
             fi
             FILES="$(git diff --name-only --diff-filter=U | sed 's/^/  /')"
@@ -152,6 +155,19 @@ jobs:
           done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
                           | "\(.url)\t\(if .required == null then true else .required end)"' \
                      ../scripts/unsloth/pr-set.json | tr '\t' ' ')
+
+          # Only when a pin actually merged. With no pins, or only optional closed ones, this tree is pristine upstream, and a finding there is not a pin problem to alert on. The nightly gates the same check on MERGED_PINS.
+          if [ -z "$PROBLEMS" ] && [ -n "$MERGED" ]; then
+            # Merging cleanly is not the same as merging correctly. Two mistakes
+            # made on 08-27 compiled fine and would have shipped: a tensor-map key
+            # defined twice, which Python resolves silently by keeping the last,
+            # and an arch arm made unreachable by the same arch appearing in an
+            # earlier fallthrough condition. Both are checked here, on the tree the
+            # pins just produced, because this is the first point it exists.
+            if ! python3 ../scripts/unsloth/merge_checks.py --root . ; then
+              PROBLEMS="${PROBLEMS}- the merged tree builds, but \`scripts/unsloth/merge_checks.py\` found a resolution that is silently wrong. See the run log for file and line.\n"
+            fi
+          fi
 
           if [ -z "$PROBLEMS" ]; then
             echo "all pins merge cleanly onto ${BASE}"

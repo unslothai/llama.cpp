@@ -15,9 +15,29 @@ on:
   push:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/sync_deletes.py
+      - scripts/unsloth/test_*.py
+      - scripts/unsloth/check_workflow_scalars.py
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
+      - .github/workflows/*.yml
+      - .github/workflows/*.yaml
   pull_request:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/sync_deletes.py
+      - scripts/unsloth/test_*.py
+      - scripts/unsloth/check_workflow_scalars.py
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
+      - .github/workflows/*.yml
+      - .github/workflows/*.yaml
 
 permissions:
   contents: read
@@ -81,3 +101,32 @@ jobs:
           done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
                           | "\(.url)\t\(if .required == null then true else .required end)"' "$FILE" | tr '\t' ' ')
           exit "$fail"
+
+  resolver-tests:
+    # These tests existed for additive_merge.py and ran nowhere, so a change to a merge resolver was covered by nothing at all.
+    # Every resolver and check under scripts/unsloth/ runs here.
+    name: Resolver and merge-check tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { fetch-depth: 1 }
+
+      - name: Run the resolver tests
+        run: |
+          set -euo pipefail
+          fail=0
+          for t in scripts/unsloth/test_additive_merge.py \
+                   scripts/unsloth/test_pin_merge.py \
+                   scripts/unsloth/test_merge_checks.py \
+                   scripts/unsloth/test_sync_deletes.py \
+                   scripts/unsloth/test_carry_vintage.py; do
+            echo "::group::$t"
+            python3 "$t" || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
+      # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
+      - name: Check no workflow string is near GitHub's size limit
+        run: python3 scripts/unsloth/check_workflow_scalars.py --root .
+
