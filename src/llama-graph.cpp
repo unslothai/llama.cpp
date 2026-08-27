@@ -3581,7 +3581,17 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
         const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
-        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool);
+        // one pool map per SEQUENCE. a non-unified cache has one sequence per stream, a
+        // unified cache puts every sequence of the ubatch in stream 0 and cuts the
+        // stream's pool table into one run per sequence, so the table needs the rebasing
+        // slack once per sequence. sized on the ubatch and not on n_seq_max, which
+        // llama-embedding sets to 256; n_seqs_unq is already part of
+        // llm_graph_params::allow_reuse, so the shape holds while a graph is reused
+        const int64_t n_ps = (int64_t) ubatch.n_seqs_unq/n_stream;
+
+        GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
+
+        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 

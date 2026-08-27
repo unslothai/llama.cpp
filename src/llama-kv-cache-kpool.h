@@ -24,17 +24,35 @@ class llama_kv_cache_context;
 // here, host side, from the cache's cells, and passed in as plain input tensors, as
 // qwen4exp's QSA does for its compression blocks.
 //
+// A position only names a pool inside ONE sequence, so the map is per SEQUENCE. A
+// non-unified cache gives every sequence its own stream and its own cells array, and
+// the two are the same thing. A unified cache puts every sequence of the ubatch in one
+// stream and one cells array, so the stream's pool table is PARTITIONED: each sequence
+// gets a contiguous run of slots and rebases inside it. `pool_bias` is -INFINITY outside
+// the query's own run, which is what stops a query from selecting a foreign pool.
+//
+// The runs are packed, not one full-width table per sequence. A full-width table per
+// sequence would multiply the pool axis by the sequence count, and the indexer scores
+// every pool against every query, so llama-embedding (which asks for n_seq_max 256 with
+// a unified cache) reserved 286 GB of compute buffer that way.
+//
 // Nothing here may emit a negative index: ggml_set_rows asserts i1 >= 0 and
 // ggml_get_rows has no sentinel, so unpopulated entries are clamped into range and
 // neutralised by the additive masks instead.
 //
 
-// number of pool slots the graph must allocate for `n_kv` cells.
+// number of pool slots the graph must allocate for `n_kv` cells shared by `n_seqs`
+// sequences.
 //
-// pool ordinals are position-derived, then rebased on each stream's lowest resident
+// pool ordinals are position-derived, then rebased on each sequence's lowest resident
 // pool so sequences not starting at position 0 still land inside the array. rebasing
-// can cost one slot at each end, hence the +2.
-uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool);
+// can cost one slot at each end, hence 2 per sequence.
+//
+// n_kv/kpool is the budget the sequences share, which is exact while their cells are
+// disjoint: a cell belongs to one pool of one sequence. llama_memory_seq_cp breaks that
+// - a shared prefix cell is pooled by every sequence holding it - and then the runs are
+// cut to the newest pools rather than the table being grown, see [TAG_KPOOL_PACK].
+uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs = 1);
 
 // how many POOLS ggml_top_k selects.
 //
@@ -79,6 +97,7 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 //
 //   pool_cells I32 [kpool*n_pools, n_stream]
 //       pool slot, member -> the cell holding that position, or 0 when not resident.
+//       One stream's slots are cut into one contiguous run per sequence.
 //       Two consumers: the compressor gathers a pool's member keys and gates with it,
 //       and the top-k expands a selected POOL ordinal back into its kpool member CELLS
 //       with it - the reference's `pool_indices[batch_idx, selected]`.
@@ -92,7 +111,8 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 //       the same predicate per POOL, which is where the reference applies it: 0.0f when
 //       pool p is completely resident and its LAST member is visible to query q
 //       (`pool_valid & pool_visible`), else -INFINITY, the query's own trailing pool
-//       included so no budget is spent on it.
+//       included so no budget is spent on it. Every slot outside the query's own
+//       sequence run is -INFINITY, so a query never selects another sequence's pool.
 //
 //       Derived here rather than in the graph on purpose. Gathering `bias` at
 //       each pool's last member looks equivalent and is not: an incomplete or
