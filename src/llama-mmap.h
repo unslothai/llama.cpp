@@ -87,7 +87,9 @@ enum llama_mmap_random_mode {
 
 llama_mmap_random_mode llama_mmap_random_mode_get();
 
-// whether batched readahead ahead of a sparse gather is enabled (LLAMA_MMAP_RANDOM_PREFETCH)
+// batched readahead ahead of a sparse gather. not separately switchable: MADV_RANDOM suppresses
+// the kernel's own readahead, so without this the gather takes a synchronous fault per row and
+// runs 2.6x slower than leaving the mapping alone
 bool llama_mmap_random_prefetch_enabled();
 
 struct llama_mlock {
