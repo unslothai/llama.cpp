@@ -3,7 +3,6 @@
 #include "llama-memory-hybrid.h"
 
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 //
@@ -78,42 +77,12 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
-    // [TAG_PLE_HISTORY]
-    // The qwen4exp PLE hash of a token mixes in the ple_ngram_size - 1 tokens before it, which
-    // a decode ubatch does not carry. It lives here because it is per-context per-sequence
-    // state: it must follow the seq_* operations and the state blob, like the caches next to it.
-    struct ple_history {
-        // position the next token of this sequence must have; -1 means the window is not trusted
-        llama_pos next_pos = -1;
-
-        // the tokens at [next_pos - toks.size(), next_pos), oldest first, at most ple_ngram_size - 1
-        // it can be shorter near a sequence start or after a rewind; the caller pads the front with EOS
-        std::vector<llama_token> toks;
-    };
-
-    // history for seq_id, default-constructed (and so untrusted) on first use
-    // const because set_input updates it through a const memory context
-    ple_history & ple_hist_get(llama_seq_id seq_id) const;
-
 private:
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
-
-    // [TAG_PLE_HISTORY] empty for every architecture but qwen4exp, the only one that asks for a history
-    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
-
-    // the seq_* halves of the history bookkeeping, one per llama_memory_i operation
-    void ple_hist_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1);
-    void ple_hist_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
-    void ple_hist_keep(llama_seq_id seq_id);
-    void ple_hist_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift);
-    void ple_hist_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1);
-
-    void ple_hist_state_write(llama_io_write_i & io, llama_seq_id seq_id) const;
-    void ple_hist_state_read (llama_io_read_i  & io, llama_seq_id seq_id);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -157,9 +126,6 @@ public:
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
-
-    // [TAG_PLE_HISTORY] the per-sequence n-gram history of the owning memory, for set_input
-    llama_memory_hybrid_idx::ple_history & get_ple_hist(llama_seq_id seq_id) const;
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

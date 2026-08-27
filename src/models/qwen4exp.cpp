@@ -866,7 +866,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_memory_hybrid_idx_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -875,8 +875,11 @@ public:
 
     const llama_model_qwen4exp & pmodel;
 
-    // the token history lives on the memory, so it is per context and part of the state blob
-    const llama_memory_hybrid_idx_context * mctx;
+    // the predecessor tokens live in the attention KV cells (ext.tok)
+    const llama_kv_cache_context * mctx;
+
+    // scratch, reused across set_input() calls
+    std::vector<llama_token> prev;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -899,66 +902,33 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_heads  = hp.ple_n_heads;
     const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
+    const int64_t n_prev   = n_gram - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
-    // missing predecessors come from the per-sequence history, but only when it is
-    // contiguous with the incoming position; otherwise the window is EOS-padded
     GGML_ASSERT(mctx != nullptr);
 
-    // snapshot the history first, so a token cannot read an earlier token of this same ubatch
-    // the snapshot is always n_gram - 1 long and EOS-padded at the front: prev() puts the most recent token last
-    std::unordered_map<llama_seq_id, std::vector<llama_token>> snap;
     for (int64_t i = 0; i < n_tokens; ++i) {
-        const llama_seq_id seq = ubatch->seq_id[i][0];
-        if (snap.count(seq)) {
-            continue;
-        }
-        auto & h = mctx->get_ple_hist(seq);
-        if (h.next_pos != ubatch->pos[i]) {
-            h.next_pos = ubatch->pos[i];
-            h.toks.clear();
-        }
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
-        }
-
-        std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
-        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
-        snap[seq] = std::move(padded);
+        // the preceding tokens would be ambiguous, see get_prev_tokens()
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() has already stored the
+    // current ubatch, so predecessors within this very ubatch are covered as well
+    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+
     for (int64_t i = 0; i < n_tokens; ++i) {
-        const llama_seq_id seq = ubatch->seq_id[i][0];
-        const llama_pos    pos = ubatch->pos[i];
-
-        const auto & hist = snap[seq];
-
-        // predecessor s (1-based) of this token, EOS past a segment boundary
-        auto prev = [&](int64_t s) -> int64_t {
-            const int64_t j = i - s;
-            if (j >= 0 && ubatch->seq_id[j][0] == seq && ubatch->pos[j] == pos - s) {
-                return tok_of(j);
-            }
-            // s - i positions before this ubatch started, most recent last
-            const int64_t back = s - i;
-            const int64_t k    = (int64_t) hist.size() - back;
-            if (back > 0 && k >= 0 && k < (int64_t) hist.size() && pos - s >= 0) {
-                return hist[k];
-            }
-            return eos;
-        };
-
-        // an EOS in the window resets everything at or before it
+        // an EOS in the window resets everything at or before it, and a missing predecessor
+        // (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
         std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
-            ctx[s] = cut ? eos : prev(s);
-            if (ctx[s] == eos) {
-                cut = true;
-            }
+            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
+            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
         }
 
         for (int64_t n = 2; n <= n_gram; ++n) {
@@ -973,13 +943,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
-
-        auto & h = mctx->get_ple_hist(seq);
-        h.toks.push_back(tok_of(i));
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
-        }
-        h.next_pos = pos + 1;
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -1048,8 +1011,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t hc_dim  = hc * n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
 
+    // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb);
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
