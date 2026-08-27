@@ -39,7 +39,11 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* optional per-token indexer key cache for sparse-attention
+                               hybrids; absent unless filter_idx is given */
+    const layer_filter_cb & filter_idx  = nullptr,
+                ggml_type   type_idx    = GGML_TYPE_F16);
 
     ~llama_memory_hybrid() = default;
 
@@ -82,12 +86,18 @@ public:
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    llama_kv_cache * get_mem_idx()  const;   // nullptr when the model has no indexer
 
 private:
     const llama_hparams & hparams;
 
+    // indexer cache geometry: n_head_kv key heads of indexer_head_size, as
+    // llama_kv_cache_dsa builds its own
+    llama_hparams hparams_idx;
+
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    const std::unique_ptr<llama_kv_cache> mem_idx;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -110,7 +120,10 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+                            // empty without an indexer. the indexer is addressed by the
+                            // attention cache's cells, so it gets that cache's slots
+                  slot_info_vec_t   sinfos_idx = {});
 
     ~llama_memory_hybrid_context() = default;
 
@@ -126,6 +139,7 @@ public:
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+    const llama_kv_cache_context * get_idx()  const;   // nullptr without an indexer
 
 private:
     // the index of the next ubatch to process
@@ -135,6 +149,7 @@ private:
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+    const llama_memory_context_ptr ctx_idx;   // null unless the model has an indexer
 
     const llama_memory_status status;
 };
