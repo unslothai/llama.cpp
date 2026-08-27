@@ -435,12 +435,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    // the bias is per cell, but only its "which block is visible" half varies per block; the rest
-    // is the plain visible/not test the attention mask already carries over the same cells. where
-    // the two tests agree, upload the per-block half only: that is 1/ratio of the cells.
-    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out.
-    // the mask also holds an mrope rule for cells of the query's own position, but it compares a
-    // text cell against itself and so never fires; only 2d image positions can differ there.
+    // only the "which block is visible" half of the bias varies per block
+    // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
+    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+    // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;

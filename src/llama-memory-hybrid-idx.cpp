@@ -394,8 +394,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
 
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry.
-        // every cache path keeps a position below the cell window, so this stays clear
+        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
+        // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
 
         for (int64_t j = 0; j < n_kv; ++j) {
@@ -418,8 +418,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
-        // per-block mode keeps the real block of an unpooled cell, so the block's own -inf
-        // reaches it; per-cell mode carries that -inf itself and only needs the gather in range
+        // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
+        // per-cell mode carries that -inf itself and only needs the gather in range
         for (int64_t j = 0; j < n_kv; ++j) {
             if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
                 blk_of[j] = -1;
@@ -436,8 +436,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const llama_pos tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
-                // a block sits wholly inside or wholly outside the tail, so one value covers it.
-                // the caller adds the attention mask, which drops the empty, foreign and future cells
+                // a block sits wholly inside or outside the tail, so one value covers it
+                // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
