@@ -100,8 +100,44 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
-            -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON
+            -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+
+      # ggml-rpc AUTO-DETECTS RDMA: on Apple it find_library(rdma)s and, when the
+      # runner has one, defaults GGML_RPC_RDMA to ON and links /usr/lib/librdma.dylib
+      # into libggml-rpc. That library ships with the runner image, not with macOS,
+      # so the bundle loaded on the builder and died everywhere else:
+      #
+      #   dyld: Library not loaded: /usr/lib/librdma.dylib
+      #     Referenced from: .../libggml-rpc.0.dylib
+      #
+      # (b10639-mix-f6f92fe, the first release carrying upstream b114b4739.) A
+      # redistributable must not have its configuration decided by whatever happened
+      # to be installed where it was built, so the value is pinned rather than
+      # detected. Pinned OFF specifically because RDMA-over-Thunderbolt is not
+      # something the prebuilt's consumers can use.
+      - name: Assert the RDMA transport stayed off
+        working-directory: src
+        run: |
+          set -euo pipefail
+          grep -q '^GGML_RPC_RDMA:BOOL=OFF$' build/CMakeCache.txt || {
+            echo "::error::GGML_RPC_RDMA is not OFF in the CMake cache; a macOS"\
+                 "prebuilt that links librdma cannot load on a consumer Mac"
+            grep -i 'rdma' build/CMakeCache.txt || true
+            exit 1
+          }
+          # The cache says what was asked for; otool says what was linked. The
+          # launch gate below cannot see this, because it runs on the one host
+          # where the library does exist.
+          # No xargs -r: that is a GNU extension and these are BSD userland runners.
+          # An empty find just makes otool complain to a discarded stderr and grep
+          # match nothing, which is the answer we want anyway.
+          if find build/bin -type f \( -name '*.dylib' -o -perm -u+x \) -print0 \
+             | xargs -0 otool -L 2>/dev/null | grep -i 'librdma'; then
+            echo "::error::a shipped Mach-O still links librdma"
+            exit 1
+          fi
+          echo "rdma gate passed: GGML_RPC_RDMA=OFF and nothing links librdma"
 
       - name: Load gate (minos <= ${{ matrix.deploy_target }}, arch, launch)
         run: bash tooling/scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.expect_arch }}" "${{ matrix.deploy_target }}"
