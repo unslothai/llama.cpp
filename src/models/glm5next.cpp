@@ -505,44 +505,63 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
     cb(pool_k, "indexer_pool_k", il);
 
-    // {d_idx, n_tps, n_ihead, n_stream}. no rope: n_rot() is 0 for the whole text tower
+    // {d_idx, n_ihead, n_tps, n_stream}. no rope: n_rot() is 0 for the whole text tower
     ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
     iq = ggml_reshape_4d(ctx0, iq, d_idx, n_ihead, n_tps, n_stream);
-    iq = ggml_permute(ctx0, iq, 0, 2, 1, 3);
     cb(iq, "indexer_q", il);
-
-    // {n_pools, n_tps, n_ihead, n_stream}: pool_k is MQA and broadcasts over the heads
-    ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, iq);
-
-    // {n_ihead, n_tps, n_pools, n_stream}, contiguous for the relu and the head sum.
-    // the ReLU sits BETWEEN the per-head dot product and the head weighting: moving it
-    // to either side is a different function, because the head weights are sign-free
-    // and the sum is not a convex combination
-    kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
-    ggml_tensor * score = ggml_relu(ctx0, kq);
-    cb(score, "indexer_score", il);
 
     // sign-unconstrained head weights: no softmax, no abs, no relu. Both scale
     // constants - the reference's softmax_scale = d_idx^-0.5 and its n_heads^-0.5 head
     // factor - are folded in here, on an {n_ihead, n_tokens} tensor rather than on the
     // {n_pools, n_tps, n_ihead} score tensor. relu is positively homogeneous and both
     // constants are positive, so this is exactly the same function, and it is what the
-    // engines and the in-tree glm-dsa both do
+    // engines and the in-tree glm-dsa both do.
+    //
+    // GGML_PREC_F32 is not cosmetic: on vLLM a bf16 head gate moves a logit by ~1e-2,
+    // which is enough to swap two near-tied pools, and the top-k below is a hard cut
     ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
     ggml_mul_mat_set_prec(w, GGML_PREC_F32);
     w = ggml_reshape_4d(ctx0, w, n_ihead, n_tps, 1, n_stream);
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
     cb(w, "indexer_weights", il);
 
-    // {1, n_tps, n_pools, n_stream} -> {n_pools, n_tps, n_stream}
-    ggml_tensor * pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w));
-    pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
-    pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
+    // both paths end with pool_bias added: -INFINITY on every pool the reference's
+    // `pool_valid & pool_visible` rejects, the query's own trailing pool included, so
+    // that no budget is spent on it
+    ggml_tensor * pool_score = nullptr;
 
-    // -INFINITY on every pool the reference's `pool_valid & pool_visible` rejects, the
-    // query's own trailing pool included, so that no budget is spent on it
-    pool_score = ggml_add(ctx0, pool_score, inp_kp->pool_bias);
-    cb(pool_score, "indexer_pool_score", il);
+    if (cparams.fused_lid) {
+        // one node for the whole dot product -> relu -> head sum -> mask chain, and the
+        // mask add comes for free. pool_k stays f32, so the kernel takes its f32 vector
+        // path rather than the f16 wmma path, which would undo the GGML_PREC_F32 above
+        ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+
+        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        cb(pool_score, "indexer_pool_score", il);
+
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
+
+        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
+    } else {
+        // {n_pools, n_tps, n_ihead, n_stream}: pool_k is MQA and broadcasts over the heads
+        ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq, 0, 2, 1, 3));
+
+        // {n_ihead, n_tps, n_pools, n_stream}, contiguous for the relu and the head sum.
+        // the ReLU sits BETWEEN the per-head dot product and the head weighting: moving it
+        // to either side is a different function, because the head weights are sign-free
+        // and the sum is not a convex combination
+        kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+        ggml_tensor * score = ggml_relu(ctx0, kq);
+        cb(score, "indexer_score", il);
+
+        // {1, n_tps, n_pools, n_stream} -> {n_pools, n_tps, n_stream}
+        pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w));
+        pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
+        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
+
+        pool_score = ggml_add(ctx0, pool_score, inp_kp->pool_bias);
+        cb(pool_score, "indexer_pool_score", il);
+    }
 
     // Top-k over POOLS at index_topk/index_kpool, then expand each selected pool to its
     // members. This is the reference's own two-step (topk over the pool axis, then
