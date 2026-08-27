@@ -236,7 +236,10 @@ public:
     bool has_cell_ext() const;
 
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
-    // entries with no matching cell are set to LLAMA_TOKEN_NULL
+    // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
+    //   tok: A B X X X C
+    //   pos: 0 1 2 2 2 5
+    //   prev, n=2: A -> [NULL, NULL], B -> [NULL, A], 3rd X -> [X, X], C -> [X, X]
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 

@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1851,6 +1852,8 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         seqs.set(ubatch.seq_id_unq[s]);
     }
 
+    const llama_pos w0 = p_min - (llama_pos) n;
+
     // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
     std::unordered_map<uint64_t, llama_token> hist;
 
@@ -1858,11 +1861,46 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         return ((uint64_t) seq_id << 32) | (uint32_t) pos;
     };
 
+    // handle M-RoPE gaps: multiple tokens share the same temporal pos
+    // TODO @ngxson : improve this in the future
+    std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
+    below.fill({ -1, LLAMA_TOKEN_NULL });
+
     for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].for_each_token_in(seqs, p_min - (llama_pos) n, p_max,
+        // p_max inclusive: an embd token looks up cells at its own (shared) position
+        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                hist[key(seq_id, pos)] = tok;
+                if (pos >= w0) {
+                    hist[key(seq_id, pos)] = tok;
+                } else if (pos > below[seq_id].first) {
+                    below[seq_id] = { pos, tok };
+                }
             });
+    }
+
+    // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
+    const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
+        for (llama_pos q = p; q >= w0; --q) {
+            const auto it = hist.find(key(seq_id, q));
+            if (it != hist.end()) {
+                return it->second;
+            }
+        }
+        return below[seq_id].second;
+    };
+
+    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
+    // do not encode the token order; resolve its predecessors by ubatch order instead
+    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
+
+    if (!ubatch.token) {
+        ord.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto & v = seq_idx[ubatch.seq_id[i][0]];
+            ord[i] = v.size();
+            v.push_back(i);
+        }
     }
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
@@ -1871,15 +1909,23 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         for (uint32_t j = 0; j < n; ++j) {
-            const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
+            const llama_pos d = (llama_pos) (n - j);
+
+            llama_pos p;
+            if (!ubatch.token) {
+                const auto & v = seq_idx[seq_id];
+                const int64_t k = (int64_t) ord[i] - d;
+                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
+                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+            } else {
+                p = ubatch.pos[i] - d;
+            }
+
             if (p < 0) {
                 continue;
             }
 
-            const auto it = hist.find(key(seq_id, p));
-            if (it != hist.end()) {
-                res[i*n + j] = it->second;
-            }
+            res[i*n + j] = lookup(seq_id, p);
         }
     }
 }
