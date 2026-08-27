@@ -287,8 +287,7 @@ jobs:
             # somewhere the checkout cannot take away.
             ADDITIVE_MERGE="${RUNNER_TEMP}/additive_merge.py"
             cp scripts/unsloth/additive_merge.py "$ADDITIVE_MERGE"
-            MERGE_CHECKS="${RUNNER_TEMP}/merge_checks.py"
-            cp scripts/unsloth/merge_checks.py "$MERGE_CHECKS"
+            cp scripts/unsloth/merge_checks.py "${RUNNER_TEMP}/merge_checks.py"
             if [ "$(jq length <<<"$PRS")" != 0 ]; then
               # Merges need a merge-base, so unshallow first.
               if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
@@ -331,25 +330,7 @@ jobs:
                   fi
                 fi
               done < <(jq -r '.[] | "\(.repo) \(.number) \(.sha)"' <<<"$PRS")
-
-              # Every pin merged. Merging cleanly is not the same as merging
-              # correctly, and the two ways it goes wrong both survive a full
-              # build, so the compile legs below would not catch either:
-              #
-              #   - an architecture registered twice in a python tensor map.
-              #     Python keeps the last duplicate key silently, so the wrong
-              #     mapping is used and the model converts wrong.
-              #   - an arch arm made unreachable because an earlier fallthrough
-              #     already matches that arch. It compiles, and the model runs
-              #     without whatever that arm was meant to set up.
-              #
-              # Both were made by hand on 08-27. This is the last point where the
-              # composed tree exists before 39 build jobs run on it, so a
-              # model-affecting mis-resolution stops here rather than shipping.
-              if ! python3 "$MERGE_CHECKS" --root . ; then
-                echo "::error::the pinned PRs merged, but merge_checks.py found a resolution that is silently wrong; see the log for file and line" >&2
-                exit 1
-              fi
+              echo "MERGED_PINS=1" >> "$GITHUB_ENV"
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
               # build number is baked below, so no git history is needed at build time.
@@ -464,6 +445,39 @@ jobs:
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); prs=$PRS; source_artifact=${SRC_ARTIFACT:-none}; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
+
+      # Every pin merged. Merging cleanly is not the same as merging correctly,
+      # and the two ways it goes wrong both survive a full build, so the compile
+      # legs would not catch either:
+      #
+      #   - an architecture registered twice in a python tensor map. Python
+      #     keeps the last duplicate key silently, so the wrong mapping is used
+      #     and the model converts wrong.
+      #   - an arch arm made unreachable because an earlier fallthrough already
+      #     matches that arch. It compiles, and the model runs without whatever
+      #     that arm was meant to set up.
+      #
+      # Both were made by hand on 08-27. This runs before the source artifact is
+      # uploaded, so a model-affecting mis-resolution stops here rather than
+      # reaching 39 build jobs and shipping.
+      #
+      # A separate step, not more script inside `resolve`, because GitHub caps a
+      # single workflow string at 21000 characters and refuses to compile the
+      # whole file past it. That step is already at 20.5k, so the prose above
+      # alone was enough to break it: the run then reports as a zero-job failure
+      # with no annotation anywhere, and neither yaml parsing nor actionlint nor
+      # GitHub's own published parser sees a problem, because the limit is only
+      # enforced server-side. YAML comments outside a block scalar cost nothing
+      # against it. No step here sets working-directory, so this starts in the
+      # same $GITHUB_WORKSPACE the merge loop left behind.
+      - name: Check the merged tree for silently wrong resolutions
+        if: ${{ env.MERGED_PINS == '1' }}
+        run: |
+          set -euo pipefail
+          if ! python3 "${RUNNER_TEMP}/merge_checks.py" --root . ; then
+            echo "::error::the pinned PRs merged, but merge_checks.py found a resolution that is silently wrong; see the log for file and line" >&2
+            exit 1
+          fi
 
       # The stamped source tree (every build): every build child extracts this
       # instead of cloning, and assemble ships it as the release's source-tarball

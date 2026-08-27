@@ -269,6 +269,51 @@ check("a rename does not license the rebuild advice",
 check("the renaming run still writes nothing",
       git(d4, "status", "--porcelain") == "", git(d4, "status", "--porcelain"))
 
+# A carry that changes a file the PR never touched. Everything the PR did touch
+# is superseded, so nothing diverges and nothing is omitted, and the rebuild
+# advice was given anyway -- while a rebuild from the PR head drops the
+# carry-only change, which is invisible to a scan of the PR's own file list.
+def carry_only_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    write(d, "theirs.txt", "base version\n")
+    write(d, "ours_only.txt", "base version\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    # The PR touches theirs.txt and nothing else.
+    git(d, "checkout", "-q", "-b", "pr")
+    write(d, "theirs.txt", "upstream v1\n")
+    git(d, "commit", "-qam", "pr c1")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry takes the PR's change AND makes one of its own, off the PR.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "theirs.txt", "upstream v1\n")
+    write(d, "ours_only.txt", "a fix we carry ourselves\n")
+    git(d, "commit", "-qam", "carry plus our own fix")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d5, base5, head5, carry6 = carry_only_fixture()
+report5 = str(Path(tempfile.mkdtemp(prefix="cvr_")) / "report.json")
+r7 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry6, "--pr-ref", head5,
+                     "--base", base5, "--report", report5],
+                    cwd=d5, capture_output=True, text=True)
+check("runs clean on a carry with its own change", r7.returncode == 0, r7.stderr)
+out5 = json.loads(Path(report5).read_text())
+check("a file only the carry changed is reported",
+      out5.get("carry_only") == ["ours_only.txt"], json.dumps(out5, indent=1))
+check("a carry-only change withholds the rebuild advice",
+      "Nothing diverges" not in r7.stdout, r7.stdout[-400:])
+check("and the PR's own file is still superseded",
+      any(e["path"] == "theirs.txt" for e in out5["superseded"]), json.dumps(out5, indent=1))
+check("the carry-only run still writes nothing",
+      git(d5, "status", "--porcelain") == "", git(d5, "status", "--porcelain"))
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")
 sys.exit(1 if FAILS else 0)

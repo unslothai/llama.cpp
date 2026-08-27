@@ -84,6 +84,21 @@ def main() -> int:
     history = [c for c in git("rev-list", f"--max-count={a.max_commits}",
                               f"{fork}..{head}").split("\n") if c]
 
+    # Paths the CARRY changed that the PR never touched at all. Everything
+    # above reasons only about files in the PR's diff, so a carry-only edit is
+    # invisible to it: every PR path can be SUPERSEDED, nothing diverges, and
+    # the summary says a rebuild from the PR head is equivalent while the
+    # rebuild drops that edit. Same failure as OMITTED, arrived at from the
+    # other side. Diffed from --base rather than the fork point because a carry
+    # replays the PR onto the base tag, so that is what its own delta is
+    # against; if a carry is ever based on something else, the extra paths only
+    # ever withhold the rebuild advice, which is the safe direction to be wrong
+    # in.
+    touched = set(files)
+    carry_only = [f for f in git("diff", "--name-only", "--no-renames",
+                                 a.base, a.carry).split("\n")
+                  if f and f not in touched]
+
     superseded, diverged, absent, omitted = [], [], [], []
     for path in files:
         ours = blob(a.carry, path)
@@ -129,6 +144,9 @@ def main() -> int:
               "a rebuild would re-add it")
     for p in absent:
         print(f"  ABSENT      {p}\n              deleted by the PR, not in the carry")
+    for p in carry_only:
+        print(f"  CARRY ONLY  {p}\n              changed by the carry, untouched by the PR; "
+              "a rebuild would drop it")
     print()
     if diverged:
         print(f"{len(diverged)} file(s) genuinely diverge. A refresh has to merge, "
@@ -137,7 +155,11 @@ def main() -> int:
         print(f"{len(omitted)} file(s) the PR head still has are missing from the "
               "carry. Rebuilding would restore them, so it is NOT equivalent to "
               "merging; keep or re-drop each one deliberately.")
-    if not diverged and not omitted:
+    if carry_only:
+        print(f"{len(carry_only)} file(s) the carry changed are outside the "
+              "PR entirely. Rebuilding from the PR head would drop them, so it "
+              "is NOT equivalent to merging; carry each one across deliberately.")
+    if not diverged and not omitted and not carry_only:
         print("Nothing diverges. Rebuilding the carry from the PR head is "
               "equivalent to merging it, without the conflicts.")
 
@@ -145,7 +167,7 @@ def main() -> int:
         with open(a.report, "w") as fh:
             json.dump({"head": head, "superseded": superseded,
                        "diverged": diverged, "omitted": omitted,
-                       "absent": absent}, fh, indent=2)
+                       "absent": absent, "carry_only": carry_only}, fh, indent=2)
     return 0
 
 

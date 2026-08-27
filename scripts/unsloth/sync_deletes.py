@@ -100,15 +100,30 @@ def main() -> int:
         # the merge result and finds nothing.
         r = git("diff", "--name-status", "--diff-filter=A", a.merge_base,
                 "--", PREFIX, cwd=a.repo)
-        for line in r.stdout.split("\n"):
-            if not line.strip():
-                continue
-            path = line.split("\t", 1)[1].strip()
-            name = path.rsplit("/", 1)[-1]
-            if name.startswith(OURS):
-                continue
-            if git("rm", "-q", "--force", "--", path, cwd=a.repo).returncode == 0:
-                added.append(path)
+        if r.returncode != 0:
+            # An unusable --merge-base produces empty stdout, which is
+            # indistinguishable from "upstream added nothing" if the exit code
+            # is ignored. This script reporting success is what tells a sync it
+            # can proceed, so a listing that never ran has to be a failure, not
+            # a quiet zero: otherwise the sync carries every newly added
+            # upstream workflow in and they start firing on the fork.
+            left.append(f"{a.merge_base}: could not list workflows added since "
+                        f"it: {r.stderr.strip()}")
+        else:
+            for line in r.stdout.split("\n"):
+                if not line.strip():
+                    continue
+                path = line.split("\t", 1)[1].strip()
+                name = path.rsplit("/", 1)[-1]
+                if name.startswith(OURS):
+                    continue
+                rm = git("rm", "-q", "--force", "--", path, cwd=a.repo)
+                if rm.returncode == 0:
+                    added.append(path)
+                else:
+                    # Same reasoning as the resolve loop above: a removal that
+                    # did not happen is reported, never dropped.
+                    left.append(f"{path}: git rm failed: {rm.stderr.strip()}")
 
     for p in resolved:
         print(f"resolved  {p}: kept the fork's deletion")

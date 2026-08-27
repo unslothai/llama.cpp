@@ -96,6 +96,19 @@ check("keeps upstream composite actions", (d / ".github/actions/ccache-buckets/a
 # 6. source files are never removed by the added-workflow sweep
 check("source file untouched throughout", (d / "src" / "model.cpp").exists())
 
+# 7. an unusable --merge-base. git diff exits nonzero with empty stdout, which
+# reads exactly like "upstream added nothing" if only stdout is looked at, so
+# the run reported success and a sync would have carried every newly added
+# upstream workflow in. The listing failing has to fail the script.
+d, base = scenario(".github/workflows/build-apple.yml",
+                   upstream_adds=".github/workflows/build-wasm.yml")
+rc, out = run(d, "0000000000000000000000000000000000000000")
+check("fails when the added-workflow listing cannot run", rc == 1, out)
+check("says which rev it could not use",
+      "0000000000" in out and "could not list" in out, out)
+check("and leaves the added workflow in place to be dealt with",
+      (d / ".github/workflows/build-wasm.yml").exists(), out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all sync_deletes tests passed")
 sys.exit(1 if FAILS else 0)
