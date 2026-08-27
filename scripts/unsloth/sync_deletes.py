@@ -3,37 +3,29 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Resolve the modify/delete conflicts a fork sync produces, and only those.
 
-Measured over every merge commit in this fork: 149 file-level conflicts, of
-which 68 (45 percent) are the same one. Upstream edits a workflow this fork
-deleted on purpose, git cannot know which side wins, and a human keeps the
-deletion. Every single time: 68 of 68 historical instances resolved by keeping
-the deletion, with no exceptions.
+Measured over every merge commit in this fork: 149 file-level conflicts, of which 68 (45 percent) are the same one.
+Upstream edits a workflow this fork deleted on purpose, git cannot know which side wins, and a human keeps the deletion.
+Every single time: 68 of 68 historical instances resolved by keeping the deletion, with no exceptions.
 
-That is not a heuristic, it is the fork's stated invariant. This fork owns no
-upstream CI. scripts/unsloth/upstream-sync.json requires the diff from the sync
-point to master to touch only .github/ and scripts/unsloth/, and
-verify_upstream_sync.py already treats these deletions as legitimate. The
-deletions are policy, so re-applying them is bookkeeping.
+That is not a heuristic, it is the fork's stated invariant.
+This fork owns no upstream CI.
+scripts/unsloth/upstream-sync.json requires the diff from the sync point to master to touch only .github/ and scripts/unsloth/, and verify_upstream_sync.py already treats these deletions as legitimate.
+The deletions are policy, so re-applying them is bookkeeping.
 
-Scope is deliberately tight, because the cost of being wrong is a workflow
-silently reappearing and firing on the fork:
+Scope is deliberately tight, because the cost of being wrong is a workflow silently reappearing and firing on the fork:
 
   - only paths under .github/workflows/
   - only modify/delete conflicts, never content conflicts
-  - never a file named unsloth-*.yml, which is ours; if one of those is ever in
-    a modify/delete conflict, something is wrong and a human should look
-  - the delete must be on our side; upstream deleting a file we modified is the
-    opposite situation and is left alone
+  - never a file named unsloth-*.yml, which is ours; if one of those is ever in a modify/delete conflict, something is wrong and a human should look
+  - the delete must be on our side; upstream deleting a file we modified is the opposite situation and is left alone
 
-The same policy covers a workflow upstream ADDED since the last sync. That is
-not a conflict at all, so git merges it in silently and the fork acquires a
-workflow that starts firing on it. Replaying sync e8735f35d3 caught exactly
-this: resolving only the conflicts left .github/workflows/build-wasm.yml in the
-tree, where the recorded human resolution had deleted it. With --added handled
-too, the replay reproduces that tree exactly.
+The same policy covers a workflow upstream ADDED since the last sync.
+That is not a conflict at all, so git merges it in silently and the fork acquires a workflow that starts firing on it.
+Replaying sync e8735f35d3 caught exactly this: resolving only the conflicts left .github/workflows/build-wasm.yml in the tree, where the recorded human resolution had deleted it.
+With --added handled too, the replay reproduces that tree exactly.
 
-Anything else is left conflicted. Exits 0 if it resolved everything it was
-asked about, 1 if any conflict remains.
+Anything else is left conflicted.
+Exits 0 if it resolved everything it was asked about, 1 if any conflict remains.
 """
 
 from __future__ import annotations
@@ -77,8 +69,8 @@ def main() -> int:
     resolved, left, added = [], [], []
     for path, st in sorted(stages.items()):
         name = path.rsplit("/", 1)[-1]
-        # stage 2 missing means our side deleted it; stage 3 present means
-        # upstream still has it. That is the sync case, and only that.
+        # stage 2 missing means our side deleted it; stage 3 present means upstream still has it.
+        # That is the sync case, and only that.
         ours_deleted = 2 not in st and 3 in st
         if (path.startswith(PREFIX) and not name.startswith(OURS) and ours_deleted):
             r = git("rm", "-q", "--force", "--", path, cwd=a.repo)
@@ -92,25 +84,17 @@ def main() -> int:
                    else "not a delete on our side")
             left.append(f"{path}: {why}")
 
-    # Workflows upstream added since the merge base. No conflict, so nothing
-    # above sees them, and the fork silently gains CI that fires on its own repo.
+    # Workflows upstream added since the merge base.
+    # No conflict, so nothing above sees them, and the fork silently gains CI that fires on its own repo.
     if a.merge_base:
-        # Against the WORKING TREE, not HEAD: mid-merge, HEAD is still our
-        # pre-merge commit, so merge_base..HEAD describes our side rather than
-        # the merge result and finds nothing.
-        # --no-renames, or an upstream workflow that was RENAMED reads as R
-        # rather than A and this filter drops it. The fork would then carry the
-        # renamed workflow and it would start firing here, which is the exact
-        # thing this block exists to stop.
+        # Against the WORKING TREE, not HEAD: mid-merge, HEAD is still our pre-merge commit, so merge_base..HEAD describes our side rather than the merge result and finds nothing.
+        # --no-renames, or an upstream workflow that was RENAMED reads as R rather than A and this filter drops it.
+        # The fork would then carry the renamed workflow and it would start firing here, which is the exact thing this block exists to stop.
         r = git("diff", "--name-status", "--diff-filter=A", "--no-renames",
                 a.merge_base, "--", PREFIX, cwd=a.repo)
         if r.returncode != 0:
-            # An unusable --merge-base produces empty stdout, which is
-            # indistinguishable from "upstream added nothing" if the exit code
-            # is ignored. This script reporting success is what tells a sync it
-            # can proceed, so a listing that never ran has to be a failure, not
-            # a quiet zero: otherwise the sync carries every newly added
-            # upstream workflow in and they start firing on the fork.
+            # An unusable --merge-base produces empty stdout, which is indistinguishable from "upstream added nothing" if the exit code is ignored.
+            # This script reporting success is what tells a sync it can proceed, so a listing that never ran has to be a failure, not a quiet zero: otherwise the sync carries every newly added upstream workflow in and they start firing on the fork.
             left.append(f"{a.merge_base}: could not list workflows added since "
                         f"it: {r.stderr.strip()}")
         else:
@@ -125,8 +109,7 @@ def main() -> int:
                 if rm.returncode == 0:
                     added.append(path)
                 else:
-                    # Same reasoning as the resolve loop above: a removal that
-                    # did not happen is reported, never dropped.
+                    # Same reasoning as the resolve loop above: a removal that did not happen is reported, never dropped.
                     left.append(f"{path}: git rm failed: {rm.stderr.strip()}")
 
     for p in resolved:

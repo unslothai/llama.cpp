@@ -3,59 +3,40 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Post-merge checks for the two mistakes a clean build does not catch.
 
-Both of these were made for real on 08-27, resolving GLM-5-Next against the
-qwen4exp carry, and both survived compilation:
+Both of these were made for real on 08-27, resolving GLM-5-Next against the qwen4exp carry, and both survived compilation:
 
-  1. A resolver unioned two byte-identical additions and produced the same
-     `MODEL_ARCH.GLM5NEXT` key twice in the tensor map. Python keeps the last
-     definition of a duplicate key, silently, so the file imports, the build
-     passes, and the converter reads the wrong mapping.
+  1. A resolver unioned two byte-identical additions and produced the same `MODEL_ARCH.GLM5NEXT` key twice in the tensor map.
+     Python keeps the last definition of a duplicate key, silently, so the file imports, the build passes, and the converter reads the wrong mapping.
 
-  2. The same union kept both an arch in a shared fallthrough condition AND a
-     dedicated `else if (arch == LLM_ARCH_GLM5NEXT)` arm below it. The shared
-     condition matches first, so the dedicated arm is dead. It compiles, and the
-     model runs with the indexer cache that arm was supposed to build.
+  2. The same union kept both an arch in a shared fallthrough condition AND a dedicated `else if (arch == LLM_ARCH_GLM5NEXT)` arm below it.
+     The shared condition matches first, so the dedicated arm is dead.
+     It compiles, and the model runs with the indexer cache that arm was supposed to build.
 
-Neither is a merge resolver. They decide nothing and rewrite nothing. They turn
-a silent wrong answer into a loud one, which is the property that was missing.
+Neither is a merge resolver.
+They decide nothing and rewrite nothing.
+They turn a silent wrong answer into a loud one, which is the property that was missing.
 
-Both are deliberately narrow, because a check that fires wrongly blocks a
-release just as effectively as a bad merge:
+Both are deliberately narrow, because a check that fires wrongly blocks a release just as effectively as a bad merge:
 
-  - An arch is only consumed by an EARLIER arm that is a pure disjunction of
-    `arch == LLM_ARCH_*` terms. A conditional arm may not run, so what follows
-    it stays reachable. The later arm is then dead if it is a disjunction whose
-    alternatives are all consumed, or a plain conjunction requiring a consumed
-    arch, since its other conditions can only narrow it further. Anything
-    mixing `||` and `&&` is left alone, and only a term that is exactly
-    `arch == X` counts, so `arch != X` is never read as requiring that arch.
+  - An arch is only consumed by an EARLIER arm that is a pure disjunction of `arch == LLM_ARCH_*` terms.
+    A conditional arm may not run, so what follows it stays reachable.
+    The later arm is then dead if it is a disjunction whose alternatives are all consumed, or a plain conjunction requiring a consumed arch, since its other conditions can only narrow it further.
+    Anything mixing `||` and `&&` is left alone, and only a term that is exactly `arch == X` counts, so `arch != X` is never read as requiring that arch.
 
-  - The unreachable-arm check reads one physical line, so a condition split
-    across lines is skipped rather than analysed. Checked against the whole of
-    src/: a line-joining variant finds exactly the same zero findings, because
-    every multiline arch condition there is a standalone `if` with no `else if`
-    chain below it. Widening the regex would add false-positive surface on the
-    release path and buy nothing today, so it stays narrow and this is recorded
-    as a known limitation rather than fixed.
+  - The unreachable-arm check reads one physical line, so a condition split across lines is skipped rather than analysed.
+    Checked against the whole of src/: a line-joining variant finds exactly the same zero findings, because every multiline arch condition there is a standalone `if` with no `else if` chain below it.
+    Widening the regex would add false-positive surface on the release path and buy nothing today, so it stays narrow and this is recorded as a known limitation rather than fixed.
 
-  - Chains are grouped by BRACE DEPTH, not by indentation. This is an accuracy
-    fix, not a widening: measured over all 181 src/**/*.cpp, depth and
-    indentation report the same zero findings, so nothing new fires and the
-    good tree stays clean, but depth keeps 339 arms in chains against 260 and
-    is right in both directions where they differ. Indentation drops the
-    enclosing chain at any nested `if`, which silences the check on the exact
-    08-27 shape, and it glues two unrelated `if`s at one indent into a single
-    chain whenever the second opener is a skipped multiline condition, which
-    reports a reachable arm as dead and blocks a release on good code.
+  - Chains are grouped by BRACE DEPTH, not by indentation.
+    This is an accuracy fix, not a widening: measured over all 181 src/**/*.cpp, depth and indentation report the same zero findings, so nothing new fires and the good tree stays clean, but depth keeps 339 arms in chains against 260 and is right in both directions where they differ.
+    Indentation drops the enclosing chain at any nested `if`, which silences the check on the exact 08-27 shape, and it glues two unrelated `if`s at one indent into a single chain whenever the second opener is a skipped multiline condition, which reports a reachable arm as dead and blocks a release on good code.
 
-  - There is deliberately NO duplicate-C++-definition check. The obvious version
-    keys on function name and flags legitimate overloads: it reported
-    `llama_model_base::create_tensor`, which is two different signatures. A real
-    duplicate is an ODR violation the compiler already rejects, so the only gain
-    would be failing sooner, which does not justify a false positive on the
-    release path.
+  - There is deliberately NO duplicate-C++-definition check.
+    The obvious version keys on function name and flags legitimate overloads: it reported `llama_model_base::create_tensor`, which is two different signatures.
+    A real duplicate is an ODR violation the compiler already rejects, so the only gain would be failing sooner, which does not justify a false positive on the release path.
 
-Exits 0 when clean, 1 when anything is found. `--report` emits JSON.
+Exits 0 when clean, 1 when anything is found.
+`--report` emits JSON.
 """
 
 from __future__ import annotations
@@ -104,9 +85,8 @@ def _pure_arch_disjunction(cond: str) -> bool:
 def _raw_delim(text: str, i: int) -> str | None:
     """The delimiter of a raw string starting at `i`, or None if one does not.
 
-    `i` indexes the `R`. The delimiter is what sits between `R"` and `(`, and
-    the literal ends only at `)delim"`, which is the whole reason a raw string
-    cannot be found with a plain regex.
+    `i` indexes the `R`.
+    The delimiter is what sits between `R"` and `(`, and the literal ends only at `)delim"`, which is the whole reason a raw string cannot be found with a plain regex.
     """
     if not text.startswith('R"', i):
         return None
@@ -126,15 +106,12 @@ def _raw_delim(text: str, i: int) -> str | None:
 def _decommented(text: str) -> list[str]:
     """The file with comments and literals blanked, line structure preserved.
 
-    Braces inside a string literal or a comment are not braces. src/ is full of
-    both (llama-chat.cpp alone embeds dozens of `{` in template strings), so
-    counting them raw would desynchronise the depth for the rest of the file.
+    Braces inside a string literal or a comment are not braces.
+    src/ is full of both (llama-chat.cpp alone embeds dozens of `{` in template strings), so counting them raw would desynchronise the depth for the rest of the file.
 
-    Scanned once, left to right, rather than by substituting one construct at a
-    time. Order cannot fix a substitution pass: blanking raw strings first lets
-    an `R"(` written inside a comment swallow everything to the next `)"`, and
-    blanking comments first lets a `//` inside a raw string end the line. Only
-    position decides which construct is real, and a scan is what knows it.
+    Scanned once, left to right, rather than by substituting one construct at a time.
+    Order cannot fix a substitution pass: blanking raw strings first lets an `R"(` written inside a comment swallow everything to the next `)"`, and blanking comments first lets a `//` inside a raw string end the line.
+    Only position decides which construct is real, and a scan is what knows it.
     """
     blank = lambda s: re.sub(r"[^\n]", " ", s)            # noqa: E731
     out: list[str] = []
@@ -180,18 +157,13 @@ def _depths(line: str, start: int) -> tuple[int, int]:
 def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
     """Group `if` / `else if` conditions into chains by BRACE DEPTH.
 
-    Indentation is not the structure. Keying chains on it, and resetting on any
-    change, means a nested `if` inside an arm replaces the enclosing chain, so
-    the outer arms after it are analysed as a fresh chain and an arch the outer
-    chain already matched looks unmatched. That is a gate that stops gating on
-    a shape that is ordinary C++: the arch dispatch at llama-model.cpp:2434 is
-    exactly one nested `if` away from it.
+    Indentation is not the structure.
+    Keying chains on it, and resetting on any change, means a nested `if` inside an arm replaces the enclosing chain, so the outer arms after it are analysed as a fresh chain and an arch the outer chain already matched looks unmatched.
+    That is a gate that stops gating on a shape that is ordinary C++: the arch dispatch at llama-model.cpp:2434 is exactly one nested `if` away from it.
 
-    The same key also mis-JOINS. Two unrelated `if`s at the same indentation
-    become one chain whenever the second one's opener is a condition the regex
-    skips, and then a perfectly reachable arm is reported unreachable, which
-    blocks a release on good code. Depth gets both right: a chain lives at the
-    depth its `if` opened at, and ends when a brace takes the file back past it.
+    The same key also mis-JOINS.
+    Two unrelated `if`s at the same indentation become one chain whenever the second one's opener is a condition the regex skips, and then a perfectly reachable arm is reported unreachable, which blocks a release on good code.
+    Depth gets both right: a chain lives at the depth its `if` opened at, and ends when a brace takes the file back past it.
     """
     raw = text.split("\n")
     clean = _decommented(text)
@@ -203,29 +175,21 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
         if c and len(c) > 1:
             done.append(c)
 
-    # A chain's closing brace and its `else if` are often on separate lines,
-    # which llama.cpp does in src/llama-quant.cpp:461 among others. Closing the
-    # chain the moment the brace line dedents would end it one line before the
-    # arm that continues it, and the duplicate arch arm after it would then be
-    # a fresh chain with nothing taken yet, so the gate passes it. Ending a
-    # chain is therefore deferred one line: the next line either continues it,
-    # or it really is over. Blank lines do not decide either way.
+    # A chain's closing brace and its `else if` are often on separate lines, which llama.cpp does in src/llama-quant.cpp:461 among others.
+    # Closing the chain the moment the brace line dedents would end it one line before the arm that continues it, and the duplicate arch arm after it would then be a fresh chain with nothing taken yet, so the gate passes it.
+    # Ending a chain is therefore deferred one line: the next line either continues it, or it really is over.
+    # Blank lines do not decide either way.
     pending: set[int] = set()
 
     depth = 0
     for i, (line, cline) in enumerate(zip(raw, clean)):
         after, lo = _depths(cline, depth)
         stripped = cline.lstrip()
-        # Matched on the decommented line: COND anchors on the `{` ending the
-        # line, so `if (arch == X) { // shared` matched nothing on the raw line
-        # and the arm vanished from the chain. _decommented blanks in place, so
-        # the spans still index the raw line and the condition text below is
-        # taken from there, intact. A line that blanked away entirely is
-        # commented-out code and opens nothing.
+        # Matched on the decommented line: COND anchors on the `{` ending the line, so `if (arch == X) { // shared` matched nothing on the raw line and the arm vanished from the chain.
+        # _decommented blanks in place, so the spans still index the raw line and the condition text below is taken from there, intact.
+        # A line that blanked away entirely is commented-out code and opens nothing.
         m = COND.search(cline) if stripped else None
-        # `} else if (...) {` and a bare `else if (...) {` after its own `}`
-        # line both continue the chain that lives at the depth this line dips
-        # to; a plain `if` opens one at the depth it starts from.
+        # `} else if (...) {` and a bare `else if (...) {` after its own `}` line both continue the chain that lives at the depth this line dips to; a plain `if` opens one at the depth it starts from.
         cont = bool(m) and (stripped.startswith("}") or stripped.startswith("else"))
         key = lo if cont else depth
         if stripped:
@@ -234,8 +198,7 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
             for k in sorted(pending, reverse=True):
                 flush(k)
             pending.clear()
-        # Any chain whose closing brace this line just passed is over, unless
-        # the next line turns out to continue it.
+        # Any chain whose closing brace this line just passed is over, unless the next line turns out to continue it.
         for k in [k for k in sorted(open_chains, reverse=True) if k >= lo]:
             if not (cont and k == key):
                 pending.add(k)
@@ -247,9 +210,7 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
             else:
                 flush(key)
                 open_chains[key] = [(i + 1, cond)]
-            # A line that both dedents and opens a chain at the same key would
-            # otherwise leave that key pending and flush the chain it just
-            # opened on the next line.
+            # A line that both dedents and opens a chain at the same key would otherwise leave that key pending and flush the chain it just opened on the next line.
             pending.discard(key)
         depth = after
     for k in sorted(open_chains, reverse=True):
@@ -260,15 +221,10 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
 def _blocked_by(cond: str, taken: set[str]) -> set[str]:
     """Arches that make this arm dead, given what earlier arms already took.
 
-    A pure disjunction is dead only when EVERY alternative is taken. A plain
-    conjunction is dead as soon as ONE of its `arch == X` conjuncts is, since
-    the other conditions can only narrow it further: an earlier unconditional
-    `arch == X` arm makes a later `arch == X && enabled` unreachable, and that
-    arm is not a pure disjunction so it used to be skipped entirely.
+    A pure disjunction is dead only when EVERY alternative is taken.
+    A plain conjunction is dead as soon as ONE of its `arch == X` conjuncts is, since the other conditions can only narrow it further: an earlier unconditional `arch == X` arm makes a later `arch == X && enabled` unreachable, and that arm is not a pure disjunction so it used to be skipped entirely.
 
-    Anything mixing `||` and `&&` is left alone rather than guessed at, and only
-    a term that is exactly `arch == X` counts, so `!(arch == X)` and `arch != X`
-    cannot be read as requiring that arch.
+    Anything mixing `||` and `&&` is left alone rather than guessed at, and only a term that is exactly `arch == X` counts, so `!(arch == X)` and `arch != X` cannot be read as requiring that arch.
     """
     archs = set(ARCH.findall(cond))
     if not archs:
@@ -296,8 +252,8 @@ def unreachable_arch_arms(path: Path) -> list[str]:
                 out.append(f"{path}:{lineno}: unreachable, "
                            f"{', '.join(sorted(dead))} already matched earlier "
                            "in this if/else chain")
-            # Only an unconditional arm consumes an arch. A conditional one may
-            # not run, so what follows it can still be reached.
+            # Only an unconditional arm consumes an arch.
+            # A conditional one may not run, so what follows it can still be reached.
             if _pure_arch_disjunction(cond):
                 taken |= set(ARCH.findall(cond))
     return out

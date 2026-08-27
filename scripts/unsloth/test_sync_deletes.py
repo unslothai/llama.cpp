@@ -3,8 +3,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Tests for sync_deletes.py. Run: python3 scripts/unsloth/test_sync_deletes.py
 
-Every case builds a real git merge, so the index stages are the ones git
-actually produces rather than a hand-written approximation.
+Every case builds a real git merge, so the index stages are the ones git actually produces rather than a hand-written approximation.
 """
 import subprocess
 import sys
@@ -96,10 +95,9 @@ check("keeps upstream composite actions", (d / ".github/actions/ccache-buckets/a
 # 6. source files are never removed by the added-workflow sweep
 check("source file untouched throughout", (d / "src" / "model.cpp").exists())
 
-# 7. an unusable --merge-base. git diff exits nonzero with empty stdout, which
-# reads exactly like "upstream added nothing" if only stdout is looked at, so
-# the run reported success and a sync would have carried every newly added
-# upstream workflow in. The listing failing has to fail the script.
+# 7. an unusable --merge-base.
+# git diff exits nonzero with empty stdout, which reads exactly like "upstream added nothing" if only stdout is looked at, so the run reported success and a sync would have carried every newly added upstream workflow in.
+# The listing failing has to fail the script.
 d, base = scenario(".github/workflows/build-apple.yml",
                    upstream_adds=".github/workflows/build-wasm.yml")
 rc, out = run(d, "0000000000000000000000000000000000000000")
@@ -109,9 +107,8 @@ check("says which rev it could not use",
 check("and leaves the added workflow in place to be dealt with",
       (d / ".github/workflows/build-wasm.yml").exists(), out)
 
-# 8. upstream RENAMES a workflow rather than adding one. Rename detection calls
-# the new path R, not A, so --diff-filter=A saw nothing and the script exited 0
-# with the renamed upstream workflow left live in the fork.
+# 8. upstream RENAMES a workflow rather than adding one.
+# Rename detection calls the new path R, not A, so --diff-filter=A saw nothing and the script exited 0 with the renamed upstream workflow left live in the fork.
 def rename_scenario():
     d = Path(tempfile.mkdtemp(prefix="sd_"))
     git(d, "init", "-q", "-b", "main")

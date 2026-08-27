@@ -3,9 +3,8 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Tests for merge_checks.py. Run: python3 scripts/unsloth/test_merge_checks.py
 
-The positive cases are reduced from the two real 08-27 mistakes. The negative
-cases are the shapes that must NOT fire, because a check that blocks a good
-merge costs a release just as surely as a bad merge does.
+The positive cases are reduced from the two real 08-27 mistakes.
+The negative cases are the shapes that must NOT fire, because a check that blocks a good merge costs a release just as surely as a bad merge does.
 """
 import subprocess
 import sys
@@ -91,10 +90,8 @@ check("does NOT fire on distinct arches", rc == 0, out)
 rc, out = run()
 check("clean tree exits 0", rc == 0, out)
 
-# A nested `if` inside an arm must not end the enclosing chain. Tracking chains
-# by indentation resets on the nested arm and analyses the outer `else if` as a
-# fresh chain, so the dedicated GLM5NEXT arm below a shared fallthrough -- the
-# exact 08-27 mistake -- stops being reported.
+# A nested `if` inside an arm must not end the enclosing chain.
+# Tracking chains by indentation resets on the nested arm and analyses the outer `else if` as a fresh chain, so the dedicated GLM5NEXT arm below a shared fallthrough - the exact 08-27 mistake - stops being reported.
 NESTED_DEAD_ARM = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
@@ -108,9 +105,8 @@ void f() {
     }
 }
 """
-# Two unrelated chains at the same indentation. The second one's opener is a
-# multiline condition, which the regex deliberately skips, so an indentation
-# key appends the reachable GLM5NEXT arm to the FIRST chain and calls it dead.
+# Two unrelated chains at the same indentation.
+# The second one's opener is a multiline condition, which the regex deliberately skips, so an indentation key appends the reachable GLM5NEXT arm to the FIRST chain and calls it dead.
 # Nothing here is unreachable, and firing would block a release on good code.
 SEPARATE_CHAINS = """
 void f() {
@@ -126,9 +122,8 @@ void f() {
     }
 }
 """
-# A brace inside a string literal or a comment is not a brace. Miscounting one
-# shifts the depth for the rest of the file, which would silence every chain
-# after it.
+# A brace inside a string literal or a comment is not a brace.
+# Miscounting one shifts the depth for the rest of the file, which would silence every chain after it.
 BRACES_IN_LITERALS = """
 void f() {
     const char * tmpl = "{% if x %}{{ y }}{% endif %}";
@@ -149,9 +144,8 @@ rc, out = run(cpp=BRACES_IN_LITERALS)
 check("still analyses a chain after braces in a string or comment",
       rc == 1 and "unreachable" in out, out)
 
-# llama.cpp puts `else if` on its own line as often as not, src/llama-quant.cpp
-# among them. Ending the chain on the brace line loses the arm that follows, so
-# the duplicate arch started a fresh chain with nothing taken and passed.
+# llama.cpp puts `else if` on its own line as often as not, src/llama-quant.cpp among them.
+# Ending the chain on the brace line loses the arm that follows, so the duplicate arch started a fresh chain with nothing taken and passed.
 NEXT_LINE_ELSE = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
@@ -174,9 +168,8 @@ void f() {
     }
 }
 """
-# The other direction, which deferring the close could break: a chain that
-# really has ended, followed by an unrelated chain at the same depth. Joining
-# them reports a reachable arm as dead and blocks a release on good code.
+# The other direction, which deferring the close could break: a chain that really has ended, followed by an unrelated chain at the same depth.
+# Joining them reports a reachable arm as dead and blocks a release on good code.
 CLOSED_THEN_NEW = """
 void f() {
     if (arch == LLM_ARCH_GLM5NEXT) {
@@ -193,8 +186,7 @@ void f() {
 }
 """
 
-# COND anchors on the `{` that ends the line, so a trailing comment after the
-# brace stopped the arm matching at all and it left the chain silently.
+# COND anchors on the `{` that ends the line, so a trailing comment after the brace stopped the arm matching at all and it left the chain silently.
 TRAILING_COMMENT = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) { // shared setup
@@ -204,8 +196,7 @@ void f() {
     }
 }
 """
-# The condition text must survive the comment stripping, since a mangled one
-# would fail to parse as a pure disjunction and quietly stop being checked.
+# The condition text must survive the comment stripping, since a mangled one would fail to parse as a pure disjunction and quietly stop being checked.
 COMMENTED_OUT_ARM = """
 void f() {
     if (arch == LLM_ARCH_GLM5NEXT) {
@@ -217,9 +208,8 @@ void f() {
 }
 """
 
-# A raw string ends only at its own delimiter, so it can hold a quote and a
-# brace that the ordinary string regex misreads. The stray `}` closed the chain
-# early and the duplicate arm after it passed as clean.
+# A raw string ends only at its own delimiter, so it can hold a quote and a brace that the ordinary string regex misreads.
+# The stray `}` closed the chain early and the duplicate arm after it passed as clean.
 RAW_STRING = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
@@ -230,8 +220,7 @@ void f() {
     }
 }
 """
-# A raw string is blanked before comments, so the `//` inside one is text, not
-# the start of a comment, and the brace after it still counts.
+# A raw string is blanked before comments, so the `//` inside one is text, not the start of a comment, and the brace after it still counts.
 RAW_WITH_SLASHES = """
 void f() {
     const char * u = R"(https://example.com/{x})";
@@ -243,11 +232,9 @@ void f() {
 }
 """
 
-# The other ordering. Blanking raw strings before comments let an `R"(` written
-# inside a comment open a literal that ran to the next `)"`, swallowing the
-# duplicate arm in between. Neither order fixes this, which is why the scan is
-# positional: whichever construct starts first wins, and here that is the
-# comment.
+# The other ordering.
+# Blanking raw strings before comments let an `R"(` written inside a comment open a literal that ran to the next `)"`, swallowing the duplicate arm in between.
+# Neither order fixes this, which is why the scan is positional: whichever construct starts first wins, and here that is the comment.
 RAW_INSIDE_COMMENT = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
@@ -259,8 +246,8 @@ void f() {
     }
 }
 """
-# An R glued to an identifier is part of it, not a raw-string prefix. Reading
-# CHAR"( as a literal would blank the rest of the chain.
+# An R glued to an identifier is part of it, not a raw-string prefix.
+# Reading CHAR"( as a literal would blank the rest of the chain.
 IDENT_ENDING_IN_R = """
 void f() {
     if (arch == LLM_ARCH_GLM5NEXT) {
@@ -272,9 +259,8 @@ void f() {
 }
 """
 
-# An unconditional arm takes the arch outright, so a later arm testing the same
-# arch with an extra condition can never run. It is not a pure disjunction, so
-# it was skipped and the dead arm passed.
+# An unconditional arm takes the arch outright, so a later arm testing the same arch with an extra condition can never run.
+# It is not a pure disjunction, so it was skipped and the dead arm passed.
 CONJUNCTION_AFTER_PLAIN = """
 void f() {
     if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
@@ -284,8 +270,7 @@ void f() {
     }
 }
 """
-# The reverse must stay clean: a CONDITIONAL arm does not consume the arch, so
-# a later arm testing it is genuinely reachable.
+# The reverse must stay clean: a CONDITIONAL arm does not consume the arch, so a later arm testing it is genuinely reachable.
 PLAIN_AFTER_CONJUNCTION = """
 void f() {
     if (arch == LLM_ARCH_GLM5NEXT && hparams.n_expert > 0) {

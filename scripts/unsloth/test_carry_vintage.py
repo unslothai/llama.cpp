@@ -3,16 +3,10 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Tests for carry_vintage.py. Run: python3 scripts/unsloth/test_carry_vintage.py
 
-Builds a throwaway repo shaped like a real carry: an upstream base tag, an
-upstream PR branch with two commits on top of it, and a carry branch that
-replayed the PR onto the base while deliberately dropping one file's change.
+Builds a throwaway repo shaped like a real carry: an upstream base tag, an upstream PR branch with two commits on top of it, and a carry branch that replayed the PR onto the base while deliberately dropping one file's change.
 
-The case that matters is that dropped file. Its content equals the BASE
-version, which is reachable from the PR head, so a vintage search that walks
-the PR head's whole ancestry finds a "match" in a commit that is not part of
-the PR at all, calls the file SUPERSEDED, and concludes that rebuilding from
-the PR head is equivalent to merging -- which would re-add exactly what the
-carry dropped.
+The case that matters is that dropped file.
+Its content equals the BASE version, which is reachable from the PR head, so a vintage search that walks the PR head's whole ancestry finds a "match" in a commit that is not part of the PR at all, calls the file SUPERSEDED, and concludes that rebuilding from the PR head is equivalent to merging - which would re-add exactly what the carry dropped.
 """
 import json
 import subprocess
@@ -65,9 +59,7 @@ def fixture():
     git(d, "commit", "-qam", "pr c2")
     head = git(d, "rev-parse", "HEAD")
 
-    # The carry: PR replayed onto base, with dropped.txt held at the base
-    # version on purpose, edited.txt at an older PR vintage, and taken.txt
-    # already at the PR head.
+    # The carry: PR replayed onto base, with dropped.txt held at the base version on purpose, edited.txt at an older PR vintage, and taken.txt already at the PR head.
     git(d, "checkout", "-q", "-b", "carry", base)
     write(d, "dropped.txt", "base version\n")
     write(d, "taken.txt", "upstream v2\n")
@@ -97,10 +89,8 @@ check("a file at an older PR commit is superseded at that vintage",
 check("a real divergence still forces a merge",
       "has to merge" in r.stdout, r.stdout[-300:])
 
-# With the deliberately dropped file removed from the picture, nothing diverges
-# any more. edited.txt is still at an older vintage than the PR head, though, so
-# the advice stays qualified: we never edited that file, but a rebuild moves it
-# to head, and only a person knows whether the carry meant to hold it.
+# With the deliberately dropped file removed from the picture, nothing diverges any more.
+# edited.txt is still at an older vintage than the PR head, though, so the advice stays qualified: we never edited that file, but a rebuild moves it to head, and only a person knows whether the carry meant to hold it.
 git(d, "checkout", "-q", "carry")
 write(d, "dropped.txt", "upstream v1\n")
 git(d, "commit", "-qam", "take it after all")
@@ -113,11 +103,9 @@ check("an older vintage still qualifies the advice",
       "OLDER vintage" in r2.stdout and "Nothing diverges" not in r2.stdout,
       r2.stdout[-300:])
 
-# A carry that deliberately OMITS a file the PR head still has. Nothing
-# diverges, every file the carry does have is superseded, and the naive answer
-# is "rebuild from the PR head" -- which restores the omitted file and loses
-# the omission. A file the PR DELETED is a different case: the carry not having
-# it is agreement, and a rebuild reproduces it exactly.
+# A carry that deliberately OMITS a file the PR head still has.
+# Nothing diverges, every file the carry does have is superseded, and the naive answer is "rebuild from the PR head" - which restores the omitted file and loses the omission.
+# A file the PR DELETED is a different case: the carry not having it is agreement, and a rebuild reproduces it exactly.
 def omission_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")
@@ -176,12 +164,8 @@ r4 = subprocess.run([sys.executable, str(SCRIPT), "--carry", git(d2, "rev-parse"
 check("a PR deletion alone still allows the rebuild",
       r4.returncode == 0 and "Nothing diverges" in r4.stdout, r4.stdout[-400:])
 
-# A multi-commit PR that does not touch every file in its FIRST commit. The
-# commits before the one that first changed a path still carry the fork's blob,
-# and they are inside fork..head, so a carry deliberately holding that file at
-# the base version matches one of them and is called SUPERSEDED -- the same
-# wrong "rebuilding is equivalent" answer the fork bound was meant to end, one
-# commit further in.
+# A multi-commit PR that does not touch every file in its FIRST commit.
+# The commits before the one that first changed a path still carry the fork's blob, and they are inside fork..head, so a carry deliberately holding that file at the base version matches one of them and is called SUPERSEDED - the same wrong "rebuilding is equivalent" answer the fork bound was meant to end, one commit further in.
 def late_touch_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")
@@ -228,10 +212,7 @@ check("the late-touch run still writes nothing",
       git(d3, "status", "--porcelain") == "", git(d3, "status", "--porcelain"))
 
 # A PR that RENAMES a file while the carry deliberately keeps the old path.
-# `git diff --name-only` prints only the new name of a detected rename, so the
-# old path never entered the file list at all: the new path came back
-# SUPERSEDED, nothing diverged, and the summary recommended a rebuild -- which
-# deletes the path the carry is holding, unreported.
+# `git diff --name-only` prints only the new name of a detected rename, so the old path never entered the file list at all: the new path came back SUPERSEDED, nothing diverged, and the summary recommended a rebuild - which deletes the path the carry is holding, unreported.
 def rename_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")
@@ -274,10 +255,8 @@ check("a rename does not license the rebuild advice",
 check("the renaming run still writes nothing",
       git(d4, "status", "--porcelain") == "", git(d4, "status", "--porcelain"))
 
-# A carry that changes a file the PR never touched. Everything the PR did touch
-# is superseded, so nothing diverges and nothing is omitted, and the rebuild
-# advice was given anyway -- while a rebuild from the PR head drops the
-# carry-only change, which is invisible to a scan of the PR's own file list.
+# A carry that changes a file the PR never touched.
+# Everything the PR did touch is superseded, so nothing diverges and nothing is omitted, and the rebuild advice was given anyway - while a rebuild from the PR head drops the carry-only change, which is invisible to a scan of the PR's own file list.
 def carry_only_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")
@@ -319,9 +298,8 @@ check("and the PR's own file is still superseded",
 check("the carry-only run still writes nothing",
       git(d5, "status", "--porcelain") == "", git(d5, "status", "--porcelain"))
 
-# A carry that takes the PR's content but changes the file mode. Content is
-# identical, so an oid-only comparison called it superseded and recommended a
-# rebuild, which drops the mode change.
+# A carry that takes the PR's content but changes the file mode.
+# Content is identical, so an oid-only comparison called it superseded and recommended a rebuild, which drops the mode change.
 def mode_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")
@@ -358,10 +336,8 @@ check("a mode-only difference is not a vintage match",
 check("a mode-only difference withholds the rebuild advice",
       "Nothing diverges" not in r8.stdout, r8.stdout[-400:])
 
-# A carry holding a file at an older commit of the PR. Nothing diverges, so the
-# advice used to be an unqualified "rebuilding is equivalent" -- but a rebuild
-# moves that file to head, and the carry may be holding the older vintage on
-# purpose, which is a decision this script cannot see.
+# A carry holding a file at an older commit of the PR.
+# Nothing diverges, so the advice used to be an unqualified "rebuilding is equivalent" - but a rebuild moves that file to head, and the carry may be holding the older vintage on purpose, which is a decision this script cannot see.
 def older_vintage_fixture():
     d = tempfile.mkdtemp(prefix="cv_")
     git(d, "init", "-q", "-b", "main")

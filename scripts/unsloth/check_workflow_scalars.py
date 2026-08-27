@@ -3,36 +3,24 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Fail when a workflow string is close to GitHub's 21000 character cap.
 
-GitHub's template compiler refuses any single string in a workflow file longer
-than 21000 characters. The whole file then fails to compile, and the failure is
-close to invisible:
+GitHub's template compiler refuses any single string in a workflow file longer than 21000 characters.
+The whole file then fails to compile, and the failure is close to invisible:
 
-  - the run has zero jobs, no annotations and an empty check suite, so there is
-    nothing to click on;
-  - `gh run view` says only "This run likely failed because of a workflow file
-    issue";
-  - the run is reported against whatever event triggered it, even an event the
-    workflow does not subscribe to, because compilation never got as far as
-    reading `on:`;
-  - and nothing local catches it. yaml parses the file, actionlint passes it,
-    and so does GitHub's own published parser (@actions/workflow-parser). The
-    limit is enforced only server-side.
+  - the run has zero jobs, no annotations and an empty check suite, so there is nothing to click on;
+  - `gh run view` says only "This run likely failed because of a workflow file issue";
+  - the run is reported against whatever event triggered it, even an event the workflow does not subscribe to, because compilation never got as far as reading `on:`;
+  - and nothing local catches it. yaml parses the file, actionlint passes it, and so does GitHub's own published parser (@actions/workflow-parser). The limit is enforced only server-side.
 
-On 08-27 a 14-line explanatory comment added inside the `resolve` job's script
-took it from 20503 to 21620 characters and silently disabled the entire release
-workflow for four pushes. The only way to see the real error was to fire a
-workflow_dispatch at the ref, which returns it as a 422:
+On 08-27 a 14-line explanatory comment added inside the `resolve` job's script took it from 20503 to 21620 characters and silently disabled the entire release workflow for four pushes.
+The only way to see the real error was to fire a workflow_dispatch at the ref, which returns it as a 422:
 
     (Line: 125, Col: 14): Exceeded max expression length 21000
 
-Comments inside a `run:` block scalar are part of the string and count against
-the limit. Comments in the YAML around it do not, so prose belongs above a step
-rather than inside it. Past that, the fix is to split the script into more
-steps: a step boundary costs nothing and resets the budget.
+Comments inside a `run:` block scalar are part of the string and count against the limit.
+Comments in the YAML around it do not, so prose belongs above a step rather than inside it.
+Past that, the fix is to split the script into more steps: a step boundary costs nothing and resets the budget.
 
-Measuring the parsed scalar is not exactly what GitHub measures, so the warn
-threshold is deliberately well below the cap rather than a character-perfect
-model of it.
+Measuring the parsed scalar is not exactly what GitHub measures, so the warn threshold is deliberately well below the cap rather than a character-perfect model of it.
 """
 
 from __future__ import annotations
@@ -43,8 +31,7 @@ from pathlib import Path
 
 import yaml
 
-# What GitHub enforces, and the point at which a script is big enough that the
-# next edit to it can cross the line without anyone thinking about size.
+# What GitHub enforces, and the point at which a script is big enough that the next edit to it can cross the line without anyone thinking about size.
 CAP = 21000
 WARN = 20000
 

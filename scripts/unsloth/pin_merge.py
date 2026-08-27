@@ -3,22 +3,15 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Three-way merge pr-set.json one pin at a time, and refuse anything ambiguous.
 
-Two repins in flight always collide. Both edit adjacent lines of the same JSON
-list, so git merges them as text and reports a conflict over lines that have
-nothing to do with each other. On 08-27 that happened twice in one hour, while
-landing the qwen4exp, Inkling and GLM-5-Next repins: each merge invalidated the
-next, and each one was resolved by hand into exactly what a per-element merge
-would have produced.
+Two repins in flight always collide.
+Both edit adjacent lines of the same JSON list, so git merges them as text and reports a conflict over lines that have nothing to do with each other.
+On 08-27 that happened twice in one hour, while landing the qwen4exp, Inkling and GLM-5-Next repins: each merge invalidated the next, and each one was resolved by hand into exactly what a per-element merge would have produced.
 
-Pin ORDER is load-bearing. resolve merges pins sequentially, so a later pin sees
-the tree the earlier ones produced, and reordering the list silently changes the
-composition. This never reorders: it walks the base list positionally and takes
-whichever side moved each entry. That also means a pin added or removed on one
-side is refused rather than aligned, because guessing where an inserted pin
-belongs is exactly the kind of guess that would change composition order. A
-side that REORDERS the list is refused for the same reason, and for a sharper
-one: position i would no longer name the same pin on both sides, so merging it
-field-wise would splice one PR's `required` onto another PR's url.
+Pin ORDER is load-bearing.
+resolve merges pins sequentially, so a later pin sees the tree the earlier ones produced, and reordering the list silently changes the composition.
+This never reorders: it walks the base list positionally and takes whichever side moved each entry.
+That also means a pin added or removed on one side is refused rather than aligned, because guessing where an inserted pin belongs is exactly the kind of guess that would change composition order.
+A side that REORDERS the list is refused for the same reason, and for a sharper one: position i would no longer name the same pin on both sides, so merging it field-wise would splice one PR's `required` onto another PR's url.
 
 Usable as a git merge driver:
 
@@ -26,10 +19,8 @@ Usable as a git merge driver:
     git config merge.pinset.driver 'python3 scripts/unsloth/pin_merge.py %O %A %B'
     echo 'scripts/unsloth/pr-set.json merge=pinset' >> .gitattributes
 
-The driver contract is to write the result over %A (ours) and exit 0, or leave
-it alone and exit non-zero to fall back to a normal conflict. That fallback is
-the whole safety story: a refusal costs a hand resolution, which is the status
-quo, and never a wrong pin set.
+The driver contract is to write the result over %A (ours) and exit 0, or leave it alone and exit non-zero to fall back to a normal conflict.
+That fallback is the whole safety story: a refusal costs a hand resolution, which is the status quo, and never a wrong pin set.
 """
 
 from __future__ import annotations
@@ -47,8 +38,8 @@ class Ambiguous(Exception):
 
 MISSING = object()
 
-# The pin url shape repin.py already enforces. The owner matters: ggml-org#125
-# and unslothai#125 are different PRs.
+# The pin url shape repin.py already enforces.
+# The owner matters: ggml-org#125 and unslothai#125 are different PRs.
 PIN_ID = re.compile(r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/")
 
 
@@ -66,8 +57,7 @@ def ident(entry: str | dict) -> str:
     """What a pin IS, independent of which commit it currently points at.
 
     A repin changes only the sha, so (owner, PR number) is the stable identity.
-    Anything that does not look like a pin url is its own identity, which is the
-    conservative reading: an unrecognised url can only ever cause a refusal.
+    Anything that does not look like a pin url is its own identity, which is the conservative reading: an unrecognised url can only ever cause a refusal.
     """
     url = fields(entry).get("url")
     m = PIN_ID.match(url) if isinstance(url, str) else None
@@ -77,17 +67,12 @@ def ident(entry: str | dict) -> str:
 def refuse_reorder(b: list, o: list, t: list) -> None:
     """Refuse if either side moved an entry that base holds somewhere else.
 
-    Merging by position assumes position i means the same pin on all three
-    sides. A reorder breaks that assumption silently: base [A, B] with ours
-    making A optional and theirs reordering to [B, A] merges position 0 as
-    "url moved to B, required moved to false" and produces B(required=false),
-    so the release skips the wrong PR and the driver still exits 0.
+    Merging by position assumes position i means the same pin on all three sides.
+    A reorder breaks that assumption silently: base [A, B] with ours making A optional and theirs reordering to [B, A] merges position 0 as "url moved to B, required moved to false" and produces B(required=false), so the release skips the wrong PR and the driver still exits 0.
 
-    Realigning by identity instead is not safe. A duplicated entry, or a
-    reorder combined with a repin, leaves more than one alignment consistent
-    with the diff, and choosing one is a guess about composition order, which
-    is load-bearing here. Refusing costs the hand resolution that was the
-    status quo; guessing costs a wrong build nothing downstream can see.
+    Realigning by identity instead is not safe.
+    A duplicated entry, or a reorder combined with a repin, leaves more than one alignment consistent with the diff, and choosing one is a guess about composition order, which is load-bearing here.
+    Refusing costs the hand resolution that was the status quo; guessing costs a wrong build nothing downstream can see.
     """
     bid = [ident(e) for e in b]
     for side, entries in (("ours", o), ("theirs", t)):
@@ -115,8 +100,7 @@ def refuse_duplicates(what: str, entries: list) -> None:
 def merge_keys(what: str, bd: dict, od: dict, td: dict) -> dict:
     """Three-way merge a mapping key by key, refusing only a real clash.
 
-    A key missing on a side is MISSING rather than absent, so "theirs deleted
-    it, ours left it alone" is a deletion both sides agree on, not a no-op.
+    A key missing on a side is MISSING rather than absent, so "theirs deleted it, ours left it alone" is a deletion both sides agree on, not a no-op.
     Ours' key order is kept, then keys only theirs or only base has.
     """
     out: dict = {}
@@ -140,9 +124,7 @@ def merge_keys(what: str, bd: dict, od: dict, td: dict) -> dict:
 def merge_entry(i: int, b, o, t):
     """Three-way merge one pin ENTRY, not just its url.
 
-    Comparing whole entries matters: an entry carries `required` as well as
-    `url`, and comparing only urls makes a `required` flip on one side look
-    like "no change", so rebuilding the list from ours drops it silently.
+    Comparing whole entries matters: an entry carries `required` as well as `url`, and comparing only urls makes a `required` flip on one side look like "no change", so rebuilding the list from ours drops it silently.
     """
     if o == t:
         return o                       # same on both sides, including untouched
@@ -150,17 +132,12 @@ def merge_entry(i: int, b, o, t):
         return t                       # only theirs touched this entry
     if t == b:
         return o                       # only ours touched this entry
-    # Both sides touched it. Merging field-wise is only meaningful while all
-    # three sides name the SAME PR. A repin moves the sha and keeps the
-    # identity, which is the case this is for. REPLACING the pin with another
-    # PR while the other side edits a field is not: base PR100(required=true),
-    # ours PR200, theirs PR100 required=false merges url from ours and
-    # required from theirs and yields PR200(required=false), so the release
-    # skips a PR nobody made optional and the driver still exits 0.
+    # Both sides touched it.
+    # Merging field-wise is only meaningful while all three sides name the SAME PR.
+    # A repin moves the sha and keeps the identity, which is the case this is for.
+    # REPLACING the pin with another PR while the other side edits a field is not: base PR100(required=true), ours PR200, theirs PR100 required=false merges url from ours and required from theirs and yields PR200(required=false), so the release skips a PR nobody made optional and the driver still exits 0.
     #
-    # Refused rather than resolved even when both sides agree on the
-    # replacement, because base then describes a different PR and every field
-    # comparison below is against settings that were never PR200's.
+    # Refused rather than resolved even when both sides agree on the replacement, because base then describes a different PR and every field comparison below is against settings that were never PR200's.
     named = {ident(b), ident(o), ident(t)}
     if len(named) != 1:
         raise Ambiguous(
@@ -170,8 +147,7 @@ def merge_entry(i: int, b, o, t):
     out = merge_keys(f"pin {i}", fields(b), fields(o), fields(t))
     if "url" not in out:
         raise Ambiguous(f"pin {i} lost its url")
-    # Keep the bare-string form when nothing but the url is present, so the
-    # file's shape is not rewritten by merging it.
+    # Keep the bare-string form when nothing but the url is present, so the file's shape is not rewritten by merging it.
     return out["url"] if list(out) == ["url"] else out
 
 
@@ -182,21 +158,17 @@ def merge_pins(base: dict, ours: dict, theirs: dict) -> dict:
             f"pin count differs (base={len(b)} ours={len(o)} theirs={len(t)}); "
             "a pin was added or removed, and placing it is an ordering decision"
         )
-    # Every side, and the result. A duplicate on one input defeats the reorder
-    # guard below; a duplicate only in the RESULT is made here, by the two
-    # sides adding the same PR at different positions.
+    # Every side, and the result.
+    # A duplicate on one input defeats the reorder guard below; a duplicate only in the RESULT is made here, by the two sides adding the same PR at different positions.
     for what, side in (("base", b), ("ours", o), ("theirs", t)):
         refuse_duplicates(what, side)
     refuse_reorder(b, o, t)
     merged = [merge_entry(i, bx, ox, tx)
               for i, (bx, ox, tx) in enumerate(zip(b, o, t))]
     refuse_duplicates("the merged pin set", merged)
-    # Everything outside .prs is three-way merged the same way. Rebuilding the
-    # document from ours instead would silently drop a change theirs made to a
-    # top-level field -- `_doc`, or any schema field added later -- and this
-    # driver REPLACES git's text merge rather than running after it, so nothing
-    # downstream would ever notice the loss. A real two-sided clash refuses,
-    # which costs a hand resolution and never a wrong document.
+    # Everything outside .prs is three-way merged the same way.
+    # Rebuilding the document from ours instead would silently drop a change theirs made to a top-level field - `_doc`, or any schema field added later - and this driver REPLACES git's text merge rather than running after it, so nothing downstream would ever notice the loss.
+    # A real two-sided clash refuses, which costs a hand resolution and never a wrong document.
     skel = [{k: (None if k == "prs" else v) for k, v in d.items()}
             for d in (base, ours, theirs)]     # .prs is merged positionally
     out = merge_keys("document", *skel)

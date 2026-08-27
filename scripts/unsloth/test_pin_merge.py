@@ -3,9 +3,8 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """Tests for pin_merge.py. Run: python3 scripts/unsloth/test_pin_merge.py
 
-The first case is the real 08-27 collision: master had moved qwen4exp to
-950f135b28 while the GLM-5-Next branch was replacing pin 118 with 125. It was
-resolved by hand at the time; this asserts the script reproduces that answer.
+The first case is the real 08-27 collision: master had moved qwen4exp to 950f135b28 while the GLM-5-Next branch was replacing pin 118 with 125.
+It was resolved by hand at the time; this asserts the script reproduces that answer.
 """
 import json
 import subprocess
@@ -118,8 +117,7 @@ def run_objs(base, ours, theirs):
 
 
 # 8. theirs flips `required` on one entry while ours repins a DIFFERENT one.
-# Comparing only urls makes theirs' flip invisible, and the result is rebuilt
-# from ours, so the flip is silently dropped by a merge that reports success.
+# Comparing only urls makes theirs' flip invisible, and the result is rebuilt from ours, so the flip is silently dropped by a merge that reports success.
 objs = [{"url": u, "required": True} for u in BASE_PINS]
 o = json.loads(json.dumps(objs)); o[5]["url"] = sub(BASE_PINS, 5, "e" * 40)[5]
 t = json.loads(json.dumps(objs)); t[1]["required"] = False
@@ -156,9 +154,8 @@ def run_docs(base, ours, theirs):
     return r.returncode, (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr.strip()
 
 
-# 12. theirs edits a TOP-LEVEL field while ours repins an entry. Rebuilding the
-# document from ours drops theirs' edit and still exits 0, and because a merge
-# driver replaces git's text merge outright, nothing else ever sees the loss.
+# 12. theirs edits a TOP-LEVEL field while ours repins an entry.
+# Rebuilding the document from ours drops theirs' edit and still exits 0, and because a merge driver replaces git's text merge outright, nothing else ever sees the loss.
 doc = {"_doc": ["old doc line"], "prs": list(BASE_PINS)}
 o = json.loads(json.dumps(doc)); o["prs"] = sub(BASE_PINS, 5, "a" * 40)
 t = json.loads(json.dumps(doc)); t["_doc"] = ["old doc line", "prune closed pins"]
@@ -189,17 +186,14 @@ rc, out, err = run_docs(doc, o, t3)
 check("honours a top-level field theirs deleted",
       rc == 0 and out is not None and "_doc" not in out, err or json.dumps(out))
 
-# 16. --help must not crash: argparse %-formats help strings, and the driver
-# placeholders %O/%A/%B are literal percents that have to be escaped.
+# 16. --help must not crash: argparse %-formats help strings, and the driver placeholders %O/%A/%B are literal percents that have to be escaped.
 r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True)
 check("--help does not crash on the %O/%A/%B placeholders",
       r.returncode == 0 and "%O" in r.stdout, (r.stderr or r.stdout)[-200:])
 
-# 17. one side REORDERS the pins while the other changes a field. Merging by
-# position then combines fields belonging to different PRs: base
-# [A(required), B(required)] with ours making A optional and theirs swapping
-# the two produces B(required=false), so the release skips the wrong PR, and
-# the driver exits 0 while doing it. A reorder must be refused instead.
+# 17. one side REORDERS the pins while the other changes a field.
+# Merging by position then combines fields belonging to different PRs: base [A(required), B(required)] with ours making A optional and theirs swapping the two produces B(required=false), so the release skips the wrong PR, and the driver exits 0 while doing it.
+# A reorder must be refused instead.
 two = [{"url": BASE_PINS[0], "required": True}, {"url": BASE_PINS[1], "required": True}]
 o = json.loads(json.dumps(two)); o[0]["required"] = False
 t = [two[1], two[0]]
@@ -210,8 +204,7 @@ check("names the reordered position", "reorder" in err, err)
 check("never emits a pin carrying another PR's field",
       pins is None or pins[0]["required"] is not False, json.dumps(pins))
 
-# 18. a reorder that also repins the moved entry still has to be refused: the
-# url no longer matches, so only the PR number identifies the entry.
+# 18. a reorder that also repins the moved entry still has to be refused: the url no longer matches, so only the PR number identifies the entry.
 t = [dict(two[1]), dict(two[0])]
 t[0]["url"] = sub(BASE_PINS, 1, "9" * 40)[1]
 rc, _, err = run_objs(two, o, t)
@@ -223,8 +216,7 @@ t2 = json.loads(json.dumps(two)); t2[0]["required"] = False
 rc, _, err = run_objs(two, o2, t2)
 check("refuses a reorder on ours", rc == 1, err)
 
-# 20. swapping a pin for a DIFFERENT PR at the same position is not a reorder
-# and must keep merging, which is case 1's real 08-27 resolution.
+# 20. swapping a pin for a DIFFERENT PR at the same position is not a reorder and must keep merging, which is case 1's real 08-27 resolution.
 rc, pins, err = run(BASE_PINS,
                     replace(BASE_PINS, 6, f"{U}/125/commits/{'a' * 40}"),
                     sub(BASE_PINS, 5, "b" * 40))
@@ -234,12 +226,9 @@ check("a same-position swap to a new PR is not a reorder", rc == 0, err)
 rc, pins, err = run(BASE_PINS, sub(BASE_PINS, 0, "1" * 40), sub(BASE_PINS, 3, "2" * 40))
 check("two repins at different positions still merge", rc == 0, err)
 
-# 22. a same-position swap to a different PR while the OTHER side edits that
-# entry's fields. Test 20's swap is safe only because nobody else touched the
-# entry; here both sides did, so the field-wise merge runs and takes the url
-# from one PR and `required` from another. Base A(required=true) with ours
-# swapping in B and theirs making A optional yielded B(required=false) and
-# exit 0, which makes the release skip a PR nobody made optional.
+# 22. a same-position swap to a different PR while the OTHER side edits that entry's fields.
+# Test 20's swap is safe only because nobody else touched the entry; here both sides did, so the field-wise merge runs and takes the url from one PR and `required` from another.
+# Base A(required=true) with ours swapping in B and theirs making A optional yielded B(required=false) and exit 0, which makes the release skip a PR nobody made optional.
 two = [{"url": BASE_PINS[0], "required": True}, {"url": BASE_PINS[1], "required": True}]
 o = json.loads(json.dumps(two)); o[0]["url"] = f"{U}/999/commits/{'c' * 40}"
 t = json.loads(json.dumps(two)); t[0]["required"] = False
@@ -251,17 +240,14 @@ check("never emits the swapped-in PR carrying the other's field",
       pins is None or pins[0].get("required") is not False, json.dumps(pins))
 
 # 23. both sides swap position 0 to the SAME new PR but disagree on a field.
-# Base still describes the PR that is gone, so every field comparison below is
-# against settings that were never this PR's: refuse rather than pick one.
+# Base still describes the PR that is gone, so every field comparison below is against settings that were never this PR's: refuse rather than pick one.
 o = json.loads(json.dumps(two)); o[0]["url"] = f"{U}/999/commits/{'c' * 40}"
 t = json.loads(json.dumps(two))
 t[0]["url"] = f"{U}/999/commits/{'c' * 40}"; t[0]["required"] = False
 rc, _, err = run_objs(two, o, t)
 check("refuses an agreed swap the sides disagree about", rc == 1, err)
 
-# 24. two entries pinning two commits of the SAME PR share one identity, so a
-# swap between them looks like no change and the reorder guard never fires: a
-# field theirs changed on the first entry then lands on the second.
+# 24. two entries pinning two commits of the SAME PR share one identity, so a swap between them looks like no change and the reorder guard never fires: a field theirs changed on the first entry then lands on the second.
 dup = [{"url": f"{U}/107/commits/{'a' * 40}", "required": True},
        {"url": f"{U}/107/commits/{'b' * 40}", "required": True}]
 o = [json.loads(json.dumps(dup[1])), json.loads(json.dumps(dup[0]))]
@@ -271,9 +257,8 @@ check("refuses a pin set that names one PR twice", rc == 1,
       json.dumps(pins) if pins else err)
 check("names the duplicated PR", "#107" in err, err)
 
-# 25. neither side has a duplicate, but the merge makes one: ours puts a new PR
-# at position 0 and theirs puts the SAME new PR at position 1. Base has it
-# nowhere, so the reorder guard sees nothing, and the driver emitted [C, C].
+# 25. neither side has a duplicate, but the merge makes one: ours puts a new PR at position 0 and theirs puts the SAME new PR at position 1.
+# Base has it nowhere, so the reorder guard sees nothing, and the driver emitted [C, C].
 two_ab = [{"url": f"{U}/107/commits/{'a' * 40}"}, {"url": f"{U}/108/commits/{'b' * 40}"}]
 c_entry = {"url": f"{U}/999/commits/{'c' * 40}"}
 o = [json.loads(json.dumps(c_entry)), json.loads(json.dumps(two_ab[1]))]

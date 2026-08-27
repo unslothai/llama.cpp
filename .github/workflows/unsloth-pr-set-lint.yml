@@ -103,9 +103,8 @@ jobs:
           exit "$fail"
 
   resolver-tests:
-    # These tests existed for additive_merge.py and ran nowhere, so a change to
-    # a merge resolver was covered by nothing at all. Every resolver and check
-    # under scripts/unsloth/ runs here.
+    # These tests existed for additive_merge.py and ran nowhere, so a change to a merge resolver was covered by nothing at all.
+    # Every resolver and check under scripts/unsloth/ runs here.
     name: Resolver and merge-check tests
     runs-on: ubuntu-24.04
     steps:
