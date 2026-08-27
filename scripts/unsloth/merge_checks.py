@@ -168,9 +168,13 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
     for i, (line, cline) in enumerate(zip(raw, clean)):
         after, lo = _depths(cline, depth)
         stripped = cline.lstrip()
-        # Matched on the raw line, so the condition text is intact, but a line
-        # that blanked away entirely is commented-out code and opens nothing.
-        m = COND.search(line) if stripped else None
+        # Matched on the decommented line: COND anchors on the `{` ending the
+        # line, so `if (arch == X) { // shared` matched nothing on the raw line
+        # and the arm vanished from the chain. _decommented blanks in place, so
+        # the spans still index the raw line and the condition text below is
+        # taken from there, intact. A line that blanked away entirely is
+        # commented-out code and opens nothing.
+        m = COND.search(cline) if stripped else None
         # `} else if (...) {` and a bare `else if (...) {` after its own `}`
         # line both continue the chain that lives at the depth this line dips
         # to; a plain `if` opens one at the depth it starts from.
@@ -188,7 +192,8 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
             if not (cont and k == key):
                 pending.add(k)
         if m:
-            cond = m.group(1) or m.group(2) or ""
+            g = 1 if m.group(1) is not None else 2
+            cond = line[m.start(g):m.end(g)]
             if cont and key in open_chains:
                 open_chains[key].append((i + 1, cond))
             else:

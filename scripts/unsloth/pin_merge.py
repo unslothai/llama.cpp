@@ -90,6 +90,17 @@ def refuse_reorder(b: list, o: list, t: list) -> None:
     status quo; guessing costs a wrong build nothing downstream can see.
     """
     bid = [ident(e) for e in b]
+    # Identity is (owner, PR number), so two entries pinning two commits of the
+    # SAME PR share one. Swapping those two then satisfies nothing below and
+    # goes undetected, and a field the other side changed on the first lands on
+    # the second. pr-set.json has never held a duplicate and the lint does not
+    # forbid one, so refuse rather than rely on that holding.
+    dupes = {k for k in bid if bid.count(k) > 1}
+    if dupes:
+        raise Ambiguous(
+            f"pin set names {', '.join(sorted(dupes))} more than once: two "
+            "entries of one PR are indistinguishable here, so a swap between "
+            "them cannot be told from no change at all")
     for side, entries in (("ours", o), ("theirs", t)):
         for i, e in enumerate(entries):
             k = ident(e)

@@ -193,6 +193,37 @@ void f() {
 }
 """
 
+# COND anchors on the `{` that ends the line, so a trailing comment after the
+# brace stopped the arm matching at all and it left the chain silently.
+TRAILING_COMMENT = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) { // shared setup
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) { /* dedicated */
+        c();
+    }
+}
+"""
+# The condition text must survive the comment stripping, since a mangled one
+# would fail to parse as a pure disjunction and quietly stop being checked.
+COMMENTED_OUT_ARM = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    //} else if (arch == LLM_ARCH_GLM5NEXT) {
+    } else if (arch == LLM_ARCH_QWEN3NEXT) {
+        c();
+    }
+}
+"""
+
+rc, out = run(cpp=TRAILING_COMMENT)
+check("catches a dead arm despite a comment after the brace",
+      rc == 1 and "unreachable" in out, out)
+check("and reports the arm that is actually dead", ":5:" in out, out)
+rc, out = run(cpp=COMMENTED_OUT_ARM)
+check("a commented-out arm is not treated as a live one", rc == 0, out)
+
 rc, out = run(cpp=NEXT_LINE_ELSE)
 check("catches a dead arm when else if starts on the next line",
       rc == 1 and "unreachable" in out, out)

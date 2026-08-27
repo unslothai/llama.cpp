@@ -259,6 +259,18 @@ t[0]["url"] = f"{U}/999/commits/{'c' * 40}"; t[0]["required"] = False
 rc, _, err = run_objs(two, o, t)
 check("refuses an agreed swap the sides disagree about", rc == 1, err)
 
+# 24. two entries pinning two commits of the SAME PR share one identity, so a
+# swap between them looks like no change and the reorder guard never fires: a
+# field theirs changed on the first entry then lands on the second.
+dup = [{"url": f"{U}/107/commits/{'a' * 40}", "required": True},
+       {"url": f"{U}/107/commits/{'b' * 40}", "required": True}]
+o = [json.loads(json.dumps(dup[1])), json.loads(json.dumps(dup[0]))]
+t = json.loads(json.dumps(dup)); t[0]["required"] = False
+rc, pins, err = run_objs(dup, o, t)
+check("refuses a pin set that names one PR twice", rc == 1,
+      json.dumps(pins) if pins else err)
+check("names the duplicated PR", "#107" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all pin_merge tests passed")
 sys.exit(1 if FAILS else 0)
