@@ -287,6 +287,8 @@ jobs:
             # somewhere the checkout cannot take away.
             ADDITIVE_MERGE="${RUNNER_TEMP}/additive_merge.py"
             cp scripts/unsloth/additive_merge.py "$ADDITIVE_MERGE"
+            MERGE_CHECKS="${RUNNER_TEMP}/merge_checks.py"
+            cp scripts/unsloth/merge_checks.py "$MERGE_CHECKS"
             if [ "$(jq length <<<"$PRS")" != 0 ]; then
               # Merges need a merge-base, so unshallow first.
               if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
@@ -329,6 +331,25 @@ jobs:
                   fi
                 fi
               done < <(jq -r '.[] | "\(.repo) \(.number) \(.sha)"' <<<"$PRS")
+
+              # Every pin merged. Merging cleanly is not the same as merging
+              # correctly, and the two ways it goes wrong both survive a full
+              # build, so the compile legs below would not catch either:
+              #
+              #   - an architecture registered twice in a python tensor map.
+              #     Python keeps the last duplicate key silently, so the wrong
+              #     mapping is used and the model converts wrong.
+              #   - an arch arm made unreachable because an earlier fallthrough
+              #     already matches that arch. It compiles, and the model runs
+              #     without whatever that arm was meant to set up.
+              #
+              # Both were made by hand on 08-27. This is the last point where the
+              # composed tree exists before 39 build jobs run on it, so a
+              # model-affecting mis-resolution stops here rather than shipping.
+              if ! python3 "$MERGE_CHECKS" --root . ; then
+                echo "::error::the pinned PRs merged, but merge_checks.py found a resolution that is silently wrong; see the log for file and line" >&2
+                exit 1
+              fi
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
               # build number is baked below, so no git history is needed at build time.

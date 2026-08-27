@@ -110,7 +110,8 @@ jobs:
           fail=0
           for t in scripts/unsloth/test_additive_merge.py \
                    scripts/unsloth/test_pin_merge.py \
-                   scripts/unsloth/test_merge_checks.py; do
+                   scripts/unsloth/test_merge_checks.py \
+                   scripts/unsloth/test_sync_deletes.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
             echo "::endgroup::"
