@@ -2644,6 +2644,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mtmd_batch_max_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--video-fps"}, "N",
+        string_format("target video frame rate (default: %.1f)", params.video_fps),
+        [](common_params & params, const std::string & value) {
+            params.video_fps = std::stof(value);
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FPS"));
+    add_opt(common_arg(
+        {"--video-timestamp-interval"}, "N",
+        string_format("interval in milliseconds between text timestamps (default: %" PRId64 ")", params.video_timestamp_interval_ms),
+        [](common_params & params, int value) {
+            params.video_timestamp_interval_ms = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL"));
+    add_opt(common_arg(
+        {"--video-ffmpeg-dir"}, "DIR",
+        "path to the directory containing ffmpeg and ffprobe (default: search in PATH)",
+        [](common_params & params, const std::string & value) {
+            params.video_ffmpeg_bin_dir = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
     if (params.is_gen_docs || llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
@@ -2699,6 +2720,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
+        {"--tensor-read-lazy"}, "MODE",
+        "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- off: always keep them resident",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
+            else if (value == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
+            else if (value == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
@@ -4111,6 +4145,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-synth-len"}, "L",
+        "target mean synthetic acceptance length, including the target token (benchmarking only)",
+        [](common_params & params, const std::string & value) {
+            const std::string text = string_strip(value);
+            size_t pos = 0;
+            const double length = std::stod(text, &pos);
+            if (pos != text.size() || length == -1.0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.synth_len = length;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_LEN"));
+    add_opt(common_arg(
+        {"--spec-synth-rates"}, "P0,P1,...",
+        "comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)",
+        [](common_params & params, const std::string & value) {
+            const auto values = string_split<std::string>(value, ',');
+            std::vector<double> rates;
+            rates.reserve(values.size());
+            for (const auto & raw : values) {
+                const std::string text = string_strip(raw);
+                size_t pos = 0;
+                const double rate = std::stod(text, &pos);
+                if (pos != text.size()) {
+                    throw std::invalid_argument("invalid value");
+                }
+                rates.push_back(rate);
+            }
+            params.speculative.synth_rates = std::move(rates);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
