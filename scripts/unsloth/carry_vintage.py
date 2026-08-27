@@ -64,7 +64,14 @@ def main() -> int:
     head = git("rev-parse", a.pr_ref)
     fork = git("merge-base", head, a.base)
     files = [f for f in git("diff", "--name-only", fork, head).split("\n") if f]
-    history = git("rev-list", f"--max-count={a.max_commits}", head).split("\n")
+    # fork..head, not head: `--max-count` caps the output, it does not bound
+    # the walk, so a bare `head` runs straight past the fork point into the
+    # base branch. A file our carry deliberately holds at the BASE version
+    # then matches a pre-fork commit and is called SUPERSEDED, and the summary
+    # says rebuilding from the PR head is equivalent -- it is not, it re-adds
+    # what the carry dropped. Only commits of the PR itself are vintages.
+    history = [c for c in git("rev-list", f"--max-count={a.max_commits}",
+                              f"{fork}..{head}").split("\n") if c]
 
     superseded, diverged, absent = [], [], []
     for path in files:

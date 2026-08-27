@@ -28,6 +28,14 @@ release just as effectively as a bad merge:
     chain is skipped. With that restriction the verdict follows from the code:
     matching that arch always takes the earlier branch.
 
+  - The unreachable-arm check reads one physical line, so a condition split
+    across lines is skipped rather than analysed. Checked against the whole of
+    src/: a line-joining variant finds exactly the same zero findings, because
+    every multiline arch condition there is a standalone `if` with no `else if`
+    chain below it. Widening the regex would add false-positive surface on the
+    release path and buy nothing today, so it stays narrow and this is recorded
+    as a known limitation rather than fixed.
+
   - There is deliberately NO duplicate-C++-definition check. The obvious version
     keys on function name and flags legitimate overloads: it reported
     `llama_model_base::create_tensor`, which is two different signatures. A real

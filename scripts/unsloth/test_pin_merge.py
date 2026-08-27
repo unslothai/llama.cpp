@@ -104,6 +104,51 @@ r = subprocess.run([sys.executable, str(SCRIPT), str(d / "base.json"), str(d / "
 ok = r.returncode == 0 and all(e.get("required") is False for e in json.loads(r.stdout)["prs"])
 check("object-form entries keep their other fields", ok, r.stdout[:200] + r.stderr)
 
+
+def run_objs(base, ours, theirs):
+    d = Path(tempfile.mkdtemp(prefix="pm_"))
+    paths = []
+    for name, entries in (("base", base), ("ours", ours), ("theirs", theirs)):
+        p = d / f"{name}.json"
+        p.write_text(json.dumps({"prs": entries}, indent=2))
+        paths.append(str(p))
+    r = subprocess.run([sys.executable, str(SCRIPT), *paths, "--stdout"],
+                       capture_output=True, text=True)
+    return r.returncode, (json.loads(r.stdout)["prs"] if r.returncode == 0 else None), r.stderr.strip()
+
+
+# 8. theirs flips `required` on one entry while ours repins a DIFFERENT one.
+# Comparing only urls makes theirs' flip invisible, and the result is rebuilt
+# from ours, so the flip is silently dropped by a merge that reports success.
+objs = [{"url": u, "required": True} for u in BASE_PINS]
+o = json.loads(json.dumps(objs)); o[5]["url"] = sub(BASE_PINS, 5, "e" * 40)[5]
+t = json.loads(json.dumps(objs)); t[1]["required"] = False
+rc, pins, err = run_objs(objs, o, t)
+check("keeps theirs' non-url field change on an entry ours did not touch",
+      rc == 0 and pins is not None and pins[1]["required"] is False, err or json.dumps(pins))
+check("keeps ours' repin alongside theirs' field change",
+      rc == 0 and pins is not None and pins[5]["url"] == o[5]["url"], err)
+
+# 9. both sides touch the SAME entry, but different fields: still mergeable.
+o = json.loads(json.dumps(objs)); o[3]["url"] = sub(BASE_PINS, 3, "f" * 40)[3]
+t = json.loads(json.dumps(objs)); t[3]["required"] = False
+rc, pins, err = run_objs(objs, o, t)
+check("merges a repin and a field change on the same entry",
+      rc == 0 and pins is not None
+      and pins[3]["url"] == o[3]["url"] and pins[3]["required"] is False, err)
+
+# 10. both sides set the same field to different values: still refused.
+o = json.loads(json.dumps(objs)); o[2]["required"] = False
+t = json.loads(json.dumps(objs)); t[2]["required"] = "maybe"
+rc, _, err = run_objs(objs, o, t)
+check("refuses a two-sided change to the same field", rc == 1, err)
+
+# 11. --help must not crash: argparse %-formats help strings, and the driver
+# placeholders %O/%A/%B are literal percents that have to be escaped.
+r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True)
+check("--help does not crash on the %O/%A/%B placeholders",
+      r.returncode == 0 and "%O" in r.stdout, (r.stderr or r.stdout)[-200:])
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all pin_merge tests passed")
 sys.exit(1 if FAILS else 0)

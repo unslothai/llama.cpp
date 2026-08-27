@@ -41,36 +41,70 @@ class Ambiguous(Exception):
     """A pin set difference this script is not allowed to decide."""
 
 
+MISSING = object()
+
+
 def pins(doc: dict) -> list[str]:
     """The pin URLs, in order. Entries are a bare string or {url, required}."""
     return [p if isinstance(p, str) else p["url"] for p in doc["prs"]]
 
 
+def fields(entry: str | dict) -> dict:
+    """An entry in dict form. A bare url string is just {"url": url}."""
+    return {"url": entry} if isinstance(entry, str) else dict(entry)
+
+
+def merge_entry(i: int, b, o, t):
+    """Three-way merge one pin ENTRY, not just its url.
+
+    Comparing whole entries matters: an entry carries `required` as well as
+    `url`, and comparing only urls makes a `required` flip on one side look
+    like "no change", so rebuilding the list from ours drops it silently.
+    """
+    if o == t:
+        return o                       # same on both sides, including untouched
+    if o == b:
+        return t                       # only theirs touched this entry
+    if t == b:
+        return o                       # only ours touched this entry
+    # Both sides touched it. Merge field-wise, so a repin on one side and a
+    # flag change on the other both survive, and refuse only the real clash.
+    bd, od, td = fields(b), fields(o), fields(t)
+    out: dict = {}
+    for k in list(od) + [k for k in td if k not in od] + \
+             [k for k in bd if k not in od and k not in td]:
+        bv, ov, tv = bd.get(k, MISSING), od.get(k, MISSING), td.get(k, MISSING)
+        if ov == tv:
+            v = ov
+        elif ov == bv:
+            v = tv
+        elif tv == bv:
+            v = ov
+        else:
+            raise Ambiguous(f"pin {i} field {k!r} changed differently on both "
+                            f"sides:\n  ours:   {ov}\n  theirs: {tv}")
+        if v is not MISSING:
+            out[k] = v
+    if "url" not in out:
+        raise Ambiguous(f"pin {i} lost its url")
+    # Keep the bare-string form when nothing but the url is present, so the
+    # file's shape is not rewritten by merging it.
+    return out["url"] if list(out) == ["url"] else out
+
+
 def merge_pins(base: dict, ours: dict, theirs: dict) -> dict:
-    b, o, t = pins(base), pins(ours), pins(theirs)
+    b, o, t = base["prs"], ours["prs"], theirs["prs"]
     if not len(b) == len(o) == len(t):
         raise Ambiguous(
             f"pin count differs (base={len(b)} ours={len(o)} theirs={len(t)}); "
             "a pin was added or removed, and placing it is an ordering decision"
         )
-    merged = []
-    for i, (bx, ox, tx) in enumerate(zip(b, o, t)):
-        if ox == tx:
-            merged.append(ox)          # same on both sides, including untouched
-        elif ox == bx:
-            merged.append(tx)          # only theirs moved this pin
-        elif tx == bx:
-            merged.append(ox)          # only ours moved this pin
-        else:
-            raise Ambiguous(f"pin {i} was repinned differently on both sides:\n"
-                            f"  ours:   {ox}\n  theirs: {tx}")
+    merged = [merge_entry(i, bx, ox, tx)
+              for i, (bx, ox, tx) in enumerate(zip(b, o, t))]
     # Keep ours' surrounding document (comments, schema fields) and swap the
     # list, so nothing outside .prs is silently rewritten by this script.
     out = json.loads(json.dumps(ours))
-    out["prs"] = [
-        p if isinstance(src, str) else {**src, "url": p}
-        for p, src in zip(merged, ours["prs"])
-    ]
+    out["prs"] = merged
     return out
 
 
@@ -81,9 +115,10 @@ def load(path: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("base", help="%O, the merge base")
-    ap.add_argument("ours", help="%A, our version; the result is written here")
-    ap.add_argument("theirs", help="%B, their version")
+    # argparse %-formats help strings, so a literal percent must be doubled.
+    ap.add_argument("base", help="%%O, the merge base")
+    ap.add_argument("ours", help="%%A, our version; the result is written here")
+    ap.add_argument("theirs", help="%%B, their version")
     ap.add_argument("--stdout", action="store_true",
                     help="print the result instead of writing over `ours`")
     ap.add_argument("--report", metavar="PATH", help="write a JSON summary here")
