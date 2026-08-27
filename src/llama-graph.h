@@ -1372,7 +1372,12 @@ struct llm_graph_context {
     // always-selected trailing pool. `cand_mask` is the reference's candidate
     // set and is what makes an over-budget selection harmless: ggml_top_k
     // returns a full budget of pool ordinals even when fewer pools carry a
-    // finite score, which during prefill is the normal state
+    // finite score, which during prefill is the normal state.
+    //
+    // Both masks may be f16 or f32, and build_inp_kpool allocates f16: the only
+    // values either holds are 0.0f and -INFINITY, both exact in f16. The combined
+    // mask inherits their type, which the KQ mask then adds into whatever its own
+    // type is
     ggml_tensor * build_attn_sparse(
             llm_graph_input_attn_k * inp,
             ggml_tensor * wo,
@@ -1385,8 +1390,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,     // [n_head_q]
             ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
             ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
-            ggml_tensor * sel_mask,  // F32 [n_kv, n_batch, 1, n_stream]
-            ggml_tensor * cand_mask, // F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
                   float   kq_scale,
                     int   il) const;
 
