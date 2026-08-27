@@ -97,16 +97,21 @@ check("a file at an older PR commit is superseded at that vintage",
 check("a real divergence still forces a merge",
       "has to merge" in r.stdout, r.stdout[-300:])
 
-# With the deliberately dropped file removed from the picture, everything the
-# PR touched really is superseded and the rebuild advice is correct.
+# With the deliberately dropped file removed from the picture, nothing diverges
+# any more. edited.txt is still at an older vintage than the PR head, though, so
+# the advice stays qualified: we never edited that file, but a rebuild moves it
+# to head, and only a person knows whether the carry meant to hold it.
 git(d, "checkout", "-q", "carry")
 write(d, "dropped.txt", "upstream v1\n")
 git(d, "commit", "-qam", "take it after all")
 carry2 = git(d, "rev-parse", "HEAD")
 r2 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry2, "--pr-ref", head,
                      "--base", base], cwd=d, capture_output=True, text=True)
-check("still recommends a rebuild when nothing diverges",
-      r2.returncode == 0 and "Nothing diverges" in r2.stdout, r2.stdout[-300:])
+check("nothing diverges once the dropped file is taken",
+      r2.returncode == 0 and "has to merge" not in r2.stdout, r2.stdout[-300:])
+check("an older vintage still qualifies the advice",
+      "OLDER vintage" in r2.stdout and "Nothing diverges" not in r2.stdout,
+      r2.stdout[-300:])
 
 # A carry that deliberately OMITS a file the PR head still has. Nothing
 # diverges, every file the carry does have is superseded, and the naive answer
@@ -352,6 +357,45 @@ check("a mode-only difference is not a vintage match",
       "tool.sh" in out6["diverged"], json.dumps(out6, indent=1))
 check("a mode-only difference withholds the rebuild advice",
       "Nothing diverges" not in r8.stdout, r8.stdout[-400:])
+
+# A carry holding a file at an older commit of the PR. Nothing diverges, so the
+# advice used to be an unqualified "rebuilding is equivalent" -- but a rebuild
+# moves that file to head, and the carry may be holding the older vintage on
+# purpose, which is a decision this script cannot see.
+def older_vintage_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    write(d, "f.txt", "base\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    git(d, "checkout", "-q", "-b", "pr")
+    write(d, "f.txt", "upstream v1\n")
+    git(d, "commit", "-qam", "pr c1")
+    write(d, "f.txt", "upstream v2\n")
+    git(d, "commit", "-qam", "pr c2")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry stopped at v1.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "f.txt", "upstream v1\n")
+    git(d, "commit", "-qam", "carry holds v1")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d7, base7, head7, carry8 = older_vintage_fixture()
+r9 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry8, "--pr-ref", head7,
+                     "--base", base7], cwd=d7, capture_output=True, text=True)
+check("runs clean on an older-vintage carry", r9.returncode == 0, r9.stderr)
+check("an older vintage is still recognised as superseded",
+      "SUPERSEDED" in r9.stdout, r9.stdout[-400:])
+check("an older vintage withholds the unqualified rebuild advice",
+      "Nothing diverges" not in r9.stdout, r9.stdout[-400:])
+check("and says a rebuild would move it to head",
+      "OLDER vintage" in r9.stdout, r9.stdout[-400:])
 
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")

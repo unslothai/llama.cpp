@@ -168,7 +168,16 @@ def main() -> int:
         print(f"{len(carry_only)} file(s) the carry changed are outside the "
               "PR entirely. Rebuilding from the PR head would drop them, so it "
               "is NOT equivalent to merging; carry each one across deliberately.")
-    if not diverged and not omitted and not carry_only:
+    # Matching an older commit of the PR proves only that we never edited the
+    # file, not that we want the newest one: the carry may be holding that
+    # vintage on purpose, which this cannot see. Rebuilding moves it to head, so
+    # the unqualified "nothing is lost" below has to stand down and say so.
+    older = [e for e in superseded if not e["current"]]
+    if older:
+        print(f"{len(older)} file(s) sit at an OLDER vintage than the PR head. "
+              "We never edited them, but a rebuild still moves them to head; "
+              "confirm no carry is holding one of them deliberately.")
+    if not diverged and not omitted and not carry_only and not older:
         print("Nothing diverges. Rebuilding the carry from the PR head is "
               "equivalent to merging it, without the conflicts.")
 

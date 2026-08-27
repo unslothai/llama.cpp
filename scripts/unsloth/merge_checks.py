@@ -155,6 +155,15 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
         if c and len(c) > 1:
             done.append(c)
 
+    # A chain's closing brace and its `else if` are often on separate lines,
+    # which llama.cpp does in src/llama-quant.cpp:461 among others. Closing the
+    # chain the moment the brace line dedents would end it one line before the
+    # arm that continues it, and the duplicate arch arm after it would then be
+    # a fresh chain with nothing taken yet, so the gate passes it. Ending a
+    # chain is therefore deferred one line: the next line either continues it,
+    # or it really is over. Blank lines do not decide either way.
+    pending: set[int] = set()
+
     depth = 0
     for i, (line, cline) in enumerate(zip(raw, clean)):
         after, lo = _depths(cline, depth)
@@ -167,11 +176,17 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
         # to; a plain `if` opens one at the depth it starts from.
         cont = bool(m) and (stripped.startswith("}") or stripped.startswith("else"))
         key = lo if cont else depth
-        # Any chain whose closing brace this line just passed is over, except
-        # the one this very line continues.
+        if stripped:
+            if cont:
+                pending.discard(key)       # this line continues it after all
+            for k in sorted(pending, reverse=True):
+                flush(k)
+            pending.clear()
+        # Any chain whose closing brace this line just passed is over, unless
+        # the next line turns out to continue it.
         for k in [k for k in sorted(open_chains, reverse=True) if k >= lo]:
             if not (cont and k == key):
-                flush(k)
+                pending.add(k)
         if m:
             cond = m.group(1) or m.group(2) or ""
             if cont and key in open_chains:
@@ -179,6 +194,10 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
             else:
                 flush(key)
                 open_chains[key] = [(i + 1, cond)]
+            # A line that both dedents and opens a chain at the same key would
+            # otherwise leave that key pending and flush the chain it just
+            # opened on the next line.
+            pending.discard(key)
         depth = after
     for k in sorted(open_chains, reverse=True):
         flush(k)

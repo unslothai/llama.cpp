@@ -149,6 +149,59 @@ rc, out = run(cpp=BRACES_IN_LITERALS)
 check("still analyses a chain after braces in a string or comment",
       rc == 1 and "unreachable" in out, out)
 
+# llama.cpp puts `else if` on its own line as often as not, src/llama-quant.cpp
+# among them. Ending the chain on the brace line loses the arm that follows, so
+# the duplicate arch started a fresh chain with nothing taken and passed.
+NEXT_LINE_ELSE = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    }
+    else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# Same, with a blank line in between: still one chain.
+NEXT_LINE_ELSE_BLANK = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    }
+
+    else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# The other direction, which deferring the close could break: a chain that
+# really has ended, followed by an unrelated chain at the same depth. Joining
+# them reports a reachable arm as dead and blocks a release on good code.
+CLOSED_THEN_NEW = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else {
+        b();
+    }
+    g();
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    } else if (arch == LLM_ARCH_QWEN3NEXT) {
+        d();
+    }
+}
+"""
+
+rc, out = run(cpp=NEXT_LINE_ELSE)
+check("catches a dead arm when else if starts on the next line",
+      rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=NEXT_LINE_ELSE_BLANK)
+check("a blank line between } and else does not end the chain",
+      rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=CLOSED_THEN_NEW)
+check("a genuinely closed chain does not absorb the next one", rc == 0, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all merge_checks tests passed")
 sys.exit(1 if FAILS else 0)
