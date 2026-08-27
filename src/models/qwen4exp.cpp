@@ -33,7 +33,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
-    std::fill(hparams.is_ple_impl.begin(), hparams.is_ple_impl.end(), 0);
+    hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
 
     uint32_t n_ple = 0;
@@ -43,7 +43,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
         for (uint32_t il : ple_layers) {
             GGML_ASSERT(il < hparams.n_layer_all);
-            hparams.is_ple_impl[il] = 1;
+            hparams.is_ple_impl.set(il);
         }
 
         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
@@ -60,8 +60,19 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_head_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_head_vocab_sizes);
+
+        // the file writes the head ranges as uint64 arrays, so read them at that width and
+        // narrow; hparams keeps them at the int32 width the row gather actually uses
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            GGML_ASSERT(head_offsets[h] + head_vocab_sizes[h] <= INT32_MAX &&
+                        "PLE head range does not fit the int32 row index");
+            hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+            hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+        }
     }
 
     // linear attention everywhere except every full_attention_interval-th layer
@@ -730,9 +741,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    // offset 0: delta-net history first, PLE history (if any) after it
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, 0, il);
+            conv_kernel_size - 1, conv_channels, il);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -945,39 +955,40 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // the table is far too big to offload, so it is gathered straight out of the mapping: one
+    // fault per row, 16 per token, no two of them on the same page. left to the get_rows those
+    // faults happen one at a time; queued here they are in flight before the graph even runs.
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
-// Read one conv history from the recurrent row at row_offset and write the new tail back.
-// The shared build_conv_state cannot do this: the row holds the delta-net history and the PLE one.
+// Read a conv history out of its own recurrent row and write the new tail back.
+// The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int64_t              row_offset,
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
 
     const int64_t n_seqs    = ubatch.n_seqs;
-    const int64_t row_total = hparams.n_embd_r();
+    const int64_t row_total = conv_states_all->ne[0];
 
-    // the gather needs the whole row, then this convolution takes its slice
-    auto it = rs_rows.find(il);
+    // the row is exactly this convolution's state, so the gather is reused as a whole
+    GGML_ASSERT(state_cols * channels == row_total);
+
+    auto it = rs_rows.find(conv_states_all);
     if (it == rs_rows.end()) {
-        it = rs_rows.emplace(il, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
 
-    const size_t esz = ggml_element_size(rows);
-
-    ggml_tensor * state = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, rows, state_cols * channels, n_seqs,
-                    rows->nb[1], row_offset * esz));
-    state = ggml_reshape_3d(ctx0, state, state_cols, channels, n_seqs);
+    ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
@@ -993,7 +1004,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
             state_cols * channels, n_seqs,
             conv_states_all->nb[1],
-            kv_head * row_size + row_offset * ggml_element_size(conv_states_all));
+            kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
@@ -1073,10 +1084,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
-    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_r_l(il),
+    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim,
-            hparams.n_embd_r() - hparams.ple_conv_state(), il);
+            hist, hc_dim, il);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {

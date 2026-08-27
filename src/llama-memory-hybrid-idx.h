@@ -78,6 +78,11 @@ public:
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
 private:
+    // forget seq_id (or, for seq_id < 0, everything) in every cache at once, so that a restore
+    // that failed partway cannot leave the indexer cache holding cells the attention cache does
+    // not. seq_id < 0 drops the whole context, as the caches themselves do on a failed restore.
+    void state_drop(llama_seq_id seq_id);
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
@@ -121,7 +126,7 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and for the full and update contexts, which build no sparse graph
+    // nullptr with no indexer, and for the update context, which builds no sparse graph
     const llama_kv_cache_context * get_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
@@ -143,7 +148,7 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch context
+    // null unless the model has an indexer and this is a batch or full context
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
