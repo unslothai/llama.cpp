@@ -170,6 +170,12 @@ jobs:
           #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
           #    /usr/local/bin, so PATH-symlinked ccache misses CUDA TUs --
           #    setting the launcher explicitly caches nvcc too.
+          # LLAMA_FATAL_WARNINGS below is -Werror. The arm64 image compiles with
+          # clang-19 against GCC 12's libstdc++, where std::stable_sort still
+          # reaches the deprecated get_temporary_buffer; GCC buries that in a
+          # system header, clang reports it at our instantiation. That failed
+          # this leg on 08-27 over a deprecation in code we do not own, so that
+          # one diagnostic is off. Every other warning stays fatal.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_NATIVE=OFF \
@@ -179,6 +185,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_CUDA_CUB_3DOT2=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=ON \
