@@ -91,8 +91,19 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.dsv4_hc_mult > 0);
 
     // trunk residual is hc_mult streams wide (deepseek4); lm_head still sees
-    // n_embd, the streams are averaged first
-    hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+    // n_embd, the streams are averaged first -- so n_embd_out stays n_embd.
+    //
+    // deepseek4 sets this to hc_mult*n_embd, and inheriting that here was a bug:
+    // our t_embd is build_norm(build_hc_mean(...)), which is [n_embd, n_tokens],
+    // but n_embd_out() would report 4*n_embd, so llama-context.cpp reads
+    // n_outputs*n_embd_out floats out of a tensor holding a quarter of that.
+    // The assert there sizes the DESTINATION, so nothing catches the short SOURCE.
+    // Only --embeddings / llama_get_embeddings* reach it, which is why plain
+    // generation never showed it.
+    //
+    // deepseek4 needs the wide value to size its MTP `h` input; when our NextN
+    // graph starts consuming it, give MTP its own width rather than widening this.
+    hparams.n_embd_out_impl = 0;
 
     // MoE
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
