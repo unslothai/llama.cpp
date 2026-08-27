@@ -52,10 +52,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // the indexer cache is a side buffer addressed cell-for-cell by the attention
+        // cache: it must track the attention cache's cells exactly or QSA top-k reads
+        // the wrong cells. sharing the attention cache's cell metadata (v_cells_impl)
+        // via `other` makes the two agree by construction -- the indexer keeps its own
+        // K/V tensors but sees the same positions/sequences/used-set as attention, so
+        // used_max_p1 and hence n_kv can never drift apart. seq ops on the indexer
+        // become no-ops (the shared cells are managed by the attention cache).
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            get_mem_attn(), filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
