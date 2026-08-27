@@ -107,6 +107,7 @@ jobs:
                      ../scripts/unsloth/pr-set.json)
 
           PROBLEMS=""
+          MERGED=""
           while read -r url REQUIRED; do
             SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
             NUM="$(sed -E 's|.*/pull/([0-9]+)/commits/.*|\1|' <<<"$url")"
@@ -130,6 +131,7 @@ jobs:
                  -c merge.conflictStyle=diff3 \
                  merge --no-ff --no-edit -m "probe ${SRC}#${NUM}" "$SHA" >/dev/null 2>&1; then
               echo "ok ${SRC}#${NUM}"
+              MERGED=1
               continue
             fi
             # Mirror resolve: a pure add/add is what the nightly will merge
@@ -139,6 +141,7 @@ jobs:
                  && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
               git -c user.name=preflight -c user.email=preflight@local commit -q --no-edit
               echo "ok ${SRC}#${NUM} (additive resolve)"
+              MERGED=1
               continue
             fi
             FILES="$(git diff --name-only --diff-filter=U | sed 's/^/  /')"
@@ -153,7 +156,8 @@ jobs:
                           | "\(.url)\t\(if .required == null then true else .required end)"' \
                      ../scripts/unsloth/pr-set.json | tr '\t' ' ')
 
-          if [ -z "$PROBLEMS" ]; then
+          # Only when a pin actually merged. With no pins, or only optional closed ones, this tree is pristine upstream, and a finding there is not a pin problem to alert on. The nightly gates the same check on MERGED_PINS.
+          if [ -z "$PROBLEMS" ] && [ -n "$MERGED" ]; then
             # Merging cleanly is not the same as merging correctly. Two mistakes
             # made on 08-27 compiled fine and would have shipped: a tensor-map key
             # defined twice, which Python resolves silently by keeping the last,
