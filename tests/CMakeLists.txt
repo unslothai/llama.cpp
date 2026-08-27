@@ -237,6 +237,38 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    llama_build(test-state-multi-seq.cpp)
+
+    llama_test(
+        test-state-multi-seq
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-state-multi-seq PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-state-multi-seq
+        NAME test-state-multi-seq-qwen4exp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-state-multi-seq-qwen4exp PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_build(test-state-idx-faults.cpp)
+
+    llama_test(
+        test-state-idx-faults
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-state-idx-faults PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
