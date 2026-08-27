@@ -2,8 +2,10 @@
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
+#    ifndef GGML_USE_HIP // CUB comes from hipCUB via common.cuh on HIP
 #    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+#    endif
+#    if !defined(GGML_USE_HIP) && (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
 #        define CUB_TOP_K_AVAILABLE
 #        include <cuda/iterator>
 using namespace cub;

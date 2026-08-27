@@ -107,9 +107,22 @@
 #define GGML_CUDA_CC_IS_QY2(cc)      (cc >= GGML_CUDA_CC_QY2 && cc < GGML_CUDA_CC_PH1)
 #define GGML_CUDA_CC_IS_PH1(cc)      (cc >= GGML_CUDA_CC_PH1)
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#if (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070) || defined(GGML_USE_HIP)
 #    define GGML_CUDA_USE_CUB
-#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#endif  // (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070) || defined(GGML_USE_HIP)
+
+#ifdef GGML_USE_HIP
+// On HIP builds CUB comes from hipCUB: the primitives live in namespace hipcub and
+// there is no <cub/cub.cuh> to include, so alias the namespace and map the few CUDA
+// stream-capture names the GGML_CUDA_USE_CUB code paths use onto the HIP ones.
+#    include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+using cudaStreamCaptureStatus             = hipStreamCaptureStatus;
+constexpr auto cudaStreamCaptureStatusNone = hipStreamCaptureStatusNone;
+inline cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus * status) {
+    return hipStreamIsCapturing(stream, status);
+}
+#endif // GGML_USE_HIP
 
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
