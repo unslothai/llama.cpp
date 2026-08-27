@@ -972,7 +972,12 @@ jobs:
   # assets match whichever run wrote them.
   reclaim:
     name: Reclaim artifact storage
-    needs: [resolve, assemble]
+    # Every build leg, not just assemble. assemble needs only resolve, so one
+    # failing leg fails it immediately while slower legs are still building, and
+    # with always() this job then deleted the app-source-* artifact out from under
+    # them. On 08-27 one arm64 CPU failure became ten: nine ROCm legs died on
+    # "Artifact not found" seconds later, which reads as a ROCm fault and is not.
+    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     # always(), so a run that publishes NOTHING still cleans up after itself.
     # Gating this on `published` leaked every non-publishing run's bundles: a
     # workflow_dispatch defaults to publish:false, and a cancelled run never
