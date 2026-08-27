@@ -243,6 +243,42 @@ void f() {
 }
 """
 
+# The other ordering. Blanking raw strings before comments let an `R"(` written
+# inside a comment open a literal that ran to the next `)"`, swallowing the
+# duplicate arm in between. Neither order fixes this, which is why the scan is
+# positional: whichever construct starts first wins, and here that is the
+# comment.
+RAW_INSIDE_COMMENT = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        // see R"( for the delimiter rules
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        const char * s = R"(text)";
+        c();
+    }
+}
+"""
+# An R glued to an identifier is part of it, not a raw-string prefix. Reading
+# CHAR"( as a literal would blank the rest of the chain.
+IDENT_ENDING_IN_R = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        int n = FOOR;
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+
+rc, out = run(cpp=RAW_INSIDE_COMMENT)
+check("an R\"( inside a comment does not open a raw string",
+      rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=IDENT_ENDING_IN_R)
+check("an identifier ending in R is not a raw-string prefix",
+      rc == 1 and "unreachable" in out, out)
+
 rc, out = run(cpp=RAW_STRING)
 check("a brace inside a raw string does not close the chain",
       rc == 1 and "unreachable" in out, out)

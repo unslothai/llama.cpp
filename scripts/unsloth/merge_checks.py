@@ -69,15 +69,8 @@ from pathlib import Path
 ARCH = re.compile(r"arch == (LLM_ARCH_\w+)")
 COND = re.compile(r"^\s*(?:\}\s*)?else if \((.*)\)\s*\{\s*$|^\s*if \((.*)\)\s*\{\s*$")
 PURE_TERM = re.compile(r"arch == LLM_ARCH_\w+")
-# Blanked before braces are counted, so a `{` in a comment or a chat template
-# string does not shift the depth for everything after it.
-_BLOCK = re.compile(r"/\*.*?\*/", re.S)
-_LINE = re.compile(r"//.*")
-_STR = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
-# R"delim(...)delim" ends only at its own delimiter, so it may hold quotes and
-# braces that _STR would misread. Blanked first, and before comments, because a
-# raw string full of `//` is ordinary and a comment holding `R"(` is not.
-_RAW = re.compile(r'R"([^()\\ \t\n]{0,16})\(.*?\)\1"', re.S)
+# Encoding prefixes a raw string may carry: LR"(...)", u8R"(...)" and so on.
+_RAW_PREFIX = ("", "L", "u", "U", "u8")
 
 
 def duplicate_dict_keys(path: Path) -> list[str]:
@@ -106,21 +99,68 @@ def _pure_arch_disjunction(cond: str) -> bool:
     return bool(terms) and all(PURE_TERM.fullmatch(t) for t in terms)
 
 
+def _raw_delim(text: str, i: int) -> str | None:
+    """The delimiter of a raw string starting at `i`, or None if one does not.
+
+    `i` indexes the `R`. The delimiter is what sits between `R"` and `(`, and
+    the literal ends only at `)delim"`, which is the whole reason a raw string
+    cannot be found with a plain regex.
+    """
+    if not text.startswith('R"', i):
+        return None
+    j = text.find("(", i + 2)
+    if j == -1:
+        return None
+    delim = text[i + 2:j]
+    if len(delim) > 16 or any(c in ' ()\\\t\n' for c in delim):
+        return None
+    # An `R` glued to an identifier is part of that identifier, not a prefix.
+    k = i
+    while k > 0 and (text[k - 1].isalnum() or text[k - 1] == "_"):
+        k -= 1
+    return delim if text[k:i] in _RAW_PREFIX else None
+
+
 def _decommented(text: str) -> list[str]:
     """The file with comments and literals blanked, line structure preserved.
 
     Braces inside a string literal or a comment are not braces. src/ is full of
     both (llama-chat.cpp alone embeds dozens of `{` in template strings), so
     counting them raw would desynchronise the depth for the rest of the file.
+
+    Scanned once, left to right, rather than by substituting one construct at a
+    time. Order cannot fix a substitution pass: blanking raw strings first lets
+    an `R"(` written inside a comment swallow everything to the next `)"`, and
+    blanking comments first lets a `//` inside a raw string end the line. Only
+    position decides which construct is real, and a scan is what knows it.
     """
-    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
-    text = _RAW.sub(blank, text)
-    text = _BLOCK.sub(blank, text)
-    out = []
-    for line in text.split("\n"):
-        line = _STR.sub(lambda m: " " * len(m.group(0)), line)
-        out.append(_LINE.sub(lambda m: " " * len(m.group(0)), line))
-    return out
+    blank = lambda s: re.sub(r"[^\n]", " ", s)            # noqa: E731
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        delim = _raw_delim(text, i)
+        if delim is not None:
+            close = f'){delim}"'
+            k = text.find(close, i + 2 + len(delim) + 1)
+            end = n if k == -1 else k + len(close)
+        elif text.startswith("//", i):
+            k = text.find("\n", i)
+            end = n if k == -1 else k
+        elif text.startswith("/*", i):
+            k = text.find("*/", i + 2)
+            end = n if k == -1 else k + 2
+        elif text[i] in "\"'":
+            q, j = text[i], i + 1
+            while j < n and text[j] != q and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            end = min(j + 1, n)
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append(blank(text[i:end]))
+        i = end
+    return "".join(out).split("\n")
 
 
 def _depths(line: str, start: int) -> tuple[int, int]:
