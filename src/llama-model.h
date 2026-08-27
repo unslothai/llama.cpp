@@ -734,19 +734,6 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
-    // ask the kernel to start reading the rows a gather is about to take from a host-mapped tensor
-    // the faults then overlap instead of paying one NVMe latency at a time
-    //
-    // does nothing unless gather_tables() named the tensor and it really is read from a mapping
-    // for anything else this is one empty-vector test
-    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
-
-    // tensors that stay host-resident and are read by sparse row gathers, not streamed once
-    // under LLAMA_MMAP_RANDOM these get the random advice and the batched readahead of prefetch_rows()
-    //
-    // named by the model, not guessed from size: a big tensor read in full, like token_embd on CPU, still wants readahead
-    virtual std::vector<const struct ggml_tensor *> gather_tables() const { return {}; }
-
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

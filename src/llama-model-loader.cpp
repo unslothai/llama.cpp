@@ -1354,8 +1354,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (size_t i = 0; i < files.size(); ++i) {
-            const auto & file = files[i];
+        for (const auto & file : files) {
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1367,16 +1366,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const auto no_prefetch = mmap_no_prefetch.find((uint16_t) i);
-
-            // the eager pull-in would read a whole gather table to fill pages the gathers barely touch
-            // skip it for this file and ask for the rest, so streamed tensors keep their readahead
-            const bool split_prefetch = prefetch && !is_numa && no_prefetch != mmap_no_prefetch.end();
-
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch && !split_prefetch ? -1 : 0, is_numa);
-            if (split_prefetch) {
-                mapping->prefetch_except(no_prefetch->second);
-            }
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

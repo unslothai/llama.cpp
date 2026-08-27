@@ -974,10 +974,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    // the table is too big to offload, so it is gathered from the mapping: 16 faults per token, no two on the same page
-    // get_rows would take them one at a time; queued here they are in flight before the graph runs
-    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
-
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
