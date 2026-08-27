@@ -1149,9 +1149,16 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
-    // set once loading is done, if any mapping was advised random. lets prefetch_rows() bail out
-    // without walking the mappings, which is the only cost the feature has when it is off.
-    bool mappings_random = false;
+    // gather tables that really came out of a mapping, resolved from gather_tables() during load.
+    // empty unless the user opted in, which is the only cost the feature has when it is off.
+    struct gather_range {
+        const ggml_tensor * tensor;
+        uint16_t            idx;  // source file, and so the mapping
+        size_t              offs; // byte offset into that file
+        size_t              len;
+    };
+
+    std::vector<gather_range> gather_ranges;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1683,6 +1690,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // kept local until the mappings exist: pimpl->gather_ranges must only ever hold ranges that
+    // were checked against a live mapping, since everything downstream indexes one
+    std::vector<impl::gather_range> nominated;
+    if (llama_mmap_random_mode_get() != LLAMA_MMAP_RANDOM_OFF) {
+        for (const ggml_tensor * t : gather_tables()) {
+            const auto * w = t ? ml.get_weight(ggml_get_name(t)) : nullptr;
+            if (w) {
+                nominated.push_back({ t, w->idx, w->offs, ggml_nbytes(w->tensor) });
+                ml.mmap_no_prefetch[w->idx].emplace_back(w->offs, ggml_nbytes(w->tensor));
+            }
+        }
+        for (auto & [_, ranges] : ml.mmap_no_prefetch) {
+            std::sort(ranges.begin(), ranges.end());
+        }
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1817,17 +1840,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
 
-        // only now that every tensor has been read is it safe to say the file is read randomly:
+        // only now that every tensor has been read is it safe to say a range is read randomly:
         // the load itself is a sequential pass and wants the readahead it has been getting.
         const llama_mmap_random_mode random_mode = llama_mmap_random_mode_get();
-        if (random_mode != LLAMA_MMAP_RANDOM_OFF) {
-            for (auto & mapping : pimpl->mappings) {
-                mapping->advise_random(random_mode == LLAMA_MMAP_RANDOM_DROP);
-            }
-            pimpl->mappings_random = !pimpl->mappings.empty();
 
-            LLAMA_LOG_INFO("%s: LLAMA_MMAP_RANDOM: advised %zu mapping(s) for random access%s\n",
-                    __func__, pimpl->mappings.size(),
+        // a nominated tensor that did not end up served from its mapping was offloaded or copied
+        // into a buffer, and nothing will gather out of the file. drop it rather than advise it
+        for (const auto & r : nominated) {
+            if (r.idx < pimpl->mappings.size() && pimpl->mappings[r.idx]->contains(r.tensor->data, r.len)) {
+                pimpl->gather_ranges.push_back(r);
+            }
+        }
+
+        for (const auto & r : pimpl->gather_ranges) {
+            pimpl->mappings[r.idx]->advise_random_range(r.offs, r.len, random_mode == LLAMA_MMAP_RANDOM_DROP);
+
+            LLAMA_LOG_INFO("%s: LLAMA_MMAP_RANDOM: %s advised for random access, %.2f MiB%s\n",
+                    __func__, ggml_get_name(r.tensor), r.len / 1024.0 / 1024.0,
                     random_mode == LLAMA_MMAP_RANDOM_DROP ? ", dropped cached pages" : "");
         }
     }
@@ -1836,19 +1865,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
-    if (!pimpl->mappings_random || t == nullptr || t->data == nullptr || n_rows == 0) {
+    if (pimpl->gather_ranges.empty() || t == nullptr || t->data == nullptr || n_rows == 0) {
         return;
     }
     if (!llama_mmap_random_prefetch_enabled()) {
         return;
     }
 
-    // rows are addressed off the tensor, so the whole tensor has to sit in the mapping we find
-    const size_t nbytes = ggml_nbytes(t);
-
-    for (const auto & mapping : pimpl->mappings) {
-        if (mapping->is_random() && mapping->contains(t->data, nbytes)) {
-            mapping->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+    // keyed off the tensor, not off its mapping: the readahead must land where the advice did,
+    // and the mapping now holds ranges that still want the kernel's own readahead
+    for (const auto & r : pimpl->gather_ranges) {
+        if (r.tensor == t) {
+            pimpl->mappings[r.idx]->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
             return;
         }
     }
