@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+"""Report which carry files are an unmodified older copy of the upstream PR.
+
+A carry branch replays an upstream PR onto an aged base tag. When that PR moves,
+the question before every refresh is the same one: have we actually changed this
+file, or are we just holding a stale copy of theirs? Answering it by hand means
+diffing every file the PR touches and reading each hunk, which is what made the
+08-27 GLM-5-Next refresh expensive, and two of those hand answers were wrong.
+
+The mechanical answer: if our version of a file is byte-identical to the version
+at SOME commit of the upstream PR, then we never edited it, and their newer copy
+supersedes ours with nothing lost. That is a fact about blob hashes, not a
+judgement. Files we really did change match no upstream commit and are reported
+as diverged, which is correct: on 08-27 gguf-py/gguf/tensor_mapping.py did not
+match, because it genuinely carried qwen4exp additions as well.
+
+This only reports. It does not resolve, stage or write anything, because
+"upstream superseded ours" is not the same as "we want upstream's", and holding
+a deliberately older vintage is a legitimate decision this script cannot see.
+
+Use it to decide whether a refresh should merge or simply rebuild:
+
+    python3 scripts/unsloth/carry_vintage.py \\
+        --carry <carry sha> --pr-ref refs/pull/27754/head --base refs/tags/b10639
+
+When every file is SUPERSEDED, rebuilding the carry from the PR head avoids the
+merge, and its conflicts, entirely.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def git(*args: str) -> str:
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(" ".join(args) + ": " + r.stderr.strip())
+    return r.stdout.strip()
+
+
+def blob(rev: str, path: str) -> str | None:
+    r = subprocess.run(["git", "rev-parse", f"{rev}:{path}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--carry", required=True, help="carry branch commit")
+    ap.add_argument("--pr-ref", required=True, help="upstream PR head ref or sha")
+    ap.add_argument("--base", required=True, help="base tag the PR forked from")
+    ap.add_argument("--max-commits", type=int, default=60,
+                    help="how far back through the PR to look for a match")
+    ap.add_argument("--report", metavar="PATH", help="write a JSON summary here")
+    a = ap.parse_args()
+
+    head = git("rev-parse", a.pr_ref)
+    fork = git("merge-base", head, a.base)
+    files = [f for f in git("diff", "--name-only", fork, head).split("\n") if f]
+    history = git("rev-list", f"--max-count={a.max_commits}", head).split("\n")
+
+    superseded, diverged, absent = [], [], []
+    for path in files:
+        ours = blob(a.carry, path)
+        if ours is None:
+            absent.append(path)
+            continue
+        if ours == blob(head, path):
+            superseded.append({"path": path, "vintage": head, "current": True})
+            continue
+        hit = next((c for c in history if blob(c, path) == ours), None)
+        if hit:
+            superseded.append({"path": path, "vintage": hit, "current": False})
+        else:
+            diverged.append(path)
+
+    print(f"carry {a.carry[:10]} vs {a.pr_ref} ({head[:10]}), {len(files)} file(s) touched")
+    print()
+    for e in superseded:
+        note = "already at PR head" if e["current"] else f"our copy is upstream {e['vintage'][:10]}"
+        print(f"  SUPERSEDED  {e['path']}\n              {note}")
+    for p in diverged:
+        print(f"  DIVERGED    {p}\n              matches no upstream vintage; we changed it, keep it")
+    for p in absent:
+        print(f"  ABSENT      {p}\n              not in the carry")
+    print()
+    if diverged:
+        print(f"{len(diverged)} file(s) genuinely diverge. A refresh has to merge, "
+              "and those files are the only ones needing judgement.")
+    else:
+        print("Nothing diverges. Rebuilding the carry from the PR head is "
+              "equivalent to merging it, without the conflicts.")
+
+    if a.report:
+        with open(a.report, "w") as fh:
+            json.dump({"head": head, "superseded": superseded,
+                       "diverged": diverged, "absent": absent}, fh, indent=2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
