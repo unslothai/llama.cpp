@@ -33,7 +33,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
-    std::fill(hparams.is_ple_impl.begin(), hparams.is_ple_impl.end(), 0);
+    hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
 
     uint32_t n_ple = 0;
@@ -43,7 +43,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
         for (uint32_t il : ple_layers) {
             GGML_ASSERT(il < hparams.n_layer_all);
-            hparams.is_ple_impl[il] = 1;
+            hparams.is_ple_impl.set(il);
         }
 
         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
@@ -60,8 +60,19 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_head_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_head_vocab_sizes);
+
+        // the file writes the head ranges as uint64 arrays, so read them at that width and
+        // narrow; hparams keeps them at the int32 width the row gather actually uses
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            GGML_ASSERT(head_offsets[h] + head_vocab_sizes[h] <= INT32_MAX &&
+                        "PLE head range does not fit the int32 row index");
+            hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+            hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+        }
     }
 
     // linear attention everywhere except every full_attention_interval-th layer
