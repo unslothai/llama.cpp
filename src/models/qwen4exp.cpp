@@ -425,6 +425,33 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        const auto * idx = mctx->get_idx();
+        if (idx == nullptr) {
+            return false;
+        }
+
+        const int64_t n_kv     = idx->get_n_kv();
+        const int64_t n_stream = mctx->get_n_stream();
+        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
+        bool res = true;
+
+        res &= params.ubatch.n_tokens % n_stream == 0;
+
+        res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+        res &= cell_blk->ne[0]  == n_kv;
+        res &= cell_blk->ne[1]  == n_stream;
+        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+
+        return res;
+    }
+
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
@@ -935,6 +962,11 @@ public:
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+    }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
