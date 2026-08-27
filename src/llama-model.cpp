@@ -1149,6 +1149,10 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // set once loading is done, if any mapping was advised random. lets prefetch_rows() bail out
+    // without walking the mappings, which is the only cost the feature has when it is off.
+    bool mappings_random = false;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1812,9 +1816,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+
+        // only now that every tensor has been read is it safe to say the file is read randomly:
+        // the load itself is a sequential pass and wants the readahead it has been getting.
+        const llama_mmap_random_mode random_mode = llama_mmap_random_mode_get();
+        if (random_mode != LLAMA_MMAP_RANDOM_OFF) {
+            for (auto & mapping : pimpl->mappings) {
+                mapping->advise_random(random_mode == LLAMA_MMAP_RANDOM_DROP);
+            }
+            pimpl->mappings_random = !pimpl->mappings.empty();
+
+            LLAMA_LOG_INFO("%s: LLAMA_MMAP_RANDOM: advised %zu mapping(s) for random access%s\n",
+                    __func__, pimpl->mappings.size(),
+                    random_mode == LLAMA_MMAP_RANDOM_DROP ? ", dropped cached pages" : "");
+        }
     }
 
     return true;
+}
+
+void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+    if (!pimpl->mappings_random || t == nullptr || t->data == nullptr || n_rows == 0) {
+        return;
+    }
+    if (!llama_mmap_random_prefetch_enabled()) {
+        return;
+    }
+
+    // rows are addressed off the tensor, so the whole tensor has to sit in the mapping we find
+    const size_t nbytes = ggml_nbytes(t);
+
+    for (const auto & mapping : pimpl->mappings) {
+        if (mapping->is_random() && mapping->contains(t->data, nbytes)) {
+            mapping->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+            return;
+        }
+    }
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
