@@ -271,6 +271,19 @@ check("refuses a pin set that names one PR twice", rc == 1,
       json.dumps(pins) if pins else err)
 check("names the duplicated PR", "#107" in err, err)
 
+# 25. neither side has a duplicate, but the merge makes one: ours puts a new PR
+# at position 0 and theirs puts the SAME new PR at position 1. Base has it
+# nowhere, so the reorder guard sees nothing, and the driver emitted [C, C].
+two_ab = [{"url": f"{U}/107/commits/{'a' * 40}"}, {"url": f"{U}/108/commits/{'b' * 40}"}]
+c_entry = {"url": f"{U}/999/commits/{'c' * 40}"}
+o = [json.loads(json.dumps(c_entry)), json.loads(json.dumps(two_ab[1]))]
+t = [json.loads(json.dumps(two_ab[0])), json.loads(json.dumps(c_entry))]
+rc, pins, err = run_objs(two_ab, o, t)
+check("refuses a merge that would pin one PR twice", rc == 1,
+      json.dumps(pins) if pins else err)
+check("says the duplicate is in the merged set",
+      "merged pin set" in err and "#999" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all pin_merge tests passed")
 sys.exit(1 if FAILS else 0)

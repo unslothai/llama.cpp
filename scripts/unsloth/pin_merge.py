@@ -90,17 +90,6 @@ def refuse_reorder(b: list, o: list, t: list) -> None:
     status quo; guessing costs a wrong build nothing downstream can see.
     """
     bid = [ident(e) for e in b]
-    # Identity is (owner, PR number), so two entries pinning two commits of the
-    # SAME PR share one. Swapping those two then satisfies nothing below and
-    # goes undetected, and a field the other side changed on the first lands on
-    # the second. pr-set.json has never held a duplicate and the lint does not
-    # forbid one, so refuse rather than rely on that holding.
-    dupes = {k for k in bid if bid.count(k) > 1}
-    if dupes:
-        raise Ambiguous(
-            f"pin set names {', '.join(sorted(dupes))} more than once: two "
-            "entries of one PR are indistinguishable here, so a swap between "
-            "them cannot be told from no change at all")
     for side, entries in (("ours", o), ("theirs", t)):
         for i, e in enumerate(entries):
             k = ident(e)
@@ -110,6 +99,17 @@ def refuse_reorder(b: list, o: list, t: list) -> None:
                     f"{bid.index(k)}: the list was reordered, and merging "
                     "reordered entries by position would take fields from "
                     "different PRs")
+
+
+def refuse_duplicates(what: str, entries: list) -> None:
+    """Two entries of one PR are indistinguishable, so nothing can align them."""
+    ids = [ident(e) for e in entries]
+    dupes = sorted({k for k in ids if ids.count(k) > 1})
+    if dupes:
+        raise Ambiguous(
+            f"{what} names {', '.join(dupes)} more than once; two entries of "
+            "one PR cannot be told apart, so a swap between them reads as no "
+            "change and a later merge would splice their fields together")
 
 
 def merge_keys(what: str, bd: dict, od: dict, td: dict) -> dict:
@@ -182,9 +182,15 @@ def merge_pins(base: dict, ours: dict, theirs: dict) -> dict:
             f"pin count differs (base={len(b)} ours={len(o)} theirs={len(t)}); "
             "a pin was added or removed, and placing it is an ordering decision"
         )
+    # Every side, and the result. A duplicate on one input defeats the reorder
+    # guard below; a duplicate only in the RESULT is made here, by the two
+    # sides adding the same PR at different positions.
+    for what, side in (("base", b), ("ours", o), ("theirs", t)):
+        refuse_duplicates(what, side)
     refuse_reorder(b, o, t)
     merged = [merge_entry(i, bx, ox, tx)
               for i, (bx, ox, tx) in enumerate(zip(b, o, t))]
+    refuse_duplicates("the merged pin set", merged)
     # Everything outside .prs is three-way merged the same way. Rebuilding the
     # document from ours instead would silently drop a change theirs made to a
     # top-level field -- `_doc`, or any schema field added later -- and this

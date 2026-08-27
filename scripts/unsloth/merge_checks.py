@@ -74,6 +74,10 @@ PURE_TERM = re.compile(r"arch == LLM_ARCH_\w+")
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _LINE = re.compile(r"//.*")
 _STR = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+# R"delim(...)delim" ends only at its own delimiter, so it may hold quotes and
+# braces that _STR would misread. Blanked first, and before comments, because a
+# raw string full of `//` is ordinary and a comment holding `R"(` is not.
+_RAW = re.compile(r'R"([^()\\ \t\n]{0,16})\(.*?\)\1"', re.S)
 
 
 def duplicate_dict_keys(path: Path) -> list[str]:
@@ -109,7 +113,9 @@ def _decommented(text: str) -> list[str]:
     both (llama-chat.cpp alone embeds dozens of `{` in template strings), so
     counting them raw would desynchronise the depth for the rest of the file.
     """
-    text = _BLOCK.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
+    text = _RAW.sub(blank, text)
+    text = _BLOCK.sub(blank, text)
     out = []
     for line in text.split("\n"):
         line = _STR.sub(lambda m: " " * len(m.group(0)), line)

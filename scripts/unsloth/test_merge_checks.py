@@ -217,6 +217,39 @@ void f() {
 }
 """
 
+# A raw string ends only at its own delimiter, so it can hold a quote and a
+# brace that the ordinary string regex misreads. The stray `}` closed the chain
+# early and the duplicate arm after it passed as clean.
+RAW_STRING = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        const char * s = R"foo("})foo";
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# A raw string is blanked before comments, so the `//` inside one is text, not
+# the start of a comment, and the brace after it still counts.
+RAW_WITH_SLASHES = """
+void f() {
+    const char * u = R"(https://example.com/{x})";
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+
+rc, out = run(cpp=RAW_STRING)
+check("a brace inside a raw string does not close the chain",
+      rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=RAW_WITH_SLASHES)
+check("a raw string holding // is not treated as a comment",
+      rc == 1 and "unreachable" in out, out)
+
 rc, out = run(cpp=TRAILING_COMMENT)
 check("catches a dead arm despite a comment after the brace",
       rc == 1 and "unreachable" in out, out)
