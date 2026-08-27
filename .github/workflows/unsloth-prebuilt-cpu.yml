@@ -119,6 +119,7 @@ jobs:
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_RPC=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=ON \
