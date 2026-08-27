@@ -61,8 +61,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
 
-        // the file writes the head ranges as uint64 arrays, so read them at that width and
-        // narrow; hparams keeps them at the int32 width the row gather actually uses
+        // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
         std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
         std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
         ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
@@ -386,8 +385,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
-// QSA attends to a budget of whole blocks of compress_ratio tokens, each scored by one
-// mean-pooled indexer key, plus the incomplete tail. set_input resolves the cache layout.
+// QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
+// one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llm_graph_input_qsa : public llm_graph_input_i {
 public:
     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio) :
@@ -502,8 +501,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
     cb(score, "indexer_score", il);
 
-    // give every token of a block the block score; the budget is a whole number of
-    // blocks, so the top-k cut still lands on a block boundary
+    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
@@ -895,10 +893,8 @@ public:
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
-    // An image is decoded as an embeddings-only batch, so ubatch->token is null and the
-    // placeholder ids are not available. The hash must still give every position a row,
-    // because this input feeds ggml_get_rows. Stand in the configured image token id, as
-    // the reference hashes the placeholder, or EOS if the file has no such key.
+    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+    // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
     const llama_token img_tok = hp.ple_image_token_id != 0
         ? (llama_token) hp.ple_image_token_id
@@ -923,13 +919,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() has already stored the
-    // current ubatch, so predecessors within this very ubatch are covered as well
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it, and a missing predecessor
-        // (before the sequence start, or no cached cell) reads as EOS
+        // an EOS in the window resets everything at or before it
+        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
         std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
@@ -955,9 +950,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    // the table is far too big to offload, so it is gathered straight out of the mapping: one
-    // fault per row, 16 per token, no two of them on the same page. left to the get_rows those
-    // faults happen one at a time; queued here they are in flight before the graph even runs.
+    // the table is too big to offload, so it is gathered from the mapping: 16 faults per token, no two on the same page
+    // get_rows would take them one at a time; queued here they are in flight before the graph runs
     pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -1071,7 +1065,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
 
-    // Depthwise causal conv dilated by the n-gram size, as a sum of shifted copies, because
+    // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
     // ggml_conv_1d_dw is documented as unreliable:
     //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
     // The history of the earlier ubatches is prepended, so a chunked prefill matches a single-shot one.

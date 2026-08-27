@@ -1141,8 +1141,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 if (ubatch.token) {
                     ext.tok = ubatch.token[i];
                 } else if (hparams.ple_n_heads > 0) {
-                    // an embd batch has already consumed the image placeholder; store what the
-                    // reference hashes in input_ids at these positions (EOS for old GGUF files)
+                    // embd batch (multimodal input) has no token ids, need to pad it with the correct ID for PLE layers
+                    // TODO @ngxson : check if we can do the same as gemma 3n / gemma 4
                     ext.tok = hparams.ple_image_token_id != 0
                         ? (llama_token) hparams.ple_image_token_id
                         : (llama_token) hparams.ple_eos_token_id;
@@ -2149,9 +2149,8 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-    // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
-    // resets all streams at once, so doing this per stream below would throw away the streams
-    // already read and leave only the last one
+    // a whole-context restore replaces every stream, so the cache is emptied once here
+    // clear() resets all streams at once, so doing it per stream below would keep only the last one
     if (seq_id == -1) {
         clear(true);
     }
@@ -2379,8 +2378,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         if (sinfo_in) {
-            // this cache mirrors another one, so it takes that cache's restored layout rather
-            // than searching for cells of its own
+            // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
                 LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                         sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
@@ -2389,14 +2387,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             sinfo = *sinfo_in;
 
-            // the layout is addressed by cell index, so it only means the same thing in both
-            // caches while their streams line up
+            // the layout is cell indices, so it means the same in both caches only while their streams line up
             sinfo.s0 = strm;
             sinfo.s1 = strm;
             sinfo.strm[0] = strm;
 
-            // seq_rm above freed exactly the cells this sequence held. anything else in the way
-            // is a cache that had already drifted, which this restore must not paper over
+            // seq_rm above freed exactly the cells this sequence held
+            // anything else in the way is a cache that had already drifted, which this restore must not hide
             for (uint32_t i = 0; i < cell_count; ++i) {
                 const uint32_t idx = sinfo.idxs[0][i];
 
@@ -2436,8 +2433,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it
-        // restores the same count. the layout itself carries no more information here
+        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
         if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
             LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                     sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);

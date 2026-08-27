@@ -498,8 +498,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
-        // the PLE table is a model-level lookup and its conv kernel and norm are mirrored, so every
-        // device computes the whole dilated conv and needs the whole history
+        // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
         if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
@@ -1149,8 +1148,8 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
-    // gather tables that really came out of a mapping, resolved from gather_tables() during load.
-    // empty unless the user opted in, which is the only cost the feature has when it is off.
+    // gather tables that really came out of a mapping, resolved from gather_tables() during load
+    // empty unless the user opted in, which is all the feature costs when off
     struct gather_range {
         const ggml_tensor * tensor;
         uint16_t            idx;  // source file, and so the mapping
@@ -1690,8 +1689,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // kept local until the mappings exist: pimpl->gather_ranges must only ever hold ranges that
-    // were checked against a live mapping, since everything downstream indexes one
+    // kept local until the mappings exist: gather_ranges must only hold ranges checked against a live mapping
     std::vector<impl::gather_range> nominated;
     if (llama_mmap_random_mode_get() != LLAMA_MMAP_RANDOM_OFF) {
         for (const ggml_tensor * t : gather_tables()) {
@@ -1840,12 +1838,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
 
-        // only now that every tensor has been read is it safe to say a range is read randomly:
-        // the load itself is a sequential pass and wants the readahead it has been getting.
+        // only safe once every tensor is read: the load is a sequential pass and wants its readahead
         const llama_mmap_random_mode random_mode = llama_mmap_random_mode_get();
 
-        // a nominated tensor that did not end up served from its mapping was offloaded or copied
-        // into a buffer, and nothing will gather out of the file. drop it rather than advise it
+        // a named tensor not served from its mapping was offloaded or copied, so nothing gathers from the file
+        // drop it rather than advise it
         for (const auto & r : nominated) {
             if (r.idx < pimpl->mappings.size() && pimpl->mappings[r.idx]->contains(r.tensor->data, r.len)) {
                 pimpl->gather_ranges.push_back(r);
@@ -1872,8 +1869,7 @@ void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * ro
         return;
     }
 
-    // keyed off the tensor, not off its mapping: the readahead must land where the advice did,
-    // and the mapping now holds ranges that still want the kernel's own readahead
+    // keyed off the tensor, not the mapping: the readahead must land where the advice did
     for (const auto & r : pimpl->gather_ranges) {
         if (r.tensor == t) {
             pimpl->mappings[r.idx]->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);

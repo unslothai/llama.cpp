@@ -59,8 +59,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // note: this repeats llama_memory_hybrid::init_batch because the indexer cache needs the
-    //       slot infos of the attention cache, which the base context does not expose
+    // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
         balloc.split_reset();
 
@@ -111,8 +110,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer cache is addressed by the cells of the attention cache, so it takes that
-        // slot layout instead of finding its own; a separate layout can drift from it
+        // the indexer uses the attention cache's slot layout; a separate one can drift from it
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
@@ -142,8 +140,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it
-    // first and leave the other caches untouched if it does
+    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
@@ -202,8 +199,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
-    // [TAG_HYBRID_IDX_STATE] the indexer section is written last, so it is a pure suffix of the
-    // attn+recr layout: a reader that does not expect it stops early instead of misparsing it.
+    // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
@@ -214,15 +210,12 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // note: this repeats llama_memory_hybrid::state_read because the indexer cache has to be
-    //       handed the cells the attention cache restored into, and because a restore that
-    //       fails halfway has to leave all three caches in the same state
+    // note: repeats llama_memory_hybrid::state_read
+    // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
     // [TAG_HYBRID_IDX_SINFO]
-    // The indexer cache is addressed by the cells of the attention cache, so its restore adopts
-    // that layout instead of searching for cells of its own. Two independent find_slot calls
-    // agree only while nothing makes the two caches see different occupancy, and a restore is
-    // exactly the operation that can no longer promise that.
+    // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
+    // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
@@ -240,8 +233,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         }
 
     } catch (...) {
-        // a half-restored context is the one state the indexer cache cannot be brought back from
-        // by itself: the attention cache holds the restored cells and the indexer the old ones.
+        // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
         state_drop(seq_id);
 
@@ -250,8 +242,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
-    // dropped directly rather than through seq_rm, which the recurrent cache is allowed to
-    // refuse and which would then clear the other two caches and not it
+    // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
 
@@ -292,9 +283,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_st
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
     mem(mem),
-    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when
-    // this is set. without it the reserved worst case is the smaller dense graph, so ggml-alloc
-    // must grow the compute buffer on the first decode
+    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
+    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :

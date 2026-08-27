@@ -408,9 +408,8 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
-                    // the target is already a 32-block type, so there is no smaller block to demote
-                    // to; the check below turns it into F16, as a 256-block type does when its
-                    // fallback does not fit
+                    // the target is already a 32-block type, so there is no smaller block to demote to
+                    // the check below turns it into F16, as a 256-block type does when its fallback does not fit
                     return_type = target_type;
                     break;
                 }
@@ -1278,10 +1277,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                // dequantize and quantize in bands of whole rows so that the f32 staging buffer stays
-                // bounded - the whole tensor at once is hundreds of GiB for tables such as
-                // per_layer_token_embd. rows are independent and the imatrix is indexed by column, so
-                // the band boundaries cannot change any output byte.
+                // work in bands of whole rows to bound the f32 staging buffer: the whole tensor is hundreds of GiB for tables like per_layer_token_embd
+                // rows are independent and the imatrix is per column, so the band size cannot change any output byte
                 static const size_t max_band_bytes = 1024ull*1024*1024; // f32 staging cap per band
                 const int64_t nrows_per_chunk = chunk_size / n_per_row;
                 int64_t band_nrows = (int64_t) (max_band_bytes / (sizeof(float) * n_per_row));

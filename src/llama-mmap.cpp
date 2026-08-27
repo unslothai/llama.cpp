@@ -472,10 +472,8 @@ static size_t llama_mmap_page_size() {
 #endif
 }
 
-// the distinct pages the given rows fall on, as offsets into the mapping, merged into runs.
-// a row is much smaller than a page and rows repeat within a batch, so this is what turns a
-// hint per row into a hint per page. platform independent: the callers differ only in which
-// syscall they hand the result to.
+// the distinct pages the given rows fall on, as offsets into the mapping, merged into runs
+// rows are smaller than a page and repeat, so this turns one hint per row into one hint per page
 static std::vector<std::pair<size_t, size_t>> llama_mmap_row_pages(
         size_t base_off, size_t stride, size_t row_size, size_t map_size,
         const int32_t * rows, size_t n_rows, size_t page_size) {
@@ -552,19 +550,17 @@ struct llama_mmap::impl {
         mapped_fragments.emplace_back(0, file->size());
     }
 
-    // the load path asks for POSIX_FADV_SEQUENTIAL, which is right while the file is being
-    // streamed once into buffers and wrong for whatever stays host-resident afterwards: those
-    // tensors are read by sparse gathers, where readahead buys nothing and costs page cache.
-    // flipping the advice only after load, and only over the tensor, keeps everything else on
-    // the loader's behaviour.
+    // load streams the file once, so it asks for POSIX_FADV_SEQUENTIAL
+    // sparse gathers want the opposite: readahead buys nothing and costs page cache
+    // so flip the advice after load, over this range only
     void advise_random_range(size_t offset, size_t len, bool drop) {
         if (offset >= size || len == 0) {
             return;
         }
         len = std::min(len, size - offset);
 
-        // madvise rejects an unaligned start and rounds the length up, so round both out. that
-        // can take in the tail of the tensor before and the head of the one after, one page each
+        // madvise needs an aligned start and rounds the length up, so round both out
+        // this can take in one page of the neighbour on each side
         const size_t page  = llama_mmap_page_size();
         const size_t first = offset & ~(page - 1);
         const size_t last  = std::min(size, (offset + len + page - 1) & ~(page - 1));
@@ -575,8 +571,7 @@ struct llama_mmap::impl {
             if (madvise((char *) addr + first, last - first, MADV_DONTNEED)) {
                 LLAMA_LOG_WARN("warning: madvise(.., MADV_DONTNEED) failed: %s\n", strerror(errno));
             }
-            // and this frees the page cache. it takes the range and spares partial pages, so a
-            // tensor sharing the first or last page keeps its cache
+            // this frees the page cache; it spares partial pages, so a neighbour on the end page keeps its own
             if (fd_advise >= 0 && posix_fadvise(fd_advise, (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED)) {
                 LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
             }
@@ -584,8 +579,7 @@ struct llama_mmap::impl {
 #else
         GGML_UNUSED(drop);
 #endif
-        // no POSIX_FADV_RANDOM to go with this: it ignores the range and marks the whole open
-        // file, and the FMODE_RANDOM it sets is only read by the read() path, never by a fault
+        // no POSIX_FADV_RANDOM here: it marks the whole file, and its FMODE_RANDOM only affects read(), not faults
         if (posix_madvise((char *) addr + first, last - first, POSIX_MADV_RANDOM)) {
             LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n", strerror(errno));
         }
@@ -620,8 +614,7 @@ struct llama_mmap::impl {
 
         for (const auto & [off, len] : llama_mmap_row_pages(
                     base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
-            // deliberately unchecked: this is a hint issued thousands of times per batch, and a
-            // failed hint only costs the fault it would have avoided
+            // unchecked on purpose: thousands of hints per batch, and a failed one only costs the fault it would have saved
             posix_madvise((char *) addr + off, len, POSIX_MADV_WILLNEED);
         }
 #else
@@ -740,8 +733,7 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
-    // Windows has no "read this range randomly" hint. not pulling the range in is what keeps the
-    // pages out; there is nothing further to say here, and nothing to drop back.
+    // Windows has no "read this range randomly" hint; not pulling the range in is what keeps the pages out
     void advise_random_range(size_t offset, size_t len, bool drop) {
         GGML_UNUSED(offset);
         GGML_UNUSED(len);
@@ -789,8 +781,7 @@ struct llama_mmap::impl {
 #endif
     }
 
-    // PrefetchVirtualMemory takes the whole set of ranges in one call, which is exactly the
-    // batching this wants: the reads are issued together instead of one fault at a time.
+    // PrefetchVirtualMemory takes every range in one call, so the reads go out together instead of one fault at a time
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
                        const int32_t * rows, size_t n_rows) const {
 #if _WIN32_WINNT >= 0x602

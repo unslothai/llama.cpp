@@ -203,10 +203,8 @@ uint32_t llama_hparams::n_embd_r() const {
     // Corresponds to Mamba's conv_states size
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
-    // qwen4exp's PLE dilated conv history deliberately does not share this row: the Meta backend
-    // splits cache_r_l by head and cannot view one sub-range of a split axis, so a second history
-    // packed behind the first is unaddressable under -sm tensor. it lives in cache_ple_r_l instead,
-    // mirrored, because the whole PLE module is mirrored
+    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
+    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
     return n_conv;
 }
 

@@ -284,14 +284,11 @@ struct llama_hparams {
     uint32_t ple_eos_token_id    = 0;
     // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
     uint32_t ple_image_token_id  = 0;
-    // unlike is_swa_impl and friends this is never read or written as a per-layer gguf array
-    // (the file lists PLE layer indices), so it is not tied to the loader's uint32 array type
-    // and can hold one bit per layer instead of one word
+    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
     std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
     // the hash multipliers reach ~2e13 and have to stay 64-bit
     std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
-    // head offsets and vocab sizes are token-space indices; the gather that consumes them
-    // truncates to int32, so 64-bit storage could never have been used
+    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
     std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
     std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
 
