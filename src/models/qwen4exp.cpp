@@ -1024,7 +1024,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head  = mctx_cur->get_head();
-    const auto mem_size = mctx_cur->get_size();
 
     const int64_t n_seqs    = ubatch.n_seqs;
     const int64_t row_total = hparams.n_embd_r();
