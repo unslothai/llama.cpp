@@ -208,12 +208,21 @@ jobs:
           # The nightly's own CPU child builds with EXAMPLES=OFF and compiles
           # the diffusion targets in a step that never fails the job, which is
           # exactly why one of them would have shipped silently.
+          #
+          # LLAMA_FATAL_WARNINGS=ON is what the macOS release leg configures, and
+          # cmake/common.cmake turns it into -Werror for GNU and Clang alike, so
+          # this gcc build reproduces the mechanism rather than approximating it.
+          # Without it the gate is blind to a whole class: an unused variable in
+          # a pinned arch built clean here and on every Linux leg, then failed
+          # both macOS legs and sank a four-hour release that had already
+          # produced 39 green jobs.
           if ! cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
               -DGGML_NATIVE=OFF \
               -DGGML_CUDA=OFF \
               -DGGML_CPU_ALL_VARIANTS=OFF \
               -DGGML_RPC=ON \
+              -DLLAMA_FATAL_WARNINGS=ON \
               -DLLAMA_BUILD_TESTS=OFF \
               -DLLAMA_BUILD_EXAMPLES=ON \
               -DLLAMA_BUILD_TOOLS=ON \
