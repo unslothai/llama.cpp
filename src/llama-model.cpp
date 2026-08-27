@@ -2519,13 +2519,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    ggml_type type_idx = GGML_TYPE_F16;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    // null for every arch but the sparse-attention ones, which is what
-                    // keeps the indexer cache from existing
-                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
-                    ggml_type type_idx = GGML_TYPE_F16;
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
