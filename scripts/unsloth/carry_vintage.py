@@ -26,7 +26,9 @@ Use it to decide whether a refresh should merge or simply rebuild:
         --carry <carry sha> --pr-ref refs/pull/27754/head --base refs/tags/b10639
 
 When every file is SUPERSEDED, rebuilding the carry from the PR head avoids the
-merge, and its conflicts, entirely.
+merge, and its conflicts, entirely. A file the PR head still has and the carry
+does not is reported as OMITTED and blocks that advice, because a rebuild would
+restore it; a file the PR DELETED is merely ABSENT and blocks nothing.
 """
 
 from __future__ import annotations
@@ -73,11 +75,16 @@ def main() -> int:
     history = [c for c in git("rev-list", f"--max-count={a.max_commits}",
                               f"{fork}..{head}").split("\n") if c]
 
-    superseded, diverged, absent = [], [], []
+    superseded, diverged, absent, omitted = [], [], [], []
     for path in files:
         ours = blob(a.carry, path)
         if ours is None:
-            absent.append(path)
+            # Two very different reasons a path is missing from the carry. If
+            # the PR DELETED it, the carry agrees and a rebuild reproduces
+            # that. If it still exists at the PR head, the carry dropped it on
+            # purpose, and a rebuild would re-add it -- the same mistake as
+            # calling a file held at the base version superseded.
+            (absent if blob(head, path) is None else omitted).append(path)
             continue
         if ours == blob(head, path):
             superseded.append({"path": path, "vintage": head, "current": True})
@@ -95,20 +102,28 @@ def main() -> int:
         print(f"  SUPERSEDED  {e['path']}\n              {note}")
     for p in diverged:
         print(f"  DIVERGED    {p}\n              matches no upstream vintage; we changed it, keep it")
+    for p in omitted:
+        print(f"  OMITTED     {p}\n              exists at the PR head, not in the carry; "
+              "a rebuild would re-add it")
     for p in absent:
-        print(f"  ABSENT      {p}\n              not in the carry")
+        print(f"  ABSENT      {p}\n              deleted by the PR, not in the carry")
     print()
     if diverged:
         print(f"{len(diverged)} file(s) genuinely diverge. A refresh has to merge, "
               "and those files are the only ones needing judgement.")
-    else:
+    if omitted:
+        print(f"{len(omitted)} file(s) the PR head still has are missing from the "
+              "carry. Rebuilding would restore them, so it is NOT equivalent to "
+              "merging; keep or re-drop each one deliberately.")
+    if not diverged and not omitted:
         print("Nothing diverges. Rebuilding the carry from the PR head is "
               "equivalent to merging it, without the conflicts.")
 
     if a.report:
         with open(a.report, "w") as fh:
             json.dump({"head": head, "superseded": superseded,
-                       "diverged": diverged, "absent": absent}, fh, indent=2)
+                       "diverged": diverged, "omitted": omitted,
+                       "absent": absent}, fh, indent=2)
     return 0
 
 

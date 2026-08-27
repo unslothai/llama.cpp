@@ -108,6 +108,69 @@ r2 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry2, "--pr-ref",
 check("still recommends a rebuild when nothing diverges",
       r2.returncode == 0 and "Nothing diverges" in r2.stdout, r2.stdout[-300:])
 
+# A carry that deliberately OMITS a file the PR head still has. Nothing
+# diverges, every file the carry does have is superseded, and the naive answer
+# is "rebuild from the PR head" -- which restores the omitted file and loses
+# the omission. A file the PR DELETED is a different case: the carry not having
+# it is agreement, and a rebuild reproduces it exactly.
+def omission_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    write(d, "keep.txt", "base version\n")
+    write(d, "doomed.txt", "base version\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    # The PR edits keep.txt, adds win.cmake, and deletes doomed.txt.
+    git(d, "checkout", "-q", "-b", "pr")
+    write(d, "keep.txt", "upstream v1\n")
+    write(d, "win.cmake", "windows-only build tweak\n")
+    git(d, "rm", "-q", "doomed.txt")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "pr c1")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry replays it but never took win.cmake.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "keep.txt", "upstream v1\n")
+    git(d, "rm", "-q", "doomed.txt")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "carry without win.cmake")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d2, base2, head2, carry3 = omission_fixture()
+# outside the repo, so the "writes nothing" check below sees a clean tree
+report2 = str(Path(tempfile.mkdtemp(prefix="cvr_")) / "report.json")
+r3 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry3, "--pr-ref", head2,
+                     "--base", base2, "--report", report2],
+                    cwd=d2, capture_output=True, text=True)
+check("runs clean on an omitting carry", r3.returncode == 0, r3.stderr)
+out2 = json.loads(Path(report2).read_text())
+check("a file present at the PR head but not in the carry is OMITTED, not absent",
+      out2.get("omitted") == ["win.cmake"] and "win.cmake" not in out2.get("absent", []),
+      json.dumps(out2, indent=1))
+check("a file the PR deleted stays merely ABSENT",
+      out2.get("absent") == ["doomed.txt"], json.dumps(out2, indent=1))
+check("an omitted file suppresses the rebuild recommendation",
+      "Nothing diverges" not in r3.stdout, r3.stdout[-400:])
+check("and says why rebuilding is not equivalent",
+      "NOT equivalent" in r3.stdout, r3.stdout[-400:])
+check("the omitting carry still writes nothing",
+      git(d2, "status", "--porcelain") == "", git(d2, "status", "--porcelain"))
+
+# Take the omitted file, and the rebuild advice is correct again.
+write(d2, "win.cmake", "windows-only build tweak\n")
+git(d2, "add", "-A")
+git(d2, "commit", "-qm", "take win.cmake after all")
+r4 = subprocess.run([sys.executable, str(SCRIPT), "--carry", git(d2, "rev-parse", "HEAD"),
+                     "--pr-ref", head2, "--base", base2], cwd=d2, capture_output=True, text=True)
+check("a PR deletion alone still allows the rebuild",
+      r4.returncode == 0 and "Nothing diverges" in r4.stdout, r4.stdout[-400:])
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")
 sys.exit(1 if FAILS else 0)

@@ -143,7 +143,53 @@ t = json.loads(json.dumps(objs)); t[2]["required"] = "maybe"
 rc, _, err = run_objs(objs, o, t)
 check("refuses a two-sided change to the same field", rc == 1, err)
 
-# 11. --help must not crash: argparse %-formats help strings, and the driver
+def run_docs(base, ours, theirs):
+    """Like run(), but the caller supplies the whole document, not just pins."""
+    d = Path(tempfile.mkdtemp(prefix="pm_"))
+    paths = []
+    for name, doc in (("base", base), ("ours", ours), ("theirs", theirs)):
+        p = d / f"{name}.json"
+        p.write_text(json.dumps(doc, indent=2))
+        paths.append(str(p))
+    r = subprocess.run([sys.executable, str(SCRIPT), *paths, "--stdout"],
+                       capture_output=True, text=True)
+    return r.returncode, (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr.strip()
+
+
+# 12. theirs edits a TOP-LEVEL field while ours repins an entry. Rebuilding the
+# document from ours drops theirs' edit and still exits 0, and because a merge
+# driver replaces git's text merge outright, nothing else ever sees the loss.
+doc = {"_doc": ["old doc line"], "prs": list(BASE_PINS)}
+o = json.loads(json.dumps(doc)); o["prs"] = sub(BASE_PINS, 5, "a" * 40)
+t = json.loads(json.dumps(doc)); t["_doc"] = ["old doc line", "prune closed pins"]
+rc, out, err = run_docs(doc, o, t)
+check("keeps theirs' top-level field change alongside ours' repin",
+      rc == 0 and out is not None and out["_doc"] == t["_doc"], err or json.dumps(out))
+check("still takes ours' repin when theirs edited the document",
+      rc == 0 and out is not None and out["prs"] == o["prs"], err)
+check("keeps .prs in its original key position",
+      rc == 0 and out is not None and list(out) == ["_doc", "prs"], json.dumps(list(out or {})))
+
+# 13. theirs ADDS a top-level field ours has never seen: it has to survive.
+t = json.loads(json.dumps(doc)); t["base_tag"] = "b10639"
+rc, out, err = run_docs(doc, o, t)
+check("keeps a top-level field only theirs added",
+      rc == 0 and out is not None and out.get("base_tag") == "b10639", err or json.dumps(out))
+
+# 14. both sides set the same top-level field differently: refuse, never guess.
+o2 = json.loads(json.dumps(doc)); o2["_doc"] = ["ours' rewrite"]
+t2 = json.loads(json.dumps(doc)); t2["_doc"] = ["theirs' rewrite"]
+rc, _, err = run_docs(doc, o2, t2)
+check("refuses a two-sided change to the same top-level field", rc == 1, err)
+check("names the clashing top-level field", "_doc" in err, err)
+
+# 15. a top-level field theirs deleted stays deleted.
+t3 = json.loads(json.dumps(doc)); del t3["_doc"]
+rc, out, err = run_docs(doc, o, t3)
+check("honours a top-level field theirs deleted",
+      rc == 0 and out is not None and "_doc" not in out, err or json.dumps(out))
+
+# 16. --help must not crash: argparse %-formats help strings, and the driver
 # placeholders %O/%A/%B are literal percents that have to be escaped.
 r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True)
 check("--help does not crash on the %O/%A/%B placeholders",

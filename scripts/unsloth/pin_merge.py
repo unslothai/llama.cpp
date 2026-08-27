@@ -54,6 +54,31 @@ def fields(entry: str | dict) -> dict:
     return {"url": entry} if isinstance(entry, str) else dict(entry)
 
 
+def merge_keys(what: str, bd: dict, od: dict, td: dict) -> dict:
+    """Three-way merge a mapping key by key, refusing only a real clash.
+
+    A key missing on a side is MISSING rather than absent, so "theirs deleted
+    it, ours left it alone" is a deletion both sides agree on, not a no-op.
+    Ours' key order is kept, then keys only theirs or only base has.
+    """
+    out: dict = {}
+    for k in list(od) + [k for k in td if k not in od] + \
+             [k for k in bd if k not in od and k not in td]:
+        bv, ov, tv = bd.get(k, MISSING), od.get(k, MISSING), td.get(k, MISSING)
+        if ov == tv:
+            v = ov
+        elif ov == bv:
+            v = tv
+        elif tv == bv:
+            v = ov
+        else:
+            raise Ambiguous(f"{what} field {k!r} changed differently on both "
+                            f"sides:\n  ours:   {ov}\n  theirs: {tv}")
+        if v is not MISSING:
+            out[k] = v
+    return out
+
+
 def merge_entry(i: int, b, o, t):
     """Three-way merge one pin ENTRY, not just its url.
 
@@ -69,22 +94,7 @@ def merge_entry(i: int, b, o, t):
         return o                       # only ours touched this entry
     # Both sides touched it. Merge field-wise, so a repin on one side and a
     # flag change on the other both survive, and refuse only the real clash.
-    bd, od, td = fields(b), fields(o), fields(t)
-    out: dict = {}
-    for k in list(od) + [k for k in td if k not in od] + \
-             [k for k in bd if k not in od and k not in td]:
-        bv, ov, tv = bd.get(k, MISSING), od.get(k, MISSING), td.get(k, MISSING)
-        if ov == tv:
-            v = ov
-        elif ov == bv:
-            v = tv
-        elif tv == bv:
-            v = ov
-        else:
-            raise Ambiguous(f"pin {i} field {k!r} changed differently on both "
-                            f"sides:\n  ours:   {ov}\n  theirs: {tv}")
-        if v is not MISSING:
-            out[k] = v
+    out = merge_keys(f"pin {i}", fields(b), fields(o), fields(t))
     if "url" not in out:
         raise Ambiguous(f"pin {i} lost its url")
     # Keep the bare-string form when nothing but the url is present, so the
@@ -101,10 +111,16 @@ def merge_pins(base: dict, ours: dict, theirs: dict) -> dict:
         )
     merged = [merge_entry(i, bx, ox, tx)
               for i, (bx, ox, tx) in enumerate(zip(b, o, t))]
-    # Keep ours' surrounding document (comments, schema fields) and swap the
-    # list, so nothing outside .prs is silently rewritten by this script.
-    out = json.loads(json.dumps(ours))
-    out["prs"] = merged
+    # Everything outside .prs is three-way merged the same way. Rebuilding the
+    # document from ours instead would silently drop a change theirs made to a
+    # top-level field -- `_doc`, or any schema field added later -- and this
+    # driver REPLACES git's text merge rather than running after it, so nothing
+    # downstream would ever notice the loss. A real two-sided clash refuses,
+    # which costs a hand resolution and never a wrong document.
+    skel = [{k: (None if k == "prs" else v) for k, v in d.items()}
+            for d in (base, ours, theirs)]     # .prs is merged positionally
+    out = merge_keys("document", *skel)
+    out["prs"] = merged                        # keeps ours' key position
     return out
 
 
