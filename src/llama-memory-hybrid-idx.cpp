@@ -476,19 +476,60 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    llama_memory_hybrid::state_read(io, seq_id, flags);
+    // note: this repeats llama_memory_hybrid::state_read because the indexer cache has to be
+    //       handed the cells the attention cache restored into, and because a restore that
+    //       fails halfway has to leave all three caches in the same state
 
-    // [TAG_HYBRID_IDX_STATE] must mirror the write order above.
-    // The indexer finds its own cells, which is safe because the two caches stay in lockstep:
-    // both state_read_meta calls run find_slot over the same occupancy and land on the same cells.
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        if (mem_idx) {
-            mem_idx->state_read(io, seq_id, flags);
+    // [TAG_HYBRID_IDX_SINFO]
+    // The indexer cache is addressed by the cells of the attention cache, so its restore adopts
+    // that layout instead of searching for cells of its own. Two independent find_slot calls
+    // agree only while nothing makes the two caches see different occupancy, and a restore is
+    // exactly the operation that can no longer promise that.
+    llama_kv_cache::slot_info_vec_t sinfos_attn;
+
+    try {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
+
+        get_mem_recr()->state_read(io, seq_id, flags);
+
+        // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            if (mem_idx) {
+                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            }
+        }
+
+        // [TAG_PLE_HISTORY] must mirror the write order above
+        ple_hist_state_read(io, seq_id);
+    } catch (...) {
+        // a half-restored context is the one state the indexer cache cannot be brought back from
+        // by itself: the attention cache holds the restored cells and the indexer the old ones.
+        // drop what was being restored from all of them, which is a state they do agree on.
+        state_drop(seq_id);
+
+        throw;
+    }
+}
+
+void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    // dropped directly rather than through seq_rm, which the recurrent cache is allowed to
+    // refuse and which would then clear the other two caches and not it
+    if (seq_id < 0) {
+        clear(true);
+
+        return;
     }
 
-    // [TAG_PLE_HISTORY] must mirror the write order above
-    ple_hist_state_read(io, seq_id);
+    get_mem_attn()->seq_rm(seq_id, -1, -1);
+    get_mem_recr()->seq_rm(seq_id, -1, -1);
+
+    if (mem_idx) {
+        mem_idx->seq_rm(seq_id, -1, -1);
+    }
+
+    ple_hist.erase(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
