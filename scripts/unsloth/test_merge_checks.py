@@ -91,6 +91,64 @@ check("does NOT fire on distinct arches", rc == 0, out)
 rc, out = run()
 check("clean tree exits 0", rc == 0, out)
 
+# A nested `if` inside an arm must not end the enclosing chain. Tracking chains
+# by indentation resets on the nested arm and analyses the outer `else if` as a
+# fresh chain, so the dedicated GLM5NEXT arm below a shared fallthrough -- the
+# exact 08-27 mistake -- stops being reported.
+NESTED_DEAD_ARM = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        if (hparams.indexer_head_size > 0) {
+            a();
+        } else if (hparams.n_expert > 0) {
+            b();
+        }
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# Two unrelated chains at the same indentation. The second one's opener is a
+# multiline condition, which the regex deliberately skips, so an indentation
+# key appends the reachable GLM5NEXT arm to the FIRST chain and calls it dead.
+# Nothing here is unreachable, and firing would block a release on good code.
+SEPARATE_CHAINS = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    }
+    unrelated();
+    if (hparams.moe_every_n_layers > 0 &&
+        il % hparams.moe_every_n_layers == 1) {
+        b();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# A brace inside a string literal or a comment is not a brace. Miscounting one
+# shifts the depth for the rest of the file, which would silence every chain
+# after it.
+BRACES_IN_LITERALS = """
+void f() {
+    const char * tmpl = "{% if x %}{{ y }}{% endif %}";
+    // a stray } in a comment {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+
+rc, out = run(cpp=NESTED_DEAD_ARM)
+check("catches a dead arm across a nested if", rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=SEPARATE_CHAINS)
+check("does NOT glue two chains at the same indentation", rc == 0, out)
+rc, out = run(cpp=BRACES_IN_LITERALS)
+check("still analyses a chain after braces in a string or comment",
+      rc == 1 and "unreachable" in out, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all merge_checks tests passed")
 sys.exit(1 if FAILS else 0)

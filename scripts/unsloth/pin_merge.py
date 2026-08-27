@@ -15,7 +15,10 @@ the tree the earlier ones produced, and reordering the list silently changes the
 composition. This never reorders: it walks the base list positionally and takes
 whichever side moved each entry. That also means a pin added or removed on one
 side is refused rather than aligned, because guessing where an inserted pin
-belongs is exactly the kind of guess that would change composition order.
+belongs is exactly the kind of guess that would change composition order. A
+side that REORDERS the list is refused for the same reason, and for a sharper
+one: position i would no longer name the same pin on both sides, so merging it
+field-wise would splice one PR's `required` onto another PR's url.
 
 Usable as a git merge driver:
 
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -43,6 +47,10 @@ class Ambiguous(Exception):
 
 MISSING = object()
 
+# The pin url shape repin.py already enforces. The owner matters: ggml-org#125
+# and unslothai#125 are different PRs.
+PIN_ID = re.compile(r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/")
+
 
 def pins(doc: dict) -> list[str]:
     """The pin URLs, in order. Entries are a bare string or {url, required}."""
@@ -52,6 +60,45 @@ def pins(doc: dict) -> list[str]:
 def fields(entry: str | dict) -> dict:
     """An entry in dict form. A bare url string is just {"url": url}."""
     return {"url": entry} if isinstance(entry, str) else dict(entry)
+
+
+def ident(entry: str | dict) -> str:
+    """What a pin IS, independent of which commit it currently points at.
+
+    A repin changes only the sha, so (owner, PR number) is the stable identity.
+    Anything that does not look like a pin url is its own identity, which is the
+    conservative reading: an unrecognised url can only ever cause a refusal.
+    """
+    url = fields(entry).get("url")
+    m = PIN_ID.match(url) if isinstance(url, str) else None
+    return f"{m.group(1)}#{m.group(2)}" if m else repr(url)
+
+
+def refuse_reorder(b: list, o: list, t: list) -> None:
+    """Refuse if either side moved an entry that base holds somewhere else.
+
+    Merging by position assumes position i means the same pin on all three
+    sides. A reorder breaks that assumption silently: base [A, B] with ours
+    making A optional and theirs reordering to [B, A] merges position 0 as
+    "url moved to B, required moved to false" and produces B(required=false),
+    so the release skips the wrong PR and the driver still exits 0.
+
+    Realigning by identity instead is not safe. A duplicated entry, or a
+    reorder combined with a repin, leaves more than one alignment consistent
+    with the diff, and choosing one is a guess about composition order, which
+    is load-bearing here. Refusing costs the hand resolution that was the
+    status quo; guessing costs a wrong build nothing downstream can see.
+    """
+    bid = [ident(e) for e in b]
+    for side, entries in (("ours", o), ("theirs", t)):
+        for i, e in enumerate(entries):
+            k = ident(e)
+            if k != bid[i] and k in bid:
+                raise Ambiguous(
+                    f"pin {i} on {side} is {k}, which base holds at position "
+                    f"{bid.index(k)}: the list was reordered, and merging "
+                    "reordered entries by position would take fields from "
+                    "different PRs")
 
 
 def merge_keys(what: str, bd: dict, od: dict, td: dict) -> dict:
@@ -109,6 +156,7 @@ def merge_pins(base: dict, ours: dict, theirs: dict) -> dict:
             f"pin count differs (base={len(b)} ours={len(o)} theirs={len(t)}); "
             "a pin was added or removed, and placing it is an ordering decision"
         )
+    refuse_reorder(b, o, t)
     merged = [merge_entry(i, bx, ox, tx)
               for i, (bx, ox, tx) in enumerate(zip(b, o, t))]
     # Everything outside .prs is three-way merged the same way. Rebuilding the

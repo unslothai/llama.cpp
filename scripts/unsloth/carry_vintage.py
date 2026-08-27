@@ -89,7 +89,19 @@ def main() -> int:
         if ours == blob(head, path):
             superseded.append({"path": path, "vintage": head, "current": True})
             continue
-        hit = next((c for c in history if blob(c, path) == ours), None)
+        # Bounding the walk to fork..head is not enough on its own. A PR with
+        # several commits usually does not touch every file in its first one,
+        # so the commits BEFORE the one that first changed this path still
+        # carry the fork's blob -- inside the range. A carry holding the file
+        # at the base version matches one of those and is called SUPERSEDED
+        # again, and the summary again says a rebuild is equivalent when it
+        # would overwrite exactly what the carry is holding. Our copy being
+        # the fork's copy is not evidence the PR ever produced it, so it is
+        # never a vintage; such a file falls through to DIVERGED, which is
+        # where a file needing a human decision belongs.
+        at_fork = blob(fork, path)
+        hit = None if ours == at_fork else \
+            next((c for c in history if blob(c, path) == ours), None)
         if hit:
             superseded.append({"path": path, "vintage": hit, "current": False})
         else:
@@ -101,7 +113,8 @@ def main() -> int:
         note = "already at PR head" if e["current"] else f"our copy is upstream {e['vintage'][:10]}"
         print(f"  SUPERSEDED  {e['path']}\n              {note}")
     for p in diverged:
-        print(f"  DIVERGED    {p}\n              matches no upstream vintage; we changed it, keep it")
+        print(f"  DIVERGED    {p}\n              matches no upstream vintage; we changed it, or we are "
+              "holding the base version on purpose. Keep it")
     for p in omitted:
         print(f"  OMITTED     {p}\n              exists at the PR head, not in the carry; "
               "a rebuild would re-add it")

@@ -171,6 +171,57 @@ r4 = subprocess.run([sys.executable, str(SCRIPT), "--carry", git(d2, "rev-parse"
 check("a PR deletion alone still allows the rebuild",
       r4.returncode == 0 and "Nothing diverges" in r4.stdout, r4.stdout[-400:])
 
+# A multi-commit PR that does not touch every file in its FIRST commit. The
+# commits before the one that first changed a path still carry the fork's blob,
+# and they are inside fork..head, so a carry deliberately holding that file at
+# the base version matches one of them and is called SUPERSEDED -- the same
+# wrong "rebuilding is equivalent" answer the fork bound was meant to end, one
+# commit further in.
+def late_touch_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    write(d, "held.txt", "base version\n")
+    write(d, "early.txt", "base version\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    # c1 touches early.txt only, so held.txt is still the base blob AT c1.
+    git(d, "checkout", "-q", "-b", "pr")
+    write(d, "early.txt", "upstream v1\n")
+    git(d, "commit", "-qam", "pr c1")
+    # c2 is the first commit to touch held.txt.
+    write(d, "held.txt", "upstream v2\n")
+    git(d, "commit", "-qam", "pr c2")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry took early.txt and holds held.txt at the base version.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "early.txt", "upstream v1\n")
+    git(d, "commit", "-qam", "carry")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d3, base3, head3, carry4 = late_touch_fixture()
+report3 = str(Path(tempfile.mkdtemp(prefix="cvr_")) / "report.json")
+r5 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry4, "--pr-ref", head3,
+                     "--base", base3, "--report", report3],
+                    cwd=d3, capture_output=True, text=True)
+check("runs clean on a late-touch PR", r5.returncode == 0, r5.stderr)
+out3 = json.loads(Path(report3).read_text())
+check("a file held at base is not superseded by a PR commit that predates its first change",
+      "held.txt" in out3["diverged"], json.dumps(out3, indent=1))
+check("no in-range commit before the first change counts as a vintage",
+      all(e["path"] != "held.txt" for e in out3["superseded"]), json.dumps(out3, indent=1))
+check("and the rebuild advice is withheld",
+      "Nothing diverges" not in r5.stdout, r5.stdout[-400:])
+check("a file the carry really did take is still superseded",
+      any(e["path"] == "early.txt" for e in out3["superseded"]), json.dumps(out3, indent=1))
+check("the late-touch run still writes nothing",
+      git(d3, "status", "--porcelain") == "", git(d3, "status", "--porcelain"))
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")
 sys.exit(1 if FAILS else 0)

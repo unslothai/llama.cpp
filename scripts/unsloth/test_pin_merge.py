@@ -195,6 +195,45 @@ r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True,
 check("--help does not crash on the %O/%A/%B placeholders",
       r.returncode == 0 and "%O" in r.stdout, (r.stderr or r.stdout)[-200:])
 
+# 17. one side REORDERS the pins while the other changes a field. Merging by
+# position then combines fields belonging to different PRs: base
+# [A(required), B(required)] with ours making A optional and theirs swapping
+# the two produces B(required=false), so the release skips the wrong PR, and
+# the driver exits 0 while doing it. A reorder must be refused instead.
+two = [{"url": BASE_PINS[0], "required": True}, {"url": BASE_PINS[1], "required": True}]
+o = json.loads(json.dumps(two)); o[0]["required"] = False
+t = [two[1], two[0]]
+rc, pins, err = run_objs(two, o, t)
+check("refuses a reorder that would splice fields across PRs", rc == 1,
+      json.dumps(pins) if pins else err)
+check("names the reordered position", "reorder" in err, err)
+check("never emits a pin carrying another PR's field",
+      pins is None or pins[0]["required"] is not False, json.dumps(pins))
+
+# 18. a reorder that also repins the moved entry still has to be refused: the
+# url no longer matches, so only the PR number identifies the entry.
+t = [dict(two[1]), dict(two[0])]
+t[0]["url"] = sub(BASE_PINS, 1, "9" * 40)[1]
+rc, _, err = run_objs(two, o, t)
+check("refuses a reorder combined with a repin", rc == 1, err)
+
+# 19. a reorder on OUR side is refused too, not just on theirs.
+o2 = [two[1], two[0]]
+t2 = json.loads(json.dumps(two)); t2[0]["required"] = False
+rc, _, err = run_objs(two, o2, t2)
+check("refuses a reorder on ours", rc == 1, err)
+
+# 20. swapping a pin for a DIFFERENT PR at the same position is not a reorder
+# and must keep merging, which is case 1's real 08-27 resolution.
+rc, pins, err = run(BASE_PINS,
+                    replace(BASE_PINS, 6, f"{U}/125/commits/{'a' * 40}"),
+                    sub(BASE_PINS, 5, "b" * 40))
+check("a same-position swap to a new PR is not a reorder", rc == 0, err)
+
+# 21. a plain repin is not a reorder either, on either side.
+rc, pins, err = run(BASE_PINS, sub(BASE_PINS, 0, "1" * 40), sub(BASE_PINS, 3, "2" * 40))
+check("two repins at different positions still merge", rc == 0, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all pin_merge tests passed")
 sys.exit(1 if FAILS else 0)
