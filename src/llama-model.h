@@ -738,6 +738,14 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // ask the kernel to start reading the rows a gather is about to take out of a host-mapped
+    // tensor, so the faults overlap instead of serializing one NVMe latency at a time.
+    //
+    // does nothing unless the tensor lives in a mapping that was advised random, which only
+    // happens under LLAMA_MMAP_RANDOM. off, and for anything not read out of a mapping (offloaded
+    // tensors, --load-mode none, non-POSIX hosts), this is one bool test.
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

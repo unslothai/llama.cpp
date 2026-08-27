@@ -50,12 +50,42 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // opt-in, see llama_mmap_random_mode(). marks the whole mapping as randomly accessed, which
+    // is only correct once loading is done: until then the loader streams the file sequentially.
+    void advise_random(bool drop);
+
+    // true once advise_random() has been applied. everything that keys off "this mapping is read
+    // randomly" tests this, so nothing changes for a mapping the user did not opt in for.
+    bool is_random() const;
+
+    // true if [ptr, ptr + len) lies inside this mapping
+    bool contains(const void * ptr, size_t len) const;
+
+    // ask the kernel to start reading the given rows. issued as one batch so the faults overlap
+    // instead of serializing; a no-op unless the mapping is marked random.
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const;
+
     static const bool SUPPORTED;
 
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// how the model file mappings should be advised, from the LLAMA_MMAP_RANDOM environment variable.
+// off unless the user asks: the random hints cost a large cold-prefill slowdown on models whose
+// host-resident tensors are read sequentially, so this cannot be a default.
+enum llama_mmap_random_mode {
+    LLAMA_MMAP_RANDOM_OFF  = 0, // upstream behaviour
+    LLAMA_MMAP_RANDOM_ON   = 1, // skip MAP_POPULATE/WILLNEED, advise random after load
+    LLAMA_MMAP_RANDOM_DROP = 2, // additionally drop what the load pulled in
+};
+
+llama_mmap_random_mode llama_mmap_random_mode_get();
+
+// whether batched readahead ahead of a sparse gather is enabled (LLAMA_MMAP_RANDOM_PREFETCH)
+bool llama_mmap_random_prefetch_enabled();
 
 struct llama_mlock {
     llama_mlock();
