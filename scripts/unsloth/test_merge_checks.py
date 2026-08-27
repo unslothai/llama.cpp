@@ -272,6 +272,61 @@ void f() {
 }
 """
 
+# An unconditional arm takes the arch outright, so a later arm testing the same
+# arch with an extra condition can never run. It is not a pure disjunction, so
+# it was skipped and the dead arm passed.
+CONJUNCTION_AFTER_PLAIN = """
+void f() {
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT && hparams.n_expert > 0) {
+        c();
+    }
+}
+"""
+# The reverse must stay clean: a CONDITIONAL arm does not consume the arch, so
+# a later arm testing it is genuinely reachable.
+PLAIN_AFTER_CONJUNCTION = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT && hparams.n_expert > 0) {
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        c();
+    }
+}
+"""
+# A negated test names the arch but does not require it, so it is reachable.
+NEGATED_ARM = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else if (arch != LLM_ARCH_GLM5NEXT && n > 0) {
+        c();
+    }
+}
+"""
+# Only one alternative of a disjunction was taken, so the arm can still run.
+PARTIAL_DISJUNCTION = """
+void f() {
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        a();
+    } else if (arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_QWEN3NEXT) {
+        c();
+    }
+}
+"""
+
+rc, out = run(cpp=CONJUNCTION_AFTER_PLAIN)
+check("catches a conditioned arm after an unconditional match of the same arch",
+      rc == 1 and "unreachable" in out, out)
+rc, out = run(cpp=PLAIN_AFTER_CONJUNCTION)
+check("a conditional arm does not consume the arch for what follows",
+      rc == 0, out)
+rc, out = run(cpp=NEGATED_ARM)
+check("a negated arch test is not read as requiring that arch", rc == 0, out)
+rc, out = run(cpp=PARTIAL_DISJUNCTION)
+check("a disjunction with one untaken alternative stays reachable", rc == 0, out)
+
 rc, out = run(cpp=RAW_INSIDE_COMMENT)
 check("an R\"( inside a comment does not open a raw string",
       rc == 1 and "unreachable" in out, out)

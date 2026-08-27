@@ -22,11 +22,13 @@ a silent wrong answer into a loud one, which is the property that was missing.
 Both are deliberately narrow, because a check that fires wrongly blocks a
 release just as effectively as a bad merge:
 
-  - The unreachable-arm check only fires when the EARLIER condition is a pure
-    disjunction of `arch == LLM_ARCH_*` terms. If it contains `&&` or anything
-    else, a later arm testing the same arch can genuinely be reachable, so the
-    chain is skipped. With that restriction the verdict follows from the code:
-    matching that arch always takes the earlier branch.
+  - An arch is only consumed by an EARLIER arm that is a pure disjunction of
+    `arch == LLM_ARCH_*` terms. A conditional arm may not run, so what follows
+    it stays reachable. The later arm is then dead if it is a disjunction whose
+    alternatives are all consumed, or a plain conjunction requiring a consumed
+    arch, since its other conditions can only narrow it further. Anything
+    mixing `||` and `&&` is left alone, and only a term that is exactly
+    `arch == X` counts, so `arch != X` is never read as requiring that arch.
 
   - The unreachable-arm check reads one physical line, so a condition split
     across lines is skipped rather than analysed. Checked against the whole of
@@ -255,19 +257,49 @@ def if_else_chains(text: str) -> list[list[tuple[int, str]]]:
     return done
 
 
+def _blocked_by(cond: str, taken: set[str]) -> set[str]:
+    """Arches that make this arm dead, given what earlier arms already took.
+
+    A pure disjunction is dead only when EVERY alternative is taken. A plain
+    conjunction is dead as soon as ONE of its `arch == X` conjuncts is, since
+    the other conditions can only narrow it further: an earlier unconditional
+    `arch == X` arm makes a later `arch == X && enabled` unreachable, and that
+    arm is not a pure disjunction so it used to be skipped entirely.
+
+    Anything mixing `||` and `&&` is left alone rather than guessed at, and only
+    a term that is exactly `arch == X` counts, so `!(arch == X)` and `arch != X`
+    cannot be read as requiring that arch.
+    """
+    archs = set(ARCH.findall(cond))
+    if not archs:
+        return set()
+    if _pure_arch_disjunction(cond):
+        return archs if archs <= taken else set()
+    if "||" in cond:
+        return set()
+    hit = set()
+    for term in cond.split("&&"):
+        m = ARCH.fullmatch(term.strip().strip("()").strip())
+        if m and m.group(1) in taken:
+            hit.add(m.group(1))
+    return hit
+
+
 def unreachable_arch_arms(path: Path) -> list[str]:
     """`else if` arms whose arch a preceding pure-disjunction arm already took."""
     out = []
     for chain in if_else_chains(path.read_text()):
         taken: set[str] = set()
         for lineno, cond in chain:
-            archs = set(ARCH.findall(cond))
-            if archs and _pure_arch_disjunction(cond) and archs <= taken:
+            dead = _blocked_by(cond, taken)
+            if dead:
                 out.append(f"{path}:{lineno}: unreachable, "
-                           f"{', '.join(sorted(archs))} already matched earlier "
+                           f"{', '.join(sorted(dead))} already matched earlier "
                            "in this if/else chain")
+            # Only an unconditional arm consumes an arch. A conditional one may
+            # not run, so what follows it can still be reached.
             if _pure_arch_disjunction(cond):
-                taken |= archs
+                taken |= set(ARCH.findall(cond))
     return out
 
 
