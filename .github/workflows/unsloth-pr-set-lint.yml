@@ -15,9 +15,21 @@ on:
   push:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/test_*.py
+      - .github/workflows/unsloth-pr-set-lint.yml
   pull_request:
     paths:
       - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/test_*.py
+      - .github/workflows/unsloth-pr-set-lint.yml
 
 permissions:
   contents: read
