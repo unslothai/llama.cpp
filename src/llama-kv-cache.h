@@ -112,7 +112,9 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // a model can hold more than one cache, so the tensor names have to stay unique
+                 const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
 

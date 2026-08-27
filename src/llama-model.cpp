@@ -379,6 +379,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
@@ -489,6 +490,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
+        }
+
+        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
+        if (std::regex_match(tensor_name, pattern_idx_cache)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // standard attention
