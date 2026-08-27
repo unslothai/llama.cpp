@@ -358,12 +358,14 @@ int main(int argc, char ** argv) {
                 "indexer_top_k (%u) is a whole number of pools of %u", hparams.indexer_top_k, hparams.indexer_kpool);
     }
 
-    // ---- a multi-sequence unified cache is rejected at create time ----------
+    // ---- a multi-sequence unified cache pools per SEQUENCE ------------------
     //
-    // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]. pools group cells by position and a unified
-    // cache shares one cells array, so two sequences at the same position would pool
-    // each other's keys. -kvu with --parallel is reachable (llama-perplexity forces it
-    // for hellaswag / winogrande / multiple-choice), so this must fail at startup.
+    // [TAG_KPOOL_SEQ_PARTITION]. pools group cells by position, and a position only
+    // names a pool inside one sequence. a unified cache shares one cells array, so the
+    // stream's pool table is cut into one run per sequence instead of the cache being
+    // refused. -kvu with --parallel is reachable (llama-perplexity forces it for
+    // hellaswag / winogrande / multiple-choice, and llama-embedding turns -np 1 into
+    // -kvu with n_seq_max 256), so this has to work rather than fail at startup.
     {
         llama_cparams cp = {};
         cp.n_ctx       = 256;
@@ -379,25 +381,167 @@ int main(int argc, char ** argv) {
         mp.type_v   = GGML_TYPE_F16;
         mp.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
 
-        bool threw = false;
-        try {
-            delete model->create_memory(mp, cp);
-        } catch (const std::exception &) {
-            threw = true;
-        }
-        CHECK(threw, "-kvu with n_seq_max 2 is refused when the model has a pooling indexer");
-
-        // one sequence in flight is fine: the shared cells array holds only its keys,
-        // and the map filters on seq_has anyway
-        cp.n_seq_max = 1;
         llama_memory_i * raw = nullptr;
         try {
             raw = model->create_memory(mp, cp);
-        } catch (const std::exception &) {
+        } catch (const std::exception & e) {
+            printf("note create_memory threw: %s\n", e.what());
             raw = nullptr;
         }
-        CHECK(raw != nullptr, "-kvu with a single sequence is still allowed");
+        CHECK(raw != nullptr, "-kvu with n_seq_max 2 is accepted: the pool map is per sequence");
+
+        const uint32_t kpool = hparams.indexer_kpool;
+
+        // one shared n_kv/kpool budget plus the rebasing slack per sequence, NOT one
+        // full-width table each: the indexer scores every slot against every query, so a
+        // full-width table per sequence multiplies the score tensor by the sequence count
+        CHECK(llama_kpool_n_pools(256, kpool, 1) == 256/kpool + 2 &&
+              llama_kpool_n_pools(256, kpool, 2) == 256/kpool + 4,
+                "llama_kpool_n_pools is n_kv/kpool + 2 per sequence (%u slots for 2 sequences)",
+                llama_kpool_n_pools(256, kpool, 2));
+
+        auto * m2 = dynamic_cast<llama_memory_hybrid *>(raw);
+        CHECK(m2 != nullptr && m2->get_mem_idx() != nullptr, "-kvu builds an indexer cache too");
+
+        // drive one ubatch holding BOTH sequences through the map. 16 positions each, so
+        // every sequence owns several complete pools and the runs have to be told apart
+        if (m2) {
+            const int64_t n_tok = 16;
+
+            std::vector<llama_token>    tok;
+            std::vector<llama_pos>      pos;
+            std::vector<llama_seq_id>   sid;
+            std::vector<llama_seq_id *> sptr;
+            std::vector<int32_t>        nsid;
+            std::vector<int8_t>         lg;
+
+            for (llama_seq_id s = 0; s < 2; ++s) {
+                for (int64_t i = 0; i < n_tok; ++i) {
+                    tok.push_back(0);
+                    pos.push_back((llama_pos) i);
+                    sid.push_back(s);
+                    nsid.push_back(1);
+                    lg.push_back(1);
+                }
+            }
+            for (size_t i = 0; i < sid.size(); ++i) {
+                sptr.push_back(&sid[i]);
+            }
+
+            llama_batch b = {};
+            b.n_tokens = (int32_t) tok.size();
+            b.token    = tok.data();
+            b.pos      = pos.data();
+            b.seq_id   = sptr.data();
+            b.n_seq_id = nsid.data();
+            b.logits   = lg.data();
+
+            llama_batch_allocr ba(hparams.n_pos_per_embd());
+            if (ba.init(b, model->vocab, nullptr, hparams.n_embd_inp(), cp.n_seq_max, true)) {
+                auto c  = m2->init_batch(ba, cp.n_ubatch, false);
+                auto * mc = dynamic_cast<llama_memory_hybrid_context *>(c.get());
+
+                CHECK(mc && mc->get_status() == LLAMA_MEMORY_STATUS_SUCCESS,
+                        "both sequences fit one unified ubatch");
+
+                if (mc && mc->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
+                    mc->apply();
+
+                    const llama_ubatch & ub = mc->get_ubatch();
+
+                    const int64_t n_kv     = mc->get_attn()->get_n_kv();
+                    const int64_t n_stream = mc->get_attn()->get_n_stream();
+                    const int64_t n_tps    = ub.n_tokens/n_stream;
+                    const int64_t n_pools  = llama_kpool_n_pools((uint32_t) n_kv, kpool, ub.n_seqs_unq);
+
+                    CHECK(n_stream == 1 && ub.n_seqs_unq == 2,
+                            "a unified cache carries both sequences in one stream (n_seqs_unq %u)",
+                            ub.n_seqs_unq);
+
+                    ggml_init_params gp = { ggml_tensor_overhead()*16, nullptr, true };
+                    ggml_context * ctx = ggml_init(gp);
+
+                    kpool_tensors kt = alloc_kpool_tensors(ctx, n_kv, n_tps, n_tps, n_stream, kpool, n_pools);
+
+                    ggml_backend_t        backend = ggml_backend_cpu_init();
+                    ggml_backend_buffer_t buf     = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+                    if (buf) {
+                        // no cell_pool: the per-cell view has one row per stream, and a
+                        // cell two sequences share has nowhere to put its second pool
+                        llama_kv_cache_set_input_kpool(m2->get_mem_attn(),
+                                /* cell_pool */ nullptr, kt.pool_cells, kt.bias, kt.pool_bias,
+                                kt.sel_mask, kt.cand_mask, &ub, kpool);
+
+                        const int32_t * pc = (const int32_t *) kt.pool_cells->data;
+                        const float   * pb = (const float   *) kt.pool_bias->data;
+
+                        const auto & cells = m2->get_mem_attn()->get_cells(0);
+
+                        // the invariant the partitioning exists for: a pool the query may
+                        // spend budget on holds only that query's own visible cells. this
+                        // is what a shared cells array breaks if the map is per stream
+                        bool     own      = true;
+                        int64_t  n_finite = 0;
+                        std::map<int64_t, int> seq_mask_of_slot;
+
+                        for (int64_t ii = 0; ii < n_tps; ++ii) {
+                            const llama_seq_id sq = ub.seq_id[ii][0];
+                            const llama_pos    q  = ub.pos[ii];
+
+                            for (int64_t p = 0; p < n_pools; ++p) {
+                                if (pb[ii*n_pools + p] != 0.0f) {
+                                    continue;
+                                }
+
+                                n_finite++;
+                                seq_mask_of_slot[p] |= 1 << sq;
+
+                                for (int64_t m = 0; m < (int64_t) kpool; ++m) {
+                                    const int32_t c = pc[p*kpool + m];
+                                    own &= c >= 0 && c < n_kv && !cells.is_empty(c) &&
+                                           cells.seq_has(c, sq) && cells.pos_get(c) <= q;
+                                }
+                            }
+                        }
+
+                        CHECK(own && n_finite > 0,
+                                "every pool a query may select holds only that query's own visible cells (%d selectable (query, pool) pairs)",
+                                (int) n_finite);
+
+                        int mask_all = 0;
+                        bool disjoint = true;
+                        for (const auto & kv : seq_mask_of_slot) {
+                            mask_all |= kv.second;
+                            disjoint &= (kv.second & (kv.second - 1)) == 0;
+                        }
+
+                        CHECK(disjoint, "the two sequences get disjoint pool runs (%d slots in use of %d)",
+                                (int) seq_mask_of_slot.size(), (int) n_pools);
+                        CHECK(mask_all == 0x3, "both sequences own selectable pools, so neither run is empty");
+
+                        ggml_backend_buffer_free(buf);
+                    }
+
+                    ggml_backend_free(backend);
+                    ggml_free(ctx);
+                }
+            }
+        }
+
         delete raw;
+
+        // one sequence in flight stays the simple case: the shared cells array holds
+        // only its keys, and the map filters on seq_has anyway
+        cp.n_seq_max = 1;
+        llama_memory_i * raw1 = nullptr;
+        try {
+            raw1 = model->create_memory(mp, cp);
+        } catch (const std::exception &) {
+            raw1 = nullptr;
+        }
+        CHECK(raw1 != nullptr, "-kvu with a single sequence is still allowed");
+        delete raw1;
     }
 
     // ---- the indexer cache keeps its own dtype ------------------------------
@@ -439,7 +583,7 @@ int main(int argc, char ** argv) {
     cparams.n_ubatch     = 32;
     cparams.n_seq_max    = 2;
     cparams.n_rs_seq     = 0;
-    cparams.kv_unified   = false;   // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]
+    cparams.kv_unified   = false;   // one sequence per stream, the n_ps == 1 layout
     cparams.offload_kqv  = false;
     cparams.flash_attn   = false;
     cparams.causal_attn  = true;
