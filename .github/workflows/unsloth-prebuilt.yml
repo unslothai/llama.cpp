@@ -446,30 +446,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); prs=$PRS; source_artifact=${SRC_ARTIFACT:-none}; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
-      # Every pin merged. Merging cleanly is not the same as merging correctly,
-      # and the two ways it goes wrong both survive a full build, so the compile
-      # legs would not catch either:
-      #
-      #   - an architecture registered twice in a python tensor map. Python
-      #     keeps the last duplicate key silently, so the wrong mapping is used
-      #     and the model converts wrong.
-      #   - an arch arm made unreachable because an earlier fallthrough already
-      #     matches that arch. It compiles, and the model runs without whatever
-      #     that arm was meant to set up.
-      #
-      # Both were made by hand on 08-27. This runs before the source artifact is
-      # uploaded, so a model-affecting mis-resolution stops here rather than
-      # reaching 39 build jobs and shipping.
-      #
-      # A separate step, not more script inside `resolve`, because GitHub caps a
-      # single workflow string at 21000 characters and refuses to compile the
-      # whole file past it. That step is already at 20.5k, so the prose above
-      # alone was enough to break it: the run then reports as a zero-job failure
-      # with no annotation anywhere, and neither yaml parsing nor actionlint nor
-      # GitHub's own published parser sees a problem, because the limit is only
-      # enforced server-side. YAML comments outside a block scalar cost nothing
-      # against it. No step here sets working-directory, so this starts in the
-      # same $GITHUB_WORKSPACE the merge loop left behind.
+      # A bad pin resolution can still build fine, so it must be caught before the source artifact ships. See merge_checks.py.
+      # Its own step, not more script in `resolve`: GitHub caps one workflow string at 21000 chars and that step is near it. See check_workflow_scalars.py.
       - name: Check the merged tree for silently wrong resolutions
         if: ${{ env.MERGED_PINS == '1' }}
         run: |

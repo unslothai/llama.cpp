@@ -314,6 +314,45 @@ check("and the PR's own file is still superseded",
 check("the carry-only run still writes nothing",
       git(d5, "status", "--porcelain") == "", git(d5, "status", "--porcelain"))
 
+# A carry that takes the PR's content but changes the file mode. Content is
+# identical, so an oid-only comparison called it superseded and recommended a
+# rebuild, which drops the mode change.
+def mode_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    write(d, "tool.sh", "#!/bin/sh\necho base\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    git(d, "checkout", "-q", "-b", "pr")
+    write(d, "tool.sh", "#!/bin/sh\necho upstream v1\n")
+    git(d, "commit", "-qam", "pr c1")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry takes that content verbatim and makes it executable.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "tool.sh", "#!/bin/sh\necho upstream v1\n")
+    git(d, "add", "-A")
+    git(d, "update-index", "--chmod=+x", "tool.sh")
+    git(d, "commit", "-qm", "carry makes it executable")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d6, base6, head6, carry7 = mode_fixture()
+report6 = str(Path(tempfile.mkdtemp(prefix="cvr_")) / "report.json")
+r8 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry7, "--pr-ref", head6,
+                     "--base", base6, "--report", report6],
+                    cwd=d6, capture_output=True, text=True)
+check("runs clean on a mode-only carry change", r8.returncode == 0, r8.stderr)
+out6 = json.loads(Path(report6).read_text())
+check("a mode-only difference is not a vintage match",
+      "tool.sh" in out6["diverged"], json.dumps(out6, indent=1))
+check("a mode-only difference withholds the rebuild advice",
+      "Nothing diverges" not in r8.stdout, r8.stdout[-400:])
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")
 sys.exit(1 if FAILS else 0)

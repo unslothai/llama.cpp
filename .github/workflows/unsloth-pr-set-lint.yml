@@ -22,9 +22,9 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
-      # Every workflow, not just this one: the size guard below protects all of
-      # them, and it only protects them if editing one runs it.
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
+      - .github/workflows/*.yaml
   pull_request:
     paths:
       - scripts/unsloth/pr-set.json
@@ -35,9 +35,9 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
-      # Every workflow, not just this one: the size guard below protects all of
-      # them, and it only protects them if editing one runs it.
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
+      - .github/workflows/*.yaml
 
 permissions:
   contents: read
@@ -127,12 +127,7 @@ jobs:
           done
           exit "$fail"
 
-      # Separate from the tests above because it guards the workflows rather
-      # than the resolvers, and because it is the check that would have caught
-      # a break nothing else could see: a run: script over GitHub's 21000
-      # character limit makes the whole file uncompilable, and every run of it
-      # then fails with no jobs, no annotation and no usable error, while yaml,
-      # actionlint and GitHub's own published parser all pass it.
+      # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
       - name: Check no workflow string is near GitHub's size limit
         run: python3 scripts/unsloth/check_workflow_scalars.py --root .
 

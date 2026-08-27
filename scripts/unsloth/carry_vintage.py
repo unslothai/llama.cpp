@@ -47,9 +47,18 @@ def git(*args: str) -> str:
 
 
 def blob(rev: str, path: str) -> str | None:
-    r = subprocess.run(["git", "rev-parse", f"{rev}:{path}"],
+    """The tree entry as "mode oid", or None if the rev has no such path.
+
+    Mode, not just the oid: a carry that only chmods a file it took verbatim
+    has the same content as upstream, so an oid comparison calls it superseded
+    and a rebuild silently drops the mode change.
+    """
+    r = subprocess.run(["git", "ls-tree", "--full-tree", "-z", rev, "--", path],
                        capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    mode, _type, oid = r.stdout.split("\0")[0].split("\t", 1)[0].split()
+    return f"{mode} {oid}"
 
 
 def main() -> int:
