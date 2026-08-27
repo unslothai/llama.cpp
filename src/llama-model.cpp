@@ -2457,14 +2457,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
-                            // [TAG_KPOOL_NEEDS_ONE_SEQ_PER_STREAM]
-                            // the indexer pools cells by position and a unified cache
-                            // shares one cells array, so two sequences at the same
-                            // position would pool each other's keys. refuse here rather
-                            // than abort inside a set_input thousands of tokens in
-                            if (cparams.kv_unified && cparams.n_seq_max > 1) {
-                                throw std::runtime_error("glm5next: the pooled indexer needs one sequence per stream, so a unified KV cache is only supported with a single sequence");
-                            }
+                            // a unified cache is fine here: the pool map is per SEQUENCE,
+                            // not per stream. see [TAG_KPOOL_SEQ_PARTITION]
 
                             // only the DSA layers carry an indexer key cache
                             filter_idx = [&](uint32_t il) {
