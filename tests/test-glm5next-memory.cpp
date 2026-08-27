@@ -278,7 +278,25 @@ struct kpool_tensors {
     ggml_tensor * pool_bias  = nullptr;
     ggml_tensor * sel_mask   = nullptr;
     ggml_tensor * cand_mask  = nullptr;
+
+    // the same two masks in the type the graph actually allocates. the values are
+    // only ever 0.0f and -INFINITY, so f16 must reproduce f32 bit for bit
+    ggml_tensor * sel_mask_f16  = nullptr;
+    ggml_tensor * cand_mask_f16 = nullptr;
 };
+
+static bool kpool_mask_f16_matches(const ggml_tensor * f32, const ggml_tensor * f16) {
+    const float       * a = (const float       *) f32->data;
+    const ggml_fp16_t * b = (const ggml_fp16_t *) f16->data;
+
+    for (int64_t i = 0; i < ggml_nelements(f32); ++i) {
+        if (ggml_fp16_to_fp32(b[i]) != a[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 // The test asks for all six, including the two the pooled graph does not consume.
 // cell_pool and bias are the per-CELL spelling of the same predicate, computed by a
@@ -299,6 +317,12 @@ static kpool_tensors alloc_kpool_tensors(
     t.pool_bias  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, n_tps, n_stream);
     t.sel_mask   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_padq, 1, n_stream);
     t.cand_mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_padq, 1, n_stream);
+
+    t.sel_mask_f16  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_padq, 1, n_stream);
+    t.cand_mask_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_padq, 1, n_stream);
+
+    ggml_set_input(t.sel_mask_f16);
+    ggml_set_input(t.cand_mask_f16);
 
     ggml_set_input(t.cell_pool);
     ggml_set_input(t.pool_cells);
@@ -519,6 +543,17 @@ int main(int argc, char ** argv) {
                         CHECK(disjoint, "the two sequences get disjoint pool runs (%d slots in use of %d)",
                                 (int) seq_mask_of_slot.size(), (int) n_pools);
                         CHECK(mask_all == 0x3, "both sequences own selectable pools, so neither run is empty");
+
+                        // the masks are filled by one partition per sequence, each writing
+                        // the rows it owns into the shared stream buffer, so this is where
+                        // a wrong element width would cross partitions
+                        llama_kv_cache_set_input_kpool(m2->get_mem_attn(),
+                                /* cell_pool */ nullptr, kt.pool_cells, kt.bias, kt.pool_bias,
+                                kt.sel_mask_f16, kt.cand_mask_f16, &ub, kpool);
+
+                        CHECK(kpool_mask_f16_matches(kt.sel_mask,  kt.sel_mask_f16) &&
+                              kpool_mask_f16_matches(kt.cand_mask, kt.cand_mask_f16),
+                                "the f16 masks match the f32 ones across two sequences in one stream");
 
                         ggml_backend_buffer_free(buf);
                     }
@@ -896,6 +931,17 @@ int main(int argc, char ** argv) {
                 }
                 CHECK(finite, "bias, pool_bias, sel_mask and cand_mask hold only 0 and -INFINITY: "
                         "no +1e9 to meet a -inf");
+
+                // which is why the graph stores them in the KQ mask's f16 and halves
+                // two [n_kv, n_batch, n_stream] inputs. same fill, half the bytes
+                {
+                    llama_kv_cache_set_input_kpool(kv_attn, kt.cell_pool, kt.pool_cells, kt.bias, kt.pool_bias,
+                            kt.sel_mask_f16, kt.cand_mask_f16, &ub, (uint32_t) kpool);
+
+                    CHECK(kpool_mask_f16_matches(kt.sel_mask,  kt.sel_mask_f16) &&
+                          kpool_mask_f16_matches(kt.cand_mask, kt.cand_mask_f16),
+                            "an f16 sel_mask/cand_mask is the exact image of the f32 one");
+                }
 
                 // cand_mask is exactly max(bias, sel_mask) lifted to KQ shape, and it
                 // is what stops an over-budget top-k from escaping the reference's
@@ -1311,6 +1357,16 @@ int main(int argc, char ** argv) {
                         }
                         CHECK(pad_masked, "the %d padding rows of a wider sel_mask/cand_mask stay -INFINITY",
                                 (int) (n_padq - n_tps));
+                    }
+
+                    // the padding fill has its own code path per mask type
+                    {
+                        llama_kv_cache_set_input_kpool(kv, kt.cell_pool, kt.pool_cells, kt.bias, kt.pool_bias,
+                                kt.sel_mask_f16, kt.cand_mask_f16, &ub, (uint32_t) kpool);
+
+                        CHECK(kpool_mask_f16_matches(kt.sel_mask,  kt.sel_mask_f16) &&
+                              kpool_mask_f16_matches(kt.cand_mask, kt.cand_mask_f16),
+                                "the f16 masks match the f32 ones on a padded ubatch too");
                     }
 
                     // the shared object refills the same tensors deterministically.

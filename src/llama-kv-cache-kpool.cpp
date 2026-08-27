@@ -24,6 +24,50 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
     return std::min(n_pools, indexer_top_k/kpool);
 }
 
+// sel_mask and cand_mask hold only 0.0f and -INFINITY, so they can be written in the
+// KQ mask's f16 exactly as in f32
+template <typename T> struct kpool_mask_of;
+
+template <> struct kpool_mask_of<float> {
+    static float from(float v) { return v; }
+};
+
+template <> struct kpool_mask_of<ggml_fp16_t> {
+    static ggml_fp16_t from(float v) { return ggml_fp32_to_fp16(v); }
+};
+
+template <typename T>
+static void kpool_mask_fill(T * dst, int64_t n) {
+    std::fill(dst, dst + n, kpool_mask_of<T>::from(-INFINITY));
+}
+
+// one query's row of both masks; the two predicates share their operands, and the
+// unsigned compares are what let this vectorise
+template <typename T>
+static void kpool_mask_row(
+                T * cur_sel,
+                T * cur_cand,
+        const llama_pos * pos_at,
+        const int32_t   * pool_of,
+          int64_t   n_kv,
+        llama_pos   q,
+        llama_pos   tail_start,
+          int64_t   bo_vis) {
+    const T v_sel  = kpool_mask_of<T>::from(0.0f);
+    const T v_mask = kpool_mask_of<T>::from(-INFINITY);
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
+        const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
+        const bool tail   = pos_at[j] >= tail_start;
+
+        cur_sel [j] = vis && tail   ? v_sel : v_mask;
+        // max(bias, sel_mask): the reference's candidate set, which the
+        // top-k budget may overrun but must never escape
+        cur_cand[j] = vis && (pooled || tail) ? v_sel : v_mask;
+    }
+}
+
 void llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
               ggml_tensor    * cell_pool,
@@ -44,13 +88,13 @@ void llama_kv_cache_set_input_kpool(
     GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask  ->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(cand_mask ->buffer));
 
-    // sel_mask and cand_mask are KQ-mask shaped, and KQ masks are f16 under flash
-    // attention; writing floats into one would overrun the allocation 2x, so check
-    // rather than trust
+    // both masks are written through raw strides below, so writing the wrong width
+    // would overrun the allocation 2x. check rather than trust
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(pool_bias ->type == GGML_TYPE_F32);
-    GGML_ASSERT(sel_mask  ->type == GGML_TYPE_F32 && "sel_mask must be f32 even when the KQ mask is f16");
-    GGML_ASSERT(cand_mask ->type == GGML_TYPE_F32 && "cand_mask must be f32 even when the KQ mask is f16");
+    GGML_ASSERT((sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32) &&
+            "sel_mask must be f16 or f32");
+    GGML_ASSERT(cand_mask->type == sel_mask->type && "both masks must have the KQ mask's type");
 
     // everything below is written through raw strides
     GGML_ASSERT(ggml_is_contiguous(pool_cells));
@@ -110,8 +154,11 @@ void llama_kv_cache_set_input_kpool(
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
     float   * dst_bias       = bias ? (float *) bias->data : nullptr;
     float   * dst_pool_bias  = (float   *) pool_bias ->data;
-    float   * dst_sel_mask   = (float   *) sel_mask  ->data;
-    float   * dst_cand_mask  = (float   *) cand_mask ->data;
+    char    * dst_sel_mask   = (char    *) sel_mask  ->data;
+    char    * dst_cand_mask  = (char    *) cand_mask ->data;
+
+    const bool   mask_f16 = sel_mask->type == GGML_TYPE_F16;
+    const size_t mask_ts  = ggml_type_size(sel_mask->type);
 
     // -1 marks a cell with no usable pool. host side only: never copied into cell_pool,
     // where ggml_get_rows would read it as an index
@@ -132,8 +179,8 @@ void llama_kv_cache_set_input_kpool(
 
     for (int64_t s = 0; s < n_ns; ++s) {
         int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pools);
-        float   * cur_sel_mask   = dst_sel_mask   + s*(n_padq*n_kv);
-        float   * cur_cand_mask  = dst_cand_mask  + s*(n_padq*n_kv);
+        char    * cur_sel_mask   = dst_sel_mask   + s*(n_padq*n_kv)*mask_ts;
+        char    * cur_cand_mask  = dst_cand_mask  + s*(n_padq*n_kv)*mask_ts;
         float   * cur_pool_bias  = dst_pool_bias  + s*(n_tps*n_pools);
 
         // slots of a pool that is not resident, and slots outside the query's own
@@ -143,8 +190,13 @@ void llama_kv_cache_set_input_kpool(
         std::fill(cur_pool_bias,  cur_pool_bias  + n_tps*n_pools, -INFINITY);
 
         // the token loop writes rows < n_tps in full; only the padding rows need clearing
-        std::fill(cur_sel_mask  + n_tps*n_kv, cur_sel_mask  + n_padq*n_kv, -INFINITY);
-        std::fill(cur_cand_mask + n_tps*n_kv, cur_cand_mask + n_padq*n_kv, -INFINITY);
+        if (mask_f16) {
+            kpool_mask_fill((ggml_fp16_t *) (cur_sel_mask  + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+            kpool_mask_fill((ggml_fp16_t *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+        } else {
+            kpool_mask_fill((float *) (cur_sel_mask  + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+            kpool_mask_fill((float *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+        }
 
         // [TAG_KPOOL_PACK]
         // cut the stream's pool table into one run per sequence, sized on the pool range
@@ -313,20 +365,17 @@ void llama_kv_cache_set_input_kpool(
                 const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
 
                 float * cur_bias = dst_bias ? dst_bias + i*n_kv : nullptr;
-                float * cur_sel  = cur_sel_mask  + ii*n_kv;
-                float * cur_cand = cur_cand_mask + ii*n_kv;
+                char  * cur_sel  = cur_sel_mask  + ii*n_kv*mask_ts;
+                char  * cur_cand = cur_cand_mask + ii*n_kv*mask_ts;
 
-                // the unsigned compares fold "empty or another sequence" (pos_at -1) and "no
-                // usable pool" (pool_of -1) into the range test, which lets this vectorise
-                for (int64_t j = 0; j < n_kv; ++j) {
-                    const bool vis    = (uint32_t) pos_at [j] <= (uint32_t) q;
-                    const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
-                    const bool tail   = pos_at[j] >= tail_start;
-
-                    cur_sel [j] = vis && tail   ? 0.0f : -INFINITY;
-                    // max(bias, sel_mask): the reference's candidate set, which the
-                    // top-k budget may overrun but must never escape
-                    cur_cand[j] = vis && (pooled || tail) ? 0.0f : -INFINITY;
+                // the unsigned compares inside fold "empty or another sequence" (pos_at -1)
+                // and "no usable pool" (pool_of -1) into the range test
+                if (mask_f16) {
+                    kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
+                            pos_at.data(), pool_of.data(), n_kv, q, tail_start, bo_vis);
+                } else {
+                    kpool_mask_row((float *) cur_sel, (float *) cur_cand,
+                            pos_at.data(), pool_of.data(), n_kv, q, tail_start, bo_vis);
                 }
 
                 if (cur_bias) {

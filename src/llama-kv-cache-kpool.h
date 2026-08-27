@@ -120,7 +120,7 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 //       that slot at cell 0 to keep the gather in range, and the pool would then
 //       inherit cell 0's validity and compete for budget with a finite score.
 //
-//   sel_mask   F32 [n_kv, n_batch, 1, n_stream]  (KQ mask shape, may be padded)
+//   sel_mask   F16/F32 [n_kv, n_batch, 1, n_stream]  (KQ mask shape, may be padded)
 //       what the top-k scatter starts from, replacing the ggml_fill(kq_mask, -INFINITY)
 //       opening the DSA mask build in llm_graph_context::build_attn: 0.0f for the
 //       query's own incomplete trailing pool, which GLM always attends to
@@ -128,7 +128,7 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 //       Forcing the tail in here rather than through the score keeps the budget a whole
 //       number of pools.
 //
-//   cand_mask  F32 [n_kv, n_batch, 1, n_stream]  (KQ mask shape, may be padded)
+//   cand_mask  F16/F32 [n_kv, n_batch, 1, n_stream]  (KQ mask shape, may be padded)
 //       max(bias, sel_mask): the reference's candidate set, i.e. every cell it could
 //       return for this query. 0.0f in a complete visible pool OR in the query's own
 //       tail, else -INFINITY, padding rows included.
@@ -191,8 +191,8 @@ public:
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]
-    ggml_tensor * sel_mask   = nullptr;   // F32 [n_kv, n_batch, 1, n_stream]
-    ggml_tensor * cand_mask  = nullptr;   // F32 [n_kv, n_batch, 1, n_stream]
+    ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+    ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;

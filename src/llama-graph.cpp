@@ -3608,13 +3608,22 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
-        // f32 even under flash attention, where the KQ mask itself is f16: these
-        // are a scatter base and a mask addend, not the tensor the FA kernel sees
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tps, 1, n_stream);
+        // f16, not f32. The only two values either mask holds are 0.0f and
+        // -INFINITY, both exact in f16, so the narrower type is lossless and halves
+        // two [n_kv, n_tps, n_stream] inputs that live for the whole ubatch: 2 GiB
+        // each at n_ctx = 1 Mi, n_ubatch = 512.
+        //
+        // Every consumer takes f16. Under flash attention this is the KQ mask's own
+        // type, so build_attn_sparse adds the two with no conversion at all. With
+        // flash attention off - which GLM-5.3-Flash requires, so it is the path that
+        // matters here - the KQ mask is f32, and ggml_add gives its result src0's
+        // type: f16 + f32 -> f16 is a supported bin_bcast on CUDA and on the CPU,
+        // and ggml_soft_max_ext takes an f16 mask as readily as an f32 one
+        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_input(inp->sel_mask);
         ggml_set_name(inp->sel_mask, "kpool_sel_mask");
 
-        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tps, 1, n_stream);
+        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_input(inp->cand_mask);
         ggml_set_name(inp->cand_mask, "kpool_cand_mask");
     }
@@ -3653,7 +3662,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     const auto & kq_mask = inp->get_kq_mask();
 
-    GGML_ASSERT(sel_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(sel_mask->type == cand_mask->type);
     GGML_ASSERT(ggml_are_same_shape(sel_mask, cand_mask));
     GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
                 sel_mask->ne[3] == kq_mask->ne[3]);
@@ -3687,7 +3697,10 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     // top-k (through an over-budget pool whose unfilled slots point at it), and
     // scattering that cell's -inf score bias would leave the query attending to
     // nothing at all. Rejecting an over-budget selection is done additively,
-    // below, by cand_mask
+    // below, by cand_mask.
+    //
+    // f32 whatever mask_all is: ggml_set_rows converts its values into the
+    // destination, and the CUDA backend only advertises SET_ROWS for f32 values
     ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
 
@@ -3703,14 +3716,12 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     // candidates and the tail
     mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
 
-    // sel_mask and cand_mask are f32 by contract - llama_kv_cache_set_input_kpool
-    // writes floats through raw strides and refuses anything else - but the KQ
-    // mask is f16 whenever flash attention is on, which is the DEFAULT, and
-    // ggml_flash_attn_ext asserts its mask is f16. Cast rather than refuse: the
-    // only two values here are 0.0f and -INFINITY and both are exact in f16.
-    // Refusing instead aborts test-llama-archs, which runs with FA on
-    if (mask_top_k->type != kq_mask->type) {
-        mask_top_k = ggml_cast(ctx0, mask_top_k, kq_mask->type);
+    // ggml_add gives its result src0's type, so an f16 selection mask absorbs an
+    // f32 KQ mask and no cast is needed. The one direction that still needs one is
+    // an f32 mask meeting an f16 KQ mask: the add would yield f32 and
+    // ggml_flash_attn_ext asserts its mask is f16
+    if (mask_top_k->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
+        mask_top_k = ggml_cast(ctx0, mask_top_k, GGML_TYPE_F16);
     }
 
     // and finally re-apply causality, occupancy and padding. load bearing: it is
