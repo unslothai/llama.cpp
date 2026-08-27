@@ -457,14 +457,7 @@ llama_mmap_random_mode llama_mmap_random_mode_get() {
 }
 
 bool llama_mmap_random_prefetch_enabled() {
-    // on with the feature, so the batched readahead that pays for the random hints cannot be
-    // left off by accident. separate only so the two halves can be measured apart.
-    static const bool enabled = []() {
-        const char * env = getenv("LLAMA_MMAP_RANDOM_PREFETCH");
-        return env == nullptr ? true : strcmp(env, "0") != 0;
-    }();
-
-    return llama_mmap_random_mode_get() != LLAMA_MMAP_RANDOM_OFF && enabled;
+    return llama_mmap_random_mode_get() != LLAMA_MMAP_RANDOM_OFF;
 }
 
 static size_t llama_mmap_page_size() {
