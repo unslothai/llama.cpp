@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
