@@ -3608,6 +3608,15 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
+        // the fused lightning indexer wants an f16 mask. built here, once, because
+        // every indexer layer shares it
+        if (cparams.fused_lid) {
+            inp->pool_bias_f16 = ggml_cast(ctx0,
+                    ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
+                    GGML_TYPE_F16);
+            ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
+        }
+
         // f16, not f32. The only two values either mask holds are 0.0f and
         // -INFINITY, both exact in f16, so the narrower type is lossless and halves
         // two [n_kv, n_tps, n_stream] inputs that live for the whole ubatch: 2 GiB

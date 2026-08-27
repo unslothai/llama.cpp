@@ -236,6 +236,16 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
+    {
+        // escape hatch: the fused kernel sums the heads in a different order than the
+        // unfused graph, so a near-tied indexer top-k can come out different
+        const char * LLAMA_FUSED_LID_DISABLE = getenv("LLAMA_FUSED_LID_DISABLE");
+        if (LLAMA_FUSED_LID_DISABLE && atoi(LLAMA_FUSED_LID_DISABLE) != 0) {
+            cparams.fused_lid = false;
+            cparams.auto_flid = false;
+        }
+    }
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;

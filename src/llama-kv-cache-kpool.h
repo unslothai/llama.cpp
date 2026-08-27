@@ -191,6 +191,13 @@ public:
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]
+
+    // pool_bias in the shape and type the fused lightning indexer wants for its mask.
+    // A ggml_cast node, not an input: built once per graph rather than once per DSA
+    // layer, since every indexer layer shares the same mask. The cast is exact -
+    // pool_bias only ever holds 0.0f or -INFINITY. nullptr when the fused path is off
+    ggml_tensor * pool_bias_f16 = nullptr; // F16 [n_pools, n_tps, 1, n_stream]
+
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
 
