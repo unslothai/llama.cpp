@@ -2071,6 +2071,13 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("n_stream mismatch");
     }
 
+    // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
+    // resets all streams at once, so doing this per stream below would throw away the streams
+    // already read and leave only the last one
+    if (seq_id == -1) {
+        clear(true);
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
@@ -2344,8 +2351,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
-
-        clear(true);
 
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
