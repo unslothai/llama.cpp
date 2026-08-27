@@ -139,8 +139,23 @@ def merge_entry(i: int, b, o, t):
         return t                       # only theirs touched this entry
     if t == b:
         return o                       # only ours touched this entry
-    # Both sides touched it. Merge field-wise, so a repin on one side and a
-    # flag change on the other both survive, and refuse only the real clash.
+    # Both sides touched it. Merging field-wise is only meaningful while all
+    # three sides name the SAME PR. A repin moves the sha and keeps the
+    # identity, which is the case this is for. REPLACING the pin with another
+    # PR while the other side edits a field is not: base PR100(required=true),
+    # ours PR200, theirs PR100 required=false merges url from ours and
+    # required from theirs and yields PR200(required=false), so the release
+    # skips a PR nobody made optional and the driver still exits 0.
+    #
+    # Refused rather than resolved even when both sides agree on the
+    # replacement, because base then describes a different PR and every field
+    # comparison below is against settings that were never PR200's.
+    named = {ident(b), ident(o), ident(t)}
+    if len(named) != 1:
+        raise Ambiguous(
+            f"pin {i} names different PRs across the sides (base {ident(b)}, "
+            f"ours {ident(o)}, theirs {ident(t)}) and both sides edited it: "
+            "merging their fields would attach one PR's settings to another")
     out = merge_keys(f"pin {i}", fields(b), fields(o), fields(t))
     if "url" not in out:
         raise Ambiguous(f"pin {i} lost its url")

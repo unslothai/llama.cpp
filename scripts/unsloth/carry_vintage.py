@@ -65,7 +65,16 @@ def main() -> int:
 
     head = git("rev-parse", a.pr_ref)
     fork = git("merge-base", head, a.base)
-    files = [f for f in git("diff", "--name-only", fork, head).split("\n") if f]
+    # --no-renames, because rename detection hides exactly the path that
+    # matters here. `git diff --name-only` prints only the NEW name of a
+    # rename, so a PR moving `old` to `new` never puts `old` in this list. A
+    # carry that deliberately keeps `old` is then never looked at: `new` comes
+    # back SUPERSEDED, nothing diverges, and the summary says a rebuild is
+    # equivalent when a rebuild deletes the file the carry is holding. Without
+    # detection the rename is a delete plus an add, so `old` is classified --
+    # DIVERGED, since our copy is the fork's and matches no upstream vintage.
+    files = [f for f in git("diff", "--name-only", "--no-renames",
+                            fork, head).split("\n") if f]
     # fork..head, not head: `--max-count` caps the output, it does not bound
     # the walk, so a bare `head` runs straight past the fork point into the
     # base branch. A file our carry deliberately holds at the BASE version

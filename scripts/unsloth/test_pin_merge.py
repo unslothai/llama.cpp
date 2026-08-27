@@ -234,6 +234,31 @@ check("a same-position swap to a new PR is not a reorder", rc == 0, err)
 rc, pins, err = run(BASE_PINS, sub(BASE_PINS, 0, "1" * 40), sub(BASE_PINS, 3, "2" * 40))
 check("two repins at different positions still merge", rc == 0, err)
 
+# 22. a same-position swap to a different PR while the OTHER side edits that
+# entry's fields. Test 20's swap is safe only because nobody else touched the
+# entry; here both sides did, so the field-wise merge runs and takes the url
+# from one PR and `required` from another. Base A(required=true) with ours
+# swapping in B and theirs making A optional yielded B(required=false) and
+# exit 0, which makes the release skip a PR nobody made optional.
+two = [{"url": BASE_PINS[0], "required": True}, {"url": BASE_PINS[1], "required": True}]
+o = json.loads(json.dumps(two)); o[0]["url"] = f"{U}/999/commits/{'c' * 40}"
+t = json.loads(json.dumps(two)); t[0]["required"] = False
+rc, pins, err = run_objs(two, o, t)
+check("refuses a same-position PR swap the other side also edited", rc == 1,
+      json.dumps(pins) if pins else err)
+check("names both PRs in the refusal", "#999" in err and "#107" in err, err)
+check("never emits the swapped-in PR carrying the other's field",
+      pins is None or pins[0].get("required") is not False, json.dumps(pins))
+
+# 23. both sides swap position 0 to the SAME new PR but disagree on a field.
+# Base still describes the PR that is gone, so every field comparison below is
+# against settings that were never this PR's: refuse rather than pick one.
+o = json.loads(json.dumps(two)); o[0]["url"] = f"{U}/999/commits/{'c' * 40}"
+t = json.loads(json.dumps(two))
+t[0]["url"] = f"{U}/999/commits/{'c' * 40}"; t[0]["required"] = False
+rc, _, err = run_objs(two, o, t)
+check("refuses an agreed swap the sides disagree about", rc == 1, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all pin_merge tests passed")
 sys.exit(1 if FAILS else 0)

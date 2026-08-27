@@ -222,6 +222,53 @@ check("a file the carry really did take is still superseded",
 check("the late-touch run still writes nothing",
       git(d3, "status", "--porcelain") == "", git(d3, "status", "--porcelain"))
 
+# A PR that RENAMES a file while the carry deliberately keeps the old path.
+# `git diff --name-only` prints only the new name of a detected rename, so the
+# old path never entered the file list at all: the new path came back
+# SUPERSEDED, nothing diverged, and the summary recommended a rebuild -- which
+# deletes the path the carry is holding, unreported.
+def rename_fixture():
+    d = tempfile.mkdtemp(prefix="cv_")
+    git(d, "init", "-q", "-b", "main")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    # Long enough that git scores the move as a rename rather than add+delete.
+    write(d, "old.py", "".join(f"line {i}\n" for i in range(40)))
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    base = git(d, "rev-parse", "HEAD")
+
+    git(d, "checkout", "-q", "-b", "pr")
+    git(d, "mv", "old.py", "new.py")
+    git(d, "commit", "-qm", "pr renames it")
+    head = git(d, "rev-parse", "HEAD")
+
+    # The carry takes the new path AND keeps the old one, on purpose.
+    git(d, "checkout", "-q", "-b", "carry", base)
+    write(d, "new.py", "".join(f"line {i}\n" for i in range(40)))
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "carry keeps both")
+    return d, base, head, git(d, "rev-parse", "HEAD")
+
+
+d4, base4, head4, carry5 = rename_fixture()
+report4 = str(Path(tempfile.mkdtemp(prefix="cvr_")) / "report.json")
+r6 = subprocess.run([sys.executable, str(SCRIPT), "--carry", carry5, "--pr-ref", head4,
+                     "--base", base4, "--report", report4],
+                    cwd=d4, capture_output=True, text=True)
+check("runs clean on a renaming PR", r6.returncode == 0, r6.stderr)
+out4 = json.loads(Path(report4).read_text())
+check("the old side of a rename is scanned at all",
+      "old.py" in out4["diverged"] + out4["absent"] + out4["omitted"]
+      or any(e["path"] == "old.py" for e in out4["superseded"]),
+      json.dumps(out4, indent=1))
+check("a retained old path is reported as diverged, not silently dropped",
+      "old.py" in out4["diverged"], json.dumps(out4, indent=1))
+check("a rename does not license the rebuild advice",
+      "Nothing diverges" not in r6.stdout, r6.stdout[-400:])
+check("the renaming run still writes nothing",
+      git(d4, "status", "--porcelain") == "", git(d4, "status", "--porcelain"))
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all carry_vintage tests passed")
 sys.exit(1 if FAILS else 0)
