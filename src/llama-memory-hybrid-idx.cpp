@@ -249,8 +249,12 @@ static void ple_hist_truncate(llama_memory_hybrid_idx::ple_history & h, llama_po
 
 void llama_memory_hybrid_idx::ple_hist_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id < 0) {
-        for (auto & it : ple_hist) {
-            ple_hist_rm(it.first, p0, p1);
+        // the recursive call erases seq_id's entry when the whole sequence is removed, so
+        // advance past it first: erase invalidates only the iterator to the erased element
+        for (auto it = ple_hist.begin(); it != ple_hist.end(); ) {
+            const llama_seq_id id = it->first;
+            ++it;
+            ple_hist_rm(id, p0, p1);
         }
         return;
     }
@@ -433,9 +437,9 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
         io.read(&next_pos, sizeof(next_pos));
         io.read(&n_toks,   sizeof(n_toks));
 
-        // the window is never longer than ple_ngram_size - 1, so a larger count is a corrupt
-        // blob and would size an allocation from the file
-        if (n_toks > 64) {
+        // the window is never longer than ple_ngram_size - 1; anything else is a corrupt or
+        // mismatched blob, and reading it would size an allocation from the file
+        if (n_toks > LLAMA_MAX_PLE_NGRAM - 1) {
             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
         }
 
