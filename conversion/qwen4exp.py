@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, cast
 
 import torch
 from torch import Tensor
@@ -169,7 +169,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             dtype=np.float32,
         )
         gguf_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
-        return [(gguf_name + ".weight", table)]
+        return [(gguf_name + ".weight", cast(Tensor, table))]
 
     def _load_ple_shard(self, name: str):
         def load() -> np.ndarray:
