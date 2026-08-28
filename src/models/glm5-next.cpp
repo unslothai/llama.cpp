@@ -157,8 +157,15 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.indexer_proj       = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,       "weight", i), {n_embd, n_indexer_head}, iflags);
             layer.indexer_attn_k     = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,     "weight", i), {n_embd, n_embd_indexer}, iflags);
             layer.indexer_attn_q_b   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B,   "weight", i), {q_lora_rank, n_indexer_head * n_embd_indexer}, iflags);
-            layer.indexer_kpool_gate = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_GATE, "weight", i), {n_embd, n_embd_indexer}, iflags);
-            layer.indexer_kpool_ape  = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_APE,  "weight", i), {n_embd_indexer, kpool}, iflags);
+            layer.indexer_kpool_gate = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_GATE, "weight", i), {n_embd, n_embd_indexer}, iflags | TENSOR_NOT_REQUIRED);
+            if (layer.indexer_kpool_gate == nullptr) {
+                layer.indexer_kpool_gate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, n_embd_indexer}, iflags);
+            }
+
+            layer.indexer_kpool_ape = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_APE, "weight", i), {n_embd_indexer, kpool}, iflags | TENSOR_NOT_REQUIRED);
+            if (layer.indexer_kpool_ape == nullptr) {
+                layer.indexer_kpool_ape = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE, "weight", i), {n_embd_indexer, kpool}, iflags);
+            }
         }
 
         if (i < (int) hparams.n_layer_dense_lead) {
