@@ -55,6 +55,15 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // true if [ptr, ptr + len) is inside this mapping
+    bool contains(const void * ptr, size_t len) const;
+
+    // start reading the given rows of a tensor in this mapping, in one batch.
+    // lazy ranges are MADV_RANDOM, which turns kernel readahead off, so without this a
+    // sparse gather costs one synchronous fault per row. hints only, never changes results.
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const;
+
     static const bool SUPPORTED;
 
 private:

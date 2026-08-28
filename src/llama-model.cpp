@@ -2180,6 +2180,19 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+void llama_model::prefetch_rows(const ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+    if (t == nullptr || t->data == nullptr || n_rows == 0) {
+        return;
+    }
+
+    for (const auto & mapping : pimpl->mappings) {
+        if (mapping->contains(t->data, ggml_nbytes(t))) {
+            mapping->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+            return;
+        }
+    }
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
