@@ -408,10 +408,27 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_build_forward_expand(gf, cur);
 }
 
+// same as llm_graph_input_embd, but also hints the per-layer table rows this batch reads.
+// the table can stay on disk (TENSOR_READ_LAZY), where a gather is one fault per token
+class llm_graph_input_embd_per_layer : public llm_graph_input_embd {
+public:
+    llm_graph_input_embd_per_layer(int64_t n_embd, const llama_model & model) :
+        llm_graph_input_embd(n_embd), model(model) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        if (ubatch->token) {
+            model.prefetch_rows(model.per_layer_tok_embd, ubatch->token, ubatch->n_tokens);
+        }
+        llm_graph_input_embd::set_input(ubatch);
+    }
+
+    const llama_model & model;
+};
+
 // equivalent to get_per_layer_inputs() in python code
 // output shape: [n_embd_per_layer, n_layer, n_tokens]
 ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_per_layer>(n_embd, model);
 
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_per_layer);
