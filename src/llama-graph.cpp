@@ -3574,19 +3574,11 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
     if (scoring) {
         const int64_t n_kv = mctx_attn->get_n_kv();
 
-        // spelled exactly as build_attn_inp_kq_mask spells it, so that sel_mask,
-        // cand_mask and the KQ mask are the same shape and add without a
-        // broadcast. get_n_stream() is the cache's stream RANGE and is a
-        // different number as soon as a server has non-contiguous slots busy
+        // must match build_attn_inp_kq_mask; get_n_stream() is the stream RANGE and is wrong
         const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
         const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
-        // one pool map per SEQUENCE. a non-unified cache has one sequence per stream, a
-        // unified cache puts every sequence of the ubatch in stream 0 and cuts the
-        // stream's pool table into one run per sequence, so the table needs the rebasing
-        // slack once per sequence. sized on the ubatch and not on n_seq_max, which
-        // llama-embedding sets to 256; n_seqs_unq is already part of
-        // llm_graph_params::allow_reuse, so the shape holds while a graph is reused
+        // pool maps are per SEQUENCE; sized on the ubatch, not n_seq_max (256 in llama-embedding)
         const int64_t n_ps = (int64_t) ubatch.n_seqs_unq/n_stream;
 
         GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
@@ -3595,9 +3587,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 
-        // this tree's build_attn_inp_kq_mask has no GGML_KQ_MASK_PAD, so the mask
-        // is exactly n_tps rows. the host side supports n_padq > n_tps, the graph
-        // below does not: the selection terms only exist for real queries
+        // the selection terms below exist only for real queries
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
         inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
@@ -3608,8 +3598,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
-        // the fused lightning indexer wants an f16 mask. built here, once, because
-        // every indexer layer shares it
+        // the fused indexer wants f16; built once, shared by every indexer layer
         if (cparams.fused_lid) {
             inp->pool_bias_f16 = ggml_cast(ctx0,
                     ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
@@ -3617,17 +3606,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
         }
 
-        // f16, not f32. The only two values either mask holds are 0.0f and
-        // -INFINITY, both exact in f16, so the narrower type is lossless and halves
-        // two [n_kv, n_tps, n_stream] inputs that live for the whole ubatch: 2 GiB
-        // each at n_ctx = 1 Mi, n_ubatch = 512.
-        //
-        // Every consumer takes f16. Under flash attention this is the KQ mask's own
-        // type, so build_attn_sparse adds the two with no conversion at all. With
-        // flash attention off - which GLM-5.3-Flash requires, so it is the path that
-        // matters here - the KQ mask is f32, and ggml_add gives its result src0's
-        // type: f16 + f32 -> f16 is a supported bin_bcast on CUDA and on the CPU,
-        // and ggml_soft_max_ext takes an f16 mask as readily as an f32 one
+        // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
         inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_input(inp->sel_mask);
         ggml_set_name(inp->sel_mask, "kpool_sel_mask");
@@ -3677,20 +3656,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
                 sel_mask->ne[3] == kq_mask->ne[3]);
 
-    // The dense DSA path (build_attn on llm_graph_input_attn_k_dsa) opens with
-    // ggml_fill(kq_mask, -INFINITY). Here the scatter starts from sel_mask
-    // instead, which already holds 0.0 on the query's own trailing incomplete
-    // pool: GLM always attends to that tail (index_kpool_always_select_tail), and
-    // keeping it out of the top-k budget is what lets the budget stay a whole
-    // number of pools.
-    //
-    // ggml_set_rows writes THROUGH to its destination and returns a view of it,
-    // and sel_mask is one shared per-ubatch input read by every indexer layer.
-    // Scattering into it directly makes each layer inherit the previous layer's
-    // unmasked cells: measured on TinySparse, layer 3 stayed inside its budget
-    // while layer 7, running second, reached 411 cells. The dense path never
-    // meets this because ggml_fill hands it a fresh tensor every layer. Take a
-    // private copy per layer.
+    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
     ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
 
     // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
@@ -3701,15 +3667,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
             top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
 
-    // A constant 0, never the cell's own bias. The scatter must not be able to
-    // ERASE a zero sel_mask already granted: a tail cell can also be named by the
-    // top-k (through an over-budget pool whose unfilled slots point at it), and
-    // scattering that cell's -inf score bias would leave the query attending to
-    // nothing at all. Rejecting an over-budget selection is done additively,
-    // below, by cand_mask.
-    //
-    // f32 whatever mask_all is: ggml_set_rows converts its values into the
-    // destination, and the CUDA backend only advertises SET_ROWS for f32 values
+    // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
+    // tail (cand_mask rejects over-budget picks below). f32: CUDA only does SET_ROWS for f32
     ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
 
@@ -3719,23 +3678,15 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     mask_top_k = ggml_view_4d(ctx0, mask_top_k, mask_top_k->ne[1], mask_top_k->ne[2], 1, mask_top_k->ne[3],
             mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
 
-    // the reference's `selected_valid` gather, additively: a cell the top-k named
-    // that is not in the reference's candidate set goes back to -inf, and a tail
-    // cell that sel_mask granted stays at 0 because cand_mask is the UNION of the
-    // candidates and the tail
+    // the reference's `selected_valid` gather, additively; cand_mask is candidates UNION tail
     mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
 
-    // ggml_add gives its result src0's type, so an f16 selection mask absorbs an
-    // f32 KQ mask and no cast is needed. The one direction that still needs one is
-    // an f32 mask meeting an f16 KQ mask: the add would yield f32 and
-    // ggml_flash_attn_ext asserts its mask is f16
+    // ggml_flash_attn_ext asserts an f16 mask, and ggml_add would yield src0's f32
     if (mask_top_k->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
         mask_top_k = ggml_cast(ctx0, mask_top_k, GGML_TYPE_F16);
     }
 
-    // and finally re-apply causality, occupancy and padding. load bearing: it is
-    // what keeps an empty, future or foreign-sequence cell masked no matter what
-    // the top-k returned
+    // load bearing: keeps an empty, future or foreign-sequence cell masked whatever top-k said
     mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
     cb(mask_top_k, "kpool_kq_mask", il);
 

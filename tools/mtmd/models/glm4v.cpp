@@ -42,8 +42,7 @@ ggml_cgraph * clip_graph_glm4v::build() {
     cb(inp, "patch_bias", -1);
 
     // pos-conv norm
-    // Note: GLM-OCR does not have a post-conv norm, and build_norm still normalizes when the
-    // weight is null, so the whole call must be skipped rather than just the affine scale
+    // GLM-OCR has none, and build_norm still normalizes on a null weight, so skip the call
     if (model.norm_embd_w != nullptr) {
         inp = build_norm(inp, model.norm_embd_w, model.norm_embd_b, norm_t, eps, -1);
     }

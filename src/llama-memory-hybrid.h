@@ -40,8 +40,7 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-                            /* optional per-token indexer key cache for sparse-attention
-                               hybrids; absent unless filter_idx is given */
+                            /* optional indexer key cache; absent unless filter_idx */
     const layer_filter_cb & filter_idx  = nullptr,
                 ggml_type   type_idx    = GGML_TYPE_F16);
 
@@ -91,8 +90,6 @@ public:
 private:
     const llama_hparams & hparams;
 
-    // indexer cache geometry: n_head_kv key heads of indexer_head_size, as
-    // llama_kv_cache_dsa builds its own
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
@@ -121,8 +118,6 @@ public:
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches,
-                            // empty without an indexer. the indexer is addressed by the
-                            // attention cache's cells, so it gets that cache's slots
                   slot_info_vec_t   sinfos_idx = {});
 
     ~llama_memory_hybrid_context() = default;

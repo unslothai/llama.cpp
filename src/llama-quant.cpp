@@ -350,27 +350,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize relative position bias (T5)
     quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
-    // glm5next: small, precision-sensitive tensors that must stay at source
-    // precision -- the mHC residual mixers, the lightning indexer (selection gate,
-    // learned k-pool position table, and the three indexer projections) and the KDA
-    // recurrence gates. ~1 GiB total on GLM-5.3-Flash, so the size cost is noise
-    // against a 100-240 GB quant, while quantizing them perturbs *which* pools the
-    // indexer selects and *how much* state each KDA step retains -- errors that
-    // compound over a sequence instead of averaging out.
-    //
-    // Note both spellings are required. The compressor tensors came in with the
-    // DeepSeek-V4 merge and are named with an UNDERSCORE (indexer_compressor_ape /
-    // _gate), while the projections use a DOT (indexer.proj / .attn_k / .attn_q_b).
-    // A single "indexer." prefix test silently misses the compressor pair.
-    //
-    // Deliberately NOT listed: attn_q_a / attn_kv_a_mqa / attn_k_b / attn_v_b. They
-    // are precision-sensitive too, but our release recipe pins them to q8_0 via
-    // --tensor-type, and that is the configuration the shipped quants were measured
-    // in (KLD 0.027 at Q5_K_XL). Forcing them full precision here would change quant
-    // sizes and invalidate those measurements.
-    //
-    // indexer.k_norm.weight needs no entry -- the generic "_norm.weight" rule above
-    // already excludes it.
+    // glm5next: quantizing these perturbs pool selection and KDA state retention, errors that
+    // compound over a sequence, for ~1 GiB. note the compressor tensors spell it with an
+    // UNDERSCORE and the projections with a DOT, so one "indexer." prefix test is not enough
     if (arch == LLM_ARCH_GLM5NEXT) {
         static const char * const glm5next_full_precision[] = {
             "hc_attn_fn",

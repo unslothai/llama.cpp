@@ -1173,10 +1173,8 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // llm_build_delta_net_base is a method-only mixin over llm_graph_context (no data
-    // members, no new virtuals), so this graph's layout and behaviour are unchanged.
-    // deepseek4 has no recurrent layers; it is here so glm5next, which derives from
-    // this graph for the mHC residual, can reach build_delta_net for its KDA layers
+    // method-only mixin; here only so glm5next, deriving from this graph, reaches
+    // build_delta_net. deepseek4 itself has no recurrent layers
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
@@ -1299,7 +1297,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * comb,
                 int il) const;
 
-        // unweighted mean over the streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
         static ggml_tensor * build_hc_mean(
                 ggml_context * ctx,
                 ggml_tensor  * x);
@@ -1345,9 +1342,7 @@ struct llama_model_glm5next : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // glm5next's mHC is DeepSeek-V4's hyper-connection block (same wide residual,
-    // 24-row mixer split, activations, Sinkhorn); only the final collapse differs
-    // (unweighted mean, not a learned gated head), so derive rather than restate
+    // glm5next's mHC is DeepSeek-V4's block, collapsed by unweighted mean, not a gated head
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
@@ -1366,11 +1361,7 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il);
 
-        // `scoring` false keeps the dense path: at or below
-        // index_topk + index_kpool - 1 resident positions the indexer selects
-        // every visible position, so dense is not an approximation there, it is
-        // the same function without the pooling work. The indexer STORE still
-        // runs; only the selection is skipped
+        // `scoring` false keeps the dense path, the same function below n_select
         ggml_tensor * build_dsa_layer(
                 const llama_layer & layer,
                 llm_graph_input_attn_k * inp_attn,
@@ -1379,10 +1370,7 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il) const;
 
-        // writes this layer's indexer key and compressor gate into the indexer
-        // cache - always - and then, when `scoring`, returns the I32 attention
-        // cache CELL indices this layer's queries select, already expanded from
-        // whole pools: [kpool*select_k, n_tps, n_stream]
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices
         ggml_tensor * build_indexer(
                 const llama_layer & layer,
                 llm_graph_input_kpool * inp_kp,

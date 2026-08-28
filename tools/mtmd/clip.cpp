@@ -686,9 +686,7 @@ ggml_tensor * clip_graph::build_ffn(
             } break;
         case FFN_SILU_CLAMP:
             {
-                // the gate is bounded above only, the up projection on both sides, and both
-                // before the activation. ggml_swiglu_oai clamps the same way but then adds
-                // one to the up branch, which is a gpt-oss detail this model does not share
+                // not ggml_swiglu_oai: it clamps the same way but adds one to the up branch
                 GGML_ASSERT(gate && "FFN_SILU_CLAMP is a gated activation");
                 const float limit = hparams.swiglu_limit;
                 GGML_ASSERT(limit > 0.0f);
@@ -1749,16 +1747,13 @@ struct clip_model_loader {
                     {
                         hparams.rope_theta = 10000.0f;
                         hparams.n_merge = 2;
-                        // the reference asks for BICUBIC (resample = PILImageResampling.BICUBIC);
-                        // the bilinear here came from the GLM-4V case this was copied from. neither
-                        // filter matches torchvision's exactly, so this is closer in kind, not exact
+                        // the reference asks for PILImageResampling.BICUBIC, which this only approximates
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        // drives the clamp in both the per-block MLP and the merger
                         get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
                         hparams.ffn_op = FFN_SILU_CLAMP;
                         log_ffn_op = "silu_clamp";
-                        // min_pixels/max_pixels of the GLM-5.3-Flash preprocessor, in tokens
+                        // the preprocessor's min_pixels/max_pixels, in tokens
                         hparams.set_limit_image_tokens(16, 8000);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;

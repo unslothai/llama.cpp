@@ -69,15 +69,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr
     )),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // MQA with one key head of indexer_head_size, as llama_kv_cache_dsa shapes its
-        // lightning-indexer cache. n_embd_head_k_full is what n_embd_head_k(il) reads
-        // for a non-SWA layer, so an MLA model still has is_mla() true here, which
-        // suppresses the V allocation the indexer does not need.
-        //
-        // a *pooling* indexer (indexer_kpool > 0, glm5next only) needs a second head:
-        // its compressor gate is a projection of the same hidden state, so it must be
-        // cached alongside the key or the pool cannot be rebuilt once the member tokens
-        // leave the batch. every other arch leaves indexer_kpool 0 and is unchanged.
+        // a *pooling* indexer (indexer_kpool > 0, glm5next only) needs a second head for
+        // the compressor gate, or the pool cannot be rebuilt once its tokens leave the
+        // batch. every other arch leaves indexer_kpool 0 and is unchanged.
         const uint32_t n_head_idx = model.hparams.indexer_kpool > 0 ? 2 : 1;
 
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), n_head_idx);
@@ -143,10 +137,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer is a side buffer addressed by the attention cache's cells, so it
-        // takes that slot layout rather than finding its own: allocating separately lets
-        // the two drift apart when the context is rewritten between turns, and the top-k
-        // indices, read against the attention mask, would then point at the wrong cells
+        // the indexer takes the attention cache's slot layout rather than finding its
+        // own: allocated separately the two drift apart when the context is rewritten
+        // between turns, and the top-k indices would then point at the wrong cells
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
@@ -241,8 +234,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
-        // indexer keys are not recomputable from the attention cache, so a restored
-        // session that skipped them would select the wrong cells
+        // indexer keys are not recomputable; skipping them here misselects on restore
         if (mem_idx) mem_idx->state_write(io, seq_id, flags);
     }
     mem_recr->state_write(io, seq_id, flags);
@@ -283,11 +275,10 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
                        bool   optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
-    // indexer keys carry no positional encoding, so a shift has nothing to correct in
-    // them, but the pending per-cell delta must still be cleared or the two caches
-    // disagree about whether a shift is outstanding. an indexer only exists for
-    // LLAMA_ROPE_TYPE_NONE archs, which is exactly when llama_kv_cache::update skips the
-    // K-shift graph and does only that
+    // indexer keys carry no positional encoding, but the pending per-cell delta must
+    // still be cleared or the two caches disagree about whether a shift is outstanding.
+    // safe because an indexer only exists for LLAMA_ROPE_TYPE_NONE archs, where
+    // llama_kv_cache::update skips the K-shift graph and does only that
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr : mem->get_mem_idx()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -332,7 +323,7 @@ bool llama_memory_hybrid_context::apply() {
         res = res & ctx_idx->apply();
 
         // a top-k over indexer cells is meaningful only if both caches cover the same
-        // window. only the batch context has slot infos to compare
+        // window
         if (!ubatches.empty()) {
             GGML_ASSERT(get_idx()->get_n_kv()     == get_attn()->get_n_kv());
             GGML_ASSERT(get_idx()->get_n_stream() == get_attn()->get_n_stream());

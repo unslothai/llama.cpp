@@ -1588,8 +1588,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
 // mtmd_image_preprocessor_glm5next
 //
 
-// for a still image the reference's temporal_factor cancels on both sides of its budget comparison,
-// leaving a plain pixel area against image_min_pixels / image_max_pixels (n_tokens * factor**2)
+// for a still image the reference's temporal_factor cancels out, leaving pixel area vs min/max
 clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparams & hparams, const clip_image_size & size) {
     const int factor = hparams.patch_size * hparams.n_merge;
     GGML_ASSERT(factor > 0);
@@ -1598,7 +1597,7 @@ clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparam
     const int height = size.height;
     const int width  = size.width;
     if (height <= 0 || width <= 0) {
-        // an empty bitmap is reachable through the public API, same tolerance as calc_size_preserved_ratio
+        // an empty bitmap is reachable through the public API
         return { 0, 0 };
     }
 
@@ -1612,7 +1611,6 @@ clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparam
     int aligned_height = align(height);
     int aligned_width  = align(width);
 
-    // upscale an image that is too small to spend the minimum token budget
     if ((int64_t) aligned_height * aligned_width < min_pixels) {
         const double scale = std::sqrt((double) min_pixels / ((double) height * (double) width));
         aligned_height = align(std::max<int64_t>(1, (int64_t) std::ceil(height * scale)));
@@ -1620,8 +1618,7 @@ clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparam
     }
 
     if ((int64_t) aligned_height * aligned_width > max_pixels) {
-        // binary search the tallest content height whose aligned canvas still fits the budget. the Qwen
-        // sqrt(area / max_pixels) scale leaves budget unspent: aligning both edges is not monotone in it
+        // aligning both edges is not monotone in the Qwen sqrt(area / max_pixels) scale, so search
         int low  = 1;
         int high = height;
         aligned_height = factor;
@@ -1657,7 +1654,7 @@ mtmd_image_preprocessor_glm5next::geometry mtmd_image_preprocessor_glm5next::get
 
     double scale = std::min((double) canvas.height / height, (double) canvas.width / width);
     if ((int64_t) height * (int64_t) width >= hparams.image_min_pixels) {
-        // an image already spending the minimum budget is only shrunk, never upscaled to fill the canvas
+        // already spending the minimum budget, so shrink only, never upscale to fill the canvas
         scale = std::min(1.0, scale);
     }
 

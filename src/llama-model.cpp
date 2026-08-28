@@ -2434,8 +2434,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    // null for every arch but the sparse-attention ones, which is what
-                    // keeps the indexer cache from existing
+                    // null except for sparse attention, which keeps the indexer cache from existing
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     ggml_type type_idx = GGML_TYPE_F16;
                     if (arch == LLM_ARCH_FALCON_H1) {
@@ -2457,17 +2456,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
-                            // a unified cache is fine here: the pool map is per SEQUENCE,
-                            // not per stream. see [TAG_KPOOL_SEQ_PARTITION]
+                            // unified is fine, the pool map is per SEQUENCE. see [TAG_KPOOL_SEQ_PARTITION]
 
                             // only the DSA layers carry an indexer key cache
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
 
-                            // the gate cached next to the key feeds a softmax, so -ctk
-                            // q8_0 would quantise something far more sensitive than a
-                            // key. keep the indexer float
+                            // the gate cached beside the key feeds a softmax, unlike -ctk q8_0's target
                             type_idx = params.type_k;
                             if (ggml_is_quantized(type_idx)) {
                                 LLAMA_LOG_WARN("%s: indexer key cache stays %s rather than %s: it also holds the compressor gates\n",
@@ -2478,9 +2474,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        // llama_memory_hybrid_iswa has no indexer cache; glm5next is
-                        // swa_type NONE, but a sparse hybrid with SWA would silently
-                        // lose its indexer
+                        // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
 
                         // Use hybrid-iswa for hybrid models with SWA
