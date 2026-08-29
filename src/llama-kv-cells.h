@@ -35,6 +35,8 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -301,6 +303,15 @@ public:
         return seq[i].count();
     }
 
+    // the whole set of sequences occupying the cell. Two cells that carry the
+    // same set are visible to exactly the same sequences, which is what lets a
+    // caller group cells without having to test one sequence at a time.
+    const seq_set_t & seq_set(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
@@ -509,8 +520,6 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
-
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;

@@ -50,6 +50,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // the cached indexer keys are raw: rotation happens after pooling, at read time
+        // so a K-shift must not rotate them, while the stream copies in the same update still apply
+        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
+
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
@@ -295,7 +299,11 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                   llama_context * lctx,
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem) {}
+    mem(mem),
+    // llama_kv_cache::update() is what applies a pending cross-stream seq_cp to the key buffer
+    // without this the copied sequence keeps the destination stream's old indexer keys
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        mem->get_mem_idx()->init_update(lctx, optimize)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -366,19 +374,38 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
-    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
-    // all mrope sections carry it: exact for text, approximate for images
-    for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_ns; ++s) {
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
-            }
-        }
-    }
+    // a block is r cells one sequence holds at consecutive indices, so it is keyed on
+    // (sequence set, index bucket). A unified cache shares one cells array between all
+    // sequences and every sequence counts positions from zero, so the bucket alone pools
+    // different sequences into one block. Cells with the same sequence set are visible to
+    // the same sequences, so that set is the coarsest key that never mixes two of them.
+    // A bucket whose cells disagree on the set splits into short groups, and a short group
+    // is dropped like the partial tail block.
+    //
+    // The index is the position, except that mrope gives every token of one image the same
+    // position. The cells are then ranked in sequence order and keyed on the rank instead.
+    GGML_ASSERT(r <= 64);
+    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
-    // one pass per stream: cell j is a different token in each, so no mapping is shared
-    std::vector<int32_t> blk_of(n_kv);
-    std::vector<int32_t> filled(n_blocks);
+    // only complete groups get an id, and a complete group owns r distinct cells, so at
+    // most n_kv/r ids are needed and no tensor changes shape
+    std::vector<int32_t>  blk_of(n_kv);
+    std::vector<int32_t>  cell_grp(n_kv);
+    std::vector<int32_t>  grp_head(n_blocks);
+    std::vector<int32_t>  grp_next;
+    std::vector<int32_t>  grp_first;
+    std::vector<int32_t>  grp_slot0;  // the cell in slot 0, which carries the block's rope position
+    std::vector<uint64_t> grp_slots;
+    std::vector<int32_t>  grp_bid;
+    std::vector<int32_t>  bid_idx;    // first index of the block
+    std::vector<int32_t>  bid_cell;   // one cell of the block, carries its sequence set
+    std::vector<int32_t>  bid_slot0;
+
+    // only used when the positions repeat
+    std::vector<int32_t> order;
+    std::vector<int32_t> rank;
+
+    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
@@ -388,52 +415,231 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
-        // an incomplete block cannot be pooled; the bias below forces those tail cells in
-        // -1 means no usable block, and block 0 only keeps the gather in range
-        std::fill(blk_of.begin(),  blk_of.end(),  -1);
-        std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+
+        bid_idx  .clear();
+        bid_cell .clear();
+        bid_slot0.clear();
+
+        // cells that all carry one sequence cannot mix, so skip the set test there
+        int n_seq_present = 0;
+
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_seq_present++;
+            }
+        }
+
+        const bool one_seq = n_seq_present <= 1;
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j)) {
-                continue;
+        // two cells of one group wanted the same slot, so the index does not name them apart
+        bool dup = false;
+
+        bool ranked = false;
+
+        auto group_cells = [&]() {
+            // an incomplete block cannot be pooled; the bias below forces those tail cells in
+            // -1 means no usable block
+            std::fill(blk_of.begin(),   blk_of.end(),   -1);
+            std::fill(cell_grp.begin(), cell_grp.end(), -1);
+            std::fill(grp_head.begin(), grp_head.end(), -1);
+
+            grp_next .clear();
+            grp_first.clear();
+            grp_slot0.clear();
+            grp_slots.clear();
+            grp_bid  .clear();
+
+            oor = false;
+            dup = false;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                const int64_t pb  = idx/r;
+
+                if (pb >= n_blocks) {
+                    oor = true;
+                    continue;
+                }
+
+                int32_t g = -1;
+
+                for (int32_t c = grp_head[pb]; c >= 0; c = grp_next[c]) {
+                    if (one_seq || cells.seq_set((uint32_t) grp_first[c]) == cells.seq_set((uint32_t) j)) {
+                        g = c;
+                        break;
+                    }
+                }
+
+                if (g < 0) {
+                    g = (int32_t) grp_first.size();
+
+                    grp_next .push_back(grp_head[pb]);
+                    grp_first.push_back((int32_t) j);
+                    grp_slot0.push_back(-1);
+                    grp_slots.push_back(0);
+                    grp_bid  .push_back(-1);
+
+                    grp_head[pb] = g;
+                }
+
+                const uint64_t bit = uint64_t(1) << (idx%r);
+
+                dup |= (grp_slots[g] & bit) != 0;
+
+                cell_grp[j]   = g;
+                grp_slots[g] |= bit;
+
+                if (idx%r == 0) {
+                    grp_slot0[g] = (int32_t) j;
+                }
+            }
+        };
+
+        group_cells();
+
+        // mrope repeats one position across a whole image, so the position stops naming a
+        // cell. Rank the cells in sequence order and key on the rank: that is the token
+        // index the reference groups on. A rank only orders cells inside one sequence, so
+        // this needs a cache holding one; otherwise the short groups are dropped as above.
+        if (dup && ubatch->is_pos_2d() && one_seq) {
+            order.clear();
+            order.reserve(n_kv);
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j)) {
+                    order.push_back((int32_t) j);
+                }
             }
 
-            const llama_pos p = cells.pos_get(j);
-            const int64_t   b = p/r;
+            // same order the mrope causal mask uses: pos first, then the 2d position
+            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
+                const llama_pos pa = cells.pos_get(a);
+                const llama_pos pb = cells.pos_get(b);
 
-            if (b >= n_blocks) {
-                oor = true;
-                continue;
+                if (pa != pb) {
+                    return pa < pb;
+                }
+
+                const auto & ea = cells.ext_get(a);
+
+                return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
+            });
+
+            rank.assign(n_kv, -1);
+
+            for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
+                rank[order[k]] = (int32_t) k;
             }
 
-            blk_of[j] = (int32_t) b;
-            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
-            filled[b]++;
+            // a rank is always below the cell count, so no bucket can fall outside
+            ranked = true;
+
+            group_cells();
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
-        // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
-        // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+        // ids in bucket order, so one sequence starting at position zero keeps its old numbering
+        int32_t n_bid = 0;
+
+        for (int64_t pb = 0; pb < n_blocks; ++pb) {
+            for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
+                if (grp_slots[g] != slots_full) {
+                    continue;
+                }
+
+                grp_bid[g] = n_bid++;
+
+                bid_idx  .push_back((int32_t) (pb*r));
+                bid_cell .push_back(grp_first[g]);
+                bid_slot0.push_back(grp_slot0[g]);
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+        }
+
+        GGML_ASSERT(n_bid <= n_blocks);
+
+        // the pooled key is roped with the block's first cell, as the reference does. Text
+        // repeats one position in every mrope section, and that is the bucket start already
+        for (int32_t b = 0; b < n_bid; ++b) {
+            int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
+
+            if (ranked) {
+                const int32_t   c = bid_slot0[b];
+                const llama_pos p = cells.pos_get(c);
+                const auto &    e = cells.ext_get(c);
+
+                sec_pos[0] = p;
+                sec_pos[1] = e.y;
+                sec_pos[2] = e.x;
+                sec_pos[3] = p;
+            }
+
+            for (int64_t sec = 0; sec < 4; ++sec) {
+                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
+            }
+        }
+
+        // unpooled cells point past the last real block, where the per-block bias is -inf.
+        // that id exists whenever such a cell does, because then the real blocks do not fill
+        // n_blocks. per-cell mode carries the -inf itself and only needs the gather in range
+        const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t g = cell_grp[j];
+
+            blk_of[j] = g < 0 ? -1 : grp_bid[g];
+
+            if (blk_of[j] >= 0) {
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+            }
+
+            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const llama_pos    q      = ubatch->pos[i];
+
+            // the query in the index the blocks are keyed on
+            int64_t q = ubatch->pos[i];
+
+            if (ranked) {
+                // rank of the query: how many cells are at or before it in the order above
+                const llama_pos qt = ubatch->pos[i];
+                const llama_pos qy = ubatch->pos[i + n_tokens];
+                const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+                int64_t lo = 0;
+                int64_t hi = (int64_t) order.size();
+
+                while (lo < hi) {
+                    const int64_t   mid = (lo + hi)/2;
+                    const int32_t   c   = order[mid];
+                    const llama_pos pc  = cells.pos_get(c);
+
+                    if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                q = lo - 1;
+            }
 
             // the tail is an incomplete block and is always visible, as in the reference
-            const llama_pos tail_start = (q + 1)/r*r;
+            const int64_t tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
@@ -441,8 +647,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
+                    // a block outside this sequence, or past the last real one, is not selectable
+                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                        cur_blk_bias[b] = -INFINITY;
+                        continue;
+                    }
+
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
                 }
 
                 continue;
@@ -453,9 +665,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             for (int64_t j = 0; j < n_kv; ++j) {
                 float v = -INFINITY;
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                    const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                    if (idx <= q) {
+                        // finite, so it can never meet a -inf and produce a nan
+                        v = idx >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                    }
                 }
 
                 cur_bias[j] = v;
