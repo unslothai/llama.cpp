@@ -6,22 +6,14 @@
 #include <algorithm>
 #include <cinttypes>
 
-// Malformed metadata has to surface as a catchable error rather than an assert:
-// GGML_ASSERT aborts the process, so an embedder that hands a user-supplied GGUF
-// to llama_model_load_from_file has no way to report the bad file and carry on.
-// These only reject values the arch genuinely cannot represent, so a file that
-// loads today still loads.
+// bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
         throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
     }
 }
 
-// get_arr() into a fixed std::array already rejects an array that is too long,
-// but a short one is copied as-is and leaves the tail of the destination alone.
-// hparams is value-initialized, so that tail reads as zero and the n-gram hash
-// quietly drops those positions instead of failing. Require the length the other
-// hyperparameters imply.
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
 static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
     uint32_t n_arr = 0;
     ml.get_arr_n(kid, n_arr, true);
@@ -43,7 +35,6 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
-    // each of these sizes a GDN tensor dimension; zero makes the linear-attention layers degenerate
     qwen4exp_require_nonzero(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
     qwen4exp_require_nonzero(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
     qwen4exp_require_nonzero(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
@@ -53,9 +44,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
-    // every reference rejects a count of 1 outright: there is nothing to mix with a single
-    // stream. transformers configuration_qwen4_exp.py:196, the vLLM port's config.py:49 and
-    // the SGLang port's configs/qwen4_exp.py:38 all raise on hc_count <= 1
+    // a count of 1 has nothing to mix: transformers configuration_qwen4_exp.py:196, vLLM
+    // config.py:49 and SGLang configs/qwen4_exp.py:38 all raise on hc_count <= 1
     if (hparams.dsv4_hc_mult <= 1) {
         throw std::runtime_error(format("%s must be greater than one, got %u",
                                         ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
@@ -81,8 +71,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
         if (n_ple != 1) {
-            // the reference permits several PLE modules, but hparams holds one set of hash
-            // constants and the converter emits one, so more than one cannot be represented here
+            // hparams holds one set of hash constants, so several PLE modules cannot be represented
             throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
                                             ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
         }
@@ -112,8 +101,6 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
         }
 
-        // the hash reads one multiplier per n-gram position and one range per head;
-        // a shorter array would leave the tail unwritten and hash to the wrong rows
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
@@ -141,7 +128,6 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        // the key is optional, but if present it divides the layer index below
         qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
@@ -605,13 +591,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, "indexer_k_pooled", il);
 
-    // rms_norm maps ne1 to gridDim.x but ne2 to gridDim.y, which stops at 65535, and a
-    // 262144 cell cache at ratio 4 has 65536 blocks. So count blocks along ne1 here.
+    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
     pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    // it flattens every row above ne0 into gridDim.x, so ne2 is safe here.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
     pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,

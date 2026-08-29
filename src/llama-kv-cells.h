@@ -303,9 +303,7 @@ public:
         return seq[i].count();
     }
 
-    // the whole set of sequences occupying the cell. Two cells that carry the
-    // same set are visible to exactly the same sequences, which is what lets a
-    // caller group cells without having to test one sequence at a time.
+    // two cells with the same set are visible to exactly the same sequences
     const seq_set_t & seq_set(uint32_t i) const {
         assert(i < pos.size());
 
