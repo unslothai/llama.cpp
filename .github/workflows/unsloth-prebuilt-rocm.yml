@@ -851,8 +851,12 @@ jobs:
       run: |
         sudo apt-get install -y patchelf
         cd llama.cpp/build/bin
-        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
-        for file in *.so* llama-*; do
+        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally.
+        # test-backend-ops is named after neither pattern but links the same shared
+        # llama/ggml libraries, so without it here the diagnostic ships with the
+        # runner's build-tree RPATH and will not start on a user's machine, which
+        # is the one thing it exists to do.
+        for file in *.so* llama-* test-backend-ops; do
           [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
         done
 
