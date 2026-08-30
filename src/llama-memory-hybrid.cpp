@@ -72,7 +72,11 @@ llama_memory_hybrid::llama_memory_hybrid(
         // a *pooling* indexer (indexer_kpool > 0, glm5next only) needs a second head for
         // the compressor gate, or the pool cannot be rebuilt once its tokens leave the
         // batch. every other arch leaves indexer_kpool 0 and is unchanged.
-        const uint32_t n_head_idx = model.hparams.indexer_kpool > 0 ? 2 : 1;
+        //
+        // the third head is the pooled key of the pool this cell ENDS, i.e. it is written
+        // only for cells at pos % kpool == kpool-1. caching it turns the per-step pooling
+        // from O(n_kv) into O(pools completed by this ubatch): see build_indexer.
+        const uint32_t n_head_idx = model.hparams.indexer_kpool > 0 ? 3 : 1;
 
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), n_head_idx);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
@@ -197,12 +201,23 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // pools group cells by absolute position, so a shift regroups them; every pooled key
+    // cached in the indexer rows is stale even though each still looks complete. a shift
+    // that is a whole number of pools regroups nothing, which is the common context-shift
+    // case, so it is worth not paying for.
+    if (mem_idx && hparams.indexer_kpool > 0 && shift % (llama_pos) hparams.indexer_kpool != 0) {
+        mem_attn->set_kpool_dirty();
+    }
     mem_attn->seq_add(seq_id, p0, p1, shift);
     if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    // as seq_add, and a divide regroups for any d != 1
+    if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
+        mem_attn->set_kpool_dirty();
+    }
     mem_attn->seq_div(seq_id, p0, p1, d);
     if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);

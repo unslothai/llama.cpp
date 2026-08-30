@@ -355,7 +355,11 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * packed = ggml_concat(ctx0,
             ggml_reshape_3d(ctx0, ik,   d_idx, 1, n_tokens),
             ggml_reshape_3d(ctx0, gate, d_idx, 1, n_tokens), 1);
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kp->k_idxs, il));
+    // key and gate are the first two heads of a three-head row; the third is the pooled key,
+    // written later from a different set of cells, so this store must leave it alone
+    ggml_build_forward_expand(gf,
+            mctx_idx->cpy_k_part(ctx0, ggml_reshape_2d(ctx0, packed, 2*d_idx, n_tokens),
+                inp_kp->k_idxs, il, 2*d_idx, 0));
 
     if (!scoring) {
         return nullptr;
@@ -368,23 +372,27 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t n_tps    = n_tokens/n_stream;
     const int64_t n_pools  = inp_kp->pool_cells->ne[0]/r;
 
-    GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 2 &&
-            "the pooled indexer cache needs a key head and a gate head");
-    GGML_ASSERT(kbuf->nb[1] == (size_t) d_idx*kbuf->nb[0] && "key and gate must be adjacent in a cell");
+    GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 3 &&
+            "the pooled indexer cache needs a key head, a gate head and a pooled head");
+    GGML_ASSERT(kbuf->nb[1] == (size_t) d_idx*kbuf->nb[0] && "key, gate and pooled must be adjacent in a cell");
     GGML_ASSERT(n_tokens == n_tps*n_stream);
 
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
             kbuf->nb[2], kbuf->nb[3], 0);
 
-    // non-resident slots hold 0, not a sentinel; garbage pools die to pool_bias, not NaN
-    ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->pool_cells);
+    // pool only what this ubatch closed. the count is fixed (see build_inp_kpool), so the
+    // decode graph keeps one shape; unused slots repeat a complete pool, whose recompute is
+    // idempotent. non-resident slots hold 0, not a sentinel; garbage pools die to pool_bias.
+    const int64_t n_new_max = inp_kp->new_pool_cells->ne[0]/r;
+
+    ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->new_pool_cells);
     cb(members, "indexer_pool_members", il);
 
     const size_t nb_mem = members->nb[1];
 
-    ggml_tensor * mem_k = ggml_view_4d(ctx0, members, d_idx, r, n_pools, n_stream,
+    ggml_tensor * mem_k = ggml_view_4d(ctx0, members, d_idx, r, n_new_max, n_stream,
             nb_mem, nb_mem*r, members->nb[2], 0);
-    ggml_tensor * mem_g = ggml_view_4d(ctx0, members, d_idx, r, n_pools, n_stream,
+    ggml_tensor * mem_g = ggml_view_4d(ctx0, members, d_idx, r, n_new_max, n_stream,
             nb_mem, nb_mem*r, members->nb[2], d_idx*members->nb[0]);
 
     // r-way softmaxes over the SLOT axis, so it must be dim 0; ape is added PRE-softmax
@@ -397,7 +405,21 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * probs = ggml_soft_max(ctx0, gate_t);
     cb(probs, "indexer_pool_probs", il);
 
-    ggml_tensor * pool_k = ggml_sum_rows(ctx0, ggml_mul(ctx0, keys_t, probs));
+    ggml_tensor * pool_new = ggml_sum_rows(ctx0, ggml_mul(ctx0, keys_t, probs));
+    pool_new = ggml_reshape_2d(ctx0, pool_new, d_idx, n_new_max*n_stream);
+    cb(pool_new, "indexer_pool_new", il);
+
+    // store into the third head of each representative cell's row. the write is indexed by
+    // GLOBAL row (stream-merged) while pool_reps below is stream-local, so the read cannot
+    // be chained off the write tensor; expand it into the graph first and let build order
+    // sequence them, exactly as the key/gate store above does.
+    ggml_build_forward_expand(gf,
+            mctx_idx->cpy_k_part(ctx0, pool_new, inp_kp->new_pool_reps, il, d_idx, 2*d_idx));
+
+    ggml_tensor * pooled_rd = ggml_view_3d(ctx0, kbuf, d_idx, n_kv, n_stream,
+            kbuf->nb[2], kbuf->nb[3], 2*d_idx*kbuf->nb[0]);
+
+    ggml_tensor * pool_k = ggml_get_rows(ctx0, pooled_rd, inp_kp->pool_reps);
     pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
     cb(pool_k, "indexer_pool_k", il);
 

@@ -3614,6 +3614,32 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_input(inp->cand_mask);
         ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+
+        // pooled-key cache. n_new_max is an exact bound on the pools one ubatch can
+        // complete: a sequence's tokens are a contiguous position run, so a run of L tokens
+        // closes at most L/kpool + 1 pools. it is FIXED for the whole decode phase so the
+        // graph shape does not depend on how many pools happened to close this step.
+        // after a position mutation every cached pooled key is stale, so this one graph has
+        // to be able to re-emit all of them. a shape change here forces a rebuild, which is
+        // the point: the wide shape is used for exactly one ubatch and then goes away.
+        const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty();
+        const int64_t  n_new_max = rebuild ? n_pools : n_tps/kpool + n_ps;
+
+        inp->n_new_max = (uint32_t) n_new_max;
+        inp->rebuild   = rebuild;
+
+        inp->pool_reps = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
+        ggml_set_input(inp->pool_reps);
+        ggml_set_name(inp->pool_reps, "kpool_pool_reps");
+
+        inp->new_pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_new_max, n_stream);
+        ggml_set_input(inp->new_pool_cells);
+        ggml_set_name(inp->new_pool_cells, "kpool_new_pool_cells");
+
+        // I64 because ggml_set_rows takes its row indices as I64
+        inp->new_pool_reps = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new_max*n_stream);
+        ggml_set_input(inp->new_pool_reps);
+        ggml_set_name(inp->new_pool_reps, "kpool_new_pool_reps");
     }
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
