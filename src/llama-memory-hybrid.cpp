@@ -202,11 +202,24 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     // pools group cells by absolute position, so a shift regroups them; every pooled key
-    // cached in the indexer rows is stale even though each still looks complete. a shift
-    // that is a whole number of pools regroups nothing, which is the common context-shift
-    // case, so it is worth not paying for.
-    if (mem_idx && hparams.indexer_kpool > 0 && shift % (llama_pos) hparams.indexer_kpool != 0) {
-        mem_attn->set_kpool_dirty();
+    // cached in the indexer rows is then stale even though each pool still looks complete.
+    // it survives only if WHOLE pools move: the shift must be a multiple of kpool and the
+    // range must start and end on a pool boundary. a pool straddling p0 or p1 keeps some
+    // members and moves the rest, which regroups it however aligned the shift itself is,
+    // and both callers pass an arbitrary bound -- the server's context shift uses
+    // n_keep + n_discard, its prompt-cache reuse uses the match head.
+    if (mem_idx && hparams.indexer_kpool > 0) {
+        const llama_pos r = (llama_pos) hparams.indexer_kpool;
+
+        // p0 < 0 means "from the start" and p1 < 0 means "to the end", so neither is a
+        // boundary a pool can straddle
+        const bool whole_pools = shift % r == 0 &&
+                                 (p0 <= 0 || p0 % r == 0) &&
+                                 (p1 <  0 || p1 % r == 0);
+
+        if (!whole_pools) {
+            mem_attn->set_kpool_dirty();
+        }
     }
     mem_attn->seq_add(seq_id, p0, p1, shift);
     if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
