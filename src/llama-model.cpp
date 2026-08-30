@@ -2469,18 +2469,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_GLM5NEXT) {
-                        filter_attn = [&](uint32_t il) {
+                        // the MTP draft context runs the NextN block and nothing else, so it
+                        // gets a cache for that one layer. the trunk never runs it and so keeps
+                        // the layer range it always had. handing the draft the trunk's cache is
+                        // not just waste: the KDA layers would take cells it can never roll
+                        // back, since a draft context is built with n_rs_seq = 0, and then a
+                        // rejected draft fails seq_rm outright.
+                        const bool mtp_ctx = arch == LLM_ARCH_GLM5NEXT &&
+                            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                            hparams.n_layer_all > hparams.n_layer();
+
+                        filter_attn = [&, mtp_ctx](uint32_t il) {
+                            if (mtp_ctx) {
+                                return il >= hparams.n_layer() && il < hparams.n_layer_all;
+                            }
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, mtp_ctx](uint32_t il) {
+                            return !mtp_ctx && il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
                             // unified is fine, the pool map is per SEQUENCE. see [TAG_KPOOL_SEQ_PARTITION]
 
                             // only the DSA layers carry an indexer key cache
-                            filter_idx = [&](uint32_t il) {
+                            filter_idx = [&, mtp_ctx](uint32_t il) {
+                                if (mtp_ctx) {
+                                    return il >= hparams.n_layer() && il < hparams.n_layer_all;
+                                }
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
 

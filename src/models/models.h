@@ -1349,6 +1349,9 @@ struct llama_model_glm5next : public llama_model_base {
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // builds nothing: lets graph_mtp reuse the block helpers below without the trunk
+        graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
+
         // not const: the delta-net helpers append to the graph through the base
         ggml_tensor * build_layer_attn(
                 const llama_model & model,
@@ -1386,6 +1389,11 @@ struct llama_model_glm5next : public llama_model_base {
                 const llama_model & model,
                 ggml_tensor * cur,
                 int il) const;
+    };
+
+    // NextN draft head. reuses the trunk's block helpers, so it stays a `graph`
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
