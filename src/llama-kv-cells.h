@@ -303,8 +303,10 @@ public:
         return seq[i].count();
     }
 
-    // two cells with the same set are visible to exactly the same sequences
-    const seq_set_t & seq_set(uint32_t i) const {
+    // the full set of sequences this cell is visible to. two cells with the same
+    // set are visible to exactly the same sequences.
+    // note: seq_get() above returns the single id and requires a one-sequence cell
+    const seq_set_t & seq_get_all(uint32_t i) const {
         assert(i < pos.size());
 
         return seq[i];
