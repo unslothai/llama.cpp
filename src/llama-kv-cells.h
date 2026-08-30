@@ -46,6 +46,8 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+
+        generation++;
     }
 
     void reset_shift() {
@@ -94,6 +96,12 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // incremented by every mutator above; used by llama_memory_hybrid_idx to detect
+    // that the cell contents changed and cached host-side data must be recomputed
+    uint32_t get_generation() const {
+        return generation;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -160,6 +168,8 @@ public:
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
 
+        generation++;
+
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
@@ -190,6 +200,8 @@ public:
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
     void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
         assert(idxs.size() == other.pos.size());
+
+        generation++;
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
@@ -223,6 +235,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        generation++;
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -240,6 +254,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        generation++;
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, pos[i]);
@@ -260,6 +276,8 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        generation++;
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -310,6 +328,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
+
+        generation++;
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, pos[i]);
@@ -397,6 +417,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        generation++;
+
         pos[i] = p;
 
         used.insert(i);
@@ -404,6 +426,9 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+
+        generation++;
+
         ext[i] = p;
     }
 
@@ -413,6 +438,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        generation++;
 
         seq_pos_rm(i);
 
@@ -443,6 +470,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        generation++;
+
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
@@ -457,6 +486,9 @@ public:
 
 private:
     bool has_shift = false;
+
+    // bumped on every mutation of the cell contents (see get_generation())
+    uint32_t generation = 0;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;

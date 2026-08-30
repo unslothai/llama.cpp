@@ -87,6 +87,23 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+public:
+    // memo for set_input_qsa: its result depends only on the indexer cells content and
+    // the ubatch, but the graph asks for it once per attention layer with identical
+    // arguments. lives here (not in the short-lived batch context) so the memo survives
+    // across decode steps. keyed by a fingerprint of cells generations + ubatch tokens.
+    struct qsa_memo {
+        bool     valid = false;
+        uint64_t key   = 0;
+
+        std::vector<int32_t> cell_blk;
+        std::vector<int32_t> blk_cells;
+        std::vector<int32_t> blk_pos;
+        std::vector<float>   bias;
+    };
+
+    mutable qsa_memo memo_qsa;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
