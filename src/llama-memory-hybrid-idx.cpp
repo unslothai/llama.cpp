@@ -566,8 +566,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
 
-        // unpooled cells point at a dead block whose per-block bias is -inf
-        const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+        // unpooled cells all point at one spare block. a spare block exists only when some
+        // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
+        const bool     have_dead = n_bid < n_blocks;
+        const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
@@ -628,6 +630,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
                     // finite, so it can never meet a -inf and produce a nan
                     cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                }
+
+                // the spare block holds the unpooled cells, which are the incomplete tail, so
+                // it gets the tail value. it must stay finite: a sequence with fewer than
+                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                if (have_dead) {
+                    cur_blk_bias[dead_bid] = 1e9f;
                 }
 
                 continue;
