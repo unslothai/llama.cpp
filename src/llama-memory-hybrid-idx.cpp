@@ -458,7 +458,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 int32_t g = -1;
 
                 for (int32_t c = grp_head[pb]; c >= 0; c = grp_next[c]) {
-                    if (one_seq || cells.seq_set((uint32_t) grp_first[c]) == cells.seq_set((uint32_t) j)) {
+                    if (one_seq || cells.seq_get_all((uint32_t) grp_first[c]) == cells.seq_get_all((uint32_t) j)) {
                         g = c;
                         break;
                     }
