@@ -2278,14 +2278,8 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    // PLE predecessors are absent from a decode ubatch, so remember them here
-    // (vLLM's ngram_context). next_pos guards it: a mismatch means the sequence
-    // was reset or rewound, and the hash falls back to EOS padding.
-    struct ple_history {
-        llama_pos                next_pos = -1;
-        std::vector<llama_token> toks;
-    };
-    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
+    class llm_graph_input_qsa;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2316,9 +2310,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells named by top_k. arch-local rather
-        // than a build_attn overload so that no shared attention path changes: the sparse
-        // MLA architectures keep their own copy of the same mask construction.
+        // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
@@ -2328,11 +2320,16 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
+        // so the layers sharing a ratio share one input set
+        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
+                    ggml_tensor * kq_mask,
                             int * sections,
                             int   il);
 
@@ -2351,9 +2348,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
-        // build_rs writes the state tensor in place, so run it at most once per
-        // layer; both convolutions share this gather.
-        std::map<int, ggml_tensor *> rs_rows;
+        // build_rs writes the state tensor in place, so one gather per cache tensor is reused
+        std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
         // QSA cache-layout inputs depend only on the cells and the ubatch, so all
         // layers sharing a compress ratio reuse one tensor set instead of building
@@ -2374,11 +2370,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                        int64_t   row_offset,
                             int   il);
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * hidden,
                             int   il);
 

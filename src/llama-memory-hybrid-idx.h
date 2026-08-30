@@ -9,19 +9,8 @@
 // llama_memory_hybrid_idx
 //
 
-// llama_memory_hybrid plus a third cache holding one indexer key per token, for hybrid
-// architectures whose attention layers are block-sparse (qwen4exp QSA).
-//
-// this is a separate llama_memory type rather than an option on llama_memory_hybrid so that
-// nothing in the hybrid path used by the other architectures changes. it duplicates
-// llama_memory_hybrid::init_batch because the indexer cache must be given the attention
-// cache's slot layout instead of finding its own, and that layout is not observable from
-// outside the returned context.
-//
-// the indexer cache is a side buffer addressed by the attention cache's cells: same size,
-// same padding, same stream count, same slots, so cell j means the same token in both.
-// everything that depends on that layout is computed host-side in set_input_qsa; the model
-// graph only gathers, pools and scores.
+// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
+// the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
@@ -75,6 +64,11 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // state write/load
+
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
+
     //
     // llama_memory_hybrid_idx specific API
     //
@@ -82,8 +76,12 @@ public:
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
 private:
-    // the indexer cache stores only one key head per layer, so it needs its own hparams
-    // instance: llama_kv_cache keeps a reference to whatever it is given
+    // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
+    // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
+    void state_drop(llama_seq_id seq_id);
+
+    // the indexer cache holds one key head per layer, so it needs its own hparams:
+    // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
@@ -142,31 +140,32 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr when the model carries no indexer, and for the full and update contexts,
-    // which do not drive the sparse-attention graph
+    // nullptr with no indexer, and for the update context, which builds no sparse graph
     const llama_kv_cache_context * get_idx() const;
 
-    // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
+    // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // block-compressed sparse attention (qwen4exp QSA) over the indexer cache's cells.
-    // blocks cut the *position* line, not the cell array, so nothing assumes a contiguous
-    // layout:
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
     //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
     //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio) const;
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
 
-    // streams per ubatch, taken from the slot infos before they are handed to ctx_idx.
-    // declared first so that it is initialised while sinfos_idx is still intact
+    // streams per ubatch, read from the slot infos before ctx_idx takes them
+    // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch context
+    // null unless the model has an indexer and this is a batch or full context
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
