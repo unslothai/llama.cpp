@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 
@@ -366,8 +367,57 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
-    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
-    // all mrope sections carry it: exact for text, approximate for images
+    // the graph calls this once per attention layer with identical inputs and the
+    // result depends only on the indexer cells and the ubatch, so memoize it on the
+    // memory object (see qsa_memo). only memoize small batches (decode): during
+    // prefill the bias matrix is n_kv*n_tokens floats and the cost is amortized.
+    const size_t bytes_cell_blk  = sizeof(int32_t)*n_kv*n_ns;
+    const size_t bytes_blk_cells = sizeof(int32_t)*r*n_blocks*n_ns;
+    const size_t bytes_blk_pos   = sizeof(int32_t)*4*n_blocks*n_ns;
+    const size_t bytes_bias      = sizeof(float)*n_kv*n_tokens;
+
+    auto & memo = mem->memo_qsa;
+
+    const bool use_memo = bytes_bias < (size_t) 256*1024*1024;
+
+    uint64_t key = 0;
+    if (use_memo) {
+        key = 1469598103934665603ull;
+        const auto fnv = [&key](uint64_t v) {
+            key ^= v;
+            key *= 1099511628211ull;
+        };
+
+        fnv((uint64_t) n_kv);
+        fnv((uint64_t) n_ns);
+        fnv((uint64_t) n_blocks);
+        fnv((uint64_t) n_tokens);
+        fnv((uint64_t) r);
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+
+            fnv((uint64_t) (int64_t) seq_of_stream);
+            fnv(mem->get_mem_idx()->get_cells(seq_of_stream).get_generation());
+        }
+
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            fnv((uint64_t) (int64_t) ubatch->seq_id[i][0]);
+            fnv((uint64_t) (int64_t) ubatch->pos[i]);
+        }
+
+        if (memo.valid && memo.key == key) {
+            memcpy(dst_cell_blk,  memo.cell_blk.data(),  bytes_cell_blk);
+            memcpy(dst_blk_cells, memo.blk_cells.data(), bytes_blk_cells);
+            memcpy(dst_blk_pos,   memo.blk_pos.data(),   bytes_blk_pos);
+            memcpy(dst_bias,      memo.bias.data(),      bytes_bias);
+
+            return;
+        }
+    }
+
+    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio. All three
+    // mrope sections carry it: exact for text, approximate for images. Positions repeat per stream.
     for (int64_t sec = 0; sec < 4; ++sec) {
         for (int64_t s = 0; s < n_ns; ++s) {
             for (int64_t b = 0; b < n_blocks; ++b) {
@@ -461,5 +511,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 cur_bias[j] = v;
             }
         }
+    }
+
+    if (use_memo) {
+        memo.cell_blk.resize(n_kv*n_ns);
+        memo.blk_cells.resize(r*n_blocks*n_ns);
+        memo.blk_pos.resize(4*n_blocks*n_ns);
+        memo.bias.resize(n_kv*n_tokens);
+
+        memcpy(memo.cell_blk.data(),  dst_cell_blk,  bytes_cell_blk);
+        memcpy(memo.blk_cells.data(), dst_blk_cells, bytes_blk_cells);
+        memcpy(memo.blk_pos.data(),   dst_blk_pos,   bytes_blk_pos);
+        memcpy(memo.bias.data(),      dst_bias,      bytes_bias);
+
+        memo.key   = key;
+        memo.valid = true;
     }
 }

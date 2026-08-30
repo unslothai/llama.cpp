@@ -2351,7 +2351,19 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // QSA cache-layout inputs depend only on the cells and the ubatch, so all
+        // layers sharing a compress ratio reuse one tensor set instead of building
+        // (and filling, and copying to the device) 48 identical copies
+        struct qsa_inps {
+            ggml_tensor * k_idxs;
+            ggml_tensor * cell_blk;
+            ggml_tensor * blk_cells;
+            ggml_tensor * blk_pos;
+            ggml_tensor * bias;
+        };
+        std::map<uint32_t, qsa_inps> qsa_shared;
+
+        // conv history at an explicit offset: delta-net and PLE share the row
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
