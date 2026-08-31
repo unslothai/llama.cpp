@@ -314,20 +314,28 @@ public:
     // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
     template<typename F>
     void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
+        // hoisted: intersecting a LLAMA_MAX_SEQ-wide bitset per cell is the cost being removed
+        llama_seq_id sel[LLAMA_MAX_SEQ];
+        int n_sel = 0;
+
+        for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+            if (seqs.test(s)) {
+                sel[n_sel++] = s;
+            }
+        }
+
+        if (n_sel == 0) {
+            return;
+        }
+
         for (const auto & i : used) {
             if (pos[i] < p0 || pos[i] >= p1) {
                 continue;
             }
 
-            const auto m = seq[i] & seqs;
-
-            // a cell carries a handful of sequences at most, out of LLAMA_MAX_SEQ
-            size_t left = m.count();
-
-            for (llama_seq_id s = 0; left > 0 && s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
-                if (m.test(s)) {
-                    f(s, pos[i], ext[i].tok);
-                    --left;
+            for (int k = 0; k < n_sel; ++k) {
+                if (seq[i].test(sel[k])) {
+                    f(sel[k], pos[i], ext[i].tok);
                 }
             }
         }
