@@ -88,6 +88,29 @@ public:
                        bool blk_bias) const;
 
 private:
+    // set_input_qsa scratch, kept across calls so the per-ubatch work does not reallocate
+    struct qsa_scratch {
+        // grp_head indexes the position buckets; grp_next chains the groups colliding in one
+        std::vector<int32_t>  blk_of;
+        std::vector<int32_t>  cell_grp;
+        std::vector<int32_t>  grp_head;
+        std::vector<int32_t>  grp_next;
+        std::vector<int32_t>  grp_first;
+        std::vector<int32_t>  grp_slot0;
+        std::vector<uint64_t> grp_slots;
+        std::vector<int32_t>  grp_bid;
+
+        std::vector<int32_t>  bid_idx;
+        std::vector<int32_t>  bid_cell;
+        std::vector<int32_t>  bid_slot0;
+
+        // mrope only: a total order over cells sharing a position
+        std::vector<int32_t>  order;
+        std::vector<int32_t>  rank;
+    };
+
+    mutable qsa_scratch qsa;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

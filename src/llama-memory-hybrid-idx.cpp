@@ -298,20 +298,24 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(r <= 64);
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
-    std::vector<int32_t>  blk_of(n_kv);
-    std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
-    std::vector<int32_t>  grp_next;
-    std::vector<int32_t>  grp_first;
-    std::vector<int32_t>  grp_slot0;
-    std::vector<uint64_t> grp_slots;
-    std::vector<int32_t>  grp_bid;
-    std::vector<int32_t>  bid_idx;
-    std::vector<int32_t>  bid_cell;
-    std::vector<int32_t>  bid_slot0;
+    // only the sized ones need a resize; the rest are cleared where they are filled
+    auto & blk_of    = qsa.blk_of;
+    auto & cell_grp  = qsa.cell_grp;
+    auto & grp_head  = qsa.grp_head;
+    auto & grp_next  = qsa.grp_next;
+    auto & grp_first = qsa.grp_first;
+    auto & grp_slot0 = qsa.grp_slot0;
+    auto & grp_slots = qsa.grp_slots;
+    auto & grp_bid   = qsa.grp_bid;
+    auto & bid_idx   = qsa.bid_idx;
+    auto & bid_cell  = qsa.bid_cell;
+    auto & bid_slot0 = qsa.bid_slot0;
+    auto & order     = qsa.order;
+    auto & rank      = qsa.rank;
 
-    std::vector<int32_t> order;
-    std::vector<int32_t> rank;
+    blk_of  .resize(n_kv);
+    cell_grp.resize(n_kv);
+    grp_head.resize(n_blocks);
 
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
