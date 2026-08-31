@@ -1866,28 +1866,35 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
     below.fill({ -1, LLAMA_TOKEN_NULL });
 
+    const auto collect = [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
+        if (pos >= w0) {
+            hist[key(seq_id, pos)] = tok;
+        } else if (pos > below[seq_id].first) {
+            below[seq_id] = { pos, tok };
+        }
+    };
+
+    // cells below w0 only answer a lookup that misses the window, which needs an M-RoPE gap
+    const llama_pos p_scan0 = std::max<llama_pos>(0, w0);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
-            [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
-                }
-            });
+        v_cells[s].for_each_token_in(seqs, p_scan0, p_max + 1, collect);
     }
 
-    // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
-    const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
+    // false means nothing in [w0, p]; the caller must then fall back to below[]
+    const auto lookup = [&](llama_seq_id seq_id, llama_pos p, llama_token & out) -> bool {
         for (llama_pos q = p; q >= w0; --q) {
             const auto it = hist.find(key(seq_id, q));
             if (it != hist.end()) {
-                return it->second;
+                out = it->second;
+                return true;
             }
         }
-        return below[seq_id].second;
+        return false;
     };
+
+    std::vector<std::pair<uint32_t, llama_seq_id>> missed;
 
     // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
     // do not encode the token order; resolve its predecessors by ubatch order instead
@@ -1925,8 +1932,24 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 continue;
             }
 
-            res[i*n + j] = lookup(seq_id, p);
+            if (!lookup(seq_id, p, res[i*n + j])) {
+                missed.push_back({ i*n + j, seq_id });
+            }
         }
+    }
+
+    if (missed.empty()) {
+        return;
+    }
+
+    if (p_scan0 > 0) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].for_each_token_in(seqs, 0, p_scan0, collect);
+        }
+    }
+
+    for (const auto & [idx, seq_id] : missed) {
+        res[idx] = below[seq_id].second;
     }
 }
 
