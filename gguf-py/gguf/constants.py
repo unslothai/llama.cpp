@@ -4001,14 +4001,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.FFN_NORM,
-        # mHC, layered on top of the per-layer norms above
         MODEL_TENSOR.HC_ATTN_FN,
         MODEL_TENSOR.HC_ATTN_BASE,
         MODEL_TENSOR.HC_ATTN_SCALE,
         MODEL_TENSOR.HC_FFN_FN,
         MODEL_TENSOR.HC_FFN_BASE,
         MODEL_TENSOR.HC_FFN_SCALE,
-        # KDA (linear-attention layers)
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_V,
@@ -4023,7 +4021,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_A,
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_NORM,
-        # DSA (MLA full-attention layers)
         MODEL_TENSOR.ATTN_Q_A,
         MODEL_TENSOR.ATTN_Q_B,
         MODEL_TENSOR.ATTN_Q_A_NORM,
@@ -4032,14 +4029,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_K_B,
         MODEL_TENSOR.ATTN_V_B,
         MODEL_TENSOR.ATTN_OUT,
-        # DSA indexer, with the kpool key compressor
         MODEL_TENSOR.INDEXER_K_NORM,
         MODEL_TENSOR.INDEXER_PROJ,
         MODEL_TENSOR.INDEXER_ATTN_K,
         MODEL_TENSOR.INDEXER_ATTN_Q_B,
         MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE,
         MODEL_TENSOR.INDEXER_COMPRESSOR_APE,
-        # FFN: dense on the leading blocks, MoE elsewhere
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
@@ -4051,7 +4046,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
-        # NextN/MTP, a full DSA decoder layer with its own indexer
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,

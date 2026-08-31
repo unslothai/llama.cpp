@@ -1584,9 +1584,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
     return output;
 }
 
-//
-// mtmd_image_preprocessor_glm5next
-//
 
 // for a still image the reference's temporal_factor cancels out, leaving pixel area vs min/max
 clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparams & hparams, const clip_image_size & size) {

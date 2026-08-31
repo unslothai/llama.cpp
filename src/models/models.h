@@ -1176,8 +1176,7 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // method-only mixin; here only so glm5next, deriving from this graph, reaches
-    // build_delta_net. deepseek4 itself has no recurrent layers
+    // method-only mixin, so glm5next reaches build_delta_net; deepseek4 has no recurrent layers
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {}
         graph(const llama_model & model, const llm_graph_params & params);

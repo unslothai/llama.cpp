@@ -2457,11 +2457,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    // null unless the arch has an indexer cache
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     ggml_type type_idx = GGML_TYPE_F16;
-                    // qwen4exp uses the dedicated llama_memory_hybrid_idx; glm5next carries its
-                    // indexer in llama_memory_hybrid via filter_idx/type_idx
+                    // qwen4exp uses llama_memory_hybrid_idx; glm5next carries its indexer in llama_memory_hybrid
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
@@ -2474,12 +2472,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_GLM5NEXT) {
-                        // the MTP draft context runs the NextN block and nothing else, so it
-                        // gets a cache for that one layer. the trunk never runs it and so keeps
-                        // the layer range it always had. handing the draft the trunk's cache is
-                        // not just waste: the KDA layers would take cells it can never roll
-                        // back, since a draft context is built with n_rs_seq = 0, and then a
-                        // rejected draft fails seq_rm outright.
+                        // the draft runs only the NextN block, so it gets a cache for that one layer. the trunk's
+                        // cache would let the KDA layers take cells it can never roll back (n_rs_seq = 0), and a
+                        // rejected draft then fails seq_rm
                         const bool mtp_ctx = arch == LLM_ARCH_GLM5NEXT &&
                             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                             hparams.n_layer_all > hparams.n_layer();
@@ -2497,7 +2492,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0) {
                             // unified is fine, the pool map is per SEQUENCE. see [TAG_KPOOL_SEQ_PARTITION]
 
-                            // only the DSA layers carry an indexer key cache
                             filter_idx = [&, mtp_ctx](uint32_t il) {
                                 if (mtp_ctx) {
                                     return il >= hparams.n_layer() && il < hparams.n_layer_all;

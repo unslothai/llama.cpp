@@ -58,7 +58,6 @@ static void kpool_mask_row(
         const bool tail   = pos_at[j] >= tail_start;
 
         cur_sel [j] = vis && tail   ? v_sel : v_mask;
-        // the candidate set, which the top-k budget may overrun but must never escape
         cur_cand[j] = vis && (pooled || tail) ? v_sel : v_mask;
     }
 }
@@ -103,8 +102,8 @@ void llama_kv_cache_set_input_kpool(
     const int64_t r        = kpool;
     const int64_t n_tokens = ubatch->n_tokens;
 
-    // [TAG_KPOOL_SEQ_PARTITION] positions are unambiguous only within one sequence, so
-    // one pool map per SEQUENCE, not per stream
+    // [TAG_KPOOL_SEQ_PARTITION] positions are unambiguous only within one sequence, so one
+    // pool map per SEQUENCE, not per stream
     GGML_ASSERT(n_ns == 1 || (int64_t) ubatch->n_seqs_unq == n_ns);
 
     const int64_t n_ps    = (int64_t) ubatch->n_seqs_unq/n_ns;
@@ -142,7 +141,6 @@ void llama_kv_cache_set_input_kpool(
         GGML_ASSERT(bias->ne[0] == n_kv && bias->ne[1] == n_tps && bias->ne[2] == n_ns);
     }
 
-    // pooled-key cache inputs travel together or not at all
     const bool kcache = pool_reps != nullptr;
 
     GGML_ASSERT((new_pool_cells != nullptr) == kcache);
@@ -211,22 +209,17 @@ void llama_kv_cache_set_input_kpool(
         int32_t * cur_new_cells = kcache ? dst_new_cells + s*(r*n_new_max)  : nullptr;
         int64_t * cur_new_reps  = kcache ? dst_new_reps  + s*n_new_max      : nullptr;
 
-        // count of real entries emitted for this stream; the rest is padding
         int64_t n_new = 0;
 
-        // members of any complete pool in this stream, used to pad the fixed-size write.
-        // recomputing a complete pool is idempotent, so a repeat is always safe.
+        // pads the fixed-size write; recomputing a complete pool is idempotent, so a repeat is safe
         const int32_t * any_rep_src = nullptr;
 
         if (kcache) {
-            // a pool with no rep gathers row 0. that row's pooled third may hold another
-            // pool's key, but such a pool is always -INFINITY in pool_bias, so the value is
-            // discarded before it can score.
+            // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
             std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
             std::fill(cur_new_cells, cur_new_cells + r*n_new_max, 0);
         }
 
-        // the token loop writes rows < n_tps in full; only the padding rows need clearing
         if (mask_f16) {
             kpool_mask_fill((ggml_fp16_t *) (cur_sel_mask  + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
             kpool_mask_fill((ggml_fp16_t *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
@@ -235,11 +228,8 @@ void llama_kv_cache_set_input_kpool(
             kpool_mask_fill((float *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
         }
 
-        // [TAG_KPOOL_PACK] one packed run per sequence, sized on the pool range it holds.
-        // NOT one full-width table per sequence: the indexer scores every slot against
-        // every query, so that multiplies the score tensor by n_seq_max.
-        // llama_memory_seq_cp can ask for more slots than exist; then a sequence keeps its
-        // newest pools, the same cut a large hole already forces.
+        // [TAG_KPOOL_PACK] one packed run per sequence, NOT one full-width table: the indexer
+        // scores every slot against every query, which would multiply the score tensor by n_seq_max
         {
             int64_t n_want = 0;
 
@@ -302,9 +292,8 @@ void llama_kv_cache_set_input_kpool(
                 pos_at[j] = cells.is_empty(j) || !cells.seq_has(j, seq_of_pool) ? -1 : cells.pos_get(j);
             }
 
-            // anchoring at the absolute p/kpool follows vLLM and SGLang, not HF
-            // (valid_keys.argmax(-1)): it is the only anchor that keeps a pool's identity
-            // stable from the prefill that built it to the decodes that read it.
+            // anchor at the absolute p/kpool (vLLM, SGLang; not HF's valid_keys.argmax(-1)): the only
+            // anchor that keeps a pool's identity stable from prefill to the decodes that read it
             int64_t b_base = 0;
             {
                 int64_t b_min = 0;
@@ -353,10 +342,8 @@ void llama_kv_cache_set_input_kpool(
             }
 
             if (kcache) {
-                // the pooled key of a complete pool lives in the row of its LAST member,
-                // the cell holding pos % r == r-1. that slot is only meaningful once the
-                // pool is complete: for a partial pool it is still 0 from the fill above,
-                // and cell 0 is a real cell whose own pooled key we must not overwrite.
+                // a complete pool's key lives in the row of its LAST member; a partial pool leaves that
+                // slot 0, and cell 0 is a real cell
                 for (int64_t p = 0; p < n_run; ++p) {
                     if (filled[p] == (int32_t) r) {
                         cur_pool_reps[run_off[ps] + p] = part_pool_cells[p*r + (r - 1)];
@@ -367,8 +354,7 @@ void llama_kv_cache_set_input_kpool(
                     }
                 }
 
-                // recompute exactly the complete pools this ubatch wrote into. touched[] is
-                // over the run, so the cost is O(tokens), not O(n_kv).
+                // touched[] is over the run, so the cost is O(tokens), not O(n_kv)
                 std::vector<uint8_t> touched(n_run, 0);
 
                 for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -386,16 +372,12 @@ void llama_kv_cache_set_input_kpool(
                 }
 
                 for (int64_t p = 0; p < n_run; ++p) {
-                    // in rebuild mode every cached pooled key is stale, so re-emit all of
-                    // them, not just the pools this ubatch closed
                     if ((!touched[p] && !rebuild) || filled[p] != (int32_t) r) {
                         continue;
                     }
 
-                    // n_new_max = n_tps/kpool + n_ps bounds this while a sequence's tokens in
-                    // one ubatch are a contiguous position run, which llama-batch.cpp
-                    // enforces. dropping a completed pool would silently serve a stale key,
-                    // so fail loudly instead of clamping.
+                    // bounded while a sequence's ubatch tokens are a contiguous run (llama-batch.cpp enforces);
+                    // fail loudly, clamping would serve a stale key
                     GGML_ASSERT(n_new < n_new_max && "k-pool: more pools completed than the fixed bound");
 
                     std::copy(part_pool_cells + p*r, part_pool_cells + (p + 1)*r,
@@ -416,16 +398,13 @@ void llama_kv_cache_set_input_kpool(
 
                 const llama_pos q = ubatch->pos[i];
 
-                // q >= 0 is what makes the unsigned range test below a range test
                 GGML_ASSERT(q >= 0);
 
                 n_done++;
 
-                // index_kpool_always_select_tail, which lands selection on pool boundaries
                 const llama_pos tail_start = (q + 1)/r*r;
 
-                // the reference tests visibility at a pool's LAST member, so a pool the
-                // query straddles is dropped whole
+                // the reference tests visibility at a pool's LAST member, so a straddled pool drops whole
                 const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
 
                 float * cur_bias = dst_bias ? dst_bias + i*n_kv : nullptr;
@@ -449,8 +428,6 @@ void llama_kv_cache_set_input_kpool(
                     }
                 }
 
-                // the query's own sequence run only; every other slot keeps the -INFINITY
-                // of the fill above, which is what keeps a foreign pool out of the budget
                 float * q_pool_bias = cur_pool_bias + ii*n_pools + run_off[ps];
 
                 for (int64_t p = 0; p < n_run; ++p) {
@@ -466,19 +443,13 @@ void llama_kv_cache_set_input_kpool(
         GGML_ASSERT(n_done == n_tps && "every query must belong to a sequence of the ubatch");
 
         if (kcache) {
-            // the write has a fixed row count, so the unused slots must name a destination
-            // that is safe to overwrite. two cases, both provably harmless:
-            //   - some complete pool exists: repeat it. recomputing a complete pool yields
-            //     the value already there, so the duplicate write is a no-op in effect.
-            //   - none exists: no cell in this stream is the last member of a complete pool,
-            //     so no pooled third is read (every pool is -INFINITY in pool_bias). cell 0
-            //     is then free.
+            // the fixed row count means unused slots must name a safe destination: repeat a complete
+            // pool (recompute is a no-op), or cell 0 when none exists (nothing reads its pooled third)
             for (int64_t p = n_new; p < n_new_max; ++p) {
                 if (any_rep_src) {
                     std::copy(any_rep_src, any_rep_src + r, cur_new_cells + p*r);
                     cur_new_reps[p] = (int64_t) strm_of[s]*kv_size + any_rep_src[r - 1];
                 } else {
-                    // cells already 0 from the fill; pool r copies of cell 0 into cell 0
                     cur_new_reps[p] = (int64_t) strm_of[s]*kv_size;
                 }
             }
@@ -487,17 +458,14 @@ void llama_kv_cache_set_input_kpool(
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
-    // unconditional: the key and gate STORE runs on the dense path too. gating it the
-    // way the scoring is gated would leave every cell below n_select with no indexer
-    // state, and the first ubatch to cross n_select would pool cells never written
+    // unconditional: the key/gate STORE runs on the dense path too, or cells below n_select
+    // would have no indexer state when the first ubatch crosses it
     mctx_idx->set_input_k_idxs(k_idxs, ubatch);
 
     if (pool_cells == nullptr) {
         return;
     }
 
-    // the pooled key is written into the INDEXER cache, whose slot layout the attention
-    // cache defines, so the stream map and cell count come from the indexer side
     std::vector<uint32_t> strm_of;
 
     if (pool_reps) {
@@ -518,9 +486,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             rebuild,
             ubatch, kpool);
 
-    // every pool has just been re-emitted, so the cache is consistent again. cleared here
-    // rather than in build_inp_kpool because a graph that is built but not evaluated must
-    // not clear it.
+    // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it
     if (rebuild) {
         mctx_attn->get_kv()->clear_kpool_dirty();
     }

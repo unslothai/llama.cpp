@@ -32,7 +32,6 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
-// defined in llama-kv-cache-kpool.h, which includes this header, so forward declared only
 class llm_graph_input_kpool;
 
 // certain models (typically multi-modal) can produce different types of graphs

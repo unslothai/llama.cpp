@@ -69,13 +69,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr
     )),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // a *pooling* indexer (indexer_kpool > 0, glm5next only) needs a second head for
-        // the compressor gate, or the pool cannot be rebuilt once its tokens leave the
-        // batch. every other arch leaves indexer_kpool 0 and is unchanged.
-        //
-        // the third head is the pooled key of the pool this cell ENDS, i.e. it is written
-        // only for cells at pos % kpool == kpool-1. caching it turns the per-step pooling
-        // from O(n_kv) into O(pools completed by this ubatch): see build_indexer.
+        // a *pooling* indexer needs a second head for the compressor gate, or the pool cannot be
+        // rebuilt once its tokens leave the batch; the third head is the pooled key of the pool
+        // this cell ENDS (pos % kpool == kpool-1)
         const uint32_t n_head_idx = model.hparams.indexer_kpool > 0 ? 3 : 1;
 
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), n_head_idx);
@@ -141,9 +137,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer takes the attention cache's slot layout rather than finding its
-        // own: allocated separately the two drift apart when the context is rewritten
-        // between turns, and the top-k indices would then point at the wrong cells
+        // the indexer takes the attention cache's slot layout: allocated separately the two drift
+        // apart when the context is rewritten, and top-k would point at wrong cells
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
@@ -201,18 +196,13 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    // pools group cells by absolute position, so a shift regroups them; every pooled key
-    // cached in the indexer rows is then stale even though each pool still looks complete.
-    // it survives only if WHOLE pools move: the shift must be a multiple of kpool and the
-    // range must start and end on a pool boundary. a pool straddling p0 or p1 keeps some
-    // members and moves the rest, which regroups it however aligned the shift itself is,
-    // and both callers pass an arbitrary bound -- the server's context shift uses
-    // n_keep + n_discard, its prompt-cache reuse uses the match head.
+    // pools group cells by absolute position, so a cached pooled key survives a shift only if
+    // WHOLE pools move: the shift must be a multiple of kpool AND the range must start and
+    // end on a pool boundary. both callers pass an arbitrary bound.
     if (mem_idx && hparams.indexer_kpool > 0) {
         const llama_pos r = (llama_pos) hparams.indexer_kpool;
 
-        // p0 < 0 means "from the start" and p1 < 0 means "to the end", so neither is a
-        // boundary a pool can straddle
+        // p0 < 0 means "from the start", p1 < 0 "to the end": neither can be straddled
         const bool whole_pools = shift % r == 0 &&
                                  (p0 <= 0 || p0 % r == 0) &&
                                  (p1 <  0 || p1 % r == 0);
@@ -227,7 +217,6 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    // as seq_add, and a divide regroups for any d != 1
     if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
         mem_attn->set_kpool_dirty();
     }
@@ -303,10 +292,7 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
                        bool   optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
-    // indexer keys carry no positional encoding, but the pending per-cell delta must
-    // still be cleared or the two caches disagree about whether a shift is outstanding.
-    // safe because an indexer only exists for LLAMA_ROPE_TYPE_NONE archs, where
-    // llama_kv_cache::update skips the K-shift graph and does only that
+    // the pending per-cell delta must still be cleared or the caches disagree about a shift
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr : mem->get_mem_idx()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -350,8 +336,6 @@ bool llama_memory_hybrid_context::apply() {
     if (ctx_idx) {
         res = res & ctx_idx->apply();
 
-        // a top-k over indexer cells is meaningful only if both caches cover the same
-        // window
         if (!ubatches.empty()) {
             GGML_ASSERT(get_idx()->get_n_kv()     == get_attn()->get_n_kv());
             GGML_ASSERT(get_idx()->get_n_stream() == get_attn()->get_n_stream());

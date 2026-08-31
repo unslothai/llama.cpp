@@ -176,8 +176,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else if (arch == LLM_ARCH_GLM5NEXT) {
-        // head_count doubles as the KDA head count, so it stays uniform; the kv array is what
-        // marks the recurrent layers, and the loader asserts it holds both a zero and a nonzero
+        // head_count doubles as the KDA head count; the kv array marks the recurrent layers
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_kv_per_layer;
         n_head_kv_per_layer.reserve(n_layer);
@@ -226,8 +225,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
     } else if (arch == LLM_ARCH_GLM5NEXT) {
-        // nope-only MLA: the cache holds the bare latent, so no rope width is added on top of
-        // the kv LoRA rank and n_rot has to be an explicit 0, not the head size default
+        // nope-only MLA: the cache holds the bare latent, so n_rot must be an explicit 0
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
@@ -304,8 +302,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4)); // build_hc_pre asserts exactly 4 streams
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
-        // the only arch that pools indexer keys; top_k must be a whole number of pools, and
-        // the resulting selection width has to stay under n_ctx or the sparse path goes unused
+        // the only arch that pools indexer keys; top_k must be a whole number of pools and the
+        // selection width must stay under n_ctx or the sparse path goes unused
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,              uint32_t(4));
         // glm5next reads these unconditionally; the if (moe) block below never sets them
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);

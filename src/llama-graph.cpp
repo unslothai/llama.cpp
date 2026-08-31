@@ -3581,7 +3581,6 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
 
-        // the selection terms below exist only for real queries
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
         inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
@@ -3609,13 +3608,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->cand_mask);
         ggml_set_name(inp->cand_mask, "kpool_cand_mask");
 
-        // pooled-key cache. n_new_max is an exact bound on the pools one ubatch can
-        // complete: a sequence's tokens are a contiguous position run, so a run of L tokens
-        // closes at most L/kpool + 1 pools. it is FIXED for the whole decode phase so the
-        // graph shape does not depend on how many pools happened to close this step.
-        // after a position mutation every cached pooled key is stale, so this one graph has
-        // to be able to re-emit all of them. a shape change here forces a rebuild, which is
-        // the point: the wide shape is used for exactly one ubatch and then goes away.
+        // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
+        // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-
+        // step; after a position mutation every cached key is stale, so it must re-emit all
         const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty();
         const int64_t  n_new_max = rebuild ? n_pools : n_tps/kpool + n_ps;
 
@@ -3630,7 +3625,6 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->new_pool_cells);
         ggml_set_name(inp->new_pool_cells, "kpool_new_pool_cells");
 
-        // I64 because ggml_set_rows takes its row indices as I64
         inp->new_pool_reps = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new_max*n_stream);
         ggml_set_input(inp->new_pool_reps);
         ggml_set_name(inp->new_pool_reps, "kpool_new_pool_reps");
@@ -3661,7 +3655,6 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
 
@@ -3679,26 +3672,22 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy
     ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
 
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
     mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
             mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
 
-    // [n_select, n_tps, n_stream] -> [n_select, n_tps, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
             top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
 
     // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
-    // tail (cand_mask rejects over-budget picks below). f32: CUDA only does SET_ROWS for f32
+    // tail. f32 because CUDA only does SET_ROWS for f32
     ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
 
     ggml_tensor * mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
 
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
     mask_top_k = ggml_view_4d(ctx0, mask_top_k, mask_top_k->ne[1], mask_top_k->ne[2], 1, mask_top_k->ne[3],
             mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
 
-    // the reference's `selected_valid` gather, additively; cand_mask is candidates UNION tail
     mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
 
     // ggml_flash_attn_ext asserts an f16 mask, and ggml_add would yield src0's f32
