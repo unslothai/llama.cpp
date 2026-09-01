@@ -1598,10 +1598,21 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
                         hparams.dsv4_max_n_token  = 384;
                         hparams.dsv4_max_wh_ratio = 8;
-                        hparams.image_max_pixels = hparams.dsv4_max_n_token
-                            * hparams.patch_size * hparams.patch_size
-                            * hparams.n_merge * hparams.n_merge;
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                        // handle min/max token counts from CLI
+                        if (hparams.custom_image_min_tokens > 0) {
+                            hparams.image_min_pixels = hparams.custom_image_min_tokens * patch_area;
+                        }
+                        if (hparams.custom_image_max_tokens > 0) {
+                            // the cap is on the whole token block, keep some room for the resize solver
+                            hparams.dsv4_max_n_token = std::max(hparams.custom_image_max_tokens, 16);
+                        }
+                        hparams.image_max_pixels = hparams.dsv4_max_n_token * patch_area;
+                        // a small custom max token count also lowers the min-pixel upscale threshold
+                        hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                        // avoid OOM on warmup
+                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
+                        hparams.set_warmup_n_tokens(warmup_side * warmup_side);
                     } break;
                 case PROJECTOR_TYPE_GEMMA3:
                     {
