@@ -1459,7 +1459,7 @@ struct mtmd_tokenizer {
                 }
 
                 if (ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4V) {
-                    // the text model preceives input in blocks of N tokens (N = COMPRESS_PAD_TO = 4)
+                    // the text model perceives input in blocks of N tokens (N = COMPRESS_PAD_TO = 4, same as the CSA compress ratio)
                     // image need to be aligned to block size, while adding IMAGE_PAD embeddings to the beginning
                     // TODO @ngxson : maybe refactor this in the future
                     constexpr int32_t align = 4;

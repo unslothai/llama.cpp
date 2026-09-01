@@ -9,7 +9,7 @@
 //
 //   [PAD]*lead_pad [START] <interleaved rows> [PAD]*pad_last [END]
 //
-// each aligner row ends with a NEWLINE, the row count is padded to an even number with PAD rows
+// each aligner row ends with a NEWLINE, an odd row count is padded with a full row of PADs
 // pairs of adjacent rows are interleaved column-wise ("N-layout")
 // the mapping is precomputed on CPU as the "layout_idx" input (see set_input in clip.cpp)
 //
@@ -83,12 +83,9 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
             cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
         }
 
-        const int n_llm_w  = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
-        const int n_llm_h  = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
-        const int rows     = n_llm_h + (n_llm_h % 2);
-        const int row_len  = n_llm_w + 1;
-        const int pad_last = (rows / 2 * row_len) % 2 * 2;
-        const int n_out    = img.lead_pad + 1 + rows * row_len + pad_last + 1;
+        const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
+        const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
+        const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
         GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
 
         ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);

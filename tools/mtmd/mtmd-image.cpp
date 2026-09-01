@@ -1104,11 +1104,7 @@ mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v
     grid_info g;
     g.n_llm_h = ((best_height / patch_size) + r - 1) / r;
     g.n_llm_w = ((best_width  / patch_size) + r - 1) / r;
-    g.n_tokens = g.n_llm_h * (g.n_llm_w + 1) + 2;
-    if (g.n_llm_h % 2 == 1) {
-        g.n_tokens += g.n_llm_w + 1; // rows are padded to an even count
-    }
-    g.n_tokens += (g.n_llm_h + 1) / 2 * (g.n_llm_w + 1) % 2 * 2; // trailing pads
+    g.n_tokens = dsv4_get_block_layout(g.n_llm_w, g.n_llm_h, 0).n_out;
     return g;
 }
 
@@ -1128,8 +1124,8 @@ void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int widt
         best_height = max_h * p * r;
     } else if (max_h_f < 2.0) {
         const int max_h = 2;
-        const int max_w = ((max_n_token - 2) / max_h) - 1;
-        GGML_ASSERT(max_w > 1);
+        // guard tiny budgets; cannot be hit with the current lower bound on max_n_token
+        const int max_w = std::max(((max_n_token - 2) / max_h) - 1, 2);
         best_width  = max_w * p * r;
         best_height = max_h * p * r;
     } else {

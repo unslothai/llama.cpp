@@ -4193,15 +4193,10 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
-                // aligner grid + newlines + pads + start/end sentinels
-                // keep in sync with clip_graph_deepseek4v::build
                 const int out_patch_size = params.patch_size * params.n_merge;
-                const int n_llm_w  = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
-                const int n_llm_h  = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
-                const int rows     = n_llm_h + (n_llm_h % 2);
-                const int row_len  = n_llm_w + 1;
-                const int pad_last = (rows / 2 * row_len) % 2 * 2;
-                n_patches = img->lead_pad + 1 + rows * row_len + pad_last + 1;
+                const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
+                const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
+                n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
@@ -5077,41 +5072,39 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
                 // set the 2D positions (mrope layout, only the first 2 channels are used)
-                int n_patches_per_col = image_size_width / patch_size;
+                int n_patches_per_row = image_size_width / patch_size;
                 std::vector<int32_t> positions(n_pos * 4, 0);
                 for (int i = 0; i < n_pos; i++) {
-                    positions[i]         = i / n_patches_per_col; // row
-                    positions[n_pos + i] = i % n_patches_per_col; // col
+                    positions[i]         = i / n_patches_per_row; // row
+                    positions[n_pos + i] = i % n_patches_per_row; // col
                 }
                 set_input_i32("positions", positions);
 
                 // token block layout index (see clip_graph_deepseek4v::build)
                 // rows [0, n_grid) are the aligner output, the sentinels follow
-                const int n_merge  = hparams.n_merge;
-                const int n_llm_w  = CLIP_ALIGN(pos_w, n_merge) / n_merge;
-                const int n_llm_h  = CLIP_ALIGN(pos_h, n_merge) / n_merge;
-                const int n_grid   = n_llm_w * n_llm_h;
+                const int n_merge = hparams.n_merge;
+                const int n_llm_w = CLIP_ALIGN(pos_w, n_merge) / n_merge;
+                const int n_llm_h = CLIP_ALIGN(pos_h, n_merge) / n_merge;
+                const int n_grid  = n_llm_w * n_llm_h;
                 const int idx_start   = n_grid;
                 const int idx_end     = n_grid + 1;
                 const int idx_newline = n_grid + 2;
                 const int idx_pad     = n_grid + 3;
 
-                const int rows     = n_llm_h + (n_llm_h % 2);
-                const int row_len  = n_llm_w + 1;
-                const int pad_last = (rows / 2 * row_len) % 2 * 2;
                 const int lead_pad = imgs.entries[0].lead_pad;
+                const auto bl = dsv4_get_block_layout(n_llm_w, n_llm_h, lead_pad);
 
                 std::vector<int32_t> idx;
-                idx.reserve(lead_pad + 1 + rows * row_len + pad_last + 1);
+                idx.reserve(bl.n_out);
                 for (int i = 0; i < lead_pad; i++) {
                     idx.push_back(idx_pad);
                 }
                 idx.push_back(idx_start);
                 // pairs of adjacent rows are interleaved column-wise ("N-layout")
                 // ref: build_image_block in inference/image_processor.py
-                for (int t = 0; t < rows * row_len; t++) {
-                    const int g   = t / (2 * row_len);
-                    const int rem = t % (2 * row_len);
+                for (int t = 0; t < bl.rows * bl.row_len; t++) {
+                    const int g   = t / (2 * bl.row_len);
+                    const int rem = t % (2 * bl.row_len);
                     const int c   = rem / 2; // column
                     const int r   = 2 * g + rem % 2; // row
                     if (r >= n_llm_h) {
@@ -5122,7 +5115,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         idx.push_back(r * n_llm_w + c);
                     }
                 }
-                for (int i = 0; i < pad_last; i++) {
+                for (int i = 0; i < bl.pad_last; i++) {
                     idx.push_back(idx_pad);
                 }
                 idx.push_back(idx_end);
@@ -5868,6 +5861,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
         LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+
+        // TEMP debugging (parity validation), will be removed before merge
+        // when the env var holds a path, dump the raw data: [int32 n_tokens][int32 n_embd][f32 data]
+        const char * dump_path = std::getenv("MTMD_DEBUG_EMBEDDINGS");
+        if (dump_path && strcmp(dump_path, "1") != 0) {
+            FILE * f = fopen(dump_path, "wb");
+            if (f) {
+                const int32_t hdr[2] = { (int32_t)n_tokens, (int32_t)n_embd };
+                fwrite(hdr, sizeof(hdr), 1, f);
+                fwrite(emb_data.data(), sizeof(float), emb_data.size(), f);
+                fclose(f);
+            }
+        }
 
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
