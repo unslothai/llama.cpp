@@ -5874,22 +5874,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
         LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
 
-        // when the env var holds a path (any value other than "1"), also dump the raw data
-        // format: [int32 n_tokens][int32 n_embd][f32 data (token-major)]
-        const char * dump_path = std::getenv("MTMD_DEBUG_EMBEDDINGS");
-        if (dump_path && strcmp(dump_path, "1") != 0) {
-            FILE * f = fopen(dump_path, "wb");
-            if (f) {
-                const int32_t hdr[2] = { (int32_t)n_tokens, (int32_t)n_embd };
-                fwrite(hdr, sizeof(hdr), 1, f);
-                fwrite(emb_data.data(), sizeof(float), emb_data.size(), f);
-                fclose(f);
-                LOG_INF("Dumped raw embeddings to %s\n", dump_path);
-            } else {
-                LOG_ERR("Failed to open %s for writing\n", dump_path);
-            }
-        }
-
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
         for (int i = 0; i < std::min((int64_t)16, n_embd); i++) {
