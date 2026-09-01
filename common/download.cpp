@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "http.h"
@@ -563,23 +564,37 @@ static hf_cache::hf_files get_split_files(const hf_cache::hf_files & files,
     return result;
 }
 
+static std::string to_upper(const std::string & s) {
+    std::string r = s;
+    for (char & c : r) {
+        c = (char) std::toupper((unsigned char) c);
+    }
+    return r;
+}
+
 // pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "mtp"),
 // preferring deeper shared directory prefix with the model, then exact `tag` match,
 // then closest quantization to the tag when given, or to the model otherwise
+//
+// `sidecar_dir` additionally admits candidates in a dedicated top-level folder of that name, which
+// shares no directory prefix with the model and is otherwise unreachable: unsloth publishes MTP
+// heads as MTP/mtp-<model>-<quant>.gguf, and without this the folder is silently never matched
+// `prefer_bits` wins over proximity when no candidate matches `tag` exactly, so a repo offering
+// several heads has one designated default rather than whichever is arithmetically nearest
 static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
                                            const std::string        & model,
                                            const std::string        & keyword,
-                                           const std::string        & tag = "") {
+                                           const std::string        & tag = "",
+                                           const std::string        & sidecar_dir = "",
+                                           int                        prefer_bits = 0) {
+    using rank_t = std::tuple<size_t, bool, bool, int, bool>;
+
     hf_cache::hf_file best;
-    size_t best_depth = 0;
-    int best_diff = 0;
-    bool best_exact = false;
+    rank_t best_rank;
     bool found = false;
 
-    std::string tag_upper = tag;
-    for (char & c : tag_upper) {
-        c = (char) std::toupper((unsigned char) c);
-    }
+    const std::string tag_upper     = to_upper(tag);
+    const std::string sidecar_upper = to_upper(sidecar_dir);
 
     int model_bits = 0;
     if (!tag_upper.empty()) {
@@ -602,27 +617,32 @@ static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
 
         auto [_, dir] = std::mismatch(model_parts.begin(), model_dir,
                                       sib_parts.begin(), sib_dir);
-        if (dir != sib_dir) {
+
+        size_t depth = 0;
+        if (dir == sib_dir) {
+            depth = dir - sib_parts.begin();
+        } else if (sidecar_upper.empty() || sib_parts.size() != 2 ||
+                   to_upper(sib_parts[0]) != sidecar_upper) {
             continue;
         }
+        // a dedicated folder ranks as depth 0, so a true same-directory sibling still wins
 
-        size_t depth = dir - sib_parts.begin();
         auto bits = extract_quant_bits(f.path);
         auto diff = std::abs(bits - model_bits);
 
-        std::string path_upper = f.path;
-        for (char & c : path_upper) {
-            c = (char) std::toupper((unsigned char) c);
-        }
-        bool exact = !tag_upper.empty() && path_upper.find("-" + tag_upper + ".") != std::string::npos;
+        const std::string path_upper = to_upper(f.path);
 
-        if (!found || depth > best_depth ||
-            (depth == best_depth && exact && !best_exact) ||
-            (depth == best_depth && exact == best_exact && diff < best_diff)) {
+        bool exact     = !tag_upper.empty() && path_upper.find("-" + tag_upper + ".") != std::string::npos;
+        bool preferred = prefer_bits != 0 && bits == prefer_bits;
+        // a head carrying its own token_embd/output loads against any build, where one that borrows
+        // them from the target needs a build that supports the borrow
+        bool self_contained = path_upper.find("SHARED") == std::string::npos;
+
+        rank_t rank{depth, exact, preferred, -diff, self_contained};
+
+        if (!found || rank > best_rank) {
             best = f;
-            best_depth = depth;
-            best_diff = diff;
-            best_exact = exact;
+            best_rank = rank;
             found = true;
         }
     }
@@ -634,10 +654,12 @@ static hf_cache::hf_file find_best_mmproj(const hf_cache::hf_files & files,
     return find_best_sibling(files, model, "mmproj");
 }
 
+// 8 bits is Q8_0: measured the fastest MTP head as well as the most accurate, because a draft step
+// is dominated by the LM head and that head is cheaper to execute at 8 bits than at bf16
 static hf_cache::hf_file find_best_mtp(const hf_cache::hf_files & files,
                                        const std::string        & model,
                                        const std::string        & tag = "") {
-    return find_best_sibling(files, model, "mtp-", tag);
+    return find_best_sibling(files, model, "mtp-", tag, "MTP", 8);
 }
 
 static hf_cache::hf_file find_best_eagle3(const hf_cache::hf_files & files,
