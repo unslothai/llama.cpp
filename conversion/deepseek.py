@@ -578,7 +578,7 @@ class DeepseekV4Model(TextModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-        if (name.startswith(("vision.", "aligner.", "image_"))
+        if (name.startswith(("aligner.", "image_"))
                 or name.endswith(".ffn.gate.bias_vl")):
             return None
         if name.startswith("mtp."):
@@ -1082,13 +1082,6 @@ class DeepseekV4FlashVisionModel(MmprojModel):
             # nn.Linear over flattened (3, p, p) patches == conv2d weight
             p = self.hparams_vision["patch_size"]
             data_torch = data_torch.reshape(data_torch.shape[0], 3, p, p)
-
-        if ".attn.wqkv." in name:
-            q, k, v = data_torch.chunk(3, dim=0)
-            yield from super().modify_tensors(q, name.replace("wqkv", "wq"), bid)
-            yield from super().modify_tensors(k, name.replace("wqkv", "wk"), bid)
-            yield from super().modify_tensors(v, name.replace("wqkv", "wv"), bid)
-            return
 
         if ".mlp.w1." in name:
             # fused SwiGLU gate+up

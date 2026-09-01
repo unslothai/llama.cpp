@@ -1583,6 +1583,7 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_QKV: (
+            "vision.blocks.{bid}.attn.wqkv", # deepseek4v
             "visual.blocks.{bid}.attn.qkv", # qwen3vl
             "vision_tower.blocks.{bid}.attn.qkv", # dots.ocr
             "vision_encoder.blocks.{bid}.attn.qkv", # dots3note
@@ -1594,7 +1595,6 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q: (
-            "vision.blocks.{bid}.attn.wq", # deepseek4v (split from wqkv)
             "model.vision_tower.vision_model.encoder.layers.{bid}.self_attn.q_proj", # Granite4Vision
             "vision_tower.vision_model.encoder.layers.{bid}.self_attn.q_proj",
             "model.vision_tower.encoder.layers.{bid}.self_attn.q_proj", # minicpmv4_6
@@ -1623,7 +1623,6 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K: (
-            "vision.blocks.{bid}.attn.wk", # deepseek4v (split from wqkv)
             "model.vision_tower.vision_model.encoder.layers.{bid}.self_attn.k_proj", # Granite4Vision
             "vision_tower.vision_model.encoder.layers.{bid}.self_attn.k_proj",
             "model.vision_tower.encoder.layers.{bid}.self_attn.k_proj", # minicpmv4_6
@@ -1652,7 +1651,6 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_V: (
-            "vision.blocks.{bid}.attn.wv", # deepseek4v (split from wqkv)
             "model.vision_tower.vision_model.encoder.layers.{bid}.self_attn.v_proj", # Granite4Vision
             "vision_tower.vision_model.encoder.layers.{bid}.self_attn.v_proj",
             "model.vision_tower.encoder.layers.{bid}.self_attn.v_proj", # minicpmv4_6
