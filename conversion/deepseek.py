@@ -1077,6 +1077,7 @@ class DeepseekV4FlashVisionModel(MmprojModel):
         return super().filter_tensors(item)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        assert self.hparams_vision is not None
         if name == "vision.patch_embed.proj.weight":
             # nn.Linear over flattened (3, p, p) patches == conv2d weight
             p = self.hparams_vision["patch_size"]
