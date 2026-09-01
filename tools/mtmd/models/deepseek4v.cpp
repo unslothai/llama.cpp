@@ -19,18 +19,15 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
     const int n_merge = hparams.n_merge;
 
     // 2D input positions
-    ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
-    ggml_set_name(pos_h, "pos_h");
-    ggml_set_input(pos_h);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches * 4);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
 
-    ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
-    ggml_set_name(pos_w, "pos_w");
-    ggml_set_input(pos_w);
-
+    int sections[4] = {d_head/4, d_head/4, 0, 0};
     auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
-        // row dims rotate in the first half, col dims in the second half
-        // the head dims are permuted at conversion time
-        return build_rope_2d(ctx0, cur, pos_h, pos_w, hparams.rope_theta, false);
+        return ggml_rope_multi(ctx0, cur, positions, nullptr,
+            d_head/2, sections, GGML_ROPE_TYPE_VISION,
+            0, hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     };
 
     ggml_tensor * inp = build_inp();

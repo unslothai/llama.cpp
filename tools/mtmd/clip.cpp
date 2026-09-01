@@ -5076,19 +5076,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
-                // set the 2D positions
+                // set the 2D positions (mrope layout, only the first 2 channels are used)
                 int n_patches_per_col = image_size_width / patch_size;
-                std::vector<int> pos_data(n_pos);
-                // dimension H
+                std::vector<int32_t> positions(n_pos * 4, 0);
                 for (int i = 0; i < n_pos; i++) {
-                    pos_data[i] = i / n_patches_per_col;
+                    positions[i]         = i / n_patches_per_col; // row
+                    positions[n_pos + i] = i % n_patches_per_col; // col
                 }
-                set_input_i32("pos_h", pos_data);
-                // dimension W
-                for (int i = 0; i < n_pos; i++) {
-                    pos_data[i] = i % n_patches_per_col;
-                }
-                set_input_i32("pos_w", pos_data);
+                set_input_i32("positions", positions);
 
                 // token block layout index (see clip_graph_deepseek4v::build)
                 // rows [0, n_grid) are the aligner output, the sentinels follow

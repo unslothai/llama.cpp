@@ -1069,16 +1069,6 @@ class DeepseekV4FlashVisionModel(MmprojModel):
         assert self.global_config["vision_max_n_token"] == 384
         assert self.global_config["vision_max_wh_ratio"] == 8
 
-    @staticmethod
-    def _permute_rope(w: Tensor, n_head: int) -> Tensor:
-        # reference 2D RoPE rotates pairs (dim j, dim j+32): dims [0,16) by row pos, [16,32) by col pos (see apply_rotary in inference/vision.py)
-        # permute to the build_rope_2d layout: dims [0,32) = adjacent row pairs, dims [32,64) = adjacent col pairs
-        out_dim = w.shape[0]
-        head_dim = out_dim // n_head
-        w = w.reshape(n_head, 2, 2, head_dim // 4, *w.shape[1:])
-        w = w.movedim(1, 3) # (head, a, b, f, ...) -> (head, b, f, a, ...)
-        return w.reshape(out_dim, *w.shape[4:])
-
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, _ = item
@@ -1087,9 +1077,6 @@ class DeepseekV4FlashVisionModel(MmprojModel):
         return super().filter_tensors(item)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        assert self.hparams_vision is not None
-        n_head = self.hparams_vision["num_attention_heads"]
-
         if name == "vision.patch_embed.proj.weight":
             # nn.Linear over flattened (3, p, p) patches == conv2d weight
             p = self.hparams_vision["patch_size"]
@@ -1097,8 +1084,6 @@ class DeepseekV4FlashVisionModel(MmprojModel):
 
         if ".attn.wqkv." in name:
             q, k, v = data_torch.chunk(3, dim=0)
-            q = self._permute_rope(q, n_head)
-            k = self._permute_rope(k, n_head)
             yield from super().modify_tensors(q, name.replace("wqkv", "wq"), bid)
             yield from super().modify_tensors(k, name.replace("wqkv", "wk"), bid)
             yield from super().modify_tensors(v, name.replace("wqkv", "wv"), bid)
