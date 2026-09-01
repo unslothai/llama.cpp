@@ -180,6 +180,41 @@ static const std::vector<std::string> spark = {
     "dspark-model-MXFP4.gguf",
 };
 
+// heads in a dedicated folder beside a root model, in the style of unsloth/Qwen3.8-27B-GGUF
+static const std::vector<std::string> mtp_dir_flat = {
+    "model-Q4_K_M.gguf",
+    "model-Q8_0.gguf",
+    "MTP/mtp-model-Q4_0.gguf",
+};
+
+// the same folder beside quant subdirectories, in the style of unsloth/Qwen3.8-Flash-Next-GGUF,
+// carrying every head we publish: three quants, each self-contained and borrowing
+static const std::vector<std::string> mtp_dir_subdir = {
+    "mmproj-BF16.gguf",
+    "UD-IQ1_S/model-UD-IQ1_S-00001-of-00002.gguf",
+    "UD-IQ1_S/model-UD-IQ1_S-00002-of-00002.gguf",
+    "Q8_0/model-Q8_0.gguf",
+    "MTP/mtp-model-BF16.gguf",
+    "MTP/mtp-model-Q4_K_M.gguf",
+    "MTP/mtp-model-Q8_0.gguf",
+    "MTP/mtp-model-shared-BF16.gguf",
+    "MTP/mtp-model-shared-Q4_K_M.gguf",
+    "MTP/mtp-model-shared-Q8_0.gguf",
+};
+
+// a dedicated folder must not take precedence over a head sharing the model's own directory
+static const std::vector<std::string> mtp_dir_and_sibling = {
+    "model-Q8_0.gguf",
+    "mtp-model-BF16.gguf",
+    "MTP/mtp-model-Q8_0.gguf",
+};
+
+// a top-level name that merely starts with MTP is not the dedicated folder
+static const std::vector<std::string> mtp_dir_near_miss = {
+    "model-Q8_0.gguf",
+    "MTPX/mtp-model-Q8_0.gguf",
+};
+
 // dspark outranks dflash in the type auto-selection
 static const std::vector<std::string> dspark_dflash = {
     "model-Q8_0.gguf",
@@ -283,6 +318,37 @@ static const plan_case plan_cases[] = {
     {"spark tag sidecar", spark, "test/repo:BF16", "", true, false,
      "", {},
      "", "", "", "", "dspark-model-BF16.gguf"},
+
+    // a head in the dedicated folder is reachable from a model at the repo root,
+    // where the directory prefix rule alone finds nothing
+    {"mtp dir flat", mtp_dir_flat, "test/repo:Q8_0", "", true, false,
+     "model-Q8_0.gguf", {"model-Q8_0.gguf"},
+     "", "MTP/mtp-model-Q4_0.gguf", "", "", ""},
+
+    // and from a model in a quant subdirectory, which shares no prefix with it either.
+    // no head matches UD-IQ1_S, so the preferred quant wins over the nearest one, and the
+    // self-contained head wins over the one that borrows from the target
+    {"mtp dir subdir", mtp_dir_subdir, "test/repo:UD-IQ1_S", "", true, false,
+     "UD-IQ1_S/model-UD-IQ1_S-00001-of-00002.gguf",
+     {"UD-IQ1_S/model-UD-IQ1_S-00001-of-00002.gguf",
+      "UD-IQ1_S/model-UD-IQ1_S-00002-of-00002.gguf"},
+     "mmproj-BF16.gguf", "MTP/mtp-model-Q8_0.gguf", "", "", ""},
+
+    // an exact tag still beats the preferred quant
+    {"mtp dir exact tag", mtp_dir_subdir, "test/repo:Q8_0", "", true, false,
+     "Q8_0/model-Q8_0.gguf", {"Q8_0/model-Q8_0.gguf"},
+     "mmproj-BF16.gguf", "MTP/mtp-model-Q8_0.gguf", "", "", ""},
+
+    // a head sharing the model's own directory outranks the dedicated folder, even though the
+    // folder holds the exact tag and the sibling does not
+    {"mtp dir loses to sibling", mtp_dir_and_sibling, "test/repo:Q8_0", "", true, false,
+     "model-Q8_0.gguf", {"model-Q8_0.gguf"},
+     "", "mtp-model-BF16.gguf", "", "", ""},
+
+    // only the exact folder name is special, MTPX/ is not
+    {"mtp dir near miss", mtp_dir_near_miss, "test/repo:Q8_0", "", true, false,
+     "model-Q8_0.gguf", {"model-Q8_0.gguf"},
+     "", "", "", "", ""},
 };
 
 static void check_plan(const plan_case & c) {

@@ -581,13 +581,16 @@ static std::string to_upper(const std::string & s) {
 // heads as MTP/mtp-<model>-<quant>.gguf, and without this the folder is silently never matched
 // `prefer_bits` wins over proximity when no candidate matches `tag` exactly, so a repo offering
 // several heads has one designated default rather than whichever is arithmetically nearest
+//
+// both only ever apply to candidates admitted by `sidecar_dir`, so a repository that resolved
+// before this existed resolves to the same file afterwards
 static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
                                            const std::string        & model,
                                            const std::string        & keyword,
                                            const std::string        & tag = "",
                                            const std::string        & sidecar_dir = "",
                                            int                        prefer_bits = 0) {
-    using rank_t = std::tuple<size_t, bool, bool, int, bool>;
+    using rank_t = std::tuple<bool, size_t, bool, bool, int, bool>;
 
     hf_cache::hf_file best;
     rank_t best_rank;
@@ -618,27 +621,30 @@ static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
         auto [_, dir] = std::mismatch(model_parts.begin(), model_dir,
                                       sib_parts.begin(), sib_dir);
 
-        size_t depth = 0;
-        if (dir == sib_dir) {
+        size_t depth  = 0;
+        bool   prefix = dir == sib_dir;
+        if (prefix) {
             depth = dir - sib_parts.begin();
         } else if (sidecar_upper.empty() || sib_parts.size() != 2 ||
                    to_upper(sib_parts[0]) != sidecar_upper) {
             continue;
         }
-        // a dedicated folder ranks as depth 0, so a true same-directory sibling still wins
 
         auto bits = extract_quant_bits(f.path);
         auto diff = std::abs(bits - model_bits);
 
         const std::string path_upper = to_upper(f.path);
 
-        bool exact     = !tag_upper.empty() && path_upper.find("-" + tag_upper + ".") != std::string::npos;
-        bool preferred = prefer_bits != 0 && bits == prefer_bits;
+        bool exact = !tag_upper.empty() && path_upper.find("-" + tag_upper + ".") != std::string::npos;
+
+        // a sibling sharing the model's directory prefix always outranks the dedicated folder, and
+        // the two rules below never fire for one, so every layout that resolved before is unchanged
+        bool preferred = !prefix && prefer_bits != 0 && bits == prefer_bits;
         // a head carrying its own token_embd/output loads against any build, where one that borrows
         // them from the target needs a build that supports the borrow
-        bool self_contained = path_upper.find("SHARED") == std::string::npos;
+        bool self_contained = !prefix && path_upper.find("SHARED") == std::string::npos;
 
-        rank_t rank{depth, exact, preferred, -diff, self_contained};
+        rank_t rank{prefix, depth, exact, preferred, -diff, self_contained};
 
         if (!found || rank > best_rank) {
             best = f;
