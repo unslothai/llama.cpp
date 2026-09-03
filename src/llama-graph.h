@@ -1173,6 +1173,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                int64_t   n_kv_max,
                   float   kq_scale,
                     int   il) const;
 
