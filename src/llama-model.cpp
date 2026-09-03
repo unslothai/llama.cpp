@@ -1738,19 +1738,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+                // a tensor of another buffer type can sit between this context's, and one span
+                // over them would map it too, so map each contiguous run separately
                 void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
+                std::vector<std::pair<size_t, size_t>> ranges;
+                ml.get_mapping_ranges(ranges, &addr, idx, ctx);
+                if (ranges.empty()) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                for (const auto & [first, last] : ranges) {
+                    if (first >= last) {
+                        continue;
+                    }
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map[idx].push_back(buf);
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -1773,7 +1780,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+                buf_map[idx].push_back(buf);
             }
         }
 
@@ -1820,7 +1827,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!ml.use_mmap) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
             const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            // one entry is a run of buffers now, not a single buffer, and every
+            // buffer in a context comes from the same buft, so the first one
+            // answers the question for all of them
+            if (buf_map.empty() || buf_map.begin()->second.empty()) {
+                return false;
+            }
+            return !ggml_backend_buffer_is_host(buf_map.begin()->second.front());
         });
     }
 
