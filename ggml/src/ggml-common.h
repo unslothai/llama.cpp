@@ -1179,7 +1179,7 @@ GGML_TABLE_END()
 #define NGRID_IQ1XS 1024
 #define NGRID_IQ1XXS 512
 #define NGRID_IQ1XXXS 256
-#if defined(GGML_COMMON_IMPL_C)
+#if defined(GGML_COMMON_IMPL_C) || defined(GGML_COMMON_IMPL_CPP)
 GGML_TABLE_BEGIN(uint64_t, iq1s_grid, NGRID_IQ1S)
     0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,
     0xffffffffffff0101, 0xffffffffff00ff00, 0xffffffffff000000, 0xffffffffff01ffff,
