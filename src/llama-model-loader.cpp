@@ -1068,6 +1068,38 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // Layer-split pipeline parallelism: this instance only materialises the decoder layers it
+    // executes, plus the LM head if it is the final stage. Done centrally here, keyed on the
+    // block id carried by LLM_TN_IMPL, so it applies to every architecture without touching each
+    // load_arch_tensors(). TENSOR_SKIP still increments n_created, so done_getting_tensors()
+    // remains consistent and no partial-load mode is needed.
+    if (hparams.il_load_beg > 0 || hparams.il_load_end > 0) {
+        const uint32_t il_end        = hparams.il_load_end ? hparams.il_load_end : hparams.n_layer();
+        const bool     is_last_stage = il_end >= hparams.n_layer();
+
+        bool skip = false;
+
+        if (tn.bid >= 0) {
+            const uint32_t bid = (uint32_t) tn.bid;
+
+            skip = (bid < hparams.il_load_beg) || (bid >= il_end);
+        } else if (!is_last_stage) {
+            // A non-final stage stops at the residual stream: no final norm, no LM head.
+            //
+            // Deliberately NOT skipped here: the tied-embedding case, which arrives as
+            // TOKEN_EMBD carrying TENSOR_DUPLICATED. That is an alias of tok_embd rather than a
+            // distinct tensor in the file, so it costs no memory, and skipping it would make
+            // n_created exceed n_tensors ("too many tensors created") because the skip path
+            // counts it while the normal duplicate path does not.
+            skip = tn.tensor == LLM_TENSOR_OUTPUT
+                || tn.tensor == LLM_TENSOR_OUTPUT_NORM;
+        }
+
+        if (skip) {
+            flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        }
+    }
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {

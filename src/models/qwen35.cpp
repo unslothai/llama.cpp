@@ -43,17 +43,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
-    // output. A non-final layer-split stage stops at the residual stream, so it needs neither
-    // the final norm nor the LM head -- for an untied model that is n_embd*n_vocab of weights it
-    // would otherwise carry for nothing.
-    const bool head_owned = (hparams.il_load_end == 0 || hparams.il_load_end >= hparams.n_layer());
-    const int  head_flags = head_owned ? 0 : (TENSOR_NOT_REQUIRED | TENSOR_SKIP);
-
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, head_flags);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, head_flags | TENSOR_NOT_REQUIRED);
+    // output. A non-final stage's output_norm / LM head are skipped centrally in
+    // llama_model_loader::create_tensor().
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL && head_owned) {
+    if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -124,16 +120,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
-    // Layer-split: only materialise the layers this instance executes. create_tensor() with
-    // TENSOR_SKIP still counts the tensor, so done_getting_tensors() stays consistent, and the
-    // graph never references the skipped layers because its loop is bounded by the same range.
-    const int pp_beg = (int) hparams.il_load_beg;
-    const int pp_end = hparams.il_load_end ? (int) std::min<uint32_t>(hparams.il_load_end, n_layer) : n_layer;
-
+    // NOTE: layers outside this instance's range are skipped centrally in
+    // llama_model_loader::create_tensor(), keyed on the block id -- nothing arch-specific here.
     for (int i = 0; i < n_layer; ++i) {
-        const bool owned = (i >= pp_beg && i < pp_end);
-
-        load_block_trunk(i, owned ? trunk_flags : (trunk_flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP));
+        load_block_trunk(i, trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
