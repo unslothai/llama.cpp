@@ -456,6 +456,29 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+
+            // pipeline parallelism only produces overlap if consecutive ubatches use different
+            // graph copies. A reused graph keeps sched->cur_copy fixed, which forces a full
+            // synchronization in process_ubatch() and serializes the pipeline again.
+            const char * LLAMA_PP_REUSE = getenv("LLAMA_PP_REUSE");
+            if (!(LLAMA_PP_REUSE && atoi(LLAMA_PP_REUSE) != 0)) {
+                graph_reuse_disable = true;
+                LLAMA_LOG_INFO("%s: graph reuse disabled (required for pipeline parallelism)\n", __func__);
+            }
+
+        }
+
+        // Number of tokens per ubatch during token generation; smaller values create more
+        // in-flight microbatches, which is what actually fills the pipeline.
+        // Deliberately independent of cparams.pipeline_parallel: ggml_backend_sched already
+        // submits every split with graph_compute_async, so consecutive ubatches overlap
+        // across backends even with n_copies == 1 and graph reuse left enabled.
+        {
+            const char * LLAMA_PP_UBATCH_TG = getenv("LLAMA_PP_UBATCH_TG");
+            if (LLAMA_PP_UBATCH_TG) {
+                n_ubatch_tg = std::max(1, atoi(LLAMA_PP_UBATCH_TG));
+                LLAMA_LOG_INFO("%s: token-generation ubatch size = %u\n", __func__, n_ubatch_tg);
+            }
         }
 
         sched_reserve();
@@ -1736,7 +1759,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        uint32_t n_ubatch_use = cparams.n_ubatch;
+        if (n_ubatch_tg > 0 && n_tokens_all <= cparams.n_seq_max && n_tokens_all > n_ubatch_tg) {
+            // token-generation step: split into microbatches so that the two pipeline stages
+            // can work on different microbatches at the same time
+            n_ubatch_use = n_ubatch_tg;
+        }
+
+        mctx = memory->init_batch(*balloc, n_ubatch_use, output_all);
         if (!mctx) {
             return -2;
         }

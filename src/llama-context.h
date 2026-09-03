@@ -378,6 +378,9 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // token-generation ubatch size used to create microbatches for pipeline parallelism (0 = off)
+    uint32_t n_ubatch_tg = 0;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

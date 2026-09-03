@@ -213,6 +213,10 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     uint64_t    last_graph_uid;
+    // hash of the last serialized graph sent to the server; lets us use GRAPH_RECOMPUTE even
+    // when the graph was rebuilt (which happens on every ubatch under pipeline parallelism,
+    // where llama.cpp's own graph reuse has to be disabled)
+    uint64_t    last_graph_hash;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -673,9 +677,65 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Pipeline-parallel support:
+// RPC_CMD_GRAPH_COMPUTE is fire-and-forget (no response is read), so from the client's
+// point of view the RPC backend is asynchronous. The command stream on a given socket is
+// strictly ordered and the server processes commands serially, so issuing any command that
+// *does* expect a response acts as a full barrier: the response cannot arrive before all
+// previously submitted graphs have finished executing on the remote device.
+static bool rpc_pp_enabled() {
+    static const bool v = (getenv("GGML_RPC_NO_PIPELINE") == NULL);
+    return v;
+}
+
+// opt-in: reuse the server-side cached graph when a rebuilt graph serializes identically
+static bool rpc_graph_hash_enabled() {
+    static const bool v = (getenv("GGML_RPC_GRAPH_HASH") != NULL);
+    return v;
+}
+
+static void rpc_barrier(const std::string & endpoint, uint32_t device) {
+    if (!rpc_pp_enabled()) {
+        return; // restore the original no-op behaviour
+    }
+    auto sock = get_socket(endpoint);
+    if (!sock) {
+        return;
+    }
+    rpc_msg_get_alignment_req request = {device};
+    rpc_msg_get_alignment_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+}
+
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_barrier(rpc_ctx->endpoint, rpc_ctx->device);
+}
+
+// event context: the endpoint/device the event belongs to
+struct ggml_backend_rpc_event_context {
+    std::string endpoint;
+    uint32_t    device;
+};
+
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    // no-op: commands on a socket are strictly ordered, so the position of the event in the
+    // command stream is implicit. Synchronizing on the event drains the stream, which is a
+    // superset of the work recorded here.
     GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    GGML_UNUSED(event);
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    ggml_backend_rpc_event_context * ev_ctx = (ggml_backend_rpc_event_context *)event->context;
+    if (ev_ctx != NULL && ev_ctx->endpoint == rpc_ctx->endpoint) {
+        // same command stream -> ordering is already guaranteed
+        return;
+    }
+    // foreign event: block until it has completed
+    ggml_backend_event_synchronize(event);
 }
 
 static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -743,8 +803,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        // a rebuilt but structurally identical graph serializes to exactly the same bytes
+        // (same ops, shapes and tensor addresses), so the server's cached graph is still valid
+        const uint64_t hash = rpc_graph_hash_enabled() ? fnv_hash(input.data(), input.size()) : 0;
+        if (hash != 0 && hash == rpc_dev_ctx->last_graph_hash) {
+            rpc_msg_graph_recompute_req request;
+            request.device = rpc_ctx->device;
+            bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+            RPC_STATUS_ASSERT(status);
+        } else {
+            rpc_dev_ctx->last_graph_hash = hash;
+            bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+            RPC_STATUS_ASSERT(status);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -763,8 +834,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -1888,11 +1959,13 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->description = ggml_backend_rpc_device_get_description(dev);
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    // async graph submission + events are supported (see rpc_barrier), which allows
+    // ggml_backend_sched to enable pipeline parallelism across RPC devices
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ rpc_pp_enabled(),
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ rpc_pp_enabled(),
         /* .mmap_support          = */ true,
     };
 }
@@ -1929,6 +2002,26 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
 }
 
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ new ggml_backend_rpc_event_context { ctx->endpoint, ctx->device },
+    };
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    delete (ggml_backend_rpc_event_context *)event->context;
+    delete event;
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    ggml_backend_rpc_event_context * ev_ctx = (ggml_backend_rpc_event_context *)event->context;
+    rpc_barrier(ev_ctx->endpoint, ev_ctx->device);
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -1942,9 +2035,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_device_event_new,
+    /* .event_free           = */ ggml_backend_rpc_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
 };
 
 // backend reg interface
@@ -2045,6 +2138,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
             /* .last_graph_uid = */ 0,
+            /* .last_graph_hash = */ 0,
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
