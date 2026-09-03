@@ -97,10 +97,7 @@ void llama_model_kimi_k3::load_arch_tensors(llama_model_loader &) {
             layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner}, 0);
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
 
-            // K3's A_log is a plain 1-D [n_head] tensor (kimi-linear's is padded).
-            // NOSCAN: build_kda consumes it via a broadcast ggml_mul, not ggml_ssm_scan.
-            // Same "blk.%d.ssm_a" name, but SSM_A declares GGML_OP_SSM_SCAN, and no backend
-            // offers that at [n_head], so the create_tensor probe fails and it lands on CPU.
+            // K3's A_log is a plain 1-D [n_head] tensor (kimi-linear's is padded)
             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head}, 0);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, 0);
 
