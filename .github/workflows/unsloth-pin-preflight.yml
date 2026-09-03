@@ -49,6 +49,15 @@ jobs:
         id: p
         run: |
           set -uo pipefail
+          # Everything below reports through `status`/`details`, so a death
+          # anywhere else leaves both empty and the alert blank: a red X on a
+          # scheduled run nobody opens. Report the abort through the same
+          # channel as a finding, so the repin bot sees a failure either way.
+          trap 'rc=$?; if [ "$rc" != 0 ]; then {
+                  echo "status=failure"
+                  echo "details<<ALERT_EOF"
+                  echo "The preflight script exited ${rc} before it finished probing, so the pins were not fully checked. See the run log for the last command it reached."
+                  echo "ALERT_EOF"; } >> "$GITHUB_OUTPUT"; fi' EXIT
           AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
           # Same base tag the nightly resolves: newest aged b#### build.
@@ -145,7 +154,16 @@ jobs:
               continue
             fi
             FILES="$(git diff --name-only --diff-filter=U | sed 's/^/  /')"
-            HUNKS="$(git diff --diff-filter=U -U0 2>/dev/null | grep -E '^\+|^-' | grep -vE '^(\+\+\+|---)' | head -20)"
+            # `|| true` is load-bearing, not tidying. GitHub runs a `run:` block
+            # under `bash -e` whatever this script's own `set` line says, `head`
+            # closes the pipe after 20 lines, and pipefail then makes the whole
+            # assignment fail. So on 09-03 the step died right here, on the first
+            # real conflict, with `grep: write error: Broken pipe` and no alert:
+            # the one path this job exists to report was the one it could not
+            # survive. It only fires when the conflict diff is bigger than the
+            # 64 KiB pipe buffer, since a smaller one is written before `head`
+            # ever closes it, which is why most conflicts got reported fine.
+            HUNKS="$(git diff --diff-filter=U -U0 2>/dev/null | grep -E '^\+|^-' | grep -vE '^(\+\+\+|---)' | head -20 || true)"
             git merge --abort 2>/dev/null
             PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` (\`${SHA:0:10}\`) does not merge onto \`${BASE}\` + the pins before it.\n\n  Conflicting files:\n\n\`\`\`\n${FILES}\n\`\`\`\n\n  <details><summary>conflict hunks</summary>\n\n\`\`\`diff\n${HUNKS}\n\`\`\`\n\n  </details>\n"
             # Stop here, like resolve does. Probing later pins against a tree
