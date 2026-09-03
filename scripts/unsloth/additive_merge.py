@@ -114,6 +114,24 @@ def identifying(lines: list[str]) -> set[str]:
     return {ln for ln in nonblank(lines) if not STRUCTURAL.match(ln)}
 
 
+# `case FOO:`, `case FOO :`, `default:`. A fallthrough label may carry no body
+# at all, which is the shape the nightly hits most often.
+CASE_LABEL = re.compile(r"^(?:case\s+[^:]+|default\s*):")
+
+
+def case_arms(lines: list[str]) -> set[str] | None:
+    """The case labels this side adds, or None if it is not a run of case arms.
+
+    None, not an empty set: "adds no case arm" and "adds case arms, none of
+    which the other side adds" have to be told apart, and only the second one
+    licenses the union below.
+    """
+    ident = [ln for ln in nonblank(lines) if not STRUCTURAL.match(ln)]
+    if not ident or not CASE_LABEL.match(ident[0]):
+        return None
+    return {ln for ln in ident if CASE_LABEL.match(ln)}
+
+
 def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[str]:
     """Return the union, or raise if this region is not a pure add/add."""
     if nonblank(base):
@@ -127,6 +145,20 @@ def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[
     if ours == theirs:
         # Both sides added byte-identical text; one copy is the resolution.
         return list(ours)
+    ours_arms, theirs_arms = case_arms(ours), case_arms(theirs)
+    if ours_arms and theirs_arms and ours_arms.isdisjoint(theirs_arms):
+        # Both sides added case arms, and not one label is on both sides. Two
+        # arms of the same switch labelled differently are two constructs, so
+        # any line they happen to share is body text, not a duplicate: the real
+        # tools/mtmd/clip.cpp collision has a KIMIK3 arm and a DEEPSEEK4V arm
+        # that both set `hparams.rope_theta = 10000.0f;`, and refusing on that
+        # coincidence is what the shared-line check is for, backwards.
+        #
+        # The same change made twice would keep its label, so it lands in the
+        # check below instead. This is the one place where a shared line is
+        # allowed, and it is allowed because the labels prove the arms are
+        # distinct -- a duplicated label would not even compile.
+        return list(theirs) + list(ours)
     shared = identifying(ours) & identifying(theirs)
     if shared:
         # Overlapping content is the signature of one construct added twice,
