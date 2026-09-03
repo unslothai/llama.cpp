@@ -119,7 +119,8 @@ jobs:
                    scripts/unsloth/test_pin_merge.py \
                    scripts/unsloth/test_merge_checks.py \
                    scripts/unsloth/test_sync_deletes.py \
-                   scripts/unsloth/test_carry_vintage.py; do
+                   scripts/unsloth/test_carry_vintage.py \
+                   scripts/unsloth/test_pin_contract.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
             echo "::endgroup::"
