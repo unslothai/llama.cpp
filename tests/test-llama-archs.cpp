@@ -341,6 +341,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
     }
+    if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        // ISWA: the loader reads the SWA head lengths unconditionally, and they
+        // are separate keys from the non-SWA pair above.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   n_embd/n_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, n_embd/n_head);
+        // canvas_length splits the forward at P = n_tokens - canvas_length and
+        // the loader rejects anything <= 0. Kept well under the 128 tokens the
+        // backend comparison decodes, so both halves of that split are exercised.
+        ms.add_kv(LLM_KV_DIFFUSION_CANVAS_LENGTH, uint32_t(16));
+    }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,             n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,         uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,            3.5565588200778455f);
@@ -455,6 +465,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DIFFUSION_GEMMA:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
@@ -519,8 +530,8 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
-        return false; // FIXME @ngxson; diffusion-gemma additionally needs canvas/ISWA fixture params
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return false; // FIXME @ngxson
     }
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
@@ -589,7 +600,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
@@ -700,14 +711,30 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
+        if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
+            // The fixture below is complete: the model loads, the graph reserves
+            // and save_models emits it. The backend comparison still aborts in
+            // llm_graph_input_attn_diffusion::set_input,
+            //
+            //   GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer))
+            //
+            // with self_kq_mask->buffer null, i.e. the mask input was not
+            // allocated for the ubatch actually being decoded. That is in the
+            // arch's own graph input, not in the fixture, so it is left to the
+            // DiffusionGemma authors rather than worked around here.
+            continue;
+        }
 
-        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        // diffusion-gemma belongs here for the same reason as the other diffusion
+        // decoders: it sets causal_attn = false, so the whole batch is one
+        // encoder pass and n_ubatch must not be capped below n_tokens.
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1 || arch == LLM_ARCH_DIFFUSION_GEMMA;
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
