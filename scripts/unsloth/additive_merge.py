@@ -13,6 +13,12 @@ Anything else is left conflicted and reported. In particular a conflict where
 the merge base is non-empty means at least one side *edited* shared text, and
 picking a side or unioning them is a guess. This script never guesses.
 
+The two additions are compared on their CONTENT, not on the braces around it.
+A case arm is `case X:`, a body, and `} break;`, and two arms for different
+architectures share that last part whatever they do. Treating the scaffolding
+as evidence that the same change was made twice refuses exactly the conflict
+this script exists for; see STRUCTURAL below.
+
 Reads a conflicted work tree, writes resolutions in place, exits 0 if every
 conflict in every file was resolved and 1 otherwise. `--report` emits JSON
 describing what it did for the caller to quote in a PR body.
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +94,26 @@ def nonblank(lines: list[str]) -> list[str]:
     return [ln.strip() for ln in lines if ln.strip()]
 
 
+# A line that closes or opens a block and nothing else. Two INDEPENDENT case
+# arms in the same switch share these by construction -- `{`, `} break;`, `}`
+# are what a case arm is made of, not what makes it that case arm -- so finding
+# them on both sides says nothing about whether the two sides added the same
+# construct. Matching them as "shared" is what refused the real add/add of
+# PROJECTOR_TYPE_KIMIK3 next to PROJECTOR_TYPE_DEEPSEEK4V in tools/mtmd/clip.cpp
+# with "one change made twice: {, } break;", when the two arms had no line of
+# actual content in common.
+#
+# Deliberately narrow: braces, brackets, parens, semicolons and commas, around
+# at most one bare block-terminating keyword. `break;` matches, `return true;`
+# does not, and anything naming a type, a constant or a function does not.
+STRUCTURAL = re.compile(r"^[\s{}()\[\];,]*(?:break|continue|return|pass)?[\s{}()\[\];,]*$")
+
+
+def identifying(lines: list[str]) -> set[str]:
+    """The lines that say WHICH construct this is, ignoring block scaffolding."""
+    return {ln for ln in nonblank(lines) if not STRUCTURAL.match(ln)}
+
+
 def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[str]:
     """Return the union, or raise if this region is not a pure add/add."""
     if nonblank(base):
@@ -100,13 +127,23 @@ def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[
     if ours == theirs:
         # Both sides added byte-identical text; one copy is the resolution.
         return list(ours)
-    shared = set(nonblank(ours)) & set(nonblank(theirs))
+    shared = identifying(ours) & identifying(theirs)
     if shared:
         # Overlapping content is the signature of one construct added twice,
         # not two independent additions. Unioning it would duplicate code.
+        # Scaffolding lines are excluded above, so what is left is content both
+        # sides genuinely wrote, which is the thing that makes this a duplicate.
         raise Unresolvable(
             "both sides add the same line(s), so this is one change made twice: "
             + ", ".join(sorted(shared)[:3])
+        )
+    if not identifying(ours) or not identifying(theirs):
+        # Everything one side added is scaffolding, so there is no content to
+        # tell the two additions apart and the exclusion above has nothing left
+        # to work with. Refuse rather than union braces onto braces.
+        raise Unresolvable(
+            "one side adds only block scaffolding, so the two additions cannot "
+            "be told apart"
         )
     # Upstream first, then ours: the same order a human repin produces.
     return list(theirs) + list(ours)

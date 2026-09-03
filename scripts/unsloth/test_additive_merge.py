@@ -86,12 +86,42 @@ rc, rep = run(repo)
 check("identical add/add is not a conflict at all", rc == 1 and "no conflicted files" in json.dumps(rep))
 
 base = "a\nz\n"
-ours = "a\ncase FOO:\n    break;\nz\n"
+ours = "a\ncase FOO:\n    log(\"same\");\n    break;\nz\n"
+theirs = "a\ncase BAR:\n    log(\"same\");\n    break;\nz\n"
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+check("overlapping add/add refuses on shared CONTENT",
+      rc == 1 and "made twice" in json.dumps(rep), rep)
+reason = rep["refused"][0]["reason"] if rep.get("refused") else ""
+check("overlapping add/add names the content line, not the braces",
+      'log("same");' in reason and "break;" not in reason, reason)
+
+# --- 3b. two independent case arms: braces are shared, content is not -------
+# The real tools/mtmd/clip.cpp shape. Refusing this on `{` and `} break;` is
+# what took the 09-02 nightly's last pin down.
+base = "switch (t) {\n}\n"
+ours = ("switch (t) {\n    case PROJECTOR_TYPE_KIMIK3:\n        {\n"
+        "            builder = std::make_unique<clip_graph_kimik3>(ctx, img);\n"
+        "        } break;\n}\n")
+theirs = ("switch (t) {\n    case PROJECTOR_TYPE_DEEPSEEK4V:\n        {\n"
+          "            builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);\n"
+          "        } break;\n}\n")
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+txt = f.read_text()
+check("independent case arms resolve despite shared braces", rc == 0 and rep["ok"], rep)
+check("independent case arms keep both", "KIMIK3" in txt and "DEEPSEEK4V" in txt and "<<<<" not in txt, txt)
+check("independent case arms keep both bodies once",
+      txt.count("} break;") == 2 and txt.count("clip_graph_kimik3") == 1, txt)
+
+# --- 3c. one side adds only scaffolding: nothing distinguishes the two ------
+base = "a\nz\n"
+ours = "a\n}\nz\n"
 theirs = "a\ncase BAR:\n    break;\nz\n"
 repo, f = make_conflict(base, ours, theirs)
 rc, rep = run(repo)
-check("overlapping add/add refuses (shared 'break;')",
-      rc == 1 and "made twice" in json.dumps(rep), rep)
+check("scaffolding-only addition refuses",
+      rc == 1 and "scaffolding" in json.dumps(rep), rep)
 
 # --- 4. one file good, one file bad: refuse the whole merge ----------------
 d = Path(tempfile.mkdtemp(prefix="am_"))
