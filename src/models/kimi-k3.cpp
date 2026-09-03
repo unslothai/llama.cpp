@@ -36,11 +36,15 @@ void llama_model_kimi_k3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,        hparams.expert_weights_norm, false);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,         hparams.expert_gating_func);
-    ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,       hparams.n_expert_latent, false);
+    // required: a silent default here loads cleanly and produces garbage
+    ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,       hparams.n_expert_latent);
 
     ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,          hparams.attn_res_block_size);
     ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,         hparams.situ_beta);
     ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA,  hparams.situ_linear_beta);
+
+    GGML_ASSERT(hparams.attn_res_block_size > 0 && "Kimi-K3 requires attn_res.block_size");
+    GGML_ASSERT(hparams.n_expert_latent   > 0 && "Kimi-K3 requires expert_latent_length");
 
     switch (hparams.n_layer()) {
         case 93: type = LLM_TYPE_2_8T_A50B; break; // Kimi-K3
