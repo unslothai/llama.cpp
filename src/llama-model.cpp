@@ -1205,6 +1205,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
+
+    // layer-split pipeline parallelism (see llama_hparams::il_load_beg). Read here, before any
+    // tensor is created, so load_arch_tensors() can skip the layers this instance does not own.
+    {
+        const char * env_beg = getenv("LLAMA_PP_IL_BEG");
+        const char * env_end = getenv("LLAMA_PP_IL_END");
+
+        hparams.il_load_beg = env_beg ? (uint32_t) std::max(0, atoi(env_beg)) : 0;
+        hparams.il_load_end = env_end ? (uint32_t) std::max(0, atoi(env_end)) : 0;
+    }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);

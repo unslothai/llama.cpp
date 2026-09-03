@@ -55,6 +55,14 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // layer-split pipeline parallelism: this instance owns decoder layers [il_load_beg, il_load_end).
+    // Weights outside the range are skipped at load time so each node holds only its own shard.
+    // Absolute indices are preserved -- nothing is renumbered -- so is_recr()/SWA/MoE per-layer
+    // settings stay valid. il_load_end == 0 means "to the end".
+    uint32_t il_load_beg = 0;
+    uint32_t il_load_end = 0;
+
+
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;

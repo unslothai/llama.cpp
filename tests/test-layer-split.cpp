@@ -77,9 +77,25 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = getenv("NGL") ? atoi(getenv("NGL")) : 999;
+    if (getenv("NOMMAP")) { mparams.load_mode = LLAMA_LOAD_MODE_NONE; }
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
+
+    // SHARD_INFO=1: load with LLAMA_PP_IL_BEG/END already in the environment and report how much
+    // of the model this shard actually materialises. Used to verify the load-time tensor skip.
+    if (getenv("SHARD_INFO")) {
+        char desc[256] = {0};
+        llama_model_desc(model, desc, sizeof(desc));
+        printf("SHARD il=[%s,%s) size=%.3f GiB params=%.3f B  %s\n",
+               getenv("LLAMA_PP_IL_BEG") ? getenv("LLAMA_PP_IL_BEG") : "0",
+               getenv("LLAMA_PP_IL_END") ? getenv("LLAMA_PP_IL_END") : "end",
+               llama_model_size(model) / 1024.0 / 1024.0 / 1024.0,
+               llama_model_n_params(model) / 1e9, desc);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
 
     const llama_vocab * vocab  = llama_model_get_vocab(model);
     const int n_vocab  = llama_vocab_n_tokens(vocab);
