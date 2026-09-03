@@ -28,11 +28,18 @@ permissions:
   contents: write
   issues: write
 
-# Every run probes the same pins against the same base, so a second one adds
-# nothing and just competes for runners. On 08-04 a dispatch and the schedule
-# sat queued together for an hour. Newest wins: it sees the newest pr-set.json.
+# Two runs of the same ref probe the same pins against the same base, so the
+# second adds nothing and just competes for runners. On 08-04 a dispatch and the
+# schedule sat queued together for an hour. Newest wins: it sees the newest
+# pr-set.json.
+#
+# Per ref, though, not globally. This file also runs on any push that touches
+# pr-set.json, so with one shared group a push to a second branch cancelled the
+# first branch's run: observed on 09-03, where the run that would have said
+# whether a repin fixed the nightly was cancelled by an unrelated branch, and
+# the PR was left showing the failure from before the fix.
 concurrency:
-  group: unsloth-pin-preflight
+  group: unsloth-pin-preflight-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
