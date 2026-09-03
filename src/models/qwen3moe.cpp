@@ -68,6 +68,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // layer-split stage bounds; absolute indices are preserved (see llama_cparams::il_beg)
+    const int il_beg = (int) cparams.il_beg;
+    const int il_end = (int) std::min<uint32_t>(cparams.il_end, (uint32_t) n_layer);
+
+    const bool is_last_stage = (il_end == n_layer);
+
     inpL = build_inp_embd(model.tok_embd);
 
     // inp_pos - contains the positions
@@ -75,9 +81,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // a non-final stage hands every token's residual to the next stage, so it never selects
+    // output rows; an unconsumed graph input is never allocated, so do not create it at all
+    ggml_tensor * inp_out_ids = is_last_stage ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_beg; il < il_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -120,7 +128,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == il_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -161,6 +169,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    if (!is_last_stage) {
+        // emit the raw residual stream entering layer il_end, before output_norm and the LM head
+        cb(cur, "result_embd_hidden", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
