@@ -29,7 +29,17 @@
     "",
     "A probe that exits 0 having run nothing is a failure, not a pass: both",
     "harnesses do exactly that for an excluded arch or a misspelled op name.",
-    "feature_matrix.py rejects skip markers and requires a non-zero case count."
+    "feature_matrix.py rejects skip markers and requires a non-zero case count.",
+    "",
+    "No runner in the prebuild pipeline has a GPU, so the nightly runs this on",
+    "CPU and every backend-op check is DEFERRED there: named and counted, never",
+    "reported as passing. The kernels are exactly where a merge goes wrong",
+    "silently, so before accepting a carry PR that touches one, build it on a",
+    "GPU box and run:",
+    "",
+    "    python3 scripts/unsloth/feature_matrix.py --build-dir build --gpu",
+    "",
+    "and paste the output into the PR. That is the only place those checks run."
   ],
   "schema": 1,
   "features": {
@@ -78,7 +88,7 @@
     }
   },
   "unchecked": {
-    "unslothai#177": "diffusion-gemma: the fixture is in place and save_models emits the model, but the backend comparison aborts in the arch's own llm_graph_input_attn_diffusion::set_input with a null self_kq_mask->buffer. Left to the DiffusionGemma authors; see the exclusion comment in tests/test-llama-archs.cpp.",
+    "unslothai#177": "diffusion-gemma: the fixture is in place and the model loads, but nothing runs it yet. The backend comparison aborts in the arch's own llm_graph_input_attn_diffusion::set_input with a null self_kq_mask->buffer, and save_models cannot emit it because the saver has no way to write attention.sliding_window_pattern, which this arch reads as required. Both are outside the fixture; see the two exclusion comments in tests/test-llama-archs.cpp.",
     "unslothai#95": "sampling penalties indexed by token id; behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
     "unslothai#137": "batched readahead for lazily read gather tables; a throughput change with no observable output difference",
     "unslothai#149": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 env parsing; needs a CUDA or HIP host, and no runner in the pipeline has one",
