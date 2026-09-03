@@ -146,6 +146,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // layer-split stage bounds. Absolute indices are preserved throughout, so per-layer
+    // hparams (is_recr()/full_attention_interval, rope sections, SWA) remain correct.
+    const int il_beg = (int) cparams.il_beg;
+    const int il_end = (int) std::min<uint32_t>(cparams.il_end, (uint32_t) n_layer);
+
+    // build_inp_embd already emits both the token-embedding path and the ubatch.embd path and
+    // selects between them at runtime, so a stage with il_beg > 0 simply gets fed hidden states
+    // through llama_batch.embd instead of token ids -- no separate input node is needed.
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
@@ -153,10 +161,19 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // A non-final stage must hand every token's residual to the next stage, so it never
+    // selects output rows. build_inp_out_ids() unconditionally registers a graph input, and
+    // an input that is never consumed by the graph is never allocated -- set_input would then
+    // dereference a null buffer. So simply do not create it for a non-final stage; every use
+    // below is already guarded on inp_out_ids being non-null. Graph topology stays constant
+    // for a given stage, which is what pipeline parallelism actually requires.
+    const bool is_last_stage = (il_end == n_layer);
+
+    ggml_tensor * inp_out_ids = is_last_stage ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_beg; il < il_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -175,7 +192,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == il_end - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -206,6 +223,19 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (il_end < n_layer) {
+        // Non-final stage: emit the raw residual stream entering layer il_end, BEFORE
+        // output_norm and the LM head. Every token's state is needed by the next stage, so
+        // inp_out_ids is deliberately not applied here (the caller must request all outputs,
+        // which llama-server does under --embeddings --pooling none).
+        cb(cur, "result_embd_hidden", -1);
+        res->t_embd   = cur;
+        res->t_logits = nullptr;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 

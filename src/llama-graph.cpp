@@ -66,6 +66,16 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+// A graph input that the built graph never consumes is not allocated by ggml-alloc, so its
+// ->buffer stays null. Writing to such a tensor either dereferences null or, once the allocator
+// has packed the address into a block it reuses for something else, silently corrupts live data.
+// This matters as soon as a context builds only part of the layer stack (layer-split pipeline
+// parallelism): a stage with no attention layers leaves the KV index/mask inputs unconsumed, a
+// stage with no recurrent layers leaves s_copy unconsumed, and so on.
+static inline bool llm_graph_input_is_live(const ggml_tensor * t) {
+    return t != nullptr && t->buffer != nullptr;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -125,7 +135,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    if (ubatch->pos && llm_graph_input_is_live(pos)) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         if (ubatch->token && n_pos_per_embd == 4) {
@@ -155,6 +165,10 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
+    if (!llm_graph_input_is_live(attn_scale)) {
+        return;
+    }
+
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -174,7 +188,7 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
-    if (pos_bucket) {
+    if (llm_graph_input_is_live(pos_bucket)) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
@@ -197,7 +211,9 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(out_ids);
+    if (!llm_graph_input_is_live(out_ids)) {
+        return;
+    }
 
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -331,7 +347,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    if (llm_graph_input_is_live(s_copy)) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -448,7 +464,10 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         }
     };
 
-    GGML_ASSERT(self_kq_mask);
+    if (!llm_graph_input_is_live(self_kq_mask)) {
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
     if (self_kq_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
@@ -458,6 +477,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         GGML_ASSERT(self_kq_mask_swa);
+        if (!llm_graph_input_is_live(self_kq_mask_swa)) {
+            return;
+        }
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
         if (self_kq_mask_swa->type == GGML_TYPE_F16) {
             fill_mask((ggml_fp16_t *) self_kq_mask_swa->data, ggml_nelements(self_kq_mask_swa), hparams.n_swa, hparams.swa_type);
@@ -1084,22 +1106,32 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // Every write below is guarded on the tensor actually having been allocated: a hybrid model
+    // sliced into a layer range may contain only attention layers or only recurrent ones, leaving
+    // the other family's inputs unconsumed and therefore unallocated.
+    if (llm_graph_input_is_live(inp_attn->self_k_idxs)) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (llm_graph_input_is_live(inp_attn->self_v_idxs)) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
-    if (inp_attn->self_k_rot) {
+    if (llm_graph_input_is_live(inp_attn->self_kq_mask)) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (llm_graph_input_is_live(inp_attn->self_k_rot)) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (llm_graph_input_is_live(inp_attn->self_v_rot)) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (llm_graph_input_is_live(inp_rs->s_copy)) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -2321,6 +2353,33 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
+
+    // A layer-split stage that starts mid-stack is fed the residual stream through ubatch.embd
+    // and never receives token ids, so emit only that branch.
+    //
+    // This is not merely an optimisation. llm_graph_input_embd::set_input writes `tokens` only
+    // when ubatch->token is non-null, but ggml_build_forward_select keeps BOTH branches in the
+    // graph to hold the topology constant -- so the token branch would execute
+    // ggml_get_rows(tok_embd, tokens) over uninitialised indices. That is an out-of-bounds read
+    // of the embedding table whose result changes from run to run; measured as a non-deterministic
+    // 0.4-1.2 max|dlogit| drift against the unsplit reference before this guard was added.
+    if (cparams.il_beg > 0) {
+        ggml_tensor * cur = inp->embd;
+
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+
+        res->t_inp_embd = cur;
+
+        cb(cur, "embd", -1);
+
+        res->add_input(std::move(inp));
+
+        ggml_build_forward_expand(gf, cur);
+
+        return cur;
+    }
 
     // select one of the 2 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550

@@ -275,6 +275,51 @@ llama_context::llama_context(
     // initialized later
     cparams.pipeline_parallel = false;
 
+    // ---- layer-split pipeline parallelism -------------------------------------------------
+    // Two independent llama.cpp instances each own a contiguous slice of the decoder stack.
+    // Stage A runs [0, il_end) and emits the raw residual stream; stage B runs [il_beg, n_layer)
+    // taking that residual in through ubatch.embd. Absolute layer indices are preserved on both
+    // sides, so nothing about rope, is_recr()/full_attention_interval, SWA patterns or per-layer
+    // MoE hparams has to be renumbered -- the same unmodified GGUF is loaded by both stages.
+    {
+        const uint32_t n_layer = hparams.n_layer();
+
+        cparams.il_beg = 0;
+        cparams.il_end = n_layer;
+
+        const char * env_beg = getenv("LLAMA_PP_IL_BEG");
+        const char * env_end = getenv("LLAMA_PP_IL_END");
+
+        if (env_beg) {
+            cparams.il_beg = (uint32_t) std::max(0, atoi(env_beg));
+        }
+        if (env_end) {
+            const int v = atoi(env_end);
+            cparams.il_end = v <= 0 ? n_layer : (uint32_t) v;
+        }
+
+        cparams.il_beg = std::min(cparams.il_beg, n_layer);
+        cparams.il_end = std::min(cparams.il_end, n_layer);
+
+        if (cparams.il_beg >= cparams.il_end) {
+            throw std::runtime_error(format("invalid layer split: il_beg (%u) must be < il_end (%u), n_layer = %u",
+                        cparams.il_beg, cparams.il_end, n_layer));
+        }
+
+        if (cparams.il_beg != 0 || cparams.il_end != n_layer) {
+            LLAMA_LOG_INFO("%s: layer-split stage: executing layers [%u, %u) of %u%s%s\n",
+                    __func__, cparams.il_beg, cparams.il_end, n_layer,
+                    cparams.il_beg  != 0       ? ", input = hidden states" : ", input = tokens",
+                    cparams.il_end  != n_layer ? ", output = hidden states (no final norm, no LM head)"
+                                               : ", output = logits");
+
+            if (cparams.il_end != n_layer && !cparams.embeddings) {
+                throw std::runtime_error("a non-final layer-split stage must be created with embeddings enabled "
+                                         "(llama-server: --embeddings --pooling none)");
+            }
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;

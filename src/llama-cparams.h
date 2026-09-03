@@ -54,6 +54,15 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // layer-split pipeline parallelism (LLAMA_PP_IL_BEG / LLAMA_PP_IL_END).
+    // This instance executes decoder layers [il_beg, il_end). Absolute layer indices are
+    // preserved, so per-layer hparams (rope, is_recr/full_attention_interval, swa patterns,
+    // MoE settings) stay correct without any renumbering of the GGUF.
+    //   il_beg > 0        -> take the residual stream from ubatch.embd instead of token_embd
+    //   il_end < n_layer  -> emit the raw residual stream, skipping output_norm and the LM head
+    uint32_t il_beg;
+    uint32_t il_end; // 0 means n_layer
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
