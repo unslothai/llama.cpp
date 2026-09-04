@@ -477,16 +477,18 @@ jobs:
 
       # The gap this closes, observed 09-03: ggml-org#27754 merged with zero conflicts and did not compile, because upstream had added a parameter to
       # build_attn_mha and the pin's new build_attn_sparse still called the old signature. Nothing before this point can see that, and without it the release
-      # dies in the CUDA leg after the 38-job fan-out. CPU only, `llama` target only: the failing translation unit is src/llama-graph.cpp, which is in that
-      # target, and a cold build of it took 59s at -j4 with no ccache, against 20-60 minutes for a CUDA build.
-      - name: Compile gate (CPU, llama target)
+      # dies in the CUDA leg after the 38-job fan-out. CPU only: a cold `llama` build took 59s at -j4 with no ccache, against 20-60 minutes for a CUDA build.
+      # mtmd is in the gate because `llama` alone is not enough: observed 09-04, ggml-org#25731 built `llama` clean while tools/mtmd did not compile at all,
+      # upstream having made mtmd_image_preprocessor::preprocess const while the pin's Inkling subclass stayed non-const, so it overrode nothing and the
+      # vision and audio towers were abstract. Every vision pin lands in mtmd, so a gate that skips it cannot see the whole class.
+      - name: Compile gate (CPU, llama and mtmd targets)
         if: ${{ env.MERGED_PINS == '1' }}
         run: |
           set -euo pipefail
           cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
             -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_CURL=OFF > /dev/null
-          if ! cmake --build "${RUNNER_TEMP}/gate" --target llama -j "$(nproc)" ; then
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF > /dev/null
+          if ! cmake --build "${RUNNER_TEMP}/gate" --target llama mtmd -j "$(nproc)" ; then
             echo "::error::the pinned PRs merged cleanly and the merged tree does not compile; fix or drop the pin rather than letting the build matrix find this" >&2
             exit 1
           fi
