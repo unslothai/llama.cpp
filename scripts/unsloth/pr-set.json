@@ -18,7 +18,7 @@
     "tag + pins), so keep its pin listed until the change lands upstream."
   ],
   "prs": [
-    "https://github.com/unslothai/llama.cpp/pull/177/commits/ea0cdfd764f6ba8b2493902d29ce5e4a969e1641",
+    "https://github.com/unslothai/llama.cpp/pull/177/commits/4137a7d3669c3fe94431b68e2e04b8804e620760",
     "https://github.com/unslothai/llama.cpp/pull/172/commits/f639c770a08d4b880555f60a1780aaacfdd1471e",
     "https://github.com/unslothai/llama.cpp/pull/70/commits/883f2c9ba78f3847148454adf025da29385fff3e",
     "https://github.com/unslothai/llama.cpp/pull/171/commits/95e08993a63e64365a5eec4741fa1262c3770f98",
