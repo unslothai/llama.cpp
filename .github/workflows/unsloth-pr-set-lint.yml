@@ -120,12 +120,43 @@ jobs:
                    scripts/unsloth/test_merge_checks.py \
                    scripts/unsloth/test_sync_deletes.py \
                    scripts/unsloth/test_carry_vintage.py \
-                   scripts/unsloth/test_pin_contract.py; do
+                   scripts/unsloth/test_pin_contract.py \
+                   scripts/unsloth/test_feature_matrix.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
             echo "::endgroup::"
           done
           exit "$fail"
+
+      # A pin nobody decided about is the failure this whole file exists to stop.
+      # Being in `unchecked` with a reason is a fine answer; being in neither map
+      # is how DiffusionGemma went five weeks with no coverage and no record of it.
+      - name: Every pin is either checked or knowingly unchecked
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, re, sys
+          pins = json.load(open("scripts/unsloth/pr-set.json"))["prs"]
+          doc  = json.load(open("scripts/unsloth/feature-checks.json"))
+          owned = {f["owner"] for f in doc["features"].values() if f.get("owner")}
+          known = owned | set(doc.get("unchecked", {}))
+          fail = 0
+          for entry in pins:
+              url = entry if isinstance(entry, str) else entry["url"]
+              m = re.match(r"https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/", url)
+              pin = f"{m.group(1)}#{m.group(2)}"
+              if pin not in known:
+                  print(f"::error file=scripts/unsloth/feature-checks.json::{pin} is pinned "
+                        "and appears in neither `features` nor `unchecked`; say which it is")
+                  fail = 1
+          for pin in sorted(owned & set(doc.get("unchecked", {}))):
+              print(f"::error file=scripts/unsloth/feature-checks.json::{pin} is in both "
+                    "`features` and `unchecked`")
+              fail = 1
+          print(f"{len(pins)} pin(s), {len(owned)} with a feature check, "
+                f"{len(doc.get('unchecked', {}))} knowingly unchecked")
+          sys.exit(fail)
+          PY
 
       # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
       - name: Check no workflow string is near GitHub's size limit

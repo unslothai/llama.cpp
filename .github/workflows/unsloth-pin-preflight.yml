@@ -213,11 +213,27 @@ jobs:
             # build_attn_sparse still called the old signature. Nothing above
             # can see that. CPU only and the `llama` target only, which is where
             # that translation unit lives; 59s cold at -j4 with no ccache.
+            GATE_OK=1
             if ! cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
-                   -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
-                   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_CURL=OFF > /dev/null \
-               || ! cmake --build "${RUNNER_TEMP}/gate" --target llama -j "$(nproc)" ; then
+                   -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF \
+                   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF > /dev/null \
+               || ! cmake --build "${RUNNER_TEMP}/gate" -j "$(nproc)" \
+                     --target llama test-llama-archs test-backend-ops test-mtmd-impl ; then
+              GATE_OK=
               PROBLEMS="${PROBLEMS}- the pins merge cleanly and the merged tree does not compile. See the run log for the file and line; this is the failure that only shows up in the CUDA leg once the nightly has fanned out.\n"
+            fi
+
+            # The last question, and the only one that needs a binary: does each
+            # feature we ship still work. Everything above is about the source.
+            # CPU only, because no runner in this pipeline has a GPU -- see the
+            # note in feature_matrix.py about what that does and does not prove.
+            if [ -n "$GATE_OK" ]; then
+              if ! python3 ../scripts/unsloth/feature_matrix.py \
+                   --build-dir "${RUNNER_TEMP}/gate" \
+                   --feature-checks ../scripts/unsloth/feature-checks.json \
+                   --report "${RUNNER_TEMP}/feature_matrix.json" ; then
+                PROBLEMS="${PROBLEMS}- the merged tree compiles and a feature we ship could not be shown to work. See the run log for which feature and which probe.\n"
+              fi
             fi
           fi
 
