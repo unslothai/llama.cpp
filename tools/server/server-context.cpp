@@ -2752,7 +2752,39 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+
+            // Do not let the view end in the middle of a slot's speculative block.
+            //
+            // A slot's spec_i_batch entries are contiguous (see the push_back loop where
+            // they are built), and common_sampler_sample_and_accept_n needs the logits
+            // for all of them from ONE decode. A view that cuts through a block leaves
+            // half its logits in a decode that has already happened, which is why
+            // post_decode had no option but to abort the slots. Ending the view just
+            // before the block instead costs one extra decode call and keeps the block
+            // whole. See https://github.com/ggml-org/llama.cpp/issues/24840
+            if (n_tokens < batch.size() - off) {
+                const int32_t view_end = off + n_tokens;
+                int32_t cut = view_end;
+                iterate(slots, [&](server_slot & slot) {
+                    if (slot.spec_i_batch.empty()) {
+                        return;
+                    }
+                    const int32_t first = slot.spec_i_batch.front();
+                    const int32_t last  = slot.spec_i_batch.back();
+                    // straddles the end of the view: stop short of it
+                    if (first > off && first < view_end && last >= view_end) {
+                        cut = std::min(cut, first);
+                    }
+                });
+                n_tokens = cut - off;
+                // A block longer than the whole view cannot be kept whole by cutting.
+                // That needs n_batch below n_draft + 1, which only the retry ladder
+                // reaches; fall back to the original view and let post_decode report it.
+                if (n_tokens <= 0) {
+                    n_tokens = std::min(n_batch, batch.size() - off);
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -3671,13 +3703,35 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
-        // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
-        iterate(slots, [&](server_slot & slot) {
-            for (auto & i : slot.spec_i_batch) {
+        // A slot whose speculative block is not in THIS view is not an error: the batch
+        // was split, and the block belongs to another view, which will sample it when it
+        // is decoded. The loop that builds the views keeps each block whole, so a block
+        // is either entirely inside or entirely outside.
+        //
+        // Aborting every slot here instead is https://github.com/ggml-org/llama.cpp/issues/24840,
+        // reached whenever a KV-full decode halves n_batch, which is exactly when several
+        // long conversations share one cache.
+        auto spec_is_inside_view = [&](const server_slot & slot) {
+            for (const auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
-                    throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
+                    return false;
                 }
+            }
+            return true;
+        };
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.spec_i_batch.empty() || spec_is_inside_view(slot)) {
+                return;
+            }
+            const int32_t first = slot.spec_i_batch.front();
+            const int32_t last  = slot.spec_i_batch.back();
+            if (first >= off && last < off + n_batch_tokens) {
+                return;
+            }
+            if (first < off + n_batch_tokens && last >= off + n_batch_tokens && first >= off) {
+                // Split anyway: only reachable when the retry ladder drove n_batch below
+                // one block. Report it rather than sample from logits that do not exist.
+                throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", last, off, off + n_batch_tokens));
             }
         });
 
@@ -3785,6 +3839,13 @@ private:
                 return;
             }
 
+            // Its logits are in a different view of this batch, so it is sampled when
+            // that view is decoded, not now. Without this the shift below produces
+            // negative indices and reads whatever is at the front of the wrong view.
+            if (!spec_is_inside_view(slot)) {
+                return;
+            }
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -3795,7 +3856,17 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // Shifted according to the current sub-batch, exactly as tok_idx is for
+                // the non-speculative path above. These are indices into the batch that
+                // was just decoded, and that batch is the VIEW, not the whole batch.
+                // Passing the absolute indices is the second half of #24840: with off
+                // non-zero they address the wrong logits.
+                std::vector<int32_t> spec_i_view;
+                spec_i_view.reserve(slot.spec_i_batch.size());
+                for (const auto & i : slot.spec_i_batch) {
+                    spec_i_view.push_back(i - off);
+                }
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
