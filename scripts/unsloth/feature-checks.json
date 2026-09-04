@@ -58,6 +58,12 @@
         { "kind": "backend-op", "op": "LIGHTNING_INDEXER" }
       ]
     },
+    "diffusion-gemma": {
+      "owner": "unslothai#177",
+      "checks": [
+        { "kind": "arch", "arch": "diffusion-gemma" }
+      ]
+    },
     "kimi-k3": {
       "owner": "unslothai#70",
       "checks": [
@@ -88,7 +94,6 @@
     }
   },
   "unchecked": {
-    "unslothai#177": "diffusion-gemma: the fixture is in place and the model loads, but nothing runs it yet. The backend comparison aborts in the arch's own llm_graph_input_attn_diffusion::set_input with a null self_kq_mask->buffer, and save_models cannot emit it because the saver has no way to write attention.sliding_window_pattern, which this arch reads as required. Both are outside the fixture; see the two exclusion comments in tests/test-llama-archs.cpp.",
     "unslothai#95": "sampling penalties indexed by token id; behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
     "unslothai#137": "batched readahead for lazily read gather tables; a throughput change with no observable output difference",
     "unslothai#149": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 env parsing; needs a CUDA or HIP host, and no runner in the pipeline has one",
