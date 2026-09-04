@@ -236,7 +236,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
-            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE) {
+            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
+            // diffusion-gemma needs a mix: with every layer sliding, the non-SWA mask
+            // is built and used by nothing, so ggml-alloc never gives it a buffer and
+            // set_input dereferences a null one. A real model has both kinds of layer.
+            arch == LLM_ARCH_DIFFUSION_GEMMA) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -606,17 +610,6 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
-        if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
-            // The fixture loads, but a model written back out does not: the
-            // saver cannot emit attention.sliding_window_pattern (see the
-            // `add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, ???)` line in
-            // llama-model-saver.cpp; the key means a period as a scalar and
-            // per-layer flags as an array, so there is no one right thing to
-            // write), and diffusion-gemma reads that key as required. So the
-            // emitted gguf fails to load, and it is test-save-load-state,
-            // which reads every file this writes, that reports it.
-            continue;
-        }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -726,19 +719,6 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
-            continue;
-        }
-        if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
-            // The fixture below is complete: the model loads, the graph reserves
-            // and save_models emits it. The backend comparison still aborts in
-            // llm_graph_input_attn_diffusion::set_input,
-            //
-            //   GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer))
-            //
-            // with self_kq_mask->buffer null, i.e. the mask input was not
-            // allocated for the ubatch actually being decoded. That is in the
-            // arch's own graph input, not in the fixture, so it is left to the
-            // DiffusionGemma authors rather than worked around here.
             continue;
         }
 
