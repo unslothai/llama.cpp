@@ -3754,8 +3754,27 @@ private:
             }
             if (first < off + n_batch_tokens && last >= off + n_batch_tokens && first >= off) {
                 // Split anyway: only reachable when the retry ladder drove n_batch below
-                // one block. Report it rather than sample from logits that do not exist.
-                throw std::runtime_error(string_format("speculative block [%d, %d] straddles the current sub-batch [%d, %d)", first, last, off, off + n_batch_tokens));
+                // one block, i.e. a cache so full that the view is narrower than the draft.
+                //
+                // Give up the DRAFT rather than the conversation. spec_i_batch[0] is the
+                // index of the token that was actually sampled last round, not a draft
+                // (see the push_back loop in server_slot::add_to_batch), and it is inside
+                // this view, so the slot can still sample its next token the ordinary way.
+                // The drafts behind it are a prediction; losing them costs this one step
+                // its speedup.
+                //
+                // Throwing here instead calls abort_all_slots, which ends EVERY
+                // conversation on the server because one of them was drafting into a full
+                // cache. Measured on the branch's own base: four chats, four errors, all of
+                // them this. It is the same failure shape as the KV-full send_error path
+                // that unslothai/llama.cpp#183 narrows.
+                SRV_WRN("speculative block [%d, %d] does not fit the current sub-batch [%d, %d); "
+                        "dropping the draft for slot %d and sampling one token\n",
+                        first, last, off, off + n_batch_tokens, slot.id);
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+                slot.i_batch = first;
+                return;
             }
         });
 
