@@ -55,7 +55,6 @@ class Glm5NextModel(TextModel):
     def is_full_attention(self, bid: int) -> bool:
         return bid >= self.hparams["num_hidden_layers"] or bid in self._full_attn_layers
 
-
     def set_gguf_parameters(self):
         hp = self.hparams
         linear_cfg = hp["linear_attn_config"]
@@ -135,7 +134,6 @@ class Glm5NextModel(TextModel):
 
         if not self.no_mtp and (nextn_layers := hp.get("num_nextn_predict_layers", 0)):
             self.gguf_writer.add_nextn_predict_layers(nextn_layers)
-
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
