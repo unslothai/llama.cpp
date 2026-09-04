@@ -364,6 +364,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+
+    // Not arch-scoped: gguf-py writes it as Keys.Diffusion.CANVAS_LENGTH,
+    // and the name on disk is unchanged by giving it an id here.
+    { LLM_KV_DIFFUSION_CANVAS_LENGTH, "diffusion.canvas_length" },
     // sentence-transformers dense modules feature dims
     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },

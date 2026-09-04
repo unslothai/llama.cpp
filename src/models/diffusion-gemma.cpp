@@ -229,7 +229,7 @@ void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
     // canvas_length splits the forward (P = n_tokens - canvas_length); must be positive
-    ml.get_key(std::string("diffusion.canvas_length"), canvas_length, true);
+    ml.get_key(LLM_KV_DIFFUSION_CANVAS_LENGTH, canvas_length);
     if (canvas_length <= 0) {
         throw std::runtime_error("DiffusionGemma requires a positive diffusion.canvas_length");
     }
