@@ -301,7 +301,10 @@ llama_context::llama_context(
         cparams.il_beg = std::min(cparams.il_beg, n_layer);
         cparams.il_end = std::min(cparams.il_end, n_layer);
 
-        if (cparams.il_beg >= cparams.il_end) {
+        // A vocab-only model has no layers at all, so [0, 0) is the correct empty range
+        // rather than an error. Rejecting it broke every vocab-only tool (llama-tokenize
+        // among them) whenever this build was used, split or not.
+        if (n_layer > 0 && cparams.il_beg >= cparams.il_end) {
             throw std::runtime_error(format("invalid layer split: il_beg (%u) must be < il_end (%u), n_layer = %u",
                         cparams.il_beg, cparams.il_end, n_layer));
         }
