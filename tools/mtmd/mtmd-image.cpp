@@ -836,7 +836,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
 }
 
 // Inkling hMLP patches
-mtmd_image_preproc_out mtmd_image_preprocessor_inkling::preprocess(const clip_image_u8 & img) {
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling::preprocess(const clip_image_u8 & img) const {
     GGML_ASSERT(hparams.patch_size == 40);
     constexpr int temporal_patch_size = 2;
     constexpr float rescale_frac = 2.0f;

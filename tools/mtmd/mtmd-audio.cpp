@@ -552,7 +552,7 @@ void mtmd_audio_preprocessor_inkling::initialize() {
 bool mtmd_audio_preprocessor_inkling::preprocess(
         const float * samples,
         size_t n_samples,
-        std::vector<mtmd_audio_mel> & output) {
+        std::vector<mtmd_audio_mel> & output) const {
     if (n_samples == 0) {
         return false;
     }
