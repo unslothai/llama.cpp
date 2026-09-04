@@ -192,6 +192,33 @@ jobs:
             if ! python3 ../scripts/unsloth/merge_checks.py --root . ; then
               PROBLEMS="${PROBLEMS}- the merged tree builds, but \`scripts/unsloth/merge_checks.py\` found a resolution that is silently wrong. See the run log for file and line.\n"
             fi
+
+            # The other half of that question. merge_checks.py asks whether the
+            # tree contains something wrong; this asks whether it still contains
+            # what each pin carries. A pin that has rotted into a no-op, or an
+            # arch registration a resolution quietly dropped, is invisible to
+            # every other check here and to the compiler.
+            if ! python3 ../scripts/unsloth/pin_contract.py --root . --base "$BASE" \
+                 --pr-set ../scripts/unsloth/pr-set.json --report "${RUNNER_TEMP}/pin_contract.json" ; then
+              PROBLEMS="${PROBLEMS}- the merged tree is missing code a pin carries. See the run log for the pin and file.\n"
+            fi
+            NOTES="$(jq -r '.notices[]?' "${RUNNER_TEMP}/pin_contract.json" 2>/dev/null || true)"
+            if [ -n "$NOTES" ]; then
+              PROBLEMS="${PROBLEMS}- pins upstream has taken over, safe to delete from \`pr-set.json\`:\n\n\`\`\`\n${NOTES}\n\`\`\`\n"
+            fi
+
+            # A clean merge is not a compiling tree. On 09-03 ggml-org#27754
+            # merged with no conflicts at all and did not compile: upstream had
+            # added a parameter to build_attn_mha and the pin's new
+            # build_attn_sparse still called the old signature. Nothing above
+            # can see that. CPU only and the `llama` target only, which is where
+            # that translation unit lives; 59s cold at -j4 with no ccache.
+            if ! cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
+                   -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+                   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_CURL=OFF > /dev/null \
+               || ! cmake --build "${RUNNER_TEMP}/gate" --target llama -j "$(nproc)" ; then
+              PROBLEMS="${PROBLEMS}- the pins merge cleanly and the merged tree does not compile. See the run log for the file and line; this is the failure that only shows up in the CUDA leg once the nightly has fanned out.\n"
+            fi
           fi
 
           if [ -z "$PROBLEMS" ]; then

@@ -282,12 +282,10 @@ jobs:
           # .github/workflows, which upstream history routinely does).
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
-            # Checking out the upstream base replaces this working tree with
-            # upstream's, which has no scripts/unsloth/. Keep the resolver
-            # somewhere the checkout cannot take away.
-            ADDITIVE_MERGE="${RUNNER_TEMP}/additive_merge.py"
-            cp scripts/unsloth/additive_merge.py "$ADDITIVE_MERGE"
-            cp scripts/unsloth/merge_checks.py "${RUNNER_TEMP}/merge_checks.py"
+            # The upstream checkout below takes scripts/unsloth/ away. Copy the
+            # whole dir out, not file by file: see the note above the step.
+            cp -r scripts/unsloth "${RUNNER_TEMP}/us"
+            ADDITIVE_MERGE="${RUNNER_TEMP}/us/additive_merge.py"
             if [ "$(jq length <<<"$PRS")" != 0 ]; then
               # Merges need a merge-base, so unshallow first.
               if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
@@ -448,12 +446,50 @@ jobs:
 
       # A bad pin resolution can still build fine, so it must be caught before the source artifact ships. See merge_checks.py.
       # Its own step, not more script in `resolve`: GitHub caps one workflow string at 21000 chars and that step is near it. See check_workflow_scalars.py.
+      # That is also why `resolve` copies all of scripts/unsloth/ to ${RUNNER_TEMP}/us in one line rather than one cp per script: every check added
+      # here would otherwise cost another line inside the capped block, and going over silently disables the whole workflow.
       - name: Check the merged tree for silently wrong resolutions
         if: ${{ env.MERGED_PINS == '1' }}
         run: |
           set -euo pipefail
-          if ! python3 "${RUNNER_TEMP}/merge_checks.py" --root . ; then
+          if ! python3 "${RUNNER_TEMP}/us/merge_checks.py" --root . ; then
             echo "::error::the pinned PRs merged, but merge_checks.py found a resolution that is silently wrong; see the log for file and line" >&2
+            exit 1
+          fi
+
+      # merge_checks.py asserts the ABSENCE of two known-bad shapes. This asserts the PRESENCE of what each pin carries, which is a different question and
+      # the one that goes unanswered when a pin rots into a no-op or a resolution quietly drops an arch registration. Free, so it runs before the compile gate.
+      - name: Check every pin still contributes what it carries
+        if: ${{ env.MERGED_PINS == '1' }}
+        # Through env, never interpolated into the script: `prs` carries PR
+        # titles, which are third-party text, and `${{ }}` pastes them into the
+        # shell source before bash ever sees it.
+        env:
+          PRS: ${{ steps.r.outputs.prs }}
+          BASE: ${{ steps.r.outputs.base }}
+        run: |
+          set -euo pipefail
+          if ! python3 "${RUNNER_TEMP}/us/pin_contract.py" --root . --base "$BASE" \
+               --prs-json "$PRS" --report "${RUNNER_TEMP}/pin_contract.json" ; then
+            echo "::error::the pinned PRs merged, but the merged tree is missing code a pin carries; see the log for the pin and file" >&2
+            exit 1
+          fi
+
+      # The gap this closes, observed 09-03: ggml-org#27754 merged with zero conflicts and did not compile, because upstream had added a parameter to
+      # build_attn_mha and the pin's new build_attn_sparse still called the old signature. Nothing before this point can see that, and without it the release
+      # dies in the CUDA leg after the 38-job fan-out. CPU only: a cold `llama` build took 59s at -j4 with no ccache, against 20-60 minutes for a CUDA build.
+      # mtmd is in the gate because `llama` alone is not enough: observed 09-04, ggml-org#25731 built `llama` clean while tools/mtmd did not compile at all,
+      # upstream having made mtmd_image_preprocessor::preprocess const while the pin's Inkling subclass stayed non-const, so it overrode nothing and the
+      # vision and audio towers were abstract. Every vision pin lands in mtmd, so a gate that skips it cannot see the whole class.
+      - name: Compile gate (CPU, llama and mtmd targets)
+        if: ${{ env.MERGED_PINS == '1' }}
+        run: |
+          set -euo pipefail
+          cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF > /dev/null
+          if ! cmake --build "${RUNNER_TEMP}/gate" --target llama mtmd -j "$(nproc)" ; then
+            echo "::error::the pinned PRs merged cleanly and the merged tree does not compile; fix or drop the pin rather than letting the build matrix find this" >&2
             exit 1
           fi
 
