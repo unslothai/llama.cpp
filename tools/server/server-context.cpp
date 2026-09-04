@@ -2743,6 +2743,12 @@ private:
             }
         });
 
+        // `batch.slot_batched` may be the victim, and is intentionally left alone. It is
+        // not dereferenced inside the decode loop -- the lora and embedding settings it
+        // supplies were applied once before the loop -- and `slots` is a fixed vector, so
+        // release() does not destroy the object and the pointer does not dangle. Every
+        // survivor passed can_batch_with() against it, so those settings remain correct
+        // for the tokens that are left.
         return true;
     }
 
