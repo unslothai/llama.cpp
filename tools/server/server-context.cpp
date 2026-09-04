@@ -2697,14 +2697,33 @@ private:
         std::vector<int32_t> remap(batch.tokens.size(), -1);
         std::vector<server_batch::token> kept;
         kept.reserve(batch.tokens.size());
+        // In embd mode `embd` is a flat n_embd-per-token array running parallel to
+        // `tokens`, and render() hands embd.data() straight to the batch. Compacting one
+        // without the other misaligns every embedding after the first removal, silently.
+        std::vector<float> kept_embd;
+        if (batch.has_embd) {
+            kept_embd.reserve(batch.embd.size());
+        }
         for (int32_t i = 0; i < (int32_t) batch.tokens.size(); i++) {
             if (i >= off && batch.tokens[i].id_slot == victim_id) {
                 continue;
             }
             remap[i] = (int32_t) kept.size();
             kept.push_back(batch.tokens[i]);
+            if (batch.has_embd) {
+                const size_t stride = (size_t) batch.n_embd;
+                const size_t begin  = (size_t) i * stride;
+                if (begin + stride <= batch.embd.size()) {
+                    kept_embd.insert(kept_embd.end(),
+                                     batch.embd.begin() + begin,
+                                     batch.embd.begin() + begin + stride);
+                }
+            }
         }
         batch.tokens = std::move(kept);
+        if (batch.has_embd) {
+            batch.embd = std::move(kept_embd);
+        }
         batch.batch_rendered = false;
         batch.render();
 
