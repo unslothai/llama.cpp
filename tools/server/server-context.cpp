@@ -3643,6 +3643,7 @@ private:
 
             // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
+                const int32_t n_batch_prev = n_batch;
                 n_batch /= 2;
 
                 // ... but never below one speculative block. A slot's spec_i_batch
@@ -3659,7 +3660,14 @@ private:
                 iterate(slots, [&](server_slot & slot) {
                     n_spec_min = std::max(n_spec_min, (int32_t) slot.spec_i_batch.size());
                 });
-                n_batch = std::max(n_batch, n_spec_min);
+                // Pause AT the floor, once, rather than clamping to it forever. The
+                // ladder reaching n_batch == 1 is what terminates this retry: decode()
+                // reports "Context size has been exceeded" only for n_batch == 1, so a
+                // hard clamp above 1 turns a cache that genuinely cannot fit anything
+                // into an infinite retry loop. Halving from the floor continues past it.
+                if (n_batch < n_spec_min && n_batch_prev > n_spec_min) {
+                    n_batch = n_spec_min;
+                }
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
