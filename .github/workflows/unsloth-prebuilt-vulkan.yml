@@ -195,6 +195,28 @@ jobs:
         if: matrix.arch == 'arm64'
         run: cp /usr/lib/llvm-19/lib/libomp.so.5 src/build/bin/
 
+      # test-backend-ops: the only tool that answers "which op and which quant
+      # type is wrong on this device", by checking every backend op against the
+      # CPU reference. No release tarball ships it, upstream's included, so when
+      # a user reports garbled output on hardware we do not have there is
+      # currently no way to ask them which kernel is at fault. It is a few MB
+      # against a 32 MB bundle. Same shape as the DiffusionGemma step below:
+      # reconfigure, build one target, never fail the job, and the bundle tars
+      # all of build/bin so it ships automatically.
+      - name: Build test-backend-ops (best-effort)
+        working-directory: src
+        run: |
+          set -u
+          cmake -S . -B build -DLLAMA_BUILD_TESTS=ON \
+            || { echo "reconfigure for tests failed; skipping test-backend-ops"; exit 0; }
+          if cmake --build build --config Release -j "$(nproc)" --target test-backend-ops; then
+            strip build/bin/test-backend-ops || true
+            echo "built test-backend-ops"
+          else
+            echo "warning: test-backend-ops failed to build; bundle will omit it"
+          fi
+          exit 0
+
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the CUDA child for the
       # rationale. The bundle tars all of build/bin, so anything produced here
@@ -341,6 +363,25 @@ jobs:
         working-directory: src
         run: |
           cmake --build build --config Release -j 3
+
+      # See the Linux leg for why this ships. It matters most here: every
+      # reporter we cannot reproduce is on Windows, and this is what lets them
+      # tell us which op and quant type is wrong on their card.
+      - name: Build test-backend-ops (best-effort)
+        working-directory: src
+        run: |
+          cmake -S . -B build -DLLAMA_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for tests failed; skipping test-backend-ops"
+            exit 0
+          }
+          cmake --build build --config Release -j 3 --target test-backend-ops
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: test-backend-ops failed to build; bundle will omit it"
+          } else {
+            Write-Host "built test-backend-ops"
+          }
+          exit 0
 
       # DiffusionGemma binaries (#24423 mix builds only): best-effort, never
       # fail the job. See the CUDA child for the rationale.

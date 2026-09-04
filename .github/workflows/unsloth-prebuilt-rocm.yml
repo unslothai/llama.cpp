@@ -379,6 +379,21 @@ jobs:
         REM Build the project
         cmake --build . -j %NUMBER_OF_PROCESSORS%
 
+        REM This step is `shell: cmd`, which has no errexit, so the job's status
+        REM is whatever the LAST command returned. Gate the real build here
+        REM before appending anything, or a failed build would be masked by the
+        REM diagnostic step below succeeding.
+        if errorlevel 1 exit /b 1
+
+        REM test-backend-ops: see the Linux leg. It matters most on this leg,
+        REM because every reporter we cannot reproduce is on Windows and this is
+        REM what lets them tell us which op and quant type is wrong on their
+        REM card. Best-effort: chained with && so a failed reconfigure skips the
+        REM build, and the bundle is never failed over a diagnostic.
+        cmake .. -DLLAMA_BUILD_TESTS=ON && cmake --build . -j %NUMBER_OF_PROCESSORS% --target test-backend-ops
+        if errorlevel 1 echo warning: test-backend-ops unavailable; bundle will omit it
+        exit /b 0
+
     - name: Copy ROCm core DLLs to build directory
       run: |
         $rocmVersion = if ($env:DETECTED_ROCM_VERSION) { $env:DETECTED_ROCM_VERSION } else { "${{ inputs.rocm_version }}" }
@@ -738,6 +753,22 @@ jobs:
         # Build the project
         cmake --build . -j $(nproc)
 
+        # test-backend-ops: the only tool that answers "which op and which quant
+        # type is wrong on this device", by checking every backend op against
+        # the CPU reference. No release tarball ships it, upstream's included,
+        # so when a user reports garbled output on hardware we do not have there
+        # is currently no way to ask them which kernel is at fault. Best-effort:
+        # the main bundle must never fail over a diagnostic.
+        if cmake .. -DLLAMA_BUILD_TESTS=ON > /dev/null 2>&1; then
+          if cmake --build . -j "$(nproc)" --target test-backend-ops; then
+            echo "built test-backend-ops"
+          else
+            echo "warning: test-backend-ops failed to build; bundle will omit it"
+          fi
+        else
+          echo "reconfigure for tests failed; skipping test-backend-ops"
+        fi
+
     - name: Copy ROCm core libs to build directory
       run: |
         build_bin_path="llama.cpp/build/bin"
@@ -820,8 +851,12 @@ jobs:
       run: |
         sudo apt-get install -y patchelf
         cd llama.cpp/build/bin
-        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
-        for file in *.so* llama-*; do
+        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally.
+        # test-backend-ops is named after neither pattern but links the same shared
+        # llama/ggml libraries, so without it here the diagnostic ships with the
+        # runner's build-tree RPATH and will not start on a user's machine, which
+        # is the one thing it exists to do.
+        for file in *.so* llama-* test-backend-ops; do
           [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
         done
 
