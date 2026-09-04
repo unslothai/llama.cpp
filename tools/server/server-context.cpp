@@ -3644,6 +3644,22 @@ private:
             // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
                 n_batch /= 2;
+
+                // ... but never below one speculative block. A slot's spec_i_batch
+                // entries all need logits from ONE decode, so a view narrower than a
+                // block cannot serve it however the view is positioned, and post_decode
+                // is left with nothing to do but abort every slot on the server.
+                //
+                // Of 78 occurrences recorded in production logs, 30 were exactly this:
+                // a block starting at the view's own offset and reaching past its end,
+                // with views of 1 and 2 against a 3-index block. Halving past that point
+                // buys no memory worth having -- the difference is a couple of cells --
+                // and costs every conversation in flight.
+                int32_t n_spec_min = 1;
+                iterate(slots, [&](server_slot & slot) {
+                    n_spec_min = std::max(n_spec_min, (int32_t) slot.spec_i_batch.size());
+                });
+                n_batch = std::max(n_batch, n_spec_min);
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
@@ -3731,7 +3747,7 @@ private:
             if (first < off + n_batch_tokens && last >= off + n_batch_tokens && first >= off) {
                 // Split anyway: only reachable when the retry ladder drove n_batch below
                 // one block. Report it rather than sample from logits that do not exist.
-                throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", last, off, off + n_batch_tokens));
+                throw std::runtime_error(string_format("speculative block [%d, %d] straddles the current sub-batch [%d, %d)", first, last, off, off + n_batch_tokens));
             }
         });
 
