@@ -44,7 +44,7 @@
   "schema": 1,
   "features": {
     "inkling": {
-      "owner": "unslothai#172",
+      "owner": "ggml-org#25731",
       "checks": [
         { "kind": "arch",       "arch": "inkling" },
         { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
@@ -52,14 +52,14 @@
       ]
     },
     "glm5next": {
-      "owner": "unslothai#173",
+      "owner": "ggml-org#27754",
       "checks": [
         { "kind": "arch",       "arch": "glm5next" },
         { "kind": "backend-op", "op": "LIGHTNING_INDEXER" }
       ]
     },
     "diffusion-gemma": {
-      "owner": "unslothai#177",
+      "owner": "ggml-org#24423",
       "checks": [
         { "kind": "arch", "arch": "diffusion-gemma" }
       ]
@@ -72,7 +72,7 @@
       ]
     },
     "iq1-narrow-grids": {
-      "owner": "unslothai#171",
+      "owner": "unslothai#61",
       "checks": [
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xs" },
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxs" },
