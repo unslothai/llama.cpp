@@ -683,8 +683,17 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 // strictly ordered and the server processes commands serially, so issuing any command that
 // *does* expect a response acts as a full barrier: the response cannot arrive before all
 // previously submitted graphs have finished executing on the remote device.
+// OPT-IN, deliberately. Advertising async+events flips ggml_backend_sched into pipeline
+// parallelism with n_copies = 4 and disables graph reuse, and that is not free: measured on
+// two loopback rpc-servers (zero network latency, so a best case), Qwen3.5-4B over
+// --device RPC0,RPC1 -sm layer -ngl 99, turning it on costs
+//     compute buffers  320 -> ~1100 MiB per device
+//     throughput       ~56 -> ~35 tok/s
+// because the events below are barriers rather than real events, so the overlap that would
+// pay for the extra copies never materialises. Defaulting this on would have imposed that
+// on every existing multi-RPC-device user, none of whom are layer splitting.
 static bool rpc_pp_enabled() {
-    static const bool v = (getenv("GGML_RPC_NO_PIPELINE") == NULL);
+    static const bool v = (getenv("GGML_RPC_PIPELINE") != NULL);
     return v;
 }
 

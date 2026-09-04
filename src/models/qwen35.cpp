@@ -44,8 +44,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output. A non-final stage's output_norm / LM head are skipped centrally in
-    // llama_model_loader::create_tensor().
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, TENSOR_NOT_REQUIRED);
+    // llama_model_loader::create_tensor(), which ORs in TENSOR_NOT_REQUIRED | TENSOR_SKIP
+    // itself. Relaxing the flag here as well would be redundant AND harmful: it would let a
+    // qwen3.5 GGUF that is genuinely missing output_norm.weight load with a null tensor,
+    // and build_norm() treats a null weight as "no weight" and silently returns an
+    // unweighted RMS norm instead of failing the load. Keep 0, as qwen3 and qwen3moe do.
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed

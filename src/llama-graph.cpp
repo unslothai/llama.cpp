@@ -211,6 +211,10 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+    // A null tensor is still a graph-construction bug and still aborts, exactly as before.
+    // Only the present-but-unallocated case is new, and it is not an error: a non-final
+    // pipeline stage registers this input and never uses it, so sched leaves it unbacked.
+    GGML_ASSERT(out_ids);
     if (!llm_graph_input_is_live(out_ids)) {
         return;
     }
@@ -464,6 +468,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         }
     };
 
+    // As in llm_graph_input_out_ids::set_input: null still aborts, unallocated is skipped.
+    GGML_ASSERT(self_kq_mask);
     if (!llm_graph_input_is_live(self_kq_mask)) {
         return;
     }
