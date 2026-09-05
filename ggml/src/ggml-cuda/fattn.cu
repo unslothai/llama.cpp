@@ -578,7 +578,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 
     // [TAG_BATCH_INVARIANT] Attend one query row at a time, as a batch of one would.
-    if (ggml_cuda_batch_invariant() && dst->src[0]->ne[1] > 1 && dst->src[0]->ne[3] == 1) {
+    const int fattn_max_cols = ggml_cuda_batch_invariant_max_cols();
+    if (ggml_cuda_batch_invariant() && dst->src[0]->ne[1] > 1 && dst->src[0]->ne[3] == 1 &&
+            (fattn_max_cols <= 0 || dst->src[0]->ne[1] <= fattn_max_cols)) {
         const ggml_tensor * Q    = dst->src[0];
         const ggml_tensor * mask = dst->src[3];
 

@@ -1843,6 +1843,14 @@ int ggml_cuda_batch_invariant() {
     return mode;
 }
 
+int ggml_cuda_batch_invariant_max_cols() {
+    static const int max_cols = []() {
+        const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+        return val ? atoi(val) : 0;
+    }();
+    return max_cols;
+}
+
 enum ggml_cuda_mm_path {
     GGML_CUDA_MM_CUBLAS_UNSUPPORTED,
     GGML_CUDA_MM_MMVF,
@@ -1901,6 +1909,10 @@ static bool ggml_cuda_mul_mat_split_columns(
     }
     // Only the token dimension is split, batched matmuls (attention) keep their shape.
     if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    const int max_cols = ggml_cuda_batch_invariant_max_cols();
+    if (max_cols > 0 && ncols_dst > max_cols) {
         return false;
     }
 
