@@ -2988,6 +2988,33 @@ private:
                 break;
             }
 
+            // A parked sequence larger than the whole pool can never come back, however long it
+            // waits: that is a real context overflow and not pressure, and it must be told so
+            // rather than left hanging. Nothing else in this loop can end a parked slot, so this
+            // is the only way one leaves without being resumed.
+            {
+                bool gave_up = false;
+
+                for (auto * slot : parked) {
+                    if (preempt_n_need(*slot) + PREEMPT_N_MARGIN > n_cells) {
+                        SLT_WRN(*slot, "parked sequence of %d tokens no longer fits the %d cell pool, giving up\n",
+                                slot->n_input_tokens(), n_cells);
+
+                        send_error(*slot,
+                                   string_format("request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
+                                                 slot->n_input_tokens(), n_cells),
+                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                        slot->release();
+
+                        gave_up = true;
+                    }
+                }
+
+                if (gave_up) {
+                    continue;
+                }
+            }
+
             std::sort(parked.begin(), parked.end(), [](const server_slot * a, const server_slot * b) {
                 if (a->n_preempt != b->n_preempt) {
                     return a->n_preempt > b->n_preempt;
