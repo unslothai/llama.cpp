@@ -49,6 +49,9 @@
 
 #define GGML_CUDA_CC_PASCAL          600
 #define GGML_CUDA_CC_DP4A            610 // minimum compute capability for __dp4a, an intrinsic for byte-wise dot products
+// [TAG_BATCH_INVARIANT] 0 = off, 1 = split every batched matmul, 2 = split only where it changes bits
+int ggml_cuda_batch_invariant();
+
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
