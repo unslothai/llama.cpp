@@ -76,6 +76,7 @@ enum slot_state {
 // room the copy goes back and the slot carries on with the same sampler, the same generated
 // text and the same open stream. A streaming client sees a pause, not an error.
 constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the reservation
+constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a streaming slot is parked
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
@@ -2106,6 +2107,25 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // [TAG_PREEMPT] tell a streaming client that its slot was parked or restored. The
+    // HTTP layer turns this into an SSE comment, so a client that does not know about
+    // preemption sees nothing, and one that does can show a pause instead of a stall.
+    void send_preempt_notice(server_slot & slot, bool parked) {
+        if (!slot.task || !slot.task->params.stream) {
+            return;
+        }
+
+        auto res = std::make_unique<server_task_result_preempt_notice>();
+
+        res->id        = slot.task->id;
+        res->index     = slot.task->index;
+        res->id_slot   = slot.id;
+        res->parked    = parked;
+        res->n_preempt = slot.n_preempt;
+
+        queue_results.send(std::move(res));
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -3092,6 +3112,8 @@ private:
 
             metrics.n_resume++;
 
+            send_preempt_notice(*best, false);
+
             SLT_WRN(*best, "resumed after %.2f s: %d tokens back in the cache in %.2f ms, kv %d/%d, preemptions %d\n",
                     (ggml_time_us() - best->t_preempt_us) / 1e6,
                     best->prompt.n_tokens(),
@@ -3108,6 +3130,8 @@ private:
                     preempt_fits_budget(slot) &&
                     slot.preempt_save()) {
                     metrics.n_preempt++;
+
+                    send_preempt_notice(slot, true);
 
                     SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
                             (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
@@ -3144,6 +3168,8 @@ private:
             }
 
             metrics.n_preempt++;
+
+            send_preempt_notice(*victim, true);
 
             SLT_WRN(*victim, "preempted: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
@@ -4739,7 +4765,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        // [TAG_PREEMPT] a slot can be parked while still processing its prompt, before any
+        // token exists. Those notices arrive ahead of the first real result; keep them and
+        // send them in front of it, so the client learns about the wait it just had.
+        std::string preempt_prefix;
         auto first_result = rd.next(req.should_stop);
+        while (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
+            const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
+            preempt_prefix += notice->parked ? ": preempted\n\n" : ": resumed\n\n";
+            first_result = rd.next(req.should_stop);
+        }
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());
             return res; // connection is closed
@@ -4759,17 +4794,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // to be sent immediately
         json first_result_json = first_result->to_json();
         if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
+            res->data = preempt_prefix; // simply send HTTP headers and status code
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
+            res->data = preempt_prefix + format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+            res->data = preempt_prefix + format_oai_resp_sse(first_result_json);
         } else {
-            res->data = format_oai_sse(first_result_json);
+            res->data = preempt_prefix + format_oai_sse(first_result_json);
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked = false](std::string & output) mutable -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -4820,10 +4855,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // receive subsequent results
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
-                auto result = rd.next([&timeout, &start_time, sse_ping_interval, &effective_should_stop]() {
+                // [TAG_PREEMPT] a parked slot produces nothing for as long as the pool is
+                // full, so while parked the ping runs every 2 s regardless of --sse-ping and
+                // is named, so a client can tell "waiting for cells" from "slow".
+                const int64_t ping_ms = parked ? PREEMPT_KEEPALIVE_MS : (sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1);
+                auto result = rd.next([&timeout, &start_time, ping_ms, &effective_should_stop]() {
                     if (effective_should_stop()) {
                         return true; // should_stop condition met
-                    } else if (sse_ping_interval > 0 && ggml_time_ms() - start_time > (int64_t)sse_ping_interval * 1000) {
+                    } else if (ping_ms > 0 && ggml_time_ms() - start_time > ping_ms) {
                         timeout = true;
                         return true; // timeout
                     }
@@ -4833,7 +4872,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (timeout) {
                     // some clients may time out (e.g. undici) will time out if no data is received for a while, so we need to send a ping to keep the connection alive
                     SRV_DBG("%s", "sending SSE ping\n");
-                    output = ":\n\n";
+                    output = parked ? ": preempt-keepalive\n\n" : ":\n\n";
                     return true;
                 }
 
@@ -4849,6 +4888,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
+                    // [TAG_PREEMPT] an SSE comment: invisible to clients that do not know
+                    // about preemption, a pause indicator for the ones that do
+                    parked = notice->parked;
+                    output = parked ? ": preempted\n\n" : ": resumed\n\n";
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
