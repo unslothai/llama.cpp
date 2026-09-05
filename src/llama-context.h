@@ -39,6 +39,9 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// [TAG_STATE_ASYNC] defined in llama-context.cpp
+struct llama_state_seq_copy;
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -155,6 +158,12 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // [TAG_STATE_ASYNC] the same two transfers, issued on a stream of their own and left running
+    llama_state_seq_copy * state_seq_copy_init();
+
+    size_t state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id,      llama_state_seq_flags flags);
+    size_t state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags);
 
     bool state_load_file(
             const char * filepath,
