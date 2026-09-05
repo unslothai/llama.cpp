@@ -1710,9 +1710,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--preempt"},
+        {"--no-preempt"},
+        string_format("with a unified KV cache and more than one slot, park a running request and put it back later "
+            "instead of failing every request when the cache fills (default: %s)", params.preempt ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.preempt = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--preempt-ram"}, "N",
-        string_format("with a unified KV cache, park a slot in host RAM instead of failing every slot when the cache fills; "
-            "N is the maximum host RAM for parked sequences in MiB (default: %d, -1 - no limit, 0 - disable)", params.preempt_ram_mib),
+        string_format("maximum host RAM in MiB for parked (preempted) sequences; a slot that fits is parked by copying "
+            "its sequence to host RAM, one that does not is parked by dropping its cells and recomputing them later "
+            "(default: %d, -1 - no limit, never recompute, 0 - never copy, always recompute; use --no-preempt to turn "
+            "preemption off)", params.preempt_ram_mib),
         [](common_params & params, int value) {
             params.preempt_ram_mib = value;
         }

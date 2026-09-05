@@ -1567,9 +1567,21 @@ std::string server_task_result_metrics::to_metrics() {
             "Preemption: Total slots parked to make room in the unified KV cache",
             (double) metrics.n_preempt
         }, {
+            "n_preempt_swap_total",
+            "Preemption: Total slots parked by copying the sequence to host RAM",
+            (double) metrics.n_preempt_swap
+        }, {
+            "n_preempt_recompute_total",
+            "Preemption: Total slots parked by dropping the cells, to be recomputed later",
+            (double) metrics.n_preempt_recompute
+        }, {
             "n_resume_total",
             "Preemption: Total parked slots put back",
             (double) metrics.n_resume
+        }, {
+            "n_recompute_tokens_total",
+            "Preemption: Total prompt tokens re-processed to put parked slots back",
+            (double) metrics.n_recompute_tokens
         },
     };
 
