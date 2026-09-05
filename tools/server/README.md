@@ -165,7 +165,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `--preempt, --no-preempt` | with a unified KV cache and more than one slot, park a running request and put it back later instead of failing every request when the cache fills (default: enabled)<br/>(env: LLAMA_ARG_PREEMPT) |
-| `--preempt-ram N` | maximum host RAM in MiB for parked (preempted) sequences. A slot that fits under the budget is parked by copying its sequence to host RAM and copying it back, which is exact; one that does not fit is parked by dropping its cells and recomputing them when room returns, which costs no host RAM but can change the continuation. `-1` is no limit, so nothing is ever recomputed; `0` means never copy, so everything is recomputed. Note this differs from `--cache-ram`: `0` does NOT disable the feature, `--no-preempt` does (default: 8192)<br/>(env: LLAMA_ARG_PREEMPT_RAM) |
+| `--preempt-ram N` | maximum host RAM in MiB for parked (preempted) sequences; a slot that fits is parked by copying its sequence to host RAM, one that does not is parked by dropping its cells and recomputing them later (default: 8192, -1 - no limit, 0 - never copy; use `--no-preempt` to turn preemption off). Copying back is exact; recomputing costs no host RAM but can change the continuation of a paused answer. Unlike `--cache-ram`, `0` does not disable the feature<br/>(env: LLAMA_ARG_PREEMPT_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -1140,11 +1140,11 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
-| `llamacpp:n_preempt_total` | Counter | Slots parked to make room in the unified KV cache (0 unless `--kv-unified` with more than one slot). |
+| `llamacpp:n_preempt_total` | Counter | Slots parked to make room in the unified KV cache (0 unless `--kv-unified` with more than one slot, and 0 with `--no-preempt`). |
 | `llamacpp:n_preempt_swap_total` | Counter | Slots parked by copying the sequence to host RAM. |
 | `llamacpp:n_preempt_recompute_total` | Counter | Slots parked by dropping the cells, to be recomputed later. |
 | `llamacpp:n_resume_total` | Counter | Parked slots put back. |
-| `llamacpp:n_recompute_tokens_total` | Counter | Prompt tokens re-processed to put parked slots back. |
+| `llamacpp:n_recompute_tokens_total` | Counter | Tokens re-processed through the model to put parked slots back (prompt and generated). |
 | `llamacpp:requests_preempted` | Gauge | Requests currently parked, waiting for room in the unified KV cache. |
 | `llamacpp:preempt_ram_bytes` | Gauge | Host RAM held by parked sequences. |
 

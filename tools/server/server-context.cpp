@@ -371,6 +371,14 @@ struct server_slot {
         return preempt_replay.empty() ? task->n_tokens() : (int32_t) preempt_replay.size();
     }
 
+    // Re-prefilling tokens this request has ALREADY generated, which is a resume and must not
+    // look like a new prompt anywhere: not to the sampler, not to the client, not to the
+    // timings. A slot parked before its prompt was finished has no replay list; it simply
+    // starts that prompt again and is an ordinary prefill in every respect, so it is not this.
+    bool preempt_replaying() const {
+        return preempt_resuming && !preempt_replay.empty();
+    }
+
     size_t preempt_state_size() const {
         return preempt_state_tgt.size() + preempt_state_dft.size();
     }
@@ -532,6 +540,10 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // the "processing has started" signal goes out once per task, however many times the slot
+    // is parked and sent back through prompt processing
+    bool sent_begin = false;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -588,6 +600,7 @@ struct server_slot {
         preempt_mode         = PREEMPT_MODE_NONE;
         state_before_preempt = SLOT_STATE_IDLE;
         preempt_resuming     = false;
+        sent_begin           = false;
         n_preempt            = 0;
         n_recompute          = 0;
         n_preempt_fail       = 0;
@@ -3023,25 +3036,40 @@ private:
         return preempt_can_recompute(slot) ? PREEMPT_MODE_RECOMPUTE : PREEMPT_MODE_NONE;
     }
 
-    // cells the slot will ask for on its next step once it is back in the pool
+    // Cells a parked slot will ask for before it can take its next step. A slot replaying
+    // tokens it has already generated needs its whole sequence back first; one that was parked
+    // before it finished its prompt starts that prompt again a batch at a time, exactly like a
+    // fresh request, and charging it the whole prompt would make a large prompt unwakeable.
     int32_t preempt_n_need(const server_slot & slot) const {
-        // a recomputed slot has to put its WHOLE sequence back through the model before it can
-        // take its next step; a swapped one only has to have its copy written back
-        if (slot.preempt_mode == PREEMPT_MODE_RECOMPUTE) {
-            return slot.n_input_tokens() + 1 + preempt_n_spec_max();
+        if (!slot.task) {
+            return 0;
+        }
+
+        const int32_t n_spec = preempt_n_spec_max();
+        const int32_t n_left = slot.n_input_tokens() - slot.prompt.n_tokens();
+
+        if (slot.preempt_mode == PREEMPT_MODE_RECOMPUTE && slot.preempt_replaying()) {
+            return slot.n_input_tokens() + 1 + n_spec;
         }
 
         int32_t res = slot.prompt.n_tokens();
 
         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
-            res += 1 + preempt_n_spec_max();
+            res += 1 + n_spec;
+        } else if (slot.preempt_replaying()) {
+            // swapped part-way through a replay: it still owes the rest of that replay before
+            // it takes a step, which is the charge preempt_kv_reserve() makes for it too
+            res += std::max(1, n_left) + 1 + n_spec;
         } else {
-            const int32_t n_left = slot.task ? slot.n_input_tokens() - slot.prompt.n_tokens() : 0;
-
             res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
 
         return res;
+    }
+
+    // tokens the pool would hold for this slot once it is fully back, for reporting
+    int32_t preempt_n_seq(const server_slot & slot) const {
+        return slot.preempt_mode == PREEMPT_MODE_RECOMPUTE ? slot.n_input_tokens() : slot.prompt.n_tokens();
     }
 
     // Cells the pool is holding right now. A released slot keeps its prompt in the cache
@@ -3084,7 +3112,7 @@ private:
                     {
                         const int32_t n_left = slot.task ? slot.n_input_tokens() - slot.prompt.n_tokens() : 0;
 
-                        if (slot.preempt_resuming) {
+                        if (slot.preempt_replaying()) {
                             // Already committed: this slot was woken because its WHOLE sequence
                             // fitted, and it gets there one batch per iteration. Charging it a
                             // single batch like an ordinary prompt would let the next iteration
@@ -3238,11 +3266,11 @@ private:
                 for (auto * slot : parked) {
                     if (preempt_n_need(*slot) + PREEMPT_N_MARGIN > n_cells) {
                         SLT_WRN(*slot, "parked sequence of %d tokens no longer fits the %d cell pool, giving up\n",
-                                preempt_n_need(*slot), n_cells);
+                                preempt_n_seq(*slot), n_cells);
 
                         send_error(*slot,
                                    string_format("request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
-                                                 slot->n_input_tokens(), n_cells),
+                                                 preempt_n_seq(*slot), n_cells),
                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                         slot->release();
 
@@ -4019,19 +4047,17 @@ private:
                         }
 
                         // [TAG_PREEMPT] On a recompute the cells are gone, so n_past is 0 and
-                        // there is nothing cached to report. Keep the figure the first prefill
-                        // recorded, so usage.cached_tokens stays <= usage.prompt_tokens, and let
-                        // n_prompt_processed accumulate: the recompute really was prompt work, and
-                        // timings.prompt_n is a work counter, not a bill. usage.prompt_tokens
-                        // stays task->n_tokens() and never grows.
-                        if (slot.preempt_resuming) {
-                            const int32_t n_redo = slot.n_input_tokens() - n_past;
-
-                            slot.n_recompute           += n_redo;
-                            metrics.n_recompute_tokens += n_redo;
-
+                        // there is nothing cached to report. Leave every figure the first prefill
+                        // recorded exactly as it was: the timings a client reads describe the
+                        // request it made, and the recomputed work is reported separately, as
+                        // n_recompute on /slots and n_recompute_tokens_total on /metrics.
+                        if (slot.preempt_replaying()) {
+                            // the tokens are counted as they are actually decoded, in
+                            // metrics_post_decode(): a replay that is interrupted and started
+                            // over must not be charged twice
                             SLT_WRN(slot, "resumed after %.2f s parked: recomputing %d tokens, %d cached, preemptions %d\n",
-                                    (ggml_time_us() - slot.t_preempt_us) / 1e6, n_redo, n_past, slot.n_preempt);
+                                    (ggml_time_us() - slot.t_preempt_us) / 1e6,
+                                    slot.n_input_tokens() - n_past, n_past, slot.n_preempt);
                         } else {
                             slot.stats.n_prompt_cached    = n_past;
                             slot.stats.n_prompt_processed = 0;
@@ -4042,9 +4068,12 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
-                        // [TAG_PREEMPT] ... which a resumed slot did a long time ago; the headers
-                        // are out and a second progress chunk would land mid-answer
-                        if (slot.task->params.stream && !slot.preempt_resuming) {
+                        // [TAG_PREEMPT] ... which it does once per task. A slot that is here for
+                        // the second time was parked and sent back, and its headers are already
+                        // out; a second one of these would land in the middle of the stream.
+                        if (slot.task->params.stream && !slot.sent_begin) {
+                            slot.sent_begin = true;
+
                             if (slot.task->params.return_progress) {
                                 // send initial 0% progress update if needed
                                 send_partial_response(slot, {}, true);
@@ -4229,13 +4258,15 @@ private:
 
                         slot.i_batch = batch.size() - 1;
 
-                        // [TAG_PREEMPT] A recompute must not restart the count or the sampler. The
+                        // [TAG_PREEMPT] A replay must not restart the count or the sampler. The
                         // sampler object was never touched by the park, so its penalties, its
                         // grammar and its RNG are exactly where the interrupted step left them.
                         // init_sampler() would reset it and replay the tokens with
                         // accept_grammar = false, which is right for a prompt and wrong for the
-                        // tokens this request generated.
-                        if (!slot.preempt_resuming) {
+                        // tokens this request generated. A slot parked before it finished its
+                        // prompt has generated nothing yet and must still be initialised here,
+                        // which is why this asks about the replay and not about the resume.
+                        if (!slot.preempt_replaying()) {
                             slot.stats.n_gen = 0;
 
                             slot.init_sampler();
@@ -4444,8 +4475,8 @@ private:
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                // [TAG_PREEMPT] a recompute is not a new prompt; the client is mid-answer
-                if (slot.task->params.stream && slot.task->params.return_progress && !slot.preempt_resuming) {
+                // [TAG_PREEMPT] a replay is not a new prompt; the client is mid-answer
+                if (slot.task->params.stream && slot.task->params.return_progress && !slot.preempt_replaying()) {
                     send_partial_response(slot, {}, true);
                 }
             }
@@ -4478,6 +4509,7 @@ private:
                 if (slot.preempt_resuming) {
                     SLT_WRN(slot, "recompute done, generating again: %d tokens back in the cache, %d recomputed in total\n",
                             slot.prompt.n_tokens(), slot.n_recompute);
+
 
                     slot.preempt_resuming = false;
                     slot.preempt_replay.clear();
@@ -4731,7 +4763,12 @@ private:
             n_prompt_tokens++;
 
             auto & slot = slots[t.id_slot];
-            if (slot.stats.is_set()) {
+            // [TAG_PREEMPT] a replayed token is not one of the request's prompt tokens; it is
+            // work the server owes itself, and it is counted as such
+            if (slot.preempt_replaying()) {
+                slot.n_recompute++;
+                metrics.n_recompute_tokens++;
+            } else if (slot.stats.is_set()) {
                 slot.stats.n_prompt_processed++;
             }
         }
@@ -4749,7 +4786,10 @@ private:
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
             auto & slot = slots[t.id_slot];
-            if (t.is_prompt && slot.stats.is_set()) {
+            // [TAG_PREEMPT] and it must not drag the prompt timestamp forward either: that
+            // would report the whole parked wall clock as prompt time and inflate the
+            // generation rate by the same amount
+            if (t.is_prompt && slot.stats.is_set() && !slot.preempt_replaying()) {
                 slot.stats.set_prompt_last(t_now);
             }
         }

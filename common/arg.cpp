@@ -1722,8 +1722,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--preempt-ram"}, "N",
         string_format("maximum host RAM in MiB for parked (preempted) sequences; a slot that fits is parked by copying "
             "its sequence to host RAM, one that does not is parked by dropping its cells and recomputing them later "
-            "(default: %d, -1 - no limit, never recompute, 0 - never copy, always recompute; use --no-preempt to turn "
-            "preemption off)", params.preempt_ram_mib),
+            "(default: %d, -1 - no limit, 0 - never copy; use --no-preempt to turn preemption off)", params.preempt_ram_mib),
         [](common_params & params, int value) {
             params.preempt_ram_mib = value;
         }

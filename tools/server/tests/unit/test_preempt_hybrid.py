@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import pytest
 from utils import *
 
@@ -56,6 +57,42 @@ def _complete(n_predict: int, prompt: str = "Hi how are you"):
         "temperature": 0.0,
         "seed": 42,
     })
+
+
+class SlotWatcher:
+    """Poll /slots while requests are in flight and keep every parked state it saw.
+
+    The counters on /metrics say a park happened; only this says what a client polling /slots
+    would have been told while it was happening."""
+
+    def __init__(self):
+        self.seen = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                res = server.make_request("GET", "/slots", timeout=5)
+                if res.status_code == 200:
+                    for slot in res.body:
+                        if slot["is_preempted"]:
+                            self.seen.append((slot["preempt_mode"], slot["n_preempt"]))
+            except Exception:
+                pass
+            self._stop.wait(0.02)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    @property
+    def modes(self):
+        return {mode for mode, _ in self.seen}
 
 
 def _metrics():
@@ -137,15 +174,20 @@ def test_preempt_ram_zero_parks_by_recompute_and_both_requests_finish():
     log = LogReader(server.log_path)
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    with SlotWatcher() as watcher:
+        results = parallel_function_calls([
+            (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+            (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+        ])
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "parked by recompute" in text
     assert "parked by swap" not in text
+
+    # whatever /slots showed while a slot was parked, it can only have been a recompute; the
+    # poll can miss a short park, so it is the mode that is asserted, not that it saw one
+    assert watcher.modes <= {"recompute"}, watcher.seen
 
     for res in results:
         assert res.status_code == 200
@@ -206,9 +248,10 @@ def test_a_small_budget_parks_both_ways():
 
 
 def test_a_recomputed_request_does_not_double_count_its_prompt():
-    # A recompute runs the prompt through the model again. That is real work and it shows up in
-    # timings.prompt_n, but it is not something the client asked for twice: usage.prompt_tokens
-    # must stay the prompt the client sent, however many times the server had to prefill it.
+    # A recompute runs the prompt through the model again. That is the server's problem and not
+    # the client's: usage.prompt_tokens is the prompt the client sent, and the timings describe
+    # the request it made, however many times the server had to prefill it. The work is
+    # reported separately, as n_recompute on /slots and n_recompute_tokens_total on /metrics.
     global server
     server.n_ctx = 512
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
@@ -221,30 +264,33 @@ def test_a_recomputed_request_does_not_double_count_its_prompt():
     n_prompt = len(plain.body["tokens"])
 
     n_predict = 64
-    res = server.make_request("POST", "/v1/completions", data={
+    res = _complete(n_predict, prompt)
+    assert res.status_code == 200
+
+    m = _metrics()
+    assert m["n_preempt_recompute_total"] >= 6, "the request was never recomputed"
+    assert m["n_preempt_swap_total"] == 0
+    # ... and it really did re-run more tokens than the request ever had
+    assert m["n_recompute_tokens_total"] > n_prompt + n_predict
+
+    # /tokenize does not add BOS, the prompt path does, so allow the one extra token
+    assert res.body["tokens_evaluated"] - n_prompt in (0, 1)
+    timings = res.body["timings"]
+    assert timings["prompt_n"] == res.body["tokens_evaluated"], "the recompute was billed as prompt"
+    assert timings["predicted_n"] == n_predict
+    # a prompt timestamp dragged forward by the recomputes would report the whole wall clock as
+    # prompt time and inflate the generation rate by the same amount
+    assert timings["prompt_ms"] < timings["predicted_ms"]
+
+    oai = server.make_request("POST", "/v1/completions", data={
         "prompt": prompt,
         "max_tokens": n_predict,
         "ignore_eos": True,
         "temperature": 0.0,
         "seed": 42,
     })
-    assert res.status_code == 200
-
-    m = _metrics()
-    assert m["n_preempt_recompute_total"] >= 6, "the request was never recomputed"
-    assert m["n_preempt_swap_total"] == 0
-
-    usage = res.body["usage"]
-    # /tokenize does not add BOS, the prompt path does, so allow the one extra token
-    assert usage["prompt_tokens"] - n_prompt in (0, 1), "the recompute was billed to the client"
+    assert oai.status_code == 200
+    usage = oai.body["usage"]
+    assert usage["prompt_tokens"] - n_prompt in (0, 1)
     assert usage["completion_tokens"] == n_predict
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-
-    # ... while the work counters do show the recomputes
-    assert m["n_recompute_tokens_total"] > usage["prompt_tokens"]
-
-    res = server.make_request("GET", "/slots")
-    assert res.status_code == 200
-    for slot in res.body:
-        assert slot["is_preempted"] is False
-        assert slot["preempt_mode"] in (None, "recompute")

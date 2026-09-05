@@ -1580,7 +1580,7 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_resume
         }, {
             "n_recompute_tokens_total",
-            "Preemption: Total prompt tokens re-processed to put parked slots back",
+            "Preemption: Total tokens re-processed through the model to put parked slots back",
             (double) metrics.n_recompute_tokens
         },
     };
