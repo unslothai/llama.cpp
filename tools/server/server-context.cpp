@@ -1621,9 +1621,15 @@ private:
         return true;
     }
 
-    // Stops every pipeline group so that the caller can touch slot and context state safely.
+    // Holds the engine so that the caller can look at the slot state safely, and, on request,
+    // waits for the in-flight decode of the groups whose context the caller is going to touch.
     // Constructing this is a no-op when there is a single group: the single update loop and the
     // task processing then run on the same thread, exactly as before.
+    //
+    // Taking mtx_engine already keeps every group out of a new iteration, so the slot state is
+    // stable as soon as the guard exists. Only touching a llama_context needs more than that,
+    // and only for the group that owns it: wait_for() blocks until that group's decode is done
+    // while the other groups keep computing. Tasks that touch no context wait for nobody.
     struct engine_guard {
         server_context_impl * srv = nullptr;
         std::unique_lock<std::mutex> lk;
@@ -1636,10 +1642,29 @@ private:
             srv = srv_;
             lk  = std::unique_lock<std::mutex>(srv->mtx_engine);
 
-            // ask every group to stop at the start of its next iteration, then wait for the
-            // decodes that are already in flight
+            // ask every group to stop at the start of its next iteration, so that the slot state
+            // cannot change under us while wait_for() releases the lock
             for (auto & grp : srv->groups) {
                 grp->n_pause_req++;
+            }
+        }
+
+        // wait until this group is not inside llama_decode, so its context can be touched
+        void wait_for(int id_group) {
+            if (srv == nullptr) {
+                return;
+            }
+
+            GGML_ASSERT(id_group >= 0 && id_group < (int) srv->groups.size());
+            server_group * grp = srv->groups[id_group].get();
+
+            srv->cv_engine.wait(lk, [&] { return !grp->busy; });
+        }
+
+        // wait for every group, for tasks that are not tied to one slot
+        void wait_for_all() {
+            if (srv == nullptr) {
+                return;
             }
 
             srv->cv_engine.wait(lk, [&] {
@@ -2568,8 +2593,10 @@ private:
             return false;
         }
 
-        // with more than one group the update loops run on their own threads, so pause them while
-        // we look at and modify the slots. no-op with a single group.
+        // with more than one group the update loops run on their own threads. Holding the engine
+        // is enough to look at and modify the slot state; the cases below additionally wait for
+        // the in-flight decode of the group whose context they touch, and only for that group.
+        // no-op with a single group.
         engine_guard guard(this);
 
         switch (task.type) {
@@ -2608,6 +2635,10 @@ private:
                         break;
                     }
 
+                    // from here on the slot's context is touched (prompt cache, KV), so the group
+                    // that owns it has to finish its decode. the other groups keep computing.
+                    guard.wait_for(slot->id_group);
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2636,6 +2667,9 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        // this walks every slot of every group
+                        guard.wait_for_all();
+
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -2658,6 +2692,7 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            guard.wait_for(slot.id_group);
                             slot.release();
                             break;
                         }
@@ -2677,6 +2712,9 @@ private:
                         queue_results.send(std::move(res));
                         break;
                     }
+
+                    // the sampler of this slot is used by its group between decodes
+                    guard.wait_for(slot->id_group);
 
                     if (task.params.control_action == "reasoning_end") {
                         // the budget sampler only exists when reasoning control was armed
@@ -2759,6 +2797,9 @@ private:
                         break;
                     }
 
+                    // reads this slot's KV out of its context
+                    guard.wait_for(slot->id_group);
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2808,6 +2849,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    // writes this slot's KV into its context
+                    guard.wait_for(slot->id_group);
 
                     const int64_t t_start = ggml_time_us();
 
@@ -2874,6 +2918,9 @@ private:
                         break;
                     }
 
+                    // prompt_clear() drops this slot's KV from its context
+                    guard.wait_for(slot->id_group);
+
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
@@ -2913,6 +2960,9 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
+                    // the adapters are applied to every context
+                    guard.wait_for_all();
+
                     auto new_loras = construct_lora_list(task.set_lora);
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
