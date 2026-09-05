@@ -494,6 +494,7 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
+    int n_preempted_slots = 0;    // [TAG_PREEMPT_RC] processing slots currently parked
 
     server_metrics metrics;
 
