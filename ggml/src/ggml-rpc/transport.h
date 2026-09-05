@@ -6,9 +6,30 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
+
+// One deferred RPC data movement, queued by the asynchronous tensor entry points of the RPC
+// backend and executed on the connection at the next flush point (a synchronize, or any other
+// command that has to keep its place in the wire order).
+struct rpc_deferred_op {
+    enum kind_t { GET, SET } kind;
+
+    // The tensor is serialized when the operation is queued, not when it is flushed: the graph
+    // result that owns it can be reset before the next flush point (one llama_decode allocates
+    // and resets a graph per ubatch), so keeping the pointer would leave a dangling read.
+    std::vector<uint8_t> tensor_bytes;
+
+    void *   data   = nullptr;   // GET: host destination; SET: host staging source
+    uint64_t offset = 0;
+    uint64_t size   = 0;
+
+    // SET only: an event on the producing backend that must complete before the staging
+    // buffer holds the data. Opaque here so the transport stays free of ggml-backend types.
+    void * event = nullptr;
+};
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
@@ -29,6 +50,14 @@ struct rpc_conn_state {
     uint64_t                seq_serving = 0;
 
     std::unordered_map<uint32_t, uint64_t> last_graph_uid;
+
+    // minor version reported by the server in HELLO, used to gate optional commands
+    uint32_t server_minor = 0;
+
+    // deferred data movements, see rpc_deferred_op. Guarded by mtx_defer, which is always
+    // taken before mtx_send and never while holding it.
+    std::mutex                   mtx_defer;
+    std::vector<rpc_deferred_op> deferred;
 };
 
 struct socket_t {
