@@ -1085,6 +1085,15 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         return false;
     }
 
+    // the asynchronous entry points of a backend only accept tensors that live in its own
+    // default buffer type; anything else (a host buffer that the backend can also reach) stays
+    // on the synchronous path
+    const ggml_tensor * other_t = src_is_rpc ? dst : src;
+    ggml_backend_buffer_t other_buf = other_t->view_src ? other_t->view_src->buffer : other_t->buffer;
+    if (other_buf == nullptr || ggml_backend_buffer_get_type(other_buf) != ggml_backend_get_default_buffer_type(other)) {
+        return false;
+    }
+
     if (!src_is_rpc) {
         // device -> RPC: pinned D2H on the producing stream, an event to tell when it landed,
         // and the send happens at the next flush point
