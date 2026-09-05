@@ -218,6 +218,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
+| `--preempt-ram MiB` | Maximum RAM for parked target and draft sequence snapshots (default: 4096; 0 disables). Requires unified KV. (env: LLAMA_ARG_PREEMPT_RAM) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
@@ -577,6 +578,8 @@ These words will not be included in the completion, so make sure to add them to 
 `t_max_predict_ms`: Set a time limit in milliseconds for the prediction (a.k.a. text-generation) phase. The timeout will trigger if the generation takes more than the specified time (measured since the first token was generated) and if a new-line character has already been generated. Useful for FIM applications. Default: `0`, which is disabled.
 
 `id_slot`: Assign the completion task to an specific slot. If is -1 the task will be assigned to a Idle slot.  Default: `-1`
+
+`priority`: Signed 32-bit integer scheduling priority, default `0`. Higher values are more important. Supported by native completions and the OpenAI-compatible completion/chat endpoints. See [request preemption](#request-preemption).
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
@@ -1138,6 +1141,97 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+
+### Request preemption
+
+With `--kv-unified --preempt-ram 4096`, text requests can share the entire context
+pool and pause when its live contents approach capacity. Preemption copies a
+sequence's target and draft state to host RAM, removes its device cells, and
+keeps its task, sampler, generated tokens, speculative state, reasoning and
+stream alive. It restores that state when room returns. No prompt replay or
+rollback to a user message is performed. The existing SSE pings continue while
+parked; use `sse_ping_interval` to choose the heartbeat interval.
+
+Scheduling occurs between completed decode/accept steps, before drafting. Each
+running sequence reserves one sampled-token cell plus its maximum next draft
+(up to three cells with `--spec-type draft-mtp --spec-draft-n-max 2`). The reserve
+shrinks with the remaining output/context budget. There is no fixed context
+partition or percentage buffer. Prefill is limited to the remaining cells.
+Idle cached sequences are cleared before parking live requests.
+
+On pressure, candidates are the lowest effective-priority tier of independent
+slots. The longest resident sequence is protected unless it is the only
+candidate in that tier; newer task IDs are selected first among the other
+candidates. This gives priority precedence when a long low-priority request is
+the last candidate before a more important request. With equal priorities the
+longest request survives (ties favor higher effective priority, then slot order).
+Parent and child slots from parallel sampling (`n > 1`) are never parked. A pressure survivor
+runs until completion before automatic restoration; this avoids repeatedly
+swapping at the watermark. Every third park of a task promotes its effective
+priority by one, without changing its requested priority. Eligible restores use
+highest effective priority, then most parks, then earliest park time. Requests
+that do not fit are skipped so a smaller request can resume.
+
+### POST `/slots/{id_slot}?action=park` and `action=unpark`
+
+These actions require `--slots`, unified KV, text input and `--preempt-ram > 0`;
+they do not require `--slot-save-path`. They execute on the inference task queue,
+never during an in-flight decode. For example:
+
+```sh
+curl -X POST 'http://localhost:8080/slots/0?action=park'
+curl -X POST 'http://localhost:8080/slots/0?action=unpark'
+```
+
+`park` holds an active independent slot until `unpark` is requested, including
+when other slots are idle. It is idempotent for an already parked slot. `unpark`
+clears the manual hold and requests restoration at the next scheduling
+opportunity; its response may still say `is_preempted: true`. Both actions return
+the slot object, including `priority`, `effective_priority`, `is_preempted`,
+`preempt_manual`, `n_preempt`, and `preempt_ram_bytes`. `GET /slots` exposes the
+same fields. An idle, invalid, parent or child slot is rejected. A failed manual
+snapshot leaves the inference request untouched.
+
+`--preempt-ram` bounds the additional target/draft snapshot payload, separate
+from prompt-cache RAM, samplers, existing checkpoints, generated text, and other
+process memory. If the RAM cap or protected slots prevent reclaiming enough
+cells, requests remain alive but wait for a cancellation or another action that
+releases capacity. Size the cap for the workload: progress cannot be guaranteed
+with insufficient host RAM. All-manually-parked or capacity-blocked workloads
+wait on the task queue, without a decode busy loop. Cancelling a parked request
+frees its snapshot. Park time is excluded from `t_max_predict_ms`.
+
+Preemption is disabled for non-unified KV and multimodal contexts. Automatic
+server sleep (`--sleep-idle-seconds > 0`) is rejected when preemption is enabled,
+since unloading a context would invalidate the retained speculative state.
+Independent text generation with standard attention and Qwen3.5 MTP is tested;
+other speculative architectures and shared-prompt pool exhaustion are not
+covered. The original per-request context limit still applies.
+
+Set `LLAMA_SERVER_PREEMPT_EVERY=N` to exercise a snapshot/remove/restore round
+trip whenever a request crosses another N generated tokens. Zero disables the
+test hook. With speculation, the crossing can occur up to the accepted draft
+length after the exact multiple; the final completed request is not parked.
+These forced round trips restore immediately at the same decode boundary.
+They isolate snapshot preservation from changes in the concurrent batch.
+
+State preservation does not guarantee bitwise output identity under arbitrary
+CUDA scheduling. Restoring a sequence can change its physical KV placement,
+and parking peers changes batch sizes. Floating-point attention reductions and
+batch-dependent kernels can then produce different logits and a different
+greedy token, even at temperature zero. Byte/token comparisons must distinguish
+an isolated forced round trip from a changed concurrent schedule.
+
+The metrics endpoint additionally exposes:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `llamacpp:preemptions_total` | Counter | Successful parks, including manual and forced parks. |
+| `llamacpp:preempt_restores_total` | Counter | Successful restores. |
+| `llamacpp:preempt_blocked_total` | Counter | Scheduling attempts blocked by snapshot RAM or policy. |
+| `llamacpp:preempt_copy_seconds_total` | Counter | Time copying snapshots to and from host RAM. |
+| `llamacpp:preempt_ram_bytes` | Gauge | Snapshot payload currently held in host RAM. |
+| `llamacpp:requests_preempted` | Gauge | Parked requests whose tasks remain alive. |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
