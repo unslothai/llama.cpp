@@ -227,3 +227,43 @@ def test_preempt_ram_zero_disables_preemption():
     assert "preempted:" not in text
     assert "Context size has been exceeded" in text
     assert any(res.status_code != 200 for res in results)
+
+
+def test_metrics_and_slots_report_the_parked_state():
+    # A client that wants to tell a parked chat from a slow one reads /slots, and an
+    # operator reads /metrics. Both must show the preemption happening, and the counters
+    # must survive the requests finishing.
+    global server
+    server.n_ctx = 256
+    server.server_metrics = True
+    server.start()
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    for slot in res.body:
+        assert slot["is_preempted"] is False
+        assert slot["n_preempt"] == 0
+
+    n_predict = 160
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+    for res in results:
+        assert res.status_code == 200
+
+    res = server.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    metrics = {}
+    for line in res.body.splitlines():
+        if line.startswith("llamacpp:"):
+            name, value = line.split(" ", 1)
+            metrics[name[len("llamacpp:"):]] = float(value)
+    assert metrics["n_preempt_total"] >= 1
+    assert metrics["n_resume_total"] == metrics["n_preempt_total"]
+    assert metrics["requests_preempted"] == 0
+    assert metrics["preempt_ram_bytes"] == 0
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert sum(slot["n_preempt"] for slot in res.body) == 0, "n_preempt is per task and resets with the slot"

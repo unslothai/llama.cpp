@@ -796,6 +796,8 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"is_preempted",  state == SLOT_STATE_PREEMPTED},
+            {"n_preempt",     n_preempt},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -2546,10 +2548,14 @@ private:
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
+                    int n_preempted_slots  = 0;
 
                     for (server_slot & slot : slots) {
                         if (slot.is_processing()) {
                             n_processing_slots++;
+                        }
+                        if (slot.state == SLOT_STATE_PREEMPTED) {
+                            n_preempted_slots++;
                         }
                     }
                     SRV_DBG("n_processing_slots = %d\n", n_processing_slots);
@@ -2558,6 +2564,8 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->n_preempted_slots   = n_preempted_slots;
+                    res->preempt_ram_bytes   = preempt_ram_used();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -2839,8 +2847,6 @@ private:
     // [TAG_PREEMPT] server-side request preemption
     //
 
-    int64_t n_preempt_total = 0;
-    int64_t n_resume_total  = 0;
 
     // LLAMA_SERVER_PREEMPT_EVERY=N preempts every generating slot every N generated tokens,
     // whether or not the pool is under pressure. It exists to answer the only question that
@@ -3084,7 +3090,7 @@ private:
                 break;
             }
 
-            n_resume_total++;
+            metrics.n_resume++;
 
             SLT_WRN(*best, "resumed after %.2f s: %d tokens back in the cache in %.2f ms, kv %d/%d, preemptions %d\n",
                     (ggml_time_us() - best->t_preempt_us) / 1e6,
@@ -3101,7 +3107,7 @@ private:
                     (int32_t) slot.stats.n_gen >= (slot.n_preempt + 1) * preempt_test_every &&
                     preempt_fits_budget(slot) &&
                     slot.preempt_save()) {
-                    n_preempt_total++;
+                    metrics.n_preempt++;
 
                     SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
                             (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
@@ -3137,7 +3143,7 @@ private:
                 break; // could not park it; the existing retry ladder is still behind us
             }
 
-            n_preempt_total++;
+            metrics.n_preempt++;
 
             SLT_WRN(*victim, "preempted: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
@@ -4422,7 +4428,8 @@ private:
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
         metrics.n_decode++;
         for (const auto & slot : slots) {
-            if (slot.is_processing()) {
+            // [TAG_PREEMPT] a parked slot is processing but took no part in this decode
+            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
                 metrics.n_busy_slots++;
             }
             metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
