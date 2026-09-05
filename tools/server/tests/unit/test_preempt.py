@@ -39,6 +39,7 @@ def create_server():
     yield
     os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
+    os.environ.pop("LLAMA_ARG_PREEMPT", None)
 
 
 def _complete(n_predict: int, prompt: str = "Hi how are you"):
@@ -208,12 +209,16 @@ def test_a_generating_slot_and_a_large_prompt_both_finish():
     assert results[1].body["timings"]["predicted_n"] == n_predict_b
 
 
-def test_preempt_ram_zero_disables_preemption():
-    # --preempt-ram 0 is the switch back to the old behaviour: nothing is parked and the
+def test_no_preempt_disables_preemption():
+    # --no-preempt is the switch back to the old behaviour: nothing is parked and the
     # KV-full path ends the requests the way it always did.
+    #
+    # This used to be --preempt-ram 0. That value now means "never copy to host RAM, always
+    # recompute", so it parks rather than disables, and the switch had to move to its own
+    # flag. test_preempt_hybrid.py covers what --preempt-ram 0 does instead.
     global server
     server.n_ctx = 256
-    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
+    os.environ["LLAMA_ARG_PREEMPT"] = "0"
     server.start()
     log = LogReader(server.log_path)
 

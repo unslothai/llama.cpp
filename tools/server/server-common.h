@@ -467,9 +467,14 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
-    // [TAG_PREEMPT] slots parked to make room in the unified KV pool, and put back
-    uint64_t n_preempt = 0;
-    uint64_t n_resume  = 0;
+    // [TAG_PREEMPT] slots parked to make room in the unified KV pool, split by how they were
+    // parked, put back, and the tokens re-run through the model to put a recomputed one back
+    // (n_preempt == n_preempt_swap + n_preempt_recompute)
+    uint64_t n_preempt           = 0;
+    uint64_t n_preempt_swap      = 0;
+    uint64_t n_preempt_recompute = 0;
+    uint64_t n_resume            = 0;
+    uint64_t n_recompute_tokens  = 0;
 
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
