@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-trace.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -132,6 +133,9 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    // opens the event trace if GGML_RPC_TRACE names a file, otherwise this is a no-op
+    ggml_trace_open(nullptr, "llama-server");
 
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin

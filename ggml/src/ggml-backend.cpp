@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-trace.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -491,11 +492,26 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG
+        // The staging path taken between two backends that cannot copy to each other directly.
+        // For a layer split over RPC this is the hidden state going GPU -> host -> peer, so the
+        // trace breaks it into the host allocation, the read back and the send.
         size_t nbytes = ggml_nbytes(src);
+        const int64_t t0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
         void * data = malloc(nbytes);
+        const int64_t t1 = ggml_trace_flag ? ggml_trace_time_us() : 0;
         ggml_backend_tensor_get(src, data, 0, nbytes);
+        const int64_t t2 = ggml_trace_flag ? ggml_trace_time_us() : 0;
         ggml_backend_tensor_set(dst, data, 0, nbytes);
+        const int64_t t3 = ggml_trace_flag ? ggml_trace_time_us() : 0;
         free(data);
+        if (ggml_trace_flag) {
+            ggml_trace_eventf("sched", "copy_stage", t0, ggml_trace_time_us(),
+                              "\"tensor\":\"%s\",\"bytes\":%zu,\"src\":\"%s\",\"dst\":\"%s\","
+                              "\"malloc_us\":%lld,\"get_us\":%lld,\"set_us\":%lld",
+                              src->name, nbytes,
+                              ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer),
+                              (long long) (t1 - t0), (long long) (t2 - t1), (long long) (t3 - t2));
+        }
     }
 }
 
@@ -1608,6 +1624,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const int64_t t_split0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
+        int64_t       t_inputs = t_split0;
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1741,6 +1760,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (ggml_trace_flag) { t_inputs = ggml_trace_time_us(); }
+
+        // GPU span around the submit of this split, so the trace shows when the kernels really
+        // ran and not only when the launch returned
+        const uint64_t gpu_tag = ggml_trace_flag ? ggml_trace_gpu_begin(split_backend, ggml_backend_name(split_backend)) : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1780,9 +1805,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (ggml_trace_flag) {
+            ggml_trace_gpu_end(split_backend, gpu_tag);
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        if (ggml_trace_flag) {
+            // note: the submit is asynchronous on most backends, so t1 is when the work was
+            //       queued, not when it finished; the GPU rows in the merged trace say that
+            ggml_trace_eventf("sched", "split", t_split0, ggml_trace_time_us(),
+                              "\"split\":%d,\"n_splits\":%d,\"backend\":\"%s\",\"n_inputs\":%d,"
+                              "\"n_nodes\":%d,\"inputs_us\":%lld,\"gpu_tag\":%llu",
+                              split_id, sched->n_splits, ggml_backend_name(split_backend),
+                              split->n_inputs, split->graph.n_nodes,
+                              (long long) (t_inputs - t_split0), (unsigned long long) gpu_tag);
         }
 
         prev_backend_id = split_backend_id;
@@ -1979,6 +2019,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (ggml_trace_flag) {
+        // everything is idle here, so this is where the completed GPU spans are collected
+        ggml_trace_gpu_flush();
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

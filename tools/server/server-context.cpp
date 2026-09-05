@@ -17,6 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "ggml-trace.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -803,6 +805,27 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // With N > 1 the point is that while group A's batch is being computed on the second stage of a
 // layer split (the RPC peer), group B's batch can be computed on the first stage (the local GPU),
 // so both devices are busy instead of each idling half of every decode step.
+// RAII span for the event tracer (ggml/include/ggml-trace.h). Off unless GGML_RPC_TRACE is set,
+// and then one branch per call site.
+struct server_trace_scope {
+    const char * name;
+    int64_t      t0;
+    int          n0;
+    int          n1;
+
+    server_trace_scope(const char * name, int n0, int n1) :
+        name(name), t0(ggml_trace_flag ? ggml_trace_time_us() : 0), n0(n0), n1(n1) {}
+
+    ~server_trace_scope() {
+        if (ggml_trace_flag) {
+            ggml_trace_eventf("server", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
+        }
+    }
+
+    server_trace_scope(const server_trace_scope &) = delete;
+    server_trace_scope & operator=(const server_trace_scope &) = delete;
+};
+
 struct server_group {
     int id = 0;
 
@@ -1696,6 +1719,10 @@ private:
 
     // the decode loop of one pipeline group, only used when n_groups > 1
     void group_loop(server_group & grp) {
+        // every event raised below this point, down to the individual RPC commands, is tagged
+        // with the group that caused it
+        ggml_trace_set_group(grp.id);
+
         while (true) {
             {
                 std::unique_lock<std::mutex> lk(mtx_engine);
@@ -3102,7 +3129,20 @@ private:
             //       to keep the shared task loop spinning
         }
 
+        if (ggml_trace_flag) {
+            ggml_trace_set_group(grp.id);
+        }
+
+        int n_slots_processing = 0;
+        if (ggml_trace_flag) {
+            for (auto * slot : grp.slots) {
+                n_slots_processing += slot->is_processing() ? 1 : 0;
+            }
+        }
+        server_trace_scope span_iter("iteration", grp.id, n_slots_processing);
+
         try {
+            server_trace_scope span_build("batch_build", grp.id, n_slots_processing);
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode(grp);
             batch.render();
@@ -3979,16 +4019,24 @@ private:
                 }
             } window(this, &grp, &lk);
 
-            ret = llama_decode(ctx_tgt, batch_view);
+            {
+                server_trace_scope span("submit", grp.id, batch_view.n_tokens);
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
             if (ret == 0 && has_output) {
+                server_trace_scope span("synchronize", grp.id, batch_view.n_tokens);
                 llama_synchronize(ctx_tgt);
             }
         } else {
             // yield to the queue, so we can still handle metrics tasks while decoding
             // note: the sync is done here too, so that the wait is also covered by the yield
             queue_tasks.yield_to_queue([&]() {
-                ret = llama_decode(ctx_tgt, batch_view);
+                {
+                    server_trace_scope span("submit", grp.id, batch_view.n_tokens);
+                    ret = llama_decode(ctx_tgt, batch_view);
+                }
                 if (ret == 0 && has_output) {
+                    server_trace_scope span("synchronize", grp.id, batch_view.n_tokens);
                     llama_synchronize(ctx_tgt);
                 }
             });
@@ -4095,6 +4143,8 @@ private:
     }
 
     void post_decode(server_group & grp, int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        server_trace_scope span_post("post_decode", grp.id, n_batch_tokens);
+
         // shadow the single-context members, as update_slots() does
         auto * ctx_tgt = grp.ctx;
         auto & slots   = grp.slots;
@@ -4170,6 +4220,7 @@ private:
 
             llama_token id;
             {
+                server_trace_scope span("sampling", grp.id, slot.id);
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -4200,13 +4251,16 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
+            {
+                server_trace_scope span("result_send", grp.id, slot.id);
+                if (!process_token(result, slot)) {
+                    // release slot because of stop condition
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
 
-                return;
+                    return;
+                }
             }
 
             slot.print_timings_tg();
