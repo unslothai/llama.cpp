@@ -1854,9 +1854,13 @@ int ggml_cuda_batch_invariant() {
 
 int ggml_cuda_batch_invariant_max_cols() {
     static const int max_cols = []() {
-        if (ggml_cuda_exact_concurrency()) { return 0; }
+        // [TAG_EXACT_CONCURRENCY] With prompt ubatches kept to one sequence, a sequence's prefill
+        // matmul shapes match its solo run, so exact mode no longer needs the column policy to be
+        // unbounded there. Honour an explicit bound when one is set; default to unbounded.
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
-        return val ? atoi(val) : 0;
+        if (val) { return atoi(val); }
+        if (ggml_cuda_exact_concurrency()) { return 0; }
+        return 0;
     }();
     return max_cols;
 }
