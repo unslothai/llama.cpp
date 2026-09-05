@@ -200,6 +200,11 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) non-blocking completion test for an event.
+        // kept last so that backends that do not implement it need no change: a missing entry
+        // is NULL, and ggml_backend_event_query() then falls back to a blocking synchronize.
+        bool                 (*event_query)       (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {
