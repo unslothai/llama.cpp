@@ -103,3 +103,9 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+// [TAG_EXACT_CONCURRENCY]
+// opt-in mode under which a sequence's attention depends only on its own cells, in position order,
+// so that its output does not change when other sequences share the KV cache. Off by default.
+// Reads the same LLAMA_EXACT_CONCURRENCY variable as the paged KV cache and the CUDA backend.
+bool llama_exact_concurrency();

@@ -507,7 +507,21 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+bool llama_batch_allocr::has_multi_token_seq() const {
+    std::vector<uint32_t> n_per_seq(n_seq_max, 0);
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+            if (++n_per_seq[batch.seq_id[i][s]] > 1) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seqs_max) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -545,6 +559,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             last_seq_id = batch.seq_id[i][0];
 
             if (cur_seq_set.size() > n_ubatch) {
+                break;
+            }
+
+            // [TAG_EXACT_CONCURRENCY]
+            if (n_seqs_max > 0 && cur_seq_set.size() >= n_seqs_max) {
                 break;
             }
         }
