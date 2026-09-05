@@ -60,6 +60,8 @@ enum slot_state {
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
     SLOT_STATE_PREEMPTED,  // [TAG_PREEMPT] cells released, everything needed to resume is in host RAM
+    SLOT_STATE_PREEMPTING, // [TAG_PREEMPT_ASYNC] the copy out is running; the cells are still this slot's
+    SLOT_STATE_RESTORING,  // [TAG_PREEMPT_ASYNC] the copy back in is running; the cells are allocated but not yet filled
 };
 
 // [TAG_PREEMPT] server-side request preemption
@@ -79,6 +81,34 @@ constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the res
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
+
+// [TAG_PREEMPT_ASYNC] how far ahead of the pool filling an asynchronous park is triggered
+//
+// A synchronous park hands the cells back before update_slots() goes on, so it only has to
+// fire once the next step would not fit. An asynchronous one does not: the copy is still
+// reading the cells, and they are only released when it lands. The slots that keep decoding
+// in the meantime need somewhere to put their tokens, so the park has to be triggered this
+// many decode steps before the pool would actually have run out. Too small and the pool
+// fills while the copy is still running, and the decode ends up waiting for it after all,
+// which is no worse than not doing this at all but no better either. Too large and slots
+// are parked, and so parked again, earlier and more often than they need to be, which costs
+// more in total than the one late park it avoided.
+//
+// Eight steps of every running slot is about a tenth of a second of runway at the speeds a
+// handful of parallel chats decode at, which is the order a copy of one sequence takes.
+constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
+
+struct llama_state_seq_copy_deleter {
+    void operator()(llama_state_seq_copy * cpy) const { llama_state_seq_copy_free(cpy); }
+};
+
+using llama_state_seq_copy_ptr = std::shared_ptr<llama_state_seq_copy>;
+
+static llama_state_seq_copy_ptr llama_state_seq_copy_make(llama_context * ctx) {
+    llama_state_seq_copy * cpy = ctx ? llama_state_seq_copy_init(ctx) : nullptr;
+
+    return cpy ? llama_state_seq_copy_ptr(cpy, llama_state_seq_copy_deleter{}) : llama_state_seq_copy_ptr();
+}
 
 struct server_slot; // forward declaration
 
@@ -320,19 +350,94 @@ struct server_slot {
     slot_state           state_before_preempt = SLOT_STATE_IDLE;
     std::vector<uint8_t> preempt_state_tgt;
     std::vector<uint8_t> preempt_state_dft;
+
+    // [TAG_PREEMPT_ASYNC] the two transfers this slot parks and resumes through
+    //
+    // They own the pinned host buffers the sequence lives in while it is parked, so when
+    // they exist the std::vectors above stay empty and the state is in the transfers. Held
+    // by shared_ptr only because the slots are built with emplace_back into a vector that
+    // reallocates as it grows, and a slot must survive being moved.
+    llama_state_seq_copy_ptr preempt_cpy_tgt;
+    llama_state_seq_copy_ptr preempt_cpy_dft;
+
+    bool preempt_is_async() const {
+        return (bool) preempt_cpy_tgt;
+    }
+
+    // microseconds the last park or resume spent draining the compute streams
+    int64_t preempt_sync_us() const {
+        if (!preempt_is_async()) {
+            return 0;
+        }
+
+        return llama_state_seq_copy_sync_us(preempt_cpy_tgt.get()) +
+               (preempt_cpy_dft ? llama_state_seq_copy_sync_us(preempt_cpy_dft.get()) : 0);
+    }
+
+    // transfers the last park or resume posted, which is what its issue cost is made of
+    size_t preempt_n_copies() const {
+        if (!preempt_is_async()) {
+            return 0;
+        }
+
+        return llama_state_seq_copy_n_copies(preempt_cpy_tgt.get()) +
+               (preempt_cpy_dft ? llama_state_seq_copy_n_copies(preempt_cpy_dft.get()) : 0);
+    }
+
+    // [TAG_PREEMPT_ASYNC] a copy is running for this slot: it is not decoding and must not be
+    // scheduled, but it still owns cells, so it is neither running nor parked
+    bool preempt_in_flight() const {
+        return state == SLOT_STATE_PREEMPTING || state == SLOT_STATE_RESTORING;
+    }
+
+    // parked, or on its way out or back in: in none of these does the slot take part in a decode
+    bool preempt_is_out() const {
+        return state == SLOT_STATE_PREEMPTED || preempt_in_flight();
+    }
     int32_t              n_preempt      = 0;   // times the CURRENT task has been preempted
     int32_t              n_preempt_fail = 0;   // consecutive failed restores
     int64_t              t_preempt_us   = 0;   // when it was parked
+    int64_t              t_preempt_copy_us = 0; // [TAG_PREEMPT_ASYNC] when the current copy was issued
 
     size_t preempt_state_size() const {
+        if (preempt_is_async()) {
+            // the capacity, not the live size: the pinned buffers are kept between two parks
+            // of the same task because page-locking them again would cost as much as the
+            // copy, so what --preempt-ram has to bound is what is held, not what is in use
+            return llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()) +
+                   (preempt_cpy_dft ? llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()) : 0);
+        }
+
         return preempt_state_tgt.size() + preempt_state_dft.size();
     }
 
     void preempt_state_free() {
+        // resizing waits for anything still in flight first: this is called from release(),
+        // which a cancelled request reaches while its copy may still be reading or writing
+        // the buffer, and freeing it underneath a running transfer would be a use-after-free
+        if (preempt_cpy_tgt) {
+            llama_state_seq_copy_buf_free(preempt_cpy_tgt.get());
+        }
+
+        if (preempt_cpy_dft) {
+            llama_state_seq_copy_buf_free(preempt_cpy_dft.get());
+        }
+
         preempt_state_tgt.clear();
         preempt_state_tgt.shrink_to_fit();
         preempt_state_dft.clear();
         preempt_state_dft.shrink_to_fit();
+    }
+
+    // [TAG_PREEMPT_ASYNC] give up on an outstanding copy without using its result
+    void preempt_copy_wait() {
+        if (preempt_cpy_tgt) {
+            llama_state_seq_copy_wait(preempt_cpy_tgt.get());
+        }
+
+        if (preempt_cpy_dft) {
+            llama_state_seq_copy_wait(preempt_cpy_dft.get());
+        }
     }
 
     // bytes preempt_save() would need for this slot right now
@@ -341,10 +446,113 @@ struct server_slot {
                (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
     }
 
+    // take the slot out of the step that is about to be built
+    //
+    // The draft is a prediction, not a result, so it goes with the cells. Preemption runs
+    // before the batch is built, so spec_i_batch is empty and prompt.tokens already holds
+    // exactly the tokens the state covers -- including the rollback done by the checkpoint
+    // path when a draft was only partially accepted.
+    void preempt_detach() {
+        spec_draft.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        spec_is_replay = false;
+
+        i_batch = -1;
+    }
+
+    // [TAG_PREEMPT_ASYNC] has the copy out finished? if so, the cells can finally go
+    bool preempt_save_poll() {
+        if (!llama_state_seq_copy_done(preempt_cpy_tgt.get())) {
+            return false;
+        }
+
+        if (preempt_cpy_dft && !llama_state_seq_copy_done(preempt_cpy_dft.get())) {
+            return false;
+        }
+
+        mem.seq_rm(id, -1, -1);
+
+        state = SLOT_STATE_PREEMPTED;
+
+        return true;
+    }
+
+    // [TAG_PREEMPT_ASYNC] has the copy back in finished? if so, the slot can decode again
+    bool preempt_restore_poll() {
+        if (!llama_state_seq_copy_done(preempt_cpy_tgt.get())) {
+            return false;
+        }
+
+        if (preempt_cpy_dft && !llama_state_seq_copy_done(preempt_cpy_dft.get())) {
+            return false;
+        }
+
+        // the state is back in the cache, so the buffers hold nothing that matters; the
+        // memory itself is kept for the next park of this task and handed back by release()
+        llama_state_seq_copy_buf_resize(preempt_cpy_tgt.get(), 0);
+
+        if (preempt_cpy_dft) {
+            llama_state_seq_copy_buf_resize(preempt_cpy_dft.get(), 0);
+        }
+
+        n_preempt_fail = 0;
+
+        state = state_before_preempt;
+
+        // same call the DONE_PROMPT -> GENERATING transition makes; it reads the restored
+        // sequence, so it has to wait for the copy like everything else
+        if (state == SLOT_STATE_GENERATING && can_speculate()) {
+            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
+        }
+
+        return true;
+    }
+
     // copy the sequence out of the cache and release its cells
+    //
+    // [TAG_PREEMPT_ASYNC] With a transfer this returns as soon as the copy has been issued,
+    // leaving the slot PREEMPTING: the cells are still its own, because the copy is still
+    // reading them, and nobody may take them until preempt_save_poll() says the copy landed.
     bool preempt_save() {
         const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        if (preempt_is_async()) {
+            if (!llama_state_seq_copy_buf_resize(preempt_cpy_tgt.get(), size_tgt) ||
+                (size_dft > 0 && (!preempt_cpy_dft ||
+                                  !llama_state_seq_copy_buf_resize(preempt_cpy_dft.get(), size_dft)))) {
+                SLT_ERR(*this, "failed to allocate %.3f MiB of pinned host memory for the preemption state\n",
+                        (size_tgt + size_dft) / (1024.0 * 1024.0));
+                preempt_state_free();
+                return false;
+            }
+
+            if (llama_state_seq_copy_get(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
+                SLT_ERR(*this, "%s", "failed to issue the copy of the target sequence out of the KV cache\n");
+                preempt_state_free();
+                return false;
+            }
+
+            if (size_dft > 0 &&
+                llama_state_seq_copy_get(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
+                SLT_ERR(*this, "%s", "failed to issue the copy of the draft sequence out of the KV cache\n");
+                preempt_state_free();
+                return false;
+            }
+
+            preempt_detach();
+
+            // note: no mem.seq_rm() here. The copy is still reading these cells, so they are
+            //       released in preempt_save_poll() once it has finished with them.
+            state_before_preempt = state;
+            state                = SLOT_STATE_PREEMPTING;
+            t_preempt_us         = ggml_time_us();
+
+            n_preempt++;
+
+            return true;
+        }
 
         try {
             preempt_state_tgt.resize(size_tgt);
@@ -369,16 +577,7 @@ struct server_slot {
             return false;
         }
 
-        // The draft is a prediction, not a result, so it goes with the cells. Preemption
-        // runs before the batch is built, so spec_i_batch is empty and prompt.tokens already
-        // holds exactly the tokens the state above covers -- including the rollback done by
-        // the checkpoint path when a draft was only partially accepted.
-        spec_draft.clear();
-        spec_i_batch.clear();
-        spec_ckpt.clear();
-        spec_is_replay = false;
-
-        i_batch = -1;
+        preempt_detach();
 
         // note: prompt.tokens is deliberately kept. It is the mirror of the state just
         //       copied out, and the resume needs it to know how many cells to ask for.
@@ -394,7 +593,33 @@ struct server_slot {
     }
 
     // put the sequence back; the slot then continues from the token it was about to decode
+    //
+    // [TAG_PREEMPT_ASYNC] With a transfer this returns as soon as the copy has been issued,
+    // leaving the slot RESTORING: the cells are allocated and owned by this sequence, so
+    // nobody else can take them, but they do not hold its state until the copy lands, which
+    // is why the slot is not scheduled until preempt_restore_poll() says so.
     bool preempt_restore() {
+        if (preempt_is_async()) {
+            const size_t size_tgt = llama_state_seq_copy_buf_size(preempt_cpy_tgt.get());
+            const size_t size_dft = preempt_cpy_dft ? llama_state_seq_copy_buf_size(preempt_cpy_dft.get()) : 0;
+
+            if (llama_state_seq_copy_set(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
+                (size_dft > 0 &&
+                 llama_state_seq_copy_set(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft)) {
+                // no room after all: let whatever was already issued finish before the
+                // half-written sequence is dropped, or the cells would go while a copy is
+                // still writing into them
+                preempt_copy_wait();
+                mem.seq_rm(id, -1, -1);
+                n_preempt_fail++;
+                return false;
+            }
+
+            state = SLOT_STATE_RESTORING;
+
+            return true;
+        }
+
         const size_t size_tgt = preempt_state_tgt.size();
         const size_t size_dft = preempt_state_dft.size();
 
@@ -649,7 +874,13 @@ struct server_slot {
             // [TAG_PREEMPT] the cells are already gone (a cancelled or failed slot can be
             // released while parked), so the mirror of them must not outlive them: the next
             // task on this slot would otherwise take a prefix match against an empty cache
-            if (state == SLOT_STATE_PREEMPTED) {
+            //
+            // [TAG_PREEMPT_ASYNC] a slot can also be released with a copy still running, by
+            // a cancelled request or by the error paths. Wait for it before anything else:
+            // the host buffer is about to be freed and the cells about to be handed to the
+            // next task, and a transfer still reading or writing either would outlive both.
+            if (preempt_is_out()) {
+                preempt_copy_wait();
                 preempt_state_free();
                 prompt_clear();
             }
@@ -796,7 +1027,7 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
-            {"is_preempted",  state == SLOT_STATE_PREEMPTED},
+            {"is_preempted",  preempt_is_out()},
             {"n_preempt",     n_preempt},
         };
 
@@ -1381,6 +1612,22 @@ private:
                 }
             };
 
+            // [TAG_PREEMPT_ASYNC] one transfer per context, made once and reused for every
+            // park and resume this slot ever does, because each owns a backend and a stream
+            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+                slot.preempt_cpy_tgt = llama_state_seq_copy_make(ctx_tgt);
+
+                if (slot.preempt_cpy_tgt && ctx_dft) {
+                    slot.preempt_cpy_dft = llama_state_seq_copy_make(ctx_dft);
+
+                    if (!slot.preempt_cpy_dft) {
+                        // a draft that cannot go asynchronously would have to be waited for
+                        // in the middle of the park, so the whole slot stays synchronous
+                        slot.preempt_cpy_tgt.reset();
+                    }
+                }
+            }
+
             slot.reset();
         }
 
@@ -1399,6 +1646,31 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        // [TAG_PREEMPT_ASYNC] the slots either all park through a transfer or none do
+        {
+            preempt_async_ok = !slots.empty();
+
+            for (const auto & slot : slots) {
+                preempt_async_ok = preempt_async_ok && slot.preempt_is_async();
+            }
+
+            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+                if (preempt_async_ok) {
+                    SRV_INF("preemption: parking and resuming asynchronously, %s host memory\n",
+                            llama_state_seq_copy_buf_is_pinned(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+                } else {
+                    SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
+                }
+            }
+
+            if (!preempt_async_ok) {
+                for (auto & slot : slots) {
+                    slot.preempt_cpy_tgt.reset();
+                    slot.preempt_cpy_dft.reset();
+                }
             }
         }
 
@@ -2554,7 +2826,7 @@ private:
                         if (slot.is_processing()) {
                             n_processing_slots++;
                         }
-                        if (slot.state == SLOT_STATE_PREEMPTED) {
+                        if (slot.preempt_is_out()) {
                             n_preempted_slots++;
                         }
                     }
@@ -2855,6 +3127,11 @@ private:
     // uninterrupted one is the preemption's fault and nothing else's.
     int32_t preempt_test_every = 0;
 
+    // [TAG_PREEMPT_ASYNC] whether the slots park and resume through a transfer. False when
+    // --no-preempt-async was given, or when the backend cannot copy asynchronously, in which
+    // case every park and resume is the synchronous one it always was.
+    bool preempt_async_ok = false;
+
     int32_t preempt_n_spec_max() const {
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
@@ -2878,7 +3155,13 @@ private:
 
         const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
 
-        return preempt_ram_used() + slot.preempt_state_required() <= budget;
+        // whatever this slot already holds is counted by preempt_ram_used() and will be
+        // reused, so parking it again only costs what it does not have yet
+        const size_t held  = slot.preempt_state_size();
+        const size_t need  = slot.preempt_state_required();
+        const size_t extra = need > held ? need - held : 0;
+
+        return preempt_ram_used() + extra <= budget;
     }
 
     // cells the slot will ask for on its next step once it is back in the pool
@@ -2908,10 +3191,38 @@ private:
                 continue; // parked: its cells are in host RAM, not in the pool
             }
 
+            // [TAG_PREEMPT_ASYNC] deliberately not skipped: a slot whose copy is still
+            // running holds cells either way. One on its way out has not released them yet
+            // because the copy is still reading them, and one on its way back in has already
+            // been given them. Skipping either would hand the same cells out twice.
+
             res += slot.prompt.n_tokens();
         }
 
         return res;
+    }
+
+    // [TAG_PREEMPT_ASYNC] the room the pool is kept clear of
+    //
+    // A synchronous park releases the cells before update_slots() carries on, so it only has
+    // to fire once the next step would not fit. An asynchronous one leaves them held until
+    // its copy lands, so it has to fire early enough that everything still decoding has
+    // somewhere to put its tokens until then. The same figure gates a resume, so that a slot
+    // is not put back into a pool it would immediately have to be taken out of again.
+    int32_t preempt_n_margin() const {
+        if (!preempt_async_active()) {
+            return PREEMPT_N_MARGIN;
+        }
+
+        int32_t n_running = 0;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out()) {
+                n_running++;
+            }
+        }
+
+        return PREEMPT_N_MARGIN + n_running * (1 + preempt_n_spec_max()) * PREEMPT_N_ASYNC_STEPS;
     }
 
     // cells those slots are about to ask for on the next decode
@@ -2936,6 +3247,21 @@ private:
 
                         res_pmt += std::max(1, std::min(n_batch, n_left));
                     } break;
+                case SLOT_STATE_RESTORING:
+                    {
+                        // [TAG_PREEMPT_ASYNC] its cells are already counted by preempt_kv_used(),
+                        // but it starts decoding as soon as its copy lands, so the step it will
+                        // take has to be reserved now -- otherwise the pool is handed out from
+                        // under it and its first step preempts somebody else straight away
+                        if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
+                            res += 1 + n_spec;
+                        } else {
+                            const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+
+                            res_pmt += std::max(1, std::min(n_batch, n_left));
+                        }
+                    } break;
+                // a preempting slot is on its way out and will not decode: nothing to reserve
                 default:
                     break;
             }
@@ -2953,7 +3279,7 @@ private:
         int32_t       n_running = 0;
 
         for (auto & slot : slots) {
-            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
+            if (slot.is_processing() && !slot.preempt_is_out()) {
                 n_running++;
 
                 if (!leader || slot.prompt.n_tokens() > leader->prompt.n_tokens()) {
@@ -3011,10 +3337,74 @@ private:
     // at a token boundary, prompt.tokens is exactly what the cache holds for it, and no
     // draft is in flight, so a slot can be removed from the picture without unpicking a
     // half-decoded batch
+    // [TAG_PREEMPT_ASYNC] is any slot parking or resuming through a transfer right now
+    bool preempt_async_active() const {
+        return preempt_async_ok;
+    }
+
+    // Pick up the copies that have landed since the last iteration. This runs before
+    // anything reads preempt_kv_used(), so a park whose cells came back is seen as free
+    // room straight away and a resume that landed can be scheduled in the same iteration.
+    void update_preempt_copies() {
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTING) {
+                if (slot.preempt_save_poll()) {
+                    metrics.n_preempt++;
+
+                    SLT_WRN(slot, "park completed after %.2f ms: %d cells released, %.1f MiB parked, kv %d/%d\n",
+                            (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
+                            slot.prompt.n_tokens(),
+                            slot.preempt_state_size() / (1024.0 * 1024.0),
+                            preempt_kv_used(), n_ctx);
+                }
+            } else if (slot.state == SLOT_STATE_RESTORING) {
+                if (slot.preempt_restore_poll()) {
+                    metrics.n_resume++;
+
+                    SLT_WRN(slot, "restore completed after %.2f ms: %d tokens back in the cache, kv %d/%d, preemptions %d\n",
+                            (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
+                            slot.prompt.n_tokens(),
+                            preempt_kv_used(), n_ctx,
+                            slot.n_preempt);
+                }
+            }
+        }
+    }
+
+    // Wait for one outstanding park, the last thing tried before giving up on finding room.
+    // It is what keeps a pool that fills faster than the copies drain no worse than the
+    // synchronous path: the decode waits for the copy exactly as it used to.
+    bool preempt_wait_in_flight() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PREEMPTING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (!slot.preempt_save_poll()) {
+                continue;
+            }
+
+            metrics.n_preempt++;
+
+            SLT_WRN(slot, "park completed after %.2f ms (waited for): %d cells released, kv %d/%d\n",
+                    (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
+                    slot.prompt.n_tokens(),
+                    preempt_kv_used(), n_ctx);
+
+            return true;
+        }
+
+        return false;
+    }
+
     void update_preemption() {
         if (!params_base.kv_unified || slots.size() < 2) {
             return; // with a cache per slot, no slot can take another one's cells
         }
+
+        update_preempt_copies();
 
         if (params_base.preempt_ram_mib == 0) {
             return; // --preempt-ram 0: the KV-full retry ladder, as before
@@ -3055,7 +3445,7 @@ private:
             // continue, so give those cells up first - same call the KV-full path makes.
             for (;;) {
                 for (auto * slot : parked) {
-                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + PREEMPT_N_MARGIN <= n_cells) {
+                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin() <= n_cells) {
                         best = slot;
                         break;
                     }
@@ -3071,6 +3461,8 @@ private:
             }
 
             const int64_t t_start = ggml_time_us();
+
+            best->t_preempt_copy_us = t_start;
 
             if (!best->preempt_restore()) {
                 // update_slots() runs in a tight loop while tasks are pending, so a counter
@@ -3090,6 +3482,22 @@ private:
                 break;
             }
 
+            // [TAG_PREEMPT_ASYNC] with a transfer the copy has only been issued; the slot is
+            // RESTORING and update_preempt_copies() counts it and logs it when it lands
+            if (best->state == SLOT_STATE_RESTORING) {
+                SLT_WRN(*best, "resumed after %.2f s: %d tokens, restore issued in %.2f ms (%zu transfers, %.2f ms sync), kv %d/%d, preemptions %d\n",
+                        (ggml_time_us() - best->t_preempt_us) / 1e6,
+                        best->prompt.n_tokens(),
+                        (ggml_time_us() - t_start) / 1e3,
+                        best->preempt_n_copies(), best->preempt_sync_us() / 1e3,
+                        preempt_kv_used(), n_cells,
+                        best->n_preempt);
+
+                // it holds cells now but is not decoding yet, so there is nothing more to
+                // decide about it this iteration
+                continue;
+            }
+
             metrics.n_resume++;
 
             SLT_WRN(*best, "resumed after %.2f s: %d tokens back in the cache in %.2f ms, kv %d/%d, preemptions %d\n",
@@ -3105,12 +3513,19 @@ private:
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
                     (int32_t) slot.stats.n_gen >= (slot.n_preempt + 1) * preempt_test_every &&
-                    preempt_fits_budget(slot) &&
-                    slot.preempt_save()) {
-                    metrics.n_preempt++;
+                    preempt_fits_budget(slot)) {
+                    slot.t_preempt_copy_us = ggml_time_us();
 
-                    SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
-                            (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
+                    if (slot.preempt_save()) {
+                        // [TAG_PREEMPT_ASYNC] a slot left PREEMPTING is counted by
+                        // update_preempt_copies() when its copy lands, not here
+                        if (slot.state == SLOT_STATE_PREEMPTED) {
+                            metrics.n_preempt++;
+                        }
+
+                        SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
+                                (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
+                    }
                 }
             }
         }
@@ -3119,12 +3534,21 @@ private:
         for (;;) {
             const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
 
-            if (n_used + PREEMPT_N_MARGIN <= n_cells) {
+            if (n_used + preempt_n_margin() <= n_cells) {
                 break;
             }
 
             // a prompt cached on an idle slot is the cheapest thing in the pool to give up
             if (try_clear_idle_slots()) {
+                continue;
+            }
+
+            // [TAG_PREEMPT_ASYNC] Out of room for the step about to be built, rather than
+            // merely short of the lookahead the asynchronous path keeps. A park that has
+            // been issued but not landed is holding cells that are already spoken for, and
+            // waiting for it is both quicker and more useful than parking somebody else,
+            // whose cells would not come back this iteration either.
+            if (n_used + PREEMPT_N_MARGIN > n_cells && preempt_wait_in_flight()) {
                 continue;
             }
 
@@ -3139,8 +3563,25 @@ private:
             const int32_t n_tokens = victim->prompt.n_tokens();
             const int64_t t_start  = ggml_time_us();
 
+            victim->t_preempt_copy_us = t_start;
+
             if (!victim->preempt_save()) {
                 break; // could not park it; the existing retry ladder is still behind us
+            }
+
+            // [TAG_PREEMPT_ASYNC] the copy has only been issued; the cells are still the
+            // victim's until it lands, so nothing further can be decided about the pool this
+            // iteration. update_preempt_copies() picks it up on the next one, and the step
+            // that wanted the room is built from whatever is free right now.
+            if (victim->state == SLOT_STATE_PREEMPTING) {
+                SLT_WRN(*victim, "preempted: %d cells, park issued in %.2f ms (%zu transfers, %.2f ms sync), %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
+                        n_tokens,
+                        (ggml_time_us() - t_start) / 1e3,
+                        victim->preempt_n_copies(), victim->preempt_sync_us() / 1e3,
+                        victim->preempt_state_size() / (1024.0 * 1024.0),
+                        preempt_kv_used(), n_cells, n_used,
+                        victim->n_preempt);
+                break;
             }
 
             metrics.n_preempt++;
@@ -3485,7 +3926,7 @@ private:
 
                 // [TAG_PREEMPT] a parked slot is processing but has nothing in the cache to
                 // batch; it takes no part in this pass until it is restored
-                if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
+                if (!slot.is_processing() || slot.preempt_is_out()) {
                     return;
                 }
 
@@ -4429,7 +4870,7 @@ private:
         metrics.n_decode++;
         for (const auto & slot : slots) {
             // [TAG_PREEMPT] a parked slot is processing but took no part in this decode
-            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
+            if (slot.is_processing() && !slot.preempt_is_out()) {
                 metrics.n_busy_slots++;
             }
             metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
