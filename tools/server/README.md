@@ -2130,3 +2130,73 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+### Unified-pool preemption
+
+With `--kv-unified`, llama-server proactively parks independent text completion
+requests in host RAM when the projected next batch exceeds `--preempt-high`
+(default **94 percent**). It parks newest arrivals first until the projection is
+at or below `--preempt-low` (default **80 percent**), or only one runnable request
+remains. The largest resident request is protected. Requests parked three times
+consecutively are considered after other eligible victims. Shared-prompt parents
+and children (`n_cmpl > 1`) are excluded. Preemption is disabled on embedding
+servers, servers with a multimodal projector, and contexts without sequence removal.
+
+The projection includes each resident sequence, its next sampled token and the
+maximum speculative draft depth. Target and draft contexts have separate pools;
+use the smaller capacity without charging the draft pool twice to the target.
+Pending prompt chunks share the remaining batch budget after generation; that
+budget is reserved before batch preparation. Counts remain conservative for shared
+prefixes, sliding-window caches and prompt-cache reuse.
+Idle prompt caches are reclaimed before live requests are parked.
+
+Parking saves full sequence state from both contexts with the host sequence-state
+APIs and removes the sequences from device memory. The task, sampler and grammar,
+stream offsets, speculative checkpoints and per-sequence MTP hidden-state
+carryover remain alive. No generated tokens are replayed or discarded. A streamed
+response pauses and resumes on the same connection. Cancellation releases parked
+RAM. Tool call text can pause mid-generation; execution of tools and subsequent
+requests remain the client's responsibility.
+
+Restoration tries the most-parked request first, then the one waiting longest,
+skipping entries that do not fit. **Every restore must project at or below LOW**;
+the LOW-to-HIGH band cannot admit restores. A request whose next step cannot fit
+under LOW on its own is not parked, to avoid an unresumable waiter. HIGH is not a
+per-request context limit: a protected solo request may grow to its normal context
+limit, with speculative depth reduced near that limit by the existing decoder.
+
+`--preempt-ram MIB` bounds the total serialized target and draft snapshots (default
+8192 MiB). It does not bound existing sampler state or the separate prompt cache.
+When the budget or host allocation is exhausted, the scheduler declines that
+victim. If remaining eligible victims cannot free enough space, the existing
+context-full error behavior remains. Fragmented device restores may additionally use up to 64 MiB of temporary
+staging memory per tensor, outside the parked-snapshot budget. A failed restore clears any partial device
+state and retains the host snapshot for retry. Persistent restore failures can
+leave a request waiting indefinitely.
+
+Set `--preempt-high 0` to disable scheduling or `--preempt-ram 0` to decline all
+parks. HIGH must be in [0, 100]; LOW in (0, 100) and strictly below a nonzero HIGH.
+The corresponding environment variables are `LLAMA_ARG_PREEMPT_HIGH`,
+`LLAMA_ARG_PREEMPT_LOW`, and `LLAMA_ARG_PREEMPT_RAM`.
+
+For regression testing, `LLAMA_SERVER_PREEMPT_EVERY=N` forces one eligible request
+to park at each N-token generation boundary. Speculative acceptance can cross the
+boundary by more than one token. The hook permits parking the last or largest
+request, retains it across scheduler iterations, and observes the RAM and LOW
+constraints. Zero disables the hook. Compare with the same seed, temperature,
+batching and sampling settings; GPU batching and different physical KV layouts
+can change floating-point results even with greedy sampling.
+
+With `--metrics`, `/metrics` exports `llamacpp:preemptions_total`,
+`preempt_restores_total`, `preempt_forced_total`, `preempt_ram_denied_total`,
+`preempt_restore_failures_total`, `preempt_unused_cells_total` and
+`preempt_copy_seconds_total` counters (all with the `llamacpp:` prefix).
+Gauges expose `preempt_parked`, `preempt_ram_bytes`, `preempt_resident_cells`,
+`preempt_projected_cells`, `preempt_high_cells`, `preempt_low_cells`, and
+`preempt_restore_max_cells`. The unused-cell counter sums free cells immediately
+before each park, including forced parks, using the conservative resident count.
+
+`/slots` adds `is_parked`, `preempt_count`, `preempt_bytes`, `preempt_parked_ms`,
+`preempt_restore_projected_cells`, `preempt_high_cells`, and `preempt_low_cells`.
+A parked request still has `is_processing: true`; its prompt-token count is its
+logical length, not resident device occupancy. Per-request fields reset on release.
