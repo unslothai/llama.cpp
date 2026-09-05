@@ -335,6 +335,12 @@ struct server_slot {
         preempt_state_dft.shrink_to_fit();
     }
 
+    // bytes preempt_save() would need for this slot right now
+    size_t preempt_state_required() const {
+        return llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) +
+               (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
+    }
+
     // copy the sequence out of the cache and release its cells
     bool preempt_save() {
         const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -413,8 +419,10 @@ struct server_slot {
         state = state_before_preempt;
 
         // same call the DONE_PROMPT -> GENERATING transition makes; for MTP it only checks
-        // that the draft context is where it should be, which the restore above ensures
-        if (can_speculate()) {
+        // that the draft context is where it should be, which the restore above ensures.
+        // A slot parked while still processing its prompt makes that transition itself
+        // once the prompt is done.
+        if (state == SLOT_STATE_GENERATING && can_speculate()) {
             common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
         }
 
@@ -2845,6 +2853,43 @@ private:
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
+    // host RAM the parked sequences hold right now
+    size_t preempt_ram_used() const {
+        size_t res = 0;
+
+        for (const auto & slot : slots) {
+            res += slot.preempt_state_size();
+        }
+
+        return res;
+    }
+
+    // whether parking this slot stays under --preempt-ram
+    bool preempt_fits_budget(const server_slot & slot) const {
+        if (params_base.preempt_ram_mib < 0) {
+            return true;
+        }
+
+        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+
+        return preempt_ram_used() + slot.preempt_state_required() <= budget;
+    }
+
+    // cells the slot will ask for on its next step once it is back in the pool
+    int32_t preempt_n_need(const server_slot & slot) const {
+        int32_t res = slot.prompt.n_tokens();
+
+        if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
+            res += 1 + preempt_n_spec_max();
+        } else {
+            const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+
+            res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
+        }
+
+        return res;
+    }
+
     // Cells the pool is holding right now. A released slot keeps its prompt in the cache
     // for the next request to reuse as a prefix, so idle slots count too: the first version
     // of this counted only the running ones, decided a pool holding 8185 cached cells was
@@ -2920,16 +2965,27 @@ private:
         server_slot * victim = nullptr;
 
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING) {
-                continue; // a generating slot is the one with a clean point to stop at
+            // Before the batch is built every one of these is at a token boundary: a
+            // generating slot between two sampled tokens, a prompt-processing slot between
+            // two chunks of its prompt, a started slot with only a cached prefix (or
+            // nothing) in the pool. A slot holding no cells is still worth parking - it
+            // is about to ask for a whole batch of them.
+            if (slot.state != SLOT_STATE_GENERATING &&
+                slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                slot.state != SLOT_STATE_STARTED) {
+                continue;
             }
 
-            if (&slot == leader || slot.prompt.n_tokens() == 0) {
+            if (&slot == leader) {
                 continue;
             }
 
             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
+            }
+
+            if (!preempt_fits_budget(slot)) {
+                continue;
             }
 
             const bool starved     = slot.n_preempt >= PREEMPT_N_STARVED;
@@ -2954,39 +3010,57 @@ private:
             return; // with a cache per slot, no slot can take another one's cells
         }
 
+        if (params_base.preempt_ram_mib == 0) {
+            return; // --preempt-ram 0: the KV-full retry ladder, as before
+        }
+
         const int32_t n_cells = n_ctx;
 
-        // put back what fits, the most-preempted slot first
+        // Put back what fits: the most-preempted slot first, then the one parked longest.
+        // A slot that does not fit yet must not hold up a smaller one that does: it keeps
+        // its place at the head of the line, and the smaller one is the first to be parked
+        // again if the pool fills, so letting it through costs the head nothing.
         for (;;) {
-            server_slot * best = nullptr;
+            std::vector<server_slot *> parked;
 
             for (auto & slot : slots) {
-                if (slot.state != SLOT_STATE_PREEMPTED) {
-                    continue;
+                if (slot.state == SLOT_STATE_PREEMPTED) {
+                    parked.push_back(&slot);
+                }
+            }
+
+            if (parked.empty()) {
+                break;
+            }
+
+            std::sort(parked.begin(), parked.end(), [](const server_slot * a, const server_slot * b) {
+                if (a->n_preempt != b->n_preempt) {
+                    return a->n_preempt > b->n_preempt;
                 }
 
-                if (!best ||
-                    slot.n_preempt > best->n_preempt ||
-                    (slot.n_preempt == best->n_preempt && slot.t_preempt_us < best->t_preempt_us)) {
-                    best = &slot;
+                return a->t_preempt_us < b->t_preempt_us;
+            });
+
+            server_slot * best = nullptr;
+
+            // Room for the sequence AND for the next step of everything already running,
+            // so that a resume cannot immediately trigger the preemption of someone else.
+            // A cached prompt on an idle slot is worth less than a conversation waiting to
+            // continue, so give those cells up first - same call the KV-full path makes.
+            for (;;) {
+                for (auto * slot : parked) {
+                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + PREEMPT_N_MARGIN <= n_cells) {
+                        best = slot;
+                        break;
+                    }
+                }
+
+                if (best || !try_clear_idle_slots()) {
+                    break;
                 }
             }
 
             if (!best) {
-                break;
-            }
-
-            const int32_t n_need = best->prompt.n_tokens() + 1 + preempt_n_spec_max();
-
-            // room for the sequence AND for the next step of everything already running,
-            // so that a resume cannot immediately trigger the preemption of someone else.
-            // A cached prompt on an idle slot is worth less than a conversation waiting to
-            // continue, so give those cells up first - same call the KV-full path makes.
-            while (preempt_kv_used() + preempt_kv_reserve() + n_need + PREEMPT_N_MARGIN > n_cells &&
-                   try_clear_idle_slots()) {
-            }
-
-            if (preempt_kv_used() + preempt_kv_reserve() + n_need + PREEMPT_N_MARGIN > n_cells) {
                 break;
             }
 
@@ -3025,6 +3099,7 @@ private:
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
                     (int32_t) slot.stats.n_gen >= (slot.n_preempt + 1) * preempt_test_every &&
+                    preempt_fits_budget(slot) &&
                     slot.preempt_save()) {
                     n_preempt_total++;
 
@@ -3050,7 +3125,8 @@ private:
             server_slot * victim = preempt_pick_victim();
 
             if (!victim) {
-                SRV_DBG("the kv pool needs %d of %d cells and nothing can be preempted\n", n_used, n_cells);
+                SRV_DBG("the kv pool needs %d of %d cells and nothing can be preempted (parked %.1f MiB of the %d MiB --preempt-ram budget)\n",
+                        n_used, n_cells, preempt_ram_used() / (1024.0 * 1024.0), params_base.preempt_ram_mib);
                 break;
             }
 
@@ -3401,7 +3477,9 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing()) {
+                // [TAG_PREEMPT] a parked slot is processing but has nothing in the cache to
+                // batch; it takes no part in this pass until it is restored
+                if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
                     return;
                 }
 
