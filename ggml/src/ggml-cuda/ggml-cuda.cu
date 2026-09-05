@@ -1835,8 +1835,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 //   1 - compute every destination column on its own, exactly as a batch of one would.
 //   2 - split off only the columns whose batch-of-one configuration differs from the
 //       batched one, leaving the already invariant matmuls batched.
+static bool ggml_cuda_exact_concurrency() {
+    static const bool exact = []() {
+        const char * value = getenv("LLAMA_EXACT_CONCURRENCY");
+        return value && atoi(value) != 0;
+    }();
+    return exact;
+}
+
 int ggml_cuda_batch_invariant() {
     static const int mode = []() {
+        if (ggml_cuda_exact_concurrency()) { return 2; }
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT");
         return val ? atoi(val) : 0;
     }();
@@ -1845,6 +1854,7 @@ int ggml_cuda_batch_invariant() {
 
 int ggml_cuda_batch_invariant_max_cols() {
     static const int max_cols = []() {
+        if (ggml_cuda_exact_concurrency()) { return 0; }
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
         return val ? atoi(val) : 0;
     }();
@@ -1903,6 +1913,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Recurrent-model output projections broadcast one weight matrix over sequence
+    // planes. These are token projections too, even though ne[2] or ne[3] is > 1.
+    // Normalize each plane before applying the existing selective column policy.
+    if (ggml_cuda_exact_concurrency() && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+            (dst->ne[2] > 1 || dst->ne[3] > 1) &&
+            src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
+        for (int64_t i3 = 0; i3 < dst->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < dst->ne[2]; ++i2) {
+                ggml_tensor src_plane = *src1;
+                ggml_tensor dst_plane = *dst;
+                src_plane.ne[2] = src_plane.ne[3] = 1;
+                dst_plane.ne[2] = dst_plane.ne[3] = 1;
+                src_plane.data = (char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3];
+                dst_plane.data = (char *) dst->data + i2*dst->nb[2] + i3*dst->nb[3];
+                ggml_cuda_mul_mat(ctx, src0, &src_plane, &dst_plane);
+            }
+        }
+        return true;
+    }
+
     const int64_t ncols_dst = dst->ne[1];
     if (ncols_dst <= 1 || src1->ne[1] != ncols_dst) {
         return false;

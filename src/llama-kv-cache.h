@@ -171,6 +171,8 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -234,6 +236,9 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+    static constexpr uint32_t exact_page_size = 256;
+    bool exact_pages = false;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -365,6 +370,8 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

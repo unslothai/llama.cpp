@@ -7193,6 +7193,41 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Same mathematical attention as the CPU mask reference, but visit nonadjacent pages
+// in a different order. Covers a partial tail and different page counts per query.
+struct test_flash_attn_ext_pages : public test_flash_attn_ext {
+    test_flash_attn_ext_pages(int64_t batch) :
+        test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, batch) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + ",exact_pages=1"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_flash_attn_ext::build_graph(ctx);
+        out->src[5] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 5, nb);
+        ggml_set_name(out->src[5], "pages");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        auto * pages = ggml_get_tensor(ctx, "pages");
+        auto * mask = ggml_get_tensor(ctx, "m");
+        std::vector<int32_t> ids(5*nb, -1);
+        std::vector<ggml_fp16_t> values(1024*nb, ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t q = 0; q < nb; ++q) {
+            ids[5*q] = q%2 ? 1 : 2;
+            ids[5*q + 1] = 2;
+            ids[5*q + 2] = 0;
+            for (int j = 0; j < 256; ++j) { values[1024*q + 512 + j] = ggml_fp32_to_fp16(0.0f); }
+            if (q%2 == 0) {
+                for (int j = 0; j < 17; ++j) { values[1024*q + j] = ggml_fp32_to_fp16(0.0f); }
+            }
+        }
+        ggml_backend_tensor_set(pages, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(mask, values.data(), 0, values.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9170,6 +9205,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Shared weights over sequence planes, as in a recurrent-model output projection.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 17, 307}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 256, {1, 1}, {4, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 256, {1, 1}, {1, 4}));
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -9937,6 +9980,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    for (int64_t batch : {1, 4, 12}) {
+        test_cases.emplace_back(new test_flash_attn_ext_pages(batch));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
