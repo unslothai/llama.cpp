@@ -1915,7 +1915,11 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only the
+    // CUDA backend reads; the remote end is not asked, so it is not claimed here
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

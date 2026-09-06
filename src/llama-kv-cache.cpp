@@ -2362,6 +2362,14 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [TAG_EXACT_CONCURRENCY] a whole-cache restore writes cells at their recorded physical
+    // index, which the paged pool owns. Refused before a byte is read, so that the failure
+    // path below, which clears the cache, is never entered for it.
+    if (exact_pages && seq_id == -1) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state restore only\n", __func__);
+        throw std::runtime_error("whole-cache restore is not supported with LLAMA_EXACT_CONCURRENCY");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2610,13 +2618,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     } else {
         // whole KV cache restore
 
-        // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
-        // index, which the paged pool owns. Report it like every other failure in this function.
-        if (exact_pages) {
-            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state "
-                    "restore only\n", __func__);
-            return false;
-        }
+        // [TAG_EXACT_CONCURRENCY] refused at the top of state_read(), before anything is read
+        GGML_ASSERT(!exact_pages);
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);

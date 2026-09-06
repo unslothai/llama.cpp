@@ -172,9 +172,13 @@ int main(int argc, char ** argv) {
     const int a_fill = getenv("PROBE_A_FILL") ? atoi(getenv("PROBE_A_FILL")) : 1;
     // PROBE_A_PERM reorders which prompt goes into which sequence in phase A. With the same
     // multiset of prompts the cache keeps its length but the masked cells hold different data.
+    // Phase B decodes prompt 0's first token on sequence 0, so the permutation may only move
+    // the neighbours: sequence 0 keeps prompt 0, or the two phases would compare different
+    // sequences.
     int a_perm[4] = {0, 1, 2, 3};
     if (const char * perm = getenv("PROBE_A_PERM")) {
         for (int k = 0; k < 4 && perm[2*k]; ++k) a_perm[k] = perm[2*k] - '0';
+        if (a_perm[0] != 0) { fprintf(stderr, "PROBE_A_PERM must keep prompt 0 on sequence 0\n"); return 1; }
     }
     {
         llama_context * ctx = make_ctx();

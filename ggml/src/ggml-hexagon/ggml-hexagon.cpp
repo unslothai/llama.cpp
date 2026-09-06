@@ -4157,7 +4157,9 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            supp = ggml_hexagon_supported_flash_attn_ext(sess, op);
+            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
+            // the CUDA backend reads
+            supp = op->src[5] == nullptr && ggml_hexagon_supported_flash_attn_ext(sess, op);
             break;
 
         case GGML_OP_SET_ROWS:

@@ -1455,13 +1455,17 @@ bool common_exact_concurrency() {
 
 // [TAG_EXACT_CONCURRENCY]
 int common_exact_decode_width(const common_params & params) {
-    const int n_slots = std::max(1, params.n_parallel);
+    const int64_t n_slots = std::max(1, params.n_parallel);
 
     // the draft tokens a slot carries into the verify ubatch alongside its accepted token, per
     // speculation type, from the same place the speculation code takes its own width
-    const int n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
+    const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
 
-    return n_slots*(1 + n_draft);
+    // the product is what a backend is asked to split columns by, as an int; one that does not
+    // fit is reported as such rather than wrapped
+    const int64_t n_cols = n_slots*(1 + n_draft);
+
+    return n_cols > INT32_MAX ? -1 : (int) n_cols;
 }
 
 // [TAG_EXACT_CONCURRENCY]
@@ -1471,15 +1475,22 @@ bool common_exact_concurrency_init(const common_params & params) {
     }
 
     // DFlash drafting turns causal attention off on its draft context, and the paged
-    // attention the mode runs on needs it; say so instead of asserting in the graph
+    // attention the mode runs on needs it; say so instead of asserting in the graph. DSpark
+    // is the same implementation under another name, so it is refused with it.
     for (const auto type : params.speculative.types) {
-        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
-            COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash: it disables causal attention, which the paged attention needs\n");
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
             return false;
         }
     }
 
     const int n_cols = common_exact_decode_width(params);
+
+    if (n_cols < 0) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY: a decode step of %d slots with %d draft tokens each is too wide to report\n",
+                std::max(1, params.n_parallel), std::max(0, (int) common_speculative_n_max(&params.speculative)));
+        return false;
+    }
 
     const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
     if (bound) {

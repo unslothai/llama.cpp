@@ -108,11 +108,14 @@ llama_context::llama_context(
     // caller that builds wider steps reports the width itself, see llama_set_exact_decode_width.
     // The sequence count is what is reported: the tokens figure can be raised later for the
     // whole process, and the width then follows it for this context too.
+    // Checked here and reported at the end of the constructor: the count is process-wide
+    // state that outlives a context, so a construction that fails later on, an unsupported
+    // cache layout say, must not leave a width behind that no context needs.
     if (llama_exact_concurrency()) {
         // an explicit column bound wins over the reported width in the backend, so one below
         // this context's width would leave its decodes batched above the bound with the mode
         // still reporting itself on; the report refuses that, and the refusal is an error here
-        if (!llama_exact_report_n_seq(cparams.n_seq_max)) {
+        if (!llama_exact_check_n_seq(cparams.n_seq_max)) {
             throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
         }
     }
@@ -498,6 +501,13 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // [TAG_EXACT_CONCURRENCY] nothing above can fail any more, so the width this context
+    // needs is published now; checked against the explicit bound at the top, so this
+    // cannot refuse unless the bound moved underneath it, which is an error all the same
+    if (llama_exact_concurrency() && !llama_exact_report_n_seq(cparams.n_seq_max)) {
+        throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
     }
 }
 
@@ -3937,6 +3947,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
+    // index, which the paged pool owns. Refused here, before anything is parsed, so that the
+    // cache the caller has is left as it was: the generic restore path clears it on failure.
+    if (memory && memory->alloc_granularity() > 1) {
+        throw std::runtime_error("whole-context restore is not supported with LLAMA_EXACT_CONCURRENCY, restore per sequence");
+    }
+
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
