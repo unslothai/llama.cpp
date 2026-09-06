@@ -3011,7 +3011,14 @@ private:
         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
             res += 1 + preempt_n_spec(slot);
         } else {
-            const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+            // a slot just given a task still mirrors the previous request's prompt; the batch
+            // builder keeps the prefix the two share and drops the rest, so what it holds and
+            // what it is about to ask for both count from that prefix, not from the old prompt
+            if (slot.state == SLOT_STATE_STARTED && slot.task) {
+                res = (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+            }
+
+            const int32_t n_left = slot.task ? slot.task->n_tokens() - res : 0;
 
             res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
@@ -3034,6 +3041,14 @@ private:
         for (const auto & slot : slots) {
             if (slot.state == SLOT_STATE_PREEMPTED) {
                 continue; // parked: its cells are in host RAM, not in the pool
+            }
+
+            // a child waiting for its parent's prompt does not share anything yet: until
+            // copy_state_to() runs it still holds whatever the previous request left in its
+            // cells, so it is charged that on its own, outside the family
+            if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                res += slot.prompt.n_tokens();
+                continue;
             }
 
             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
@@ -3108,10 +3123,25 @@ private:
 
         const size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
 
-        if (n_keep < slot.prompt.tokens.size()) {
-            slot.prompt.tokens.keep_first(n_keep);
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        if (n_keep >= slot.prompt.tokens.size()) {
+            return;
         }
+
+        // a memory that cannot remove part of a sequence (a recurrent state without rollback
+        // room for the stale suffix) aborts on a partial removal; for it the whole stale
+        // sequence goes, and the prompt is processed from the start on resume, as it would be
+        // without a usable checkpoint
+        const bool partial_ok = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                                (!ctx_dft || ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+
+        if (!partial_ok) {
+            slot.prompt.tokens.clear();
+            slot.mem.seq_rm(slot.id, -1, -1);
+            return;
+        }
+
+        slot.prompt.tokens.keep_first(n_keep);
+        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
     }
 
     server_slot * preempt_pick_victim() {
