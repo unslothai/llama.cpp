@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <set>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -104,6 +105,19 @@ constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is 
 // parked, and a smaller slot may pass a head that does not fit.
 // LLAMA_SERVER_PREEMPT_RESUME=head (the default) or pass; read once in load_model() and logged.
 static bool g_preempt_resume_head_of_line = true;
+
+// [TAG_PREEMPT] the SSE comment for a park or a resume. A request with several prompts
+// streams them through one reader, so the comment names the prompt it is about, except for
+// prompt 0, whose comment stays the bare form a single-prompt client matches on.
+static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
+    std::string res = notice.parked ? ": preempted" : ": resumed";
+
+    if (notice.index > 0) {
+        res += " " + std::to_string(notice.index);
+    }
+
+    return res + "\n\n";
+}
 
 static bool preempt_resume_head_of_line() {
     return g_preempt_resume_head_of_line;
@@ -5754,10 +5768,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // token exists. Those notices arrive ahead of the first real result; keep them and
         // send them in front of it, so the client learns about the wait it just had.
         std::string preempt_prefix;
+        std::set<size_t> parked_idx; // prompts of this request that are parked right now
         auto first_result = rd.next(req.should_stop);
         while (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
             const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
-            preempt_prefix += notice->parked ? ": preempted\n\n" : ": resumed\n\n";
+            preempt_prefix += preempt_notice_comment(*notice);
+            if (notice->parked) {
+                parked_idx.insert(notice->index);
+            } else {
+                parked_idx.erase(notice->index);
+            }
             first_result = rd.next(req.should_stop);
         }
         if (first_result == nullptr) {
@@ -5789,7 +5809,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked = false](std::string & output) mutable -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked_idx](std::string & output) mutable -> bool {
+            // [TAG_PREEMPT] the keepalive runs while ANY prompt of the request is parked: with
+            // several prompts in one stream, one resuming does not mean the others did
+            const bool parked = !parked_idx.empty();
+
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -5876,8 +5900,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
                     // [TAG_PREEMPT] an SSE comment: invisible to clients that do not know
                     // about preemption, a pause indicator for the ones that do
-                    parked = notice->parked;
-                    output = parked ? ": preempted\n\n" : ": resumed\n\n";
+                    if (notice->parked) {
+                        parked_idx.insert(notice->index);
+                    } else {
+                        parked_idx.erase(notice->index);
+                    }
+                    output = preempt_notice_comment(*notice);
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
