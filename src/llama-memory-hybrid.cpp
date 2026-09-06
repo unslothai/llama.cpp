@@ -142,6 +142,12 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+uint32_t llama_memory_hybrid::alloc_granularity() const {
+    // the recurrent half holds one state per sequence rather than per token, so the
+    // attention half is the one whose cells a caller is planning capacity for
+    return mem_attn->alloc_granularity();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

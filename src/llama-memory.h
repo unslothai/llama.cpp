@@ -100,6 +100,15 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // [TAG_EXACT_CONCURRENCY] cells this module hands out in one indivisible unit.
+    //
+    // 1 for every module that allocates a cell per token, which is all of them unless a mode
+    // is on that allocates in larger blocks. Where it is larger, a sequence of n tokens
+    // occupies round_up(n, granularity) cells, and a caller that plans pool capacity by
+    // counting tokens will believe there is room that does not exist. Not pure, so a module
+    // that has never heard of this inherits the answer that has always been true of it.
+    virtual uint32_t alloc_granularity() const { return 1; }
+
     //
     // ops
     //

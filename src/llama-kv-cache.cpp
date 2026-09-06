@@ -1410,6 +1410,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+uint32_t llama_kv_cache::alloc_granularity() const {
+    // [TAG_EXACT_CONCURRENCY] a page is given to one (sequence, position / page) pair, so a
+    // sequence holding n tokens holds round_up(n, exact_page_size) cells: its tail page is
+    // charged in full whether or not it is full.
+    return exact_pages ? exact_page_size : 1;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo 256, so the
     // paged pool cannot shift positions. Reporting it here is what makes the server disable
