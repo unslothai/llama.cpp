@@ -1,5 +1,7 @@
 import os
 import tempfile
+import threading
+import time
 import pytest
 import requests
 from utils import *
@@ -166,3 +168,82 @@ def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
             announced += 1
             assert ": resumed" in comments
     assert announced >= 1, [r[0] for r in results]
+
+
+def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
+    # A request parked while still processing its prompt has no token to send yet. The
+    # response must not wait for one: it starts with the notice, so the client sees
+    # "paused" and gets the keepalive at once, instead of a silent connection that only
+    # opens when the slot resumes.
+    global server
+    # The resident keeps growing towards the whole pool; the newcomer's prompt is larger
+    # than what is free beside it, so the planner parks the newcomer before it has a token.
+    global server
+    server.n_ctx = 512
+    server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once
+    server.start()
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    first = _completion_payload(390) | {"prompt": " ".join(["Once upon a time there was a brave knight who"] * 6)}
+    second = _completion_payload(32) | {"prompt": " ".join(["The quick brown fox jumps over the lazy dog and"] * 14)}
+
+    timeline = []
+    lock = threading.Lock()
+
+    def _run(name, payload, started=None):
+        res = requests.post(url, json=payload, stream=True)
+        assert res.status_code == 200
+        for raw in res.iter_lines():
+            line = raw.decode("utf-8")
+            if not line:
+                continue
+            with lock:
+                timeline.append((time.monotonic(), name, line))
+            if started is not None and line.startswith("data: "):
+                started.set()
+
+    started = threading.Event()
+    t = threading.Thread(target=_run, args=("first", first, started))
+    t.start()
+    assert started.wait(30)
+    _run("second", second)
+    t.join(60)
+
+    second_lines = [(ts, line) for ts, name, line in timeline if name == "second"]
+    first_end = max(ts for ts, name, _ in timeline if name == "first")
+    # The notice is the very first thing on the wire, and it arrives while the other
+    # stream is still running, not when it has finished and the parked slot resumes.
+    assert second_lines[0][1] == ": preempted", second_lines[:3]
+    assert second_lines[0][0] < first_end
+    events = [line for _, line in second_lines if line in (": preempted", ": resumed") or line.startswith("data: ")]
+    assert events[0] == ": preempted" and events[1] == ": resumed" and events[2].startswith("data: "), events[:3]
+    datas = [line[6:] for _, line in second_lines if line.startswith("data: ")]
+    assert _content(datas)
+    final = json.loads([d for d in datas if d != "[DONE]"][-1])
+    assert final["tokens_predicted"] == 32
+
+
+def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
+    # The rotation from test_preempt: a resident cycling through context shifts holds the
+    # pool, and after the head has waited its turn the resident is parked in its place.
+    # That park is a park like any other, so its stream must say so, and every notice
+    # must be paired: no stream ends with a park it was never told about.
+    global server
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.start()
+    n_predict = 12000
+    p1 = _completion_payload(n_predict) | {"prompt": "Once upon a time there was a brave knight who"}
+    p2 = _completion_payload(n_predict) | {"prompt": "The quick brown fox jumps over the lazy dog and"}
+    results = parallel_function_calls([
+        (_stream_raw, ("/completion", p1)),
+        (_stream_raw, ("/completion", p2)),
+    ])
+    n_parked = 0
+    for comments, datas in results:
+        final = json.loads([d for d in datas if d != "[DONE]"][-1])
+        assert final["tokens_predicted"] == n_predict
+        seq = [c for c in comments if c in (": preempted", ": resumed")]
+        assert seq == [": preempted", ": resumed"] * (len(seq) // 2), seq
+        n_parked += len(seq) // 2
+    # Both streams took turns: at least one park each, so at least two in all.
+    assert n_parked >= 2, [r[0] for r in results]

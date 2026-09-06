@@ -3601,6 +3601,26 @@ private:
     // Keep the slot that is furthest along -- it is the closest to finishing and to giving
     // its cells back -- and among the rest prefer one that has not been preempted
     // PREEMPT_N_STARVED times already, then the smallest.
+    // [TAG_PREEMPT] a slot just given a task still mirrors the previous request's prompt
+    // until the batch builder keeps the prefix the two share and drops the rest (see the
+    // SLOT_STATE_STARTED block of update_slots). Parked as it is, it would be copied out,
+    // charged and sized by the old prompt, and a short unrelated request could exceed the
+    // budget or stay parked for room it will never use. Keeping only the shared prefix now
+    // is what the batch builder does anyway; the chunk reuse it can add on top is given up
+    // for a slot the planner has to touch, which is rare.
+    void preempt_normalize_started(server_slot & slot) {
+        if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+            return;
+        }
+
+        const size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+        if (n_keep < slot.prompt.tokens.size()) {
+            slot.prompt.tokens.keep_first(n_keep);
+            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        }
+    }
+
     server_slot * preempt_pick_victim() {
         server_slot * leader    = nullptr;
         int32_t       n_running = 0;
@@ -3642,6 +3662,8 @@ private:
             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
             }
+
+            preempt_normalize_started(slot);
 
             if (!preempt_fits_budget(slot)) {
                 continue;
@@ -3901,6 +3923,8 @@ private:
                         if (slot.state != SLOT_STATE_PREEMPTING) {
                             metrics.n_preempt++;
                         }
+
+                        send_preempt_notice(slot, true);
 
                         SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn, preemptions %d\n",
                                 slot.n_ctx_shift, slot.prompt.n_tokens(),
@@ -5877,34 +5901,37 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::string preempt_prefix;
         std::set<size_t> parked_idx; // prompts of this request that are parked right now
         auto first_result = rd.next(req.should_stop);
-        while (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
+        if (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
+            // [TAG_PREEMPT] parked before any token exists. The stream starts now, with the
+            // notice, so the parked keepalive runs through the wait instead of the client
+            // seeing nothing until the slot resumes; the first ordinary result follows in
+            // the stream, an error included, since the response has already begun.
             const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
-            preempt_prefix += preempt_notice_comment(*notice);
+            preempt_prefix = preempt_notice_comment(*notice);
             if (notice->parked) {
                 parked_idx.insert(notice->index);
             } else {
                 parked_idx.erase(notice->index);
             }
-            first_result = rd.next(req.should_stop);
-        }
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
+            first_result.reset();
+        } else {
+            if (first_result == nullptr) {
+                GGML_ASSERT(req.should_stop());
+                return res; // connection is closed
+            }
+
+            if (first_result->is_error()) {
+                res->error(first_result->to_json());
+                return res;
+            }
+
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
         }
 
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
+        json first_result_json = first_result ? first_result->to_json() : json(nullptr);
         if (first_result_json == nullptr) {
             res->data = preempt_prefix; // simply send HTTP headers and status code
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
@@ -6019,6 +6046,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
+                    if (res_json.is_null()) {
+                        // [TAG_PREEMPT] the signal a prompt sends before its first token, so
+                        // that the headers go out, carries no data. Normally it is the first
+                        // result and only opens the stream; after a notice opened the stream
+                        // it has nothing to add, and the sender skips an empty chunk.
+                        return true;
+                    }
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
