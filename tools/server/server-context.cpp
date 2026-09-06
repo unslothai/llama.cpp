@@ -3548,7 +3548,7 @@ private:
                         // take has to be reserved now -- otherwise the pool is handed out from
                         // under it and its first step preempts somebody else straight away
                         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
-                            res += preempt_n_cells_step(n_cur, 1 + n_spec);
+                            res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
                         } else {
                             const int32_t n_left = slot.task ? slot.task->n_tokens() - n_cur : 0;
 
