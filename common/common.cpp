@@ -2251,6 +2251,133 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+common_state_buffer_pool & common_state_buffer_pool::instance() {
+    static common_state_buffer_pool pool;
+    return pool;
+}
+
+// derived once, from host memory as the CPU backend device reports it. an unknown host memory
+// size means no pooling at all, which is the safe direction.
+static size_t common_state_buffer_pool_cap() {
+    size_t mem_free  = 0;
+    size_t mem_total = 0;
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev != nullptr) {
+        ggml_backend_dev_memory(cpu_dev, &mem_free, &mem_total);
+    }
+
+    if (mem_total == 0) {
+        return 0;
+    }
+
+    return std::min(mem_total / 16, mem_free / 4);
+}
+
+void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        st.n_get++;
+
+        t_last_us = ggml_time_us();
+
+        // an allocation that is already big enough is already resident - nothing to do
+        if (dst.capacity() < size) {
+            // best fit, so a large pooled buffer is not spent on a small request
+            size_t best = free_bufs.size();
+            for (size_t i = 0; i < free_bufs.size(); ++i) {
+                if (free_bufs[i].capacity() >= size &&
+                        (best == free_bufs.size() || free_bufs[i].capacity() < free_bufs[best].capacity())) {
+                    best = i;
+                }
+            }
+
+            if (best < free_bufs.size()) {
+                held_bytes -= free_bufs[best].capacity();
+
+                // the pooled buffer goes to the caller and the caller's undersized one is
+                // dropped: it belongs to a different size class and is of no use here
+                std::swap(dst, free_bufs[best]);
+                free_bufs.erase(free_bufs.begin() + best);
+
+                st.n_hit++;
+            }
+        }
+    }
+
+    // on a hit the pooled buffer normally already has exactly this size, so this is a no-op and
+    // the stale bytes are left in place. that is safe because every caller overwrites the whole
+    // buffer and aborts if the state does not fill it. when the sizes differ, the fill only
+    // touches pages that are already resident.
+    dst.resize(size);
+}
+
+void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
+    const size_t cap = src.capacity();
+
+    if (cap < MIN_BUFFER_BYTES) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+
+    st.n_put++;
+
+    t_last_us = ggml_time_us();
+
+    if (!cap_known) {
+        cap_bytes = common_state_buffer_pool_cap();
+        cap_known = true;
+    }
+
+    if (free_bufs.size() >= MAX_BUFFERS || held_bytes + cap > cap_bytes) {
+        return; // declined: src is freed by its own destructor, as it would be without the pool
+    }
+
+    // the logical size is kept, not cleared: a later get() of the same size is then a no-op
+    // resize rather than a full zero fill of the buffer
+    free_bufs.push_back(std::move(src));
+
+    held_bytes += cap;
+
+    n_hwm = std::max(n_hwm, free_bufs.size());
+
+    st.n_keep++;
+}
+
+void common_state_buffer_pool::trim(int64_t idle_us) {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    if (free_bufs.empty() || ggml_time_us() - t_last_us < idle_us) {
+        return;
+    }
+
+    free_bufs.clear();
+    free_bufs.shrink_to_fit();
+
+    held_bytes = 0;
+}
+
+common_state_buffer_pool::stats common_state_buffer_pool::get_stats() const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    stats res = st;
+
+    res.held_bytes = held_bytes;
+    res.cap_bytes  = cap_bytes;
+    res.n_hwm      = n_hwm;
+
+    return res;
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    auto & pool = common_state_buffer_pool::instance();
+
+    pool.put(std::move(data_tgt));
+    pool.put(std::move(data_dft));
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2289,7 +2416,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    common_state_buffer_pool::instance().get(data_tgt, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2307,7 +2434,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    common_state_buffer_pool::instance().get(data_dft, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

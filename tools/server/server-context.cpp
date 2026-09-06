@@ -2249,10 +2249,13 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        const auto pool = common_state_buffer_pool::instance().get_stats();
+
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, buffer pool: %" PRIu64 "/%" PRIu64 " reused, %.3f of %.3f MiB held, hwm %zu)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                pool.n_hit, pool.n_get, pool.held_bytes / (1024.0 * 1024.0), pool.cap_bytes / (1024.0 * 1024.0), pool.n_hwm);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2701,6 +2704,11 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+
+                // give the checkpoint buffers back once the server has been quiet for a while.
+                // the delay matters: back-to-back request waves go briefly all-idle between
+                // waves, and dropping the pool there would throw away every reuse.
+                common_state_buffer_pool::instance().trim(30ll*1000*1000);
 
                 metrics_flush_idle();
 
