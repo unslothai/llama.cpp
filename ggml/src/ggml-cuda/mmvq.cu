@@ -541,6 +541,21 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// [TAG_BATCH_INVARIANT]
+bool ggml_cuda_mmvq_matches_single_column(enum ggml_type type, int cc, int64_t ncols_dst) {
+    if (ncols_dst < 1 || ncols_dst > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    if (table_id == MMVQ_PARAMETERS_GB10) {
+        // There nwarps also depends on the K loop trip count, which the caller does not pass in.
+        return ncols_dst == 1;
+    }
+    // blocks_per_iter, which is what assigns K blocks to threads, is proportional to nwarps.
+    // rows_per_cuda_block only changes which rows a block owns, not the order within a row.
+    return calc_nwarps(type, 1, table_id) == calc_nwarps(type, (int) ncols_dst, table_id);
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -577,9 +592,13 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
+    // [TAG_BATCH_INVARIANT] with ids, a sample is a token: the batch-invariant MUL_MAT_ID launch
+    // puts every token of the batch on the z axis of one single-column launch, so each (token,
+    // expert slot) block runs the exact single-token configuration. The stock single-token launch
+    // has one sample, where this indexing is ids[channel_dst] as before.
+    channel_x  = ncols_dst == 1 && ids ? ids[sample_dst*ids_stride + channel_dst] : fastdiv(channel_dst, channel_ratio);
+    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y)      : channel_dst;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -1266,7 +1285,14 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // [TAG_BATCH_INVARIANT] under the knob a MUL_MAT_ID with several tokens is computed as one
+    // launch of the single-token configuration with the tokens on the sample axis, so every
+    // (token, expert slot) block reduces exactly as the token alone would. The token count is
+    // then not bounded by the column templates.
+    const bool tokens_as_samples = ids && ne2 > 1 && ggml_cuda_batch_invariant();
+
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || tokens_as_samples);
+    GGML_ASSERT(!tokens_as_samples || !fusion);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -1353,6 +1379,17 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (tokens_as_samples) {
+        GGML_ASSERT(ne03 == 1 && ne13 == 1 && ne3 == 1);
+        // one column, one sample per token: y advances by s12 per token, dst by s2, x not at all
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+            ne01,              1,             s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            1,                 ne2,           s03, s12,              s2,               ids_stride, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

@@ -105,7 +105,20 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // isolate_seqs_above = [TAG_EXACT_CONCURRENCY] when > 0, a sequence set with more than this many
+    //               tokens left to place is a prompt and is given a ubatch of its own; sets at or
+    //               below it are decode steps (one token, or one plus the speculative drafts) and
+    //               stay grouped together, so a prompt next to three decodes costs one extra ubatch
+    //               and does not serialize the three decodes, and a speculative verify batch is not
+    //               run once per sequence
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t isolate_seqs_above = 0);
+
+    // [TAG_EXACT_CONCURRENCY] true if some sequence still has more than n_tokens left to place,
+    // i.e. what remains of the batch holds a prompt rather than decode steps only
+    bool has_seq_wider_than(uint32_t n_tokens) const;
+
+    // [TAG_EXACT_CONCURRENCY] true if some token carries more than one sequence id
+    bool has_shared_tokens() const;
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

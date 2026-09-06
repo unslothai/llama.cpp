@@ -38,6 +38,19 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// [TAG_EXACT_CONCURRENCY] the knob is read from the environment by the KV cache, the batch
+// splitter and the CUDA backend independently, because it has to be answered before a
+// context exists. The server needs the same answer to refuse the one request shape the mode
+// cannot serve, so it reads it the same way rather than growing a public API for it.
+static bool server_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -95,6 +108,45 @@ static bool preempt_resume_head_of_line() {
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
 constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // a resident cycling through context shifts gives way to a parked head that has waited this long
+
+// [TAG_EXACT_CONCURRENCY] The planner above counts cells, not tokens, because the two are not
+// the same number under every mode. llama_memory_alloc_granularity() reports how many cells the
+// pool hands out at a time: 1 in every ordinary configuration, and the exact concurrency page
+// size when that mode is on, where one page belongs to one (sequence, position / page) pair and
+// a sequence of n tokens therefore occupies round_up(n, page) cells. Four sequences can be
+// holding up to 4 * (page - 1) cells that nobody else can be given, and a planner counting
+// tokens sees room in the pool that find_slot cannot find in pages: it never reaches the
+// threshold that would park anybody, the retry ladder halves n_batch to 1, and every request
+// ends in the context error that preemption exists to remove.
+
+// cells a run of n_tokens occupies when the pool allocates g at a time
+static constexpr int32_t preempt_n_cells_g(int32_t n_tokens, int32_t g) {
+    return (g <= 1 || n_tokens <= 0) ? n_tokens : ((n_tokens + g - 1) / g) * g;
+}
+
+// cells a run of n_tokens has to be given for a step of n_step more: nothing until the step
+// crosses a page boundary, a whole page when it does
+static constexpr int32_t preempt_n_cells_step_g(int32_t n_tokens, int32_t n_step, int32_t g) {
+    return preempt_n_cells_g(n_tokens + n_step, g) - preempt_n_cells_g(n_tokens, g);
+}
+
+// At a granularity of 1 both are the identity, so every figure the planner computes is exactly
+// the arithmetic it did before it started asking the memory how it allocates, and nothing
+// changes in any configuration that does not page.
+static_assert(preempt_n_cells_g(0, 1) == 0 && preempt_n_cells_g(1, 1) == 1 &&
+              preempt_n_cells_g(8191, 1) == 8191 && preempt_n_cells_g(-3, 1) == -3,
+              "at a granularity of 1 a run of n tokens has to cost exactly n cells");
+static_assert(preempt_n_cells_step_g(0, 1, 1) == 1 && preempt_n_cells_step_g(8191, 1, 1) == 1 &&
+              preempt_n_cells_step_g(1000, 512, 1) == 512,
+              "at a granularity of 1 a step of n tokens has to cost exactly n cells");
+
+// and the page arithmetic itself, so the rounding cannot be changed by accident
+static_assert(preempt_n_cells_g(1, 256) == 256 && preempt_n_cells_g(256, 256) == 256 &&
+              preempt_n_cells_g(257, 256) == 512,
+              "a tail page is charged in full");
+static_assert(preempt_n_cells_step_g(255, 1, 256) == 0 && preempt_n_cells_step_g(256, 1, 256) == 256 &&
+              preempt_n_cells_step_g(256, 257, 256) == 512,
+              "a step is free until it crosses a page boundary and costs whole pages when it does");
 
 struct server_slot; // forward declaration
 
@@ -1444,6 +1496,28 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        // [TAG_EXACT_CONCURRENCY] ask the cache how it allocates, rather than assume a cell per
+        // token. 1 in every ordinary configuration, so this changes nothing unless a mode that
+        // places cells in blocks is on.
+        {
+            preempt_alloc_granularity = (int32_t) std::max(1u, llama_memory_alloc_granularity(llama_get_memory(ctx_tgt)));
+
+            // a test knob: the paged attention kernel only supports a head size of 256, so a
+            // harness model cannot turn exact concurrency on, and this is the only way to reach
+            // the paged arithmetic of the planner from the server tests
+            const char * LLAMA_SERVER_PREEMPT_GRANULARITY = getenv("LLAMA_SERVER_PREEMPT_GRANULARITY");
+
+            if (LLAMA_SERVER_PREEMPT_GRANULARITY) {
+                preempt_alloc_granularity = std::max(1, atoi(LLAMA_SERVER_PREEMPT_GRANULARITY));
+
+                SRV_WRN("LLAMA_SERVER_PREEMPT_GRANULARITY = %d (test knob: planning the kv pool in blocks of %d cells)\n",
+                        preempt_alloc_granularity, preempt_alloc_granularity);
+            } else if (preempt_alloc_granularity > 1) {
+                SRV_INF("preemption: the kv pool allocates %d cells at a time, planning in pages\n",
+                        preempt_alloc_granularity);
             }
         }
 
@@ -2933,6 +3007,30 @@ private:
     int32_t preempt_test_every = 0;
     std::string preempt_test_policy = "smallest"; // LLAMA_SERVER_PREEMPT_POLICY, see load_model
 
+    // [TAG_EXACT_CONCURRENCY] cells the pool hands out at a time, read once at load from the
+    // memory itself: 1 in every ordinary configuration, the page size under exact concurrency.
+    // Everything below plans in cells because of it. LLAMA_SERVER_PREEMPT_GRANULARITY overrides
+    // it, which is how the harness reaches the paged arithmetic on a model whose head size the
+    // paged attention kernel does not support.
+    int32_t preempt_alloc_granularity = 1;
+
+    // cells a slot holding n_tokens actually occupies
+    int32_t preempt_n_cells(int32_t n_tokens) const {
+        return preempt_n_cells_g(n_tokens, preempt_alloc_granularity);
+    }
+
+    // cells a slot holding n_tokens has to be given for a step of n_step more
+    int32_t preempt_n_cells_step(int32_t n_tokens, int32_t n_step) const {
+        return preempt_n_cells_step_g(n_tokens, n_step, preempt_alloc_granularity);
+    }
+
+    // Cells kept spare on top of the reservation. A step that crosses a page boundary costs a
+    // whole page rather than a cell, so a margin of a few cells is no margin at all under a page
+    // allocator: round it up to one page. With a granularity of 1 this is PREEMPT_N_MARGIN.
+    int32_t preempt_n_margin() const {
+        return preempt_n_cells(PREEMPT_N_MARGIN);
+    }
+
     // env: LLAMA_SERVER_PREEMPT_PLANNER=off (test knob): no parking ahead of the decode, so
     // the KV-full retry ladder and its last resort are the only thing between a full pool
     // and the context error
@@ -3020,7 +3118,10 @@ private:
             res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
 
-        return res;
+        // [TAG_EXACT_CONCURRENCY] a restore takes fresh pages and its tail page is charged in
+        // full, so what the pool has to have free for this slot is the rounded figure. Under
+        // counting here is what admits a resume that find_slot then cannot satisfy.
+        return preempt_n_cells(res);
     }
 
     // Cells the pool is holding right now. A released slot keeps its prompt in the cache
@@ -3040,11 +3141,14 @@ private:
                 continue; // parked: its cells are in host RAM, not in the pool
             }
 
+            // [TAG_EXACT_CONCURRENCY] the slot's tail page is charged in full: it belongs to
+            // this sequence and cannot be given to anybody else, however little of it is used
+
             // a child waiting for its parent's prompt does not share anything yet: until
             // copy_state_to() runs it still holds whatever the previous request left in its
             // cells, so it is charged that on its own, outside the family
             if (slot.state == SLOT_STATE_WAIT_OTHER) {
-                res += slot.prompt.n_tokens();
+                res += preempt_n_cells(slot.prompt.n_tokens());
                 continue;
             }
 
@@ -3052,7 +3156,7 @@ private:
                 const int family = slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
 
                 if (std::find(charged.begin(), charged.end(), family) != charged.end()) {
-                    res += std::max(0, slot.prompt.n_tokens() - slot.task->n_tokens());
+                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - slot.task->n_tokens()));
                     continue;
                 }
 
@@ -3063,11 +3167,11 @@ private:
             // batch builder keeps the prefix the two share and drops the rest; what stays is
             // the prefix, so that is what the pool holds for it
             if (slot.state == SLOT_STATE_STARTED && slot.task) {
-                res += (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                res += preempt_n_cells((int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens));
                 continue;
             }
 
-            res += slot.prompt.n_tokens();
+            res += preempt_n_cells(slot.prompt.n_tokens());
         }
 
         return res;
@@ -3080,27 +3184,47 @@ private:
         int32_t res     = 0;
         int32_t res_pmt = 0;
 
+        // [TAG_EXACT_CONCURRENCY] each slot reserves the cells its next step ADDS, not the
+        // tokens it adds. preempt_kv_used() already charges every slot's tail page in full, so
+        // with a granularity of 1 these are the same number and nothing changes; with a larger
+        // one the step is free until it crosses a page boundary and costs a whole page when it
+        // does. Reserving tokens on top of a rounded used figure would miss exactly that
+        // crossing, which is the only moment the pool can actually run out.
         for (const auto & slot : slots) {
+            const int32_t n_cur = slot.prompt.n_tokens();
+
             switch (slot.state) {
                 case SLOT_STATE_GENERATING:
                 case SLOT_STATE_DONE_PROMPT:
                     {
-                        res += 1 + preempt_n_spec(slot);
+                        res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
                     } break;
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
-                        const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+                        const int32_t n_left = slot.task ? slot.task->n_tokens() - n_cur : 0;
 
-                        res_pmt += std::max(1, std::min(n_batch, n_left));
+                        res_pmt += preempt_n_cells_step(n_cur, std::max(1, std::min(n_batch, n_left)));
                     } break;
                 default:
                     break;
             }
         }
 
-        // one batch is all the prompt slots get between them, however many are waiting
-        return res + std::min(res_pmt, n_batch);
+        // one batch is all the prompt slots get between them, however many are waiting; in
+        // cells that batch can straddle one boundary more than it has tokens for
+        // one batch is all the prompt slots get between them, however many are waiting; under
+        // page allocation each of them can still cross a page boundary of its own within that
+        // batch, so the cap keeps one boundary per prompt slot on top of the batch
+        int32_t n_pmt = 0;
+
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                n_pmt++;
+            }
+        }
+
+        return res + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
     }
 
     // Keep the slot that is furthest along -- it is the closest to finishing and to giving
@@ -3312,7 +3436,7 @@ private:
             // continue, so give those cells up first - same call the KV-full path makes.
             for (;;) {
                 const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
-                const int32_t margin   = occupied == 0 ? 0 : PREEMPT_N_MARGIN;
+                const int32_t margin   = occupied == 0 ? 0 : preempt_n_margin();
 
                 for (auto * slot : parked) {
                     if (occupied + preempt_n_need(*slot) + margin <= n_cells) {
@@ -3446,7 +3570,7 @@ private:
         for (;;) {
             const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
 
-            if (n_used + PREEMPT_N_MARGIN <= n_cells) {
+            if (n_used + preempt_n_margin() <= n_cells) {
                 break;
             }
 
@@ -4400,7 +4524,7 @@ private:
         for (;;) {
             const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
 
-            if (n_parked > 0 && n_used + PREEMPT_N_MARGIN <= n_cells) {
+            if (n_parked > 0 && n_used + preempt_n_margin() <= n_cells) {
                 break;
             }
 
@@ -5145,6 +5269,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // [TAG_EXACT_CONCURRENCY] the children of an n_cmpl > 1 task are served by
+            // copying the parent's cells to another sequence id, and exact mode gives a KV
+            // page to one sequence, so there is nothing for that copy to land in. Refuse
+            // the request here, where it becomes a 400 the client can read, rather than
+            // letting it reach seq_cp with nothing to do.
+            if (task.params.n_cmpl > 1 && server_exact_concurrency()) {
+                throw std::runtime_error(
+                    "n > 1 is not supported while LLAMA_EXACT_CONCURRENCY is set: each "
+                    "completion needs its own sequence, and in exact mode a KV page belongs "
+                    "to a single sequence. Send n separate requests, or unset the variable.");
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

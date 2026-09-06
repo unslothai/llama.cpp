@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool paged = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -247,13 +247,25 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // In the paged specialization KV_max carries [count, physical page IDs...] per query.
+    // The loop and each warp's recurrence follow logical positions, never physical addresses.
+    static_assert(!paged || ncols == 1, "paged attention has one query per block");
+    const int * pages = paged ? KV_max + (sequence*int(ne01.z) + ic0)*(1 + ne11/FATTN_KQ_STRIDE) : nullptr;
+    const int k_VKQ_max = paged ? pages[0]*FATTN_KQ_STRIDE : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    const char * K_base = K;
+    const char * V_base = V;
+    const half * mask_base = maskh;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
-             // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+        if constexpr (paged) {
+            const int physical = pages[1 + k_VKQ_0/FATTN_KQ_STRIDE]*FATTN_KQ_STRIDE + k_VKQ_0%FATTN_KQ_STRIDE;
+            K = K_base + int64_t(physical)*nb11;
+            V = V_base + int64_t(physical)*nb21;
+            maskh = mask_base + physical;
+        }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.

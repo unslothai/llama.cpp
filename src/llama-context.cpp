@@ -101,6 +101,24 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    // [TAG_EXACT_CONCURRENCY] the widest decode step this context can build: one column per
+    // sequence, times the tokens a sequence contributes to a step. Reported so that a backend
+    // splitting columns for exactness covers it without the caller having to know the bound; a
+    // caller that builds wider steps reports the width itself, see llama_set_exact_decode_width.
+    // The sequence count is what is reported: the tokens figure can be raised later for the
+    // whole process, and the width then follows it for this context too.
+    // Checked here and reported at the end of the constructor: the count is process-wide
+    // state that outlives a context, so a construction that fails later on, an unsupported
+    // cache layout say, must not leave a width behind that no context needs.
+    if (llama_exact_concurrency()) {
+        // an explicit column bound wins over the reported width in the backend, so one below
+        // this context's width would leave its decodes batched above the bound with the mode
+        // still reporting itself on; the report refuses that, and the refusal is an error here
+        if (!llama_exact_check_n_seq(cparams.n_seq_max)) {
+            throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
+        }
+    }
+
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
@@ -393,6 +411,13 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_EXACT_CONCURRENCY] the paged attention the mode runs on is causal; a context
+        // created non-causal with a cache would assert on its first graph, so it is refused here
+        if (llama_exact_concurrency() && memory && !cparams.causal_attn) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so it cannot be created with non-causal attention\n", __func__);
+            throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
+        }
     }
 
     // init backends
@@ -475,6 +500,13 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // [TAG_EXACT_CONCURRENCY] nothing above can fail any more, so the width this context
+    // needs is published now; checked against the explicit bound at the top, so this
+    // cannot refuse unless the bound moved underneath it, which is an error all the same
+    if (llama_exact_concurrency() && !llama_exact_report_n_seq(cparams.n_seq_max)) {
+        throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
     }
 }
 
@@ -1185,6 +1217,13 @@ void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (cparams.causal_attn == value) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] the paged attention the mode runs on is causal; a context with a
+    // cache under the mode keeps causal attention rather than asserting in the next graph
+    if (!value && memory && llama_exact_concurrency()) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so causal attention cannot be turned off; the change is refused\n", __func__);
         return;
     }
 
@@ -3226,6 +3265,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
+    // index, which the paged pool owns. Refused here, before anything is parsed, so that the
+    // cache the caller has is left as it was: the generic restore path clears it on failure.
+    if (memory && memory->alloc_granularity() > 1) {
+        throw std::runtime_error("whole-context restore is not supported with LLAMA_EXACT_CONCURRENCY, restore per sequence");
+    }
+
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4028,6 +4074,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+uint32_t llama_memory_alloc_granularity(llama_memory_t mem) {
+    if (!mem) {
+        return 1;
+    }
+
+    return mem->alloc_granularity();
 }
 
 // llama state API

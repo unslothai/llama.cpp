@@ -431,7 +431,15 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // [TAG_EXACT_CONCURRENCY] same rule as the hybrid memory: a recurrent state that a
+                // prompt leaves behind depends on what shared its ubatch, so isolate the prompts.
+                // The figure is passed whenever the mode is on, not only when a prompt is present:
+                // it also keeps sets of unequal token counts apart, and a three-token verify step
+                // placed beside a two-token one as two now and one later would be reduced in
+                // chunks the solo run never had.
+                const uint32_t isolate = llama_exact_concurrency() ? llama_exact_decode_tokens() : 0;
+
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }
 
             if (ubatch.n_tokens == 0) {

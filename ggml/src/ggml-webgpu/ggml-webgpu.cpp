@@ -4408,6 +4408,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
+                // the CUDA backend reads
+                if (op->src[5]) {
+                    supports_op = false;
+                    break;
+                }
+
                 // conservative support checks for whether the more resource-intensive shader paths
                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
                 supports_op = src0->type == GGML_TYPE_F32 &&
