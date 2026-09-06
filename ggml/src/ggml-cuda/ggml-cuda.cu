@@ -1856,7 +1856,11 @@ int ggml_cuda_batch_invariant() {
 static std::atomic<int> g_exact_decode_width{0};
 
 void ggml_backend_cuda_set_exact_decode_width(int n_cols) {
-    g_exact_decode_width.store(n_cols > 0 ? n_cols : 0, std::memory_order_relaxed);
+    // monotonic: the widest figure ever reported stays, whatever order the reports arrive in
+    int cur = g_exact_decode_width.load(std::memory_order_relaxed);
+
+    while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
+    }
 }
 
 int ggml_cuda_batch_invariant_max_cols() {
