@@ -85,6 +85,61 @@ static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
     return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
 }
 
+// [TAG_EXACT_CONCURRENCY] whether the device can actually run the paged attention op for a
+// layer of this shape. The registry name says which backends carry the kernels; it does not
+// say the build has them (FLASH_ATTN_AVAILABLE), nor that the device's architecture, the
+// head width and the K/V types land on a kernel. Where they do not, the scheduler would hand
+// the op to the CPU, which accepts the page table as the reference for test-backend-ops and
+// ignores it, and the mode would report itself on while attending in physical order. So the
+// op is built the way the graph builds it, at the widths a decode step, a verify step and a
+// prompt chunk use, and the device is asked.
+static bool llama_dev_supports_paged_attn(
+        ggml_backend_dev_t dev,
+        ggml_type type_k, ggml_type type_v,
+        uint32_t n_embd_head_k, uint32_t n_embd_head_v,
+        uint32_t n_head, uint32_t n_head_kv,
+        uint32_t n_cells, uint32_t page_size) {
+    if (!llama_dev_has_paged_attn(dev)) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+
+    bool res = true;
+
+    const int64_t n_kv = page_size;
+
+    for (const int64_t n_tokens : { (int64_t) 1, (int64_t) 4, (int64_t) 16, (int64_t) 512 }) {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd_head_k, n_tokens, n_head,    1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k,        n_embd_head_k, n_kv,     n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_v,        n_embd_head_v, n_kv,     n_head_kv, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+
+        ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) n_embd_head_k), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+
+        op->src[5] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + n_cells/page_size, n_tokens);
+
+        if (!ggml_backend_dev_supports_op(dev, op)) {
+            res = false;
+            break;
+        }
+    }
+
+    ggml_free(ctx);
+
+    return res;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -298,6 +353,18 @@ llama_kv_cache::llama_kv_cache(
                     "(pass -ngl to offload all layers and do not pass --no-kv-offload)\n",
                     __func__, il, dev_name);
             throw std::runtime_error("exact concurrency: KV cache layer is not on the CUDA backend");
+        }
+
+        // [TAG_EXACT_CONCURRENCY] the backend is the right one; ask it whether this layer's
+        // attention, with the page table attached, lands on one of its kernels at all
+        if (exact_pages && !llama_dev_supports_paged_attn(model.dev_layer(il), type_k, type_v,
+                    hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                    hparams.n_head(il), hparams.n_head_kv(il), kv_size, exact_page_size)) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s cannot run the paged attention for layer %d "
+                    "(K %s, V %s, %u-wide heads): the build or the device has no flash attention kernel for it, "
+                    "and the op would fall to the CPU, which ignores the page table\n",
+                    __func__, dev_name, il, ggml_type_name(type_k), ggml_type_name(type_v), hparams.n_embd_head_k(il));
+            throw std::runtime_error("exact concurrency: the device cannot run the paged attention");
         }
 
         ggml_context * ctx = ctx_for_buft(buft);
