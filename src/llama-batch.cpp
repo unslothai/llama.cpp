@@ -537,6 +537,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
+    // [TAG_EXACT_CONCURRENCY] tokens left in the first set taken, when isolating: only sets with
+    // the same count join it, so that every set in the ubatch finishes in this ubatch
+    uint32_t n_left_first = 0;
+
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
@@ -565,7 +569,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             // are decode steps, plain or speculative, whose columns the backend's column policy
             // already keeps exact, so keep grouping those: isolating them too would make one
             // prompt serialize every concurrent decode for the whole of the prefill, and would run
-            // a speculative verify step once per sequence.
+            // a speculative verify step once per sequence. Grouped sets must have the same number
+            // of tokens left: the equal-length expansion below would otherwise place a three-token
+            // verify step beside a two-token one as two tokens now and one later, and a memory
+            // that reduces over a chunk of tokens (a chunked state space scan) would then sum in a
+            // different order than the solo run's single three-token ubatch. A set with a
+            // different count waits for a later ubatch.
             if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 
@@ -586,6 +595,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                     last_seq_id = batch.seq_id[i][0];
 
                     break;
+                }
+
+                if (cur_seq_set.empty()) {
+                    n_left_first = n_left;
+                } else if (n_left != n_left_first) {
+                    continue;
                 }
             }
 
