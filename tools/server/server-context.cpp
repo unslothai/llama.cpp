@@ -3352,6 +3352,10 @@ private:
     // set by preempt_last_resort(): the batch being decoded was given up, stop the chunk loop
     bool preempt_batch_abandoned = false;
 
+    // [TAG_PREEMPT_ASYNC] a context shift was recorded this round; it is applied inside the
+    // next llama_decode as one graph over the whole K cache, in place
+    bool preempt_shift_pending = false;
+
     int32_t preempt_n_spec_max() const {
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
@@ -3692,6 +3696,42 @@ private:
         }
     }
 
+    // [TAG_PREEMPT_ASYNC] wait for every copy in flight, parks and restores alike. The
+    // context shift a slot recorded this round is applied inside the next llama_decode as one
+    // graph over the whole K cache, in place: a restore still writing its cells on its own
+    // stream could be read half done and written back stale, and a park still reading its
+    // cells would read through the rewrite. Shifts are rare, so this round waits.
+    void preempt_wait_for_shift() {
+        if (!preempt_shift_pending) {
+            return;
+        }
+
+        preempt_shift_pending = false;
+
+        while (preempt_wait_in_flight()) {
+        }
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_RESTORING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (!slot.preempt_restore_poll()) {
+                continue;
+            }
+
+            metrics.n_resume++;
+
+            SLT_WRN(slot, "restore completed after %.2f ms (waited for, a context shift is due): %d tokens back in the cache, kv %d/%d, preemptions %d\n",
+                    (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
+                    slot.prompt.n_tokens(),
+                    preempt_kv_used(), n_ctx,
+                    slot.n_preempt);
+        }
+    }
+
     // Wait for one outstanding park, the last thing tried before giving up on finding room.
     // It is what keeps a pool that fills faster than the copies drain no worse than the
     // synchronous path: the decode waits for the copy exactly as it used to.
@@ -3837,9 +3877,13 @@ private:
                             continue;
                         }
 
+                        const int64_t t_start = ggml_time_us();
+
                         if (!preempt_fits_budget(slot) || !slot.preempt_save()) {
                             continue;
                         }
+
+                        slot.t_preempt_copy_us = t_start;
 
                         // [TAG_PREEMPT_ASYNC] an asynchronous park is counted when its copy
                         // lands, and the head is re-examined on the pass that sees the room
@@ -4132,6 +4176,9 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        preempt_wait_for_shift();
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -4223,6 +4270,7 @@ private:
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 slot.n_ctx_shift++;
+                preempt_shift_pending = true;
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
