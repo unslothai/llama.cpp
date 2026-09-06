@@ -550,6 +550,7 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
         assert results[i].body["timings"]["predicted_n"] == n_predict_abc
     assert results[3].body["timings"]["predicted_n"] == n_predict_d
 
+
 def test_two_prompts_near_the_context_size_both_complete():
     # Two prompts that each fit the context alone but not together. The second one is
     # parked before it takes any cells, and it is close enough to n_ctx that its sequence
