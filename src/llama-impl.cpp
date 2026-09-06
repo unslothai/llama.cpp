@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <climits>
 #include <atomic>
+#include <mutex>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -210,6 +211,12 @@ bool llama_exact_report_n_seq(uint32_t n_seq) {
 bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
     n_tokens = n_tokens > 0 ? n_tokens : 1;
 
+    // never lowered: a narrower context set up later would otherwise turn the verify steps of
+    // an existing speculative context into prompts and serialise them
+    if (n_tokens <= g_exact_decode_tokens.load(std::memory_order_relaxed)) {
+        return true;
+    }
+
     // every context that exists widens with the figure, so the width they will need is
     // reported first; a figure the explicit bound cannot cover leaves the old one in place
     const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
@@ -254,6 +261,11 @@ bool llama_set_exact_decode_width(uint32_t n_cols) {
     if (!llama_exact_width_within_explicit_bound(n_cols)) {
         return false;
     }
+
+    // one reporter at a time: the widest figure is read and handed to the backends below as
+    // one step, so a narrower report cannot overtake a wider one on its way to a backend
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
 
     uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
 

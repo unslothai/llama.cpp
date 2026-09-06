@@ -284,6 +284,14 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("exact concurrency: unsupported attention head size");
         }
 
+        // [TAG_EXACT_CONCURRENCY] the paged attention kernel has no soft-capped variant and would
+        // assert on its first call, so a soft-capped model is refused at load instead
+        if (exact_pages && hparams.attn_soft_cap) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model soft-caps its attention logits (%.1f), "
+                    "which the paged attention kernel does not apply\n", __func__, hparams.f_attn_logit_softcapping);
+            throw std::runtime_error("exact concurrency: attention soft cap is not supported");
+        }
+
         if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
                     "which has no paged attention: every layer must be offloaded to the CUDA backend "

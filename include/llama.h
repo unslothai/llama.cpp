@@ -810,7 +810,8 @@ extern "C" {
     // speculative verify batch is not run once per sequence. Process-wide, default 1. Raising it
     // widens the decode step of every context that exists, and their width is re-reported with
     // it; false, and no change, when an explicit column bound given to the backend cannot cover
-    // that width (see llama_set_exact_decode_width).
+    // that width (see llama_set_exact_decode_width). Never lowers what was set: a narrower context
+    // set up later must not turn an existing context's verify steps into prompts.
     LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);
 
