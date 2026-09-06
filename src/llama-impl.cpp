@@ -202,18 +202,20 @@ static std::atomic<uint32_t> g_exact_decode_width{0};
 void llama_set_exact_decode_width(uint32_t n_cols) {
     uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
 
-    while (n_cols > cur) {
-        if (g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
-            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
-                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+    while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
+    }
 
-                auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
-                if (fn) {
-                    fn((int) n_cols);
-                }
-            }
+    // The widest figure so far goes to every backend on every call, not only when it grew: a
+    // width reported before a backend was loaded would otherwise never reach it, and every
+    // context reports at creation, by which time the backends are there.
+    const uint32_t widest = g_exact_decode_width.load(std::memory_order_relaxed);
 
-            return;
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+
+        auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
+        if (fn) {
+            fn((int) widest);
         }
     }
 }
