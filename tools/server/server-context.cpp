@@ -3104,6 +3104,10 @@ private:
             return; // with a cache per slot, no slot can take another one's cells
         }
 
+        if (!llama_get_memory(ctx_tgt)) {
+            return; // no cache at all (an embedding model): nothing to run out of, nothing to park
+        }
+
         if (params_base.preempt_ram_mib == 0) {
             return; // --preempt-ram 0: the KV-full retry ladder, as before
         }
@@ -4161,7 +4165,7 @@ private:
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
     bool preempt_last_resort_possible() const {
-        return params_base.kv_unified && params_base.preempt_ram_mib > 0 && slots.size() >= 2;
+        return params_base.kv_unified && params_base.preempt_ram_mib > 0 && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
     bool preempt_last_resort(int32_t off) {
