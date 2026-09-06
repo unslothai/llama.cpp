@@ -101,6 +101,14 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    // [TAG_EXACT_CONCURRENCY] the widest decode step this context can build: one column per
+    // sequence, times the tokens a sequence contributes to a step. Reported so that a backend
+    // splitting columns for exactness covers it without the caller having to know the bound; a
+    // caller that builds wider steps reports the width itself, see llama_set_exact_decode_width.
+    if (llama_exact_concurrency()) {
+        llama_set_exact_decode_width(cparams.n_seq_max * llama_exact_decode_tokens());
+    }
+
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",

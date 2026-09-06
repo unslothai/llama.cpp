@@ -1,5 +1,6 @@
 #include "llama-impl.h"
 
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
 
@@ -191,4 +192,32 @@ void llama_set_exact_decode_tokens(uint32_t n_tokens) {
 
 uint32_t llama_exact_decode_tokens(void) {
     return g_exact_decode_tokens.load(std::memory_order_relaxed);
+}
+
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h. A backend that
+// splits columns to make a decode exact reads it through ggml_backend_cuda_set_exact_decode_width,
+// reached through the registry so that a backend that is absent or loaded late costs nothing.
+static std::atomic<uint32_t> g_exact_decode_width{0};
+
+void llama_set_exact_decode_width(uint32_t n_cols) {
+    uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
+
+    while (n_cols > cur) {
+        if (g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+
+                auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
+                if (fn) {
+                    fn((int) n_cols);
+                }
+            }
+
+            return;
+        }
+    }
+}
+
+uint32_t llama_exact_decode_width(void) {
+    return g_exact_decode_width.load(std::memory_order_relaxed);
 }

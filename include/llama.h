@@ -811,6 +811,15 @@ extern "C" {
     LLAMA_API void     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);
 
+    // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns: the
+    // sequences a context can hold times the tokens each contributes to a step. Every context
+    // reports its own at creation and a backend keeps the widest it has heard, so a decode of any
+    // context stays within the bound its kernels split at. A caller that builds wider steps than
+    // the contexts imply (a draft of its own, say) reports the width itself, before creating the
+    // context or before the first decode. Never lowers what was reported.
+    LLAMA_API void     llama_set_exact_decode_width(uint32_t n_cols);
+    LLAMA_API uint32_t llama_exact_decode_width(void);
+
     //
     // State / sessions
     //
