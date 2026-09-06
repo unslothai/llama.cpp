@@ -433,7 +433,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 //   so that the rollback snapshots remain valid
                 // [TAG_EXACT_CONCURRENCY] same rule as the hybrid memory: a recurrent state that a
                 // prompt leaves behind depends on what shared its ubatch, so isolate the prompts
-                const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
+                const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
 
                 ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }

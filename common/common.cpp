@@ -1484,6 +1484,9 @@ bool common_exact_concurrency_init(const common_params & params) {
 
     const int n_cols = common_exact_decode_width(params);
 
+    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is
+    llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel)));
+
     const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
     if (bound) {
         const int max_cols = atoi(bound);

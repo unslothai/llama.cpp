@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 #include <climits>
+#include <atomic>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -179,4 +180,15 @@ bool llama_exact_concurrency() {
     }();
 
     return enabled;
+}
+
+// [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
+static std::atomic<uint32_t> g_exact_decode_tokens{1};
+
+void llama_set_exact_decode_tokens(uint32_t n_tokens) {
+    g_exact_decode_tokens.store(n_tokens > 0 ? n_tokens : 1, std::memory_order_relaxed);
+}
+
+uint32_t llama_exact_decode_tokens(void) {
+    return g_exact_decode_tokens.load(std::memory_order_relaxed);
 }
