@@ -537,13 +537,27 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+// The connections of an endpoint, looked up by endpoint. The server serves the connections of a
+// client one at a time, so opening a second connection to an endpoint that already has a live one
+// would block until the first closes. Anything that only wants the CURRENT connection must use
+// find_socket, which never opens one.
+static std::mutex                                              g_sockets_mutex;
+static std::unordered_map<std::string, std::weak_ptr<socket_t>> g_sockets;
 
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
+static std::shared_ptr<socket_t> find_socket(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_sockets_mutex);
+    auto it = g_sockets.find(endpoint);
+    if (it != g_sockets.end()) {
+        return it->second.lock();
+    }
+    return nullptr;
+}
+
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_sockets_mutex);
+
+    auto it = g_sockets.find(endpoint);
+    if (it != g_sockets.end()) {
         if (auto sock = it->second.lock()) {
             return sock;
         }
@@ -566,7 +580,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    g_sockets[endpoint] = sock;
     return sock;
 }
 
@@ -752,10 +766,19 @@ static bool send_get_tensors(const socket_ptr & sock, const std::vector<rpc_defe
     if (out_size != total) {
         return false;
     }
+
+    // One receive for the whole response, then scatter. The RDMA transport is not a byte stream:
+    // a receive completion carries exactly one send, and recv_data copies all of it, so reading a
+    // single sent message back in several pieces overruns the first destination and then blocks
+    // for a completion that never comes.
+    std::vector<uint8_t> response(total);
+    if (total > 0 && !sock->recv_data(response.data(), total)) {
+        return false;
+    }
+    size_t off = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (!sock->recv_data(gets[i]->data, gets[i]->size)) {
-            return false;
-        }
+        memcpy(gets[i]->data, response.data() + off, gets[i]->size);
+        off += gets[i]->size;
     }
     return true;
 }
@@ -1041,7 +1064,8 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    auto sock = get_socket(rpc_ctx->endpoint);
+    // never open a connection here: with nothing connected there is nothing queued either
+    auto sock = find_socket(rpc_ctx->endpoint);
     if (sock != nullptr) {
         rpc_flush_deferred_guarded(sock);
     }
@@ -1114,9 +1138,18 @@ static bool ggml_backend_rpc_cpy_tensor_p2p(ggml_backend_t backend_src, ggml_bac
     return response.result != 0;
 }
 
+// The connection a tensor already lives on. Never opens one.
+static socket_ptr tensor_socket(const ggml_tensor * tensor) {
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || !ggml_backend_buffer_is_rpc(buf)) {
+        return nullptr;
+    }
+    return ((ggml_backend_rpc_buffer_context *) buf->context)->sock;
+}
+
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
-    auto sock = get_socket(rpc_ctx->endpoint);
+    GGML_UNUSED(backend);
+    auto sock = tensor_socket(tensor);
 
     if (sock == nullptr || !rpc_supports_batched_get(sock)) {
         ggml_backend_tensor_get(tensor, data, offset, size);
@@ -1169,9 +1202,7 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         return false;
     }
 
-    ggml_backend_rpc_context * rpc_ctx =
-        (ggml_backend_rpc_context *) (src_is_rpc ? backend_src->context : backend_dst->context);
-    auto sock = get_socket(rpc_ctx->endpoint);
+    auto sock = tensor_socket(src_is_rpc ? src : dst);
     if (sock == nullptr) {
         return false;
     }
