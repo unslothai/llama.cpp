@@ -1290,6 +1290,15 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [TAG_EXACT_CONCURRENCY] before any context exists, the fitting ones included: the
+    // per-sequence figure and the column bound are checked against the explicit bound first,
+    // so a context is never created under a figure the bound does not cover. A caller that
+    // skipped common_params_parse() gets the same check here; on failure nothing is loaded.
+    if (!model_only && !common_exact_concurrency_init(params)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
+        return;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1519,11 +1528,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    // [TAG_EXACT_CONCURRENCY] before the warmup, which is the first graph this process computes
-    if (!common_exact_concurrency_init(params)) {
-        return res;
-    }
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
