@@ -592,9 +592,13 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
+    // [TAG_BATCH_INVARIANT] with ids, a sample is a token: the batch-invariant MUL_MAT_ID launch
+    // puts every token of the batch on the z axis of one single-column launch, so each (token,
+    // expert slot) block runs the exact single-token configuration. The stock single-token launch
+    // has one sample, where this indexing is ids[channel_dst] as before.
+    channel_x  = ncols_dst == 1 && ids ? ids[sample_dst*ids_stride + channel_dst] : fastdiv(channel_dst, channel_ratio);
+    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y)      : channel_dst;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -1281,7 +1285,14 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // [TAG_BATCH_INVARIANT] under the knob a MUL_MAT_ID with several tokens is computed as one
+    // launch of the single-token configuration with the tokens on the sample axis, so every
+    // (token, expert slot) block reduces exactly as the token alone would. The token count is
+    // then not bounded by the column templates.
+    const bool tokens_as_samples = ids && ne2 > 1 && ggml_cuda_batch_invariant();
+
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || tokens_as_samples);
+    GGML_ASSERT(!tokens_as_samples || !fusion);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -1368,6 +1379,17 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (tokens_as_samples) {
+        GGML_ASSERT(ne03 == 1 && ne13 == 1 && ne3 == 1);
+        // one column, one sample per token: y advances by s12 per token, dst by s2, x not at all
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+            ne01,              1,             s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            1,                 ne2,           s03, s12,              s2,               ids_stride, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
