@@ -2947,6 +2947,24 @@ private:
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
+    // draft tokens this slot's next step can actually carry: the configured maximum, cut to
+    // what its context and its prediction budget leave, the way get_n_draft_max() cuts it
+    int32_t preempt_n_spec(const server_slot & slot) const {
+        int32_t res = preempt_n_spec_max();
+
+        if (res == 0 || !slot.task || !slot.can_speculate()) {
+            return 0;
+        }
+
+        res = std::min(res, slot.n_ctx - slot.prompt.n_tokens() - 2);
+
+        if (slot.n_remaining() > 0) {
+            res = std::min(res, slot.n_remaining() - 1);
+        }
+
+        return std::max(0, res);
+    }
+
     // host RAM the parked sequences hold right now
     size_t preempt_ram_used() const {
         size_t res = 0;
@@ -2974,7 +2992,7 @@ private:
         int32_t res = slot.prompt.n_tokens();
 
         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
-            res += 1 + preempt_n_spec_max();
+            res += 1 + preempt_n_spec(slot);
         } else {
             const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
 
@@ -2991,9 +3009,33 @@ private:
     int32_t preempt_kv_used() const {
         int32_t res = 0;
 
+        // n_cmpl > 1: the parent and its children share the prompt's cells through seq_cp, so
+        // the prompt is charged once per family, to whichever resident member comes first;
+        // the others are charged only what they generated on top of it
+        std::vector<int> charged;
+
         for (const auto & slot : slots) {
             if (slot.state == SLOT_STATE_PREEMPTED) {
                 continue; // parked: its cells are in host RAM, not in the pool
+            }
+
+            if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+                const int family = slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
+
+                if (std::find(charged.begin(), charged.end(), family) != charged.end()) {
+                    res += std::max(0, slot.prompt.n_tokens() - slot.task->n_tokens());
+                    continue;
+                }
+
+                charged.push_back(family);
+            }
+
+            // a slot just given a task still mirrors the previous request's prompt until the
+            // batch builder keeps the prefix the two share and drops the rest; what stays is
+            // the prefix, so that is what the pool holds for it
+            if (slot.state == SLOT_STATE_STARTED && slot.task) {
+                res += (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                continue;
             }
 
             res += slot.prompt.n_tokens();
@@ -3004,7 +3046,6 @@ private:
 
     // cells those slots are about to ask for on the next decode
     int32_t preempt_kv_reserve() const {
-        const int32_t n_spec  = preempt_n_spec_max();
         const int32_t n_batch = llama_n_batch(ctx_tgt);
 
         int32_t res     = 0;
@@ -3015,7 +3056,7 @@ private:
                 case SLOT_STATE_GENERATING:
                 case SLOT_STATE_DONE_PROMPT:
                     {
-                        res += 1 + n_spec;
+                        res += 1 + preempt_n_spec(slot);
                     } break;
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
@@ -3333,7 +3374,9 @@ private:
             }
         }
 
-        // [TAG_PREEMPT] make the pool fit the step that is about to be built
+        // [TAG_PREEMPT] make the pool fit the step that is about to be built, measured after
+        // any context shift
+        pre_decode_shift();
         update_preemption();
 
         try {
@@ -3418,9 +3461,11 @@ private:
         }
     }
 
-    void pre_decode() {
-        // apply context-shift if needed
-        // TODO: simplify and improve
+    // apply context-shift if needed
+    // TODO: simplify and improve
+    // [TAG_PREEMPT] runs before update_preemption() so the pool is measured after the shift,
+    // not with the cells the shift is about to give back
+    void pre_decode_shift() {
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
@@ -3482,7 +3527,9 @@ private:
                 slot.truncated = true;
             }
         });
+    }
 
+    void pre_decode() {
         // start populating the batch for this iteration
         batch.clear();
 
@@ -4165,7 +4212,7 @@ private:
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
     bool preempt_last_resort_possible() const {
-        return params_base.kv_unified && params_base.preempt_ram_mib > 0 && slots.size() >= 2 && llama_get_memory(ctx_tgt);
+        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
     bool preempt_last_resort(int32_t off) {
