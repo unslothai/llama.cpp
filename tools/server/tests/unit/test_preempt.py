@@ -330,6 +330,31 @@ def test_the_last_resort_parks_instead_of_ending_everyone():
         assert len(res.body["tokens"]) == n_predict
 
 
+def test_the_last_resort_works_with_an_unlimited_budget():
+    # --preempt-ram -1 is the documented unlimited setting; it must enable the last resort
+    # the same as any positive budget does
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "-1"
+    server.start()
+    log = LogReader(server.log_path)
+
+    n_predict = 160
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted as a last resort" in text
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+
+
 def test_the_last_resort_rewinds_a_prompt_in_flight():
     # Same, with a prompt being processed when the pool runs out: the chunk that failed
     # is taken back off the slot's tokens and processed again after the resume, so the
