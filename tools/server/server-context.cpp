@@ -4879,6 +4879,8 @@ private:
 
             n_parked++;
 
+            send_preempt_notice(*victim, true);
+
             // [TAG_PREEMPT_ASYNC] the cells are wanted now, not next iteration: wait for the
             // copy to land, which releases them and logs the park the way the planner does
             if (victim->state == SLOT_STATE_PREEMPTING) {
