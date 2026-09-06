@@ -4598,6 +4598,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+uint32_t llama_memory_alloc_granularity(llama_memory_t mem) {
+    if (!mem) {
+        return 1;
+    }
+
+    return mem->alloc_granularity();
+}
+
 // llama state API
 
 // deprecated

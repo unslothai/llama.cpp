@@ -795,6 +795,14 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // [TAG_EXACT_CONCURRENCY] Cells the memory allocates in one indivisible unit.
+    //
+    // 1 in every ordinary configuration. Larger where a mode places cells in blocks, and
+    // then a sequence of n tokens occupies round_up(n, granularity) cells. A caller that
+    // decides whether the pool has room by counting tokens has to round the same way, or it
+    // will believe there is space that cannot be handed out.
+    LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
+
     //
     // State / sessions
     //

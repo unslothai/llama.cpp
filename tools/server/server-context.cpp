@@ -1688,6 +1688,18 @@ private:
             }
         }
 
+        // [TAG_EXACT_CONCURRENCY] ask the cache how it allocates, rather than assume a cell
+        // per token. 1 in every ordinary configuration, so this changes nothing unless a
+        // mode that places cells in blocks is on.
+        {
+            preempt_alloc_granularity = (int32_t) std::max(1u, llama_memory_alloc_granularity(llama_get_memory(ctx_tgt)));
+
+            if (preempt_alloc_granularity > 1) {
+                SRV_INF("preemption: the kv pool allocates %d cells at a time, planning in pages\n",
+                        preempt_alloc_granularity);
+            }
+        }
+
         {
             const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
             preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
@@ -3165,6 +3177,28 @@ private:
     // case every park and resume is the synchronous one it always was.
     bool preempt_async_ok = false;
 
+    // [TAG_EXACT_CONCURRENCY] cells the pool hands out at a time: 1 normally, the page size
+    // under exact concurrency. Everything below plans in cells rather than tokens because of
+    // it -- with a page size of 256, four sequences can hold 1020 cells the pool cannot hand
+    // to anybody else, and a planner counting tokens sees room that find_slot cannot find.
+    int32_t preempt_alloc_granularity = 1;
+
+    // cells a sequence of n tokens actually occupies
+    int32_t preempt_n_cells(int32_t n_tokens) const {
+        const int32_t g = preempt_alloc_granularity;
+
+        if (g <= 1 || n_tokens <= 0) {
+            return n_tokens;
+        }
+
+        return ((n_tokens + g - 1) / g) * g;
+    }
+
+    // cells a slot holding n_tokens has to be given for a step of n_step more
+    int32_t preempt_n_cells_step(int32_t n_tokens, int32_t n_step) const {
+        return preempt_n_cells(n_tokens + n_step) - preempt_n_cells(n_tokens);
+    }
+
     int32_t preempt_n_spec_max() const {
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
@@ -3209,7 +3243,10 @@ private:
             res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
 
-        return res;
+        // [TAG_EXACT_CONCURRENCY] a restore takes fresh pages and its tail page is charged in
+        // full, so what the pool has to have free for this slot is the rounded figure. Under
+        // counting here is what admits a resume that find_slot then cannot satisfy.
+        return preempt_n_cells(res);
     }
 
     // Cells the pool is holding right now. A released slot keeps its prompt in the cache
@@ -3229,7 +3266,7 @@ private:
             // because the copy is still reading them, and one on its way back in has already
             // been given them. Skipping either would hand the same cells out twice.
 
-            res += slot.prompt.n_tokens();
+            res += preempt_n_cells(slot.prompt.n_tokens());
         }
 
         return res;
@@ -3255,7 +3292,12 @@ private:
             }
         }
 
-        return PREEMPT_N_MARGIN + n_running * (1 + preempt_n_spec_max()) * PREEMPT_N_ASYNC_STEPS;
+        // [TAG_EXACT_CONCURRENCY] the lookahead is a number of decode steps, and under a
+        // page allocator any one of them can cost a whole page rather than a cell. Round the
+        // runway up to a page so the park is issued with at least one page of real room
+        // behind it; with a page size of 1 this is the figure it always was.
+        return preempt_n_cells(
+                PREEMPT_N_MARGIN + n_running * (1 + preempt_n_spec_max()) * PREEMPT_N_ASYNC_STEPS);
     }
 
     // cells those slots are about to ask for on the next decode
@@ -3266,19 +3308,27 @@ private:
         int32_t res     = 0;
         int32_t res_pmt = 0;
 
+        // [TAG_EXACT_CONCURRENCY] each slot reserves the cells its next step ADDS, not the
+        // tokens it adds. preempt_kv_used() already charges every slot's tail page in full,
+        // so with a page size of 1 these are the same number and nothing changes; with a
+        // larger one the step is free until it crosses a page boundary and costs a whole
+        // page when it does. Reserving tokens on top of a rounded used figure would miss
+        // exactly that crossing, which is the only moment the pool can actually run out.
         for (const auto & slot : slots) {
+            const int32_t n_cur = slot.prompt.n_tokens();
+
             switch (slot.state) {
                 case SLOT_STATE_GENERATING:
                 case SLOT_STATE_DONE_PROMPT:
                     {
-                        res += 1 + n_spec;
+                        res += preempt_n_cells_step(n_cur, 1 + n_spec);
                     } break;
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
-                        const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+                        const int32_t n_left = slot.task ? slot.task->n_tokens() - n_cur : 0;
 
-                        res_pmt += std::max(1, std::min(n_batch, n_left));
+                        res_pmt += preempt_n_cells_step(n_cur, std::max(1, std::min(n_batch, n_left)));
                     } break;
                 case SLOT_STATE_RESTORING:
                     {
@@ -3287,11 +3337,11 @@ private:
                         // take has to be reserved now -- otherwise the pool is handed out from
                         // under it and its first step preempts somebody else straight away
                         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
-                            res += 1 + n_spec;
+                            res += preempt_n_cells_step(n_cur, 1 + n_spec);
                         } else {
-                            const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+                            const int32_t n_left = slot.task ? slot.task->n_tokens() - n_cur : 0;
 
-                            res_pmt += std::max(1, std::min(n_batch, n_left));
+                            res_pmt += preempt_n_cells_step(n_cur, std::max(1, std::min(n_batch, n_left)));
                         }
                     } break;
                 // a preempting slot is on its way out and will not decode: nothing to reserve
@@ -3300,8 +3350,9 @@ private:
             }
         }
 
-        // one batch is all the prompt slots get between them, however many are waiting
-        return res + std::min(res_pmt, n_batch);
+        // one batch is all the prompt slots get between them, however many are waiting; in
+        // cells that batch can straddle one boundary more than it has tokens for
+        return res + std::min(res_pmt, preempt_n_cells(n_batch));
     }
 
     // Keep the slot that is furthest along -- it is the closest to finishing and to giving
