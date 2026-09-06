@@ -5380,9 +5380,10 @@ static bool ggml_backend_cuda_device_event_query(ggml_backend_dev_t dev, ggml_ba
 
     const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
 
+    // not an error, and nothing to clear: cudaEventQuery() returns cudaErrorNotReady
+    // without recording it as the thread's last error, so collecting one here would only
+    // consume somebody else's, and a real launch failure would be swallowed
     if (err == cudaErrorNotReady) {
-        // not an error: clear it so it is not reported against the next call
-        (void) cudaGetLastError();
         return false;
     }
 
