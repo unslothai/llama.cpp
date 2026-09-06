@@ -3311,6 +3311,16 @@ private:
                 server_slot * head = parked.front();
 
                 if (ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
+                    // the resident whose cells let the head in, the smallest of those; failing
+                    // one that does so alone, the largest, since it makes the most room. Taking
+                    // the first shifting resident in slot order could park one too small to
+                    // matter, spend the park budget on it, and leave the head waiting anyway.
+                    const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
+                    const int32_t need     = preempt_n_need(*head) + PREEMPT_N_MARGIN;
+
+                    server_slot * pick        = nullptr;
+                    bool          pick_enough = false;
+
                     for (auto & slot : slots) {
                         if (slot.state != SLOT_STATE_GENERATING || slot.n_ctx_shift == 0) {
                             continue;
@@ -3320,20 +3330,34 @@ private:
                             continue;
                         }
 
-                        if (!preempt_fits_budget(slot) || !slot.preempt_save()) {
+                        if (!preempt_fits_budget(slot)) {
                             continue;
                         }
 
+                        const bool enough = occupied - slot.prompt.n_tokens() + need <= n_cells;
+
+                        if (!pick ||
+                            (enough && !pick_enough) ||
+                            (enough == pick_enough && (enough ? slot.prompt.n_tokens() < pick->prompt.n_tokens()
+                                                              : slot.prompt.n_tokens() > pick->prompt.n_tokens()))) {
+                            pick        = &slot;
+                            pick_enough = enough;
+                        }
+                    }
+
+                    if (pick && pick->preempt_save()) {
+                        server_slot & slot = *pick;
+
                         metrics.n_preempt++;
 
-                        SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn, preemptions %d\n",
+                        SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
                                 slot.n_ctx_shift, slot.prompt.n_tokens(),
                                 slot.preempt_state_size() / (1024.0 * 1024.0),
                                 (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                pick_enough ? "" : " (not enough room by itself)",
                                 slot.n_preempt);
 
                         best = head; // re-examined by the loop, which sees the room it just got
-                        break;
                     }
                 }
 
