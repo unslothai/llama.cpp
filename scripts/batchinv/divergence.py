@@ -5,8 +5,22 @@ import argparse, json, os, signal, subprocess, sys, threading, time, urllib.requ
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import PROMPTS
 
-WS = os.environ["UNSLOTH_WORKSPACE"]
-MODEL = f"{WS}/models/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+# Environment recorded with every run. LLAMA_EXACT_CONCURRENCY inherited from the shell is what
+# decides whether a run labelled as the mode-off reference actually was one, so it is not optional.
+RECORDED_ENV = ("LLAMA_EXACT_CONCURRENCY", "GGML_CUDA_BATCH_INVARIANT",
+                "GGML_CUDA_BATCH_INVARIANT_MAX_COLS", "LLAMA_SERVER_PREEMPT_EVERY",
+                "CUDA_VISIBLE_DEVICES")
+
+MODEL_REL = "models/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+
+
+def model_path():
+    """Resolved when the server args are built, so --help works without the variable set."""
+    ws = os.environ.get("UNSLOTH_WORKSPACE")
+    if not ws:
+        raise RuntimeError("UNSLOTH_WORKSPACE is not set; it must point at the workspace holding "
+                           + MODEL_REL)
+    return os.path.join(ws, MODEL_REL)
 
 
 def post(port, path, payload, timeout=1800):
@@ -34,7 +48,7 @@ def completion(port, prompt, n_predict):
 class Server:
     def __init__(self, port, binary, extra, env_extra, log_path, spec, kv_unified=True):
         self.port, self.log_path = port, log_path
-        self.args = [binary, "-m", MODEL, "--port", str(port), "--host", "127.0.0.1",
+        self.args = [binary, "-m", model_path(), "--port", str(port), "--host", "127.0.0.1",
                      "--parallel", "4", "-c", "8192",
                      "--flash-attn", "on", "--metrics", "-ngl", "99", "--no-warmup",
                      "--seed", "0", "--spec-type", spec]
@@ -46,48 +60,78 @@ class Server:
         self.env = dict(os.environ)
         self.env["CUDA_VISIBLE_DEVICES"] = "3"
         self.env.update(env_extra)
+        # what the server will actually see, not what this run meant to set
+        self.env_resolved = {k: self.env[k] for k in RECORDED_ENV if k in self.env}
+        self.p = None
+        self.fh = None
 
     def __enter__(self):
         self.fh = open(self.log_path, "ab")
         self.fh.write(("\n=== " + " ".join(self.args) + "\n=== env " +
-                       json.dumps({k: v for k, v in self.env.items()
-                                   if k.startswith("GGML") or k == "CUDA_VISIBLE_DEVICES"}) + "\n").encode())
+                       json.dumps(self.env_resolved) + "\n").encode())
         self.fh.flush()
         self.p = subprocess.Popen(self.args, stdout=self.fh, stderr=subprocess.STDOUT,
                                   env=self.env, start_new_session=True)
         print(f"[server] pid={self.p.pid} port={self.port} log={self.log_path}", flush=True)
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            if self.p.poll() is not None:
-                raise RuntimeError(f"server died rc={self.p.returncode}, see {self.log_path}")
-            try:
-                if get(self.port, "/health").get("status") == "ok":
-                    print("[server] ready", flush=True)
-                    return self
-            except Exception:
-                time.sleep(1.0)
-        raise RuntimeError("server did not become healthy")
+        try:
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                if self.p.poll() is not None:
+                    raise RuntimeError(f"server died rc={self.p.returncode}, see {self.log_path}")
+                try:
+                    if get(self.port, "/health").get("status") == "ok":
+                        print("[server] ready", flush=True)
+                        return self
+                except Exception:
+                    time.sleep(1.0)
+            raise RuntimeError("server did not become healthy")
+        except BaseException:
+            # __exit__ is not called when __enter__ raises, so a server that started but never
+            # reported healthy would keep the GPU, the port and the log handle
+            self.__exit__(None, None, None)
+            raise
 
     def __exit__(self, *a):
-        print(f"[server] stopping pid={self.p.pid}", flush=True)
-        try:
-            os.killpg(os.getpgid(self.p.pid), signal.SIGTERM)
-            self.p.wait(timeout=60)
-        except Exception:
+        # note: POSIX only. On Windows this needs CREATE_NEW_PROCESS_GROUP at Popen and
+        # terminate()/kill() here; the runs this harness backs are Linux only.
+        if self.p is not None:
+            print(f"[server] stopping pid={self.p.pid}", flush=True)
             try:
-                os.killpg(os.getpgid(self.p.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(self.p.pid), signal.SIGTERM)
+                self.p.wait(timeout=60)
             except Exception:
-                pass
-        self.fh.close()
+                try:
+                    os.killpg(os.getpgid(self.p.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    self.p.wait(timeout=60)
+                except Exception:
+                    pass
+            self.p = None
+        if self.fh is not None:
+            self.fh.close()
+            self.fh = None
 
 
 def run_concurrent(port, names, n_predict):
     barrier = threading.Barrier(len(names))
+    lock = threading.Lock()
     out = {}
+    errors = []
 
     def work(name):
-        barrier.wait()
-        out[name] = completion(port, PROMPTS[name], n_predict)
+        try:
+            barrier.wait()
+            res = completion(port, PROMPTS[name], n_predict)
+        except BaseException as e:
+            with lock:
+                errors.append((name, e))
+            # release the others rather than let them block on a barrier that will never fill
+            barrier.abort()
+            return
+        with lock:
+            out[name] = res
 
     ts = [threading.Thread(target=work, args=(n,)) for n in names]
     t0 = time.time()
@@ -95,7 +139,18 @@ def run_concurrent(port, names, n_predict):
         t.start()
     for t in ts:
         t.join()
-    return out, time.time() - t0
+    wall = time.time() - t0
+
+    # a thread exception used to only print a traceback, so a run where P1..P3 failed and P0
+    # succeeded was still reported as a clean four-way concurrency result
+    if errors:
+        raise RuntimeError("concurrent requests failed: " +
+                           "; ".join(f"{n}: {type(e).__name__}: {e}" for n, e in errors))
+    missing = set(names) - set(out)
+    if missing:
+        raise RuntimeError(f"concurrent requests produced no result for {sorted(missing)}")
+
+    return out, wall
 
 
 def first_diff(a, b):
@@ -121,12 +176,15 @@ def main():
     a = ap.parse_args()
 
     env_extra = dict(kv.split("=", 1) for kv in a.env)
+    server = Server(a.port, a.binary, a.extra, env_extra, a.out + ".server.log", a.spec,
+                    kv_unified=not a.no_kv_unified)
     res = {"label": a.label, "spec": a.spec, "n_predict": a.n_predict,
-           "env": env_extra, "extra": a.extra, "binary": a.binary,
+           "env_requested": env_extra, "env": server.env_resolved,
+           "model": server.args[2], "args": server.args,
+           "extra": a.extra, "binary": a.binary,
            "kv_unified": not a.no_kv_unified}
 
-    with Server(a.port, a.binary, a.extra, env_extra, a.out + ".server.log", a.spec,
-                kv_unified=not a.no_kv_unified) as s:
+    with server as s:
         solo = completion(a.port, PROMPTS["P0"], a.n_predict)
         ref = json.load(open(a.reference))["tokens"] if a.reference else solo["tokens"]
         res["solo_first_diff"] = first_diff(ref, solo["tokens"])
