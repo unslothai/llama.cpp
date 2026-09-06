@@ -4134,8 +4134,12 @@ private:
     // update_slots() rebuilds the batch from the survivors. The planner brings the parked
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
+    bool preempt_last_resort_possible() const {
+        return params_base.kv_unified && params_base.preempt_ram_mib > 0 && slots.size() >= 2;
+    }
+
     bool preempt_last_resort(int32_t off) {
-        if (!params_base.kv_unified || params_base.preempt_ram_mib == 0 || slots.size() < 2) {
+        if (!preempt_last_resort_possible()) {
             return false;
         }
 
@@ -4268,8 +4272,9 @@ private:
                 // [TAG_PREEMPT] with speculation on, a slot's sampled token and its draft have
                 // to stay in one view: a narrower view splits the group and the verify step
                 // throws for the slot whose tokens straddle it. Halving is no help there, so
-                // after the idle slots the ladder goes to its last resort straight away.
-                if (ret == 1 && n_batch > 1 && batch_has_spec_groups()) {
+                // after the idle slots the ladder goes to its last resort straight away. With
+                // no budget to park into the ladder is what it always was.
+                if (ret == 1 && n_batch > 1 && preempt_last_resort_possible() && batch_has_spec_groups()) {
                     if (try_clear_idle_slots()) {
                         SRV_WRN("%s", "failed to find free space in the KV cache, retrying after purging an idle slot\n");
                         return false; // retry at the same width
