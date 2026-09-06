@@ -1462,6 +1462,17 @@ private:
             const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
             preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
 
+            // LLAMA_SERVER_PREEMPT_POLICY: which non-leader the planner parks, for comparing
+            // policies against each other on the same workload. smallest (the default and the
+            // shipped one), largest, youngest (the most recent task, as vLLM's scheduler
+            // preempts), oldest. The leader is kept and the starvation guard applies under all.
+            const char * LLAMA_SERVER_PREEMPT_POLICY = getenv("LLAMA_SERVER_PREEMPT_POLICY");
+            preempt_test_policy = LLAMA_SERVER_PREEMPT_POLICY ? LLAMA_SERVER_PREEMPT_POLICY : "smallest";
+
+            if (preempt_test_policy != "smallest") {
+                SRV_WRN("LLAMA_SERVER_PREEMPT_POLICY = %s (test knob: victim choice for comparison only)\n", preempt_test_policy.c_str());
+            }
+
             if (preempt_test_every > 0) {
                 SRV_WRN("LLAMA_SERVER_PREEMPT_EVERY = %d (test knob: preempting every slot every %d tokens)\n",
                         preempt_test_every, preempt_test_every);
@@ -2917,6 +2928,7 @@ private:
     // shape at every step, so a preempted continuation that is not byte-identical to an
     // uninterrupted one is the preemption's fault and nothing else's.
     int32_t preempt_test_every = 0;
+    std::string preempt_test_policy = "smallest"; // LLAMA_SERVER_PREEMPT_POLICY, see load_model
 
     // env: LLAMA_SERVER_PREEMPT_PLANNER=off (test knob): no parking ahead of the decode, so
     // the KV-full retry ladder and its last resort are the only thing between a full pool
@@ -3163,12 +3175,31 @@ private:
 
             if (!victim ||
                 (starved_cur && !starved) ||
-                (starved_cur == starved && slot.prompt.n_tokens() < victim->prompt.n_tokens())) {
+                (starved_cur == starved && preempt_better_victim(slot, *victim))) {
                 victim = &slot;
             }
         }
 
         return victim;
+    }
+
+    // is a the better victim of the two? the smallest slot under the shipped policy: it
+    // gives up the least work and its restore is the cheapest (see the PR's simulation);
+    // the other choices exist for the comparison runs behind LLAMA_SERVER_PREEMPT_POLICY
+    bool preempt_better_victim(const server_slot & a, const server_slot & b) const {
+        if (preempt_test_policy == "largest") {
+            return a.prompt.n_tokens() > b.prompt.n_tokens();
+        }
+
+        if (preempt_test_policy == "youngest") {
+            return a.task->id > b.task->id;
+        }
+
+        if (preempt_test_policy == "oldest") {
+            return a.task->id < b.task->id;
+        }
+
+        return a.prompt.n_tokens() < b.prompt.n_tokens();
     }
 
     // called once per update_slots(), before the batch is built: at that point every slot is
