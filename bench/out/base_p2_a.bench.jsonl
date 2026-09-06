@@ -1,0 +1,1 @@
+{"label": "base_p2_a", "conc": 32, "npp": 128, "ntg": 256, "n_ok": 64, "n_err": 0, "wall_s": 121.475, "agg_tok_s": 134.87, "tpot_med_ms": 210.61, "tpot_p90_ms": 212.84, "ttft_med_ms": 7278.3, "ttft_p90_ms": 7779.84, "decode_tok_s_per_req": 4.75, "per_backend": {"http://127.0.0.1:8185": 64}, "errors": []}

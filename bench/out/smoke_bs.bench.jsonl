@@ -1,0 +1,1 @@
+{"label": "smoke_bs", "conc": 4, "npp": 128, "ntg": 16, "n_ok": 0, "n_err": 8, "errors": [{"error": "http 503", "backend": "http://127.0.0.1:8185"}, {"error": "http 503", "backend": "http://127.0.0.1:8185"}, {"error": "http 503", "backend": "http://127.0.0.1:8185"}]}
