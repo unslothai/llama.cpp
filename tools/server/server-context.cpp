@@ -124,6 +124,7 @@ static bool preempt_resume_head_of_line() {
 }
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
+constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // a resident cycling through context shifts gives way to a parked head that has waited this long
 
 // [TAG_PREEMPT_ASYNC] how far ahead of the pool filling an asynchronous park is triggered
 //
@@ -477,6 +478,7 @@ struct server_slot {
         return state == SLOT_STATE_PREEMPTED || preempt_in_flight();
     }
     int32_t              n_preempt      = 0;   // times the CURRENT task has been preempted
+    int32_t              n_ctx_shift    = 0;   // context shifts the CURRENT task has made: it is at the pool's limit and cycling
     int32_t              n_preempt_fail = 0;   // consecutive failed restores
     int64_t              t_preempt_us   = 0;   // when it was parked
     int64_t              t_preempt_copy_us = 0; // [TAG_PREEMPT_ASYNC] when the current copy was issued
@@ -826,6 +828,7 @@ struct server_slot {
         state_before_preempt = SLOT_STATE_IDLE;
         n_preempt            = 0;
         n_preempt_fail       = 0;
+        n_ctx_shift          = 0;
         t_preempt_us         = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
@@ -3815,7 +3818,46 @@ private:
                 }
             }
 
+            // Nothing fits. A resident that has reached the pool's limit and is cycling
+            // through context shifts holds the room for as long as it likes to generate,
+            // and the head behind it would wait for ever. After the head has waited its
+            // turn, that resident is parked in its place: it is at a token boundary like
+            // any other park, and when it comes back it is the one waiting, so the two
+            // take turns instead of one taking everything.
             if (!best) {
+                server_slot * head = parked.front();
+
+                if (ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
+                    for (auto & slot : slots) {
+                        if (slot.state != SLOT_STATE_GENERATING || slot.n_ctx_shift == 0) {
+                            continue;
+                        }
+
+                        if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+                            continue;
+                        }
+
+                        if (!preempt_fits_budget(slot) || !slot.preempt_save()) {
+                            continue;
+                        }
+
+                        metrics.n_preempt++;
+
+                        SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn, preemptions %d\n",
+                                slot.n_ctx_shift, slot.prompt.n_tokens(),
+                                slot.preempt_state_size() / (1024.0 * 1024.0),
+                                (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                slot.n_preempt);
+
+                        best = head; // re-examined by the loop, which sees the room it just got
+                        break;
+                    }
+                }
+
+                if (best) {
+                    continue;
+                }
+
                 break;
             }
 
@@ -4175,6 +4217,8 @@ private:
                 n_discard = std::clamp(n_discard, 0, std::max(0, n_left - 1));
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+
+                slot.n_ctx_shift++;
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
