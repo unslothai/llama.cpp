@@ -21,10 +21,35 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 // dedup helpers
+
+// [TAG_EXACT_CONCURRENCY]
+// The page table is wired into llm_graph_input_attn_kv only. The V-less layouts build their
+// attention without one, so a model on one of those would get its cells placed in pages by the
+// allocator and then attend in physical cell order anyway: the mode would report itself as on and
+// lose the one invariant it exists for, which is the same silent failure the CUDA placement gate
+// was added to stop. Refuse the context instead.
+//
+// Rejecting is the smaller correct change here. Wiring self_pages into llm_graph_input_attn_k alone
+// is four lines, but it fixes only one of the four V-less input classes, and DeepSeek 3.2 uses two
+// of them: its sparse layers rewrite the mask from a top-k selection and would still be unpaged, so
+// the model would end up half paged, which is worse than refused. None of these architectures was
+// measured, and the paged kernel additionally requires 256-dimensional K and V heads.
+static void llm_graph_reject_exact_concurrency(const char * layout) {
+    if (!llama_exact_concurrency()) {
+        return;
+    }
+
+    LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, but this model uses the %s attention "
+            "layout, which carries no page table and would attend in physical cell order\n",
+            __func__, layout);
+
+    throw std::runtime_error("exact concurrency: unsupported attention layout");
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -2871,6 +2896,8 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur) {
 
+    llm_graph_reject_exact_concurrency("V-less KV (attn_k)");
+
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
 
     {
@@ -3247,6 +3274,8 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
     const llama_cparams & cparams,
     const llama_kv_cache_dsa_context * mctx_cur) {
 
+    llm_graph_reject_exact_concurrency("sparse V-less KV (attn_k_dsa)");
+
     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
 
     {
@@ -3363,6 +3392,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
 llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+
+    llm_graph_reject_exact_concurrency("V-less sliding window KV (attn_k_iswa)");
 
     auto inp = std::make_unique<llm_graph_input_attn_k_iswa>(hparams, cparams, mctx_cur);
 
