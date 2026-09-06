@@ -639,6 +639,11 @@ bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_t
     return device->iface.supports_op(device, op);
 }
 
+bool ggml_backend_dev_supports_event_query(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    return device->iface.event_query != NULL;
+}
+
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(device);
     return device->iface.supports_buft(device, buft);

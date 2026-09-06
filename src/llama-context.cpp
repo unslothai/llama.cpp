@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3546,6 +3547,24 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
         ggml_backend_dev_get_props(dev, &props);
 
         if (!props.caps.async || !props.caps.events) {
+            continue;
+        }
+
+        // A device that advertises events but does not implement event_query is no use
+        // here. ggml_backend_event_query() then answers the only way it can, by waiting for
+        // the event, so the first poll of a transfer blocks the caller for the whole copy --
+        // the very stall this exists to remove, except that the caller has been told the
+        // copy is asynchronous and has stopped looking for it. Such a device is left out, so
+        // that state_seq_copy_init() returns NULL and the caller keeps the synchronous calls
+        // it already had.
+        if (!ggml_backend_dev_supports_event_query(dev)) {
+            static std::atomic<bool> warned(false);
+
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_INFO("%s: %s cannot test an event without waiting for it, so sequence "
+                               "states are copied synchronously\n", __func__, ggml_backend_dev_name(dev));
+            }
+
             continue;
         }
 

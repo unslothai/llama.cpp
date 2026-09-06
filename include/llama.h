@@ -944,8 +944,9 @@ extern "C" {
     // written. llama_state_seq_copy_free() waits for an outstanding copy first.
     struct llama_state_seq_copy;
 
-    // NULL if the context's backends cannot copy asynchronously; the caller then uses the
-    // synchronous llama_state_seq_*_data_ext calls
+    // NULL if the context's backends cannot copy asynchronously, or cannot say whether a
+    // copy has finished without waiting for it, which would put the stall straight back; the
+    // caller then uses the synchronous llama_state_seq_*_data_ext calls
     LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
     LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
 
