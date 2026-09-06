@@ -3226,12 +3226,19 @@ private:
     // its copy lands, so it has to fire early enough that everything still decoding has
     // somewhere to put its tokens until then. The same figure gates a resume, so that a slot
     // is not put back into a pool it would immediately have to be taken out of again.
-    int32_t preempt_n_margin() const {
+    //
+    // n_additional_running is for slots that are not running yet but are about to be: a
+    // resume candidate is still PREEMPTED while it is being considered, so it is not counted
+    // by the loop below, yet the moment it is admitted it starts decoding and needs the same
+    // runway as everybody else. Admitting it without charging it that runway is what the
+    // margin exists to prevent, and it showed up as a slot restored and parked again a few
+    // iterations later, over and over.
+    int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
         if (!preempt_async_active()) {
             return PREEMPT_N_MARGIN;
         }
 
-        int32_t n_running = 0;
+        int32_t n_running = n_additional_running;
 
         for (const auto & slot : slots) {
             if (slot.is_processing() && !slot.preempt_is_out()) {
@@ -3457,12 +3464,14 @@ private:
             server_slot * best = nullptr;
 
             // Room for the sequence AND for the next step of everything already running,
-            // so that a resume cannot immediately trigger the preemption of someone else.
+            // and for the lookahead of the candidate itself, which is about to become one of
+            // them: a resume must not immediately trigger the preemption of someone else, or
+            // of itself.
             // A cached prompt on an idle slot is worth less than a conversation waiting to
             // continue, so give those cells up first - same call the KV-full path makes.
             for (;;) {
                 for (auto * slot : parked) {
-                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin() <= n_cells) {
+                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin(1) <= n_cells) {
                         best = slot;
                         break;
                     }
