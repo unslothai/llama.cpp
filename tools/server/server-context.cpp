@@ -37,6 +37,19 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// [TAG_EXACT_CONCURRENCY] the knob is read from the environment by the KV cache, the batch
+// splitter and the CUDA backend independently, because it has to be answered before a
+// context exists. The server needs the same answer to refuse the one request shape the mode
+// cannot serve, so it reads it the same way rather than growing a public API for it.
+static bool server_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -4685,6 +4698,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // [TAG_EXACT_CONCURRENCY] the children of an n_cmpl > 1 task are served by
+            // copying the parent's cells to another sequence id, and exact mode gives a KV
+            // page to one sequence, so there is nothing for that copy to land in. Refuse
+            // the request here, where it becomes a 400 the client can read, rather than
+            // letting it reach seq_cp with nothing to do.
+            if (task.params.n_cmpl > 1 && server_exact_concurrency()) {
+                throw std::runtime_error(
+                    "n > 1 is not supported while LLAMA_EXACT_CONCURRENCY is set: each "
+                    "completion needs its own sequence, and in exact mode a KV page belongs "
+                    "to a single sequence. Send n separate requests, or unset the variable.");
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

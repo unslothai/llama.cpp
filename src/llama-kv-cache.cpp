@@ -582,16 +582,21 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    // [TAG_EXACT_CONCURRENCY] a page belongs to one (sequence, position/256) pair, so two sequences
-    // cannot share physical cells. Refuse the copy rather than abort the process: this is reachable
-    // from a request parameter.
-    if (exact_pages && seq_id_src != seq_id_dst) {
-        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so cells cannot be shared between "
-                "sequences: ignoring the copy from seq %d to seq %d\n", __func__, seq_id_src, seq_id_dst);
-        return;
-    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] a page belongs to one sequence, so cells cannot be shared
+    // between two of them. Refuse the operation rather than abort the process: a server
+    // rejects the request that would reach here (n_cmpl > 1), and any caller this does not
+    // cover degrades to a failed copy it can report instead of killing every other request
+    // on the machine. Placed after the shared-cells return so a draft cache, which copies
+    // nothing of its own, is unaffected.
+    if (exact_pages && seq_id_src != seq_id_dst) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support copying cells between "
+                        "sequences (%d -> %d); ignoring the copy\n",
+                        __func__, seq_id_src, seq_id_dst);
         return;
     }
 
@@ -712,16 +717,18 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo 256, so a
-    // shift would have to move the cells too. get_can_shift() reports this so that --context-shift
-    // and --cache-reuse are turned off at load; this is the guard for the library API.
-    if (exact_pages && shift != 0) {
-        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so positions cannot be shifted: "
-                "ignoring the shift of %d on seq %d\n", __func__, shift, seq_id);
-        return;
-    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo the
+    // page size, so shifting positions would put every cell of the sequence in the wrong
+    // place. Context shift is unsupported in exact mode; say so rather than abort.
+    if (exact_pages && shift != 0) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support shifting positions "
+                        "(seq %d, shift %d); ignoring the shift\n",
+                        __func__, seq_id, shift);
         return;
     }
 
@@ -770,15 +777,17 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    // [TAG_EXACT_CONCURRENCY] same reason as seq_add: the offset inside a page is derived from the
-    // position, so dividing the positions would leave every cell in the wrong slot.
-    if (exact_pages && d != 1) {
-        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so positions cannot be divided: "
-                "ignoring the division by %d on seq %d\n", __func__, d, seq_id);
-        return;
-    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] same reason as seq_add: dividing positions breaks the
+    // identity between a cell's position and its offset inside its page.
+    if (exact_pages && d != 1) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support dividing positions "
+                        "(seq %d, d %d); ignoring the division\n",
+                        __func__, seq_id, d);
         return;
     }
 
