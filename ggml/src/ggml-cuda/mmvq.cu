@@ -541,6 +541,21 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// [TAG_BATCH_INVARIANT]
+bool ggml_cuda_mmvq_matches_single_column(enum ggml_type type, int cc, int64_t ncols_dst) {
+    if (ncols_dst < 1 || ncols_dst > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    if (table_id == MMVQ_PARAMETERS_GB10) {
+        // There nwarps also depends on the K loop trip count, which the caller does not pass in.
+        return ncols_dst == 1;
+    }
+    // blocks_per_iter, which is what assigns K blocks to threads, is proportional to nwarps.
+    // rows_per_cuda_block only changes which rows a block owns, not the order within a row.
+    return calc_nwarps(type, 1, table_id) == calc_nwarps(type, (int) ncols_dst, table_id);
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(

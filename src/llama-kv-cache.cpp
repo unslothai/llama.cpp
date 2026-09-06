@@ -84,6 +84,14 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
+    const char * exact_env = getenv("LLAMA_EXACT_CONCURRENCY");
+    exact_pages = exact_env && atoi(exact_env) != 0;
+    if (exact_pages) {
+        GGML_ASSERT(unified && offload && !v_trans && n_swa == 0);
+        GGML_ASSERT(type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16);
+        GGML_ASSERT(kv_size % exact_page_size == 0);
+    }
+
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
@@ -447,6 +455,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    GGML_ASSERT(!exact_pages || seq_id_src == seq_id_dst);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -566,6 +575,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    GGML_ASSERT(!exact_pages || shift == 0);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -616,6 +626,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    GGML_ASSERT(!exact_pages || d == 1);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -961,6 +972,48 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         }
     }
 
+    if (exact_pages) {
+        // Reconstruct page ownership from live cells. Empty pages are immediately reusable;
+        // prepare() can roll back its speculative allocations without a second metadata log.
+        const auto & cells = v_cells[0];
+        using page_key = std::pair<llama_seq_id, llama_pos>;
+        std::map<page_key, uint32_t> pages;
+        std::vector<bool> occupied(cells.size()/exact_page_size, false);
+        std::vector<bool> assigned(cells.size(), false);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) { continue; }
+            GGML_ASSERT(cells.seq_count(i) == 1);
+            const auto pos = cells.pos_get(i);
+            GGML_ASSERT(pos >= 0 && uint32_t(pos)%exact_page_size == i%exact_page_size);
+            const page_key key {cells.seq_get(i), pos/exact_page_size};
+            auto ins = pages.emplace(key, i/exact_page_size);
+            GGML_ASSERT(ins.first->second == i/exact_page_size);
+            occupied[i/exact_page_size] = true;
+        }
+        slot_info res {0, 0, {0}, {{}}};
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            GGML_ASSERT(ubatch.n_seq_id[i] == 1 && ubatch.pos[i] >= 0);
+            const page_key key {ubatch.seq_id[i][0], ubatch.pos[i]/exact_page_size};
+            auto it = pages.find(key);
+            if (it == pages.end()) {
+                // Round-robin free-page search deliberately permits nonmonotonic physical order.
+                uint32_t page = v_heads[0]/exact_page_size;
+                uint32_t tested = 0;
+                while (tested < occupied.size() && occupied[page%occupied.size()]) { ++page; ++tested; }
+                if (tested == occupied.size()) { return {}; }
+                page %= occupied.size();
+                occupied[page] = true;
+                it = pages.emplace(key, page).first;
+            }
+            const uint32_t idx = it->second*exact_page_size + ubatch.pos[i]%exact_page_size;
+            if (!cells.is_empty(idx) || assigned[idx]) { return {}; }
+            assigned[idx] = true;
+            res.idxs[0].push_back(idx);
+        }
+        if (cont && !res.is_contiguous()) { return {}; }
+        return res;
+    }
+
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
 
@@ -1232,7 +1285,50 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+ggml_tensor * llama_kv_cache::build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!exact_pages) { return nullptr; }
+    auto * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + get_size()/exact_page_size, ubatch.n_tokens);
+    ggml_set_input(pages);
+    ggml_set_name(pages, "attn_logical_pages");
+    return pages;
+}
+
+void llama_kv_cache::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(exact_pages && dst->ne[1] == ubatch->n_tokens);
+    std::map<llama_seq_id, std::map<llama_pos, uint32_t>> pages;
+    const auto & cells = v_cells[0];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) {
+            GGML_ASSERT(cells.seq_count(i) == 1);
+            pages[cells.seq_get(i)][cells.pos_get(i)/exact_page_size] = i/exact_page_size;
+        }
+    }
+    std::vector<int32_t> data(ggml_nelements(dst), -1);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1);
+        auto * row = data.data() + i*dst->ne[0];
+        row[0] = 0;
+        for (const auto & page : pages[ubatch->seq_id[i][0]]) {
+            // Exclude wholly future pages even when prefill includes later query rows.
+            if (page.first*exact_page_size > uint32_t(ubatch->pos[i])) { break; }
+            row[++row[0]] = page.second;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int32_t));
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_pages(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_pages(dst, ubatch);
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    // The physical view spans the pool. The page map, independently padded per query,
+    // is the only loop bound for exact attention; neighbours cannot extend that loop.
+    if (exact_pages) { return get_size(); }
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -2283,6 +2379,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             GGML_ASSERT(cells.seq_has(idx, dest_seq_id));
         }
     } else {
+        GGML_ASSERT(!exact_pages && "exact mode supports per-sequence restore only");
         // whole KV cache restore
 
         if (cell_count > cells.size()) {

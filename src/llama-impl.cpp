@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <sstream>
@@ -168,4 +169,14 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool llama_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
 }
