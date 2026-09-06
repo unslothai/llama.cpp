@@ -2119,8 +2119,13 @@ Details:
   slot that still holds its prefix, whichever group that slot belongs to.
 - Task processing briefly pauses the decode loops, so `/slots`, `/metrics` and cancellations are
   answered after the in-flight decode of each group finishes rather than during it.
-- `N > 1` is refused at startup together with speculative decoding (`--model-draft`, MTP),
-  multimodal (`--mmproj`) and `--sleep-idle-seconds`.
+- Speculative decoding works per group: every group owns a draft or MTP context bound to its own
+  target context and a `common_speculative` of its own, so `--spec-type draft-mtp` and
+  `--model-draft` combine with `N > 1` (with `--model-draft` the draft model is loaded once per
+  group). Slot save / restore, checkpoints and the prompt cache carry the draft state exactly as
+  with one group.
+- `N > 1` is refused at startup together with multimodal (`--mmproj`), `--control-vector` and
+  `--sleep-idle-seconds`.
 - With `N = 1` nothing changes: one context, one batch and one update loop on the main thread.
 - Each group samples its own rows over a small worker pool, because a serial pass over the slots
   costs tens of milliseconds per step between the decode and the next submit and, at `N > 1`,

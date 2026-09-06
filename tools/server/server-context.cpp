@@ -956,6 +956,19 @@ struct server_group {
     // slots owned by this group, in slot id order (slots are partitioned contiguously)
     std::vector<server_slot *> slots;
 
+    // speculative decoding state of this group
+    // note: a common_speculative and its draft (or MTP) context are bound to one target context,
+    //       so each group owns its own set, sized for the group's sequences and indexed by
+    //       slot.seq_id (which is slot.id with a single group)
+    common_speculative_init_result_ptr spec_init;
+
+    llama_model   * model_dft = nullptr;
+    llama_context * ctx_dft   = nullptr;
+
+    common_speculative_ptr spec;
+
+    common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
     int64_t  t_decode_start  = 0; // start of the last submitted decode of this group
@@ -1059,15 +1072,9 @@ private:
     std::mutex mtx_metrics;
     std::mutex mtx_prompt_cache;
 
-    llama_model   * model_dft = nullptr;
-    llama_context * ctx_dft   = nullptr;
-
-    common_speculative_init_result_ptr spec_init;
-
+    // note: the speculative decoding state (draft / MTP context, common_speculative) lives in
+    //       the groups, see struct server_group
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-    common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-
-    common_speculative_ptr spec;
 
     bool add_bos_token = true;
 
@@ -1102,11 +1109,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        spec.reset();
-        spec_init.reset();
+        // the draft / MTP context of a group refers to the group's context, so it goes first
+        for (auto & grp : groups) {
+            grp->spec.reset();
+            grp->spec_init.reset();
 
-        ctx_dft   = nullptr;
-        model_dft = nullptr;
+            grp->ctx_dft   = nullptr;
+            grp->model_dft = nullptr;
+        }
 
         // groups[0]->ctx is owned by llama_init, the rest were created by llama_init_from_model()
         for (size_t g = 1; g < groups.size(); ++g) {
@@ -1276,7 +1286,7 @@ private:
         // every code path below exactly as it was.
         n_groups = std::max(1, n_pipeline_groups_req);
 
-        if (n_groups > 1 && !validate_pipeline_groups(params_base, has_spec, has_mmproj)) {
+        if (n_groups > 1 && !validate_pipeline_groups(params_base, has_mmproj)) {
             return false;
         }
 
@@ -1366,30 +1376,40 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
-            {
-                common_params params_dft = common_base_params_to_speculative(params_base);
+            // one draft / MTP context per group, each bound to the context of its group and sized
+            // for the group's sequences (with a single group params_ctx is params_base, as before)
+            // note: with --model-draft the draft model is loaded once per group
+            for (int g = 0; g < n_groups; ++g) {
+                server_group & grp = *groups[g];
+
+                common_params params_dft = common_base_params_to_speculative(params_ctx);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
-                model_dft = spec_init->model();
-                ctx_dft   = spec_init->context();
+                grp.spec_init = common_speculative_init_from_params(params_dft, model_tgt, grp.ctx);
+                grp.model_dft = grp.spec_init->model();
+                grp.ctx_dft   = grp.spec_init->context();
 
-                if (has_draft && model_dft == nullptr) {
+                if (has_draft && grp.model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (grp.ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
 
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+                if (n_groups > 1) {
+                    SRV_INF("created draft context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
+                            g, (int) llama_n_ctx(grp.ctx_dft), (int) llama_n_seq_max(grp.ctx_dft));
+                }
             }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = groups[0]->ctx_dft;
 
             load_progress_callback(1.0f, &load_progress_spec);
         }
@@ -1474,26 +1494,33 @@ private:
         }
 
         // try speculative decoding
-        // note: a common_speculative is bound to one target context, and its code paths yield to
-        //       the task queue, which only one thread may do - so it is off with several groups
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && n_groups == 1) {
-            try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-            } catch (const std::exception & e) {
-                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+        // note: a common_speculative is bound to one target context, so each group gets its own,
+        //       sized for the group's sequences (n_seq_per_group == n_parallel with one group)
+        for (auto & grp : groups) {
+            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                common_params_speculative params_spec = params_base.speculative;
+
+                params_spec.draft.ctx_tgt = grp->ctx;
+                params_spec.draft.ctx_dft = grp->ctx_dft;
+
+                try {
+                    grp->spec.reset(common_speculative_init(params_spec, n_seq_per_group));
+                } catch (const std::exception & e) {
+                    SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                }
             }
-        }
 
-        if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
-        }
+            if (grp->ctx_dft) {
+                grp->ctx_dft_seq_rm_type = common_context_can_seq_rm(grp->ctx_dft);
+            }
 
-        if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
-        } else {
-            spec_init.reset();
-            ctx_dft   = nullptr;
-            model_dft = nullptr;
+            if (grp->spec) {
+                SRV_TRC("%s", "speculative decoding context initialized\n");
+            } else {
+                grp->spec_init.reset();
+                grp->ctx_dft   = nullptr;
+                grp->model_dft = nullptr;
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1506,11 +1533,11 @@ private:
             slot.id_group = grp.id;
             slot.seq_id   = i % n_seq_per_group;
             slot.ctx_tgt  = grp.ctx;
-            slot.ctx_dft  = ctx_dft;
-            slot.mem.init(grp.ctx, ctx_dft);
+            slot.ctx_dft  = grp.ctx_dft;
+            slot.mem.init(grp.ctx, grp.ctx_dft);
 
             grp.slots.push_back(&slot);
-            slot.spec    = spec.get();
+            slot.spec    = grp.spec.get();
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
@@ -1641,7 +1668,7 @@ private:
     }
 
     // refuse everything we cannot make safe with more than one context, rather than half-support it
-    bool validate_pipeline_groups(const common_params & params, bool has_spec, bool has_mmproj) const {
+    bool validate_pipeline_groups(const common_params & params, bool has_mmproj) const {
         auto refuse = [](const char * what) {
             SRV_ERR("--pipeline-groups > 1 is not supported together with %s\n", what);
             return false;
@@ -1663,10 +1690,8 @@ private:
             return false;
         }
 
-        // a common_speculative and its draft context are bound to one target context
-        if (has_spec) {
-            return refuse("speculative decoding (--model-draft / MTP)");
-        }
+        // note: speculative decoding is fine - every group owns a draft / MTP context and a
+        //       common_speculative of its own, see struct server_group
 
         // mtmd_context is bound to one llama_context
         if (has_mmproj) {
@@ -2783,7 +2808,7 @@ private:
         cur.update_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        common_speculative_get_state(slot.spec, slot.seq_id, cur.data_spec);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3447,6 +3472,11 @@ private:
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
         (void) ctx_tgt;
+
+        // the speculative state of this group
+        auto & spec    = grp.spec;
+        auto * ctx_dft = grp.ctx_dft;
+        const auto ctx_dft_seq_rm_type = grp.ctx_dft_seq_rm_type;
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3536,7 +3566,7 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                common_speculative_get_draft_params(spec.get(), slot.seq_id).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3565,7 +3595,7 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        common_speculative_get_draft_params(spec.get(), slot.seq_id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
@@ -3581,10 +3611,16 @@ private:
         });
 
         // generate the actual drafts (if any)
+        // note: only the main thread may yield to the task queue, and with several groups each
+        //       group drafts on its own thread and against its own draft context
         if (!drafting.empty()) {
-            queue_tasks.yield_to_queue([&]() {
+            if (n_groups > 1) {
                 common_speculative_draft(spec.get());
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    common_speculative_draft(spec.get());
+                });
+            }
         }
 
         // make checkpoints if needed
@@ -3909,7 +3945,7 @@ private:
                                         it->load_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_state(spec.get(), slot.seq_id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -4192,6 +4228,10 @@ private:
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
 
+        // the speculative state of this group
+        auto & spec      = grp.spec;
+        auto * model_dft = grp.model_dft;
+
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode(grp);
@@ -4327,13 +4367,17 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        // note: speculative decoding is refused with more than one group, so this always runs on
-        //       the main thread and yield_to_queue() is safe here
+        // note: only the main thread may yield to the task queue; with several groups the batch
+        //       goes through this group's draft context on this group's thread
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
+            if (n_groups > 1) {
                 ok = common_speculative_process(spec.get(), batch_view);
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch_view);
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4375,6 +4419,9 @@ private:
         // shadow the single-context members, as update_slots() does
         auto * ctx_tgt = grp.ctx;
         auto & slots   = grp.slots;
+
+        // the speculative state of this group
+        auto & spec = grp.spec;
         (void) ctx_tgt;
 
         // for checking if a given batch index is inside batch_view
@@ -4487,7 +4534,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    common_speculative_begin(spec.get(), slot.seq_id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4619,7 +4666,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.seq_id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }
