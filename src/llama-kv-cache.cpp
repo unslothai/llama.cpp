@@ -507,7 +507,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(!exact_pages || seq_id_src == seq_id_dst);
+    // [TAG_EXACT_CONCURRENCY] a page belongs to one (sequence, position/256) pair, so two sequences
+    // cannot share physical cells. Refuse the copy rather than abort the process: this is reachable
+    // from a request parameter.
+    if (exact_pages && seq_id_src != seq_id_dst) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so cells cannot be shared between "
+                "sequences: ignoring the copy from seq %d to seq %d\n", __func__, seq_id_src, seq_id_dst);
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -627,7 +634,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    GGML_ASSERT(!exact_pages || shift == 0);
+    // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo 256, so a
+    // shift would have to move the cells too. get_can_shift() reports this so that --context-shift
+    // and --cache-reuse are turned off at load; this is the guard for the library API.
+    if (exact_pages && shift != 0) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so positions cannot be shifted: "
+                "ignoring the shift of %d on seq %d\n", __func__, shift, seq_id);
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -678,7 +692,13 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    GGML_ASSERT(!exact_pages || d == 1);
+    // [TAG_EXACT_CONCURRENCY] same reason as seq_add: the offset inside a page is derived from the
+    // position, so dividing the positions would leave every cell in the wrong slot.
+    if (exact_pages && d != 1) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, so positions cannot be divided: "
+                "ignoring the division by %d on seq %d\n", __func__, d, seq_id);
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1276,6 +1296,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo 256, so the
+    // paged pool cannot shift positions. Reporting it here is what makes the server disable
+    // --context-shift and --cache-reuse at load, with a warning, instead of accepting both and
+    // failing on the first request that needs them.
+    if (exact_pages) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -2431,8 +2458,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             GGML_ASSERT(cells.seq_has(idx, dest_seq_id));
         }
     } else {
-        GGML_ASSERT(!exact_pages && "exact mode supports per-sequence restore only");
         // whole KV cache restore
+
+        // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
+        // index, which the paged pool owns. Report it like every other failure in this function.
+        if (exact_pages) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state "
+                    "restore only\n", __func__);
+            return false;
+        }
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
