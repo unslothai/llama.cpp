@@ -267,3 +267,30 @@ def test_metrics_and_slots_report_the_parked_state():
     res = server.make_request("GET", "/slots")
     assert res.status_code == 200
     assert sum(slot["n_preempt"] for slot in res.body) == 0, "n_preempt is per task and resets with the slot"
+
+
+def test_two_prompts_near_the_context_size_both_complete():
+    # Two prompts that each fit the context alone but not together. The second one is
+    # parked before it takes any cells, and it is close enough to n_ctx that its sequence
+    # plus its first batch would not leave the usual scheduling margin. It must still be
+    # restored once the first one finishes: with nothing resident there is nobody to keep
+    # the margin for. Before the fix it was parked for ever, with no restore ever tried.
+    global server
+    server.n_ctx = 256
+    # the whole prompt in one batch, so the parked slot's first step is the whole prompt
+    server.n_batch = 256
+    server.start()
+    log = LogReader(server.log_path)
+
+    # sized in tokens, not words: the prompt is the token ids of a short sentence repeated
+    base = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there was a little girl"}).body["tokens"]
+    long_prompt = (base * 64)[:250]
+    n_predict = 4
+    together = parallel_function_calls([(_complete, (n_predict, long_prompt)) for _ in range(2)])
+
+    text = log.drain()
+    assert "cannot fit the pool" not in text
+
+    for res in together:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
