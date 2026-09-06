@@ -448,6 +448,13 @@ struct server_slot {
             return;
         }
 
+        // the buffer is only ever read by send_final_response(), and only when the request
+        // asked for per-token probabilities. Without them every token still copied a string
+        // and a vector into a list that grows for the whole generation and is then dropped.
+        if (task->params.sampling.n_probs <= 0) {
+            return;
+        }
+
         generated_token_probs.push_back(token);
     }
 
