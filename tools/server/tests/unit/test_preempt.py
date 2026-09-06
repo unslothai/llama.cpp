@@ -730,3 +730,36 @@ def test_the_rotation_parks_a_resident_that_lets_the_head_in():
     text = open(server.log_path).read()
     assert "rotated out after" in text
     assert "Context size has been exceeded" not in text
+
+
+def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_server_lives():
+    # One request asking for two completions is one conversation in two slots: a parent
+    # and a child sharing the prompt. When the two together do not fit the pool there is
+    # nobody else to park, since the family is charged once and a member of it is not a
+    # victim for the other, so the request gets the context error it would get alone, and
+    # the server carries on serving.
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/completion", data={
+        "n_predict": 160,
+        "n_cmpl": 2,
+        "prompt": "Once upon a time there was a brave knight who",
+        "ignore_eos": True,
+        "return_tokens": True,
+        "temperature": 0.0,
+        "seed": 42,
+    })
+    assert res.status_code == 500
+    assert "Context size has been exceeded" in res.body["error"]["message"]
+
+    text = log.drain()
+    assert "preempted as a last resort" not in text, "a family alone in the pool has no victim"
+    assert "GGML_ASSERT" not in text
+
+    after = _complete(8)
+    assert after.status_code == 200
+    assert after.body["timings"]["predicted_n"] == 8
