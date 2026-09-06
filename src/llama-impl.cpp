@@ -199,12 +199,41 @@ static std::recursive_mutex g_exact_mutex;
 // context created under a narrower figure would batch above the bound it reported.
 static std::atomic<uint32_t> g_exact_max_n_seq{0};
 
+static bool llama_exact_width_within_explicit_bound(uint32_t n_cols);
+
+// the width is sequences times tokens, handed to a backend as an int; a product that does not
+// fit is refused rather than wrapped
+static bool llama_exact_width_of(uint32_t n_seq, uint32_t n_tokens, uint32_t & n_cols) {
+    const uint64_t w = (uint64_t) n_seq * (uint64_t) n_tokens;
+
+    if (w > (uint64_t) INT32_MAX) {
+        LLAMA_LOG_ERROR("%s: a decode step of %u sequences with %u tokens each is too wide to report\n", __func__, n_seq, n_tokens);
+        return false;
+    }
+
+    n_cols = (uint32_t) w;
+
+    return true;
+}
+
+bool llama_exact_check_n_seq(uint32_t n_seq) {
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
+
+    uint32_t n_cols = 0;
+
+    return llama_exact_width_of(n_seq_max, llama_exact_decode_tokens(), n_cols) && llama_exact_width_within_explicit_bound(n_cols);
+}
+
 bool llama_exact_report_n_seq(uint32_t n_seq) {
     std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
 
     const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
 
-    if (!llama_set_exact_decode_width(n_seq_max * llama_exact_decode_tokens())) {
+    uint32_t n_cols = 0;
+
+    if (!llama_exact_width_of(n_seq_max, llama_exact_decode_tokens(), n_cols) || !llama_set_exact_decode_width(n_cols)) {
         return false;
     }
 
@@ -231,7 +260,9 @@ bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
     // reported first; a figure the explicit bound cannot cover leaves the old one in place
     const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
 
-    if (n_seq > 0 && !llama_set_exact_decode_width(n_seq * n_tokens)) {
+    uint32_t n_cols = 0;
+
+    if (n_seq > 0 && (!llama_exact_width_of(n_seq, n_tokens, n_cols) || !llama_set_exact_decode_width(n_cols))) {
         return false;
     }
 

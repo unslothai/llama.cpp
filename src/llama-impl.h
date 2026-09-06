@@ -113,3 +113,7 @@ bool llama_exact_concurrency();
 // [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so that the
 // decode width every context needs is known to the backend and follows llama_set_exact_decode_tokens
 bool llama_exact_report_n_seq(uint32_t n_seq);
+
+// the same check without the report: whether a context of n_seq sequences could be reported
+// under the explicit column bound, for a constructor that may still fail after asking
+bool llama_exact_check_n_seq(uint32_t n_seq);
