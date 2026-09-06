@@ -192,23 +192,35 @@ static std::atomic<uint32_t> g_exact_decode_tokens{1};
 // context created under a narrower figure would batch above the bound it reported.
 static std::atomic<uint32_t> g_exact_max_n_seq{0};
 
-void llama_exact_report_n_seq(uint32_t n_seq) {
+bool llama_exact_report_n_seq(uint32_t n_seq) {
+    const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
+
+    if (!llama_set_exact_decode_width(n_seq_max * llama_exact_decode_tokens())) {
+        return false;
+    }
+
     uint32_t cur = g_exact_max_n_seq.load(std::memory_order_relaxed);
 
     while (n_seq > cur && !g_exact_max_n_seq.compare_exchange_weak(cur, n_seq, std::memory_order_relaxed)) {
     }
 
-    llama_set_exact_decode_width(g_exact_max_n_seq.load(std::memory_order_relaxed) * llama_exact_decode_tokens());
+    return true;
 }
 
-void llama_set_exact_decode_tokens(uint32_t n_tokens) {
-    g_exact_decode_tokens.store(n_tokens > 0 ? n_tokens : 1, std::memory_order_relaxed);
+bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
+    n_tokens = n_tokens > 0 ? n_tokens : 1;
 
+    // every context that exists widens with the figure, so the width they will need is
+    // reported first; a figure the explicit bound cannot cover leaves the old one in place
     const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
 
-    if (n_seq > 0) {
-        llama_set_exact_decode_width(n_seq * llama_exact_decode_tokens());
+    if (n_seq > 0 && !llama_set_exact_decode_width(n_seq * n_tokens)) {
+        return false;
     }
+
+    g_exact_decode_tokens.store(n_tokens, std::memory_order_relaxed);
+
+    return true;
 }
 
 uint32_t llama_exact_decode_tokens(void) {
@@ -220,7 +232,29 @@ uint32_t llama_exact_decode_tokens(void) {
 // reached through the registry so that a backend that is absent or loaded late costs nothing.
 static std::atomic<uint32_t> g_exact_decode_width{0};
 
-void llama_set_exact_decode_width(uint32_t n_cols) {
+// an explicit column bound given to the CUDA backend wins over the reported width there, so a
+// width above it would leave decodes batched past the bound with the mode still reporting itself
+// on; a width the bound does not cover is refused instead of stored
+static bool llama_exact_width_within_explicit_bound(uint32_t n_cols) {
+    static const int explicit_cols = []() {
+        const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+        return val ? atoi(val) : -1;
+    }();
+
+    if (explicit_cols > 0 && (uint32_t) explicit_cols < n_cols) {
+        LLAMA_LOG_ERROR("%s: GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at least %u columns for the decode step just requested; raise it, set it to 0 for no bound, or unset it\n",
+                __func__, explicit_cols, n_cols);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_set_exact_decode_width(uint32_t n_cols) {
+    if (!llama_exact_width_within_explicit_bound(n_cols)) {
+        return false;
+    }
+
     uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
 
     while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
@@ -239,6 +273,8 @@ void llama_set_exact_decode_width(uint32_t n_cols) {
             fn((int) widest);
         }
     }
+
+    return true;
 }
 
 uint32_t llama_exact_decode_width(void) {

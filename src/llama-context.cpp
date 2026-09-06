@@ -123,7 +123,9 @@ llama_context::llama_context(
             }
         }
 
-        llama_exact_report_n_seq(cparams.n_seq_max);
+        if (!llama_exact_report_n_seq(cparams.n_seq_max)) {
+            throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
+        }
     }
 
     cparams.n_rs_seq = params.n_rs_seq;

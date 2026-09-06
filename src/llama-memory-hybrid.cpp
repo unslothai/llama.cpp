@@ -98,7 +98,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 // leaves a different gated delta net state than the same prompt processed alone.
                 // Giving such a sequence a ubatch of its own removes that. A plain decode step, one
                 // token per sequence, is already exact and stays batched.
-                const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
+                // The figure is passed whenever the mode is on, not only when a prompt is present:
+                // it also keeps sets of unequal token counts apart (see llama_batch_allocr::split_equal).
+                const uint32_t isolate = llama_exact_concurrency() ? llama_exact_decode_tokens() : 0;
 
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }

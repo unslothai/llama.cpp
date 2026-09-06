@@ -1472,9 +1472,6 @@ bool common_exact_concurrency_init(const common_params & params) {
 
     const int n_cols = common_exact_decode_width(params);
 
-    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is
-    llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel)));
-
     const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
     if (bound) {
         const int max_cols = atoi(bound);
@@ -1488,9 +1485,16 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // a context created later reports n_seq_max times the per-sequence width, which is this
-    // figure again; reporting it here as well covers a caller that decodes before that
-    llama_set_exact_decode_width((uint32_t) n_cols);
+    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode
+    // step is; a context created later reports n_seq_max times that figure, which is n_cols
+    // again, and reporting n_cols here as well covers a caller that decodes before that. Both
+    // refuse a width the explicit bound above cannot cover, which the check above already
+    // caught for this process; contexts created earlier by the caller are covered here.
+    if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
+        !llama_set_exact_decode_width((uint32_t) n_cols)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
+        return false;
+    }
 
     return true;
 }
