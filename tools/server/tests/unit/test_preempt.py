@@ -465,3 +465,31 @@ def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_hea
     for res in results:
         assert res.status_code == 200
         assert res.body["timings"]["predicted_n"] == n_predict
+
+
+def test_the_rotation_parks_a_resident_that_lets_the_head_in():
+    # Three generations with no end in a 256-cell pool with context shift on: two residents
+    # cycle through shifts while the third waits parked. Every rotation must let the head
+    # in, so all three keep finishing their tokens and no stream ends short.
+    global server
+    server.n_slots = 3
+    server.n_ctx = 384
+    server.enable_ctx_shift = True
+    server.start()
+    n_predict = 9000
+    prompts = [
+        "Once upon a time there was a brave knight who",
+        "The quick brown fox jumps over the lazy dog and",
+        "In a small village by the sea there lived a fisherman who",
+    ]
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {
+            "prompt": p, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        })) for p in prompts
+    ])
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] == n_predict
+    text = open(server.log_path).read()
+    assert "rotated out after" in text
+    assert "Context size has been exceeded" not in text
