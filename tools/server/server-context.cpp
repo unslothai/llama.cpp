@@ -3664,15 +3664,44 @@ private:
 
             server_slot * best = nullptr;
 
+            // A parked slot whose sequence plus its next step would not fit an empty pool can
+            // never be restored, and would otherwise sit at the head of the line for ever
+            // without a restore ever being attempted: a prompt within n_ctx that was parked
+            // before it took any cells, but too close to n_ctx to leave room for its first
+            // batch. That is the single-conversation overflow the KV-full path reports, so
+            // report it the same way and rescan the line without it.
+            {
+                server_slot * impossible = nullptr;
+
+                for (auto * slot : parked) {
+                    if (preempt_n_need(*slot) > n_cells) {
+                        impossible = slot;
+                        break;
+                    }
+                }
+
+                if (impossible) {
+                    SLT_WRN(*impossible, "parked sequence of %d tokens cannot fit the pool of %d cells even alone, failing it\n",
+                            preempt_n_need(*impossible), n_cells);
+                    send_error(*impossible, "Context size has been exceeded.");
+                    impossible->release();
+                    continue;
+                }
+            }
+
             // Room for the sequence AND for the next step of everything already running,
             // and for the lookahead of the candidate itself, which is about to become one of
             // them: a resume must not immediately trigger the preemption of someone else, or
-            // of itself.
+            // of itself. The margin is headroom for the others; with nothing resident there
+            // is nobody to keep it for, so a sequence that fits the pool exactly is let back in.
             // A cached prompt on an idle slot is worth less than a conversation waiting to
             // continue, so give those cells up first - same call the KV-full path makes.
             for (;;) {
+                const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
+                const int32_t margin   = occupied == 0 ? 0 : preempt_n_margin(1);
+
                 for (auto * slot : parked) {
-                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin(1) <= n_cells) {
+                    if (occupied + preempt_n_need(*slot) + margin <= n_cells) {
                         best = slot;
                         break;
                     }
