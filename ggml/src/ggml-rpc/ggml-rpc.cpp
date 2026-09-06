@@ -393,8 +393,11 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    // releasing a remote buffer must not abort: this runs during teardown, and if the peer is
+    // already gone then so is the buffer. The local context is freed either way.
+    if (!send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0)) {
+        GGML_LOG_ERROR("%s: failed to free the remote buffer, the connection is gone\n", __func__);
+    }
     delete ctx;
 }
 
@@ -823,24 +826,34 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
 }
 
-static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
+static bool get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
     rpc_msg_get_device_memory_req request;
     request.device = device;
     rpc_msg_get_device_memory_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response))) {
+        return false;
+    }
     *free = response.free_mem;
     *total = response.total_mem;
+    return true;
 }
 
 void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
+    *free = 0;
+    *total = 0;
     auto sock = get_socket(endpoint);
     if (sock == nullptr) {
-        *free = 0;
-        *total = 0;
         return;
     }
-    get_device_memory(sock, device, free, total);
+    // this is an informational device property, not part of the data path, and it is queried during
+    // teardown as well (the memory breakdown printed on exit), by which time the peer rpc-server may
+    // already be gone. A dead connection here must not abort the process: report the memory as
+    // unknown, which is what an endpoint we cannot connect to at all already reports.
+    if (!get_device_memory(sock, device, free, total)) {
+        GGML_LOG_ERROR("%s: failed to query device memory of %s, reporting 0\n", __func__, endpoint);
+        *free = 0;
+        *total = 0;
+    }
 }
 
 // RPC server-side implementation
