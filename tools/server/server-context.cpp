@@ -3617,6 +3617,10 @@ private:
         // page allocator any one of them can cost a whole page rather than a cell. Round the
         // runway up to a page so the park is issued with at least one page of real room
         // behind it; with a page size of 1 this is the figure it always was.
+        // The sum is rounded once, not once per running slot: every slot could cross a page
+        // boundary during the copy, but reserving a page for each of them would keep a page
+        // per slot out of the users' reach all the time, whereas the case it guards against
+        // costs one synchronous wait for a copy already in flight, in preempt_wait_in_flight().
         return preempt_n_cells(
                 PREEMPT_N_MARGIN + n_running * (1 + preempt_n_spec_max()) * PREEMPT_N_ASYNC_STEPS);
     }
