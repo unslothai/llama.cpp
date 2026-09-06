@@ -126,7 +126,16 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool fallback = ne01 % 128 != 0;
+    // The Blackwell MMQ tile table uses a 64-row / occupancy-2 tile for the K-quants and the FP4
+    // types, which is a win for dense mul_mat but a loss for mul_mat_id: the MoE launch picks its J
+    // from ncols_max = the total token count while each expert only holds
+    // ncols_max*n_expert_used/n_experts columns, so halving I only doubles the number of row tiles
+    // that pay for the mostly empty J tile. The table therefore keeps the stock 128-row tile in its
+    // fallback == true entries and mul_mat_id selects those. Requesting the bounds-checked variant
+    // is always safe: `fallback` only enables the src0->ne[1] range check in the tile loads and the
+    // write-back, so this cannot change results, and it is gated on Blackwell so no other GPU sees
+    // a different kernel.
+    const bool fallback = ne01 % 128 != 0 || (ids && blackwell_mma_available(cc));
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
