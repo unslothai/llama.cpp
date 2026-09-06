@@ -9,7 +9,7 @@ from prompts import PROMPTS
 # decides whether a run labelled as the mode-off reference actually was one, so it is not optional.
 RECORDED_ENV = ("LLAMA_EXACT_CONCURRENCY", "GGML_CUDA_BATCH_INVARIANT",
                 "GGML_CUDA_BATCH_INVARIANT_MAX_COLS", "LLAMA_SERVER_PREEMPT_EVERY",
-                "CUDA_VISIBLE_DEVICES")
+                "LLAMA_KV_CACHE_DEBUG", "LLAMA_BATCH_DEBUG", "CUDA_VISIBLE_DEVICES")
 
 MODEL_REL = "models/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 
