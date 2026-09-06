@@ -3145,6 +3145,14 @@ private:
         server_slot * leader    = nullptr;
         int32_t       n_running = 0;
 
+        // a slot just given a task is measured by the prefix it keeps, not by the previous
+        // request's prompt it still mirrors: measured by the mirror, a short request over a
+        // large stale cache would be the never-parked leader while the longest live
+        // conversation was parked in its place
+        for (auto & slot : slots) {
+            preempt_normalize_started(slot);
+        }
+
         for (auto & slot : slots) {
             if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
                 n_running++;
@@ -3182,8 +3190,6 @@ private:
             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
             }
-
-            preempt_normalize_started(slot);
 
             if (!preempt_fits_budget(slot)) {
                 continue;
