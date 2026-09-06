@@ -107,8 +107,10 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
-    const char * exact_env = getenv("LLAMA_EXACT_CONCURRENCY");
-    exact_pages = exact_env && atoi(exact_env) != 0;
+    // [TAG_EXACT_CONCURRENCY] read the knob through the one cached reader that the graph and the
+    // CUDA dispatcher also use, so a process that sets it between two context creations cannot end
+    // up with a paged cache on top of a dispatcher that is still in default mode
+    exact_pages = llama_exact_concurrency();
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -791,7 +793,15 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            // [TAG_EXACT_CONCURRENCY] split_simple packs every sequence's prompt tokens into one
+            // ubatch, so a sequence's prefill would run at a width its solo run never sees. Take
+            // the sequence-set split instead, which can give each prompt a ubatch of its own; a
+            // plain decode step has nothing to isolate and keeps taking split_simple.
+            const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
+
+            auto ubatch = n_stream == 1 && !isolate
+                ? balloc.split_simple(n_ubatch)
+                : balloc.split_equal(n_ubatch, n_stream > 1, 0, isolate);
 
             if (ubatch.n_tokens == 0) {
                 break;

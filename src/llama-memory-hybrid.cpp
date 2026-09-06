@@ -89,11 +89,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 // [TAG_EXACT_CONCURRENCY] the recurrent half of a hybrid model is not invariant to
                 // the shape of the ubatch: a prompt processed next to other sequences' prompt tokens
                 // leaves a different gated delta net state than the same prompt processed alone.
-                // Keeping such a ubatch to a single sequence removes that. A plain decode step, one
+                // Giving such a sequence a ubatch of its own removes that. A plain decode step, one
                 // token per sequence, is already exact and stays batched.
-                const uint32_t n_seqs_max = llama_exact_concurrency() && balloc.has_multi_token_seq() ? 1 : 0;
+                const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_seqs_max);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }
 
             if (ubatch.n_tokens == 0) {
