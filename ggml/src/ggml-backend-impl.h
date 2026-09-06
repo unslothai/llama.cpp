@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
