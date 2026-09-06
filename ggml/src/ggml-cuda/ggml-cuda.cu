@@ -2228,6 +2228,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_BATCH_INVARIANT]
     if (ggml_cuda_mul_mat_id_splits_tokens(dst)) {
         GGML_ASSERT(ne3 == 1 && src1->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+        // A quantized expert matrix takes the single-token MMVQ path for every token count, and
+        // that path can put the tokens on its sample axis in one launch rather than being
+        // re-entered once per token. Anything else is still recomputed one token at a time.
+        if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            return;
+        }
         ggml_cuda_mul_mat_id_split_tokens(ctx, dst);
         return;
     }
