@@ -927,6 +927,64 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // [TAG_STATE_ASYNC] asynchronous per-sequence state transfer
+    //
+    // llama_state_seq_get_data_ext / set_data_ext do not return until every byte has moved,
+    // so a caller that copies a sequence out of the cache to make room stops doing anything
+    // else for as long as the copy takes. A transfer object issues the same copies on a
+    // stream of its own and hands back control immediately; the caller polls
+    // llama_state_seq_copy_done() and gets on with its other work in between.
+    //
+    // The transfer owns the host buffer it reads from or writes into. That buffer is pinned
+    // when the backend offers pinned memory, which is what makes the copy fast, and it
+    // cannot be freed while a copy is still using it.
+    //
+    // Between issuing and completion the caller must not touch the buffer, must not free or
+    // reuse the cells of a sequence being read, and must not decode a sequence being
+    // written. llama_state_seq_copy_free() waits for an outstanding copy first.
+    struct llama_state_seq_copy;
+
+    // NULL if the context's backends cannot copy asynchronously; the caller then uses the
+    // synchronous llama_state_seq_*_data_ext calls
+    LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
+    LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
+
+    // Size the transfer's host buffer, keeping no contents; NULL on failure. Grow-only:
+    // page-locking host memory is far too slow to do once per transfer, so the memory is
+    // kept between them and only given back by llama_state_seq_copy_buf_free().
+    LLAMA_API uint8_t * llama_state_seq_copy_buf_resize  (struct llama_state_seq_copy * cpy, size_t size);
+    LLAMA_API uint8_t * llama_state_seq_copy_buf         (struct llama_state_seq_copy * cpy);
+    LLAMA_API size_t    llama_state_seq_copy_buf_size    (struct llama_state_seq_copy * cpy);
+    // host memory actually held, which is what a caller budgeting host RAM has to count
+    LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
+    LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
+
+    // true when the buffer is page-locked, i.e. when the copies can really overlap
+    LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
+
+    // issue the copies; return the number of bytes covered, 0 on failure
+    LLAMA_API size_t llama_state_seq_copy_get(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_copy_set(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+
+    // transfers the last issue posted: one per run of adjacent cells, per tensor
+    LLAMA_API size_t llama_state_seq_copy_n_copies(struct llama_state_seq_copy * cpy);
+
+    // microseconds the last issue spent waiting for the compute streams before it could start
+    LLAMA_API int64_t llama_state_seq_copy_sync_us(struct llama_state_seq_copy * cpy);
+
+    // non-blocking completion test, and the blocking wait behind it
+    LLAMA_API bool llama_state_seq_copy_done(struct llama_state_seq_copy * cpy);
+    LLAMA_API void llama_state_seq_copy_wait(struct llama_state_seq_copy * cpy);
+
     //
     // Decoding
     //

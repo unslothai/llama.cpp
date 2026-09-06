@@ -125,6 +125,9 @@ extern "C" {
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
+    // non-blocking: true once everything recorded before the event has completed.
+    // backends without a query implementation fall back to a blocking synchronize and return true.
+    GGML_API bool                 ggml_backend_event_query(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
     //
