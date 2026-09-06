@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "ggml-trace.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -702,10 +704,32 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// RAII span for the event tracer, one branch on ggml_trace_flag when tracing is off
+struct llama_trace_scope {
+    const char * name;
+    int64_t      t0;
+    int          n0;
+    int          n1;
+
+    llama_trace_scope(const char * name, int n0, int n1) :
+        name(name), t0(ggml_trace_flag ? ggml_trace_time_us() : 0), n0(n0), n1(n1) {}
+
+    ~llama_trace_scope() {
+        if (ggml_trace_flag) {
+            ggml_trace_eventf("llama", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
+        }
+    }
+
+    llama_trace_scope(const llama_trace_scope &) = delete;
+    llama_trace_scope & operator=(const llama_trace_scope &) = delete;
+};
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+
+    llama_trace_scope span("synchronize", (int) n_queued_tokens, 0);
 
     ggml_backend_sched_synchronize(sched.get());
 
@@ -1647,6 +1671,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    llama_trace_scope span_decode("decode", batch_inp.n_tokens, 0);
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2491,9 +2517,18 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    const int64_t t0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (ggml_trace_flag) {
+        // the individual splits are traced by the scheduler itself, this is the whole submit
+        ggml_trace_eventf("llama", "graph_compute", t0, ggml_trace_time_us(),
+                          "\"n_splits\":%d,\"n_nodes\":%d,\"batched\":%d",
+                          ggml_backend_sched_get_n_splits(sched.get()), ggml_graph_n_nodes(gf), batched ? 1 : 0);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

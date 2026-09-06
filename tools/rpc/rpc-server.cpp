@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-trace.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -175,6 +176,7 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    std::string              trace;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -186,6 +188,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "      --trace FILE                 write an event trace to FILE (same as GGML_RPC_TRACE)\n");
     fprintf(stderr, "\n");
 }
 
@@ -231,6 +234,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             if (params.port <= 0 || params.port > 65535) {
                 return false;
             }
+        } else if (arg == "--trace") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.trace = argv[i];
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -307,6 +315,8 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         fprintf(stderr, "\n");
     }
+
+    ggml_trace_open(params.trace.empty() ? nullptr : params.trace.c_str(), "rpc-server");
 
     auto devices = get_devices(params);
     if (devices.empty()) {
