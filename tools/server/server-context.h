@@ -110,6 +110,11 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // number of pipeline groups, i.e. independent llama_contexts over the one model, each with its
+    // own slots, batch and decode thread (--pipeline-groups, default 1)
+    // note: must be set before load_model() is called
+    void set_pipeline_groups(int n_groups);
 };
 
 
