@@ -3166,7 +3166,18 @@ private:
 
         // one batch is all the prompt slots get between them, however many are waiting; in
         // cells that batch can straddle one boundary more than it has tokens for
-        return res + std::min(res_pmt, preempt_n_cells(n_batch));
+        // one batch is all the prompt slots get between them, however many are waiting; under
+        // page allocation each of them can still cross a page boundary of its own within that
+        // batch, so the cap keeps one boundary per prompt slot on top of the batch
+        int32_t n_pmt = 0;
+
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                n_pmt++;
+            }
+        }
+
+        return res + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
     }
 
     // Keep the slot that is furthest along -- it is the closest to finishing and to giving

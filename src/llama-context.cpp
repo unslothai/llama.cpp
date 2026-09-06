@@ -416,6 +416,13 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_EXACT_CONCURRENCY] the paged attention the mode runs on is causal; a context
+        // created non-causal with a cache would assert on its first graph, so it is refused here
+        if (llama_exact_concurrency() && memory && !cparams.causal_attn) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so it cannot be created with non-causal attention\n", __func__);
+            throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
+        }
     }
 
     // init backends
