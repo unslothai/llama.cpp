@@ -88,13 +88,11 @@ constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is 
 // single wait by 2.5 to 3x for 0 to 3 percent of makespan at 8192 cells, and parks less often.
 // LLAMA_SERVER_PREEMPT_RESUME=pass keeps the previous order: most-preempted first, then longest
 // parked, and a smaller slot may pass a head that does not fit.
-static bool preempt_resume_head_of_line() {
-    static const bool head_of_line = []() {
-        const char * val = getenv("LLAMA_SERVER_PREEMPT_RESUME");
-        return !(val && strcmp(val, "pass") == 0);
-    }();
+// LLAMA_SERVER_PREEMPT_RESUME=head (the default) or pass; read once in load_model() and logged.
+static bool g_preempt_resume_head_of_line = true;
 
-    return head_of_line;
+static bool preempt_resume_head_of_line() {
+    return g_preempt_resume_head_of_line;
 }
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
@@ -1716,6 +1714,17 @@ private:
         }
 
         {
+            const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
+            if (LLAMA_SERVER_PREEMPT_RESUME && strcmp(LLAMA_SERVER_PREEMPT_RESUME, "head") != 0) {
+                if (strcmp(LLAMA_SERVER_PREEMPT_RESUME, "pass") != 0) {
+                    SRV_ERR("LLAMA_SERVER_PREEMPT_RESUME = %s is not a resume order; use head (the default) or pass\n",
+                            LLAMA_SERVER_PREEMPT_RESUME);
+                    return false;
+                }
+                g_preempt_resume_head_of_line = false;
+                SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_RESUME = pass (parked slots come back most-preempted first, and a smaller slot may pass a head that does not fit)\n");
+            }
+
             const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
             preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
 
