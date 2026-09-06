@@ -738,10 +738,19 @@ static bool send_get_tensors(const socket_ptr & sock, const std::vector<rpc_defe
     if (out_size != total) {
         return false;
     }
+
+    // One receive for the whole response, then scatter. The RDMA transport is not a byte stream:
+    // a receive completion carries exactly one send, and recv_data copies all of it, so reading a
+    // single sent message back in several pieces overruns the first destination and then blocks
+    // for a completion that never comes.
+    std::vector<uint8_t> response(total);
+    if (total > 0 && !sock->recv_data(response.data(), total)) {
+        return false;
+    }
+    size_t off = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (!sock->recv_data(gets[i]->data, gets[i]->size)) {
-            return false;
-        }
+        memcpy(gets[i]->data, response.data() + off, gets[i]->size);
+        off += gets[i]->size;
     }
     return true;
 }
