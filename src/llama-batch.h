@@ -117,6 +117,9 @@ public:
     // i.e. what remains of the batch holds a prompt rather than decode steps only
     bool has_seq_wider_than(uint32_t n_tokens) const;
 
+    // [TAG_EXACT_CONCURRENCY] true if some token carries more than one sequence id
+    bool has_shared_tokens() const;
+
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
