@@ -2286,6 +2286,8 @@ static size_t common_state_buffer_pool_cap() {
 void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
     std::vector<uint8_t> prev; // the caller's previous storage, offered back below
 
+    bool hit = false;
+
     {
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -2297,6 +2299,8 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
             // the caller's own allocation is already big enough, so it is already resident.
             // that is a reuse too, and the cheapest kind.
             st.n_hit++;
+
+            hit = true;
         } else {
             // best fit, so a large pooled buffer is not spent on a small request
             size_t best = free_bufs.size();
@@ -2317,6 +2321,8 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
                 std::swap(dst, prev);
 
                 st.n_hit++;
+
+                hit = true;
             }
         }
     }
@@ -2325,11 +2331,23 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
     // checkpoint later, so offer it back rather than dropping it on the floor
     put(std::move(prev));
 
-    // on a hit the pooled buffer normally already has exactly this size, so this is a no-op and
-    // the stale bytes are left in place. that is safe because every caller overwrites the whole
-    // buffer and aborts if the state does not fill it. when the sizes differ, the fill only
-    // touches pages that are already resident.
+    // on a hit the pooled buffer normally already has exactly this size, so this is a no-op.
+    // when the sizes differ the fill only touches pages that are already resident.
     dst.resize(size);
+
+    // then write the whole buffer once, the way resize() on a fresh allocation would.
+    //
+    // this looks like exactly the cost the pool exists to remove, and it is not. On a fresh
+    // mmap the fill costs 44 ms because it is faulting in 149 MiB one page at a time; over
+    // pages that are already mapped and resident it is a single store stream, 0.85 ms measured
+    // on a DGX Spark. It pays for itself: llama_state_seq_get_data_ext() copying into a
+    // recycled buffer that has NOT been touched measures 14.0 ms per call against 8.3 ms when
+    // it has, so the pass costs 0.85 ms and saves 5.7. The reason is the same one that makes
+    // the fill load bearing on a fresh allocation, only weaker: the device-to-host copy is
+    // fastest into host pages the CPU wrote last.
+    if (hit) {
+        memset(dst.data(), 0, size);
+    }
 }
 
 void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
