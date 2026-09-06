@@ -3841,7 +3841,11 @@ private:
                             continue;
                         }
 
-                        metrics.n_preempt++;
+                        // [TAG_PREEMPT_ASYNC] an asynchronous park is counted when its copy
+                        // lands, and the head is re-examined on the pass that sees the room
+                        if (slot.state != SLOT_STATE_PREEMPTING) {
+                            metrics.n_preempt++;
+                        }
 
                         SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn, preemptions %d\n",
                                 slot.n_ctx_shift, slot.prompt.n_tokens(),
