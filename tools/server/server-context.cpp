@@ -3757,6 +3757,10 @@ private:
 
             metrics.n_resume++;
 
+            // the restore landed here rather than in update_preempt_copies(), so the mirror
+            // of the park notice is sent here: no later poll sees this slot restoring
+            send_preempt_notice(slot, false);
+
             SLT_WRN(slot, "restore completed after %.2f ms (waited for, a context shift is due): %d tokens back in the cache, kv %d/%d, preemptions %d\n",
                     (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
                     slot.prompt.n_tokens(),
