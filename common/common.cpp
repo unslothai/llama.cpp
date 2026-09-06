@@ -1500,15 +1500,9 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // the CUDA backend may not be present or may be loaded dynamically, so go through the registry
-    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
-        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-
-        auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
-        if (fn) {
-            fn(n_cols);
-        }
-    }
+    // a context created later reports n_seq_max times the per-sequence width, which is this
+    // figure again; reporting it here as well covers a caller that decodes before that
+    llama_set_exact_decode_width((uint32_t) n_cols);
 
     return true;
 }
