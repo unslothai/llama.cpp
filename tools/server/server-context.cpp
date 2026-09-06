@@ -1286,6 +1286,27 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // [TAG_PREEMPT_ASYNC] the slots outlive this call -- they are declared after
+        // llama_init, so they are still there when it is reset here, and load_model() clears
+        // them only after the next context exists -- and any one of them may be holding a
+        // park or a resume that is still reading or writing KV tensors of the contexts about
+        // to be freed. release() makes the same wait for a single slot; this is the one that
+        // covers all of them, and on the sleeping-state path it is the only one there is,
+        // because the server carries on running afterwards.
+        for (auto & slot : slots) {
+            slot.preempt_copy_wait();
+
+            // the transfer holds a backend and an event of its own, and its host buffer is
+            // no use to the context that comes back: let go of both before that context's
+            // successor makes new ones
+            slot.preempt_cpy_tgt.reset();
+            slot.preempt_cpy_dft.reset();
+        }
+
+        // the next context allocates its own host buffers, so say again what they turn out
+        // to be
+        preempt_ram_kind_logged = false;
+
         spec.reset();
         spec_init.reset();
 
@@ -1673,8 +1694,11 @@ private:
 
             if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
                 if (preempt_async_ok) {
-                    SRV_INF("preemption: parking and resuming asynchronously, %s host memory\n",
-                            llama_state_seq_copy_buf_is_pinned(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+                    // no buffer has been allocated yet, so this is what the backend offers,
+                    // not what is held. What was actually got is reported by the first park,
+                    // because a host buffer type may still hand back ordinary memory.
+                    SRV_INF("preemption: parking and resuming asynchronously, backend offers %s host memory\n",
+                            llama_state_seq_copy_buf_can_pin(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
                 } else {
                     SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
                 }
@@ -3203,6 +3227,27 @@ private:
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
+    // [TAG_PREEMPT_ASYNC] whether the kind of host memory the parks actually got has been
+    // reported. It is only knowable once a buffer exists, and it is worth knowing: pinned
+    // memory is what lets the copies overlap, and a host buffer type is free to hand back
+    // ordinary memory instead of failing.
+    bool preempt_ram_kind_logged = false;
+
+    void preempt_log_ram_kind(const server_slot & slot) {
+        if (preempt_ram_kind_logged || !slot.preempt_is_async()) {
+            return;
+        }
+
+        if (llama_state_seq_copy_buf_capacity(slot.preempt_cpy_tgt.get()) == 0) {
+            return; // nothing held, so nothing to report yet
+        }
+
+        preempt_ram_kind_logged = true;
+
+        SRV_INF("preemption: parking into %s host memory\n",
+                llama_state_seq_copy_buf_is_pinned(slot.preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+    }
+
     // host RAM the parked sequences hold right now
     size_t preempt_ram_used() const {
         size_t res = 0;
@@ -3279,12 +3324,19 @@ private:
     // its copy lands, so it has to fire early enough that everything still decoding has
     // somewhere to put its tokens until then. The same figure gates a resume, so that a slot
     // is not put back into a pool it would immediately have to be taken out of again.
-    int32_t preempt_n_margin() const {
+    //
+    // n_additional_running is for slots that are not running yet but are about to be: a
+    // resume candidate is still PREEMPTED while it is being considered, so it is not counted
+    // by the loop below, yet the moment it is admitted it starts decoding and needs the same
+    // runway as everybody else. Admitting it without charging it that runway is what the
+    // margin exists to prevent, and it showed up as a slot restored and parked again a few
+    // iterations later, over and over.
+    int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
         if (!preempt_async_active()) {
             return PREEMPT_N_MARGIN;
         }
 
-        int32_t n_running = 0;
+        int32_t n_running = n_additional_running;
 
         for (const auto & slot : slots) {
             if (slot.is_processing() && !slot.preempt_is_out()) {
@@ -3533,12 +3585,14 @@ private:
             server_slot * best = nullptr;
 
             // Room for the sequence AND for the next step of everything already running,
-            // so that a resume cannot immediately trigger the preemption of someone else.
+            // and for the lookahead of the candidate itself, which is about to become one of
+            // them: a resume must not immediately trigger the preemption of someone else, or
+            // of itself.
             // A cached prompt on an idle slot is worth less than a conversation waiting to
             // continue, so give those cells up first - same call the KV-full path makes.
             for (;;) {
                 for (auto * slot : parked) {
-                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin() <= n_cells) {
+                    if (preempt_kv_used() + preempt_kv_reserve() + preempt_n_need(*slot) + preempt_n_margin(1) <= n_cells) {
                         best = slot;
                         break;
                     }
@@ -3615,6 +3669,8 @@ private:
                     slot.t_preempt_copy_us = ggml_time_us();
 
                     if (slot.preempt_save()) {
+                        preempt_log_ram_kind(slot);
+
                         // [TAG_PREEMPT_ASYNC] a slot left PREEMPTING is counted by
                         // update_preempt_copies() when its copy lands, not here
                         if (slot.state == SLOT_STATE_PREEMPTED) {
@@ -3673,6 +3729,8 @@ private:
             if (!victim->preempt_save()) {
                 break; // could not park it; the existing retry ladder is still behind us
             }
+
+            preempt_log_ram_kind(*victim);
 
             // [TAG_PREEMPT] the notice goes with the save, not with the cell release.
             // preempt_save() has already detached the victim, so from here it takes no part

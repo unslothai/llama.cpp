@@ -952,8 +952,9 @@ extern "C" {
     // written. llama_state_seq_copy_free() waits for an outstanding copy first.
     struct llama_state_seq_copy;
 
-    // NULL if the context's backends cannot copy asynchronously; the caller then uses the
-    // synchronous llama_state_seq_*_data_ext calls
+    // NULL if the context's backends cannot copy asynchronously, or cannot say whether a
+    // copy has finished without waiting for it, which would put the stall straight back; the
+    // caller then uses the synchronous llama_state_seq_*_data_ext calls
     LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
     LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
 
@@ -967,10 +968,20 @@ extern "C" {
     LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
     LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
 
-    // true when the buffer is page-locked, i.e. when the copies can really overlap
+    // true when the buffer that is held right now is page-locked, i.e. when the copies can
+    // really overlap. False while no buffer is held, since none is page-locked then: a
+    // caller asking before the first resize wants llama_state_seq_copy_buf_can_pin().
     LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
 
-    // issue the copies; return the number of bytes covered, 0 on failure
+    // true when the backend offers pinned host memory at all. It is what the next resize
+    // will ask for, not what any buffer is: an allocation can still come back pageable.
+    LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
+
+    // Issue the copies; return the number of bytes covered, 0 on failure. size must be
+    // between 1 and llama_state_seq_copy_buf_size(): the buffer belongs to the transfer, and
+    // a size beyond it is refused rather than believed. LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is
+    // refused too, since these copies serialise through host memory; use
+    // llama_state_seq_get_data_ext / set_data_ext for that flag.
     LLAMA_API size_t llama_state_seq_copy_get(
             struct llama_state_seq_copy * cpy,
                            size_t   size,

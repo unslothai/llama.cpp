@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3549,6 +3550,24 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
+        // A device that advertises events but does not implement event_query is no use
+        // here. ggml_backend_event_query() then answers the only way it can, by waiting for
+        // the event, so the first poll of a transfer blocks the caller for the whole copy --
+        // the very stall this exists to remove, except that the caller has been told the
+        // copy is asynchronous and has stopped looking for it. Such a device is left out, so
+        // that state_seq_copy_init() returns NULL and the caller keeps the synchronous calls
+        // it already had.
+        if (!ggml_backend_dev_supports_event_query(dev)) {
+            static std::atomic<bool> warned(false);
+
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_INFO("%s: %s cannot test an event without waiting for it, so sequence "
+                               "states are copied synchronously\n", __func__, ggml_backend_dev_name(dev));
+            }
+
+            continue;
+        }
+
         // a backend of its own, not the one the graphs are computed on: that one moves its
         // copies to whichever stream it is currently using, so a transfer posted to it could
         // end up ordered behind a graph -- which is the stall this exists to avoid
@@ -3581,7 +3600,22 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
 }
 
 size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (!cpy.data) {
+    // Unlike the legacy API the library owns this buffer, so the extent the io object is
+    // built with can be checked instead of believed. Every bounds check inside that object
+    // validates against the extent it was given, so a size larger than the allocation makes
+    // all of them agree with the caller and the copy runs past the buffer.
+    if (!cpy.data || size == 0 || size > cpy.size) {
+        LLAMA_LOG_ERROR("%s: cannot cover %zu bytes, the transfer's buffer holds %zu\n", __func__, size, cpy.size);
+        return 0;
+    }
+
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE asks for the tensor data to be left in device buffers,
+    // and this path has nowhere to leave it: it serialises through the host buffer it owns,
+    // which is the whole point of it. llama_state_seq_get_size_ext() with that flag reports
+    // a metadata-sized state, so a caller pairing the two would size a buffer for one thing
+    // and fill it with another; the synchronous calls serve that flag.
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported here, the copies go through host memory\n", __func__);
         return 0;
     }
 
@@ -3610,7 +3644,22 @@ size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size
 }
 
 size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (!cpy.data) {
+    // Unlike the legacy API the library owns this buffer, so the extent the io object is
+    // built with can be checked instead of believed. Every bounds check inside that object
+    // validates against the extent it was given, so a size larger than the allocation makes
+    // all of them agree with the caller and the copy runs past the buffer.
+    if (!cpy.data || size == 0 || size > cpy.size) {
+        LLAMA_LOG_ERROR("%s: cannot cover %zu bytes, the transfer's buffer holds %zu\n", __func__, size, cpy.size);
+        return 0;
+    }
+
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE asks for the tensor data to be left in device buffers,
+    // and this path has nowhere to leave it: it serialises through the host buffer it owns,
+    // which is the whole point of it. llama_state_seq_get_size_ext() with that flag reports
+    // a metadata-sized state, so a caller pairing the two would size a buffer for one thing
+    // and fill it with another; the synchronous calls serve that flag.
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported here, the copies go through host memory\n", __func__);
         return 0;
     }
 
@@ -4740,6 +4789,13 @@ void llama_state_seq_copy_buf_free(llama_state_seq_copy * cpy) {
 }
 
 bool llama_state_seq_copy_buf_is_pinned(llama_state_seq_copy * cpy) {
+    // what was allocated, not what could be: a host buffer type is free to hand back
+    // ordinary memory, which is what CUDA does under GGML_CUDA_NO_PINNED, and there is
+    // nothing page-locked before the first resize or after buf_free()
+    return cpy->pinned;
+}
+
+bool llama_state_seq_copy_buf_can_pin(llama_state_seq_copy * cpy) {
     return cpy->can_pin;
 }
 
