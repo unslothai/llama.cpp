@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -75,6 +76,8 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_GET_TENSORS,
+    RPC_CMD_COPY_TENSOR_TO,
+    RPC_CMD_PEER_BARRIER,
     RPC_CMD_COUNT,
 };
 
@@ -194,6 +197,29 @@ struct rpc_msg_copy_tensor_req {
 };
 
 struct rpc_msg_copy_tensor_rsp {
+    uint8_t result;
+};
+
+// RPC_CMD_COPY_TENSOR_TO tells the server that holds `src` to write it into `dst` on another
+// server, without the data passing through the client. The request is
+// | rpc_msg_copy_tensor_to_hdr | endpoint_len bytes of the destination endpoint |, and the
+// response arrives once the destination has acknowledged the write.
+struct rpc_msg_copy_tensor_to_hdr {
+    rpc_tensor src;
+    rpc_tensor dst;
+    uint64_t   size;
+    uint32_t   endpoint_len;
+};
+
+struct rpc_msg_copy_tensor_to_rsp {
+    uint8_t result;
+};
+
+// RPC_CMD_PEER_BARRIER has an empty request and a one byte response. A connection is served
+// strictly in order, so receiving its response proves that every command sent earlier on the
+// same connection has finished. It is what a source server waits on after pushing a
+// RPC_CMD_SET_TENSOR to a destination server.
+struct rpc_msg_peer_barrier_rsp {
     uint8_t result;
 };
 
@@ -337,6 +363,8 @@ static const char * rpc_cmd_name(int cmd) {
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
         case RPC_CMD_GET_TENSORS:       return "GET_TENSORS";
+        case RPC_CMD_COPY_TENSOR_TO:    return "COPY_TENSOR_TO";
+        case RPC_CMD_PEER_BARRIER:      return "PEER_BARRIER";
         default:                        return "?";
     }
 }
@@ -1025,6 +1053,67 @@ static bool rpc_supports_batched_get(const socket_ptr & sock) {
     return !disabled && sock->conn.server_minor >= 2;
 }
 
+// true when the server understands RPC_CMD_COPY_TENSOR_TO and RPC_CMD_PEER_BARRIER.
+// GGML_RPC_P2P=0 forces the old path, for A/B measurements.
+static bool rpc_supports_p2p(const socket_ptr & sock) {
+    static const char * env      = std::getenv("GGML_RPC_P2P");
+    static const bool   disabled = env != nullptr && std::strcmp(env, "0") == 0;
+    return !disabled && sock != nullptr && sock->conn.server_minor >= 3;
+}
+
+// Server to server movement of a tensor that crosses a stage boundary of a layer split. The
+// client tells the server that holds the source to write it into the destination tensor on
+// another server; only the command and its acknowledgement cross the client's host, not the
+// data. Two servers of one endpoint keep using the server local RPC_CMD_COPY_TENSOR.
+static bool ggml_backend_rpc_cpy_tensor_p2p(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                            const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *) backend_src->context;
+    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *) backend_dst->context;
+
+    if (src_ctx->endpoint == dst_ctx->endpoint) {
+        // same server: ggml_backend_rpc_buffer_cpy_tensor does it without leaving the server
+        return false;
+    }
+    if (src->buffer == nullptr || dst->buffer == nullptr ||
+        !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false;
+    }
+    const uint64_t size = (uint64_t) ggml_nbytes(src);
+    if (size != (uint64_t) ggml_nbytes(dst)) {
+        return false;
+    }
+
+    auto src_sock = get_socket(src_ctx->endpoint);
+    auto dst_sock = get_socket(dst_ctx->endpoint);
+    if (!rpc_supports_p2p(src_sock) || !rpc_supports_p2p(dst_sock)) {
+        return false;
+    }
+
+    // anything queued for the destination has to be on the wire before the peer write lands
+    rpc_flush_deferred_guarded(dst_sock);
+
+    const std::string & endpoint = dst_ctx->endpoint;
+    rpc_msg_copy_tensor_to_hdr hdr;
+    hdr.src          = serialize_tensor(src);
+    hdr.dst          = serialize_tensor(dst);
+    hdr.size         = size;
+    hdr.endpoint_len = (uint32_t) endpoint.size();
+
+    std::vector<uint8_t> input(sizeof(hdr) + endpoint.size());
+    memcpy(input.data(), &hdr, sizeof(hdr));
+    memcpy(input.data() + sizeof(hdr), endpoint.data(), endpoint.size());
+
+    // The reply arrives once the destination server has acknowledged the write, so the
+    // destination cannot compute before the hidden state has landed: the next thing the
+    // scheduler does on that backend is RPC_CMD_GRAPH_COMPUTE, which is sent after this
+    // returns.
+    rpc_msg_copy_tensor_to_rsp response;
+    bool status = send_rpc_cmd(src_sock, RPC_CMD_COPY_TENSOR_TO, input.data(), input.size(),
+                               &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    return response.result != 0;
+}
+
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     auto sock = get_socket(rpc_ctx->endpoint);
@@ -1059,8 +1148,10 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     const bool src_is_rpc = ggml_backend_is_rpc(backend_src);
     const bool dst_is_rpc = ggml_backend_is_rpc(backend_dst);
 
-    // RPC to RPC on the same server is handled by the buffer level copy
-    if (src_is_rpc == dst_is_rpc) {
+    if (src_is_rpc && dst_is_rpc) {
+        return ggml_backend_rpc_cpy_tensor_p2p(backend_src, backend_dst, src, dst);
+    }
+    if (!src_is_rpc && !dst_is_rpc) {
         return false;
     }
 
@@ -1360,10 +1451,22 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+// State that every connection of one server process shares.
+//
+// Before peer to peer copies a server served one client at a time, so a session could own its
+// buffers privately. A source server now opens a second connection to the destination server
+// and writes into a buffer that the coordinator allocated over its own connection, so the live
+// buffers have to be visible to every connection, and command execution has to be serialised
+// across connections (two connections must never drive the same backend at the same time).
+struct rpc_server_shared {
+    std::mutex                               mtx;      // serialises command execution
+    std::unordered_set<ggml_backend_buffer_t> buffers; // every live buffer of this process
+};
+
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, rpc_server_shared & shared)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), shared(shared) {
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
@@ -1381,6 +1484,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensors(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool copy_tensor_to(const std::vector<uint8_t> & input, rpc_msg_copy_tensor_to_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -1401,9 +1505,17 @@ private:
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
 
 
+    socket_ptr get_peer_socket(const std::string & endpoint);
+
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
-    std::unordered_set<ggml_backend_buffer_t> buffers;
+    rpc_server_shared & shared;
+    // buffers allocated over this connection; freed when it closes
+    std::unordered_set<ggml_backend_buffer_t> owned_buffers;
+    // connections to other servers, one per destination endpoint, closed with this connection
+    std::unordered_map<std::string, socket_ptr> peer_socks;
+    // reused staging for RPC_CMD_COPY_TENSOR_TO
+    std::vector<uint8_t> p2p_buf;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
@@ -1416,6 +1528,8 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -1456,6 +1570,8 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 }
 
 bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -1469,7 +1585,8 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         response.remote_size = buffer->size;
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        shared.buffers.insert(buffer);
+        owned_buffers.insert(buffer);
     } else {
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -1477,6 +1594,8 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
 }
 
 bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -1489,6 +1608,8 @@ bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_ms
 }
 
 bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -1501,9 +1622,11 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 }
 
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (shared.buffers.find(buffer) == shared.buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1513,21 +1636,26 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 }
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (owned_buffers.find(buffer) == owned_buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
     ggml_backend_buffer_free(buffer);
-    buffers.erase(buffer);
+    owned_buffers.erase(buffer);
+    shared.buffers.erase(buffer);
     return true;
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (shared.buffers.find(buffer) == shared.buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1536,6 +1664,8 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
 }
 
 bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1607,7 +1737,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+    if (result->buffer && shared.buffers.find(result->buffer) == shared.buffers.end()) {
         result->buffer = nullptr;
     }
 
@@ -1632,6 +1762,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         return false;
@@ -1705,6 +1837,8 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         response.result = 0;
@@ -1746,6 +1880,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 }
 
 bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1781,6 +1917,8 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 }
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1820,6 +1958,8 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 // request order, so one decode step of a backend sampled batch is one round trip instead of one
 // per sequence and per sampler output.
 bool rpc_server::get_tensors(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     if (input.size() < sizeof(uint32_t)) {
         return false;
     }
@@ -1871,6 +2011,8 @@ bool rpc_server::get_tensors(const std::vector<uint8_t> & input, std::vector<uin
 }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1908,6 +2050,111 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    return true;
+}
+
+socket_ptr rpc_server::get_peer_socket(const std::string & endpoint) {
+    auto it = peer_socks.find(endpoint);
+    if (it != peer_socks.end()) {
+        return it->second;
+    }
+    // the same connect and HELLO negotiation a client does, so a server to server link uses
+    // RDMA whenever both rails allow it and TCP otherwise
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to connect to %s\n", __func__, endpoint.c_str());
+        return nullptr;
+    }
+    if (sock->conn.server_minor < 3) {
+        GGML_LOG_ERROR("[%s] %s does not support peer to peer copies\n", __func__, endpoint.c_str());
+        return nullptr;
+    }
+    peer_socks[endpoint] = sock;
+    return sock;
+}
+
+// Writes a tensor of this server into a tensor of another server. The data never reaches the
+// client that issued the command. The source region is validated exactly like RPC_CMD_GET_TENSOR
+// and is pushed to the destination as an ordinary RPC_CMD_SET_TENSOR, so the destination applies
+// its own deserialize_tensor and buffer range checks and nothing about the destination pointer is
+// trusted here. RPC_CMD_PEER_BARRIER then tells us that the write has landed.
+//
+// Recoverable problems (the destination is unreachable or too old, the write was rejected) are
+// reported as result = 0, which puts the client back on its previous path; only a malformed
+// request or an out of bounds source is a protocol error.
+bool rpc_server::copy_tensor_to(const std::vector<uint8_t> & input, rpc_msg_copy_tensor_to_rsp & response) {
+    response.result = 0;
+    if (input.size() < sizeof(rpc_msg_copy_tensor_to_hdr)) {
+        return false;
+    }
+    rpc_msg_copy_tensor_to_hdr hdr;
+    memcpy(&hdr, input.data(), sizeof(hdr));
+    if (input.size() != sizeof(hdr) + (size_t) hdr.endpoint_len) {
+        return false;
+    }
+    const std::string endpoint((const char *) input.data() + sizeof(hdr), hdr.endpoint_len);
+
+    const size_t msg_size = sizeof(rpc_tensor) + sizeof(uint64_t) + (size_t) hdr.size;
+    if (p2p_buf.size() < msg_size) {
+        p2p_buf.resize(msg_size);
+    }
+    const uint64_t dst_offset = 0;
+    memcpy(p2p_buf.data(), &hdr.dst, sizeof(rpc_tensor));
+    memcpy(p2p_buf.data() + sizeof(rpc_tensor), &dst_offset, sizeof(dst_offset));
+
+    // read the source out of this server's device; the peer connection is used without this
+    // lock, so a ring of servers cannot deadlock on each other's execution mutex
+    {
+        std::lock_guard<std::mutex> lock(shared.mtx);
+
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &hdr.src);
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+            return false;
+        }
+
+        // sanitize tensor->data
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (hdr.src.data < p0 || hdr.src.data >= p1 || hdr.size > (p1 - hdr.src.data)) {
+            GGML_LOG_ERROR("[%s] source region (data=0x%" PRIx64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, hdr.src.data, hdr.size, p0, p1);
+            return false;
+        }
+        if (hdr.size > (uint64_t) ggml_nbytes(tensor)) {
+            GGML_LOG_ERROR("[%s] source region larger than the tensor\n", __func__);
+            return false;
+        }
+
+        ggml_backend_tensor_get(tensor, p2p_buf.data() + sizeof(rpc_tensor) + sizeof(dst_offset), 0, hdr.size);
+    }
+
+    socket_ptr peer = get_peer_socket(endpoint);
+    if (peer == nullptr) {
+        return true;
+    }
+
+    LOG_DBG("[%s] %" PRIu64 " bytes to %s\n", __func__, hdr.size, endpoint.c_str());
+
+    if (!send_rpc_cmd(peer, RPC_CMD_SET_TENSOR, p2p_buf.data(), msg_size)) {
+        GGML_LOG_ERROR("[%s] failed to send to %s\n", __func__, endpoint.c_str());
+        peer_socks.erase(endpoint);
+        return true;
+    }
+    rpc_msg_peer_barrier_rsp barrier;
+    if (!send_rpc_cmd(peer, RPC_CMD_PEER_BARRIER, nullptr, 0, &barrier, sizeof(barrier))) {
+        GGML_LOG_ERROR("[%s] %s did not acknowledge the write\n", __func__, endpoint.c_str());
+        peer_socks.erase(endpoint);
+        return true;
+    }
+    response.result = barrier.result;
     return true;
 }
 
@@ -1968,6 +2215,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
@@ -2042,6 +2291,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -2057,6 +2308,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 }
 
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
+    std::lock_guard<std::mutex> lock(shared.mtx);
+
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -2071,14 +2324,18 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
-    for (auto buffer : buffers) {
+    // the connections this server opened to other servers go away with this connection
+    peer_socks.clear();
+    std::lock_guard<std::mutex> lock(shared.mtx);
+    for (auto buffer : owned_buffers) {
+        shared.buffers.erase(buffer);
         ggml_backend_buffer_free(buffer);
     }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, rpc_server_shared & shared) {
+    rpc_server server(backends, cache_dir, shared);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2314,6 +2571,32 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_COPY_TENSOR_TO: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_copy_tensor_to_rsp response;
+                if (!server.copy_tensor_to(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PEER_BARRIER: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                // every command received earlier on this connection has already been served
+                rpc_msg_peer_barrier_rsp response;
+                response.result = 1;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2425,6 +2708,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+    // One thread per connection: besides the client that drives this server, other servers
+    // connect to it to deliver the tensors of a layer split directly (RPC_CMD_COPY_TENSOR_TO).
+    // The connections share one buffer registry and one execution mutex, see rpc_server_shared.
+    auto shared = std::make_shared<rpc_server_shared>();
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -2433,9 +2720,13 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        // the state the threads share outlives this function, so a failed accept cannot pull
+        // it out from under a connection that is still being served
+        std::thread([backends, cache_dir, client_socket, shared]() {
+            rpc_serve_client(backends, cache_dir, client_socket, *shared);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
     rpc_transport_shutdown();
     for (auto backend : backends) {
