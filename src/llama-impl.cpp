@@ -186,8 +186,29 @@ bool llama_exact_concurrency() {
 // [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
 static std::atomic<uint32_t> g_exact_decode_tokens{1};
 
+// the most sequences any context so far was created with. The tokens figure is process
+// wide, so raising it widens the decode step of every context that already exists; the
+// width those contexts reported at creation is re-reported here with the new figure, or a
+// context created under a narrower figure would batch above the bound it reported.
+static std::atomic<uint32_t> g_exact_max_n_seq{0};
+
+void llama_exact_report_n_seq(uint32_t n_seq) {
+    uint32_t cur = g_exact_max_n_seq.load(std::memory_order_relaxed);
+
+    while (n_seq > cur && !g_exact_max_n_seq.compare_exchange_weak(cur, n_seq, std::memory_order_relaxed)) {
+    }
+
+    llama_set_exact_decode_width(g_exact_max_n_seq.load(std::memory_order_relaxed) * llama_exact_decode_tokens());
+}
+
 void llama_set_exact_decode_tokens(uint32_t n_tokens) {
     g_exact_decode_tokens.store(n_tokens > 0 ? n_tokens : 1, std::memory_order_relaxed);
+
+    const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
+
+    if (n_seq > 0) {
+        llama_set_exact_decode_width(n_seq * llama_exact_decode_tokens());
+    }
 }
 
 uint32_t llama_exact_decode_tokens(void) {
