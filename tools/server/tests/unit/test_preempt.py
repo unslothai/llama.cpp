@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import tempfile
 import pytest
@@ -38,6 +39,7 @@ def create_server():
     os.close(fd)
     yield
     os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
+    os.environ.pop("LLAMA_SERVER_PREEMPT_GRANULARITY", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_ASYNC", None)
 
@@ -111,6 +113,48 @@ def test_two_slots_that_overflow_the_pool_together_both_finish():
         assert res.body["truncated"] is False
         assert len(res.body["tokens"]) == n_predict
 
+
+def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
+    # A pool that hands out cells in blocks gives a whole block to one sequence, so a sequence
+    # of n tokens occupies round_up(n, block) cells and holds the rest of its tail block against
+    # everybody else. The planner has to count those cells: counting tokens, it sees room the
+    # allocator cannot find, never parks anybody, and the retry ladder ends every request.
+    #
+    # llama_memory_alloc_granularity() reports the block size, and the only mode that returns
+    # more than 1 today is exact concurrency, whose paged attention kernel needs a head size this
+    # model does not have. LLAMA_SERVER_PREEMPT_GRANULARITY injects the figure instead: what is
+    # under test is the server's arithmetic, which is the same at 64 as at 256.
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
+    server.start()
+    log = LogReader(server.log_path)
+    assert "LLAMA_SERVER_PREEMPT_GRANULARITY = 64" in log.drain()
+
+    n_predict = 160
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted:" in text
+    assert "resumed after" in text
+
+    # every figure the planner logs is a whole number of blocks: "kv N/256" is what the pool is
+    # holding and "(wanted N)" is that plus what the next decode reserves. Counting tokens, both
+    # land wherever the sequences happen to be.
+    held   = [int(n) for n in re.findall(r"kv (\d+)/256", text)]
+    wanted = [int(n) for n in re.findall(r"\(wanted (\d+)\)", text)]
+    assert held and wanted, f"the planner logged no figures:\n{text}"
+    assert all(n % 64 == 0 for n in held + wanted), f"not whole blocks: {held} {wanted}"
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["truncated"] is False
+        assert len(res.body["tokens"]) == n_predict
 
 
 _WORDS = (

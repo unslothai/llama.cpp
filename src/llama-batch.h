@@ -105,12 +105,14 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    // n_seqs_max  = maximum sequence sets per ubatch, 0 = no limit
-    //               [TAG_EXACT_CONCURRENCY] passing 1 keeps a ubatch to a single sequence
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seqs_max = 0);
+    // isolate_multi_token_seqs = [TAG_EXACT_CONCURRENCY] a sequence set with more than one token
+    //               left to place is given a ubatch of its own; sets with a single token left are
+    //               still grouped together, so a prompt next to three decodes costs one extra
+    //               ubatch and does not serialize the three decodes
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool isolate_multi_token_seqs = false);
 
-    // [TAG_EXACT_CONCURRENCY] true if some sequence contributes more than one token to the batch,
-    // i.e. this is not a plain one-token-per-sequence decode step
+    // [TAG_EXACT_CONCURRENCY] true if some sequence still has more than one token left to place,
+    // i.e. what remains of the batch is not a plain one-token-per-sequence decode step
     bool has_multi_token_seq() const;
 
     // sequence-set-wise split - each ubatch contains a single sequence-set

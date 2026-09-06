@@ -124,6 +124,45 @@ static llama_state_seq_copy_ptr llama_state_seq_copy_make(llama_context * ctx) {
     return cpy ? llama_state_seq_copy_ptr(cpy, llama_state_seq_copy_deleter{}) : llama_state_seq_copy_ptr();
 }
 
+// [TAG_EXACT_CONCURRENCY] The planner above counts cells, not tokens, because the two are not
+// the same number under every mode. llama_memory_alloc_granularity() reports how many cells the
+// pool hands out at a time: 1 in every ordinary configuration, and the exact concurrency page
+// size when that mode is on, where one page belongs to one (sequence, position / page) pair and
+// a sequence of n tokens therefore occupies round_up(n, page) cells. Four sequences can be
+// holding up to 4 * (page - 1) cells that nobody else can be given, and a planner counting
+// tokens sees room in the pool that find_slot cannot find in pages: it never reaches the
+// threshold that would park anybody, the retry ladder halves n_batch to 1, and every request
+// ends in the context error that preemption exists to remove.
+
+// cells a run of n_tokens occupies when the pool allocates g at a time
+static constexpr int32_t preempt_n_cells_g(int32_t n_tokens, int32_t g) {
+    return (g <= 1 || n_tokens <= 0) ? n_tokens : ((n_tokens + g - 1) / g) * g;
+}
+
+// cells a run of n_tokens has to be given for a step of n_step more: nothing until the step
+// crosses a page boundary, a whole page when it does
+static constexpr int32_t preempt_n_cells_step_g(int32_t n_tokens, int32_t n_step, int32_t g) {
+    return preempt_n_cells_g(n_tokens + n_step, g) - preempt_n_cells_g(n_tokens, g);
+}
+
+// At a granularity of 1 both are the identity, so every figure the planner computes is exactly
+// the arithmetic it did before it started asking the memory how it allocates, and nothing
+// changes in any configuration that does not page.
+static_assert(preempt_n_cells_g(0, 1) == 0 && preempt_n_cells_g(1, 1) == 1 &&
+              preempt_n_cells_g(8191, 1) == 8191 && preempt_n_cells_g(-3, 1) == -3,
+              "at a granularity of 1 a run of n tokens has to cost exactly n cells");
+static_assert(preempt_n_cells_step_g(0, 1, 1) == 1 && preempt_n_cells_step_g(8191, 1, 1) == 1 &&
+              preempt_n_cells_step_g(1000, 512, 1) == 512,
+              "at a granularity of 1 a step of n tokens has to cost exactly n cells");
+
+// and the page arithmetic itself, so the rounding cannot be changed by accident
+static_assert(preempt_n_cells_g(1, 256) == 256 && preempt_n_cells_g(256, 256) == 256 &&
+              preempt_n_cells_g(257, 256) == 512,
+              "a tail page is charged in full");
+static_assert(preempt_n_cells_step_g(255, 1, 256) == 0 && preempt_n_cells_step_g(256, 1, 256) == 256 &&
+              preempt_n_cells_step_g(256, 257, 256) == 512,
+              "a step is free until it crosses a page boundary and costs whole pages when it does");
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -1712,13 +1751,23 @@ private:
             }
         }
 
-        // [TAG_EXACT_CONCURRENCY] ask the cache how it allocates, rather than assume a cell
-        // per token. 1 in every ordinary configuration, so this changes nothing unless a
-        // mode that places cells in blocks is on.
+        // [TAG_EXACT_CONCURRENCY] ask the cache how it allocates, rather than assume a cell per
+        // token. 1 in every ordinary configuration, so this changes nothing unless a mode that
+        // places cells in blocks is on.
         {
             preempt_alloc_granularity = (int32_t) std::max(1u, llama_memory_alloc_granularity(llama_get_memory(ctx_tgt)));
 
-            if (preempt_alloc_granularity > 1) {
+            // a test knob: the paged attention kernel only supports a head size of 256, so a
+            // harness model cannot turn exact concurrency on, and this is the only way to reach
+            // the paged arithmetic of the planner from the server tests
+            const char * LLAMA_SERVER_PREEMPT_GRANULARITY = getenv("LLAMA_SERVER_PREEMPT_GRANULARITY");
+
+            if (LLAMA_SERVER_PREEMPT_GRANULARITY) {
+                preempt_alloc_granularity = std::max(1, atoi(LLAMA_SERVER_PREEMPT_GRANULARITY));
+
+                SRV_WRN("LLAMA_SERVER_PREEMPT_GRANULARITY = %d (test knob: planning the kv pool in blocks of %d cells)\n",
+                        preempt_alloc_granularity, preempt_alloc_granularity);
+            } else if (preempt_alloc_granularity > 1) {
                 SRV_INF("preemption: the kv pool allocates %d cells at a time, planning in pages\n",
                         preempt_alloc_granularity);
             }
@@ -3201,26 +3250,21 @@ private:
     // case every park and resume is the synchronous one it always was.
     bool preempt_async_ok = false;
 
-    // [TAG_EXACT_CONCURRENCY] cells the pool hands out at a time: 1 normally, the page size
-    // under exact concurrency. Everything below plans in cells rather than tokens because of
-    // it -- with a page size of 256, four sequences can hold 1020 cells the pool cannot hand
-    // to anybody else, and a planner counting tokens sees room that find_slot cannot find.
+    // [TAG_EXACT_CONCURRENCY] cells the pool hands out at a time, read once at load from the
+    // memory itself: 1 in every ordinary configuration, the page size under exact concurrency.
+    // Everything below plans in cells because of it. LLAMA_SERVER_PREEMPT_GRANULARITY overrides
+    // it, which is how the harness reaches the paged arithmetic on a model whose head size the
+    // paged attention kernel does not support.
     int32_t preempt_alloc_granularity = 1;
 
-    // cells a sequence of n tokens actually occupies
+    // cells a slot holding n_tokens actually occupies
     int32_t preempt_n_cells(int32_t n_tokens) const {
-        const int32_t g = preempt_alloc_granularity;
-
-        if (g <= 1 || n_tokens <= 0) {
-            return n_tokens;
-        }
-
-        return ((n_tokens + g - 1) / g) * g;
+        return preempt_n_cells_g(n_tokens, preempt_alloc_granularity);
     }
 
     // cells a slot holding n_tokens has to be given for a step of n_step more
     int32_t preempt_n_cells_step(int32_t n_tokens, int32_t n_step) const {
-        return preempt_n_cells(n_tokens + n_step) - preempt_n_cells(n_tokens);
+        return preempt_n_cells_step_g(n_tokens, n_step, preempt_alloc_granularity);
     }
 
     int32_t preempt_n_spec_max() const {
@@ -3311,6 +3355,8 @@ private:
             // because the copy is still reading them, and one on its way back in has already
             // been given them. Skipping either would hand the same cells out twice.
 
+            // [TAG_EXACT_CONCURRENCY] the slot's tail page is charged in full: it belongs to
+            // this sequence and cannot be given to anybody else, however little of it is used
             res += preempt_n_cells(slot.prompt.n_tokens());
         }
 
@@ -3333,7 +3379,9 @@ private:
     // iterations later, over and over.
     int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
         if (!preempt_async_active()) {
-            return PREEMPT_N_MARGIN;
+            // [TAG_EXACT_CONCURRENCY] a margin of eight cells is no margin at all where a
+            // step can cost a whole page, so the synchronous figure is rounded as well
+            return preempt_n_cells(PREEMPT_N_MARGIN);
         }
 
         int32_t n_running = n_additional_running;

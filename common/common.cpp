@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1433,6 +1434,82 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
+// [TAG_EXACT_CONCURRENCY]
+bool common_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+int common_exact_decode_width(const common_params & params) {
+    const int n_slots = std::max(1, params.n_parallel);
+
+    // the draft tokens a slot carries into the verify ubatch alongside its accepted token
+    int n_draft = 0;
+
+    for (const auto type : params.speculative.types) {
+        switch (type) {
+            case COMMON_SPECULATIVE_TYPE_NONE:
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                n_draft = std::max(n_draft, params.speculative.ngram_mod.n_max);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                n_draft = std::max(n_draft, (int) params.speculative.ngram_simple.size_m);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                n_draft = std::max(n_draft, (int) params.speculative.ngram_map_k.size_m);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                n_draft = std::max(n_draft, (int) params.speculative.ngram_map_k4v.size_m);
+                break;
+            default:
+                n_draft = std::max(n_draft, params.speculative.draft.n_max);
+                break;
+        }
+    }
+
+    return n_slots*(1 + std::max(0, n_draft));
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool common_exact_concurrency_init(const common_params & params) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    const int n_cols = common_exact_decode_width(params);
+
+    const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+    if (bound) {
+        const int max_cols = atoi(bound);
+        if (max_cols > 0 && max_cols < n_cols) {
+            COM_ERR("GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at "
+                    "least %d to cover a decode step of %d slots, above which a matmul is left "
+                    "batched and its rows depend on the other rows in the ubatch. Raise it to %d, "
+                    "set it to 0 for no bound, or unset it to let it default to %d.\n",
+                    max_cols, n_cols, std::max(1, params.n_parallel), n_cols, n_cols);
+            return false;
+        }
+    }
+
+    // the CUDA backend may not be present or may be loaded dynamically, so go through the registry
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+
+        auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
+        if (fn) {
+            fn(n_cols);
+        }
+    }
+
+    return true;
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1453,6 +1530,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // [TAG_EXACT_CONCURRENCY] before the warmup, which is the first graph this process computes
+    if (!common_exact_concurrency_init(params)) {
+        return res;
+    }
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");

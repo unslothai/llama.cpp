@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -61,6 +62,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// [TAG_EXACT_CONCURRENCY]
+// The paged attention specialization that reads the logical page table lives in the CUDA backend
+// sources, which are also built as the ROCm and MUSA backends. Every other backend ignores src[5]
+// and walks the pool in physical cell order, so a KV layer placed there would silently lose the
+// guarantee the mode exists to provide.
+static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(reg);
+    if (!name) {
+        return false;
+    }
+
+    return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -84,13 +108,10 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
-    const char * exact_env = getenv("LLAMA_EXACT_CONCURRENCY");
-    exact_pages = exact_env && atoi(exact_env) != 0;
-    if (exact_pages) {
-        GGML_ASSERT(unified && offload && !v_trans && n_swa == 0);
-        GGML_ASSERT(type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16);
-        GGML_ASSERT(kv_size % exact_page_size == 0);
-    }
+    // [TAG_EXACT_CONCURRENCY] read the knob through the one cached reader that the graph and the
+    // CUDA dispatcher also use, so a process that sets it between two context creations cannot end
+    // up with a paged cache on top of a dispatcher that is still in default mode
+    exact_pages = llama_exact_concurrency();
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -104,6 +125,30 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // [TAG_EXACT_CONCURRENCY]
+    // Every one of these is reachable from the command line, so report which one failed by name
+    // instead of aborting on a bare assert that only prints a file and a line.
+    if (exact_pages) {
+        const char * unsupported = nullptr;
+
+        if (!unified) {
+            unsupported = "it needs a unified KV cache (pass --kv-unified)";
+        } else if (v_trans) {
+            unsupported = "it needs a non-transposed V cache (pass --flash-attn on)";
+        } else if (n_swa != 0) {
+            unsupported = "the paged pool does not support sliding window attention";
+        } else if (type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
+            unsupported = "it needs an F16 KV cache (do not pass --cache-type-k or --cache-type-v)";
+        } else if (kv_size % exact_page_size != 0) {
+            unsupported = "the context size must be a multiple of 256 (pass -c as a multiple of 256)";
+        }
+
+        if (unsupported) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s\n", __func__, unsupported);
+            throw std::runtime_error("exact concurrency: unsupported KV cache configuration");
+        }
+    }
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -227,6 +272,16 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+
+        // [TAG_EXACT_CONCURRENCY] a layer left anywhere else attends in physical cell order while
+        // the mode still reports itself as on, so refuse the load instead
+        if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
+                    "which has no paged attention: every layer must be offloaded to the CUDA backend "
+                    "(pass -ngl to offload all layers and do not pass --no-kv-offload)\n",
+                    __func__, il, dev_name);
+            throw std::runtime_error("exact concurrency: KV cache layer is not on the CUDA backend");
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -372,7 +427,76 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+// [TAG_EXACT_CONCURRENCY]
+void llama_kv_cache::exact_pages_rebuild() const {
+    const auto & cells = v_cells[0];
+
+    exact_page_owner.assign(cells.size()/exact_page_size, exact_page{});
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+
+        GGML_ASSERT(cells.seq_count(i) == 1);
+
+        const auto pos = cells.pos_get(i);
+
+        GGML_ASSERT(pos >= 0 && uint32_t(pos)%exact_page_size == i%exact_page_size);
+
+        const exact_page cur { cells.seq_get(i), llama_pos(pos/(llama_pos) exact_page_size) };
+
+        auto & owner = exact_page_owner[i/exact_page_size];
+
+        GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
+
+        owner = cur;
+    }
+
+    exact_page_owner_dirty = false;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+void llama_kv_cache::exact_pages_sync() const {
+    if (exact_page_owner_dirty) {
+        exact_pages_rebuild();
+
+        return;
+    }
+
+    if (debug > 0) {
+        // the incrementally maintained ownership has to say what the cells say
+        const auto kept = exact_page_owner;
+
+        exact_pages_rebuild();
+
+        GGML_ASSERT(kept.size() == exact_page_owner.size());
+
+        for (size_t p = 0; p < kept.size(); ++p) {
+            GGML_ASSERT(kept[p].seq == exact_page_owner[p].seq && kept[p].lpg == exact_page_owner[p].lpg);
+        }
+    }
+}
+
+// [TAG_EXACT_CONCURRENCY]
+void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos) {
+    if (exact_page_owner_dirty || exact_page_owner.empty()) {
+        // the next sync rebuilds from the cells anyway
+        return;
+    }
+
+    const exact_page cur { seq, llama_pos(pos/(llama_pos) exact_page_size) };
+
+    auto & owner = exact_page_owner[idx/exact_page_size];
+
+    GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
+
+    owner = cur;
+}
+
 void llama_kv_cache::clear(bool data) {
+    exact_page_owner_dirty = true;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -390,6 +514,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
+
+    // [TAG_EXACT_CONCURRENCY] a removal can empty a page, which only the cells know
+    exact_page_owner_dirty = true;
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -564,6 +691,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (other) {
         return;
     }
+
+    // [TAG_EXACT_CONCURRENCY] as in seq_rm, this can empty pages
+    exact_page_owner_dirty = true;
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -748,7 +878,15 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            // [TAG_EXACT_CONCURRENCY] split_simple packs every sequence's prompt tokens into one
+            // ubatch, so a sequence's prefill would run at a width its solo run never sees. Take
+            // the sequence-set split instead, which can give each prompt a ubatch of its own; a
+            // plain decode step has nothing to isolate and keeps taking split_simple.
+            const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
+
+            auto ubatch = n_stream == 1 && !isolate
+                ? balloc.split_simple(n_ubatch)
+                : balloc.split_equal(n_ubatch, n_stream > 1, 0, isolate);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -795,6 +933,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        // [TAG_EXACT_CONCURRENCY] page ownership before placing the ubatch, so that undoing the
+        // speculative placement does not force a rebuild from every cell on the next ubatch
+        std::vector<exact_page> exact_page_owner_old;
     };
 
     // remember the old state of the cells so we can restore it in the end
@@ -815,7 +957,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_new, v_heads, {}, exact_page_owner };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -842,6 +984,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
             cells.set(sinfo.idxs[s], it->v_cells[s]);
             head = it->v_heads_old[s];
+        }
+
+        // [TAG_EXACT_CONCURRENCY] the speculative placements are being undone behind the
+        // allocator's back. Put back what it knew before, unless something during the placement
+        // removed cells as well, in which case only the cells can say what is left.
+        if (!exact_page_owner_dirty) {
+            exact_page_owner = it->exact_page_owner_old;
         }
     }
 
@@ -1002,23 +1151,26 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     if (exact_pages) {
-        // Reconstruct page ownership from live cells. Empty pages are immediately reusable;
-        // prepare() can roll back its speculative allocations without a second metadata log.
+        // Page ownership is maintained as cells are placed and invalidated when they are removed,
+        // so the allocator reads one entry per physical page rather than scanning every cell. The
+        // claims this call makes are local: prepare() can still roll back its speculative
+        // placements, and empty pages stay immediately reusable.
         const auto & cells = v_cells[0];
+
+        exact_pages_sync();
+
         using page_key = std::pair<llama_seq_id, llama_pos>;
+
+        std::vector<exact_page> owner = exact_page_owner;
         std::map<page_key, uint32_t> pages;
-        std::vector<bool> occupied(cells.size()/exact_page_size, false);
-        std::vector<bool> assigned(cells.size(), false);
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (cells.is_empty(i)) { continue; }
-            GGML_ASSERT(cells.seq_count(i) == 1);
-            const auto pos = cells.pos_get(i);
-            GGML_ASSERT(pos >= 0 && uint32_t(pos)%exact_page_size == i%exact_page_size);
-            const page_key key {cells.seq_get(i), pos/exact_page_size};
-            auto ins = pages.emplace(key, i/exact_page_size);
-            GGML_ASSERT(ins.first->second == i/exact_page_size);
-            occupied[i/exact_page_size] = true;
+
+        for (uint32_t p = 0; p < owner.size(); ++p) {
+            if (owner[p].seq >= 0) {
+                pages.emplace(page_key {owner[p].seq, owner[p].lpg}, p);
+            }
         }
+
+        std::set<uint32_t> assigned;
         slot_info res {0, 0, {0}, {{}}};
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             GGML_ASSERT(ubatch.n_seq_id[i] == 1 && ubatch.pos[i] >= 0);
@@ -1028,15 +1180,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 // Round-robin free-page search deliberately permits nonmonotonic physical order.
                 uint32_t page = v_heads[0]/exact_page_size;
                 uint32_t tested = 0;
-                while (tested < occupied.size() && occupied[page%occupied.size()]) { ++page; ++tested; }
-                if (tested == occupied.size()) { return {}; }
-                page %= occupied.size();
-                occupied[page] = true;
+                while (tested < owner.size() && owner[page%owner.size()].seq >= 0) { ++page; ++tested; }
+                if (tested == owner.size()) { return {}; }
+                page %= owner.size();
+                owner[page] = exact_page {key.first, key.second};
                 it = pages.emplace(key, page).first;
             }
             const uint32_t idx = it->second*exact_page_size + ubatch.pos[i]%exact_page_size;
-            if (!cells.is_empty(idx) || assigned[idx]) { return {}; }
-            assigned[idx] = true;
+            if (!cells.is_empty(idx) || !assigned.insert(idx).second) { return {}; }
             res.idxs[0].push_back(idx);
         }
         if (cont && !res.is_contiguous()) { return {}; }
@@ -1221,6 +1372,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+            // [TAG_EXACT_CONCURRENCY] the page this cell belongs to is now owned by its sequence
+            if (exact_pages) {
+                GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+
+                exact_pages_claim(idx, ubatch.seq_id[i][0], ubatch.pos[i]);
+            }
         }
     }
 
@@ -1260,6 +1418,13 @@ uint32_t llama_kv_cache::alloc_granularity() const {
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // [TAG_EXACT_CONCURRENCY] a cell's offset inside its page is its position modulo 256, so the
+    // paged pool cannot shift positions. Reporting it here is what makes the server disable
+    // --context-shift and --cache-reuse at load, with a warning, instead of accepting both and
+    // failing on the first request that needs them.
+    if (exact_pages) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1331,12 +1496,15 @@ ggml_tensor * llama_kv_cache::build_input_pages(ggml_context * ctx, const llama_
 
 void llama_kv_cache::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(exact_pages && dst->ne[1] == ubatch->n_tokens);
+
+    // [TAG_EXACT_CONCURRENCY] one entry per physical page, not one per cell
+    exact_pages_sync();
+
     std::map<llama_seq_id, std::map<llama_pos, uint32_t>> pages;
-    const auto & cells = v_cells[0];
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (!cells.is_empty(i)) {
-            GGML_ASSERT(cells.seq_count(i) == 1);
-            pages[cells.seq_get(i)][cells.pos_get(i)/exact_page_size] = i/exact_page_size;
+    for (uint32_t p = 0; p < exact_page_owner.size(); ++p) {
+        const auto & owner = exact_page_owner[p];
+        if (owner.seq >= 0) {
+            pages[owner.seq][owner.lpg] = p;
         }
     }
     std::vector<int32_t> data(ggml_nelements(dst), -1);
@@ -2415,8 +2583,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             GGML_ASSERT(cells.seq_has(idx, dest_seq_id));
         }
     } else {
-        GGML_ASSERT(!exact_pages && "exact mode supports per-sequence restore only");
         // whole KV cache restore
+
+        // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
+        // index, which the paged pool owns. Report it like every other failure in this function.
+        if (exact_pages) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state "
+                    "restore only\n", __func__);
+            return false;
+        }
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);

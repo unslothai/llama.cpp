@@ -1304,6 +1304,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+
+        // [TAG_EXACT_CONCURRENCY] refuse a column bound that cannot cover a decode step before
+        // anything is loaded, rather than running with the guarantee quietly switched off
+        if (!common_exact_concurrency_init(ctx_arg.params)) {
+            ctx_arg.params = params_org;
+            return false;
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;

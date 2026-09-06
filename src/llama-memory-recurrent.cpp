@@ -431,7 +431,11 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // [TAG_EXACT_CONCURRENCY] same rule as the hybrid memory: a recurrent state that a
+                // prompt leaves behind depends on what shared its ubatch, so isolate the prompts
+                const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
+
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }
 
             if (ubatch.n_tokens == 0) {

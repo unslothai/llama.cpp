@@ -1852,22 +1852,67 @@ int ggml_cuda_batch_invariant() {
     return mode;
 }
 
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch the caller says it can build, 0 if it never said
+static std::atomic<int> g_exact_decode_width{0};
+
+void ggml_backend_cuda_set_exact_decode_width(int n_cols) {
+    g_exact_decode_width.store(n_cols > 0 ? n_cols : 0, std::memory_order_relaxed);
+}
+
 int ggml_cuda_batch_invariant_max_cols() {
-    static const int max_cols = []() {
-        // [TAG_EXACT_CONCURRENCY] With prompt ubatches kept to one sequence, a sequence's prefill
-        // matmul shapes match its solo run, so exact mode no longer needs the column policy to be
-        // unbounded there. An explicit bound always wins, in either mode.
+    // [TAG_EXACT_CONCURRENCY] With prompt ubatches kept to one sequence, a sequence's prefill
+    // matmul shapes match its solo run, so exact mode no longer needs the column policy to be
+    // unbounded there. An explicit bound always wins, in either mode.
+    static const int explicit_cols = []() {
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
-        if (val) { return atoi(val); }
-        // Exact mode then only has to cover the widest ubatch a decode step can build: one column
-        // per slot, times one plus the number of speculative draft tokens carried with it. 16
-        // covers the default four slots at up to three tokens each, which is what
-        // --spec-type draft-mtp --spec-draft-n-max 2 produces. More slots, or a wider draft, need
-        // the bound set explicitly; above it the column split does not fire.
-        if (ggml_cuda_exact_concurrency()) { return 16; }
-        return 0;
+        return val ? atoi(val) : -1;
     }();
-    return max_cols;
+
+    if (explicit_cols >= 0) {
+        return explicit_cols;
+    }
+
+    if (!ggml_cuda_exact_concurrency()) {
+        return 0;
+    }
+
+    // Exact mode only has to cover the widest ubatch a decode step can build: one column per slot,
+    // times one plus the number of speculative draft tokens carried with it. Use that width when
+    // the caller reported it through ggml_backend_cuda_set_exact_decode_width(). Nothing reported
+    // it, so fall back to 16, which covers four slots at up to three tokens each, which is what
+    // --parallel 4 --spec-type draft-mtp --spec-draft-n-max 2 produces. Above the bound the column
+    // split does not fire, and ggml_cuda_warn_above_exact_bound() says so once.
+    const int width = g_exact_decode_width.load(std::memory_order_relaxed);
+
+    return width > 0 ? width : 16;
+}
+
+// [TAG_EXACT_CONCURRENCY] a batch wider than the bound is left batched, so its rows depend on the
+// other rows in it and the mode does not hold for that op. Say so once, rather than never.
+//
+// Only when nothing reported a decode width. When one was reported the bound is derived from it, so
+// the only batches above the bound are prompt ubatches, and those hold a single sequence under this
+// mode: their exactness comes from that, not from the column policy, and leaving them batched is
+// the whole point of having a bound at all. Warning on those would be crying wolf on every prefill.
+static void ggml_cuda_warn_above_exact_bound(const char * op, int64_t ncols, int max_cols) {
+    if (!ggml_cuda_exact_concurrency()) {
+        return;
+    }
+
+    if (g_exact_decode_width.load(std::memory_order_relaxed) > 0) {
+        return;
+    }
+
+    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (warned.test_and_set(std::memory_order_relaxed)) {
+        return;
+    }
+
+    GGML_LOG_WARN("%s: LLAMA_EXACT_CONCURRENCY is set, but this %s is %d columns wide while "
+            "GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d, so it is left batched and its result depends "
+            "on the other columns in the ubatch. Raise the bound, set it to 0 for no bound, or call "
+            "ggml_backend_cuda_set_exact_decode_width() with the widest decode this process builds. "
+            "Reported once.\n", __func__, op, (int) ncols, max_cols);
 }
 
 enum ggml_cuda_mm_path {
@@ -1952,6 +1997,7 @@ static bool ggml_cuda_mul_mat_split_columns(
     }
     const int max_cols = ggml_cuda_batch_invariant_max_cols();
     if (max_cols > 0 && ncols_dst > max_cols) {
+        ggml_cuda_warn_above_exact_bound("MUL_MAT", ncols_dst, max_cols);
         return false;
     }
 
@@ -2049,6 +2095,7 @@ static bool ggml_cuda_mul_mat_id_splits_tokens(const ggml_tensor * dst) {
     }
     const int max_cols = ggml_cuda_batch_invariant_max_cols();
     if (max_cols > 0 && ntokens > max_cols) {
+        ggml_cuda_warn_above_exact_bound("MUL_MAT_ID", ntokens, max_cols);
         return false;
     }
     return true;
@@ -5750,6 +5797,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // [TAG_EXACT_CONCURRENCY]
+    if (strcmp(name, "ggml_backend_cuda_set_exact_decode_width") == 0) {
+        return (void *)ggml_backend_cuda_set_exact_decode_width;
     }
     return nullptr;
 }

@@ -511,6 +511,11 @@ bool llama_batch_allocr::has_multi_token_seq() const {
     std::vector<uint32_t> n_per_seq(n_seq_max, 0);
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        // tokens already placed in an earlier ubatch do not make the rest of the batch a prompt
+        if (used[i]) {
+            continue;
+        }
+
         for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
             if (++n_per_seq[batch.seq_id[i][s]] > 1) {
                 return true;
@@ -521,7 +526,7 @@ bool llama_batch_allocr::has_multi_token_seq() const {
     return false;
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seqs_max) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool isolate_multi_token_seqs) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -554,16 +559,39 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
+            // [TAG_EXACT_CONCURRENCY] a sequence set that still has more than one token to place is
+            // a prompt, and a prompt shares its arithmetic with whatever else is in the ubatch, so
+            // give it a ubatch of its own. Sets with one token left are a plain decode step, which
+            // is already exact, so keep grouping those: isolating them too would make one prompt
+            // serialize every concurrent decode for the whole of the prefill.
+            if (isolate_multi_token_seqs) {
+                uint32_t n_left = 0;
+
+                for (const auto idx : seq_set_map[seq_set[i]]) {
+                    if (!used[idx]) {
+                        ++n_left;
+                    }
+                }
+
+                if (n_left > 1) {
+                    if (!cur_seq_set.empty()) {
+                        // let the sets already taken have this ubatch; the prompt gets the next one
+                        break;
+                    }
+
+                    cur_seq_set.push_back(seq_set[i]);
+
+                    last_seq_id = batch.seq_id[i][0];
+
+                    break;
+                }
+            }
+
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];
 
             if (cur_seq_set.size() > n_ubatch) {
-                break;
-            }
-
-            // [TAG_EXACT_CONCURRENCY]
-            if (n_seqs_max > 0 && cur_seq_set.size() >= n_seqs_max) {
                 break;
             }
         }
