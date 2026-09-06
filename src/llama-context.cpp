@@ -107,7 +107,22 @@ llama_context::llama_context(
     // splitting columns for exactness covers it without the caller having to know the bound; a
     // caller that builds wider steps reports the width itself, see llama_set_exact_decode_width.
     if (llama_exact_concurrency()) {
-        llama_set_exact_decode_width(cparams.n_seq_max * llama_exact_decode_tokens());
+        const uint32_t n_cols = cparams.n_seq_max * llama_exact_decode_tokens();
+
+        // an explicit column bound wins over the reported width in the backend, so one below
+        // this context's width would leave its decodes batched above the bound with the mode
+        // still reporting itself on; refuse it here, the way the server's setup does
+        if (const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS")) {
+            const int max_cols = atoi(bound);
+
+            if (max_cols > 0 && (uint32_t) max_cols < n_cols) {
+                LLAMA_LOG_ERROR("%s: GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at least %u to cover a decode step of %u sequences; raise it, set it to 0 for no bound, or unset it\n",
+                        __func__, max_cols, n_cols, cparams.n_seq_max);
+                throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
+            }
+        }
+
+        llama_set_exact_decode_width(n_cols);
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
@@ -1194,6 +1209,13 @@ void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (cparams.causal_attn == value) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] the paged attention the mode runs on is causal; a context with a
+    // cache under the mode keeps causal attention rather than asserting in the next graph
+    if (!value && memory && llama_exact_concurrency()) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so causal attention cannot be turned off; the change is refused\n", __func__);
         return;
     }
 

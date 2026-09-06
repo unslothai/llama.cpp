@@ -1448,38 +1448,26 @@ bool common_exact_concurrency() {
 int common_exact_decode_width(const common_params & params) {
     const int n_slots = std::max(1, params.n_parallel);
 
-    // the draft tokens a slot carries into the verify ubatch alongside its accepted token
-    int n_draft = 0;
+    // the draft tokens a slot carries into the verify ubatch alongside its accepted token, per
+    // speculation type, from the same place the speculation code takes its own width
+    const int n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
 
-    for (const auto type : params.speculative.types) {
-        switch (type) {
-            case COMMON_SPECULATIVE_TYPE_NONE:
-                break;
-            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
-                n_draft = std::max(n_draft, params.speculative.ngram_mod.n_max);
-                break;
-            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
-                n_draft = std::max(n_draft, (int) params.speculative.ngram_simple.size_m);
-                break;
-            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
-                n_draft = std::max(n_draft, (int) params.speculative.ngram_map_k.size_m);
-                break;
-            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
-                n_draft = std::max(n_draft, (int) params.speculative.ngram_map_k4v.size_m);
-                break;
-            default:
-                n_draft = std::max(n_draft, params.speculative.draft.n_max);
-                break;
-        }
-    }
-
-    return n_slots*(1 + std::max(0, n_draft));
+    return n_slots*(1 + n_draft);
 }
 
 // [TAG_EXACT_CONCURRENCY]
 bool common_exact_concurrency_init(const common_params & params) {
     if (!common_exact_concurrency()) {
         return true;
+    }
+
+    // DFlash drafting turns causal attention off on its draft context, and the paged
+    // attention the mode runs on needs it; say so instead of asserting in the graph
+    for (const auto type : params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash: it disables causal attention, which the paged attention needs\n");
+            return false;
+        }
     }
 
     const int n_cols = common_exact_decode_width(params);
