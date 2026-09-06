@@ -3337,7 +3337,9 @@ private:
         int32_t n_running = n_additional_running;
 
         for (const auto & slot : slots) {
-            if (slot.is_processing() && !slot.preempt_is_out()) {
+            // A slot on its way back in already holds its cells and starts decoding the
+            // moment its copy lands, so it needs the runway now; one on its way out does not.
+            if (slot.is_processing() && (!slot.preempt_is_out() || slot.state == SLOT_STATE_RESTORING)) {
                 n_running++;
             }
         }
