@@ -17,6 +17,9 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cstdio>
+#include <atomic>
+#include <chrono>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -25,6 +28,128 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 
 namespace fs = std::filesystem;
+
+// ---------------------------------------------------------------------------
+// Env-gated load profiler (GGML_RPC_LOADPROF=1). Off by default and zero cost
+// when off: one relaxed atomic load per set_tensor. It breaks the weight upload
+// down into hashing, host staging, wire time and the gap between calls, which is
+// what tells a protocol problem apart from a bandwidth problem.
+// ---------------------------------------------------------------------------
+struct rpc_load_prof {
+    bool enabled = false;
+    const char * tag = "client";
+
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> ns_hash{0};
+    std::atomic<uint64_t> ns_stage{0};
+    std::atomic<uint64_t> ns_wire{0};
+    std::atomic<uint64_t> ns_gap{0};
+    std::atomic<uint64_t> hash_calls{0};
+    std::atomic<uint64_t> hash_hits{0};
+    std::atomic<uint64_t> hash_bytes{0};
+    // size histogram: <4K, <64K, <1M, <10M, >=10M
+    std::atomic<uint64_t> hist[5];
+    std::atomic<uint64_t> last_end_ns{0};
+    std::atomic<uint64_t> first_ns{0};
+    std::atomic<uint64_t> gap_max{0};
+    std::atomic<uint64_t> gaps_1ms{0};
+
+    rpc_load_prof(const char * tag) : tag(tag) {
+        const char * e = std::getenv("GGML_RPC_LOADPROF");
+        enabled = e != nullptr && e[0] != '0';
+        for (int i = 0; i < 5; i++) hist[i].store(0);
+    }
+
+    static uint64_t now_ns() {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void bucket(size_t size) {
+        int b = size < 4096 ? 0 : size < 65536 ? 1 : size < (1u<<20) ? 2 : size < 10u*(1u<<20) ? 3 : 4;
+        hist[b].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void print() {
+        if (!enabled || calls.load() == 0) {
+            return;
+        }
+        const double mb = (double) bytes.load() / (1024.0*1024.0);
+        const double gap_s   = ns_gap.load()   / 1e9;
+        const double hash_s  = ns_hash.load()  / 1e9;
+        const double stage_s = ns_stage.load() / 1e9;
+        const double wire_s  = ns_wire.load()  / 1e9;
+        const double span_s  = (last_end_ns.load() - first_ns.load()) / 1e9;
+        fprintf(stderr, "RPCLOADPROF[%s] set_tensor calls=%" PRIu64 " bytes=%.1f MiB span=%.2fs\n",
+                      tag, calls.load(), mb, span_s);
+        fprintf(stderr, "RPCLOADPROF[%s]   hash=%.2fs (%" PRIu64 " calls, %" PRIu64 " hits, %.1f MiB) stage=%.2fs wire=%.2fs gap=%.2fs\n",
+                      tag, hash_s, hash_calls.load(), hash_hits.load(),
+                      (double) hash_bytes.load()/(1024.0*1024.0), stage_s, wire_s, gap_s);
+        fprintf(stderr, "RPCLOADPROF[%s]   gap max=%.3fs, %" PRIu64 " gaps over 1 ms\n",
+                      tag, gap_max.load()/1e9, gaps_1ms.load());
+        fprintf(stderr, "RPCLOADPROF[%s]   sizes <4K=%" PRIu64 " <64K=%" PRIu64 " <1M=%" PRIu64 " <10M=%" PRIu64 " >=10M=%" PRIu64 "\n",
+                      tag, hist[0].load(), hist[1].load(), hist[2].load(), hist[3].load(), hist[4].load());
+        if (wire_s > 0) {
+            fprintf(stderr, "RPCLOADPROF[%s]   effective wire rate %.2f MiB/s, end to end %.2f MiB/s\n",
+                          tag, mb/wire_s, span_s > 0 ? mb/span_s : 0.0);
+        }
+    }
+
+    ~rpc_load_prof() { print(); }
+};
+
+// GGML_RPC_LOAD_OPT=0 restores the pre-optimisation upload path: always try SET_TENSOR_HASH,
+// stage every tensor into one contiguous buffer before sending, one RDMA chunk in flight.
+static bool rpc_load_opt() {
+    static const bool opt = [] {
+        const char * e = std::getenv("GGML_RPC_LOAD_OPT");
+        return !(e && e[0] == '0');
+    }();
+    return opt;
+}
+
+static rpc_load_prof g_rpc_loadprof_client("client");
+static rpc_load_prof g_rpc_loadprof_server("server");
+
+// Per command client side accounting, so the load can be attributed to a command and not just
+// to "somewhere in the RPC backend". Same env gate, same zero cost when off.
+static const char * rpc_cmd_name(int cmd);
+
+struct rpc_cmd_prof {
+    std::atomic<uint64_t> calls[64];
+    std::atomic<uint64_t> ns[64];
+    bool enabled = false;
+
+    rpc_cmd_prof() {
+        const char * e = std::getenv("GGML_RPC_LOADPROF");
+        enabled = e != nullptr && e[0] != '0';
+        for (int i = 0; i < 64; i++) { calls[i].store(0); ns[i].store(0); }
+    }
+
+    void add(int cmd, uint64_t dt) {
+        if (cmd >= 0 && cmd < 64) {
+            calls[cmd].fetch_add(1, std::memory_order_relaxed);
+            ns[cmd].fetch_add(dt, std::memory_order_relaxed);
+        }
+    }
+
+    ~rpc_cmd_prof() {
+        if (!enabled) {
+            return;
+        }
+        for (int i = 0; i < 64; i++) {
+            if (calls[i].load() > 0) {
+                // entries at 32 and above are the request plus the wait for the response
+                fprintf(stderr, "RPCLOADPROF[cmd] %-18s%-5s calls=%8" PRIu64 " time=%8.2fs\n",
+                        rpc_cmd_name(i % 32), i >= 32 ? "+rsp" : "", calls[i].load(), ns[i].load()/1e9);
+            }
+        }
+    }
+};
+
+static rpc_cmd_prof g_rpc_cmdprof;
+
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
@@ -77,6 +202,30 @@ enum rpc_cmd {
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
+static const char * rpc_cmd_name(int cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:      return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:     return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:      return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:   return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:       return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:      return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:        return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:   return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:        return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:       return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:     return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY: return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:       return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:             return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
+        case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
+        default:                        return "UNKNOWN";
+    }
+}
+
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -88,9 +237,14 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    // was a padding byte, always zero. A server that predates this reports no features, which
+    // is the conservative answer, so the message keeps its size and old and new interoperate.
+    uint8_t flags;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
+
+// the server keeps a local tensor cache, so RPC_CMD_SET_TENSOR_HASH can save an upload
+#define RPC_SRV_FLAG_HAS_CACHE (1 << 0)
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
@@ -298,9 +452,44 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
+// Same wire format as send_rpc_cmd below, with the request written from two buffers instead of
+// one. It exists so that a tensor upload does not have to be copied into a staging buffer whose
+// only purpose is to make the header and the payload contiguous: for a 27B layer split that copy
+// is several gigabytes of pure memory traffic, plus the zero fill of the buffer that receives it.
+// The bytes on the wire are identical, so a server built before this change sees no difference.
+static bool send_rpc_cmd_hdr_payload(socket_ptr sock, enum rpc_cmd cmd,
+                                     const void * hdr, size_t hdr_size,
+                                     const void * payload, size_t payload_size) {
+    const uint64_t t0 = g_rpc_cmdprof.enabled ? rpc_load_prof::now_ns() : 0;
+    struct prof_guard {
+        enum rpc_cmd cmd; uint64_t t0;
+        ~prof_guard() { if (g_rpc_cmdprof.enabled) g_rpc_cmdprof.add(cmd, rpc_load_prof::now_ns() - t0); }
+    } guard{cmd, t0};
+    uint8_t cmd_byte = cmd;
+    uint64_t input_size = hdr_size + payload_size;
+    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+        return false;
+    }
+    if (!sock->send_data(&input_size, sizeof(input_size))) {
+        return false;
+    }
+    if (!sock->send_data(hdr, hdr_size)) {
+        return false;
+    }
+    if (payload_size > 0 && !sock->send_data(payload, payload_size)) {
+        return false;
+    }
+    return sock->flush();
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    const uint64_t t0 = g_rpc_cmdprof.enabled ? rpc_load_prof::now_ns() : 0;
+    struct prof_guard {
+        enum rpc_cmd cmd; uint64_t t0;
+        ~prof_guard() { if (g_rpc_cmdprof.enabled) g_rpc_cmdprof.add(cmd, rpc_load_prof::now_ns() - t0); }
+    } guard{cmd, t0};
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -317,6 +506,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    const uint64_t t0 = g_rpc_cmdprof.enabled ? rpc_load_prof::now_ns() : 0;
+    struct prof_guard {
+        enum rpc_cmd cmd; uint64_t t0;
+        // the inner call books its own send time, so book only the wait for the response here
+        ~prof_guard() { if (g_rpc_cmdprof.enabled) g_rpc_cmdprof.add(cmd + 32, rpc_load_prof::now_ns() - t0); }
+    } guard{cmd, t0};
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
@@ -352,6 +547,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
                        response.major, response.minor, response.patch);
         return false;
     }
+
+    sock->srv_flags = response.flags;
 
     sock->update_caps(response.conn_caps);
     return true;
@@ -488,27 +685,82 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_load_prof & prof = g_rpc_loadprof_client;
+    const bool prof_on = prof.enabled;
+    uint64_t t_call = 0;
+    if (prof_on) {
+        t_call = rpc_load_prof::now_ns();
+        uint64_t prev = prof.last_end_ns.load(std::memory_order_relaxed);
+        if (prev != 0) {
+            const uint64_t g = t_call - prev;
+            prof.ns_gap.fetch_add(g, std::memory_order_relaxed);
+            if (g > 1000000) {
+                prof.gaps_1ms.fetch_add(1, std::memory_order_relaxed);
+            }
+            uint64_t m = prof.gap_max.load(std::memory_order_relaxed);
+            while (g > m && !prof.gap_max.compare_exchange_weak(m, g, std::memory_order_relaxed)) { }
+        } else {
+            prof.first_ns.store(t_call, std::memory_order_relaxed);
+        }
+        prof.calls.fetch_add(1, std::memory_order_relaxed);
+        prof.bytes.fetch_add(size, std::memory_order_relaxed);
+        prof.bucket(size);
+    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    // Hashing a tensor only pays off if the server keeps a cache to match it against. Without
+    // one the reply is always "not cached", so the FNV pass over every large tensor is pure
+    // cost: on a 27B split it hashes gigabytes at about 1.2 GiB/s and then uploads them anyway.
+    // The server now says at HELLO whether it has a cache.
+    const bool try_hash = !rpc_load_opt() || (ctx->sock->srv_flags & RPC_SRV_FLAG_HAS_CACHE);
+    if (size > HASH_THRESHOLD && try_hash) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
+        uint64_t t0 = prof_on ? rpc_load_prof::now_ns() : 0;
         request.hash = fnv_hash((const uint8_t*)data, size);
+        if (prof_on) {
+            prof.ns_hash.fetch_add(rpc_load_prof::now_ns() - t0, std::memory_order_relaxed);
+            prof.hash_calls.fetch_add(1, std::memory_order_relaxed);
+            prof.hash_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
         rpc_msg_set_tensor_hash_rsp response;
+        uint64_t t1 = prof_on ? rpc_load_prof::now_ns() : 0;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        if (prof_on) {
+            prof.ns_wire.fetch_add(rpc_load_prof::now_ns() - t1, std::memory_order_relaxed);
+        }
         RPC_STATUS_ASSERT(status);
         if (response.result) {
             // the server has the same data, no need to send it
+            if (prof_on) {
+                prof.hash_hits.fetch_add(1, std::memory_order_relaxed);
+                prof.last_end_ns.store(rpc_load_prof::now_ns(), std::memory_order_relaxed);
+            }
             return;
         }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    uint64_t t2 = prof_on ? rpc_load_prof::now_ns() : 0;
+    uint8_t hdr[sizeof(rpc_tensor) + sizeof(uint64_t)];
+    memcpy(hdr, &rpc_tensor, sizeof(rpc_tensor));
+    memcpy(hdr + sizeof(rpc_tensor), &offset, sizeof(offset));
+    std::vector<uint8_t> input;
+    if (!rpc_load_opt()) {
+        // pre-optimisation path, kept for A/B: one contiguous buffer for header and payload
+        input.resize(sizeof(hdr) + size, 0);
+        memcpy(input.data(), hdr, sizeof(hdr));
+        memcpy(input.data() + sizeof(hdr), data, size);
+    }
+    uint64_t t3 = prof_on ? rpc_load_prof::now_ns() : 0;
+    bool status = input.empty()
+        ? send_rpc_cmd_hdr_payload(ctx->sock, RPC_CMD_SET_TENSOR, hdr, sizeof(hdr), data, size)
+        : send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    if (prof_on) {
+        uint64_t t4 = rpc_load_prof::now_ns();
+        prof.ns_stage.fetch_add(t3 - t2, std::memory_order_relaxed);
+        prof.ns_wire.fetch_add(t4 - t3, std::memory_order_relaxed);
+        prof.last_end_ns.store(t4, std::memory_order_relaxed);
+    }
     RPC_STATUS_ASSERT(status);
 }
 
@@ -861,7 +1113,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_stream(const socket_ptr & sock);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -887,6 +1139,9 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    // reused, never zero filled, and only allocated when the destination is not host memory
+    std::unique_ptr<uint8_t[]> stage_buf;
+    size_t stage_cap = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
@@ -896,6 +1151,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.flags = cache_dir != nullptr ? RPC_SRV_FLAG_HAS_CACHE : 0;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -1115,15 +1371,33 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
-    // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+// Reads one RPC_CMD_SET_TENSOR message straight off the connection instead of into a
+// std::vector sized to the whole message. The vector cost two full passes over every tensor,
+// one to zero the fresh buffer and one to copy the payload out of it, and for a host backend
+// the payload can be received into its final home with no copy at all.
+// The wire format is unchanged: | rpc_tensor | offset (8 bytes) | data (size bytes) |.
+bool rpc_server::set_tensor_stream(const socket_ptr & sock) {
+    constexpr size_t hdr_size = sizeof(rpc_tensor) + sizeof(uint64_t);
+
+    uint64_t msg_size;
+    if (!sock->recv_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
-    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
-    uint64_t offset;
-    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
-    const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    if (msg_size < hdr_size) {
+        GGML_LOG_ERROR("[%s] message too small (%" PRIu64 ")\n", __func__, msg_size);
+        return false;
+    }
+    const size_t size = msg_size - hdr_size;
+    if (g_rpc_loadprof_server.enabled) {
+        g_rpc_loadprof_server.bytes.fetch_add(msg_size, std::memory_order_relaxed);
+        g_rpc_loadprof_server.bucket(msg_size);
+    }
+
+    rpc_tensor in_tensor;
+    uint64_t   offset;
+    if (!sock->recv_data(&in_tensor, sizeof(in_tensor)) || !sock->recv_data(&offset, sizeof(offset))) {
+        return false;
+    }
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1133,7 +1407,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
@@ -1145,25 +1419,48 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
             GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
+                           __func__, in_tensor.data, offset, size, p0, p1);
             return false;
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
+    // a host buffer can take the payload directly; anything else, or a run that has to hash the
+    // payload for the cache, needs it contiguous in host memory first
+    const bool direct = ggml_backend_buffer_is_host(tensor->buffer) && cache_dir == nullptr;
+    uint8_t * dst;
+    if (direct) {
+        dst = (uint8_t *) tensor->data + offset;
+    } else {
+        if (stage_cap < size) {
+            stage_buf.reset(new (std::nothrow) uint8_t[size]);
+            if (stage_buf == nullptr) {
+                GGML_LOG_ERROR("[%s] failed to allocate %zu bytes of staging\n", __func__, size);
+                stage_cap = 0;
+                return false;
+            }
+            stage_cap = size;
+        }
+        dst = stage_buf.get();
+    }
+    if (size > 0 && !sock->recv_data(dst, size)) {
+        return false;
+    }
+
     if (cache_dir && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
+        uint64_t hash = fnv_hash(dst, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
         std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
+        ofs.write((const char *)dst, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
+    if (!direct) {
+        ggml_backend_tensor_set(tensor, dst, offset, size);
+    }
     return true;
 }
 
@@ -1679,12 +1976,26 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                rpc_load_prof & prof = g_rpc_loadprof_server;
+                const bool prof_on = prof.enabled;
+                uint64_t t0 = 0;
+                if (prof_on) {
+                    t0 = rpc_load_prof::now_ns();
+                    uint64_t prev = prof.last_end_ns.load(std::memory_order_relaxed);
+                    if (prev != 0) {
+                        prof.ns_gap.fetch_add(t0 - prev, std::memory_order_relaxed);
+                    } else {
+                        prof.first_ns.store(t0, std::memory_order_relaxed);
+                    }
+                }
+                if (!server.set_tensor_stream(sock)) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
-                    return;
+                if (prof_on) {
+                    uint64_t t2 = rpc_load_prof::now_ns();
+                    prof.calls.fetch_add(1, std::memory_order_relaxed);
+                    prof.ns_wire.fetch_add(t2 - t0, std::memory_order_relaxed);
+                    prof.last_end_ns.store(t2, std::memory_order_relaxed);
                 }
                 break;
             }
@@ -1849,6 +2160,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         printf("Accepted client connection\n");
         fflush(stdout);
         rpc_serve_client(backends, cache_dir, client_socket);
+        g_rpc_loadprof_server.print();
         printf("Client connection closed\n");
         fflush(stdout);
     }
