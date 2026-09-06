@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "unicode.h"
 
 #include <sstream>
 
@@ -159,12 +160,45 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     }
 }
 
+// Appends `text_added` to `text`, keeping in `pending` the trailing bytes of an incomplete UTF-8
+// sequence so that the next chunk can complete it, and replacing bytes that can never form a valid
+// codepoint with U+FFFD.
+//
+// The generated text is a raw byte stream and is not guaranteed to be valid UTF-8: a byte fallback
+// token, or a prompt that ends in the middle of a multi-byte character (the model then continues
+// with the remaining continuation bytes), makes it start with, or contain, bytes that do not decode.
+// The chat parsers reject malformed UTF-8 by design, and the exception thrown for it propagates out
+// of the streaming loop and cancels the task, so the request ends with no tokens at all. The JSON
+// serialiser already substitutes U+FFFD for those bytes on the way to the client, so doing the same
+// substitution before parsing keeps the parser input identical to what the client receives.
+static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added) {
+    pending += text_added;
+
+    size_t pos = 0;
+    while (pos < pending.size()) {
+        const auto res = common_parse_utf8_codepoint(pending, pos);
+        if (res.status == utf8_parse_result::INCOMPLETE) {
+            // wait for the rest of the sequence
+            break;
+        }
+        if (res.status == utf8_parse_result::INVALID) {
+            text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+            pos += 1;
+            continue;
+        }
+        text.append(pending, pos, res.bytes_consumed);
+        pos += res.bytes_consumed;
+    }
+
+    pending.erase(0, pos);
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    generated_text += text_added;
+    append_utf8_sanitized(generated_text, generated_text_pending, text_added);
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
