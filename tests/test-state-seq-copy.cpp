@@ -113,6 +113,14 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : oversized, empty and ON_DEVICE transfers are all refused\n", __func__);
 
+    // a transfer that fails part way, one byte short of the state, must post nothing: the
+    // caller is told it failed and is free to reuse the buffer at once
+    CHECK(llama_state_seq_copy_get(cpy, size - 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
+    CHECK(llama_state_seq_copy_n_copies(cpy) == 0);
+    CHECK(llama_state_seq_copy_done(cpy));
+
+    fprintf(stderr, "%s : a transfer one byte short is refused and posts no copies\n", __func__);
+
     // the same call at the size the transfer does own still works, and round-trips
     std::vector<uint8_t> before(llama_state_seq_get_size(ctx, seq_id));
     CHECK(llama_state_seq_get_data(ctx, before.data(), before.size(), seq_id) == before.size());
@@ -121,6 +129,11 @@ int main(int argc, char ** argv) {
     llama_state_seq_copy_wait(cpy);
 
     llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+
+    // the restore side too: a buffer claimed one byte short is refused before a copy is posted
+    CHECK(llama_state_seq_copy_set(cpy, size - 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
+    CHECK(llama_state_seq_copy_n_copies(cpy) == 0);
+    CHECK(llama_state_seq_copy_done(cpy));
 
     CHECK(llama_state_seq_copy_set(cpy, size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == size);
     llama_state_seq_copy_wait(cpy);
