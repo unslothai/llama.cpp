@@ -38,6 +38,7 @@ def create_server():
     os.close(fd)
     yield
     os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
+    os.environ.pop("LLAMA_SERVER_PREEMPT_PLANNER", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
 
 
@@ -267,3 +268,102 @@ def test_metrics_and_slots_report_the_parked_state():
     res = server.make_request("GET", "/slots")
     assert res.status_code == 200
     assert sum(slot["n_preempt"] for slot in res.body) == 0, "n_preempt is per task and resets with the slot"
+
+
+def test_two_prompts_near_the_context_size_both_complete():
+    # Two prompts that each fit the context alone but not together. The second one is
+    # parked before it takes any cells, and it is close enough to n_ctx that its sequence
+    # plus its first batch would not leave the usual scheduling margin. It must still be
+    # restored once the first one finishes: with nothing resident there is nobody to keep
+    # the margin for. Before the fix it was parked for ever, with no restore ever tried.
+    global server
+    server.n_ctx = 256
+    # the whole prompt in one batch, so the parked slot's first step is the whole prompt
+    server.n_batch = 256
+    server.start()
+    log = LogReader(server.log_path)
+
+    # sized in tokens, not words: the prompt is the token ids of a short sentence repeated
+    base = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there was a little girl"}).body["tokens"]
+    long_prompt = (base * 64)[:250]
+    n_predict = 4
+    together = parallel_function_calls([(_complete, (n_predict, long_prompt)) for _ in range(2)])
+
+    text = log.drain()
+    assert "cannot fit the pool" not in text
+
+    for res in together:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+
+
+def test_the_last_resort_parks_instead_of_ending_everyone():
+    # With the planner off nothing is parked ahead of the decode, so two generations that
+    # fit alone but not together fill the pool until a single token finds no cell. That
+    # is where upstream ends every slot with the context error. Instead the batch is
+    # given up, the smaller slot is parked, the larger one finishes, and the parked one
+    # comes back and finishes too.
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    server.start()
+    log = LogReader(server.log_path)
+    assert "LLAMA_SERVER_PREEMPT_PLANNER = off" in log.drain()
+
+    n_predict = 160
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted:" not in text, "the planner was off, nothing may be parked ahead of the decode"
+    assert "preempted as a last resort" in text
+    assert "last resort: batch given up" in text
+    assert "resumed after" in text
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["truncated"] is False
+        assert len(res.body["tokens"]) == n_predict
+
+
+def test_the_last_resort_rewinds_a_prompt_in_flight():
+    # Same, with a prompt being processed when the pool runs out: the chunk that failed
+    # is taken back off the slot's tokens and processed again after the resume, so the
+    # prompt is neither skipped nor fed twice. The prompt is far longer than a batch, so
+    # the failing chunk is a chunk of it, not its last token.
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompt_b, n_b = _prompt_of_about(150, "Charlie")
+    n_predict_a = 230
+    n_predict_b = 90
+    assert 8 + n_predict_a <= 256 and n_b + n_predict_b <= 256
+    assert 8 + n_predict_a + n_b + n_predict_b > 256
+
+    def _late(n_predict, prompt):
+        time.sleep(0.02)
+        return _complete(n_predict, prompt)
+
+    results = parallel_function_calls([
+        (_complete, (n_predict_a, "Hi how are you")),
+        (_late, (n_predict_b, prompt_b)),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted as a last resort" in text
+
+    assert results[0].status_code == 200
+    assert results[0].body["timings"]["predicted_n"] == n_predict_a
+    assert results[1].status_code == 200
+    assert results[1].body["timings"]["predicted_n"] == n_predict_b
+    # the chunk that was in the batch given up is processed once, after the rewind, and
+    # the count is the prompt plus the BOS the server adds
+    assert results[1].body["timings"]["prompt_n"] == n_b + 1
