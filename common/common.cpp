@@ -2256,8 +2256,8 @@ common_state_buffer_pool & common_state_buffer_pool::instance() {
     return pool;
 }
 
-// derived once, from host memory as the CPU backend device reports it. an unknown host memory
-// size means no pooling at all, which is the safe direction.
+// derived once, from host memory as the CPU backend device reports it. a host memory size that
+// cannot be trusted means no pooling at all, which is the safe direction.
 static size_t common_state_buffer_pool_cap() {
     size_t mem_free  = 0;
     size_t mem_total = 0;
@@ -2267,14 +2267,25 @@ static size_t common_state_buffer_pool_cap() {
         ggml_backend_dev_memory(cpu_dev, &mem_free, &mem_total);
     }
 
-    if (mem_total == 0) {
+    GGML_UNUSED(mem_free);
+
+    // zero means the CPU device could not report a size. an absurd size means the query itself
+    // failed without saying so: ggml_backend_cpu_device_get_memory() multiplies out
+    // sysconf(_SC_PHYS_PAGES) with no error check, so a -1 from a restricted container arrives
+    // here as ~1.8e19. treat both as unknown and keep nothing.
+    if (mem_total == 0 || mem_total > (1ull << 50)) {
         return 0;
     }
 
-    return std::min(mem_total / 16, mem_free / 4);
+    // a fraction of TOTAL host memory, deliberately not of free: every non-Windows host reports
+    // free == total for the CPU device ("free system memory is ill-defined, assume all of it is
+    // free"), so a free-based cap would be the same number with a false claim attached to it.
+    return mem_total / 16;
 }
 
 void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
+    std::vector<uint8_t> prev; // the caller's previous storage, offered back below
+
     {
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -2282,8 +2293,11 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
 
         t_last_us = ggml_time_us();
 
-        // an allocation that is already big enough is already resident - nothing to do
-        if (dst.capacity() < size) {
+        if (dst.capacity() >= size) {
+            // the caller's own allocation is already big enough, so it is already resident.
+            // that is a reuse too, and the cheapest kind.
+            st.n_hit++;
+        } else {
             // best fit, so a large pooled buffer is not spent on a small request
             size_t best = free_bufs.size();
             for (size_t i = 0; i < free_bufs.size(); ++i) {
@@ -2296,15 +2310,20 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
             if (best < free_bufs.size()) {
                 held_bytes -= free_bufs[best].capacity();
 
-                // the pooled buffer goes to the caller and the caller's undersized one is
-                // dropped: it belongs to a different size class and is of no use here
-                std::swap(dst, free_bufs[best]);
+                prev = std::move(free_bufs[best]);
                 free_bufs.erase(free_bufs.begin() + best);
+
+                // dst takes the pooled buffer and prev takes the caller's old one
+                std::swap(dst, prev);
 
                 st.n_hit++;
             }
         }
     }
+
+    // the caller's old buffer was too small for this request but may still serve a smaller
+    // checkpoint later, so offer it back rather than dropping it on the floor
+    put(std::move(prev));
 
     // on a hit the pooled buffer normally already has exactly this size, so this is a no-op and
     // the stale bytes are left in place. that is safe because every caller overwrites the whole
@@ -2317,7 +2336,7 @@ void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
     const size_t cap = src.capacity();
 
     if (cap < MIN_BUFFER_BYTES) {
-        return;
+        return; // below the allocator's mmap threshold: holding it would save nothing
     }
 
     std::lock_guard<std::mutex> lock(mtx);
@@ -2331,8 +2350,31 @@ void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
         cap_known = true;
     }
 
-    if (free_bufs.size() >= MAX_BUFFERS || held_bytes + cap > cap_bytes) {
-        return; // declined: src is freed by its own destructor, as it would be without the pool
+    if (cap > cap_bytes) {
+        return; // one buffer of this size would spend the whole budget
+    }
+
+    // eviction. make room by dropping the smallest pooled buffers, but only ones smaller than
+    // the buffer coming in. a pool already full of buffers at least this large has nothing to
+    // gain from the swap, so decline instead. that rule is what keeps a workload whose
+    // checkpoints grow through a prompt from wedging the pool full of small buffers that no
+    // later and larger request can use.
+    while (free_bufs.size() >= MAX_BUFFERS || held_bytes + cap > cap_bytes) {
+        size_t worst = 0;
+        for (size_t i = 1; i < free_bufs.size(); ++i) {
+            if (free_bufs[i].capacity() < free_bufs[worst].capacity()) {
+                worst = i;
+            }
+        }
+
+        if (free_bufs.empty() || free_bufs[worst].capacity() >= cap) {
+            return; // declined: src is freed by its own destructor, as it would be without the pool
+        }
+
+        held_bytes -= free_bufs[worst].capacity();
+        free_bufs.erase(free_bufs.begin() + worst);
+
+        st.n_evict++;
     }
 
     // the logical size is kept, not cleared: a later get() of the same size is then a no-op
@@ -2357,6 +2399,7 @@ void common_state_buffer_pool::trim(int64_t idle_us) {
     free_bufs.shrink_to_fit();
 
     held_bytes = 0;
+    n_hwm      = 0;
 }
 
 common_state_buffer_pool::stats common_state_buffer_pool::get_stats() const {
@@ -2372,10 +2415,18 @@ common_state_buffer_pool::stats common_state_buffer_pool::get_stats() const {
 }
 
 common_prompt_checkpoint::~common_prompt_checkpoint() {
-    auto & pool = common_state_buffer_pool::instance();
+    // a destructor is noexcept and put() can throw: it locks a mutex and pushes to a vector.
+    // that matters on exactly the path this has to survive, because server_prompt_cache::alloc()
+    // recovers from a std::bad_alloc by destroying cached prompts, and a throw from here would
+    // turn a graceful cache shrink into a terminate().
+    try {
+        auto & pool = common_state_buffer_pool::instance();
 
-    pool.put(std::move(data_tgt));
-    pool.put(std::move(data_dft));
+        pool.put(std::move(data_tgt));
+        pool.put(std::move(data_dft));
+    } catch (...) {
+        // the buffers are freed by their own destructors instead
+    }
 }
 
 size_t common_prompt_checkpoint::size() const {

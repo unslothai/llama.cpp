@@ -1155,14 +1155,23 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 // Memory policy.
 //
-//  - Byte cap. At most `cap_bytes` is retained, derived once from host memory as
-//    min(1/16 of total, 1/4 of free). A machine with little memory therefore keeps little or
-//    nothing, and when host memory cannot be determined at all the pool keeps nothing.
-//  - Count cap. At most `MAX_BUFFERS` buffers, a sanity bound; the byte cap is the real one.
+//  - Byte cap. At most `cap_bytes` is retained, derived once as 1/16 of total host memory, so
+//    the pool is proportionate to the machine it runs on. When host memory cannot be
+//    determined the pool keeps nothing.
+//  - Count cap. At most `MAX_BUFFERS` buffers. With `n_ctx_checkpoints` defaulting to 32 per
+//    slot a busy server can release far more than that at once, so this cap does bind, and
+//    the eviction rule below decides which buffers survive it.
+//  - Eviction. A buffer offered to a full pool displaces the smallest pooled buffer, but only
+//    one smaller than itself; otherwise it is declined. Without that rule a workload whose
+//    checkpoints grow through a prompt would fill the pool with small buffers that no later
+//    request can use, and the hit rate would fall to zero while the memory stayed held.
 //  - Size floor. Buffers below `MIN_BUFFER_BYTES` are never retained. Below the allocator's
 //    mmap threshold there is no fault storm to avoid, so pooling them would only hold memory.
-//  - Release. `trim()` drops buffers the pool has not touched for a while, so an idle server
-//    gives the memory back instead of holding it for the life of the process.
+//  - Release. `trim()` drops buffers the pool has not touched for a while. The server calls it
+//    from the task queue's idle wait, so a server that goes quiet gives the memory back, and
+//    with a zero timeout from the prompt cache's out-of-memory recovery, so pooled bytes are
+//    always reclaimable under allocation pressure even though they are not counted against
+//    `--cache-ram`.
 //
 // When any cap is reached the buffer is simply freed, which is exactly the behaviour without
 // the pool: a machine that cannot afford the pool degrades to today's behaviour, never to
@@ -1173,7 +1182,7 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // count the process already peaked at without the pool. The byte cap and `trim()` bound the
 // one case where that is not true: a server whose live checkpoint count structurally shrinks.
 struct common_state_buffer_pool {
-    // sanity bound on the buffer count; the byte cap is the limit that actually binds
+    // bound on the buffer count. this does bind in practice, see the eviction rule above
     static constexpr size_t MAX_BUFFERS = 64;
 
     // buffers below this size are left to the allocator: they do not come from mmap(), so
@@ -1184,7 +1193,8 @@ struct common_state_buffer_pool {
         uint64_t n_get  = 0; // buffers requested
         uint64_t n_hit  = 0; // ... served from the pool
         uint64_t n_put  = 0; // buffers offered back
-        uint64_t n_keep = 0; // ... retained
+        uint64_t n_keep  = 0; // ... retained
+        uint64_t n_evict = 0; // pooled buffers displaced to make room
         size_t held_bytes = 0;
         size_t cap_bytes  = 0;
         size_t n_hwm      = 0; // high water mark of retained buffers
