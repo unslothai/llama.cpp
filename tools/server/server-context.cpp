@@ -3179,7 +3179,8 @@ private:
             // [TAG_PREEMPT] a parked slot took no part in what failed: its sequence is in
             // host RAM, not in the cache, and it comes back when there is room, the same as
             // in the decode error sweep
-            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
+            // [TAG_PREEMPT_ASYNC] a slot whose copy is in flight is out of the round as well
+            if (slot.is_processing() && !slot.preempt_is_out()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
