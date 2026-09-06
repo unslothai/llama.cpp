@@ -4219,6 +4219,8 @@ private:
             metrics.n_preempt++;
             n_parked++;
 
+            send_preempt_notice(*victim, true);
+
             SLT_WRN(*victim, "preempted as a last resort: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
                     (ggml_time_us() - t_start) / 1e3,
