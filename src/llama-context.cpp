@@ -3332,7 +3332,19 @@ public:
     llama_io_write_host_async(uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
         ptr(p), buf_size(len), cpy(cpy) {}
 
+    // The transfers are posted from the destructor, and only once serialisation has got to
+    // the end: a failure part way, a buffer one byte short say, is reported to the caller as
+    // a zero return, and a caller told that is free to reuse the buffer at once. Copies
+    // posted regardless would still be reading it.
+    void commit() {
+        committed = true;
+    }
+
     ~llama_io_write_host_async() {
+        if (!committed) {
+            return;
+        }
+
         llama_io_emit(winfos, 0, winfos.size(),
                 [this](ggml_tensor * tensor, uint8_t * ptr, size_t offset, size_t size,
                        size_t n_copies, size_t stride_tensor, size_t stride_data) {
@@ -3385,6 +3397,8 @@ private:
     std::vector<write_info> winfos;
 
     llama_state_seq_copy & cpy;
+
+    bool committed = false;
 };
 
 class llama_io_read_host_async : public llama_io_read_i {
@@ -3392,7 +3406,18 @@ public:
     llama_io_read_host_async(const uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
         ptr(p), buf_size(len), cpy(cpy) {}
 
+    // see llama_io_write_host_async::commit(): the restore that failed part way has already
+    // dropped the sequence, and copies posted for it would write into cells that are no
+    // longer its own
+    void commit() {
+        committed = true;
+    }
+
     ~llama_io_read_host_async() {
+        if (!committed) {
+            return;
+        }
+
         // No whole-tensor staging here, unlike the synchronous path above. Staging reads a
         // tensor, patches this sequence's bytes into the host copy and writes the whole
         // tensor back, which preserves the neighbours only while nothing else is touching
@@ -3454,6 +3479,8 @@ private:
     std::vector<read_info> rinfos;
 
     llama_state_seq_copy & cpy;
+
+    bool committed = false;
 };
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
@@ -3594,6 +3621,36 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
         return nullptr;
     }
 
+    // The devices above are the ones the graphs run on, not necessarily the ones the state
+    // lives on: with most layers left on the CPU the KV cache is host memory, and a tensor
+    // there takes the synchronous branch of backend_for(). A transfer whose every copy would
+    // do that is not asynchronous, whatever it is called, and the caller is better served by
+    // the synchronous calls it already has and a log line that says so.
+    if (memory) {
+        bool on_device = false;
+
+        for (const auto & [buft, size] : memory->memory_breakdown()) {
+            if (size == 0) {
+                continue;
+            }
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+            if (ggml_backend_buft_is_host(buft) || !dev || buft != ggml_backend_dev_buffer_type(dev) ||
+                    cpy->devs.find(dev) == cpy->devs.end()) {
+                LLAMA_LOG_INFO("%s: the sequence state is not all in device memory (%s), so it is copied synchronously\n",
+                        __func__, ggml_backend_buft_name(buft));
+                return nullptr;
+            }
+
+            on_device = true;
+        }
+
+        if (!on_device) {
+            return nullptr;
+        }
+    }
+
     cpy->can_pin = cpy->host_buffer_type() != ggml_backend_cpu_buffer_type();
 
     return cpy.release();
@@ -3636,7 +3693,11 @@ size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(io, seq_id, flags);
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+
+        io.commit();
+
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -3681,7 +3742,11 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
         llama_seq_id seq_id_read;
         io.read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(io, seq_id, flags);
+        const size_t n = state_seq_read_data(io, seq_id, flags);
+
+        io.commit();
+
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;

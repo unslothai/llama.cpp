@@ -1725,11 +1725,29 @@ private:
 
             if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
                 if (preempt_async_ok) {
-                    // no buffer has been allocated yet, so this is what the backend offers,
-                    // not what is held. What was actually got is reported by the first park,
-                    // because a host buffer type may still hand back ordinary memory.
-                    SRV_INF("preemption: parking and resuming asynchronously, backend offers %s host memory\n",
-                            llama_state_seq_copy_buf_can_pin(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+                    // Pinned host memory is what lets a copy run beside the decode: one into or
+                    // out of pageable memory is staged by the driver and blocks the thread that
+                    // issued it, which is the stall the asynchronous path exists to remove. A
+                    // host buffer type is free to hand back ordinary memory instead of failing
+                    // (GGML_CUDA_NO_PINNED, or a pinning limit), and that is only knowable from
+                    // a buffer, so a small one is taken and looked at before the first park.
+                    bool pinned = llama_state_seq_copy_buf_can_pin(slots[0].preempt_cpy_tgt.get());
+
+                    if (pinned) {
+                        auto * cpy = slots[0].preempt_cpy_tgt.get();
+
+                        pinned = llama_state_seq_copy_buf_resize(cpy, 1u << 20) != nullptr &&
+                                 llama_state_seq_copy_buf_is_pinned(cpy);
+
+                        llama_state_seq_copy_buf_free(cpy);
+                    }
+
+                    if (pinned) {
+                        SRV_INF("%s", "preemption: parking and resuming asynchronously through pinned host memory\n");
+                    } else {
+                        SRV_WRN("%s", "preemption: the host memory on offer is pageable, so a copy would block the decode; parking and resuming synchronously\n");
+                        preempt_async_ok = false;
+                    }
                 } else {
                     SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
                 }
