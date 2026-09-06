@@ -3695,6 +3695,27 @@ private:
                         victim->preempt_state_size() / (1024.0 * 1024.0),
                         preempt_kv_used(), n_cells, n_used,
                         victim->n_preempt);
+
+                // [TAG_PREEMPT_ASYNC] Whether we may leave now depends on which of the two
+                // thresholds we are under.
+                //
+                // Short of the lookahead only: there is still room for the step about to be
+                // built, the park is early by design, and leaving is the whole point -- the
+                // copy runs beside the decode and update_preempt_copies() collects it next
+                // iteration.
+                //
+                // Out of room for the step itself: the cells are held until the copy lands,
+                // so leaving now builds a batch into a pool that has not got smaller. The
+                // decode fails, and the retry ladder halves n_batch to 1 without ever
+                // polling the copy, ending in "Context size has been exceeded" for every
+                // slot. The synchronous path did not have this problem because it returned
+                // the cells before it returned. Go round instead: the next pass reaches
+                // preempt_wait_in_flight() and waits for the park just issued, which is no
+                // worse than the synchronous path and is what it was written for.
+                if (n_used + PREEMPT_N_MARGIN > n_cells) {
+                    continue;
+                }
+
                 break;
             }
 
@@ -4647,6 +4668,18 @@ private:
                     // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);
                 }
+            }
+
+            // [TAG_PREEMPT_ASYNC] Before giving up any batch width: a park that has been
+            // issued and not yet landed is holding cells that are already spoken for, and
+            // waiting for it returns them. Halving the batch returns nothing, so without
+            // this the ladder can run all the way down to n_batch == 1 and end every
+            // request while the room it needed was moments from arriving. Safe from here
+            // because the slot was detached before this batch was built, so completing its
+            // park cannot change what the batch about to be retried contains.
+            if (ret == 1 && preempt_wait_in_flight()) {
+                SRV_WRN("%s", "waited for an in-flight park before retrying the decode\n");
+                return false; // retry at the same batch size, with the cells it freed
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache

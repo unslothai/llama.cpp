@@ -447,3 +447,60 @@ def test_no_preempt_async_falls_back_to_the_synchronous_path():
     # the synchronous path still parks and resumes
     assert text.count("preempted on request") >= 6
     assert text.count("resumed after") >= 6
+
+
+def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everything():
+    # [TAG_PREEMPT_ASYNC] The case the async path made worse than the synchronous one, and
+    # that the existing tests miss because their victim holds almost no cells.
+    #
+    # Three slots are well into generating when a fourth request arrives whose prompt does
+    # not fit in what is left. update_preemption() picks a victim and issues its park, but
+    # an asynchronous park does not return the cells before update_slots() carries on. If
+    # the loop leaves at that point, the batch is built into a pool that has not got any
+    # smaller, llama_decode returns 1, and the retry ladder halves n_batch to 1 in
+    # microseconds without ever polling the copy -- ending every request with "Context size
+    # has been exceeded" while the room it wanted was one event query away.
+    #
+    # Pass is what the synchronous path gave: a park, and all four requests finish.
+    global server
+    server.n_ctx = 512
+    server.n_gpu_layer = 99
+    server.n_slots = 4
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompt_a, n_a = _prompt_of_about(100, "Alpha")
+    prompt_b, n_b = _prompt_of_about(100, "Bravo")
+    prompt_c, n_c = _prompt_of_about(100, "Charlie")
+    prompt_d, n_d = _prompt_of_about(150, "Delta")
+
+    # A, B and C oversubscribe the pool between them, so the pressure does not depend on
+    # when D arrives, and every occupant is holding real cells rather than the handful the
+    # other tests park. Each of the four still fits on its own.
+    n_predict_abc = 130
+    n_predict_d = 40
+    assert max(n_a, n_b, n_c) + n_predict_abc < 512 and n_d + n_predict_d < 512
+    assert n_a + n_b + n_c + 3 * n_predict_abc > 512
+
+    def _late(n_predict, prompt):
+        # D's prompt arrives into a pool the other three have already grown into; this
+        # model decodes about 120 tokens a second, so they are all still running
+        time.sleep(0.25)
+        return _complete(n_predict, prompt)
+
+    results = parallel_function_calls([
+        (_complete, (n_predict_abc, prompt_a)),
+        (_complete, (n_predict_abc, prompt_b)),
+        (_complete, (n_predict_abc, prompt_c)),
+        (_late,     (n_predict_d, prompt_d)),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted" in text
+
+    for i, res in enumerate(results):
+        assert res.status_code == 200, (i, res.body)
+    for i in range(3):
+        assert results[i].body["timings"]["predicted_n"] == n_predict_abc
+    assert results[3].body["timings"]["predicted_n"] == n_predict_d
