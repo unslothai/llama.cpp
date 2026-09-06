@@ -3176,7 +3176,10 @@ private:
 
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            // [TAG_PREEMPT] a parked slot took no part in what failed: its sequence is in
+            // host RAM, not in the cache, and it comes back when there is room, the same as
+            // in the decode error sweep
+            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
@@ -3312,6 +3315,22 @@ private:
         const size_t extra = need > held ? need - held : 0;
 
         return preempt_ram_used() + extra <= budget;
+    }
+
+    // the same for a rotation: the parked head is restored on the pass that parks the
+    // resident, so its bytes are on their way out and are not held against the resident.
+    // A budget that holds one sequence but not two would otherwise refuse every rotation
+    // and leave the head parked for as long as the resident cares to generate.
+    bool preempt_fits_budget_for_rotation(const server_slot & slot, const server_slot & head) const {
+        if (params_base.preempt_ram_mib < 0) {
+            return true;
+        }
+
+        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+        const size_t used   = preempt_ram_used();
+        const size_t leaving = std::min(used, head.preempt_state_size());
+
+        return used - leaving + slot.preempt_state_required() <= budget;
     }
 
     // cells the slot will ask for on its next step once it is back in the pool
@@ -3815,7 +3834,7 @@ private:
                             continue;
                         }
 
-                        if (!preempt_fits_budget(slot)) {
+                        if (!preempt_fits_budget_for_rotation(slot, *head)) {
                             continue;
                         }
 
