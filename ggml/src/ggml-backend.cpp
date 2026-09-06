@@ -551,6 +551,18 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
+bool ggml_backend_event_query(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+
+    if (event->device->iface.event_query == NULL) {
+        // no way to ask: the honest answer is to wait for it and then say yes
+        ggml_backend_event_synchronize(event);
+        return true;
+    }
+
+    return event->device->iface.event_query(event->device, event);
+}
+
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.event_wait != NULL);
@@ -625,6 +637,11 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     return device->iface.supports_op(device, op);
+}
+
+bool ggml_backend_dev_supports_event_query(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    return device->iface.event_query != NULL;
 }
 
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
