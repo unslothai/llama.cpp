@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <set>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -77,6 +78,7 @@ enum slot_state {
 // room the copy goes back and the slot carries on with the same sampler, the same generated
 // text and the same open stream. A streaming client sees a pause, not an error.
 constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the reservation
+constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a streaming slot is parked
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 
 // [TAG_PREEMPT] The order parked slots come back in. Head of the line by park time, and nobody
@@ -88,6 +90,19 @@ constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is 
 // parked, and a smaller slot may pass a head that does not fit.
 // LLAMA_SERVER_PREEMPT_RESUME=head (the default) or pass; read once in load_model() and logged.
 static bool g_preempt_resume_head_of_line = true;
+
+// [TAG_PREEMPT] the SSE comment for a park or a resume. A request with several prompts
+// streams them through one reader, so the comment names the prompt it is about, except for
+// prompt 0, whose comment stays the bare form a single-prompt client matches on.
+static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
+    std::string res = notice.parked ? ": preempted" : ": resumed";
+
+    if (notice.index > 0) {
+        res += " " + std::to_string(notice.index);
+    }
+
+    return res + "\n\n";
+}
 
 static bool preempt_resume_head_of_line() {
     return g_preempt_resume_head_of_line;
@@ -2180,6 +2195,25 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // [TAG_PREEMPT] tell a streaming client that its slot was parked or restored. The
+    // HTTP layer turns this into an SSE comment, so a client that does not know about
+    // preemption sees nothing, and one that does can show a pause instead of a stall.
+    void send_preempt_notice(server_slot & slot, bool parked) {
+        if (!slot.task || !slot.task->params.stream) {
+            return;
+        }
+
+        auto res = std::make_unique<server_task_result_preempt_notice>();
+
+        res->id        = slot.task->id;
+        res->index     = slot.task->index;
+        res->id_slot   = slot.id;
+        res->parked    = parked;
+        res->n_preempt = slot.n_preempt;
+
+        queue_results.send(std::move(res));
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -3375,6 +3409,8 @@ private:
 
                         metrics.n_preempt++;
 
+                        send_preempt_notice(slot, true);
+
                         SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
                                 slot.n_ctx_shift, slot.prompt.n_tokens(),
                                 slot.preempt_state_size() / (1024.0 * 1024.0),
@@ -3415,6 +3451,8 @@ private:
 
             metrics.n_resume++;
 
+            send_preempt_notice(*best, false);
+
             SLT_WRN(*best, "resumed after %.2f s: %d tokens back in the cache in %.2f ms, kv %d/%d, preemptions %d\n",
                     (ggml_time_us() - best->t_preempt_us) / 1e6,
                     best->prompt.n_tokens(),
@@ -3431,6 +3469,8 @@ private:
                     preempt_fits_budget(slot) &&
                     slot.preempt_save()) {
                     metrics.n_preempt++;
+
+                    send_preempt_notice(slot, true);
 
                     SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
                             (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
@@ -3471,6 +3511,8 @@ private:
             }
 
             metrics.n_preempt++;
+
+            send_preempt_notice(*victim, true);
 
             SLT_WRN(*victim, "preempted: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
@@ -4420,6 +4462,8 @@ private:
             metrics.n_preempt++;
             n_parked++;
 
+            send_preempt_notice(*victim, true);
+
             SLT_WRN(*victim, "preempted as a last resort: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
                     (ggml_time_us() - t_start) / 1e3,
@@ -5199,37 +5243,59 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        // [TAG_PREEMPT] a slot can be parked while still processing its prompt, before any
+        // token exists. Those notices arrive ahead of the first real result; keep them and
+        // send them in front of it, so the client learns about the wait it just had.
+        std::string preempt_prefix;
+        std::set<size_t> parked_idx; // prompts of this request that are parked right now
         auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
-        }
-
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
-        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+        if (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
+            // [TAG_PREEMPT] parked before any token exists. The stream starts now, with the
+            // notice, so the parked keepalive runs through the wait instead of the client
+            // seeing nothing until the slot resumes; the first ordinary result follows in
+            // the stream, an error included, since the response has already begun.
+            const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
+            preempt_prefix = preempt_notice_comment(*notice);
+            if (notice->parked) {
+                parked_idx.insert(notice->index);
+            } else {
+                parked_idx.erase(notice->index);
+            }
+            first_result.reset();
         } else {
-            res->data = format_oai_sse(first_result_json);
+            if (first_result == nullptr) {
+                GGML_ASSERT(req.should_stop());
+                return res; // connection is closed
+            }
+
+            if (first_result->is_error()) {
+                res->error(first_result->to_json());
+                return res;
+            }
+
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
+        }
+
+        json first_result_json = first_result ? first_result->to_json() : json(nullptr);
+        if (first_result_json == nullptr) {
+            res->data = preempt_prefix; // simply send HTTP headers and status code
+        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+            res->data = preempt_prefix + format_anthropic_sse(first_result_json);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            res->data = preempt_prefix + format_oai_resp_sse(first_result_json);
+        } else {
+            res->data = preempt_prefix + format_oai_sse(first_result_json);
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked_idx](std::string & output) mutable -> bool {
+            // [TAG_PREEMPT] the keepalive runs while ANY prompt of the request is parked: with
+            // several prompts in one stream, one resuming does not mean the others did
+            const bool parked = !parked_idx.empty();
+
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -5280,10 +5346,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // receive subsequent results
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
-                auto result = rd.next([&timeout, &start_time, sse_ping_interval, &effective_should_stop]() {
+                // [TAG_PREEMPT] a parked slot produces nothing for as long as the pool is
+                // full, so while parked the ping runs every 2 s regardless of --sse-ping and
+                // is named, so a client can tell "waiting for cells" from "slow".
+                const int64_t ping_ms = parked ? PREEMPT_KEEPALIVE_MS : (sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1);
+                auto result = rd.next([&timeout, &start_time, ping_ms, &effective_should_stop]() {
                     if (effective_should_stop()) {
                         return true; // should_stop condition met
-                    } else if (sse_ping_interval > 0 && ggml_time_ms() - start_time > (int64_t)sse_ping_interval * 1000) {
+                    } else if (ping_ms > 0 && ggml_time_ms() - start_time > ping_ms) {
                         timeout = true;
                         return true; // timeout
                     }
@@ -5293,7 +5363,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (timeout) {
                     // some clients may time out (e.g. undici) will time out if no data is received for a while, so we need to send a ping to keep the connection alive
                     SRV_DBG("%s", "sending SSE ping\n");
-                    output = ":\n\n";
+                    output = parked ? ": preempt-keepalive\n\n" : ":\n\n";
                     return true;
                 }
 
@@ -5309,12 +5379,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
+                    // [TAG_PREEMPT] an SSE comment: invisible to clients that do not know
+                    // about preemption, a pause indicator for the ones that do
+                    if (notice->parked) {
+                        parked_idx.insert(notice->index);
+                    } else {
+                        parked_idx.erase(notice->index);
+                    }
+                    output = preempt_notice_comment(*notice);
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
+                    if (res_json.is_null()) {
+                        // [TAG_PREEMPT] the signal a prompt sends before its first token, so
+                        // that the headers go out, carries no data. Normally it is the first
+                        // result and only opens the stream; after a notice opened the stream
+                        // it has nothing to add, and the sender skips an empty chunk.
+                        return true;
+                    }
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
