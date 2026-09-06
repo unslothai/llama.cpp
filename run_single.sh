@@ -71,3 +71,18 @@ cell() {
     $PY $D/scripts/phase_table.py "$O/${tag}_client.jsonl" 2>&1 | tee -a "$LOG"
   fi
 }
+
+BASE=${BASE:-/home/nvidianew/temp/wt_srvperf/bin_base}
+NEW=${NEW:-/home/nvidianew/temp/wt_srvperf/build/bin}
+
+cell base_t32 "$BASE" 1 32
+cell new_t32  "$NEW"  1 32
+
+cell base_a "$BASE" 0 1,8,32
+cell new_b  "$NEW"  0 1,8,32
+cell base_c "$BASE" 0 1,8,32
+
+# what the prefill checkpoints cost, using the knob that already exists
+cell base_ckpt0 "$BASE" 0 32 -ctxcp 0
+
+say "run_single done"

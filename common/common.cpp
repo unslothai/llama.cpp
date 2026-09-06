@@ -3,6 +3,18 @@
 
 #include "build-info.h"
 #include "common.h"
+
+#include "ggml-trace.h"
+
+// scratch instrumentation, mirrors the one in tools/server/server-context.cpp
+#define STRACE_T0(v)             const int64_t v = ggml_trace_flag ? ggml_trace_time_us() : 0
+#define STRACE_EMIT(name, v, a, b)                                                          \
+    do {                                                                                    \
+        if (ggml_trace_flag) {                                                              \
+            ggml_trace_eventf("server", name, v, ggml_trace_time_us(),                      \
+                              "\"n0\":%d,\"n1\":%d", (int) (a), (int) (b));                 \
+        }                                                                                   \
+    } while (0)
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2287,11 +2299,17 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    STRACE_T0(t_size);
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    STRACE_EMIT("ckpt.get_size", t_size, (int) (ckpt_size >> 20), 0);
 
+    STRACE_T0(t_resize);
     data_tgt.resize(ckpt_size);
+    STRACE_EMIT("ckpt.resize", t_resize, (int) (ckpt_size >> 20), 0);
 
+    STRACE_T0(t_get);
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    STRACE_EMIT("ckpt.get_data", t_get, (int) (ckpt_size >> 20), 0);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
