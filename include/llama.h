@@ -969,7 +969,11 @@ extern "C" {
     // will ask for, not what any buffer is: an allocation can still come back pageable.
     LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
 
-    // issue the copies; return the number of bytes covered, 0 on failure
+    // Issue the copies; return the number of bytes covered, 0 on failure. size must be
+    // between 1 and llama_state_seq_copy_buf_size(): the buffer belongs to the transfer, and
+    // a size beyond it is refused rather than believed. LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is
+    // refused too, since these copies serialise through host memory; use
+    // llama_state_seq_get_data_ext / set_data_ext for that flag.
     LLAMA_API size_t llama_state_seq_copy_get(
             struct llama_state_seq_copy * cpy,
                            size_t   size,
