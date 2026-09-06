@@ -489,7 +489,7 @@ class ModelBase:
                     quant_format == "nvfp4-pack-quantized"
                     or quant_format == "mixed-precision"
                     and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                    and any(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
                 )
 
                 if len(groups) > 1 and not nvfp4_compressed_tensors:
@@ -538,8 +538,27 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
-                    pass
+                    # NVFP4 tensors were already repacked by _generate_nvfp4_tensors and removed
+                    # from model_tensors. For a "mixed-precision" checkpoint whatever weight_scale
+                    # entries are left belong to the non-NVFP4 config group (FP8 per-channel);
+                    # dequantize them exactly like the float-quantized branch above.
+                    for name in self.model_tensors.keys():
+                        if name.endswith(".weight_scale"):
+                            weight_name = name.removesuffix("_scale")
+                            if weight_name not in self.model_tensors:
+                                tensors_to_remove.append(name)
+                                continue
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            is_fp8 = False
+                            if self._fp8_as_q8:
+                                is_fp8 = w().dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                            self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
+                            tensors_to_remove.append(name)
+                            if is_fp8:
+                                self._fp8_dequantized.add(weight_name)
+                        elif name.endswith((".input_scale", ".k_scale", ".v_scale", ".weight_scale_2")):
+                            tensors_to_remove.append(name)
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
@@ -751,8 +770,15 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
+            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales).
+            # In a compressed-tensors "mixed-precision" checkpoint the FP8 group also has a
+            # 2D weight_scale of shape [out, 1], so shape alone is not enough: an NVFP4
+            # tensor is nibble-packed uint8 with an E4M3 scale, one per 16 values.
             if scale.ndim < 2:
+                continue
+            if weight.dtype != torch.uint8 or scale.dtype != torch.float8_e4m3fn:
+                continue
+            if scale.shape[-1] * 16 != weight.shape[-1] * 2:
                 continue
 
             scale2 = LazyTorchTensor.to_eager(self.model_tensors.get(scale2_name, lambda: torch.tensor(1.0))())
@@ -858,7 +884,7 @@ class ModelBase:
             quant_format == "nvfp4-pack-quantized"
             or quant_format == "mixed-precision"
             and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            and any(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
         )
         if quant_algo != "NVFP4":
             if nvfp4_compressed_tensors:
