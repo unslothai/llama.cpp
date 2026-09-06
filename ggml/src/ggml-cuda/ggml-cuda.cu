@@ -3528,9 +3528,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    //topk-moe
-    if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-            cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+    // topk-moe
+    // [TAG_BATCH_INVARIANT] The routing fusion passes its memory-range check only when the ubatch
+    // holds one token, so a request decoding alone picks the fused warp-local top-k kernel and the
+    // same request decoding next to neighbours picks the softmax, argsort and normalize chain.
+    // Two algorithms for one set of routing weights is the batch dependence this mode removes.
+    if (!ggml_cuda_batch_invariant() &&
+            (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
