@@ -3322,16 +3322,38 @@ private:
     // resident, so its bytes are on their way out and are not held against the resident.
     // A budget that holds one sequence but not two would otherwise refuse every rotation
     // and leave the head parked for as long as the resident cares to generate.
+    // [TAG_PREEMPT_ASYNC] an asynchronous head keeps its pinned buffer through the restore
+    // (see preempt_state_size), so nothing of it leaves; what the resident already holds is
+    // reused, as in preempt_fits_budget, and only the rest is charged.
     bool preempt_fits_budget_for_rotation(const server_slot & slot, const server_slot & head) const {
         if (params_base.preempt_ram_mib < 0) {
             return true;
         }
 
-        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
-        const size_t used   = preempt_ram_used();
-        const size_t leaving = std::min(used, head.preempt_state_size());
+        const size_t budget  = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+        const size_t used    = preempt_ram_used();
+        const size_t leaving = head.preempt_is_async() ? 0 : std::min(used, head.preempt_state_size());
+        const size_t held    = slot.preempt_state_size();
+        const size_t need    = slot.preempt_state_required();
+        const size_t extra   = need > held ? need - held : 0;
 
-        return used - leaving + slot.preempt_state_required() <= budget;
+        return used - leaving + extra <= budget;
+    }
+
+    // [TAG_PREEMPT_ASYNC] a restored slot keeps its pinned buffer for its next park, which is
+    // worth it while the budget has room for it and not otherwise: over budget, a buffer held
+    // by a slot that is running would keep every other slot from being parked at all
+    void preempt_trim_ram(server_slot & slot) {
+        if (params_base.preempt_ram_mib < 0) {
+            return;
+        }
+
+        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+
+        if (preempt_ram_used() > budget && slot.preempt_state_size() > 0) {
+            SLT_INF(slot, "%.1f MiB of parked RAM returned: the pool is over its budget\n", slot.preempt_state_size() / (1024.0 * 1024.0));
+            slot.preempt_state_free();
+        }
     }
 
     // cells the slot will ask for on its next step once it is back in the pool
@@ -3634,6 +3656,8 @@ private:
                 if (slot.preempt_restore_poll()) {
                     metrics.n_resume++;
 
+                    preempt_trim_ram(slot);
+
                     SLT_WRN(slot, "restore completed after %.2f ms: %d tokens back in the cache, kv %d/%d, preemptions %d\n",
                             (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
                             slot.prompt.n_tokens(),
@@ -3671,6 +3695,8 @@ private:
             }
 
             metrics.n_resume++;
+
+            preempt_trim_ram(slot);
 
             SLT_WRN(slot, "restore completed after %.2f ms (waited for, a context shift is due): %d tokens back in the cache, kv %d/%d, preemptions %d\n",
                     (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
@@ -3815,7 +3841,15 @@ private:
             if (!best) {
                 server_slot * head = parked.front();
 
-                if (ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
+                // [TAG_PREEMPT_ASYNC] a park still copying holds its cells, so the head would
+                // not fit yet and a rotation now would only park another resident on top
+                bool parking = false;
+
+                for (const auto & slot : slots) {
+                    parking = parking || slot.state == SLOT_STATE_PREEMPTING;
+                }
+
+                if (!parking && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
                     // the resident whose cells let the head in, the smallest of those; failing
                     // one that does so alone, the largest, since it makes the most room. Taking
                     // the first shifting resident in slot order could park one too small to
@@ -3870,7 +3904,12 @@ private:
                                 pick_enough ? "" : " (not enough room by itself)",
                                 slot.n_preempt);
 
-                        best = head; // re-examined by the loop, which sees the room it just got
+                        // [TAG_PREEMPT_ASYNC] a synchronous park has released its cells, so the
+                        // head is re-examined now; an asynchronous one has not, and the head is
+                        // re-examined on the pass that sees the copy land
+                        if (slot.state == SLOT_STATE_PREEMPTED) {
+                            best = head;
+                        }
                     }
                 }
 
@@ -4547,6 +4586,10 @@ private:
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+
+                                            // [TAG_PREEMPT_ASYNC] applied inside the next llama_decode by the
+                                            // same in-place graph as a context shift, see preempt_wait_for_shift
+                                            preempt_shift_pending = true;
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
