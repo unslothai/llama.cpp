@@ -318,6 +318,7 @@ def summarize(files, client, out):
         wire_out = 0
         wire_in = 0
         worst = (0, "", 0)
+        idle_by = defaultdict(float)
         host = [get(cat, name, grp) for cat, name in
                 (("server", "batch_build"), ("server", "submit"), ("server", "synchronize"),
                  ("server", "post_decode"), ("server", "sampling"), ("server", "result_send"),
@@ -356,22 +357,26 @@ def summarize(files, client, out):
             acc["logits"] += union_len(clip(logits, t0, t1))
             acc["stage"] += get("sched", "copy_stage", grp).covered(t0, t1)
 
-            # the longest stretch of the step in which neither GPU was busy
+            # the stretches of the step in which neither GPU was busy, and what the host was
+            # doing in them: the single longest one, and the total attributed per phase
             hole = gaps(local_iv + peer_iv, t0, t1)
             acc["idle_both"] += union_len(hole)
             for g0, g1 in hole:
+                name, cov = name_gap(host, g0, g1)
                 if g1 - g0 > worst[0]:
-                    worst = (g1 - g0, name_gap(host, g0, g1), g0)
+                    worst = (g1 - g0, "%s (%.0f%% of the gap)" % (name, 100.0 * cov / max(g1 - g0, 1)), g0)
+                idle_by[name] += cov
+                idle_by["unattributed"] += (g1 - g0) - cov
 
         if n == 0:
             continue
-        rows.append((grp, n, acc, wire_out, wire_in, worst))
+        rows.append((grp, n, acc, wire_out, wire_in, worst, idle_by))
 
     hdr = ("group  steps  step_ms  build  submit   sync   post  sampl   send | "
            "localGPU  peerGPU  transfer  logits  stage | idle_both")
     out.write(hdr + "\n")
     out.write("-" * len(hdr) + "\n")
-    for grp, n, acc, wo, wi, worst in rows:
+    for grp, n, acc, wo, wi, worst, idle_by in rows:
         def ms(k):
             return acc[k] / n / 1000.0
         out.write("%5d  %5d  %7.1f %6.1f %7.1f %6.1f %6.1f %6.1f %6.1f | "
@@ -381,10 +386,13 @@ def summarize(files, client, out):
                      ms("transfer"), ms("logits"), ms("stage"), ms("idle_both")))
     out.write("\n")
 
-    for grp, n, acc, wo, wi, worst in rows:
+    for grp, n, acc, wo, wi, worst, idle_by in rows:
         out.write("group %d: %.1f kB out and %.1f kB in per step over RPC; "
                   "biggest idle gap %.1f ms in %s\n"
                   % (grp, wo / n / 1024.0, wi / n / 1024.0, worst[0] / 1000.0, worst[1]))
+        top = sorted(idle_by.items(), key=lambda kv: -kv[1])[:4]
+        out.write("         idle with neither GPU busy, per step: %s\n"
+                  % ", ".join("%s %.1f ms" % (k, v / n / 1000.0) for k, v in top if v > 0))
 
     busy_local = gpu_local.covered(w0, w1)
     busy_peer = gpu_peer.covered(w0, w1)
@@ -410,9 +418,8 @@ def name_gap(indexes, g0, g1):
                 best_cov = cov
                 best = e
     if best is None:
-        return "nothing traced"
-    return "%s/%s (%.0f%% of the gap)" % (best.get("ph"), best.get("n"),
-                                          100.0 * best_cov / max(g1 - g0, 1))
+        return "nothing traced", 0
+    return "%s/%s" % (best.get("ph"), best.get("n")), best_cov
 
 
 # ---------------------------------------------------------------------------- main
