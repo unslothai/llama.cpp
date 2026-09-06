@@ -1272,6 +1272,23 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // [TAG_PREEMPT_ASYNC] the slots outlive this call -- they are declared after
+        // llama_init, so they are still there when it is reset here, and load_model() clears
+        // them only after the next context exists -- and any one of them may be holding a
+        // park or a resume that is still reading or writing KV tensors of the contexts about
+        // to be freed. release() makes the same wait for a single slot; this is the one that
+        // covers all of them, and on the sleeping-state path it is the only one there is,
+        // because the server carries on running afterwards.
+        for (auto & slot : slots) {
+            slot.preempt_copy_wait();
+
+            // the transfer holds a backend and an event of its own, and its host buffer is
+            // no use to the context that comes back: let go of both before that context's
+            // successor makes new ones
+            slot.preempt_cpy_tgt.reset();
+            slot.preempt_cpy_dft.reset();
+        }
+
         spec.reset();
         spec_init.reset();
 
