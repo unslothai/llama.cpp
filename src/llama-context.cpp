@@ -3260,6 +3260,30 @@ struct llama_state_seq_copy {
         }
     }
 
+    // Order the context's compute behind the copies just recorded, on the device: every
+    // backend the graphs run on waits for the event of the transfer on its device before
+    // the next graph it is given. This is a stream wait, not a host wait, so the caller's
+    // thread carries on and the decode it issues next starts the moment the copy lands.
+    //
+    // Needed for a restore and only a restore: its copies write cells of the KV cache
+    // while other sequences keep decoding, and an attention that is not paged reads every
+    // cell up to n_kv, masked ones included, so without this the reads and the writes are
+    // unordered. A park reads cells nobody writes until it has landed, and the decode that
+    // produced them has been drained by the synchronize() at the top of the issue.
+    void order_before(const std::vector<ggml_backend_ptr> & compute) {
+        for (auto & it : devs) {
+            if (!it.second.pending) {
+                continue;
+            }
+
+            for (const auto & backend : compute) {
+                if (ggml_backend_get_device(backend.get()) == it.first) {
+                    ggml_backend_event_wait(backend.get(), it.second.event);
+                }
+            }
+        }
+    }
+
     bool done() {
         bool res = true;
 
@@ -3769,27 +3793,35 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
 
     cpy.n_copies = 0;
 
-    llama_io_read_host_async io(cpy.data, size, cpy);
+    size_t n = 0;
 
-    try {
-        uint32_t magic_read;
-        io.read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
+    {
+        llama_io_read_host_async io(cpy.data, size, cpy);
+
+        try {
+            uint32_t magic_read;
+            io.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io.read(&seq_id_read, sizeof(seq_id_read));
+
+            n = state_seq_read_data(io, seq_id, flags);
+
+            io.commit();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+            return 0;
         }
-
-        llama_seq_id seq_id_read;
-        io.read(&seq_id_read, sizeof(seq_id_read));
-
-        const size_t n = state_seq_read_data(io, seq_id, flags);
-
-        io.commit();
-
-        return n;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
-        return 0;
     }
+
+    // the adapter has posted the copies and recorded the events on its way out; the
+    // graphs that follow on these devices wait for them, see order_before()
+    cpy.order_before(backends);
+
+    return n;
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
