@@ -275,6 +275,15 @@ llama_kv_cache::llama_kv_cache(
 
         // [TAG_EXACT_CONCURRENCY] a layer left anywhere else attends in physical cell order while
         // the mode still reports itself as on, so refuse the load instead
+        // [TAG_EXACT_CONCURRENCY] the paged attention kernel handles 256-wide K and V heads only;
+        // any other width would run unpaged on the CPU while the mode reports itself as on
+        if (exact_pages && (hparams.n_embd_head_k(il) != 256 || (!is_mla && hparams.n_embd_head_v(il) != 256) || is_mla)) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d has %u-wide K heads and %u-wide V heads%s, "
+                    "and the paged attention kernel supports 256-wide K and V heads only\n",
+                    __func__, il, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), is_mla ? " (MLA)" : "");
+            throw std::runtime_error("exact concurrency: unsupported attention head size");
+        }
+
         if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
                     "which has no paged attention: every layer must be offloaded to the CUDA backend "
@@ -874,6 +883,14 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     GGML_UNUSED(embd_all);
 
     do {
+        // [TAG_EXACT_CONCURRENCY] a token shared by several sequences would be one cell in a page
+        // that belongs to one sequence; the placement asserts on it later, so refuse it here
+        if (exact_pages && balloc.has_shared_tokens()) {
+            LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                    "give every token exactly one sequence id\n", __func__);
+            break;
+        }
+
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;

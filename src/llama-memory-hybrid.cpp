@@ -66,6 +66,13 @@ llama_memory_hybrid::llama_memory_hybrid(
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
+        // [TAG_EXACT_CONCURRENCY] refused before the attention half asserts on it, see llama_kv_cache::init_batch
+        if (llama_exact_concurrency() && balloc.has_shared_tokens()) {
+            LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                    "give every token exactly one sequence id\n", __func__);
+            break;
+        }
+
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
@@ -163,6 +170,14 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // [TAG_EXACT_CONCURRENCY] the attention half refuses this under exact mode; refuse it here
+    // before either half is touched, so the two halves cannot end up describing different states
+    if (llama_exact_concurrency() && seq_id_src != seq_id_dst) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support copying cells between sequences (%d -> %d); ignoring the copy\n",
+                __func__, seq_id_src, seq_id_dst);
+        return;
+    }
+
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
@@ -173,11 +188,23 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (llama_exact_concurrency() && shift != 0) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support shifting positions (seq %d, shift %d); ignoring the shift\n",
+                __func__, seq_id, shift);
+        return;
+    }
+
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (llama_exact_concurrency() && d != 1) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support dividing positions (seq %d, d %d); ignoring the division\n",
+                __func__, seq_id, d);
+        return;
+    }
+
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
 }

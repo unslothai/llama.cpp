@@ -507,6 +507,16 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
+bool llama_batch_allocr::has_shared_tokens() const {
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] > 1) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool llama_batch_allocr::has_seq_wider_than(uint32_t n_tokens) const {
     std::vector<uint32_t> n_per_seq(n_seq_max, 0);
 
