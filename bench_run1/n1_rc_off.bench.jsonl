@@ -1,0 +1,1 @@
+{"label": "n1_rc_off", "conc": 32, "npp": 128, "ntg": 256, "n_ok": 64, "n_err": 0, "wall_s": 161.141, "agg_tok_s": 101.67, "tpot_med_ms": 293.92, "tpot_p90_ms": 298.8, "ttft_med_ms": 5113.97, "ttft_p90_ms": 6612.24, "decode_tok_s_per_req": 3.4, "per_backend": {"http://127.0.0.1:8188": 64}, "errors": []}

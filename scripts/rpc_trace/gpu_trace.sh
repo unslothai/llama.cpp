@@ -40,7 +40,27 @@ memcheck() {
 export LD_LIBRARY_PATH=$BIN LLAMA_ARG_OFFLINE=1
 
 SRVPID=""; PEERPID=""
-stop_peer() { [ -n "$PEERPID" ] && $SSH "kill -TERM $PEERPID 2>/dev/null; sleep 2; kill -9 $PEERPID 2>/dev/null; true"; PEERPID=""; }
+
+# Kill every rpc-server this script started on the peer. By pid, and then by a match scoped to
+# our own port, because a server left behind holds the port and the next cell silently talks to
+# it instead ("Failed to create server socket" in its log and an empty trace).
+stop_peer() {
+  # note: matched with pgrep -x on the binary name and then on the port in /proc, never with
+  #       pgrep -f or pkill -f, whose pattern also matches the remote shell running it
+  $SSH "kill -TERM $PEERPID 2>/dev/null; sleep 2; kill -9 $PEERPID 2>/dev/null;
+        for p in \$(pgrep -x ggml-rpc-server 2>/dev/null); do
+          if tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null | grep -q -- '-p $RPCPORT'; then
+            kill -9 \$p 2>/dev/null
+          fi
+        done; true" 2>/dev/null
+  PEERPID=""
+  # do not return until the port is free again
+  for i in $(seq 1 30); do
+    timeout 2 bash -c "</dev/tcp/$PEER/$RPCPORT" 2>/dev/null || return 0
+    sleep 1
+  done
+  say "  !!! peer port $RPCPORT still busy"
+}
 trap '[ -n "$SRVPID" ] && kill -9 $SRVPID 2>/dev/null; stop_peer' EXIT
 
 # cell <tag> <device order> <trace 0|1> [extra server args...]
@@ -50,8 +70,14 @@ cell() {
 
   local ptrace=""
   [ "$trace" = 1 ] && ptrace="--trace /tmp/trace_${tag}_peer.jsonl"
-  PEERPID=$($SSH "cd $PEERDIR && LD_LIBRARY_PATH=$PEERDIR setsid nohup ./ggml-rpc-server -H 0.0.0.0 -p $RPCPORT $ptrace > /tmp/trace_rpc_$tag.log 2>&1 < /dev/null & echo \$!")
+  stop_peer
+  # note: no setsid here. $! would then be the pid of setsid and the server, its child, would
+  #       survive every kill. -n so ssh does not hold the terminal open waiting for stdin.
+  PEERPID=$($SSH -n "cd $PEERDIR && LD_LIBRARY_PATH=$PEERDIR nohup ./ggml-rpc-server -H 0.0.0.0 -p $RPCPORT $ptrace > /tmp/trace_rpc_$tag.log 2>&1 < /dev/null & echo \$!")
   for i in $(seq 1 60); do timeout 2 bash -c "</dev/tcp/$PEER/$RPCPORT" 2>/dev/null && break; sleep 1; done
+  if $SSH -n "grep -q 'Failed to create server socket' /tmp/trace_rpc_$tag.log" 2>/dev/null; then
+    say "  !!! peer rpc-server for $tag could not bind $RPCPORT, aborting"; exit 1
+  fi
   say "  peer rpc-server $PEERPID up ($tag)"
 
   ( exec nvidia-smi --query-gpu=utilization.gpu,clocks.sm,temperature.gpu,power.draw --format=csv,noheader -lms 100 | while IFS= read -r l; do echo "$(date +%s.%N),$l"; done > "$S/${tag}_local.csv" ) & local SL=$!
@@ -76,7 +102,9 @@ cell() {
 
   kill -TERM $SRVPID 2>/dev/null; for i in $(seq 1 120); do kill -0 $SRVPID 2>/dev/null || break; sleep 1; done
   kill -9 $SRVPID 2>/dev/null; SRVPID=""
+  sleep 2   # let the peer flush the tail of its trace before it is stopped
   stop_peer
+  say "  peer compute apps after $tag: $($SSH -n 'nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr "\n" " "')"
   for p in $SL $SP; do for c in $(pgrep -P $p 2>/dev/null); do pkill -P $c 2>/dev/null; kill $c 2>/dev/null; done; kill $p 2>/dev/null; done
 
   if [ "$trace" = 1 ]; then

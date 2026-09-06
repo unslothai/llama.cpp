@@ -30,6 +30,7 @@ struct trace_state {
     FILE *      f    = nullptr;
     std::string role;
     int64_t     t_open = 0;
+    int64_t     n_unflushed = 0;
 
     ~trace_state() {
         if (f) {
@@ -53,6 +54,11 @@ thread_local const char * tls_subject = nullptr;
 thread_local uint64_t     tls_uid     = 0;
 thread_local std::string  tls_line;
 
+// a traced process is usually stopped with a signal at the end of a run, and the tail of the
+// stdio buffer would be lost, so the file is flushed every so many lines. At the rate a decode
+// step produces events this is a handful of flushes per second.
+const int64_t TRACE_FLUSH_EVERY = 128;
+
 // one line is built in the calling thread and handed to the file under the lock
 void emit(const std::string & line) {
     trace_state & s = state();
@@ -62,6 +68,10 @@ void emit(const std::string & line) {
         return;
     }
     fwrite(line.data(), 1, line.size(), s.f);
+    if (++s.n_unflushed >= TRACE_FLUSH_EVERY) {
+        s.n_unflushed = 0;
+        fflush(s.f);
+    }
 }
 
 void append_escaped(std::string & out, const char * src) {
