@@ -109,21 +109,9 @@ llama_context::llama_context(
     // The sequence count is what is reported: the tokens figure can be raised later for the
     // whole process, and the width then follows it for this context too.
     if (llama_exact_concurrency()) {
-        const uint32_t n_cols = cparams.n_seq_max * llama_exact_decode_tokens();
-
         // an explicit column bound wins over the reported width in the backend, so one below
         // this context's width would leave its decodes batched above the bound with the mode
-        // still reporting itself on; refuse it here, the way the server's setup does
-        if (const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS")) {
-            const int max_cols = atoi(bound);
-
-            if (max_cols > 0 && (uint32_t) max_cols < n_cols) {
-                LLAMA_LOG_ERROR("%s: GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at least %u to cover a decode step of %u sequences; raise it, set it to 0 for no bound, or unset it\n",
-                        __func__, max_cols, n_cols, cparams.n_seq_max);
-                throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
-            }
-        }
-
+        // still reporting itself on; the report refuses that, and the refusal is an error here
         if (!llama_exact_report_n_seq(cparams.n_seq_max)) {
             throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
         }
