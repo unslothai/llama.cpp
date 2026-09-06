@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import tempfile
 import pytest
@@ -38,8 +39,10 @@ def create_server():
     os.close(fd)
     yield
     os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
+    os.environ.pop("LLAMA_SERVER_PREEMPT_GRANULARITY", None)
     os.environ.pop("LLAMA_SERVER_PREEMPT_PLANNER", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
+    os.environ.pop("LLAMA_ARG_PREEMPT_ASYNC", None)
 
 
 def _complete(n_predict: int, prompt: str = "Hi how are you"):
@@ -111,6 +114,48 @@ def test_two_slots_that_overflow_the_pool_together_both_finish():
         assert res.body["truncated"] is False
         assert len(res.body["tokens"]) == n_predict
 
+
+def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
+    # A pool that hands out cells in blocks gives a whole block to one sequence, so a sequence
+    # of n tokens occupies round_up(n, block) cells and holds the rest of its tail block against
+    # everybody else. The planner has to count those cells: counting tokens, it sees room the
+    # allocator cannot find, never parks anybody, and the retry ladder ends every request.
+    #
+    # llama_memory_alloc_granularity() reports the block size, and the only mode that returns
+    # more than 1 today is exact concurrency, whose paged attention kernel needs a head size this
+    # model does not have. LLAMA_SERVER_PREEMPT_GRANULARITY injects the figure instead: what is
+    # under test is the server's arithmetic, which is the same at 64 as at 256.
+    global server
+    server.n_ctx = 256
+    os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
+    server.start()
+    log = LogReader(server.log_path)
+    assert "LLAMA_SERVER_PREEMPT_GRANULARITY = 64" in log.drain()
+
+    n_predict = 160
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted:" in text
+    assert "resumed after" in text
+
+    # every figure the planner logs is a whole number of blocks: "kv N/256" is what the pool is
+    # holding and "(wanted N)" is that plus what the next decode reserves. Counting tokens, both
+    # land wherever the sequences happen to be.
+    held   = [int(n) for n in re.findall(r"kv (\d+)/256", text)]
+    wanted = [int(n) for n in re.findall(r"\(wanted (\d+)\)", text)]
+    assert held and wanted, f"the planner logged no figures:\n{text}"
+    assert all(n % 64 == 0 for n in held + wanted), f"not whole blocks: {held} {wanted}"
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["truncated"] is False
+        assert len(res.body["tokens"]) == n_predict
 
 
 _WORDS = (
@@ -270,6 +315,242 @@ def test_metrics_and_slots_report_the_parked_state():
     assert sum(slot["n_preempt"] for slot in res.body) == 0, "n_preempt is per task and resets with the slot"
 
 
+# [TAG_PREEMPT_ASYNC] parking and resuming on a stream of their own
+#
+# The copies are only asynchronous on a backend that can copy asynchronously and signal an
+# event, which today means a GPU one. On a CPU-only build the server says so and falls back
+# to the synchronous path, and the tests below that need the asynchronous one skip.
+
+_ASYNC_BANNER = "parking and resuming asynchronously"
+
+
+def _start_async(**kwargs) -> str:
+    """Start the server with the asynchronous path asked for, and return its log so far."""
+    os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1"
+    for key, value in kwargs.items():
+        setattr(server, key, value)
+    server.start()
+    with open(server.log_path) as f:
+        return f.read()
+
+
+def _require_async(text: str):
+    if _ASYNC_BANNER not in text:
+        pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")
+
+
+def test_async_preemption_does_not_change_the_output():
+    # The same question the synchronous determinism test asks, of the asynchronous path:
+    # with one request the batch has the same shape at every step, so a continuation that
+    # was parked and resumed through a transfer and is not byte-identical to an
+    # uninterrupted one is the transfer's fault and nothing else's.
+    global server
+    server.n_ctx = 512
+    server.n_gpu_layer = 99
+    text = _start_async()
+    _require_async(text)
+
+    res_plain = _complete(64)
+    assert res_plain.status_code == 200
+
+    server.stop()
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res_preempted = _complete(64)
+    assert res_preempted.status_code == 200
+
+    text = log.drain()
+    _require_async(text)
+    assert text.count("preempted on request") >= 6
+    assert text.count("resumed after") >= 6
+    # the asynchronous path is the one that ran, not the synchronous fallback: only it
+    # splits a park and a resume into an issue and a completion
+    assert "park completed after" in text
+    assert "restore issued in" in text
+    assert "restore completed after" in text
+
+    assert res_preempted.body["content"] == res_plain.body["content"]
+    assert res_preempted.body["tokens"] == res_plain.body["tokens"]
+
+
+def test_async_preemption_under_load_keeps_every_slot_and_its_output():
+    # Two requests that do not fit the pool together, parked and resumed asynchronously
+    # while the other one keeps decoding. Every slot must finish, and finish with exactly
+    # the tokens it produces when it has the pool to itself.
+    global server
+    server.n_ctx = 256
+    server.n_gpu_layer = 99
+    text = _start_async()
+    _require_async(text)
+
+    n_predict = 160
+    prompts = [
+        "Once upon a time there was a brave knight who",
+        "The quick brown fox jumps over the lazy dog and",
+    ]
+
+    # each one alone, for the reference tokens
+    alone = [_complete(n_predict, prompt) for prompt in prompts]
+    for res in alone:
+        assert res.status_code == 200
+
+    server.stop()
+    server.start()
+    log = LogReader(server.log_path)
+
+    together = parallel_function_calls([(_complete, (n_predict, prompt)) for prompt in prompts])
+
+    text = log.drain()
+    _require_async(text)
+    assert "Context size has been exceeded" not in text
+    assert "preempted:" in text
+    assert "resumed after" in text
+
+    for res, ref in zip(together, alone):
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["truncated"] is False
+        assert res.body["tokens"] == ref.body["tokens"]
+
+
+def _cancel_soon(n_predict: int, prompt: str, timeout: float):
+    try:
+        server.make_request("POST", "/completion", data={
+            "n_predict": n_predict,
+            "prompt": prompt,
+            "ignore_eos": True,
+            "temperature": 0.0,
+            "seed": 42,
+        }, timeout=timeout)
+    except Exception:
+        pass  # the point is the drop, not the response
+
+
+def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
+    # A cancelled request can reach release() with a park or a resume still running, which
+    # is where the host buffer is freed and the cells are handed on. Both have to wait for
+    # the copy first. LLAMA_SERVER_PREEMPT_EVERY keeps every slot cycling between the two
+    # states, so cancelling at a spread of moments lands in both; what is asserted is that
+    # the server survives it, the slots come back, and it still answers correctly.
+    global server
+    server.n_ctx = 512
+    server.n_gpu_layer = 99
+    # every 8 tokens, so a slot spends most of its life in one of the two copy states, but
+    # not so often that the abandoned requests take minutes to drain
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    text = _start_async()
+    _require_async(text)
+
+    for i in range(4):
+        _cancel_soon(96, "Once upon a time there was a brave knight who", 0.05 + 0.1 * i)
+
+    # every slot back, and none of them still holding a parked sequence
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        res = server.make_request("GET", "/slots")
+        assert res.status_code == 200
+        if all(not slot["is_processing"] for slot in res.body):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("a slot never came back after a cancel during a copy")
+
+    for slot in res.body:
+        assert slot["is_preempted"] is False
+
+    if server.server_metrics:
+        res = server.make_request("GET", "/metrics")
+        for line in res.body.splitlines():
+            if line.startswith("llamacpp:preempt_ram_bytes"):
+                assert float(line.split(" ", 1)[1]) == 0, "a cancelled slot kept its parked memory"
+
+    # and the server still works
+    res = _complete(16)
+    assert res.status_code == 200
+    assert res.body["timings"]["predicted_n"] == 16
+
+
+def test_no_preempt_async_falls_back_to_the_synchronous_path():
+    # The flag has to really switch it off, so that the two can be compared on one binary.
+    global server
+    server.n_ctx = 512
+    server.n_gpu_layer = 99
+    os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "0"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = _complete(64)
+    assert res.status_code == 200
+
+    text = log.drain()
+    assert _ASYNC_BANNER not in text
+    assert "park issued in" not in text
+    assert "restore issued in" not in text
+    # the synchronous path still parks and resumes
+    assert text.count("preempted on request") >= 6
+    assert text.count("resumed after") >= 6
+
+
+def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everything():
+    # [TAG_PREEMPT_ASYNC] The case the async path made worse than the synchronous one, and
+    # that the existing tests miss because their victim holds almost no cells.
+    #
+    # Three slots are well into generating when a fourth request arrives whose prompt does
+    # not fit in what is left. update_preemption() picks a victim and issues its park, but
+    # an asynchronous park does not return the cells before update_slots() carries on. If
+    # the loop leaves at that point, the batch is built into a pool that has not got any
+    # smaller, llama_decode returns 1, and the retry ladder halves n_batch to 1 in
+    # microseconds without ever polling the copy -- ending every request with "Context size
+    # has been exceeded" while the room it wanted was one event query away.
+    #
+    # Pass is what the synchronous path gave: a park, and all four requests finish.
+    global server
+    server.n_ctx = 512
+    server.n_gpu_layer = 99
+    server.n_slots = 4
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompt_a, n_a = _prompt_of_about(100, "Alpha")
+    prompt_b, n_b = _prompt_of_about(100, "Bravo")
+    prompt_c, n_c = _prompt_of_about(100, "Charlie")
+    prompt_d, n_d = _prompt_of_about(150, "Delta")
+
+    # A, B and C oversubscribe the pool between them, so the pressure does not depend on
+    # when D arrives, and every occupant is holding real cells rather than the handful the
+    # other tests park. Each of the four still fits on its own.
+    n_predict_abc = 130
+    n_predict_d = 40
+    assert max(n_a, n_b, n_c) + n_predict_abc < 512 and n_d + n_predict_d < 512
+    assert n_a + n_b + n_c + 3 * n_predict_abc > 512
+
+    def _late(n_predict, prompt):
+        # D's prompt arrives into a pool the other three have already grown into; this
+        # model decodes about 120 tokens a second, so they are all still running
+        time.sleep(0.25)
+        return _complete(n_predict, prompt)
+
+    results = parallel_function_calls([
+        (_complete, (n_predict_abc, prompt_a)),
+        (_complete, (n_predict_abc, prompt_b)),
+        (_complete, (n_predict_abc, prompt_c)),
+        (_late,     (n_predict_d, prompt_d)),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted" in text
+
+    for i, res in enumerate(results):
+        assert res.status_code == 200, (i, res.body)
+    for i in range(3):
+        assert results[i].body["timings"]["predicted_n"] == n_predict_abc
+    assert results[3].body["timings"]["predicted_n"] == n_predict_d
+
+
 def test_two_prompts_near_the_context_size_both_complete():
     # Two prompts that each fit the context alone but not together. The second one is
     # parked before it takes any cells, and it is close enough to n_ctx that its sequence
@@ -285,7 +566,7 @@ def test_two_prompts_near_the_context_size_both_complete():
 
     # sized in tokens, not words: the prompt is the token ids of a short sentence repeated
     base = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there was a little girl"}).body["tokens"]
-    long_prompt = (base * 64)[:250]
+    long_prompt = (base * 64)[:240]
     n_predict = 4
     together = parallel_function_calls([(_complete, (n_predict, long_prompt)) for _ in range(2)])
 

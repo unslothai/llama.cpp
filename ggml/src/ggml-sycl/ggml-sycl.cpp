@@ -6342,7 +6342,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_sycl_flash_attn_ext_supported(device, op);
+            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only the
+            // CUDA backend reads
+            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }
@@ -6448,6 +6450,7 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
     /* .event_new               = */ ggml_backend_sycl_device_event_new,
     /* .event_free              = */ ggml_backend_sycl_device_event_free,
     /* .event_synchronize       = */ ggml_backend_sycl_device_event_synchronize,
+    /* .event_query             = */ NULL,
 };
 
 // backend reg

@@ -7842,6 +7842,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only the
+            // CUDA backend reads
+            if (op->src[5]) {
+                return false;
+            }
             // The E17 compilers segfault while building FA kernels, skip E17 for now
             if (adreno_e17_compiler_quirks(backend_ctx)) {
                 return false;
@@ -11332,6 +11337,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .event_query          = */ NULL,
 };
 }
 

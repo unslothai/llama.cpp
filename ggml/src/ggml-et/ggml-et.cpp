@@ -1266,6 +1266,12 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                         (op->src[1]->ne[1] % op->src[4]->ne[1] == 0);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
+            // the CUDA backend reads
+            if (op->src[5]) {
+                supported = false;
+                break;
+            }
             if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && op->src[2] &&
                 (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) && op->src[4] == nullptr &&
@@ -1684,6 +1690,7 @@ static const struct ggml_backend_device_i ggml_backend_et_device_i = {
     /* .event_new         = */ NULL,
     /* .event_free        = */ NULL,
     /* .event_synchronize = */ NULL,
+    /* .event_query       = */ NULL,
 };
 
 /*

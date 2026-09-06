@@ -1304,6 +1304,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+
+        // [TAG_EXACT_CONCURRENCY] refuse a column bound that cannot cover a decode step before
+        // anything is loaded, rather than running with the guarantee quietly switched off
+        if (!common_exact_concurrency_init(ctx_arg.params)) {
+            ctx_arg.params = params_org;
+            return false;
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -1717,6 +1724,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.preempt_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_PREEMPT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--preempt-async"},
+        {"--no-preempt-async"},
+        "copy a parked sequence out of and back into the KV cache on a stream of its own, so the "
+        "slots that keep running do not wait for it (default: enabled, needs a backend that can "
+        "copy asynchronously, otherwise the copies are synchronous as before)",
+        [](common_params & params, bool value) {
+            params.preempt_async = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

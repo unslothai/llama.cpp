@@ -1128,6 +1128,11 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_FLASH_ATTN_EXT: {
+        // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
+        // the CUDA backend reads
+        if (op->src[5]) {
+            return true;
+        }
         float scale = 1.0f;
         float max_bias = 0.0f;
         float logit_softcap = 0.0f;
@@ -1454,6 +1459,7 @@ static const struct ggml_backend_device_i ggml_backend_openvino_device_interface
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .event_query          = */ NULL,
 };
 
 struct ggml_backend_openvino_reg_context {

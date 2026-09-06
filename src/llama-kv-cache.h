@@ -131,6 +131,9 @@ public:
 
     bool get_can_shift() const override;
 
+    // [TAG_EXACT_CONCURRENCY] the page size under exact mode, 1 otherwise
+    uint32_t alloc_granularity() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -171,6 +174,8 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -234,6 +239,31 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+    static constexpr uint32_t exact_page_size = 256;
+    bool exact_pages = false;
+
+    // [TAG_EXACT_CONCURRENCY]
+    // Which (sequence, logical page) owns each physical page of the pool; seq < 0 means the page is
+    // free. Kept current as cells are placed, and marked dirty by the paths that remove cells, so
+    // that find_slot() and set_input_pages() read one entry per page instead of rebuilding the map
+    // from every live cell twice per ubatch. Mutable because set_input_pages() is const.
+    struct exact_page {
+        llama_seq_id seq = -1;
+        llama_pos    lpg = -1;
+    };
+
+    mutable std::vector<exact_page> exact_page_owner;
+    mutable bool                    exact_page_owner_dirty = true;
+
+    // bring exact_page_owner up to date; rebuilds only when a removal marked it dirty
+    void exact_pages_sync() const;
+
+    // recompute it from the live cells
+    void exact_pages_rebuild() const;
+
+    // record that a cell of (seq, pos) now lives at physical cell idx
+    void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -365,6 +395,8 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

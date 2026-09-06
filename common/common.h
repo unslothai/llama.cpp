@@ -615,6 +615,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t preempt_ram_mib     = 8192;  // host RAM for parked (preempted) sequences: -1 = no limit, 0 = disable preemption
+    bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -930,6 +931,19 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// [TAG_EXACT_CONCURRENCY]
+// true when LLAMA_EXACT_CONCURRENCY is set for this process
+bool common_exact_concurrency();
+
+// the widest ubatch a decode step can build with these parameters: one column per slot, times one
+// plus the number of speculative draft tokens carried with it. Under exact mode this is what the
+// CUDA column policy has to cover, and what its default bound is derived from.
+int common_exact_decode_width(const common_params & params);
+
+// report that width to the CUDA backend, and refuse an explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS
+// that is smaller than it. Returns false if the configuration must not run.
+bool common_exact_concurrency_init(const common_params & params);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

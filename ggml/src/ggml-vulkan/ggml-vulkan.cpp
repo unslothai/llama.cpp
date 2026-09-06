@@ -18192,6 +18192,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
+                // the CUDA backend reads
+                if (op->src[5]) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
@@ -18798,6 +18803,7 @@ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
     /* .event_new            = */ ggml_backend_vk_device_event_new,
     /* .event_free           = */ ggml_backend_vk_device_event_free,
     /* .event_synchronize    = */ ggml_backend_vk_device_event_synchronize,
+    /* .event_query          = */ NULL,
 };
 
 static const char * ggml_backend_vk_reg_get_name(ggml_backend_reg_t reg) {
