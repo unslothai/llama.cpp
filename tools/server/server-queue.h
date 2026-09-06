@@ -5,10 +5,12 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
-#include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -155,14 +157,36 @@ struct server_response {
 private:
     bool running = true;
 
-    // for keeping track of all tasks waiting for the result
-    std::unordered_set<int> waiting_task_ids;
+    // One waiter per reader, shared by every task id that reader registered in one call.
+    // Results are queued on the waiter that owns the id, so sending a result wakes only the
+    // thread that is waiting for it, and that thread finds its result without searching.
+    //
+    // Previously there was a single result vector and a single condition variable: every
+    // result woke every waiting HTTP thread, and each of them re-took the mutex and scanned
+    // the whole vector before going back to sleep. With N slots generating that is N wakeups
+    // and N scans per token, i.e. N^2 per decode step, all of it contending with the decode
+    // thread for the same mutex.
+    struct waiter {
+        std::condition_variable cv;
 
-    // the main result queue (using ptr for polymorphism)
-    std::vector<server_task_result_ptr> queue_results;
+        // FIFO, so results are handed out in the order they were sent, as before
+        std::deque<server_task_result_ptr> results;
+    };
+
+    using waiter_ptr = std::shared_ptr<waiter>;
+
+    // task id --> the waiter that is expecting its results
+    std::unordered_map<int, waiter_ptr> waiting;
 
     std::mutex mutex_results;
-    std::condition_variable condition_results;
+
+    // only used to park a reader whose ids are no longer in the waiting list, so that it
+    // still returns after the timeout it asked for rather than spinning
+    std::condition_variable condition_gone;
+
+    // all ids registered together share one waiter, so the first hit is the right one
+    // must be called with mutex_results held
+    waiter_ptr find_waiter(const std::unordered_set<int> & id_tasks) const;
 
 public:
     // add the id_task to the list of tasks waiting for response
