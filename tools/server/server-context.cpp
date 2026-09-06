@@ -4744,6 +4744,17 @@ private:
         return true;
     }
 
+    // [TAG_PREEMPT] whether a slot in the batch has its sampled token and a draft in it
+    bool batch_has_spec_groups() const {
+        for (const auto & slot : slots) {
+            if (!slot.spec_i_batch.empty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -4802,6 +4813,19 @@ private:
 
             {
                 std::string err;
+
+                // [TAG_PREEMPT] with speculation on, a slot's sampled token and its draft have
+                // to stay in one view: a narrower view splits the group and the verify step
+                // throws for the slot whose tokens straddle it. Halving is no help there, so
+                // after the idle slots the ladder goes to its last resort straight away.
+                if (ret == 1 && n_batch > 1 && batch_has_spec_groups()) {
+                    if (try_clear_idle_slots()) {
+                        SRV_WRN("%s", "failed to find free space in the KV cache, retrying after purging an idle slot\n");
+                        return false; // retry at the same width
+                    }
+
+                    n_batch = 1;
+                }
 
                 if (n_batch == 1 && ret == 1) {
                     // [TAG_PREEMPT] park instead of ending everyone, when there is a budget to park into
