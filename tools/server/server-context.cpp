@@ -612,30 +612,47 @@ struct server_slot {
                 return false;
             }
 
-            if (llama_state_seq_copy_get(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
-                SLT_ERR(*this, "%s", "failed to issue the copy of the target sequence out of the KV cache\n");
-                preempt_state_free();
-                return false;
+            // [TAG_PREEMPT_ASYNC] the load-time probe saw pinned memory, but a buffer this much
+            // larger can still come back pageable (a host-locking limit, say): the host buffer
+            // type hands back ordinary memory rather than failing, and a copy into pageable
+            // memory blocks the thread that issued it, which is the stall this path exists to
+            // remove. Such a slot parks synchronously from now on: its transfers are given
+            // back and the plain path below takes over, for this park and every later one.
+            const bool pageable = !llama_state_seq_copy_buf_is_pinned(preempt_cpy_tgt.get()) ||
+                                  (size_dft > 0 && !llama_state_seq_copy_buf_is_pinned(preempt_cpy_dft.get()));
+
+            if (pageable) {
+                SLT_WRN(*this, "the host memory for a %.3f MiB park is pageable, so this slot parks synchronously from now on\n",
+                        (size_tgt + size_dft) / (1024.0 * 1024.0));
+
+                preempt_cpy_tgt.reset();
+                preempt_cpy_dft.reset();
+            } else {
+                if (llama_state_seq_copy_get(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
+                    SLT_ERR(*this, "%s", "failed to issue the copy of the target sequence out of the KV cache\n");
+                    preempt_state_free();
+                    return false;
+                }
+
+                if (size_dft > 0 &&
+                    llama_state_seq_copy_get(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
+                    SLT_ERR(*this, "%s", "failed to issue the copy of the draft sequence out of the KV cache\n");
+                    preempt_state_free();
+                    return false;
+                }
+
+                preempt_detach();
+
+                // note: no mem.seq_rm() here. The copy is still reading these cells, so they are
+                //       released in preempt_save_poll() once it has finished with them.
+                state_before_preempt = state;
+                state                = SLOT_STATE_PREEMPTING;
+                t_preempt_us         = ggml_time_us();
+
+                n_preempt++;
+
+                return true;
             }
-
-            if (size_dft > 0 &&
-                llama_state_seq_copy_get(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
-                SLT_ERR(*this, "%s", "failed to issue the copy of the draft sequence out of the KV cache\n");
-                preempt_state_free();
-                return false;
-            }
-
-            preempt_detach();
-
-            // note: no mem.seq_rm() here. The copy is still reading these cells, so they are
-            //       released in preempt_save_poll() once it has finished with them.
-            state_before_preempt = state;
-            state                = SLOT_STATE_PREEMPTING;
-            t_preempt_us         = ggml_time_us();
-
-            n_preempt++;
-
-            return true;
         }
 
         try {
