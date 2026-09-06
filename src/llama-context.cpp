@@ -106,6 +106,8 @@ llama_context::llama_context(
     // sequence, times the tokens a sequence contributes to a step. Reported so that a backend
     // splitting columns for exactness covers it without the caller having to know the bound; a
     // caller that builds wider steps reports the width itself, see llama_set_exact_decode_width.
+    // The sequence count is what is reported: the tokens figure can be raised later for the
+    // whole process, and the width then follows it for this context too.
     if (llama_exact_concurrency()) {
         const uint32_t n_cols = cparams.n_seq_max * llama_exact_decode_tokens();
 
@@ -122,7 +124,7 @@ llama_context::llama_context(
             }
         }
 
-        llama_set_exact_decode_width(n_cols);
+        llama_exact_report_n_seq(cparams.n_seq_max);
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
@@ -417,6 +419,13 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_EXACT_CONCURRENCY] the paged attention the mode runs on is causal; a context
+        // created non-causal with a cache would assert on its first graph, so it is refused here
+        if (llama_exact_concurrency() && memory && !cparams.causal_attn) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so it cannot be created with non-causal attention\n", __func__);
+            throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
+        }
     }
 
     // init backends

@@ -109,3 +109,7 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 // so that its output does not change when other sequences share the KV cache. Off by default.
 // Reads the same LLAMA_EXACT_CONCURRENCY variable as the paged KV cache and the CUDA backend.
 bool llama_exact_concurrency();
+
+// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so that the
+// decode width every context needs is known to the backend and follows llama_set_exact_decode_tokens
+void llama_exact_report_n_seq(uint32_t n_seq);
