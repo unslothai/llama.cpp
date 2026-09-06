@@ -392,3 +392,32 @@ def test_the_last_resort_rewinds_a_prompt_in_flight():
     # the chunk that was in the batch given up is processed once, after the rewind, and
     # the count is the prompt plus the BOS the server adds
     assert results[1].body["timings"]["prompt_n"] == n_b + 1
+
+
+def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_head():
+    # Two generations that each outgrow the pool on their own, with context shift on. The
+    # resident reaches the limit, shifts, keeps about half the pool and would keep going
+    # for as long as it has tokens to make, while the parked one never fits beside it.
+    # After the head has waited its turn the resident is parked in its place, and the two
+    # take turns until both finish. Long enough that the resident is still going when the
+    # head's turn comes: this model makes a couple of thousand tokens a second.
+    global server
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.start()
+    log = LogReader(server.log_path)
+
+    n_predict = 12000
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "slot context shift" in text
+    assert "rotated out after" in text
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
