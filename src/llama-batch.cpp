@@ -611,6 +611,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                     n_left_first = n_left;
                 } else if (n_left != n_left_first) {
                     continue;
+                } else if ((cur_seq_set.size() + 1) * n_left_first > n_ubatch) {
+                    // one more set would not finish in this ubatch: the expansion below would
+                    // then cut every set part way, the chunking the guard exists to prevent
+                    break;
                 }
             }
 
