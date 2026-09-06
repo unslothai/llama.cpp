@@ -187,6 +187,12 @@ bool llama_exact_concurrency() {
 // [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
 static std::atomic<uint32_t> g_exact_decode_tokens{1};
 
+// one lock for the token figure, the sequence count and the width: the three move together
+// (a context reports its count and the width that follows; a new token figure re-reports the
+// width for every count seen), and a report interleaved with a change of figure could leave
+// the backend with a width that covers neither. Recursive, since the setters call each other.
+static std::recursive_mutex g_exact_mutex;
+
 // the most sequences any context so far was created with. The tokens figure is process
 // wide, so raising it widens the decode step of every context that already exists; the
 // width those contexts reported at creation is re-reported here with the new figure, or a
@@ -194,6 +200,8 @@ static std::atomic<uint32_t> g_exact_decode_tokens{1};
 static std::atomic<uint32_t> g_exact_max_n_seq{0};
 
 bool llama_exact_report_n_seq(uint32_t n_seq) {
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
     const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
 
     if (!llama_set_exact_decode_width(n_seq_max * llama_exact_decode_tokens())) {
@@ -210,6 +218,8 @@ bool llama_exact_report_n_seq(uint32_t n_seq) {
 
 bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
     n_tokens = n_tokens > 0 ? n_tokens : 1;
+
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
 
     // never lowered: a narrower context set up later would otherwise turn the verify steps of
     // an existing speculative context into prompts and serialise them
@@ -262,10 +272,7 @@ bool llama_set_exact_decode_width(uint32_t n_cols) {
         return false;
     }
 
-    // one reporter at a time: the widest figure is read and handed to the backends below as
-    // one step, so a narrower report cannot overtake a wider one on its way to a backend
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
 
     uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
 
