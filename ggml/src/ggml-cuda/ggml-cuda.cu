@@ -2030,6 +2030,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_ABORT("fatal error");
 }
 
+// [TAG_BATCH_INVARIANT]
+// True when the batch-invariant policy computes this MUL_MAT_ID one token at a time.
+// Every expert product then reduces the way it would in a batch of one, whatever the
+// rest of the ubatch routed to.
+static bool ggml_cuda_mul_mat_id_splits_tokens(const ggml_tensor * dst) {
+    if (!ggml_cuda_batch_invariant()) {
+        return false;
+    }
+    const int64_t ntokens = dst->ne[2];
+    if (ntokens <= 1) {
+        return false;
+    }
+    const int max_cols = ggml_cuda_batch_invariant_max_cols();
+    if (max_cols > 0 && ntokens > max_cols) {
+        return false;
+    }
+    return true;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -2040,9 +2059,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+    // [TAG_BATCH_INVARIANT] a split node runs as ntokens single-token calls, so the path
+    // that decides whether the stream is synchronized is the single-token one.
+    const int64_t ntokens = ggml_cuda_mul_mat_id_splits_tokens(dst) ? 1 : dst->ne[2];
+
+    if (ntokens <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            if (ntokens <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2050,15 +2073,55 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ntokens, /*n_experts=*/src0->ne[2])) {
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, ntokens, /*mul_mat_id=*/true)) {
         return false;
     }
 
     return true;
+}
+
+static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// [TAG_BATCH_INVARIANT]
+// Recompute dst one token at a time. Every implementation below groups the ubatch's tokens
+// by the expert they routed to, so the column count of an expert's matmul, the tokens the
+// per-expert copy gathers and the width the activations are quantized at all depend on what
+// the other tokens in the ubatch picked. Handing each token its own call removes that: the
+// callee sees the shapes a batch of one has, whatever the neighbours did.
+static void ggml_cuda_mul_mat_id_split_tokens(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    const int64_t ntokens = dst->ne[2];
+
+    for (int64_t i = 0; i < ntokens; ++i) {
+        ggml_tensor src1_token = *src1;
+        ggml_tensor ids_token  = *ids;
+        ggml_tensor dst_token  = *dst;
+
+        // src1 is [ne10, ne11, ntokens], one expert list per token in ids [n_expert_used, ntokens]
+        src1_token.ne[2] = 1;
+        src1_token.nb[3] = src1_token.nb[2];
+        src1_token.data  = (char *) src1->data + i*src1->nb[2];
+
+        ids_token.ne[1] = 1;
+        ids_token.nb[2] = ids_token.nb[1];
+        ids_token.nb[3] = ids_token.nb[1];
+        ids_token.data  = (char *) ids->data + i*ids->nb[1];
+
+        dst_token.ne[2] = 1;
+        dst_token.nb[3] = dst_token.nb[2];
+        dst_token.data  = (char *) dst->data + i*dst->nb[2];
+
+        dst_token.src[1] = &src1_token;
+        dst_token.src[2] = &ids_token;
+
+        ggml_cuda_mul_mat_id(ctx, &dst_token);
+    }
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2072,6 +2135,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // [TAG_BATCH_INVARIANT]
+    if (ggml_cuda_mul_mat_id_splits_tokens(dst)) {
+        GGML_ASSERT(ne3 == 1 && src1->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+        ggml_cuda_mul_mat_id_split_tokens(ctx, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
