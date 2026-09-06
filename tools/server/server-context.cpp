@@ -826,6 +826,16 @@ struct server_trace_scope {
     server_trace_scope & operator=(const server_trace_scope &) = delete;
 };
 
+// non-scoped variant, for bracketing a region without introducing a block
+#define STRACE_T0(v)             const int64_t v = ggml_trace_flag ? ggml_trace_time_us() : 0
+#define STRACE_EMIT(name, v, a, b)                                                          \
+    do {                                                                                    \
+        if (ggml_trace_flag) {                                                              \
+            ggml_trace_eventf("server", name, v, ggml_trace_time_us(),                      \
+                              "\"n0\":%d,\"n1\":%d", (int) (a), (int) (b));                 \
+        }                                                                                   \
+    } while (0)
+
 struct server_group {
     int id = 0;
 
@@ -2095,7 +2105,9 @@ private:
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end
+        STRACE_T0(t_utf8);
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
+        STRACE_EMIT("pt.utf8", t_utf8, slot.id, (int) slot.generated_text.size());
 
         // search stop word and delete it
         if (!incomplete) {
@@ -2104,7 +2116,9 @@ private:
             const std::string str_test = slot.generated_text.substr(pos);
             bool send_text = true;
 
+            STRACE_T0(t_stop);
             size_t stop_pos = slot.find_stopping_strings(str_test, token_str.size(), true);
+            STRACE_EMIT("pt.stop_str", t_stop, slot.id, (int) str_test.size());
             if (stop_pos != std::string::npos) {
                 slot.generated_text.erase(
                     slot.generated_text.begin() + pos + stop_pos,
@@ -2125,9 +2139,13 @@ private:
                 result.text_to_send = "";
             }
 
+            STRACE_T0(t_addtok2);
             slot.add_token(result);
+            STRACE_EMIT("pt.add_token", t_addtok2, slot.id, 0);
             if (slot.task->params.stream) {
+                STRACE_T0(t_sp);
                 send_partial_response(slot, result, false);
+                STRACE_EMIT("pt.send_partial", t_sp, slot.id, 0);
             }
         }
 
@@ -2336,7 +2354,9 @@ private:
             res->stats = slot.stats;
         }
 
+        STRACE_T0(t_qsend);
         queue_results.send(std::move(res));
+        STRACE_EMIT("pt.queue_send", t_qsend, slot.id, 0);
     }
 
     void send_final_response(server_slot & slot) {
@@ -3145,7 +3165,9 @@ private:
             server_trace_scope span_build("batch_build", grp.id, n_slots_processing);
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode(grp);
+            STRACE_T0(t_render);
             batch.render();
+            STRACE_EMIT("pd.render", t_render, grp.id, batch.size());
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots(grp, "pre_decode() failed: " + std::string(e.what()));
@@ -3224,6 +3246,7 @@ private:
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
         (void) ctx_tgt;
+        STRACE_T0(t_ctxshift);
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3288,7 +3311,10 @@ private:
             }
         });
 
+        STRACE_EMIT("pd.ctx_shift", t_ctxshift, grp.id, 0);
+
         // start populating the batch for this iteration
+        STRACE_T0(t_select);
         batch.clear();
 
         // track if given slot can be batched with slots already in the batch
@@ -3357,7 +3383,10 @@ private:
             }
         });
 
+        STRACE_EMIT("pd.select", t_select, grp.id, (int) generating.size());
+
         // generate the actual drafts (if any)
+        STRACE_T0(t_draft);
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
@@ -3412,10 +3441,14 @@ private:
             }
         });
 
+        STRACE_EMIT("pd.draft", t_draft, grp.id, (int) drafting.size());
+
         // update the batch with the sampled/drafted tokens
+        STRACE_T0(t_last);
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        STRACE_EMIT("pd.last_sampled", t_last, grp.id, (int) generating.size());
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3425,6 +3458,7 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
+        STRACE_T0(t_prompts);
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
@@ -3533,7 +3567,9 @@ private:
 
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
+                                STRACE_T0(t_prefix);
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                STRACE_EMIT("pd.common_prefix", t_prefix, slot.id, (int) input_tokens.size());
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3758,7 +3794,9 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    STRACE_T0(t_seqrm);
                     slot.mem.seq_rm(slot.seq_id, p0, -1);
+                    STRACE_EMIT("pd.seq_rm", t_seqrm, slot.id, p0);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3838,6 +3876,8 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
+                    STRACE_T0(t_addtok);
+                    const int32_t n_batch_before_add = batch.size();
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
@@ -3895,6 +3935,8 @@ private:
                         }
                     }
 
+                    STRACE_EMIT("pd.add_tokens", t_addtok, slot.id, batch.size() - n_batch_before_add);
+
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
@@ -3917,7 +3959,9 @@ private:
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
 
+                        STRACE_T0(t_initsmpl);
                         slot.init_sampler();
+                        STRACE_EMIT("pd.init_sampler", t_initsmpl, slot.id, slot.prompt.n_tokens());
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3926,8 +3970,10 @@ private:
                         }
                     }
 
+                    STRACE_T0(t_posq);
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(slot.ctx_tgt), slot.seq_id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.seq_id);
+                    STRACE_EMIT("pd.pos_query", t_posq, slot.id, 0);
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
@@ -3948,7 +3994,9 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        STRACE_T0(t_ckpt);
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        STRACE_EMIT("pd.checkpoint", t_ckpt, slot.id, n_tokens_cur);
                     }
                 }
 
@@ -3957,6 +4005,7 @@ private:
                 }
             });
         }
+        STRACE_EMIT("pd.prompts", t_prompts, grp.id, 0);
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -4227,7 +4276,9 @@ private:
 
             slot.i_batch = -1;
 
+            STRACE_T0(t_accept);
             common_sampler_accept(slot.smpl.get(), id, true);
+            STRACE_EMIT("pd.smpl_accept", t_accept, slot.id, 0);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4244,7 +4295,9 @@ private:
 
             completion_token_output result;
             result.tok          = id;
+            STRACE_T0(t_piece);
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            STRACE_EMIT("pd.to_piece", t_piece, slot.id, 0);
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
             if (slot.task->params.sampling.n_probs > 0) {
@@ -4368,7 +4421,9 @@ private:
                 completion_token_output result;
 
                 result.tok          = ids[i];
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                STRACE_T0(t_piece);
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            STRACE_EMIT("pd.to_piece", t_piece, slot.id, 0);
                 result.prob         = 1.0f; // set later
 
                 // TODO: set result.probs
