@@ -960,8 +960,14 @@ extern "C" {
     LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
     LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
 
-    // true when the buffer is page-locked, i.e. when the copies can really overlap
+    // true when the buffer that is held right now is page-locked, i.e. when the copies can
+    // really overlap. False while no buffer is held, since none is page-locked then: a
+    // caller asking before the first resize wants llama_state_seq_copy_buf_can_pin().
     LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
+
+    // true when the backend offers pinned host memory at all. It is what the next resize
+    // will ask for, not what any buffer is: an allocation can still come back pageable.
+    LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
 
     // issue the copies; return the number of bytes covered, 0 on failure
     LLAMA_API size_t llama_state_seq_copy_get(

@@ -4751,6 +4751,13 @@ void llama_state_seq_copy_buf_free(llama_state_seq_copy * cpy) {
 }
 
 bool llama_state_seq_copy_buf_is_pinned(llama_state_seq_copy * cpy) {
+    // what was allocated, not what could be: a host buffer type is free to hand back
+    // ordinary memory, which is what CUDA does under GGML_CUDA_NO_PINNED, and there is
+    // nothing page-locked before the first resize or after buf_free()
+    return cpy->pinned;
+}
+
+bool llama_state_seq_copy_buf_can_pin(llama_state_seq_copy * cpy) {
     return cpy->can_pin;
 }
 

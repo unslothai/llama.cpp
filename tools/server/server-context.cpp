@@ -1289,6 +1289,10 @@ private:
             slot.preempt_cpy_dft.reset();
         }
 
+        // the next context allocates its own host buffers, so say again what they turn out
+        // to be
+        preempt_ram_kind_logged = false;
+
         spec.reset();
         spec_init.reset();
 
@@ -1676,8 +1680,11 @@ private:
 
             if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
                 if (preempt_async_ok) {
-                    SRV_INF("preemption: parking and resuming asynchronously, %s host memory\n",
-                            llama_state_seq_copy_buf_is_pinned(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+                    // no buffer has been allocated yet, so this is what the backend offers,
+                    // not what is held. What was actually got is reported by the first park,
+                    // because a host buffer type may still hand back ordinary memory.
+                    SRV_INF("preemption: parking and resuming asynchronously, backend offers %s host memory\n",
+                            llama_state_seq_copy_buf_can_pin(slots[0].preempt_cpy_tgt.get()) ? "pinned" : "pageable");
                 } else {
                     SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
                 }
@@ -3153,6 +3160,27 @@ private:
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
+    // [TAG_PREEMPT_ASYNC] whether the kind of host memory the parks actually got has been
+    // reported. It is only knowable once a buffer exists, and it is worth knowing: pinned
+    // memory is what lets the copies overlap, and a host buffer type is free to hand back
+    // ordinary memory instead of failing.
+    bool preempt_ram_kind_logged = false;
+
+    void preempt_log_ram_kind(const server_slot & slot) {
+        if (preempt_ram_kind_logged || !slot.preempt_is_async()) {
+            return;
+        }
+
+        if (llama_state_seq_copy_buf_capacity(slot.preempt_cpy_tgt.get()) == 0) {
+            return; // nothing held, so nothing to report yet
+        }
+
+        preempt_ram_kind_logged = true;
+
+        SRV_INF("preemption: parking into %s host memory\n",
+                llama_state_seq_copy_buf_is_pinned(slot.preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+    }
+
     // host RAM the parked sequences hold right now
     size_t preempt_ram_used() const {
         size_t res = 0;
@@ -3543,6 +3571,8 @@ private:
                     slot.t_preempt_copy_us = ggml_time_us();
 
                     if (slot.preempt_save()) {
+                        preempt_log_ram_kind(slot);
+
                         // [TAG_PREEMPT_ASYNC] a slot left PREEMPTING is counted by
                         // update_preempt_copies() when its copy lands, not here
                         if (slot.state == SLOT_STATE_PREEMPTED) {
@@ -3594,6 +3624,8 @@ private:
             if (!victim->preempt_save()) {
                 break; // could not park it; the existing retry ladder is still behind us
             }
+
+            preempt_log_ram_kind(*victim);
 
             // [TAG_PREEMPT_ASYNC] the copy has only been issued; the cells are still the
             // victim's until it lands, so nothing further can be decided about the pool this
