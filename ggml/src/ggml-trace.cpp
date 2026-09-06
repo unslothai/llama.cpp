@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -290,7 +291,11 @@ namespace {
 
 struct trace_gpu_state {
     std::mutex                                mutex;
-    bool                                      probed = false;
+    // a scheduler runs over several backends and only some of them offer the hooks, so the answer
+    // is kept per registry: `probed` is every registry already asked, `supported` those that said
+    // yes. Handing a backend to the mark function of another backend's registry would be fatal.
+    std::unordered_set<const void *>          probed;
+    std::unordered_set<const void *>          supported;
     ggml_trace_gpu_mark_t                     mark   = nullptr;
     ggml_trace_gpu_poll_t                     poll   = nullptr;
     std::unordered_map<uint64_t, int64_t>     starts;
@@ -303,28 +308,33 @@ trace_gpu_state & gpu() {
     return s;
 }
 
-// caller holds gpu().mutex
-void gpu_probe(ggml_backend_t backend) {
+// true when `backend` can record GPU marks; caller holds gpu().mutex
+bool gpu_probe(ggml_backend_t backend) {
     trace_gpu_state & st = gpu();
-    if (st.probed) {
-        return;
-    }
-    st.probed = true;
 
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
-        return;
+        return false;
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg == nullptr) {
-        return;
+        return false;
     }
-    st.mark = (ggml_trace_gpu_mark_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trace_mark");
-    st.poll = (ggml_trace_gpu_poll_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trace_poll");
-    if (st.mark == nullptr) {
-        GGML_LOG_INFO("ggml_trace: %s has no GPU timing hook, graph events will be host side only\n",
+    if (!st.probed.insert((const void *) reg).second) {
+        return st.supported.count((const void *) reg) != 0;
+    }
+
+    ggml_trace_gpu_mark_t mark = (ggml_trace_gpu_mark_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trace_mark");
+    ggml_trace_gpu_poll_t poll = (ggml_trace_gpu_poll_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trace_poll");
+    if (mark == nullptr || poll == nullptr) {
+        GGML_LOG_INFO("ggml_trace: %s has no GPU timing hook, its events are host side only\n",
                       ggml_backend_dev_name(dev));
+        return false;
     }
+    st.mark = mark;
+    st.poll = poll;
+    st.supported.insert((const void *) reg);
+    return true;
 }
 
 } // namespace
@@ -333,8 +343,7 @@ uint64_t ggml_trace_gpu_begin(ggml_backend_t backend, const char * name) {
     trace_gpu_state & st = gpu();
 
     std::lock_guard<std::mutex> lock(st.mutex);
-    gpu_probe(backend);
-    if (st.mark == nullptr) {
+    if (!gpu_probe(backend)) {
         return 0;
     }
     const uint64_t tag = st.next_tag++;
@@ -350,6 +359,7 @@ void ggml_trace_gpu_end(ggml_backend_t backend, uint64_t tag) {
     if (st.mark == nullptr || tag == 0) {
         return;
     }
+    // the tag is non zero only if this backend answered the probe
     st.mark(backend, tag, 1);
 }
 

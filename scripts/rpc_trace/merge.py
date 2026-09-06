@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import json
 import os
 import sys
@@ -240,23 +241,40 @@ def sub_phases(e):
 LOGITS_MIN_BYTES = 64 * 1024
 
 
+class Index:
+    """intervals sorted by start, with a bisect lookup of the ones overlapping a window"""
+
+    def __init__(self, items):
+        # items: list of (t0, t1, payload)
+        self.items = sorted(items, key=lambda x: x[0])
+        self.starts = [x[0] for x in self.items]
+        self.max_dur = max((x[1] - x[0] for x in self.items), default=0)
+
+    def overlapping(self, w0, w1):
+        lo = bisect.bisect_left(self.starts, w0 - self.max_dur)
+        out = []
+        for t0, t1, payload in self.items[lo:]:
+            if t0 >= w1:
+                break
+            if t1 > w0:
+                out.append((t0, t1, payload))
+        return out
+
+    def covered(self, w0, w1):
+        return union_len(clip([(a, b) for a, b, _ in self.overlapping(w0, w1)], w0, w1))
+
+
 def summarize(files, client, out):
     servers = [f for f in files if f.role == "rpc-server"]
-
-    def ev(f, cat, name=None):
-        return [e for e in f.events
-                if e.get("ph") == cat and (name is None or e.get("n") == name)]
 
     def shift(f, e):
         return (e["t0"] - f.offset_us, e["t1"] - f.offset_us)
 
-    # GPU busy intervals of each node
-    gpu_local = [shift(client, e) for e in ev(client, "gpu")]
-    gpu_peer = []
-    for f in servers:
-        gpu_peer += [shift(f, e) for e in ev(f, "gpu")]
+    # GPU busy intervals of each node, on the client's clock
+    gpu_local = Index([shift(client, e) + (e,) for e in client.events if e.get("ph") == "gpu"])
+    gpu_peer = Index([shift(f, e) + (e,) for f in servers for e in f.events if e.get("ph") == "gpu"])
 
-    iters = ev(client, "server", "iteration")
+    iters = [e for e in client.events if e.get("ph") == "server" and e.get("n") == "iteration"]
     if not iters:
         out.write("no llama-server iterations in the trace\n")
         return
@@ -271,22 +289,39 @@ def summarize(files, client, out):
                   % (os.path.basename(f.path), f.label(), f.offset_us / 1000.0, len(f.events)))
     out.write("\n")
 
-    # per phase intervals, indexed so each step can be attributed quickly
-    rpc_cmds = ev(client, "rpc.client")
-    stage = ev(client, "sched", "copy_stage")
+    groups = sorted({e.get("grp", 0) for e in iters})
 
-    by_group = defaultdict(list)
-    for e in iters:
-        by_group[e.get("grp", 0)].append(e)
+    # one index per (category, name, group), so a step is a bisect and not a scan of the file
+    idx = {}
+    for e in client.events:
+        key = (e.get("ph"), e.get("n"), e.get("grp", 0))
+        idx.setdefault(key, []).append((e["t0"], e["t1"], e))
+    for key in list(idx):
+        idx[key] = Index(idx[key])
+
+    empty = Index([])
+
+    def get(cat, name, grp):
+        return idx.get((cat, name, grp), empty)
+
+    # the RPC commands of one group, all command types together
+    rpc_by_grp = {}
+    for grp in groups:
+        rpc_by_grp[grp] = Index([(e["t0"], e["t1"], e) for e in client.events
+                                 if e.get("ph") == "rpc.client" and e.get("grp", 0) == grp])
 
     rows = []
-    for grp in sorted(by_group):
-        steps = by_group[grp]
+    for grp in groups:
+        steps = [e for e in iters if e.get("grp", 0) == grp]
         acc = defaultdict(float)
         n = 0
         wire_out = 0
         wire_in = 0
         worst = (0, "", 0)
+        host = [get(cat, name, grp) for cat, name in
+                (("server", "batch_build"), ("server", "submit"), ("server", "synchronize"),
+                 ("server", "post_decode"), ("server", "sampling"), ("server", "result_send"),
+                 ("llama", "graph_compute"), ("sched", "split"), ("sched", "copy_stage"))]
 
         for it in steps:
             t0, t1 = it["t0"], it["t1"]
@@ -294,12 +329,8 @@ def summarize(files, client, out):
                 continue
             n += 1
 
-            def phase(name, cat="server"):
-                return union_len(clip([(e["t0"], e["t1"]) for e in client.events
-                                       if e.get("ph") == cat and e.get("n") == name
-                                       and e.get("grp", grp) == grp], t0, t1))
+            cmds = [e for _, _, e in rpc_by_grp[grp].overlapping(t0, t1)]
 
-            cmds = [e for e in rpc_cmds if e["t0"] >= t0 and e["t0"] < t1 and e.get("grp", grp) == grp]
             send = [(e.get("t_send0", e["t0"]), e.get("t_send1", e["t1"])) for e in cmds]
             recv = [(e.get("t_wait", 0), e.get("t_recv1", 0)) for e in cmds if e.get("reply")]
             recv = [r for r in recv if r[0] and r[1] > r[0]]
@@ -309,28 +340,28 @@ def summarize(files, client, out):
             wire_out += sum(e.get("bytes_out", 0) for e in cmds)
             wire_in += sum(e.get("bytes_in", 0) for e in cmds)
 
-            local = union_len(clip(gpu_local, t0, t1))
-            peer = union_len(clip(gpu_peer, t0, t1))
+            local_iv = clip([(a, b) for a, b, _ in gpu_local.overlapping(t0, t1)], t0, t1)
+            peer_iv = clip([(a, b) for a, b, _ in gpu_peer.overlapping(t0, t1)], t0, t1)
 
             acc["step"] += t1 - t0
-            acc["build"] += phase("batch_build")
-            acc["submit"] += phase("submit")
-            acc["sync"] += phase("synchronize")
-            acc["post"] += phase("post_decode")
-            acc["sampling"] += phase("sampling")
-            acc["send"] += phase("result_send")
-            acc["local_gpu"] += local
-            acc["peer_gpu"] += peer
+            acc["build"] += get("server", "batch_build", grp).covered(t0, t1)
+            acc["submit"] += get("server", "submit", grp).covered(t0, t1)
+            acc["sync"] += get("server", "synchronize", grp).covered(t0, t1)
+            acc["post"] += get("server", "post_decode", grp).covered(t0, t1)
+            acc["sampling"] += get("server", "sampling", grp).covered(t0, t1)
+            acc["send"] += get("server", "result_send", grp).covered(t0, t1)
+            acc["local_gpu"] += union_len(local_iv)
+            acc["peer_gpu"] += union_len(peer_iv)
             acc["transfer"] += union_len(clip(send + recv, t0, t1))
             acc["logits"] += union_len(clip(logits, t0, t1))
-            acc["stage"] += union_len(clip([(e["t0"], e["t1"]) for e in stage], t0, t1))
+            acc["stage"] += get("sched", "copy_stage", grp).covered(t0, t1)
 
             # the longest stretch of the step in which neither GPU was busy
-            for g0, g1 in gaps(gpu_local + gpu_peer, t0, t1):
+            hole = gaps(local_iv + peer_iv, t0, t1)
+            acc["idle_both"] += union_len(hole)
+            for g0, g1 in hole:
                 if g1 - g0 > worst[0]:
-                    worst = (g1 - g0, name_gap(client, g0, g1, grp), g0)
-
-            acc["idle_both"] += union_len(gaps(gpu_local + gpu_peer, t0, t1))
+                    worst = (g1 - g0, name_gap(host, g0, g1), g0)
 
         if n == 0:
             continue
@@ -355,34 +386,29 @@ def summarize(files, client, out):
                   "biggest idle gap %.1f ms in %s\n"
                   % (grp, wo / n / 1024.0, wi / n / 1024.0, worst[0] / 1000.0, worst[1]))
 
-    busy_local = union_len(clip(gpu_local, w0, w1))
-    busy_peer = union_len(clip(gpu_peer, w0, w1))
+    busy_local = gpu_local.covered(w0, w1)
+    busy_peer = gpu_peer.covered(w0, w1)
     out.write("\nover the whole window: local GPU busy %.1f%% (idle %.1f%%), "
               "peer GPU busy %.1f%% (idle %.1f%%)\n"
               % (100.0 * busy_local / span, 100.0 * (1 - busy_local / span),
                  100.0 * busy_peer / span, 100.0 * (1 - busy_peer / span)))
-    if not gpu_local:
+    if not gpu_local.items:
         out.write("note: no GPU spans on the client, so the local GPU row is empty "
                   "(CPU backend, or a build without the CUDA timing hook)\n")
-    if not gpu_peer:
+    if not gpu_peer.items:
         out.write("note: no GPU spans from the peer, so the peer GPU row is empty\n")
 
 
-def name_gap(client, g0, g1, grp):
+def name_gap(indexes, g0, g1):
     """what the host was doing during a stretch in which no GPU was busy"""
     best = None
     best_cov = 0
-    for e in client.events:
-        if e.get("ph") not in ("server", "llama", "rpc.client", "sched"):
-            continue
-        if e.get("grp", grp) != grp:
-            continue
-        if e.get("n") in ("iteration",):
-            continue
-        cov = min(e["t1"], g1) - max(e["t0"], g0)
-        if cov > best_cov:
-            best_cov = cov
-            best = e
+    for ix in indexes:
+        for a, b, e in ix.overlapping(g0, g1):
+            cov = min(b, g1) - max(a, g0)
+            if cov > best_cov:
+                best_cov = cov
+                best = e
     if best is None:
         return "nothing traced"
     return "%s/%s (%.0f%% of the gap)" % (best.get("ph"), best.get("n"),
