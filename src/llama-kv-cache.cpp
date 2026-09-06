@@ -61,6 +61,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// [TAG_EXACT_CONCURRENCY]
+// The paged attention specialization that reads the logical page table lives in the CUDA backend
+// sources, which are also built as the ROCm and MUSA backends. Every other backend ignores src[5]
+// and walks the pool in physical cell order, so a KV layer placed there would silently lose the
+// guarantee the mode exists to provide.
+static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(reg);
+    if (!name) {
+        return false;
+    }
+
+    return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -86,11 +109,6 @@ llama_kv_cache::llama_kv_cache(
 
     const char * exact_env = getenv("LLAMA_EXACT_CONCURRENCY");
     exact_pages = exact_env && atoi(exact_env) != 0;
-    if (exact_pages) {
-        GGML_ASSERT(unified && offload && !v_trans && n_swa == 0);
-        GGML_ASSERT(type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16);
-        GGML_ASSERT(kv_size % exact_page_size == 0);
-    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -104,6 +122,30 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // [TAG_EXACT_CONCURRENCY]
+    // Every one of these is reachable from the command line, so report which one failed by name
+    // instead of aborting on a bare assert that only prints a file and a line.
+    if (exact_pages) {
+        const char * unsupported = nullptr;
+
+        if (!unified) {
+            unsupported = "it needs a unified KV cache (pass --kv-unified)";
+        } else if (v_trans) {
+            unsupported = "it needs a non-transposed V cache (pass --flash-attn on)";
+        } else if (n_swa != 0) {
+            unsupported = "the paged pool does not support sliding window attention";
+        } else if (type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
+            unsupported = "it needs an F16 KV cache (do not pass --cache-type-k or --cache-type-v)";
+        } else if (kv_size % exact_page_size != 0) {
+            unsupported = "the context size must be a multiple of 256 (pass -c as a multiple of 256)";
+        }
+
+        if (unsupported) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s\n", __func__, unsupported);
+            throw std::runtime_error("exact concurrency: unsupported KV cache configuration");
+        }
+    }
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -227,6 +269,16 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+
+        // [TAG_EXACT_CONCURRENCY] a layer left anywhere else attends in physical cell order while
+        // the mode still reports itself as on, so refuse the load instead
+        if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
+                    "which has no paged attention: every layer must be offloaded to the CUDA backend "
+                    "(pass -ngl to offload all layers and do not pass --no-kv-offload)\n",
+                    __func__, il, dev_name);
+            throw std::runtime_error("exact concurrency: KV cache layer is not on the CUDA backend");
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
