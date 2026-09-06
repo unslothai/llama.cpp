@@ -2074,6 +2074,74 @@ Note that the following endpoints are exempt from being considered as incoming t
 - `GET /models`
 - `GET /metrics`
 
+## Pipeline groups
+
+`--pipeline-groups N` (default `1`) runs the server's slots over `N` independent `llama_context`
+objects created from the same model. Each group has its own batch, its own sampling and its own
+decode thread; the model weights, the task queue, the results queue and the HTTP layer are shared.
+
+This is meant for a layer split across two machines, e.g.
+
+```sh
+llama-server -m model.gguf -c 32768 --parallel 16 \
+    --rpc peer:50052 --device RPC0,CUDA0 -sm layer -ngl 99 \
+    --pipeline-groups 2
+```
+
+Note the device order: **list the remote device first and the local one last**. With `-sm layer`
+the devices are filled in the order they are given, so the last one holds the output layer. Put
+the local GPU last and the logits are produced locally, which removes a `n_vocab * n_rows * 4`
+byte transfer from every decode step (31.8 MB per step at 32 rows on a 248320-token vocabulary)
+and lets the sampler read them out of local memory. On a pair of DGX Sparks with
+Qwen3.8-27B-UD-Q4_K_XL at 32 concurrent clients this is worth more than the pipeline groups
+themselves, and the two compound:
+
+| device order | groups | tok/s | TPOT ms | GPU busy, local / remote |
+|---|---|---|---|---|
+| `CUDA0,RPC0` | 1 | 94.9 | 310 | 44 / 43 pc |
+| `CUDA0,RPC0` | 2 | 75.5 | 395 | 43 / 44 pc |
+| `RPC0,CUDA0` | 1 | 99.7 | 295 | 41 / 43 pc |
+| `RPC0,CUDA0` | 2 | **130.4** | 223 | 76 / 79 pc |
+
+With one context, a layer split is a two-stage pipeline that is fed one batch at a time, so each
+stage is idle while the other one computes. With two groups there are two batches in flight, so
+while group A is being computed on the second stage, group B is being computed on the first one.
+
+Details:
+
+- The slots are partitioned contiguously: with `--parallel P` and `--pipeline-groups N`, group `g`
+  owns slots `[g*P/N, (g+1)*P/N)`. `--parallel` must be a positive multiple of `--pipeline-groups`.
+- Each context is created with `n_seq_max = P/N` and `n_ctx = C/N`, so the per-slot context and the
+  total KV memory over all groups are the same as with a single context. `-c` must be given
+  explicitly and must be a multiple of `N`.
+- Slot selection for an incoming request still runs over *all* slots, so prompt cache similarity and
+  the slot save / restore endpoints work exactly as before: a returning conversation lands on the
+  slot that still holds its prefix, whichever group that slot belongs to.
+- Task processing briefly pauses the decode loops, so `/slots`, `/metrics` and cancellations are
+  answered after the in-flight decode of each group finishes rather than during it.
+- Speculative decoding works per group: every group owns a draft or MTP context bound to its own
+  target context and a `common_speculative` of its own, so `--spec-type draft-mtp` and
+  `--model-draft` combine with `N > 1` (with `--model-draft` the draft model is loaded once per
+  group). Slot save / restore, checkpoints and the prompt cache carry the draft state exactly as
+  with one group.
+- `N > 1` is refused at startup together with multimodal (`--mmproj`), `--control-vector` and
+  `--sleep-idle-seconds`.
+- With `N = 1` nothing changes: one context, one batch and one update loop on the main thread.
+- Each group samples its own rows over a small worker pool, because a serial pass over the slots
+  costs tens of milliseconds per step between the decode and the next submit and, at `N > 1`,
+  competes for memory bandwidth with the other group's GPU work. The total number of sampling
+  threads is the same however many groups there are; `LLAMA_SERVER_SAMPLE_THREADS=1` turns the
+  pool off. The sampled tokens do not depend on how the pass is scheduled.
+- Use `--cache-ram 0` with a layer split. The RAM prompt cache moves a whole slot state on every
+  slot handover, and on a split most of that state lives on the remote node, so it goes over the
+  wire; at 32 concurrent clients on the pair it costs about a quarter of the throughput with one
+  group and much more with two, because the handover runs on the single task thread and the other
+  group starves while it does.
+- `LLAMA_SERVER_PIPE_PROF=1` prints, every five seconds and per group, how long an iteration
+  spends waiting for the engine, in `pre_decode`, in `llama_decode`, in `llama_synchronize`, and
+  in `post_decode`, and splits `post_decode` per token into sampling, detokenization, stop-string
+  handling and the result queue. That is how the numbers above were found.
+
 ## More examples
 
 ### Interactive mode
