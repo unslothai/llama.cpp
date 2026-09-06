@@ -3094,6 +3094,26 @@ private:
     // Keep the slot that is furthest along -- it is the closest to finishing and to giving
     // its cells back -- and among the rest prefer one that has not been preempted
     // PREEMPT_N_STARVED times already, then the smallest.
+    // [TAG_PREEMPT] a slot just given a task still mirrors the previous request's prompt
+    // until the batch builder keeps the prefix the two share and drops the rest (see the
+    // SLOT_STATE_STARTED block of update_slots). Parked as it is, it would be copied out,
+    // charged and sized by the old prompt, and a short unrelated request could exceed the
+    // budget or stay parked for room it will never use. Keeping only the shared prefix now
+    // is what the batch builder does anyway; the chunk reuse it can add on top is given up
+    // for a slot the planner has to touch, which is rare.
+    void preempt_normalize_started(server_slot & slot) {
+        if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+            return;
+        }
+
+        const size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+        if (n_keep < slot.prompt.tokens.size()) {
+            slot.prompt.tokens.keep_first(n_keep);
+            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        }
+    }
+
     server_slot * preempt_pick_victim() {
         server_slot * leader    = nullptr;
         int32_t       n_running = 0;
@@ -3135,6 +3155,8 @@ private:
             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
             }
+
+            preempt_normalize_started(slot);
 
             if (!preempt_fits_budget(slot)) {
                 continue;
