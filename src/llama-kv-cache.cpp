@@ -882,7 +882,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             // ubatch, so a sequence's prefill would run at a width its solo run never sees. Take
             // the sequence-set split instead, which can give each prompt a ubatch of its own; a
             // plain decode step has nothing to isolate and keeps taking split_simple.
-            const bool isolate = llama_exact_concurrency() && balloc.has_multi_token_seq();
+            const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
 
             auto ubatch = n_stream == 1 && !isolate
                 ? balloc.split_simple(n_ubatch)

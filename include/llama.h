@@ -803,6 +803,14 @@ extern "C" {
     // will believe there is space that cannot be handed out.
     LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
 
+    // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or
+    // 1 plus the draft length under speculative decoding. Under LLAMA_EXACT_CONCURRENCY a sequence
+    // set with more tokens than this left to place is a prompt and is prefilled in a ubatch of its
+    // own; a set at or below it is a decode step and stays grouped with the other decodes, so a
+    // speculative verify batch is not run once per sequence. Process-wide, default 1.
+    LLAMA_API void     llama_set_exact_decode_tokens(uint32_t n_tokens);
+    LLAMA_API uint32_t llama_exact_decode_tokens(void);
+
     //
     // State / sessions
     //

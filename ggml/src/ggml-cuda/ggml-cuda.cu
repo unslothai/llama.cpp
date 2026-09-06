@@ -1962,7 +1962,35 @@ static ggml_cuda_mm_path ggml_cuda_mul_mat_path(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// Recompute dst one column at a time so that each column sees the batch-of-one configuration.
+// [TAG_BATCH_INVARIANT]
+// The widest slice of columns that can be recomputed in one launch while every column in it still
+// sums the way a batch of one would. A column's result depends on the implementation and, for
+// MMVQ, on the warp count of the launch, and neither depends on the values of the other columns
+// in the launch, so a slice as wide as the batch-of-one configuration reaches gives each of its
+// columns the batch-of-one value while reading the weights once for all of them instead of once
+// per column. A twelve-column speculative decode over a table whose configuration holds up to four
+// columns then costs three weight reads rather than twelve. Always below ncols_dst, so the
+// recursive call cannot land back here with the same shape.
+static int64_t ggml_cuda_mul_mat_invariant_width(
+        int cc, int warp_size, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        ggml_cuda_mm_path path_one, int64_t ncols_dst) {
+    if (path_one != GGML_CUDA_MM_MMVF && path_one != GGML_CUDA_MM_MMVQ) {
+        return 1;
+    }
+    const int64_t widest = path_one == GGML_CUDA_MM_MMVF ? MMVF_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
+    for (int64_t w = std::min<int64_t>(ncols_dst - 1, widest); w > 1; --w) {
+        if (ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, w) != path_one) {
+            continue;
+        }
+        if (path_one == GGML_CUDA_MM_MMVQ && !ggml_cuda_mmvq_matches_single_column(src0->type, cc, w)) {
+            continue;
+        }
+        return w;
+    }
+    return 1;
+}
+
+// Recompute dst in slices of columns so that each column sees the batch-of-one configuration.
 // Returns false when the batched launch already gives every column that same value.
 static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
@@ -2001,6 +2029,9 @@ static bool ggml_cuda_mul_mat_split_columns(
         return false;
     }
 
+    // Mode 1 recomputes one column at a time. Mode 2 recomputes in the widest slices that keep the
+    // batch-of-one arithmetic, which is what the exact concurrency mode runs under.
+    int64_t width = 1;
     if (ggml_cuda_batch_invariant() >= 2) {
         const ggml_cuda_mm_path path_one     = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, 1);
         const ggml_cuda_mm_path path_batched = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, ncols_dst);
@@ -2014,20 +2045,26 @@ static bool ggml_cuda_mul_mat_split_columns(
                 return false;
             }
         }
+        width = ggml_cuda_mul_mat_invariant_width(cc, warp_size, src0, src1, dst, path_one, ncols_dst);
+        if (width >= ncols_dst) {
+            width = 1;
+        }
     }
 
-    for (int64_t i = 0; i < ncols_dst; ++i) {
+    for (int64_t i = 0; i < ncols_dst; i += width) {
+        const int64_t n = std::min(width, ncols_dst - i);
+
         ggml_tensor src1_col = *src1;
         ggml_tensor dst_col  = *dst;
 
-        src1_col.ne[1] = 1;
-        src1_col.nb[2] = src1_col.nb[1];
-        src1_col.nb[3] = src1_col.nb[1];
+        src1_col.ne[1] = n;
+        src1_col.nb[2] = n*src1_col.nb[1];
+        src1_col.nb[3] = n*src1_col.nb[1];
         src1_col.data  = (char *) src1->data + i*src1->nb[1];
 
-        dst_col.ne[1] = 1;
-        dst_col.nb[2] = dst_col.nb[1];
-        dst_col.nb[3] = dst_col.nb[1];
+        dst_col.ne[1] = n;
+        dst_col.nb[2] = n*dst_col.nb[1];
+        dst_col.nb[3] = n*dst_col.nb[1];
         dst_col.data  = (char *) dst->data + i*dst->nb[1];
 
         ggml_cuda_mul_mat(ctx, src0, &src1_col, &dst_col);

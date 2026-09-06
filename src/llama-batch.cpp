@@ -507,7 +507,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-bool llama_batch_allocr::has_multi_token_seq() const {
+bool llama_batch_allocr::has_seq_wider_than(uint32_t n_tokens) const {
     std::vector<uint32_t> n_per_seq(n_seq_max, 0);
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -517,7 +517,7 @@ bool llama_batch_allocr::has_multi_token_seq() const {
         }
 
         for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
-            if (++n_per_seq[batch.seq_id[i][s]] > 1) {
+            if (++n_per_seq[batch.seq_id[i][s]] > n_tokens) {
                 return true;
             }
         }
@@ -526,7 +526,7 @@ bool llama_batch_allocr::has_multi_token_seq() const {
     return false;
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool isolate_multi_token_seqs) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t isolate_seqs_above) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -559,12 +559,14 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
-            // [TAG_EXACT_CONCURRENCY] a sequence set that still has more than one token to place is
-            // a prompt, and a prompt shares its arithmetic with whatever else is in the ubatch, so
-            // give it a ubatch of its own. Sets with one token left are a plain decode step, which
-            // is already exact, so keep grouping those: isolating them too would make one prompt
-            // serialize every concurrent decode for the whole of the prefill.
-            if (isolate_multi_token_seqs) {
+            // [TAG_EXACT_CONCURRENCY] a sequence set that still has more tokens to place than a
+            // decode step carries is a prompt, and a prompt shares its arithmetic with whatever
+            // else is in the ubatch, so give it a ubatch of its own. Sets at or below that width
+            // are decode steps, plain or speculative, whose columns the backend's column policy
+            // already keeps exact, so keep grouping those: isolating them too would make one
+            // prompt serialize every concurrent decode for the whole of the prefill, and would run
+            // a speculative verify step once per sequence.
+            if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 
                 for (const auto idx : seq_set_map[seq_set[i]]) {
@@ -573,7 +575,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                     }
                 }
 
-                if (n_left > 1) {
+                if (n_left > isolate_seqs_above) {
                     if (!cur_seq_set.empty()) {
                         // let the sets already taken have this ubatch; the prompt gets the next one
                         break;
