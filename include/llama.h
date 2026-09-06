@@ -807,8 +807,11 @@ extern "C" {
     // 1 plus the draft length under speculative decoding. Under LLAMA_EXACT_CONCURRENCY a sequence
     // set with more tokens than this left to place is a prompt and is prefilled in a ubatch of its
     // own; a set at or below it is a decode step and stays grouped with the other decodes, so a
-    // speculative verify batch is not run once per sequence. Process-wide, default 1.
-    LLAMA_API void     llama_set_exact_decode_tokens(uint32_t n_tokens);
+    // speculative verify batch is not run once per sequence. Process-wide, default 1. Raising it
+    // widens the decode step of every context that exists, and their width is re-reported with
+    // it; false, and no change, when an explicit column bound given to the backend cannot cover
+    // that width (see llama_set_exact_decode_width).
+    LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);
 
     // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns: the
@@ -816,8 +819,10 @@ extern "C" {
     // reports its own at creation and a backend keeps the widest it has heard, so a decode of any
     // context stays within the bound its kernels split at. A caller that builds wider steps than
     // the contexts imply (a draft of its own, say) reports the width itself, before creating the
-    // context or before the first decode. Never lowers what was reported.
-    LLAMA_API void     llama_set_exact_decode_width(uint32_t n_cols);
+    // context or before the first decode. Never lowers what was reported. Returns false, and
+    // reports nothing, when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is set to a positive figure below
+    // the width: that bound wins in the backend, so decodes above it would be left batched.
+    LLAMA_API bool     llama_set_exact_decode_width(uint32_t n_cols);
     LLAMA_API uint32_t llama_exact_decode_width(void);
 
     //
