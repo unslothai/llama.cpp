@@ -54,19 +54,57 @@ def _complete(n_predict: int, prompt: str = "Hi how are you"):
     return res
 
 
+_PROMPT_A = "Once upon a time there was a brave knight who"
+_PROMPT_B = "The quick brown fox jumps over the lazy dog and"
+_PROMPT_C = "In a small village by the sea there lived a fisherman who"
+
+
+def _start(**kwargs) -> LogReader:
+    """Start the server with these settings, and read its log from the first line."""
+    for key, value in kwargs.items():
+        setattr(server, key, value)
+    server.start()
+    return LogReader(server.log_path)
+
+
+def _late(n_predict: int, prompt: str, delay: float = 0.02):
+    time.sleep(delay)
+    return _complete(n_predict, prompt)
+
+
+def _complete_all(n_predict: int, prompts=(_PROMPT_A, _PROMPT_B)):
+    return parallel_function_calls([(_complete, (n_predict, prompt)) for prompt in prompts])
+
+
+def _complete_all_raw(n_predict: int, prompts):
+    """As _complete_all, without return_tokens: these ask for thousands of tokens."""
+    return parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {
+            "prompt": prompt, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        })) for prompt in prompts
+    ])
+
+
+def _assert_completed(results, n_predict: int, whole: bool = False):
+    """Every request generated what it asked for; `whole` also pins the untruncated body."""
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+        if whole:
+            assert res.body["truncated"] is False
+            assert len(res.body["tokens"]) == n_predict
+
+
 def test_forced_preemption_does_not_change_the_output():
     # park and restore the only running slot every 8 tokens: the batch shape is the same at every step, so any difference in the output is the preemption's fault
-    global server
-    server.n_ctx = 512
-    server.start()
+    _start(n_ctx=512)
     reference = _complete(64)
     assert reference.status_code == 200
     assert reference.body["timings"]["predicted_n"] == 64
     server.stop()
 
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start()
     assert "LLAMA_SERVER_PREEMPT_EVERY = 8" in log.drain()
 
     preempted = _complete(64)
@@ -83,43 +121,27 @@ def test_forced_preemption_does_not_change_the_output():
 
 def test_two_slots_that_overflow_the_pool_together_both_finish():
     # each request fits the pool alone (168 of 256 cells) but not together; without preemption both end with "Context size has been exceeded"
-    global server
-    server.n_ctx = 256
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "preempted:" in text
     assert "resumed after" in text
 
-    for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
-        assert res.body["truncated"] is False
-        assert len(res.body["tokens"]) == n_predict
+    _assert_completed(results, n_predict, whole=True)
 
 
 def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
     # a block allocator gives a whole block to one sequence, so the planner has to count cells: counting tokens it sees room the allocator cannot find. GRANULARITY injects the size.
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
     assert "LLAMA_SERVER_PREEMPT_GRANULARITY = 64" in log.drain()
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
@@ -131,11 +153,7 @@ def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
     assert held and wanted, f"the planner logged no figures:\n{text}"
     assert all(n % 64 == 0 for n in held + wanted), f"not whole blocks: {held} {wanted}"
 
-    for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
-        assert res.body["truncated"] is False
-        assert len(res.body["tokens"]) == n_predict
+    _assert_completed(results, n_predict, whole=True)
 
 
 _WORDS = (
@@ -164,10 +182,7 @@ def _prompt_of_about(n_tokens: int, salt: str = "") -> tuple[str, int]:
 
 
 def test_two_prompts_that_overflow_the_pool_together_both_finish():
-    global server
-    server.n_ctx = 256
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     prompt_a, n_a = _prompt_of_about(150, "Alpha")
     prompt_b, n_b = _prompt_of_about(150, "Bravo")
@@ -175,38 +190,27 @@ def test_two_prompts_that_overflow_the_pool_together_both_finish():
     assert n_a + n_predict <= 256 and n_b + n_predict <= 256
     assert n_a + n_b + 2 * n_predict > 256
 
-    results = parallel_function_calls([
-        (_complete, (n_predict, prompt_a)),
-        (_complete, (n_predict, prompt_b)),
-    ])
+    results = _complete_all(n_predict, [prompt_a, prompt_b])
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "preempted:" in text
     assert "resumed after" in text
 
+    _assert_completed(results, n_predict)
     for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
         assert len(res.body["tokens"]) == n_predict
 
 
 def test_a_generating_slot_and_a_large_prompt_both_finish():
     # a long generation meets a large prompt arriving beside it: the prompt is admitted chunk by chunk, whoever is smaller is parked, and both finish
-    global server
-    server.n_ctx = 256
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     prompt_b, n_b = _prompt_of_about(150, "Charlie")
     n_predict_a = 230
     n_predict_b = 90
     assert 8 + n_predict_a <= 256 and n_b + n_predict_b <= 256
     assert 8 + n_predict_a + n_b + n_predict_b > 256
-
-    def _late(n_predict, prompt):
-        time.sleep(0.02)
-        return _complete(n_predict, prompt)
 
     results = parallel_function_calls([
         (_complete, (n_predict_a, "Hi how are you")),
@@ -225,17 +229,11 @@ def test_a_generating_slot_and_a_large_prompt_both_finish():
 
 def test_preempt_ram_zero_disables_preemption():
     # --preempt-ram 0 switches back to the old behaviour: nothing is parked and the KV-full path ends the requests
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "preempted:" not in text
@@ -244,10 +242,7 @@ def test_preempt_ram_zero_disables_preemption():
 
 
 def test_metrics_and_slots_report_the_parked_state():
-    global server
-    server.n_ctx = 256
-    server.server_metrics = True
-    server.start()
+    _start(n_ctx=256, server_metrics=True)
 
     res = server.make_request("GET", "/slots")
     assert res.status_code == 200
@@ -256,10 +251,7 @@ def test_metrics_and_slots_report_the_parked_state():
         assert slot["n_preempt"] == 0
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
     for res in results:
         assert res.status_code == 200
 
@@ -288,11 +280,7 @@ _ASYNC_BANNER = "parking and resuming asynchronously"
 def _start_async(**kwargs) -> str:
     """Start the server with the asynchronous path asked for, and return its log so far."""
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1"
-    for key, value in kwargs.items():
-        setattr(server, key, value)
-    server.start()
-    with open(server.log_path) as f:
-        return f.read()
+    return _start(**kwargs).drain()
 
 
 def _require_async(text: str):
@@ -302,10 +290,7 @@ def _require_async(text: str):
 
 def test_async_preemption_does_not_change_the_output():
     # the synchronous determinism question asked of the asynchronous path: with one request the batch shape is fixed, so a continuation that is not byte-identical is the transfer's fault
-    global server
-    server.n_ctx = 512
-    server.n_gpu_layer = 99
-    text = _start_async()
+    text = _start_async(n_ctx=512, n_gpu_layer=99)
     _require_async(text)
 
     res_plain = _complete(64)
@@ -313,8 +298,7 @@ def test_async_preemption_does_not_change_the_output():
 
     server.stop()
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start()
 
     res_preempted = _complete(64)
     assert res_preempted.status_code == 200
@@ -332,27 +316,19 @@ def test_async_preemption_does_not_change_the_output():
 
 
 def test_async_preemption_under_load_keeps_every_slot_and_its_output():
-    global server
-    server.n_ctx = 256
-    server.n_gpu_layer = 99
-    text = _start_async()
+    text = _start_async(n_ctx=256, n_gpu_layer=99)
     _require_async(text)
 
     n_predict = 160
-    prompts = [
-        "Once upon a time there was a brave knight who",
-        "The quick brown fox jumps over the lazy dog and",
-    ]
 
-    alone = [_complete(n_predict, prompt) for prompt in prompts]
+    alone = [_complete(n_predict, prompt) for prompt in (_PROMPT_A, _PROMPT_B)]
     for res in alone:
         assert res.status_code == 200
 
     server.stop()
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start()
 
-    together = parallel_function_calls([(_complete, (n_predict, prompt)) for prompt in prompts])
+    together = _complete_all(n_predict)
 
     text = log.drain()
     _require_async(text)
@@ -360,9 +336,8 @@ def test_async_preemption_under_load_keeps_every_slot_and_its_output():
     assert "preempted:" in text
     assert "resumed after" in text
 
+    _assert_completed(together, n_predict)
     for res, ref in zip(together, alone):
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
         assert res.body["truncated"] is False
         assert res.body["tokens"] == ref.body["tokens"]
 
@@ -382,15 +357,12 @@ def _cancel_soon(n_predict: int, prompt: str, timeout: float):
 
 def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
     # a cancelled request can reach release() with a park or a resume still running, where the host buffer is freed and the cells handed on, so both have to wait for the copy
-    global server
-    server.n_ctx = 512
-    server.n_gpu_layer = 99
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    text = _start_async()
+    text = _start_async(n_ctx=512, n_gpu_layer=99)
     _require_async(text)
 
     for i in range(4):
-        _cancel_soon(96, "Once upon a time there was a brave knight who", 0.05 + 0.1 * i)
+        _cancel_soon(96, _PROMPT_A, 0.05 + 0.1 * i)
 
     deadline = time.time() + 120
     while time.time() < deadline:
@@ -418,13 +390,9 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 
 def test_no_preempt_async_falls_back_to_the_synchronous_path():
     # The flag has to really switch it off, so that the two can be compared on one binary.
-    global server
-    server.n_ctx = 512
-    server.n_gpu_layer = 99
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "0"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=512, n_gpu_layer=99)
 
     res = _complete(64)
     assert res.status_code == 200
@@ -439,12 +407,7 @@ def test_no_preempt_async_falls_back_to_the_synchronous_path():
 
 def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everything():
     # [TAG_PREEMPT_ASYNC] the case the async path made worse than the synchronous one: an asynchronous park does not return the cells before update_slots() carries on
-    global server
-    server.n_ctx = 512
-    server.n_gpu_layer = 99
-    server.n_slots = 4
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=512, n_gpu_layer=99, n_slots=4)
 
     prompt_a, n_a = _prompt_of_about(100, "Alpha")
     prompt_b, n_b = _prompt_of_about(100, "Bravo")
@@ -456,15 +419,11 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
     assert max(n_a, n_b, n_c) + n_predict_abc < 512 and n_d + n_predict_d < 512
     assert n_a + n_b + n_c + 3 * n_predict_abc > 512
 
-    def _late(n_predict, prompt):
-        time.sleep(0.25)
-        return _complete(n_predict, prompt)
-
     results = parallel_function_calls([
         (_complete, (n_predict_abc, prompt_a)),
         (_complete, (n_predict_abc, prompt_b)),
         (_complete, (n_predict_abc, prompt_c)),
-        (_late,     (n_predict_d, prompt_d)),
+        (_late,     (n_predict_d, prompt_d, 0.25)),
     ])
 
     text = log.drain()
@@ -480,38 +439,26 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
 
 def test_two_prompts_near_the_context_size_both_complete():
     # the second prompt is parked before it takes any cells and is too close to n_ctx to leave the usual margin, but must still be restored once the first finishes
-    global server
-    server.n_ctx = 256
-    server.n_batch = 256
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256, n_batch=256)
 
     base = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there was a little girl"}).body["tokens"]
     long_prompt = (base * 64)[:240]
     n_predict = 4
-    together = parallel_function_calls([(_complete, (n_predict, long_prompt)) for _ in range(2)])
+    together = _complete_all(n_predict, [long_prompt, long_prompt])
 
     text = log.drain()
     assert "cannot fit the pool" not in text
 
-    for res in together:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
+    _assert_completed(together, n_predict)
 
 
 def test_the_last_resort_parks_instead_of_ending_everyone():
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
     assert "LLAMA_SERVER_PREEMPT_PLANNER = off" in log.drain()
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
@@ -520,54 +467,35 @@ def test_the_last_resort_parks_instead_of_ending_everyone():
     assert "last resort: batch given up" in text
     assert "resumed after" in text
 
-    for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
-        assert res.body["truncated"] is False
-        assert len(res.body["tokens"]) == n_predict
+    _assert_completed(results, n_predict, whole=True)
 
 
 def test_the_last_resort_works_with_an_unlimited_budget():
     # --preempt-ram -1 is the documented unlimited setting and must enable the last resort too
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "-1"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     n_predict = 160
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "preempted as a last resort" in text
 
-    for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
+    _assert_completed(results, n_predict)
 
 
 def test_the_last_resort_rewinds_a_prompt_in_flight():
     # the failed chunk comes back off the slot's tokens and is processed again after the resume, neither skipped nor fed twice
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     prompt_b, n_b = _prompt_of_about(150, "Charlie")
     n_predict_a = 230
     n_predict_b = 90
     assert 8 + n_predict_a <= 256 and n_b + n_predict_b <= 256
     assert 8 + n_predict_a + n_b + n_predict_b > 256
-
-    def _late(n_predict, prompt):
-        time.sleep(0.02)
-        return _complete(n_predict, prompt)
 
     results = parallel_function_calls([
         (_complete, (n_predict_a, "Hi how are you")),
@@ -588,45 +516,23 @@ def test_the_last_resort_rewinds_a_prompt_in_flight():
 
 def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_head():
     # with context shift on the resident would hold half the pool for as long as it generates, so once the head has waited its turn the resident is parked and the two take turns
-    global server
-    server.n_ctx = 256
-    server.enable_ctx_shift = True
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256, enable_ctx_shift=True)
 
     n_predict = 12000
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "slot context shift" in text
     assert "rotated out after" in text
 
-    for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
+    _assert_completed(results, n_predict)
 
 
 def test_the_rotation_parks_a_resident_that_lets_the_head_in():
-    global server
-    server.n_slots = 3
-    server.n_ctx = 384
-    server.enable_ctx_shift = True
-    server.start()
+    _start(n_slots=3, n_ctx=384, enable_ctx_shift=True)
     n_predict = 9000
-    prompts = [
-        "Once upon a time there was a brave knight who",
-        "The quick brown fox jumps over the lazy dog and",
-        "In a small village by the sea there lived a fisherman who",
-    ]
-    results = parallel_function_calls([
-        (server.make_request, ("POST", "/completion", {
-            "prompt": p, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
-        })) for p in prompts
-    ])
+    results = _complete_all_raw(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C))
     for res in results:
         assert res.status_code == 200, res.body
         assert res.body["tokens_predicted"] == n_predict
@@ -637,16 +543,13 @@ def test_the_rotation_parks_a_resident_that_lets_the_head_in():
 
 def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_server_lives():
     # a family member is not a victim for the other, so a two-completion request gets the context error it would get alone and the server carries on
-    global server
-    server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
-    server.start()
-    log = LogReader(server.log_path)
+    log = _start(n_ctx=256)
 
     res = server.make_request("POST", "/completion", data={
         "n_predict": 160,
         "n_cmpl": 2,
-        "prompt": "Once upon a time there was a brave knight who",
+        "prompt": _PROMPT_A,
         "ignore_eos": True,
         "return_tokens": True,
         "temperature": 0.0,
@@ -666,53 +569,32 @@ def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_
 
 def test_a_restored_slot_gives_its_idle_buffer_back_when_another_slot_needs_to_park():
     # an asynchronous slot keeps its pinned buffer after a restore, and that idle capacity counts against --preempt-ram: unless it is given back, the first restore spends the budget
-    global server
-    server.n_ctx = 8192
-    server.n_gpu_layer = 99
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "256"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
-    text = _start_async()
+    text = _start_async(n_ctx=8192, n_gpu_layer=99)
     _require_async(text)
     log = LogReader(server.log_path)
 
     n_predict = 1800
-    results = parallel_function_calls([
-        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
-        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
-    ])
+    results = _complete_all(n_predict)
 
     text = log.drain()
     assert "Context size has been exceeded" not in text
     assert "idle parked RAM returned" in text, "the idle buffer of a restored slot was never given back"
-    import re
     parked = re.findall(r"id\s+(\d+) \| task \d+ \| preempted on request", text)
     assert {"0", "1"} <= set(parked), f"only slots {sorted(set(parked))} were ever parked"
 
+    _assert_completed(results, n_predict)
     for res in results:
-        assert res.status_code == 200
-        assert res.body["timings"]["predicted_n"] == n_predict
         assert res.body["truncated"] is False
 
 
 def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_when_a_resident_finishes():
     # a rotation holds both states at once, since the resident is parked before the head is restored and freed, so a budget for two heads but not a head plus the resident must refuse
-    global server
-    server.n_slots = 3
-    server.n_ctx = 2048
-    server.enable_ctx_shift = True
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
-    server.start()
+    _start(n_slots=3, n_ctx=2048, enable_ctx_shift=True)
     n_predict = 12000
-    prompts = [
-        "Once upon a time there was a brave knight who",
-        "The quick brown fox jumps over the lazy dog and",
-        "In a small village by the sea there lived a fisherman who",
-    ]
-    results = parallel_function_calls([
-        (server.make_request, ("POST", "/completion", {
-            "prompt": p, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
-        })) for p in prompts
-    ])
+    results = _complete_all_raw(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C))
     for res in results:
         assert res.status_code == 200, res.body
         assert res.body["tokens_predicted"] == n_predict
@@ -724,7 +606,6 @@ def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_w
 
 def test_a_recurrent_model_is_served_without_preemption():
     # a recurrent cache holds one state per sequence whatever its length, so preemption is off for such a model and the forced-park knob parks nothing
-    global server
     path = os.environ.get("LLAMA_SERVER_TEST_RECURRENT_MODEL")
     if path:
         server.model_file = path
@@ -736,10 +617,7 @@ def test_a_recurrent_model_is_served_without_preemption():
     server.n_ctx = 1024
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     server.start(timeout_seconds=300)
-    results = parallel_function_calls([
-        (_complete, (64, "Once upon a time")),
-        (_complete, (64, "The quick brown fox")),
-    ])
+    results = _complete_all(64, ["Once upon a time", "The quick brown fox"])
     for res in results:
         assert res.status_code == 200, res.body
         assert res.body["tokens_predicted"] == 64

@@ -81,10 +81,32 @@ def _chat_payload(n_predict: int) -> dict:
     }
 
 
-def test_a_stream_announces_its_parks_and_the_body_is_unchanged():
-    global server
-    server.n_ctx = 512
+_PROMPT_A = "Once upon a time there was a brave knight who"
+_PROMPT_B = "The quick brown fox jumps over the lazy dog and"
+
+
+def _start(**kwargs):
+    """Start the server with these settings."""
+    for key, value in kwargs.items():
+        setattr(server, key, value)
     server.start()
+
+
+def _final(datas: list[str]) -> dict:
+    """The last response object of a finished stream, past the [DONE] marker."""
+    return json.loads([d for d in datas if d != "[DONE]"][-1])
+
+
+def _stream_both(n_predict: int):
+    """One streaming completion per prompt, both at once."""
+    return parallel_function_calls([
+        (_stream_raw, ("/completion", _completion_payload(n_predict) | {"prompt": prompt}))
+        for prompt in (_PROMPT_A, _PROMPT_B)
+    ])
+
+
+def test_a_stream_announces_its_parks_and_the_body_is_unchanged():
+    _start(n_ctx=512)
     ref_comments, ref_datas = _stream_raw("/completion", _completion_payload(64))
     assert not any(c.startswith(": preempted") or c.startswith(": resumed") for c in ref_comments)
     assert _content(ref_datas)
@@ -110,10 +132,8 @@ def test_a_stream_announces_its_parks_and_the_body_is_unchanged():
 
 
 def test_the_oai_chat_stream_carries_the_same_comments():
-    global server
-    server.n_ctx = 512
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
+    _start(n_ctx=512)
     comments, datas = _stream_raw("/v1/chat/completions", _chat_payload(48))
     assert ": preempted" in comments and ": resumed" in comments
     assert datas[-1] == "[DONE]"
@@ -121,10 +141,8 @@ def test_the_oai_chat_stream_carries_the_same_comments():
 
 
 def test_non_streaming_requests_see_nothing():
-    global server
-    server.n_ctx = 512
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
+    _start(n_ctx=512)
     res = server.make_request("POST", "/completion", data={
         "n_predict": 32,
         "prompt": "Hi how are you",
@@ -138,20 +156,13 @@ def test_non_streaming_requests_see_nothing():
 
 
 def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
-    global server
-    server.n_ctx = 256
-    server.start()
+    _start(n_ctx=256)
 
     n_predict = 160
-    p1 = _completion_payload(n_predict) | {"prompt": "Once upon a time there was a brave knight who"}
-    p2 = _completion_payload(n_predict) | {"prompt": "The quick brown fox jumps over the lazy dog and"}
-    results = parallel_function_calls([
-        (_stream_raw, ("/completion", p1)),
-        (_stream_raw, ("/completion", p2)),
-    ])
+    results = _stream_both(n_predict)
     announced = 0
     for comments, datas in results:
-        final = json.loads([d for d in datas if d != "[DONE]"][-1])
+        final = _final(datas)
         assert final["timings"]["predicted_n"] == n_predict
         assert final["truncated"] is False
         if ": preempted" in comments:
@@ -162,14 +173,11 @@ def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
 
 def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
     # A request parked while still processing its prompt has no token to send yet, so the response starts with the notice instead of a silent connection.
-    global server
-    global server
-    server.n_ctx = 512
-    server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once
-    server.start()
+    # n_batch: the whole prompt in one batch, so the planner sees its size at once
+    _start(n_ctx=512, n_batch=512)
     url = f"http://{server.server_host}:{server.server_port}/completion"
-    first = _completion_payload(390) | {"prompt": " ".join(["Once upon a time there was a brave knight who"] * 6)}
-    second = _completion_payload(32) | {"prompt": " ".join(["The quick brown fox jumps over the lazy dog and"] * 14)}
+    first = _completion_payload(390) | {"prompt": " ".join([_PROMPT_A] * 6)}
+    second = _completion_payload(32) | {"prompt": " ".join([_PROMPT_B] * 14)}
 
     timeline = []
     lock = threading.Lock()
@@ -201,25 +209,16 @@ def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
     assert events[0] == ": preempted" and events[1] == ": resumed" and events[2].startswith("data: "), events[:3]
     datas = [line[6:] for _, line in second_lines if line.startswith("data: ")]
     assert _content(datas)
-    final = json.loads([d for d in datas if d != "[DONE]"][-1])
-    assert final["tokens_predicted"] == 32
+    assert _final(datas)["tokens_predicted"] == 32
 
 
 def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
-    global server
-    server.n_ctx = 256
-    server.enable_ctx_shift = True
-    server.start()
+    _start(n_ctx=256, enable_ctx_shift=True)
     n_predict = 12000
-    p1 = _completion_payload(n_predict) | {"prompt": "Once upon a time there was a brave knight who"}
-    p2 = _completion_payload(n_predict) | {"prompt": "The quick brown fox jumps over the lazy dog and"}
-    results = parallel_function_calls([
-        (_stream_raw, ("/completion", p1)),
-        (_stream_raw, ("/completion", p2)),
-    ])
+    results = _stream_both(n_predict)
     n_parked = 0
     for comments, datas in results:
-        final = json.loads([d for d in datas if d != "[DONE]"][-1])
+        final = _final(datas)
         assert final["tokens_predicted"] == n_predict
         seq = [c for c in comments if c in (": preempted", ": resumed")]
         assert seq == [": preempted", ": resumed"] * (len(seq) // 2), seq
@@ -229,14 +228,12 @@ def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
 
 def test_an_oversized_prompt_is_errored_instead_of_parked():
     # A slot just given a task has not passed the prompt checks yet, and a notice opens the stream, so parking it would turn a plain error response into 200 plus an in-stream one.
-    global server
-    server.n_ctx = 512
-    server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    server.start()
+    # n_batch: the whole prompt in one batch, so the planner sees its size at once
+    _start(n_ctx=512, n_batch=512)
     url = f"http://{server.server_host}:{server.server_port}/completion"
-    resident = _completion_payload(390) | {"prompt": " ".join(["Once upon a time there was a brave knight who"] * 6)}
-    oversized = _completion_payload(16) | {"prompt": " ".join(["The quick brown fox jumps over the lazy dog and"] * 80)}
+    resident = _completion_payload(390) | {"prompt": " ".join([_PROMPT_A] * 6)}
+    oversized = _completion_payload(16) | {"prompt": " ".join([_PROMPT_B] * 80)}
 
     started = threading.Event()
 
