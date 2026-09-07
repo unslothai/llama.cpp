@@ -501,3 +501,68 @@ def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_
     after = _complete(8)
     assert after.status_code == 200
     assert after.body["timings"]["predicted_n"] == 8
+
+
+def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_when_a_resident_finishes():
+    # Three generations with no end in a pool one of them fills, with context shift on,
+    # under a --preempt-ram that holds the two parked heads but not a head and the resident
+    # at once. The resident is parked before the head is restored and freed, so a rotation
+    # holds both states together: under this budget the first one asked for is refused and
+    # said so, and the heads come back when the resident finishes instead. Every stream
+    # still finishes its tokens and nothing gets the context error.
+    global server
+    server.n_slots = 3
+    server.n_ctx = 2048
+    server.enable_ctx_shift = True
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
+    server.start()
+    # long enough that the resident is still cycling through shifts two seconds after the
+    # heads were parked, which is when a rotation is first asked for: at 6000 this model
+    # finished in under three seconds on a fast host and nothing was ever refused
+    n_predict = 12000
+    prompts = [
+        "Once upon a time there was a brave knight who",
+        "The quick brown fox jumps over the lazy dog and",
+        "In a small village by the sea there lived a fisherman who",
+    ]
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {
+            "prompt": p, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        })) for p in prompts
+    ])
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] == n_predict
+    text = open(server.log_path).read()
+    assert "no rotation: --preempt-ram 2 MiB" in text
+    assert "resumed after" in text
+    assert "Context size has been exceeded" not in text
+
+
+def test_a_recurrent_model_is_served_without_preemption():
+    # A recurrent cache holds one state per sequence whatever its length, so the token
+    # count the planner measures says nothing about it: preemption is off for such a
+    # model, said so at load, and the forced-park knob parks nothing.
+    global server
+    path = os.environ.get("LLAMA_SERVER_TEST_RECURRENT_MODEL")
+    if path:
+        server.model_file = path
+    else:
+        server.model_file = None
+        server.model_hf_repo = "Felladrin/gguf-mamba-130m-hf"
+        server.model_hf_file = "mamba-130m-hf.Q2_K.gguf"
+        server.offline = False
+    server.n_ctx = 1024
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    server.start(timeout_seconds=300)
+    results = parallel_function_calls([
+        (_complete, (64, "Once upon a time")),
+        (_complete, (64, "The quick brown fox")),
+    ])
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] == 64
+    text = open(server.log_path).read()
+    assert "preemption: off, the recurrent cache holds one state per sequence" in text
+    assert "preempted" not in text
+    assert "Context size has been exceeded" not in text
