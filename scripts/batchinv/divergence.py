@@ -5,8 +5,8 @@ import argparse, json, os, signal, subprocess, sys, threading, time, urllib.requ
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import PROMPTS
 
-# Environment recorded with every run. LLAMA_EXACT_CONCURRENCY inherited from the shell is what
-# decides whether a run labelled as the mode-off reference actually was one, so it is not optional.
+# recorded with every run; LLAMA_EXACT_CONCURRENCY inherited from the shell decides whether a run
+# labelled as the mode-off reference actually was one, so it is not optional
 RECORDED_ENV = ("LLAMA_EXACT_CONCURRENCY", "GGML_CUDA_BATCH_INVARIANT",
                 "GGML_CUDA_BATCH_INVARIANT_MAX_COLS", "LLAMA_SERVER_PREEMPT_EVERY",
                 "LLAMA_KV_CACHE_DEBUG", "LLAMA_BATCH_DEBUG", "CUDA_VISIBLE_DEVICES")
@@ -86,14 +86,13 @@ class Server:
                     time.sleep(1.0)
             raise RuntimeError("server did not become healthy")
         except BaseException:
-            # __exit__ is not called when __enter__ raises, so a server that started but never
+            # __exit__ is not called when __enter__ raises, and a server that started but never
             # reported healthy would keep the GPU, the port and the log handle
             self.__exit__(None, None, None)
             raise
 
     def __exit__(self, *a):
-        # note: POSIX only. On Windows this needs CREATE_NEW_PROCESS_GROUP at Popen and
-        # terminate()/kill() here; the runs this harness backs are Linux only.
+        # note: POSIX only; Windows would need CREATE_NEW_PROCESS_GROUP at Popen
         if self.p is not None:
             print(f"[server] stopping pid={self.p.pid}", flush=True)
             try:
@@ -141,8 +140,7 @@ def run_concurrent(port, names, n_predict):
         t.join()
     wall = time.time() - t0
 
-    # a thread exception used to only print a traceback, so a run where P1..P3 failed and P0
-    # succeeded was still reported as a clean four-way concurrency result
+    # without this a run where P1..P3 failed and P0 succeeded reads as a clean four-way result
     if errors:
         raise RuntimeError("concurrent requests failed: " +
                            "; ".join(f"{n}: {type(e).__name__}: {e}" for n, e in errors))

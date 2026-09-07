@@ -474,13 +474,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
-        // [TAG_EXACT_CONCURRENCY] note: GGML_OP_FLASH_ATTN_EXT with src[5] set, the
-        // exact-concurrency page table, is deliberately still accepted here. The CPU ignores the
-        // page table and attends in physical cell order, which is why every other backend refuses
-        // it, but the CPU is also the reference that test-backend-ops compares the paged CUDA
-        // kernel against, and that test builds a mask which selects exactly the listed cells. A KV
-        // cache layer cannot reach the CPU under the mode anyway: llama_kv_cache refuses to
-        // construct unless every KV layer is on the CUDA backend.
+        // [TAG_EXACT_CONCURRENCY] note: FLASH_ATTN_EXT with src[5], the page table, is deliberately
+        // still accepted. The CPU ignores it and attends in physical order, but it is also the
+        // reference test-backend-ops compares the paged CUDA kernel against, and that test's mask
+        // selects exactly the listed cells. A KV layer cannot reach the CPU under the mode anyway.
         default:
             return true;
     }

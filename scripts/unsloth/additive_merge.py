@@ -94,18 +94,11 @@ def nonblank(lines: list[str]) -> list[str]:
     return [ln.strip() for ln in lines if ln.strip()]
 
 
-# A line that closes or opens a block and nothing else. Two INDEPENDENT case
-# arms in the same switch share these by construction -- `{`, `} break;`, `}`
-# are what a case arm is made of, not what makes it that case arm -- so finding
-# them on both sides says nothing about whether the two sides added the same
-# construct. Matching them as "shared" is what refused the real add/add of
-# PROJECTOR_TYPE_KIMIK3 next to PROJECTOR_TYPE_DEEPSEEK4V in tools/mtmd/clip.cpp
-# with "one change made twice: {, } break;", when the two arms had no line of
-# actual content in common.
-#
-# Deliberately narrow: braces, brackets, parens, semicolons and commas, around
-# at most one bare block-terminating keyword. `break;` matches, `return true;`
-# does not, and anything naming a type, a constant or a function does not.
+# A line that only opens or closes a block. Two independent case arms share these by
+# construction, so finding them on both sides says nothing about the two sides adding the
+# same construct: treating them as shared is what refused the real PROJECTOR_TYPE_KIMIK3 /
+# PROJECTOR_TYPE_DEEPSEEK4V add/add in tools/mtmd/clip.cpp. Deliberately narrow: brackets,
+# semicolons and commas around at most one bare block-terminating keyword.
 STRUCTURAL = re.compile(r"^[\s{}()\[\];,]*(?:break|continue|return|pass)?[\s{}()\[\];,]*$")
 
 
@@ -114,8 +107,7 @@ def identifying(lines: list[str]) -> set[str]:
     return {ln for ln in nonblank(lines) if not STRUCTURAL.match(ln)}
 
 
-# `case FOO:`, `case FOO :`, `default:`. A fallthrough label may carry no body
-# at all, which is the shape the nightly hits most often.
+# `case FOO:`, `case FOO :`, `default:`; a fallthrough label may carry no body at all
 CASE_LABEL = re.compile(r"^(?:case\s+[^:]+|default\s*):")
 
 
@@ -147,32 +139,23 @@ def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[
         return list(ours)
     ours_arms, theirs_arms = case_arms(ours), case_arms(theirs)
     if ours_arms and theirs_arms and ours_arms.isdisjoint(theirs_arms):
-        # Both sides added case arms, and not one label is on both sides. Two
-        # arms of the same switch labelled differently are two constructs, so
-        # any line they happen to share is body text, not a duplicate: the real
-        # tools/mtmd/clip.cpp collision has a KIMIK3 arm and a DEEPSEEK4V arm
-        # that both set `hparams.rope_theta = 10000.0f;`, and refusing on that
-        # coincidence is what the shared-line check is for, backwards.
-        #
-        # The same change made twice would keep its label, so it lands in the
-        # check below instead. This is the one place where a shared line is
-        # allowed, and it is allowed because the labels prove the arms are
-        # distinct -- a duplicated label would not even compile.
+        # Both sides added case arms and no label is on both, so they are two constructs
+        # and any line they share is body text: the real clip.cpp collision has arms that
+        # both set `hparams.rope_theta = 10000.0f;`. The same change made twice would keep
+        # its label and land in the check below, so this is the one place a shared line is
+        # allowed - a duplicated label would not even compile.
         return list(theirs) + list(ours)
     shared = identifying(ours) & identifying(theirs)
     if shared:
         # Overlapping content is the signature of one construct added twice,
         # not two independent additions. Unioning it would duplicate code.
-        # Scaffolding lines are excluded above, so what is left is content both
-        # sides genuinely wrote, which is the thing that makes this a duplicate.
+        # scaffolding is excluded above, so what is left is content both sides wrote
         raise Unresolvable(
             "both sides add the same line(s), so this is one change made twice: "
             + ", ".join(sorted(shared)[:3])
         )
     if not identifying(ours) or not identifying(theirs):
-        # Everything one side added is scaffolding, so there is no content to
-        # tell the two additions apart and the exclusion above has nothing left
-        # to work with. Refuse rather than union braces onto braces.
+        # one side is all scaffolding, so there is no content to tell the additions apart
         raise Unresolvable(
             "one side adds only block scaffolding, so the two additions cannot "
             "be told apart"

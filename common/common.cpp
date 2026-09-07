@@ -1290,10 +1290,9 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    // [TAG_EXACT_CONCURRENCY] before any context exists, the fitting ones included: the
-    // per-sequence figure and the column bound are checked against the explicit bound first,
-    // so a context is never created under a figure the bound does not cover. A caller that
-    // skipped common_params_parse() gets the same check here; on failure nothing is loaded.
+    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure
+    // the explicit bound does not cover; this also covers a caller that skipped
+    // common_params_parse(). On failure nothing is loaded.
     if (!model_only && !common_exact_concurrency_init(params)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
         return;
@@ -1457,12 +1456,11 @@ bool common_exact_concurrency() {
 int common_exact_decode_width(const common_params & params) {
     const int64_t n_slots = std::max(1, params.n_parallel);
 
-    // the draft tokens a slot carries into the verify ubatch alongside its accepted token, per
-    // speculation type, from the same place the speculation code takes its own width
+    // draft tokens a slot carries into the verify ubatch, from the same place the speculation
+    // code takes its own width
     const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
 
-    // the product is what a backend is asked to split columns by, as an int; one that does not
-    // fit is reported as such rather than wrapped
+    // the product is handed to a backend as an int; one that overflows is reported, not wrapped
     const int64_t n_cols = n_slots*(1 + n_draft);
 
     return n_cols > INT32_MAX ? -1 : (int) n_cols;
@@ -1474,9 +1472,8 @@ bool common_exact_concurrency_init(const common_params & params) {
         return true;
     }
 
-    // DFlash drafting turns causal attention off on its draft context, and the paged
-    // attention the mode runs on needs it; say so instead of asserting in the graph. DSpark
-    // is the same implementation under another name, so it is refused with it.
+    // DFlash drafting turns causal attention off on its draft context, which the paged attention
+    // needs; say so instead of asserting in the graph. DSpark is the same implementation.
     for (const auto type : params.speculative.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
             COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
@@ -1505,11 +1502,9 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode
-    // step is; a context created later reports n_seq_max times that figure, which is n_cols
-    // again, and reporting n_cols here as well covers a caller that decodes before that. Both
-    // refuse a width the explicit bound above cannot cover, which the check above already
-    // caught for this process; contexts created earlier by the caller are covered here.
+    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step
+    // is. A context created later reports n_seq_max times that, which is n_cols again; reporting
+    // n_cols here too covers a caller that decodes first, or contexts it created earlier.
     if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
         !llama_set_exact_decode_width((uint32_t) n_cols)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");

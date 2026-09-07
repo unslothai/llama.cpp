@@ -243,11 +243,10 @@ private:
     static constexpr uint32_t exact_page_size = 256;
     bool exact_pages = false;
 
-    // [TAG_EXACT_CONCURRENCY]
-    // Which (sequence, logical page) owns each physical page of the pool; seq < 0 means the page is
-    // free. Kept current as cells are placed, and marked dirty by the paths that remove cells, so
-    // that find_slot() and set_input_pages() read one entry per page instead of rebuilding the map
-    // from every live cell twice per ubatch. Mutable because set_input_pages() is const.
+    // [TAG_EXACT_CONCURRENCY] which (sequence, logical page) owns each physical page; seq < 0 means
+    // free. Kept current as cells are placed and marked dirty by removals, so find_slot() and
+    // set_input_pages() read one entry per page instead of rebuilding from every live cell twice per
+    // ubatch. Mutable because set_input_pages() is const.
     struct exact_page {
         llama_seq_id seq = -1;
         llama_pos    lpg = -1;

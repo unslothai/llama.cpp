@@ -7193,8 +7193,8 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
-// Same mathematical attention as the CPU mask reference, but visit nonadjacent pages
-// in a different order. Covers a partial tail and different page counts per query.
+// same attention as the CPU mask reference, but visiting nonadjacent pages in a different order;
+// covers a partial tail and different page counts per query
 struct test_flash_attn_ext_pages : public test_flash_attn_ext {
     test_flash_attn_ext_pages(int64_t batch) :
         test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, batch) {}
@@ -9205,7 +9205,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Shared weights over sequence planes, as in a recurrent-model output projection.
+    // shared weights over sequence planes, as in a recurrent-model output projection
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 17, 307}) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 256, {1, 1}, {4, 1}));
@@ -9213,10 +9213,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Mixture-of-experts projections at the token counts a decode ubatch forms. The gate and up
-    // projections broadcast one activation row over the expert list, the down projection carries
-    // one row per expert, and the mixed quantization of a real MoE gguf puts different types on
-    // the two. 17 tokens is past the width the exact-concurrency policy pins.
+    // MoE projections at the token counts a decode ubatch forms: gate and up broadcast one
+    // activation row over the expert list, down carries one row per expert, and a real MoE gguf
+    // puts different types on the two. 17 tokens is past the width exact concurrency pins.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (int n : {1, 2, 4, 8, 17}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, true,   512, n, 2048));

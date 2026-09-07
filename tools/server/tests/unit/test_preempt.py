@@ -5,10 +5,9 @@ import tempfile
 import pytest
 from utils import *
 
-# Preemption on a unified KV pool: when the next decode does not fit, one slot is parked
-# (its sequence copied to host RAM, its cells released) instead of every slot being
-# terminated. Both tests need more than one slot and --kv-unified, which is the only
-# configuration where one slot can take another one's cells.
+# Preemption on a unified KV pool: when the next decode does not fit, one slot is parked (its
+# sequence copied to host RAM, its cells released) instead of every slot being terminated. Needs
+# more than one slot and --kv-unified, the only configuration where slots share cells.
 
 server = ServerPreset.tinyllama2()
 
@@ -58,9 +57,8 @@ def _complete(n_predict: int, prompt: str = "Hi how are you"):
 
 
 def test_forced_preemption_does_not_change_the_output():
-    # Park and restore the only running slot every 8 tokens. With one request the batch
-    # has the same shape at every step whether or not the slot was parked in between, so
-    # any difference in the output is the preemption's fault and nothing else's.
+    # park and restore the only running slot every 8 tokens: the batch shape is the same at every
+    # step, so any difference in the output is the preemption's fault
     global server
     server.n_ctx = 512
     server.start()
@@ -87,11 +85,9 @@ def test_forced_preemption_does_not_change_the_output():
 
 
 def test_two_slots_that_overflow_the_pool_together_both_finish():
-    # Each request alone fits in the pool: 8 prompt tokens plus 160 generated is well
-    # under 256. Together they do not, 336 against 256. Without preemption the retry
-    # ladder ends with "Context size has been exceeded" on every processing slot; with it
-    # the smaller slot is parked until the leader finishes and its cells are purged, and
-    # then it resumes from the token it was parked on.
+    # each request fits the pool alone (168 of 256 cells) but not together (336). Without
+    # preemption both end with "Context size has been exceeded"; with it the smaller is parked
+    # until the leader finishes, then resumes from the token it was parked on.
     global server
     server.n_ctx = 256
     server.start()
@@ -116,15 +112,11 @@ def test_two_slots_that_overflow_the_pool_together_both_finish():
 
 
 def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
-    # A pool that hands out cells in blocks gives a whole block to one sequence, so a sequence
-    # of n tokens occupies round_up(n, block) cells and holds the rest of its tail block against
-    # everybody else. The planner has to count those cells: counting tokens, it sees room the
-    # allocator cannot find, never parks anybody, and the retry ladder ends every request.
-    #
-    # llama_memory_alloc_granularity() reports the block size, and the only mode that returns
-    # more than 1 today is exact concurrency, whose paged attention kernel needs a head size this
-    # model does not have. LLAMA_SERVER_PREEMPT_GRANULARITY injects the figure instead: what is
-    # under test is the server's arithmetic, which is the same at 64 as at 256.
+    # a pool that allocates in blocks gives a whole block to one sequence, so n tokens occupy
+    # round_up(n, block) cells and the planner has to count cells: counting tokens it sees room
+    # the allocator cannot find, never parks anybody, and the retry ladder ends every request.
+    # LLAMA_SERVER_PREEMPT_GRANULARITY injects the block size, since the only mode that reports
+    # one needs a head size this model does not have; the arithmetic is the same at 64 as at 256.
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
@@ -143,9 +135,8 @@ def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
     assert "preempted:" in text
     assert "resumed after" in text
 
-    # every figure the planner logs is a whole number of blocks: "kv N/256" is what the pool is
-    # holding and "(wanted N)" is that plus what the next decode reserves. Counting tokens, both
-    # land wherever the sequences happen to be.
+    # every figure the planner logs is a whole number of blocks: "kv N/256" is what the pool holds
+    # and "(wanted N)" is that plus the next decode's reservation
     held   = [int(n) for n in re.findall(r"kv (\d+)/256", text)]
     wanted = [int(n) for n in re.findall(r"\(wanted (\d+)\)", text)]
     assert held and wanted, f"the planner logged no figures:\n{text}"
@@ -185,9 +176,8 @@ def _prompt_of_about(n_tokens: int, salt: str = "") -> tuple[str, int]:
 
 
 def test_two_prompts_that_overflow_the_pool_together_both_finish():
-    # Neither slot ever generates before the pool is full: both are still processing their
-    # prompts. A prompt-processing slot is between two chunks of its prompt, which is as
-    # clean a boundary as the one between two sampled tokens, so it is parked the same way.
+    # neither slot generates before the pool is full: a slot between two chunks of its prompt is
+    # as clean a boundary as one between two sampled tokens, so it is parked the same way
     global server
     server.n_ctx = 256
     server.start()
@@ -216,20 +206,17 @@ def test_two_prompts_that_overflow_the_pool_together_both_finish():
 
 
 def test_a_generating_slot_and_a_large_prompt_both_finish():
-    # One slot is generating a long answer to a short prompt when a large prompt arrives
-    # beside it. Together they need far more than the pool has. The prompt is admitted
-    # chunk by chunk, whoever is smaller is parked when the pool fills, and both finish.
-    # This model produces a thousand tokens a second, so the second request is sent right
-    # behind the first rather than after a delay: its prompt takes several batches to
-    # process, which is enough for the two to overlap however fast the first one runs.
+    # a slot generating a long answer to a short prompt meets a large prompt arriving beside it,
+    # needing far more than the pool has: the prompt is admitted chunk by chunk, whoever is
+    # smaller is parked, and both finish. The second request follows immediately, since its
+    # prompt takes several batches and that is enough overlap however fast the first one runs.
     global server
     server.n_ctx = 256
     server.start()
     log = LogReader(server.log_path)
 
     prompt_b, n_b = _prompt_of_about(150, "Charlie")
-    # b lives long enough for the two to collide: the first run of this used 16 tokens
-    # and b was finished and purged before a had grown into it
+    # b has to live long enough for the two to collide
     n_predict_a = 230
     n_predict_b = 90
     assert 8 + n_predict_a <= 256 and n_b + n_predict_b <= 256
@@ -255,8 +242,8 @@ def test_a_generating_slot_and_a_large_prompt_both_finish():
 
 
 def test_preempt_ram_zero_disables_preemption():
-    # --preempt-ram 0 is the switch back to the old behaviour: nothing is parked and the
-    # KV-full path ends the requests the way it always did.
+    # --preempt-ram 0 switches back to the old behaviour: nothing is parked and the KV-full path
+    # ends the requests the way it always did
     global server
     server.n_ctx = 256
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
@@ -276,9 +263,8 @@ def test_preempt_ram_zero_disables_preemption():
 
 
 def test_metrics_and_slots_report_the_parked_state():
-    # A client that wants to tell a parked chat from a slow one reads /slots, and an
-    # operator reads /metrics. Both must show the preemption happening, and the counters
-    # must survive the requests finishing.
+    # /slots tells a parked chat from a slow one and /metrics reports it to an operator; both
+    # must show the preemption, and the counters must survive the requests finishing
     global server
     server.n_ctx = 256
     server.server_metrics = True
@@ -552,11 +538,9 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
 
 
 def test_two_prompts_near_the_context_size_both_complete():
-    # Two prompts that each fit the context alone but not together. The second one is
-    # parked before it takes any cells, and it is close enough to n_ctx that its sequence
-    # plus its first batch would not leave the usual scheduling margin. It must still be
-    # restored once the first one finishes: with nothing resident there is nobody to keep
-    # the margin for. Before the fix it was parked for ever, with no restore ever tried.
+    # two prompts that each fit the context alone but not together. The second is parked before
+    # it takes any cells and is too close to n_ctx to leave the usual margin, but must still be
+    # restored once the first finishes: with nothing resident there is nobody to keep it for.
     global server
     server.n_ctx = 256
     # the whole prompt in one batch, so the parked slot's first step is the whole prompt
@@ -579,11 +563,9 @@ def test_two_prompts_near_the_context_size_both_complete():
 
 
 def test_the_last_resort_parks_instead_of_ending_everyone():
-    # With the planner off nothing is parked ahead of the decode, so two generations that
-    # fit alone but not together fill the pool until a single token finds no cell. That
-    # is where upstream ends every slot with the context error. Instead the batch is
-    # given up, the smaller slot is parked, the larger one finishes, and the parked one
-    # comes back and finishes too.
+    # with the planner off, two generations that fit alone but not together fill the pool until a
+    # single token finds no cell, where upstream ends every slot with the context error. Instead
+    # the batch is given up, the smaller slot is parked, and both finish.
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -637,10 +619,8 @@ def test_the_last_resort_works_with_an_unlimited_budget():
 
 
 def test_the_last_resort_rewinds_a_prompt_in_flight():
-    # Same, with a prompt being processed when the pool runs out: the chunk that failed
-    # is taken back off the slot's tokens and processed again after the resume, so the
-    # prompt is neither skipped nor fed twice. The prompt is far longer than a batch, so
-    # the failing chunk is a chunk of it, not its last token.
+    # same, with a prompt being processed when the pool runs out: the failed chunk comes back off
+    # the slot's tokens and is processed again after the resume, neither skipped nor fed twice
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -676,12 +656,10 @@ def test_the_last_resort_rewinds_a_prompt_in_flight():
 
 
 def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_head():
-    # Two generations that each outgrow the pool on their own, with context shift on. The
-    # resident reaches the limit, shifts, keeps about half the pool and would keep going
-    # for as long as it has tokens to make, while the parked one never fits beside it.
-    # After the head has waited its turn the resident is parked in its place, and the two
-    # take turns until both finish. Long enough that the resident is still going when the
-    # head's turn comes: this model makes a couple of thousand tokens a second.
+    # two generations that each outgrow the pool, with context shift on: the resident shifts and
+    # would hold half the pool for as long as it generates, while the parked one never fits
+    # beside it. After the head has waited its turn the resident is parked in its place and the
+    # two take turns. n_predict is large enough that the resident is still going by then.
     global server
     server.n_ctx = 256
     server.enable_ctx_shift = True
@@ -705,9 +683,8 @@ def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_hea
 
 
 def test_the_rotation_parks_a_resident_that_lets_the_head_in():
-    # Three generations with no end in a 256-cell pool with context shift on: two residents
-    # cycle through shifts while the third waits parked. Every rotation must let the head
-    # in, so all three keep finishing their tokens and no stream ends short.
+    # three endless generations with context shift on: two residents cycle through shifts while
+    # the third waits parked, and every rotation must let the head in so no stream ends short
     global server
     server.n_slots = 3
     server.n_ctx = 384
@@ -733,11 +710,9 @@ def test_the_rotation_parks_a_resident_that_lets_the_head_in():
 
 
 def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_server_lives():
-    # One request asking for two completions is one conversation in two slots: a parent
-    # and a child sharing the prompt. When the two together do not fit the pool there is
-    # nobody else to park, since the family is charged once and a member of it is not a
-    # victim for the other, so the request gets the context error it would get alone, and
-    # the server carries on serving.
+    # a two-completion request is one conversation in two slots, and a family member is not a
+    # victim for the other, so with nobody else to park it gets the context error it would get
+    # alone and the server carries on serving
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"

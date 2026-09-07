@@ -457,9 +457,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // [TAG_BATCH_INVARIANT] Every choice below switches on Q->ne[1] or on K->ne[1], and both
-    // grow with the other sequences in the batch and in the shared KV cache. Pin the kernel a
-    // batch of one would use so a request is never moved onto a different algorithm by its neighbours.
+    // [TAG_BATCH_INVARIANT] every choice below switches on Q->ne[1] or K->ne[1], both of which grow
+    // with the other sequences, so pin the kernel a batch of one would use
     if (ggml_cuda_batch_invariant() && can_use_vector_kernel && Q->ne[1] == 1) {
         return BEST_FATTN_KERNEL_VEC;
     }
@@ -592,7 +591,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
-    // [TAG_BATCH_INVARIANT] Attend one query row at a time, as a batch of one would.
+    // [TAG_BATCH_INVARIANT] attend one query row at a time, as a batch of one would
     const int fattn_max_cols = ggml_cuda_batch_invariant_max_cols();
     if (ggml_cuda_batch_invariant() && dst->src[0]->ne[1] > 1 && dst->src[0]->ne[3] == 1 &&
             (fattn_max_cols <= 0 || dst->src[0]->ne[1] <= fattn_max_cols)) {
@@ -606,8 +605,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
             ggml_tensor mask_row;
             ggml_tensor dst_row = *dst;
-            // ne[2] keeps running to the end of dst so that the scratch space for F16 copies of
-            // K and V, which is placed right behind dst, is still put in the same place.
+            // ne[2] runs to the end of dst so the F16 K/V scratch behind dst stays in place
             dst_row.ne[2] = dst->ne[2] - i;
             dst_row.data  = (char *) dst->data + i*dst->nb[2];
             dst_row.src[0] = &Q_row;

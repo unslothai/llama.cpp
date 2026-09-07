@@ -39,13 +39,11 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 
-// [TAG_EXACT_CONCURRENCY]
-// Report the widest ubatch a decode step of this process can build: one column per slot, times one
-// plus the number of speculative draft tokens carried with it. Under LLAMA_EXACT_CONCURRENCY the
-// column policy then defaults to that width instead of a fixed number, so --parallel or a wider
-// draft cannot silently push a decode above the bound and leave it batched. An explicitly set
-// GGML_CUDA_BATCH_INVARIANT_MAX_COLS still wins. Call before the first graph is computed. Also
-// available through ggml_backend_reg_get_proc_address().
+// [TAG_EXACT_CONCURRENCY] report the widest ubatch a decode step of this process can build: one
+// column per slot times one plus its draft tokens. Under LLAMA_EXACT_CONCURRENCY the column policy
+// defaults to that instead of a fixed number, so --parallel or a wider draft cannot silently push a
+// decode above the bound. An explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS still wins. Call before
+// the first graph is computed; also available through ggml_backend_reg_get_proc_address().
 GGML_BACKEND_API void ggml_backend_cuda_set_exact_decode_width(int n_cols);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

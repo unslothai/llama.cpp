@@ -104,16 +104,14 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 
-// [TAG_EXACT_CONCURRENCY]
-// opt-in mode under which a sequence's attention depends only on its own cells, in position order,
-// so that its output does not change when other sequences share the KV cache. Off by default.
-// Reads the same LLAMA_EXACT_CONCURRENCY variable as the paged KV cache and the CUDA backend.
+// [TAG_EXACT_CONCURRENCY] opt-in mode under which a sequence's attention depends only on its own
+// cells, in position order, so its output does not change when others share the KV cache. Off by
+// default; reads the same variable as the paged KV cache and the CUDA backend.
 bool llama_exact_concurrency();
 
-// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so that the
-// decode width every context needs is known to the backend and follows llama_set_exact_decode_tokens
+// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend
+// knows the width every context needs and it follows llama_set_exact_decode_tokens
 bool llama_exact_report_n_seq(uint32_t n_seq);
 
-// the same check without the report: whether a context of n_seq sequences could be reported
-// under the explicit column bound, for a constructor that may still fail after asking
+// the same check without the report, for a constructor that may still fail after asking
 bool llama_exact_check_n_seq(uint32_t n_seq);

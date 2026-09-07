@@ -2656,8 +2656,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only
-                // the CUDA backend reads
+                // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
                 if (op->src[5]) {
                     return false;
                 }

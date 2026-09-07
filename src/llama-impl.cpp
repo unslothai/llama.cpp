@@ -187,22 +187,18 @@ bool llama_exact_concurrency() {
 // [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
 static std::atomic<uint32_t> g_exact_decode_tokens{1};
 
-// one lock for the token figure, the sequence count and the width: the three move together
-// (a context reports its count and the width that follows; a new token figure re-reports the
-// width for every count seen), and a report interleaved with a change of figure could leave
-// the backend with a width that covers neither. Recursive, since the setters call each other.
+// one lock for the token figure, the sequence count and the width, since the three move together
+// and a report interleaved with a change of figure could leave the backend with a width that
+// covers neither; recursive, since the setters call each other
 static std::recursive_mutex g_exact_mutex;
 
-// the most sequences any context so far was created with. The tokens figure is process
-// wide, so raising it widens the decode step of every context that already exists; the
-// width those contexts reported at creation is re-reported here with the new figure, or a
-// context created under a narrower figure would batch above the bound it reported.
+// the most sequences any context was created with. The tokens figure is process wide, so raising
+// it widens every existing context's decode step and their width is re-reported with it.
 static std::atomic<uint32_t> g_exact_max_n_seq{0};
 
 static bool llama_exact_width_within_explicit_bound(uint32_t n_cols);
 
-// the width is sequences times tokens, handed to a backend as an int; a product that does not
-// fit is refused rather than wrapped
+// sequences times tokens, handed to a backend as an int; a product that overflows is refused
 static bool llama_exact_width_of(uint32_t n_seq, uint32_t n_tokens, uint32_t & n_cols) {
     const uint64_t w = (uint64_t) n_seq * (uint64_t) n_tokens;
 
@@ -250,14 +246,14 @@ bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
 
     std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
 
-    // never lowered: a narrower context set up later would otherwise turn the verify steps of
-    // an existing speculative context into prompts and serialise them
+    // never lowered: a narrower context set up later would turn an existing speculative
+    // context's verify steps into prompts and serialise them
     if (n_tokens <= g_exact_decode_tokens.load(std::memory_order_relaxed)) {
         return true;
     }
 
-    // every context that exists widens with the figure, so the width they will need is
-    // reported first; a figure the explicit bound cannot cover leaves the old one in place
+    // every context widens with the figure, so report the width first; one the explicit bound
+    // cannot cover leaves the old figure in place
     const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
 
     uint32_t n_cols = 0;
@@ -275,14 +271,13 @@ uint32_t llama_exact_decode_tokens(void) {
     return g_exact_decode_tokens.load(std::memory_order_relaxed);
 }
 
-// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h. A backend that
-// splits columns to make a decode exact reads it through ggml_backend_cuda_set_exact_decode_width,
-// reached through the registry so that a backend that is absent or loaded late costs nothing.
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h. Backends read it
+// through ggml_backend_cuda_set_exact_decode_width, reached through the registry so an absent or
+// late-loaded backend costs nothing.
 static std::atomic<uint32_t> g_exact_decode_width{0};
 
-// an explicit column bound given to the CUDA backend wins over the reported width there, so a
-// width above it would leave decodes batched past the bound with the mode still reporting itself
-// on; a width the bound does not cover is refused instead of stored
+// an explicit column bound wins in the CUDA backend, so a width above it would leave decodes
+// batched past the bound: refuse such a width instead of storing it
 static bool llama_exact_width_within_explicit_bound(uint32_t n_cols) {
     static const int explicit_cols = []() {
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
@@ -310,9 +305,8 @@ bool llama_set_exact_decode_width(uint32_t n_cols) {
     while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
     }
 
-    // The widest figure so far goes to every backend on every call, not only when it grew: a
-    // width reported before a backend was loaded would otherwise never reach it, and every
-    // context reports at creation, by which time the backends are there.
+    // the widest figure goes to every backend on every call, not only when it grew, or a width
+    // reported before a backend was loaded would never reach it
     const uint32_t widest = g_exact_decode_width.load(std::memory_order_relaxed);
 
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {

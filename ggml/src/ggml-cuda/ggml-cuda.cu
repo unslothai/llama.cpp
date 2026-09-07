@@ -1758,8 +1758,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
-    // [TAG_BATCH_INVARIANT] mul_mat+GLU is only fused for a single destination column, so
-    // leaving it on would give a solo request a different code path from a batched one.
+    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single destination column only, so leaving
+    // it on would give a solo request a different code path from a batched one
     if (ggml_cuda_batch_invariant()) {
         return false;
     }
@@ -1791,8 +1791,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
-    // [TAG_BATCH_INVARIANT] mul_mat+GLU is only fused for a single destination column, so
-    // leaving it on would give a solo request a different code path from a batched one.
+    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single destination column only, so leaving
+    // it on would give a solo request a different code path from a batched one
     if (ggml_cuda_batch_invariant()) {
         return false;
     }
@@ -1825,16 +1825,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// [TAG_BATCH_INVARIANT]
-// The number of tokens in a batch picks both the matmul implementation below and, inside
-// several of them, how the K loop is divided between threads. Both change the order in
-// which the partial products of one destination element are summed, so the same request
-// produces different bits depending on how many other requests decode alongside it.
-//
-// GGML_CUDA_BATCH_INVARIANT removes that dependency:
-//   1 - compute every destination column on its own, exactly as a batch of one would.
-//   2 - split off only the columns whose batch-of-one configuration differs from the
-//       batched one, leaving the already invariant matmuls batched.
+// [TAG_BATCH_INVARIANT] the token count picks the matmul implementation and how its K loop is
+// divided between threads, both of which change the summation order, so the same request produces
+// different bits depending on how many others decode alongside it. GGML_CUDA_BATCH_INVARIANT:
+//   1 - compute every destination column on its own, exactly as a batch of one would
+//   2 - split off only the columns whose batch-of-one configuration differs from the batched one
 static bool ggml_cuda_exact_concurrency() {
     static const bool exact = []() {
         const char * value = getenv("LLAMA_EXACT_CONCURRENCY");
@@ -1864,9 +1859,8 @@ void ggml_backend_cuda_set_exact_decode_width(int n_cols) {
 }
 
 int ggml_cuda_batch_invariant_max_cols() {
-    // [TAG_EXACT_CONCURRENCY] With prompt ubatches kept to one sequence, a sequence's prefill
-    // matmul shapes match its solo run, so exact mode no longer needs the column policy to be
-    // unbounded there. An explicit bound always wins, in either mode.
+    // [TAG_EXACT_CONCURRENCY] prompt ubatches hold one sequence, so a prefill already matches its
+    // solo run and needs no unbounded column policy. An explicit bound always wins.
     static const int explicit_cols = []() {
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
         return val ? atoi(val) : -1;
@@ -1880,24 +1874,19 @@ int ggml_cuda_batch_invariant_max_cols() {
         return 0;
     }
 
-    // Exact mode only has to cover the widest ubatch a decode step can build: one column per slot,
-    // times one plus the number of speculative draft tokens carried with it. Use that width when
-    // the caller reported it through ggml_backend_cuda_set_exact_decode_width(). Nothing reported
-    // it, so fall back to 16, which covers four slots at up to three tokens each, which is what
-    // --parallel 4 --spec-type draft-mtp --spec-draft-n-max 2 produces. Above the bound the column
-    // split does not fire, and ggml_cuda_warn_above_exact_bound() says so once.
+    // the widest ubatch a decode step can build: one column per slot times one plus its draft
+    // tokens, as reported by ggml_backend_cuda_set_exact_decode_width(). Failing a report, 16,
+    // which covers --parallel 4 --spec-type draft-mtp --spec-draft-n-max 2. Above the bound the
+    // column split does not fire and ggml_cuda_warn_above_exact_bound() says so once.
     const int width = g_exact_decode_width.load(std::memory_order_relaxed);
 
     return width > 0 ? width : 16;
 }
 
-// [TAG_EXACT_CONCURRENCY] a batch wider than the bound is left batched, so its rows depend on the
-// other rows in it and the mode does not hold for that op. Say so once, rather than never.
-//
-// Only when nothing reported a decode width. When one was reported the bound is derived from it, so
-// the only batches above the bound are prompt ubatches, and those hold a single sequence under this
-// mode: their exactness comes from that, not from the column policy, and leaving them batched is
-// the whole point of having a bound at all. Warning on those would be crying wolf on every prefill.
+// [TAG_EXACT_CONCURRENCY] a batch wider than the bound is left batched, so the mode does not hold
+// for that op; say so once. Only when nothing reported a decode width: a reported one makes the
+// batches above the bound prompt ubatches, which are exact by holding a single sequence, so
+// warning on those would be crying wolf on every prefill.
 static void ggml_cuda_warn_above_exact_bound(const char * op, int64_t ncols, int max_cols) {
     if (!ggml_cuda_exact_concurrency()) {
         return;
@@ -1929,7 +1918,7 @@ enum ggml_cuda_mm_path {
     GGML_CUDA_MM_CUBLAS,
 };
 
-// The implementation ggml_cuda_mul_mat would pick for a batch of ne11 columns.
+// the implementation ggml_cuda_mul_mat would pick for a batch of ne11 columns
 static ggml_cuda_mm_path ggml_cuda_mul_mat_path(
         int cc, int warp_size, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int64_t ne11) {
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -1966,14 +1955,10 @@ static ggml_cuda_mm_path ggml_cuda_mul_mat_path(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT]
-// The widest slice of columns that can be recomputed in one launch while every column in it still
-// sums the way a batch of one would. A column's result depends on the implementation and, for
-// MMVQ, on the warp count of the launch, and neither depends on the values of the other columns
-// in the launch, so a slice as wide as the batch-of-one configuration reaches gives each of its
-// columns the batch-of-one value while reading the weights once for all of them instead of once
-// per column. A twelve-column speculative decode over a table whose configuration holds up to four
-// columns then costs three weight reads rather than twelve. Always below ncols_dst, so the
+// [TAG_BATCH_INVARIANT] the widest slice of columns that can be recomputed in one launch while
+// every column still sums as a batch of one would. A column's result depends on the implementation
+// and, for MMVQ, the launch's warp count, never on the other columns, so a slice this wide reads
+// the weights once for all of them instead of once per column. Always below ncols_dst, so the
 // recursive call cannot land back here with the same shape.
 static int64_t ggml_cuda_mul_mat_invariant_width(
         int cc, int warp_size, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
@@ -1994,14 +1979,13 @@ static int64_t ggml_cuda_mul_mat_invariant_width(
     return 1;
 }
 
-// Recompute dst in slices of columns so that each column sees the batch-of-one configuration.
-// Returns false when the batched launch already gives every column that same value.
+// recompute dst in slices of columns so each column sees the batch-of-one configuration; false
+// when the batched launch already gives every column that same value
 static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // Recurrent-model output projections broadcast one weight matrix over sequence
-    // planes. These are token projections too, even though ne[2] or ne[3] is > 1.
-    // Normalize each plane before applying the existing selective column policy.
+    // recurrent output projections broadcast one weight matrix over sequence planes: these are
+    // token projections too, so normalize each plane before applying the column policy
     if (ggml_cuda_exact_concurrency() && src0->ne[2] == 1 && src0->ne[3] == 1 &&
             (dst->ne[2] > 1 || dst->ne[3] > 1) &&
             src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
@@ -2023,7 +2007,7 @@ static bool ggml_cuda_mul_mat_split_columns(
     if (ncols_dst <= 1 || src1->ne[1] != ncols_dst) {
         return false;
     }
-    // Only the token dimension is split, batched matmuls (attention) keep their shape.
+    // only the token dimension is split; batched matmuls (attention) keep their shape
     if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
         return false;
     }
@@ -2033,14 +2017,14 @@ static bool ggml_cuda_mul_mat_split_columns(
         return false;
     }
 
-    // Mode 1 recomputes one column at a time. Mode 2 recomputes in the widest slices that keep the
-    // batch-of-one arithmetic, which is what the exact concurrency mode runs under.
+    // mode 1 recomputes one column at a time; mode 2, which exact concurrency runs under, uses the
+    // widest slices that keep the batch-of-one arithmetic
     int64_t width = 1;
     if (ggml_cuda_batch_invariant() >= 2) {
         const ggml_cuda_mm_path path_one     = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, 1);
         const ggml_cuda_mm_path path_batched = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, ncols_dst);
         if (path_one == path_batched) {
-            // Same implementation, but it still has to sum each destination element in the same order.
+            // same implementation, but it still has to sum in the same order
             if (path_batched == GGML_CUDA_MM_MMVF) {
                 return false; // the block size follows K alone
             }
@@ -2122,10 +2106,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_ABORT("fatal error");
 }
 
-// [TAG_BATCH_INVARIANT]
-// True when the batch-invariant policy computes this MUL_MAT_ID one token at a time.
-// Every expert product then reduces the way it would in a batch of one, whatever the
-// rest of the ubatch routed to.
+// [TAG_BATCH_INVARIANT] true when the policy computes this MUL_MAT_ID one token at a time, so
+// every expert product reduces as it would in a batch of one
 static bool ggml_cuda_mul_mat_id_splits_tokens(const ggml_tensor * dst) {
     if (!ggml_cuda_batch_invariant()) {
         return false;
@@ -2152,8 +2134,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    // [TAG_BATCH_INVARIANT] a split node runs as ntokens single-token calls, so the path
-    // that decides whether the stream is synchronized is the single-token one.
+    // [TAG_BATCH_INVARIANT] a split node runs as ntokens single-token calls, so the path that
+    // decides whether the stream is synchronized is the single-token one
     const int64_t ntokens = ggml_cuda_mul_mat_id_splits_tokens(dst) ? 1 : dst->ne[2];
 
     if (ntokens <= MMVQ_MAX_BATCH_SIZE) {
@@ -2179,12 +2161,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT]
-// Recompute dst one token at a time. Every implementation below groups the ubatch's tokens
-// by the expert they routed to, so the column count of an expert's matmul, the tokens the
-// per-expert copy gathers and the width the activations are quantized at all depend on what
-// the other tokens in the ubatch picked. Handing each token its own call removes that: the
-// callee sees the shapes a batch of one has, whatever the neighbours did.
+// [TAG_BATCH_INVARIANT] recompute dst one token at a time. Every implementation below groups the
+// ubatch's tokens by the expert they routed to, so shapes depend on what the other tokens picked;
+// one call per token makes the callee see the shapes a batch of one has.
 static void ggml_cuda_mul_mat_id_split_tokens(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2232,9 +2211,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_BATCH_INVARIANT]
     if (ggml_cuda_mul_mat_id_splits_tokens(dst)) {
         GGML_ASSERT(ne3 == 1 && src1->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
-        // A quantized expert matrix takes the single-token MMVQ path for every token count, and
-        // that path can put the tokens on its sample axis in one launch rather than being
-        // re-entered once per token. Anything else is still recomputed one token at a time.
+        // a quantized expert matrix takes the single-token MMVQ path at every token count, and that
+        // path can put the tokens on its sample axis in one launch; anything else goes token by token
         if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
             return;
@@ -3629,10 +3607,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // topk-moe
-    // [TAG_BATCH_INVARIANT] The routing fusion passes its memory-range check only when the ubatch
-    // holds one token, so a request decoding alone picks the fused warp-local top-k kernel and the
-    // same request decoding next to neighbours picks the softmax, argsort and normalize chain.
-    // Two algorithms for one set of routing weights is the batch dependence this mode removes.
+    // [TAG_BATCH_INVARIANT] the routing fusion passes its memory-range check only for a one-token
+    // ubatch, so a solo request takes the fused top-k kernel and a batched one takes the softmax,
+    // argsort and normalize chain: two algorithms for one set of routing weights
     if (!ggml_cuda_batch_invariant() &&
             (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
