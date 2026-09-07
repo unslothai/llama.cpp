@@ -89,8 +89,6 @@ constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is 
 // LLAMA_SERVER_PREEMPT_RESUME=pass keeps the previous order: most-preempted first, then longest
 // parked, and a smaller slot may pass a head that does not fit.
 // LLAMA_SERVER_PREEMPT_RESUME=head (the default) or pass; read once in load_model() and logged.
-static bool g_preempt_resume_head_of_line = true;
-
 // [TAG_PREEMPT] the SSE comment for a park or a resume. A request with several prompts
 // streams them through one reader, so the comment names the prompt it is about, except for
 // prompt 0, whose comment stays the bare form a single-prompt client matches on.
@@ -102,10 +100,6 @@ static std::string preempt_notice_comment(const server_task_result_preempt_notic
     }
 
     return res + "\n\n";
-}
-
-static bool preempt_resume_head_of_line() {
-    return g_preempt_resume_head_of_line;
 }
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
@@ -1465,9 +1459,9 @@ private:
         }
 
         {
-            // read on every load, so a reload after the variable changed, or another context
-            // loaded in the same process, gets its own order rather than the previous one's
-            g_preempt_resume_head_of_line = true;
+            // read on every load and kept on this context, so a reload after the variable
+            // changed, or another context loaded in the same process, has an order of its own
+            preempt_resume_head = true;
 
             const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
             if (LLAMA_SERVER_PREEMPT_RESUME && strcmp(LLAMA_SERVER_PREEMPT_RESUME, "head") != 0) {
@@ -1476,7 +1470,7 @@ private:
                             LLAMA_SERVER_PREEMPT_RESUME);
                     return false;
                 }
-                g_preempt_resume_head_of_line = false;
+                preempt_resume_head = false;
                 SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_RESUME = pass (parked slots come back most-preempted first, and a smaller slot may pass a head that does not fit)\n");
             }
 
@@ -1506,8 +1500,11 @@ private:
                 SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_PLANNER = off (test knob: nothing is parked ahead of the decode, only as a last resort)\n");
             }
 
-            if (llama_model_is_recurrent(model_tgt)) {
-                preempt_recurrent = true;
+            // assigned, not only set: the same context reloaded with an attention model after
+            // a recurrent one gets its preemption back
+            preempt_recurrent = llama_model_is_recurrent(model_tgt);
+
+            if (preempt_recurrent) {
                 SRV_WRN("%s", "preemption: off, the recurrent cache holds one state per sequence whatever its length, so there is no cell pool to run out of\n");
             }
         }
@@ -2983,6 +2980,11 @@ private:
     // and the context error
     bool preempt_planner_off = false;
 
+    // LLAMA_SERVER_PREEMPT_RESUME: head (the default) puts parked slots back in the order they
+    // were parked and only the first until it fits; pass lets a smaller slot pass a head
+    // that does not fit. Read at load, per context.
+    bool preempt_resume_head = true;
+
     // a recurrent cache holds one state per sequence whatever its length: no cell pool,
     // nothing to run out of, and the token count the planner measures says nothing about
     // it. Preemption is off for those models; a hybrid keeps its attention cache and stays on.
@@ -3297,11 +3299,11 @@ private:
 
         const int32_t n_cells = n_ctx;
 
-        // Put back what fits, in the order preempt_resume_head_of_line() describes: by default
+        // Put back what fits, in the order preempt_resume_head describes: by default
         // the slot parked longest, and only that one until it fits; under
         // LLAMA_SERVER_PREEMPT_RESUME=pass the most-preempted slot first, then the one parked
         // longest, and a smaller slot may pass a head that does not fit.
-        const bool head_of_line = preempt_resume_head_of_line();
+        const bool head_of_line = preempt_resume_head;
 
         for (;;) {
             std::vector<server_slot *> parked;
