@@ -2716,6 +2716,10 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
+        if (deferred) {
+            return; // [TAG_STATE_ASYNC] the derived class posts the copies itself
+        }
+
         llama_io_emit(winfos, 0, winfos.size(),
                 [](ggml_tensor * tensor, uint8_t * ptr, size_t offset, size_t size,
                    size_t n_copies, size_t stride_tensor, size_t stride_data) {
@@ -2750,10 +2754,8 @@ public:
         return size_written;
     }
 
-private:
-    uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_written = 0;
+protected:
+    llama_io_write_host(uint8_t * p, size_t len, bool deferred) : ptr(p), buf_size(len), deferred(deferred) {}
 
     struct write_info {
         ggml_tensor * tensor;
@@ -2762,6 +2764,12 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+    const bool deferred = false;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -2769,6 +2777,10 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
+        if (deferred) {
+            return; // [TAG_STATE_ASYNC] the derived class posts the copies itself
+        }
+
         // flush the reads
         for (size_t i = 0; i < rinfos.size();) {
             auto * tensor = rinfos[i].tensor;
@@ -2843,10 +2855,8 @@ public:
         return size_read;
     }
 
-private:
-    const uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_read = 0;
+protected:
+    llama_io_read_host(const uint8_t * p, size_t len, bool deferred) : ptr(p), buf_size(len), deferred(deferred) {}
 
     struct read_info {
         ggml_tensor * tensor;
@@ -2855,6 +2865,12 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+private:
+    const uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_read = 0;
+    const bool deferred = false;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -3357,10 +3373,11 @@ struct llama_state_seq_copy {
     }
 };
 
-class llama_io_write_host_async : public llama_io_write_i {
+// [TAG_STATE_ASYNC] the buffer walk of llama_io_write_host, with the copies posted on the transfer's stream instead of made here
+class llama_io_write_host_async : public llama_io_write_host {
 public:
     llama_io_write_host_async(uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
-        ptr(p), buf_size(len), cpy(cpy) {}
+        llama_io_write_host(p, len, true), cpy(cpy) {}
 
     // posted from the destructor, and only once serialisation reached the end: a caller told of a partial failure by a zero return is free to reuse the buffer at once
     void commit() {
@@ -3384,54 +3401,17 @@ public:
         cpy.record();
     }
 
-    void write(const void * src, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        memcpy(ptr, src, size);
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-
-        winfos.push_back({tensor, ptr, size, offset});
-
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    size_t n_bytes() override {
-        return size_written;
-    }
-
 private:
-    uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_written = 0;
-
-    struct write_info {
-        ggml_tensor * tensor;
-        uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<write_info> winfos;
-
     llama_state_seq_copy & cpy;
 
     bool committed = false;
 };
 
-class llama_io_read_host_async : public llama_io_read_i {
+// [TAG_STATE_ASYNC] the read half of the same, without llama_io_read_host's whole-tensor staging: a write-back would undo whatever the sequences sharing the tensor wrote while these copies ran
+class llama_io_read_host_async : public llama_io_read_host {
 public:
     llama_io_read_host_async(const uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
-        ptr(p), buf_size(len), cpy(cpy) {}
+        llama_io_read_host(p, len, true), cpy(cpy) {}
 
     // see llama_io_write_host_async::commit(): a restore that failed part way has dropped the sequence, and copies posted for it would write cells that are no longer its own
     void commit() {
@@ -3443,7 +3423,6 @@ public:
             return;
         }
 
-        // no whole-tensor staging here, unlike the synchronous path above: a write-back would undo whatever the sequences sharing the tensor wrote while these copies ran
         llama_io_emit(rinfos, 0, rinfos.size(),
                 [this](ggml_tensor * tensor, const uint8_t * ptr, size_t offset, size_t size,
                        size_t n_copies, size_t stride_tensor, size_t stride_data) {
@@ -3456,45 +3435,7 @@ public:
         cpy.record();
     }
 
-    void read(void * dst, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        memcpy(dst, ptr, size);
-        ptr += size;
-        size_read += size;
-        buf_size -= size;
-    }
-
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-
-        rinfos.push_back({tensor, ptr, size, offset});
-
-        ptr += size;
-        size_read += size;
-        buf_size -= size;
-    }
-
-    size_t n_bytes() override {
-        return size_read;
-    }
-
 private:
-    const uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_read = 0;
-
-    struct read_info {
-        ggml_tensor * tensor;
-        const uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<read_info> rinfos;
-
     llama_state_seq_copy & cpy;
 
     bool committed = false;
