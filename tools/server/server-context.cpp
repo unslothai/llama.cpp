@@ -4220,12 +4220,14 @@ private:
             }
         }
 
-        // [TAG_PREEMPT] make the pool fit the step that is about to be built, measured after
-        // any context shift
-        pre_decode_shift();
-        update_preemption();
-
         try {
+            // [TAG_PREEMPT] make the pool fit the step that is about to be built, measured
+            // after any context shift. Inside the guard with the rest of the step: a shift
+            // rebuilds a slot's tokens and a park allocates, and either can throw, which the
+            // slots are told about rather than the loop ending on an uncaught exception
+            pre_decode_shift();
+            update_preemption();
+
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
