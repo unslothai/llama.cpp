@@ -515,6 +515,7 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // transfers outlive nothing: the server frees its slots before the contexts
     for (auto & it : state_copy_fences) {
         ggml_backend_event_free(it.second);
     }
@@ -3216,6 +3217,8 @@ struct llama_state_seq_copy {
 
     ggml_backend_buffer_ptr host_buf;
 
+    bool counted = false; // held in the context's count of live transfers
+
     uint8_t * data     = nullptr;
     size_t    size     = 0;   // bytes the current transfer covers
     size_t    capacity = 0;   // bytes actually held, kept across transfers
@@ -3228,6 +3231,10 @@ struct llama_state_seq_copy {
     int64_t   t_sync_us = 0;
 
     ~llama_state_seq_copy() {
+        if (counted) {
+            ctx->state_seq_copy_release();
+        }
+
         wait();
 
         for (auto & it : devs) {
@@ -3658,6 +3665,18 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
 // [TAG_STATE_ASYNC]
 
+void llama_context::state_seq_copy_release() {
+    GGML_ASSERT(state_copy_live > 0);
+
+    if (--state_copy_live == 0) {
+        for (auto & it : state_copy_fences) {
+            ggml_backend_event_free(it.second);
+        }
+
+        state_copy_fences.clear();
+    }
+}
+
 void llama_context::state_seq_copy_fence() {
     for (const auto & it : state_copy_fences) {
         for (const auto & backend : backends) {
@@ -3791,6 +3810,9 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
 
     // the fences say where the compute streams are now, before any transfer asks
     state_seq_copy_fence();
+
+    state_copy_live++;
+    cpy->counted = true;
 
     return cpy.release();
 }

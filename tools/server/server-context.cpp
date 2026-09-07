@@ -1873,6 +1873,10 @@ private:
         }
 
         {
+            // read on every load, so a reload after the variable changed, or another context
+            // loaded in the same process, gets its own order rather than the previous one's
+            g_preempt_resume_head_of_line = true;
+
             const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
             if (LLAMA_SERVER_PREEMPT_RESUME && strcmp(LLAMA_SERVER_PREEMPT_RESUME, "head") != 0) {
                 if (strcmp(LLAMA_SERVER_PREEMPT_RESUME, "pass") != 0) {
@@ -4466,6 +4470,12 @@ private:
             pre_decode_shift();
             update_preemption();
 
+            // [TAG_PREEMPT_ASYNC] before pre_decode(), not only before the target decode: the
+            // draft it asks for is a decode on the draft context, which applies that cache's
+            // pending shift in place, and a park or restore still copying draft cells would
+            // read through it or be overwritten by it just the same
+            preempt_wait_for_shift();
+
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
@@ -4501,8 +4511,6 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
-
-        preempt_wait_for_shift();
 
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
