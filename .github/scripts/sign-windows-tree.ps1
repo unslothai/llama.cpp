@@ -52,6 +52,32 @@ if ($files.Count -eq 0) {
     exit 1
 }
 
+# Leave an existing valid signature alone. Signing replaces it, and some of
+# what we bundle arrives already signed by its vendor: the OpenMP runtime is
+# signed by Microsoft, and re-signing it would strip that and substitute ours
+# for no gain. Files that are unsigned, or whose chain does not build, are ours
+# to sign. Everything is re-verified at the end either way.
+$alreadySigned = @()
+$toSign = @()
+foreach ($f in $files) {
+    if ((Get-AuthenticodeSignature -LiteralPath $f.FullName).Status -eq 'Valid') {
+        $alreadySigned += $f
+    } else {
+        $toSign += $f
+    }
+}
+
+if ($alreadySigned.Count -gt 0) {
+    Write-Host "leaving $($alreadySigned.Count) already-signed file(s) untouched:"
+    foreach ($f in $alreadySigned) { Write-Host "  $($f.Name)" }
+}
+
+if ($toSign.Count -eq 0) {
+    Write-Host "all $($files.Count) PE file(s) under $Path are already validly signed"
+    exit 0
+}
+
+$files = $toSign
 Write-Host "signing $($files.Count) PE file(s) under $Path"
 
 # Retried only for Azure auth flakiness. A signing rejection is a real failure
