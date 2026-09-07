@@ -3031,20 +3031,29 @@ private:
         return preempt_ram_used() + slot.preempt_state_required() <= budget;
     }
 
+    // cells of the slot's that its next step keeps: a slot just given a task still mirrors
+    // the previous request's prompt until the batch builder keeps the prefix the two share
+    // and drops the rest (all of it when the request does not cache its prompt), so what it
+    // holds, and what it is about to ask for, both count from that prefix
+    int32_t preempt_n_retained(const server_slot & slot) const {
+        if (slot.state == SLOT_STATE_STARTED && slot.task) {
+            if (!slot.task->params.cache_prompt) {
+                return 0;
+            }
+
+            return (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        }
+
+        return slot.prompt.n_tokens();
+    }
+
     // cells the slot will ask for on its next step once it is back in the pool
     int32_t preempt_n_need(const server_slot & slot) const {
-        int32_t res = slot.prompt.n_tokens();
+        int32_t res = preempt_n_retained(slot);
 
         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
             res += 1 + preempt_n_spec(slot);
         } else {
-            // a slot just given a task still mirrors the previous request's prompt; the batch
-            // builder keeps the prefix the two share and drops the rest, so what it holds and
-            // what it is about to ask for both count from that prefix, not from the old prompt
-            if (slot.state == SLOT_STATE_STARTED && slot.task) {
-                res = (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
-            }
-
             const int32_t n_left = slot.task ? slot.task->n_tokens() - res : 0;
 
             res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
@@ -3089,15 +3098,7 @@ private:
                 charged.push_back(family);
             }
 
-            // a slot just given a task still mirrors the previous request's prompt until the
-            // batch builder keeps the prefix the two share and drops the rest; what stays is
-            // the prefix, so that is what the pool holds for it
-            if (slot.state == SLOT_STATE_STARTED && slot.task) {
-                res += (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
-                continue;
-            }
-
-            res += slot.prompt.n_tokens();
+            res += preempt_n_retained(slot);
         }
 
         return res;
@@ -3120,7 +3121,10 @@ private:
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
-                        const int32_t n_left = slot.task ? slot.task->n_tokens() - slot.prompt.n_tokens() : 0;
+                        // from the prefix a started slot keeps, not from the prompt it still
+                        // mirrors: measured by the mirror, a request shorter than the last one
+                        // reserved one cell for a chunk of hundreds
+                        const int32_t n_left = slot.task ? slot.task->n_tokens() - preempt_n_retained(slot) : 0;
 
                         res_pmt += std::max(1, std::min(n_batch, n_left));
                     } break;
