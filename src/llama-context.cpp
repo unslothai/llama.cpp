@@ -3192,6 +3192,8 @@ struct llama_state_seq_copy {
     struct dev_copy {
         ggml_backend_ptr     backend;
         ggml_backend_event_t event   = nullptr;
+        // recorded on the compute stream and waited for on the copy stream, see order_after()
+        ggml_backend_event_t fence   = nullptr;
         bool                 pending = false;
     };
 
@@ -3216,6 +3218,9 @@ struct llama_state_seq_copy {
         for (auto & it : devs) {
             if (it.second.event) {
                 ggml_backend_event_free(it.second.event);
+            }
+            if (it.second.fence) {
+                ggml_backend_event_free(it.second.fence);
             }
         }
     }
@@ -3256,6 +3261,25 @@ struct llama_state_seq_copy {
         for (auto & it : devs) {
             if (it.second.pending) {
                 ggml_backend_event_record(it.second.event, it.second.backend.get());
+            }
+        }
+    }
+
+    // Order the copies about to be posted behind the compute already queued on each device:
+    // the decode that produced the cells a park reads, or that a restore's cells were
+    // carved out of, has to be finished before the copy touches them. Recorded on the
+    // compute backend's stream and waited for on the copy stream, so the host drains
+    // nothing. Draining it (synchronize()) is what this replaces: with the wait that
+    // order_before() queues on the compute stream for the previous restore, a host drain
+    // blocked this thread until that copy had landed, and two restores issued in one pass
+    // ran one after the other with the whole transfer back on the decode loop.
+    void order_after(const std::vector<ggml_backend_ptr> & compute) {
+        for (auto & it : devs) {
+            for (const auto & backend : compute) {
+                if (ggml_backend_get_device(backend.get()) == it.first) {
+                    ggml_backend_event_record(it.second.fence, backend.get());
+                    ggml_backend_event_wait(it.second.backend.get(), it.second.fence);
+                }
             }
         }
     }
@@ -3674,10 +3698,19 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
+        ggml_backend_event_t fence = ggml_backend_event_new(dev);
+
+        if (!fence) {
+            ggml_backend_event_free(event);
+            ggml_backend_free(backend_cpy);
+            continue;
+        }
+
         auto & dc = cpy->devs[dev];
 
         dc.backend.reset(backend_cpy);
         dc.event = event;
+        dc.fence = fence;
     }
 
     if (cpy->devs.empty()) {
@@ -3739,13 +3772,11 @@ size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size
         return 0;
     }
 
-    // The copies run on their own stream and are ordered against nothing, so the decode that
-    // produced these cells has to be finished before they are read. This is the one part of
-    // the transfer that stays on the caller's thread, and it costs nothing where it is used:
-    // a caller preempting a sequence does it between two decodes, with the previous one
-    // already drained by the sampling that followed it.
+    // The copies run on their own stream, so the decode that produced these cells has to be
+    // finished before they are read: the copy stream waits for the compute stream, on the
+    // device, see order_after(). Nothing stays on the caller's thread.
     const int64_t t_sync = ggml_time_us();
-    synchronize();
+    cpy.order_after(backends);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 
     cpy.n_copies = 0;
@@ -3787,8 +3818,11 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
         return 0;
     }
 
+    // the cells this restore was given may still be read by a graph in flight (masked, but
+    // read), so the copy stream waits for the compute stream before it writes them: on the
+    // device, see order_after(), rather than by draining the compute stream on this thread
     const int64_t t_sync = ggml_time_us();
-    synchronize();
+    cpy.order_after(backends);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 
     cpy.n_copies = 0;
