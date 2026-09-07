@@ -340,6 +340,7 @@ struct server_slot {
     int32_t              n_ctx_shift    = 0;   // context shifts the CURRENT task has made: it is at the pool's limit and cycling
     int32_t              n_preempt_fail = 0;   // consecutive failed restores
     int64_t              t_preempt_us   = 0;   // when it was parked
+    bool                 preempt_rotation_refused = false; // this park has logged a rotation refused for budget
 
     size_t preempt_state_size() const {
         return preempt_state_tgt.size() + preempt_state_dft.size();
@@ -404,6 +405,7 @@ struct server_slot {
         state_before_preempt = state;
         state                = SLOT_STATE_PREEMPTED;
         t_preempt_us         = ggml_time_us();
+        preempt_rotation_refused = false;
 
         n_preempt++;
 
@@ -1483,6 +1485,11 @@ private:
 
             if (preempt_planner_off) {
                 SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_PLANNER = off (test knob: nothing is parked ahead of the decode, only as a last resort)\n");
+            }
+
+            if (llama_model_is_recurrent(model_tgt)) {
+                preempt_recurrent = true;
+                SRV_WRN("%s", "preemption: off, the recurrent cache holds one state per sequence whatever its length, so there is no cell pool to run out of\n");
             }
         }
 
@@ -2938,6 +2945,11 @@ private:
     // and the context error
     bool preempt_planner_off = false;
 
+    // a recurrent cache holds one state per sequence whatever its length: no cell pool,
+    // nothing to run out of, and the token count the planner measures says nothing about
+    // it. Preemption is off for those models; a hybrid keeps its attention cache and stays on.
+    bool preempt_recurrent = false;
+
     // set by preempt_last_resort(): the batch being decoded was given up, stop the chunk loop
     bool preempt_batch_abandoned = false;
 
@@ -2983,22 +2995,6 @@ private:
         const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
 
         return preempt_ram_used() + slot.preempt_state_required() <= budget;
-    }
-
-    // the same for a rotation: the parked head is restored on the pass that parks the
-    // resident, so its bytes are on their way out and are not held against the resident.
-    // A budget that holds one sequence but not two would otherwise refuse every rotation
-    // and leave the head parked for as long as the resident cares to generate.
-    bool preempt_fits_budget_for_rotation(const server_slot & slot, const server_slot & head) const {
-        if (params_base.preempt_ram_mib < 0) {
-            return true;
-        }
-
-        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
-        const size_t used   = preempt_ram_used();
-        const size_t leaving = std::min(used, head.preempt_state_size());
-
-        return used - leaving + slot.preempt_state_required() <= budget;
     }
 
     // cells the slot will ask for on its next step once it is back in the pool
@@ -3240,8 +3236,8 @@ private:
             return; // no cache at all (an embedding model): nothing to run out of, nothing to park
         }
 
-        if (params_base.preempt_ram_mib == 0) {
-            return; // --preempt-ram 0: the KV-full retry ladder, as before
+        if (params_base.preempt_ram_mib == 0 || preempt_recurrent) {
+            return; // --preempt-ram 0, or a recurrent cache: the KV-full retry ladder, as before
         }
 
         const int32_t n_cells = n_ctx;
@@ -3343,8 +3339,9 @@ private:
                     const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
                     const int32_t need     = preempt_n_need(*head) + PREEMPT_N_MARGIN;
 
-                    server_slot * pick        = nullptr;
-                    bool          pick_enough = false;
+                    server_slot * pick           = nullptr;
+                    bool          pick_enough    = false;
+                    bool          budget_refused = false;
 
                     for (auto & slot : slots) {
                         if (slot.state != SLOT_STATE_GENERATING || slot.n_ctx_shift == 0) {
@@ -3355,7 +3352,13 @@ private:
                             continue;
                         }
 
-                        if (!preempt_fits_budget_for_rotation(slot, *head)) {
+                        // The head's own bytes are not credited as leaving: the resident is
+                        // parked before the head is restored and freed, so both states are
+                        // held at once, and the cap is a cap on what is held. A budget that
+                        // holds one sequence but not two does not rotate, and the head waits
+                        // for a resident to finish, which is said once per park below.
+                        if (!preempt_fits_budget(slot)) {
+                            budget_refused = true;
                             continue;
                         }
 
@@ -3368,6 +3371,13 @@ private:
                             pick        = &slot;
                             pick_enough = enough;
                         }
+                    }
+
+                    if (!pick && budget_refused && !head->preempt_rotation_refused) {
+                        head->preempt_rotation_refused = true;
+
+                        SLT_WRN(*head, "no rotation: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; the head waits for a resident to finish\n",
+                                params_base.preempt_ram_mib);
                     }
 
                     if (pick && pick->preempt_save()) {
@@ -4362,7 +4372,7 @@ private:
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
     bool preempt_last_resort_possible() const {
-        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && slots.size() >= 2 && llama_get_memory(ctx_tgt);
+        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
     bool preempt_last_resort(int32_t off) {
