@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -170,7 +171,10 @@ struct llama_context {
     void state_seq_copy_fence();
 
     // a transfer letting go of this context: the last one takes the fences with it
-    void state_seq_copy_release();
+    void state_seq_copy_release(llama_state_seq_copy * cpy);
+
+    // at teardown: wait for every live transfer and let it go
+    void state_seq_copies_drain();
 
     bool state_load_file(
             const char * filepath,
@@ -369,8 +373,9 @@ private:
     std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
 
     // transfers alive on this context; the fences go when the last one does, so a server
-    // that made transfers and then gave them up records nothing after its decodes
-    int32_t state_copy_live = 0;
+    // that made transfers and then gave them up records nothing after its decodes, and a
+    // context freed with transfers still alive drains them and lets them go first
+    std::set<llama_state_seq_copy *> state_copies;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
