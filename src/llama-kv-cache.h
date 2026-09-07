@@ -243,10 +243,7 @@ private:
     static constexpr uint32_t exact_page_size = 256;
     bool exact_pages = false;
 
-    // [TAG_EXACT_CONCURRENCY] which (sequence, logical page) owns each physical page; seq < 0 means
-    // free. Kept current as cells are placed and marked dirty by removals, so find_slot() and
-    // set_input_pages() read one entry per page instead of rebuilding from every live cell twice per
-    // ubatch. Mutable because set_input_pages() is const.
+    // [TAG_EXACT_CONCURRENCY] which (sequence, logical page) owns each physical page; seq < 0 means free, and it is kept current as cells are placed and dirtied by removals
     struct exact_page {
         llama_seq_id seq = -1;
         llama_pos    lpg = -1;
@@ -255,13 +252,10 @@ private:
     mutable std::vector<exact_page> exact_page_owner;
     mutable bool                    exact_page_owner_dirty = true;
 
-    // bring exact_page_owner up to date; rebuilds only when a removal marked it dirty
     void exact_pages_sync() const;
 
-    // recompute it from the live cells
     void exact_pages_rebuild() const;
 
-    // record that a cell of (seq, pos) now lives at physical cell idx
     void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
 
     bool v_trans = true;  // the value tensor is transposed

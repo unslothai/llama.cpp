@@ -474,10 +474,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
-        // [TAG_EXACT_CONCURRENCY] note: FLASH_ATTN_EXT with src[5], the page table, is deliberately
-        // still accepted. The CPU ignores it and attends in physical order, but it is also the
-        // reference test-backend-ops compares the paged CUDA kernel against, and that test's mask
-        // selects exactly the listed cells. A KV layer cannot reach the CPU under the mode anyway.
+        // [TAG_EXACT_CONCURRENCY] note: FLASH_ATTN_EXT with src[5], the page table, is deliberately still accepted: the CPU ignores it, but it is the reference test-backend-ops uses
         default:
             return true;
     }

@@ -1,14 +1,4 @@
-// [TAG_STATE_ASYNC] guards on the asynchronous per-sequence state transfer
-//
-// llama_state_seq_copy_get / _set take a size and a flags word from the caller and hand both
-// to an io object that validates everything else against them. The buffer belongs to the
-// transfer, so a size larger than it is refused rather than believed, and
-// LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused because these copies serialise through host
-// memory. This also checks that the buffer reports itself as page-locked only while it holds
-// memory that is.
-//
-// Skipped, not failed, on a backend that cannot copy asynchronously: there is no transfer to
-// make and the synchronous calls are what a caller uses there.
+// [TAG_STATE_ASYNC] guards on the asynchronous state transfer: the buffer belongs to the transfer, so an oversized size is refused, and ON_DEVICE is refused as these go via the host
 
 #include "arg.h"
 #include "common.h"
@@ -52,8 +42,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // put something in the cache to copy: two sequences interleaved, so the cells of each
-    // are a comb rather than one block, which is what the transfer is built for
+    // two sequences interleaved, so the cells of each are a comb rather than one block, which is what the transfer is built for
     std::vector<llama_token> tokens(60, 1);
 
     llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
@@ -100,28 +89,23 @@ int main(int argc, char ** argv) {
     CHECK(llama_state_seq_copy_get(cpy, size + 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_set(cpy, size + 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
 
-    // and so is an empty one, which cannot even hold the header
     CHECK(llama_state_seq_copy_get(cpy, 0, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_set(cpy, 0, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
 
-    // ON_DEVICE keeps the tensor data off the host, which is where these copies go
     CHECK(llama_state_seq_copy_get(cpy, size, seq_id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == 0);
     CHECK(llama_state_seq_copy_set(cpy, size, seq_id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == 0);
 
-    // none of that may have posted anything
     CHECK(llama_state_seq_copy_done(cpy));
 
     fprintf(stderr, "%s : oversized, empty and ON_DEVICE transfers are all refused\n", __func__);
 
-    // a transfer that fails part way, one byte short of the state, must post nothing: the
-    // caller is told it failed and is free to reuse the buffer at once
+    // a transfer that fails part way must post nothing: the caller is told it failed and is free to reuse the buffer at once
     CHECK(llama_state_seq_copy_get(cpy, size - 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_n_copies(cpy) == 0);
     CHECK(llama_state_seq_copy_done(cpy));
 
     fprintf(stderr, "%s : a transfer one byte short is refused and posts no copies\n", __func__);
 
-    // the same call at the size the transfer does own still works, and round-trips
     std::vector<uint8_t> before(llama_state_seq_get_size(ctx, seq_id));
     CHECK(llama_state_seq_get_data(ctx, before.data(), before.size(), seq_id) == before.size());
 
@@ -146,7 +130,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s : a transfer at the buffer's own size round-trips seq %d byte-for-byte\n",
             __func__, seq_id);
 
-    // giving the memory back leaves nothing page-locked to report
     llama_state_seq_copy_buf_free(cpy);
     CHECK(llama_state_seq_copy_buf_is_pinned(cpy) == false);
     CHECK(llama_state_seq_copy_buf_capacity(cpy) == 0);

@@ -1,6 +1,4 @@
-// Locate the first graph op whose sequence-0 output changes when the decode batch holds four
-// sequences instead of one. Seq 0's prompt KV is identical in both phases, so the only
-// difference is the width of the final decode ubatch.
+// Locate the first graph op whose sequence-0 output changes when the decode batch holds four sequences instead of one; seq 0's prompt KV is identical in both phases.
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -120,7 +118,6 @@ static llama_token greedy(llama_context * ctx, int32_t i, int n_vocab) {
     return best;
 }
 
-// feed a prompt as one decode call for one sequence, return the greedy next token
 static llama_token feed(llama_context * ctx, const std::vector<llama_token> & p, llama_seq_id seq, int n_vocab) {
     batch_holder h;
     for (size_t i = 0; i < p.size(); ++i) {
@@ -167,12 +164,9 @@ int main(int argc, char ** argv) {
     std::vector<node_rec> rec_a, rec_b;
     llama_token first_tok[4] = {0, 0, 0, 0};
 
-    // phase A: decode ubatch width 1. PROBE_A_FILL is how many sequences are already in the
-    // shared KV cache, which sets K->ne[1] for attention.
+    // phase A: decode ubatch width 1. PROBE_A_FILL is how many sequences are already in the shared KV cache, which sets K->ne[1].
     const int a_fill = getenv("PROBE_A_FILL") ? atoi(getenv("PROBE_A_FILL")) : 1;
-    // PROBE_A_PERM reorders which prompt goes into which sequence in phase A, keeping the cache
-    // length but changing what the masked cells hold. It may only move the neighbours: sequence 0
-    // keeps prompt 0, or the two phases would compare different sequences.
+    // PROBE_A_PERM reorders which prompt goes into which sequence in phase A; it may only move the neighbours, since sequence 0 must keep prompt 0
     int a_perm[4] = {0, 1, 2, 3};
     if (const char * perm = getenv("PROBE_A_PERM")) {
         for (int k = 0; k < 4 && perm[2*k]; ++k) a_perm[k] = perm[2*k] - '0';
@@ -195,7 +189,6 @@ int main(int argc, char ** argv) {
         llama_free(ctx);
     }
 
-    // phase B: same seq-0 prompt KV, then a decode ubatch holding n_seqs tokens
     {
         llama_context * ctx = make_ctx();
         if (prefill) {
@@ -238,7 +231,6 @@ int main(int argc, char ** argv) {
         llama_free(ctx);
     }
 
-    // optional: keep decoding and report the first step at which seq 0's token differs
     const int n_steps = getenv("PROBE_STEPS") ? atoi(getenv("PROBE_STEPS")) : 0;
     int first_bad_step = -1;
     if (n_steps > 0) {
@@ -277,7 +269,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "nodes: A=%zu B=%zu  first tokens: %d %d %d %d\n",
             rec_a.size(), rec_b.size(), first_tok[0], first_tok[1], first_tok[2], first_tok[3]);
 
-    // walk both node lists in order and compare seq 0's slice
     FILE * out = out_path ? fopen(out_path, "w") : stdout;
     fprintf(out, "{\"n_seqs\":%d,\"first_bad_step\":%d,\"nodes_a\":%zu,\"nodes_b\":%zu,\"diffs\":[", n_seqs, first_bad_step, rec_a.size(), rec_b.size());
     size_t n = rec_a.size() < rec_b.size() ? rec_a.size() : rec_b.size();
@@ -293,8 +284,7 @@ int main(int argc, char ** argv) {
             verdict = "misaligned";
         } else if (A.op == "GATED_DELTA_NET" && A.gdn_tokens == B.gdn_tokens &&
                 !A.data.empty() && !B.data.empty()) {
-            // packed GDN outputs put all token outputs before all sequence states, so seq 0's
-            // state moves when the number of sequences changes
+            // packed GDN outputs put all token outputs before all sequence states, so seq 0's state moves when the number of sequences changes
             const size_t output = A.ne[0]*A.gdn_tokens;
             const size_t state = A.ne[0]*A.ne[1]/A.gdn_seqs - output;
             for (size_t k = 0; k < output + state; ++k) {
@@ -325,7 +315,6 @@ int main(int argc, char ** argv) {
             } else if (A.data.empty() || B.data.empty()) {
                 verdict = "too-large";
             } else {
-                // compare element (.., i_tdim = 0, ..) across all other indices
                 int64_t st[4] = {1, A.ne[0], A.ne[0]*A.ne[1], A.ne[0]*A.ne[1]*A.ne[2]};
                 int64_t stb[4] = {1, B.ne[0], B.ne[0]*B.ne[1], B.ne[0]*B.ne[1]*B.ne[2]};
                 for (int64_t i3 = 0; i3 < A.ne[3]; ++i3)

@@ -27,11 +27,7 @@
 
 // dedup helpers
 
-// [TAG_EXACT_CONCURRENCY] the page table is wired into llm_graph_input_attn_kv only, so a V-less
-// layout would have its cells placed in pages and then attend in physical order anyway, with the
-// mode reporting itself as on. Refuse the context instead: wiring self_pages into
-// llm_graph_input_attn_k alone fixes one of the four V-less classes, and DeepSeek 3.2 uses two of
-// them, so the model would end up half paged, which is worse than refused.
+// [TAG_EXACT_CONCURRENCY] the page table is wired into llm_graph_input_attn_kv only, so a V-less layout would attend in physical order with the mode reporting itself on
 static void llm_graph_reject_exact_concurrency(const char * layout) {
     if (!llama_exact_concurrency()) {
         return;

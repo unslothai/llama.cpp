@@ -94,11 +94,8 @@ def nonblank(lines: list[str]) -> list[str]:
     return [ln.strip() for ln in lines if ln.strip()]
 
 
-# A line that only opens or closes a block. Two independent case arms share these by
-# construction, so finding them on both sides says nothing about the two sides adding the
-# same construct: treating them as shared is what refused the real PROJECTOR_TYPE_KIMIK3 /
-# PROJECTOR_TYPE_DEEPSEEK4V add/add in tools/mtmd/clip.cpp. Deliberately narrow: brackets,
-# semicolons and commas around at most one bare block-terminating keyword.
+# a line that only opens or closes a block. Two independent case arms share these by construction, so
+# treating them as shared refused the real PROJECTOR_TYPE_KIMIK3 / _DEEPSEEK4V add/add in tools/mtmd/clip.cpp.
 STRUCTURAL = re.compile(r"^[\s{}()\[\];,]*(?:break|continue|return|pass)?[\s{}()\[\];,]*$")
 
 
@@ -107,7 +104,6 @@ def identifying(lines: list[str]) -> set[str]:
     return {ln for ln in nonblank(lines) if not STRUCTURAL.match(ln)}
 
 
-# `case FOO:`, `case FOO :`, `default:`; a fallthrough label may carry no body at all
 CASE_LABEL = re.compile(r"^(?:case\s+[^:]+|default\s*):")
 
 
@@ -139,23 +135,17 @@ def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[
         return list(ours)
     ours_arms, theirs_arms = case_arms(ours), case_arms(theirs)
     if ours_arms and theirs_arms and ours_arms.isdisjoint(theirs_arms):
-        # Both sides added case arms and no label is on both, so they are two constructs
-        # and any line they share is body text: the real clip.cpp collision has arms that
-        # both set `hparams.rope_theta = 10000.0f;`. The same change made twice would keep
-        # its label and land in the check below, so this is the one place a shared line is
-        # allowed - a duplicated label would not even compile.
+        # both sides added case arms and no label is on both, so any line they share is body text; the same change made twice would keep its label, so sharing is allowed only here
         return list(theirs) + list(ours)
     shared = identifying(ours) & identifying(theirs)
     if shared:
         # Overlapping content is the signature of one construct added twice,
         # not two independent additions. Unioning it would duplicate code.
-        # scaffolding is excluded above, so what is left is content both sides wrote
         raise Unresolvable(
             "both sides add the same line(s), so this is one change made twice: "
             + ", ".join(sorted(shared)[:3])
         )
     if not identifying(ours) or not identifying(theirs):
-        # one side is all scaffolding, so there is no content to tell the additions apart
         raise Unresolvable(
             "one side adds only block scaffolding, so the two additions cannot "
             "be told apart"

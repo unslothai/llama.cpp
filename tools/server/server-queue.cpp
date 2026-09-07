@@ -448,16 +448,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
-    // [TAG_PREEMPT] The timeout is a deadline, not a per-wait duration.
-    //
-    // send() notify_all()s on one condition variable for every result of every task, so a
-    // reader waiting on a task that is producing nothing is woken by every token every other
-    // task produces. With wait_for() each of those wakeups restarted the wait, and on a busy
-    // server the timeout was never reached at all: whoever was waiting for a quiet task
-    // waited forever, however small the timeout they asked for. That is exactly the
-    // situation of a parked slot, which by definition exists because the others are busy, so
-    // neither its 2 s keepalive nor the ordinary --sse-ping could ever fire for it. Waiting
-    // until a fixed point instead makes the timeout mean what every caller reads it as.
+    // [TAG_PREEMPT] the timeout is a deadline, not a per-wait duration: send() notify_all()s for every result of every task, and with wait_for() each wakeup restarted the wait
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
 
     while (true) {

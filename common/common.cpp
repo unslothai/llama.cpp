@@ -1290,9 +1290,7 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure
-    // the explicit bound does not cover; this also covers a caller that skipped
-    // common_params_parse(). On failure nothing is loaded.
+    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure the explicit bound does not cover
     if (!model_only && !common_exact_concurrency_init(params)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
         return;
@@ -1456,8 +1454,6 @@ bool common_exact_concurrency() {
 int common_exact_decode_width(const common_params & params) {
     const int64_t n_slots = std::max(1, params.n_parallel);
 
-    // draft tokens a slot carries into the verify ubatch, from the same place the speculation
-    // code takes its own width
     const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
 
     // the product is handed to a backend as an int; one that overflows is reported, not wrapped
@@ -1472,8 +1468,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         return true;
     }
 
-    // DFlash drafting turns causal attention off on its draft context, which the paged attention
-    // needs; say so instead of asserting in the graph. DSpark is the same implementation.
+    // DFlash drafting turns causal attention off on its draft context, which the paged attention needs; say so instead of asserting in the graph. DSpark is the same.
     for (const auto type : params.speculative.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
             COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
@@ -1502,9 +1497,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step
-    // is. A context created later reports n_seq_max times that, which is n_cols again; reporting
-    // n_cols here too covers a caller that decodes first, or contexts it created earlier.
+    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is; this also covers a caller that decodes before creating a context
     if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
         !llama_set_exact_decode_width((uint32_t) n_cols)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");

@@ -392,10 +392,7 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic_stream();
 };
 
-// [TAG_PREEMPT] out-of-band notice for a streaming task whose slot was parked or restored.
-// Serialised as an SSE comment (": preempted", ": resumed"), which every existing client
-// ignores, so the body of the response is unchanged by preemption. Never sent to a
-// non-streaming task.
+// [TAG_PREEMPT] out-of-band notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") every existing client ignores
 struct server_task_result_preempt_notice : server_task_result {
     bool    parked    = false; // true when the slot was just parked, false when restored
     int32_t n_preempt = 0;     // how many times this task has been parked so far

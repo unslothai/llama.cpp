@@ -5,8 +5,7 @@ import argparse, json, os, signal, subprocess, sys, threading, time, urllib.requ
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import PROMPTS
 
-# recorded with every run; LLAMA_EXACT_CONCURRENCY inherited from the shell decides whether a run
-# labelled as the mode-off reference actually was one, so it is not optional
+# recorded with every run: LLAMA_EXACT_CONCURRENCY inherited from the shell decides whether a reference run really was one
 RECORDED_ENV = ("LLAMA_EXACT_CONCURRENCY", "GGML_CUDA_BATCH_INVARIANT",
                 "GGML_CUDA_BATCH_INVARIANT_MAX_COLS", "LLAMA_SERVER_PREEMPT_EVERY",
                 "LLAMA_KV_CACHE_DEBUG", "LLAMA_BATCH_DEBUG", "CUDA_VISIBLE_DEVICES")
@@ -60,7 +59,6 @@ class Server:
         self.env = dict(os.environ)
         self.env["CUDA_VISIBLE_DEVICES"] = "3"
         self.env.update(env_extra)
-        # what the server will actually see, not what this run meant to set
         self.env_resolved = {k: self.env[k] for k in RECORDED_ENV if k in self.env}
         self.p = None
         self.fh = None
@@ -86,8 +84,6 @@ class Server:
                     time.sleep(1.0)
             raise RuntimeError("server did not become healthy")
         except BaseException:
-            # __exit__ is not called when __enter__ raises, and a server that started but never
-            # reported healthy would keep the GPU, the port and the log handle
             self.__exit__(None, None, None)
             raise
 
@@ -189,7 +185,6 @@ def main():
         res["reference"] = a.reference
         res["solo"] = {"n_tokens": len(ref), "tok_per_s": solo["timings"]["predicted_per_second"],
                        "text_sha": None}
-        # solo repeat, to prove solo itself is stable
         solo2 = completion(a.port, PROMPTS["P0"], a.n_predict)
         res["solo_repeat_first_diff"] = first_diff(ref, solo2["tokens"])
         res["rounds"] = []

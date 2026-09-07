@@ -247,8 +247,7 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    // in the paged specialization KV_max carries [count, physical page IDs...] per query; the loop
-    // and each warp's recurrence follow logical positions, never physical addresses
+    // in the paged specialization KV_max carries [count, physical page IDs...] per query; the loop and each warp's recurrence follow logical positions, never physical addresses
     static_assert(!paged || ncols == 1, "paged attention has one query per block");
     const int * pages = paged ? KV_max + (sequence*int(ne01.z) + ic0)*(1 + ne11/FATTN_KQ_STRIDE) : nullptr;
     const int k_VKQ_max = paged ? pages[0]*FATTN_KQ_STRIDE : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);

@@ -6,11 +6,7 @@ import pytest
 import requests
 from utils import *
 
-# [TAG_PREEMPT] A streaming client is told when its slot is parked and when it is
-# restored, as SSE comments, and the body is byte for byte what it is without any park.
-# Comments are legal SSE that every existing client ignores; a client that knows about
-# preemption can show "paused" instead of a dead stream, and a keepalive every 2 s while
-# parked keeps proxies and read timeouts from giving up on a wait that is by design long.
+# [TAG_PREEMPT] a streaming client is told when its slot is parked and restored, as SSE comments every existing client ignores; a keepalive every 2 s keeps proxies from giving up
 
 server = ServerPreset.tinyllama2()
 
@@ -102,11 +98,8 @@ def test_a_stream_announces_its_parks_and_the_body_is_unchanged():
     resumed = [c for c in comments if c == ": resumed"]
     assert len(parked) >= 6, comments
     assert len(resumed) == len(parked), comments
-    # Every park is followed by its resume before the next park.
     seq = [c for c in comments if c in (": preempted", ": resumed")]
     assert seq == [": preempted", ": resumed"] * len(parked), seq
-    # The generated text is byte for byte the unparked text, token by token. Only the
-    # final chunk's wall-clock timings differ between the two runs.
     def _pieces(ds):
         return [json.loads(d).get("content") for d in ds if d != "[DONE]"]
 
@@ -145,9 +138,6 @@ def test_non_streaming_requests_see_nothing():
 
 
 def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
-    # The pair from test_preempt: each alone fits, together they do not, so one is
-    # parked until the other finishes. The parked stream must carry the comments and
-    # finish with its full output.
     global server
     server.n_ctx = 256
     server.start()
@@ -171,13 +161,8 @@ def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
 
 
 def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
-    # A request parked while still processing its prompt has no token to send yet. The
-    # response must not wait for one: it starts with the notice, so the client sees
-    # "paused" and gets the keepalive at once, instead of a silent connection that only
-    # opens when the slot resumes.
+    # A request parked while still processing its prompt has no token to send yet, so the response starts with the notice instead of a silent connection.
     global server
-    # The resident keeps growing towards the whole pool; the newcomer's prompt is larger
-    # than what is free beside it, so the planner parks the newcomer before it has a token.
     global server
     server.n_ctx = 512
     server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once
@@ -210,8 +195,6 @@ def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
 
     second_lines = [(ts, line) for ts, name, line in timeline if name == "second"]
     first_end = max(ts for ts, name, _ in timeline if name == "first")
-    # The notice is the very first thing on the wire, and it arrives while the other
-    # stream is still running, not when it has finished and the parked slot resumes.
     assert second_lines[0][1] == ": preempted", second_lines[:3]
     assert second_lines[0][0] < first_end
     events = [line for _, line in second_lines if line in (": preempted", ": resumed") or line.startswith("data: ")]
@@ -223,10 +206,6 @@ def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
 
 
 def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
-    # The rotation from test_preempt: a resident cycling through context shifts holds the
-    # pool, and after the head has waited its turn the resident is parked in its place.
-    # That park is a park like any other, so its stream must say so, and every notice
-    # must be paired: no stream ends with a park it was never told about.
     global server
     server.n_ctx = 256
     server.enable_ctx_shift = True
@@ -245,16 +224,11 @@ def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
         seq = [c for c in comments if c in (": preempted", ": resumed")]
         assert seq == [": preempted", ": resumed"] * (len(seq) // 2), seq
         n_parked += len(seq) // 2
-    # Both streams took turns: at least one park each, so at least two in all.
     assert n_parked >= 2, [r[0] for r in results]
 
 
 def test_an_oversized_prompt_is_errored_instead_of_parked():
-    # A slot that has just been given a task has not passed the prompt checks yet: they
-    # run on its first pass through update_slots. Parked before that, it would be told
-    # ": preempted" first, and the notice opens the stream, so a prompt larger than the
-    # context would come back as 200 plus an in-stream error instead of the plain error
-    # response it gets with nothing running. The planner leaves such a slot alone.
+    # A slot just given a task has not passed the prompt checks yet, and a notice opens the stream, so parking it would turn a plain error response into 200 plus an in-stream one.
     global server
     server.n_ctx = 512
     server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once

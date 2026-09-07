@@ -114,7 +114,6 @@ check("independent case arms keep both bodies once",
       txt.count("} break;") == 2 and txt.count("clip_graph_kimik3") == 1, txt)
 
 # --- 3b2. two case arms that share a body line, which is a coincidence ------
-# clip.cpp after upstream landed DEEPSEEK4V: both arms set the same rope_theta
 base = "switch (t) {\n}\n"
 ours = ("switch (t) {\n    case PROJECTOR_TYPE_KIMIK3:\n        {\n"
         "            hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;\n"

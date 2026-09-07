@@ -5,9 +5,7 @@ import tempfile
 import pytest
 from utils import *
 
-# Preemption on a unified KV pool: when the next decode does not fit, one slot is parked (its
-# sequence copied to host RAM, its cells released) instead of every slot being terminated. Needs
-# more than one slot and --kv-unified, the only configuration where slots share cells.
+# Preemption on a unified KV pool: one slot is parked, its sequence copied to host RAM and its cells released, instead of every slot being terminated. Needs --kv-unified.
 
 server = ServerPreset.tinyllama2()
 
@@ -57,8 +55,7 @@ def _complete(n_predict: int, prompt: str = "Hi how are you"):
 
 
 def test_forced_preemption_does_not_change_the_output():
-    # park and restore the only running slot every 8 tokens: the batch shape is the same at every
-    # step, so any difference in the output is the preemption's fault
+    # park and restore the only running slot every 8 tokens: the batch shape is the same at every step, so any difference in the output is the preemption's fault
     global server
     server.n_ctx = 512
     server.start()
@@ -85,9 +82,7 @@ def test_forced_preemption_does_not_change_the_output():
 
 
 def test_two_slots_that_overflow_the_pool_together_both_finish():
-    # each request fits the pool alone (168 of 256 cells) but not together (336). Without
-    # preemption both end with "Context size has been exceeded"; with it the smaller is parked
-    # until the leader finishes, then resumes from the token it was parked on.
+    # each request fits the pool alone (168 of 256 cells) but not together; without preemption both end with "Context size has been exceeded"
     global server
     server.n_ctx = 256
     server.start()
@@ -112,11 +107,7 @@ def test_two_slots_that_overflow_the_pool_together_both_finish():
 
 
 def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
-    # a pool that allocates in blocks gives a whole block to one sequence, so n tokens occupy
-    # round_up(n, block) cells and the planner has to count cells: counting tokens it sees room
-    # the allocator cannot find, never parks anybody, and the retry ladder ends every request.
-    # LLAMA_SERVER_PREEMPT_GRANULARITY injects the block size, since the only mode that reports
-    # one needs a head size this model does not have; the arithmetic is the same at 64 as at 256.
+    # a block allocator gives a whole block to one sequence, so the planner has to count cells: counting tokens it sees room the allocator cannot find. GRANULARITY injects the size.
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
@@ -135,8 +126,6 @@ def test_the_planner_counts_whole_pages_when_the_pool_allocates_in_pages():
     assert "preempted:" in text
     assert "resumed after" in text
 
-    # every figure the planner logs is a whole number of blocks: "kv N/256" is what the pool holds
-    # and "(wanted N)" is that plus the next decode's reservation
     held   = [int(n) for n in re.findall(r"kv (\d+)/256", text)]
     wanted = [int(n) for n in re.findall(r"\(wanted (\d+)\)", text)]
     assert held and wanted, f"the planner logged no figures:\n{text}"
@@ -170,14 +159,11 @@ def _prompt_of_about(n_tokens: int, salt: str = "") -> tuple[str, int]:
         if n <= n_tokens:
             assert n >= n_tokens - 12, f"could not land near {n_tokens} tokens, got {n}"
             return text, n
-        # about four tokens per word on this model's vocabulary
         words = words[: len(words) - max(1, (n - n_tokens) // 8)]
     raise AssertionError("empty prompt")
 
 
 def test_two_prompts_that_overflow_the_pool_together_both_finish():
-    # neither slot generates before the pool is full: a slot between two chunks of its prompt is
-    # as clean a boundary as one between two sampled tokens, so it is parked the same way
     global server
     server.n_ctx = 256
     server.start()
@@ -206,17 +192,13 @@ def test_two_prompts_that_overflow_the_pool_together_both_finish():
 
 
 def test_a_generating_slot_and_a_large_prompt_both_finish():
-    # a slot generating a long answer to a short prompt meets a large prompt arriving beside it,
-    # needing far more than the pool has: the prompt is admitted chunk by chunk, whoever is
-    # smaller is parked, and both finish. The second request follows immediately, since its
-    # prompt takes several batches and that is enough overlap however fast the first one runs.
+    # a long generation meets a large prompt arriving beside it: the prompt is admitted chunk by chunk, whoever is smaller is parked, and both finish
     global server
     server.n_ctx = 256
     server.start()
     log = LogReader(server.log_path)
 
     prompt_b, n_b = _prompt_of_about(150, "Charlie")
-    # b has to live long enough for the two to collide
     n_predict_a = 230
     n_predict_b = 90
     assert 8 + n_predict_a <= 256 and n_b + n_predict_b <= 256
@@ -242,8 +224,7 @@ def test_a_generating_slot_and_a_large_prompt_both_finish():
 
 
 def test_preempt_ram_zero_disables_preemption():
-    # --preempt-ram 0 switches back to the old behaviour: nothing is parked and the KV-full path
-    # ends the requests the way it always did
+    # --preempt-ram 0 switches back to the old behaviour: nothing is parked and the KV-full path ends the requests
     global server
     server.n_ctx = 256
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
@@ -263,8 +244,6 @@ def test_preempt_ram_zero_disables_preemption():
 
 
 def test_metrics_and_slots_report_the_parked_state():
-    # /slots tells a parked chat from a slow one and /metrics reports it to an operator; both
-    # must show the preemption, and the counters must survive the requests finishing
     global server
     server.n_ctx = 256
     server.server_metrics = True
@@ -301,11 +280,7 @@ def test_metrics_and_slots_report_the_parked_state():
     assert sum(slot["n_preempt"] for slot in res.body) == 0, "n_preempt is per task and resets with the slot"
 
 
-# [TAG_PREEMPT_ASYNC] parking and resuming on a stream of their own
-#
-# The copies are only asynchronous on a backend that can copy asynchronously and signal an
-# event, which today means a GPU one. On a CPU-only build the server says so and falls back
-# to the synchronous path, and the tests below that need the asynchronous one skip.
+# [TAG_PREEMPT_ASYNC] parking and resuming on a stream of their own, only on a backend that can copy asynchronously and signal an event; a CPU-only build falls back and these skip
 
 _ASYNC_BANNER = "parking and resuming asynchronously"
 
@@ -326,10 +301,7 @@ def _require_async(text: str):
 
 
 def test_async_preemption_does_not_change_the_output():
-    # The same question the synchronous determinism test asks, of the asynchronous path:
-    # with one request the batch has the same shape at every step, so a continuation that
-    # was parked and resumed through a transfer and is not byte-identical to an
-    # uninterrupted one is the transfer's fault and nothing else's.
+    # the synchronous determinism question asked of the asynchronous path: with one request the batch shape is fixed, so a continuation that is not byte-identical is the transfer's fault
     global server
     server.n_ctx = 512
     server.n_gpu_layer = 99
@@ -351,8 +323,6 @@ def test_async_preemption_does_not_change_the_output():
     _require_async(text)
     assert text.count("preempted on request") >= 6
     assert text.count("resumed after") >= 6
-    # the asynchronous path is the one that ran, not the synchronous fallback: only it
-    # splits a park and a resume into an issue and a completion
     assert "park completed after" in text
     assert "restore issued in" in text
     assert "restore completed after" in text
@@ -362,9 +332,6 @@ def test_async_preemption_does_not_change_the_output():
 
 
 def test_async_preemption_under_load_keeps_every_slot_and_its_output():
-    # Two requests that do not fit the pool together, parked and resumed asynchronously
-    # while the other one keeps decoding. Every slot must finish, and finish with exactly
-    # the tokens it produces when it has the pool to itself.
     global server
     server.n_ctx = 256
     server.n_gpu_layer = 99
@@ -377,7 +344,6 @@ def test_async_preemption_under_load_keeps_every_slot_and_its_output():
         "The quick brown fox jumps over the lazy dog and",
     ]
 
-    # each one alone, for the reference tokens
     alone = [_complete(n_predict, prompt) for prompt in prompts]
     for res in alone:
         assert res.status_code == 200
@@ -415,16 +381,10 @@ def _cancel_soon(n_predict: int, prompt: str, timeout: float):
 
 
 def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
-    # A cancelled request can reach release() with a park or a resume still running, which
-    # is where the host buffer is freed and the cells are handed on. Both have to wait for
-    # the copy first. LLAMA_SERVER_PREEMPT_EVERY keeps every slot cycling between the two
-    # states, so cancelling at a spread of moments lands in both; what is asserted is that
-    # the server survives it, the slots come back, and it still answers correctly.
+    # a cancelled request can reach release() with a park or a resume still running, where the host buffer is freed and the cells handed on, so both have to wait for the copy
     global server
     server.n_ctx = 512
     server.n_gpu_layer = 99
-    # every 8 tokens, so a slot spends most of its life in one of the two copy states, but
-    # not so often that the abandoned requests take minutes to drain
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     text = _start_async()
     _require_async(text)
@@ -432,7 +392,6 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
     for i in range(4):
         _cancel_soon(96, "Once upon a time there was a brave knight who", 0.05 + 0.1 * i)
 
-    # every slot back, and none of them still holding a parked sequence
     deadline = time.time() + 120
     while time.time() < deadline:
         res = server.make_request("GET", "/slots")
@@ -452,7 +411,6 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
             if line.startswith("llamacpp:preempt_ram_bytes"):
                 assert float(line.split(" ", 1)[1]) == 0, "a cancelled slot kept its parked memory"
 
-    # and the server still works
     res = _complete(16)
     assert res.status_code == 200
     assert res.body["timings"]["predicted_n"] == 16
@@ -475,24 +433,12 @@ def test_no_preempt_async_falls_back_to_the_synchronous_path():
     assert _ASYNC_BANNER not in text
     assert "park issued in" not in text
     assert "restore issued in" not in text
-    # the synchronous path still parks and resumes
     assert text.count("preempted on request") >= 6
     assert text.count("resumed after") >= 6
 
 
 def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everything():
-    # [TAG_PREEMPT_ASYNC] The case the async path made worse than the synchronous one, and
-    # that the existing tests miss because their victim holds almost no cells.
-    #
-    # Three slots are well into generating when a fourth request arrives whose prompt does
-    # not fit in what is left. update_preemption() picks a victim and issues its park, but
-    # an asynchronous park does not return the cells before update_slots() carries on. If
-    # the loop leaves at that point, the batch is built into a pool that has not got any
-    # smaller, llama_decode returns 1, and the retry ladder halves n_batch to 1 in
-    # microseconds without ever polling the copy -- ending every request with "Context size
-    # has been exceeded" while the room it wanted was one event query away.
-    #
-    # Pass is what the synchronous path gave: a park, and all four requests finish.
+    # [TAG_PREEMPT_ASYNC] the case the async path made worse than the synchronous one: an asynchronous park does not return the cells before update_slots() carries on
     global server
     server.n_ctx = 512
     server.n_gpu_layer = 99
@@ -505,17 +451,12 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
     prompt_c, n_c = _prompt_of_about(100, "Charlie")
     prompt_d, n_d = _prompt_of_about(150, "Delta")
 
-    # A, B and C oversubscribe the pool between them, so the pressure does not depend on
-    # when D arrives, and every occupant is holding real cells rather than the handful the
-    # other tests park. Each of the four still fits on its own.
     n_predict_abc = 130
     n_predict_d = 40
     assert max(n_a, n_b, n_c) + n_predict_abc < 512 and n_d + n_predict_d < 512
     assert n_a + n_b + n_c + 3 * n_predict_abc > 512
 
     def _late(n_predict, prompt):
-        # D's prompt arrives into a pool the other three have already grown into; this
-        # model decodes about 120 tokens a second, so they are all still running
         time.sleep(0.25)
         return _complete(n_predict, prompt)
 
@@ -538,17 +479,13 @@ def test_a_prompt_arriving_into_a_nearly_full_pool_parks_rather_than_ends_everyt
 
 
 def test_two_prompts_near_the_context_size_both_complete():
-    # two prompts that each fit the context alone but not together. The second is parked before
-    # it takes any cells and is too close to n_ctx to leave the usual margin, but must still be
-    # restored once the first finishes: with nothing resident there is nobody to keep it for.
+    # the second prompt is parked before it takes any cells and is too close to n_ctx to leave the usual margin, but must still be restored once the first finishes
     global server
     server.n_ctx = 256
-    # the whole prompt in one batch, so the parked slot's first step is the whole prompt
     server.n_batch = 256
     server.start()
     log = LogReader(server.log_path)
 
-    # sized in tokens, not words: the prompt is the token ids of a short sentence repeated
     base = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there was a little girl"}).body["tokens"]
     long_prompt = (base * 64)[:240]
     n_predict = 4
@@ -563,9 +500,6 @@ def test_two_prompts_near_the_context_size_both_complete():
 
 
 def test_the_last_resort_parks_instead_of_ending_everyone():
-    # with the planner off, two generations that fit alone but not together fill the pool until a
-    # single token finds no cell, where upstream ends every slot with the context error. Instead
-    # the batch is given up, the smaller slot is parked, and both finish.
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -594,8 +528,7 @@ def test_the_last_resort_parks_instead_of_ending_everyone():
 
 
 def test_the_last_resort_works_with_an_unlimited_budget():
-    # --preempt-ram -1 is the documented unlimited setting; it must enable the last resort
-    # the same as any positive budget does
+    # --preempt-ram -1 is the documented unlimited setting and must enable the last resort too
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -619,8 +552,7 @@ def test_the_last_resort_works_with_an_unlimited_budget():
 
 
 def test_the_last_resort_rewinds_a_prompt_in_flight():
-    # same, with a prompt being processed when the pool runs out: the failed chunk comes back off
-    # the slot's tokens and is processed again after the resume, neither skipped nor fed twice
+    # the failed chunk comes back off the slot's tokens and is processed again after the resume, neither skipped nor fed twice
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -650,16 +582,12 @@ def test_the_last_resort_rewinds_a_prompt_in_flight():
     assert results[0].body["timings"]["predicted_n"] == n_predict_a
     assert results[1].status_code == 200
     assert results[1].body["timings"]["predicted_n"] == n_predict_b
-    # the chunk that was in the batch given up is processed once, after the rewind, and
-    # the count is the prompt plus the BOS the server adds
+    # the chunk in the batch given up is processed once after the rewind; the count is the prompt plus the BOS the server adds
     assert results[1].body["timings"]["prompt_n"] == n_b + 1
 
 
 def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_head():
-    # two generations that each outgrow the pool, with context shift on: the resident shifts and
-    # would hold half the pool for as long as it generates, while the parked one never fits
-    # beside it. After the head has waited its turn the resident is parked in its place and the
-    # two take turns. n_predict is large enough that the resident is still going by then.
+    # with context shift on the resident would hold half the pool for as long as it generates, so once the head has waited its turn the resident is parked and the two take turns
     global server
     server.n_ctx = 256
     server.enable_ctx_shift = True
@@ -683,8 +611,6 @@ def test_a_resident_cycling_through_context_shifts_takes_turns_with_a_parked_hea
 
 
 def test_the_rotation_parks_a_resident_that_lets_the_head_in():
-    # three endless generations with context shift on: two residents cycle through shifts while
-    # the third waits parked, and every rotation must let the head in so no stream ends short
     global server
     server.n_slots = 3
     server.n_ctx = 384
@@ -710,9 +636,7 @@ def test_the_rotation_parks_a_resident_that_lets_the_head_in():
 
 
 def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_server_lives():
-    # a two-completion request is one conversation in two slots, and a family member is not a
-    # victim for the other, so with nobody else to park it gets the context error it would get
-    # alone and the server carries on serving
+    # a family member is not a victim for the other, so a two-completion request gets the context error it would get alone and the server carries on
     global server
     server.n_ctx = 256
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -741,15 +665,8 @@ def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_
 
 
 def test_a_restored_slot_gives_its_idle_buffer_back_when_another_slot_needs_to_park():
-    # Under a finite --preempt-ram an asynchronous slot keeps its pinned buffer after a
-    # restore, for its next park, and that idle capacity counted against the budget. With
-    # a budget that holds one sequence, the first restore spent it for good: every later
-    # park of the other slot was refused. The idle buffer is given back when another slot
-    # needs the room, and both slots go on being parked.
+    # an asynchronous slot keeps its pinned buffer after a restore, and that idle capacity counts against --preempt-ram: unless it is given back, the first restore spends the budget
     global server
-    # a pool of 8192 cells, but the model's own window is 2048, so each generation stays
-    # under that; 1800 tokens of this model's state is about 1.1 MiB, so a budget of
-    # 2 MiB holds one sequence and not two
     server.n_ctx = 8192
     server.n_gpu_layer = 99
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "256"
@@ -778,21 +695,13 @@ def test_a_restored_slot_gives_its_idle_buffer_back_when_another_slot_needs_to_p
 
 
 def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_when_a_resident_finishes():
-    # Three generations with no end in a pool one of them fills, with context shift on,
-    # under a --preempt-ram that holds the two parked heads but not a head and the resident
-    # at once. The resident is parked before the head is restored and freed, so a rotation
-    # holds both states together: under this budget the first one asked for is refused and
-    # said so, and the heads come back when the resident finishes instead. Every stream
-    # still finishes its tokens and nothing gets the context error.
+    # a rotation holds both states at once, since the resident is parked before the head is restored and freed, so a budget for two heads but not a head plus the resident must refuse
     global server
     server.n_slots = 3
     server.n_ctx = 2048
     server.enable_ctx_shift = True
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
     server.start()
-    # long enough that the resident is still cycling through shifts two seconds after the
-    # heads were parked, which is when a rotation is first asked for: at 6000 this model
-    # finished in under three seconds on a fast host and nothing was ever refused
     n_predict = 12000
     prompts = [
         "Once upon a time there was a brave knight who",
@@ -814,9 +723,7 @@ def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_w
 
 
 def test_a_recurrent_model_is_served_without_preemption():
-    # A recurrent cache holds one state per sequence whatever its length, so the token
-    # count the planner measures says nothing about it: preemption is off for such a
-    # model, said so at load, and the forced-park knob parks nothing.
+    # a recurrent cache holds one state per sequence whatever its length, so preemption is off for such a model and the forced-park knob parks nothing
     global server
     path = os.environ.get("LLAMA_SERVER_TEST_RECURRENT_MODEL")
     if path:

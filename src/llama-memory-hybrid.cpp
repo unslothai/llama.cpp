@@ -93,10 +93,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                // [TAG_EXACT_CONCURRENCY] the recurrent half is not invariant to the ubatch shape:
-                // a prompt processed next to other prompts leaves a different gated delta net state,
-                // so it gets a ubatch of its own while plain decode steps stay batched. Passed
-                // whenever the mode is on, since it also keeps sets of unequal token counts apart.
+                // [TAG_EXACT_CONCURRENCY] the recurrent half is not invariant to the ubatch shape, so a prompt gets a ubatch of its own
                 const uint32_t isolate = llama_exact_concurrency() ? llama_exact_decode_tokens() : 0;
 
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
@@ -149,8 +146,7 @@ bool llama_memory_hybrid::get_can_shift() const {
 }
 
 uint32_t llama_memory_hybrid::alloc_granularity() const {
-    // the recurrent half holds one state per sequence, so the attention half is the one whose
-    // cells a caller is planning capacity for
+    // the recurrent half holds one state per sequence, so the attention half is the one whose cells a caller is planning capacity for
     return mem_attn->alloc_granularity();
 }
 
@@ -169,8 +165,7 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    // [TAG_EXACT_CONCURRENCY] the attention half refuses this, so refuse before either half is
-    // touched or the two could end up describing different states
+    // [TAG_EXACT_CONCURRENCY] the attention half refuses this, so refuse before either half is touched or the two could end up describing different states
     if (llama_exact_concurrency() && seq_id_src != seq_id_dst) {
         LLAMA_LOG_ERROR("%s: exact concurrency does not support copying cells between sequences (%d -> %d); ignoring the copy\n",
                 __func__, seq_id_src, seq_id_dst);

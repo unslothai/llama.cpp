@@ -62,9 +62,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
-// [TAG_EXACT_CONCURRENCY] the paged attention specialization lives in the CUDA sources, which are
-// also built as ROCm and MUSA. Every other backend ignores src[5] and walks the pool in physical
-// cell order, so a KV layer placed there would silently lose the mode's guarantee.
+// [TAG_EXACT_CONCURRENCY] the paged specialization lives in the CUDA sources; every other backend ignores src[5] and walks the pool in physical cell order
 static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
     if (!dev) {
         return false;
@@ -83,11 +81,7 @@ static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
     return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
 }
 
-// [TAG_EXACT_CONCURRENCY] whether the device can actually run the paged attention op for a layer
-// of this shape. The registry name only says which backends carry the kernels, not that the build
-// has them or that this architecture, head width and K/V types land on one; otherwise the op
-// falls to the CPU, which ignores the page table. So build the op as the graph does, at the
-// widths a decode step, a verify step and a prompt chunk use, and ask the device.
+// [TAG_EXACT_CONCURRENCY] whether the device can actually run the paged attention op for a layer of this shape: the registry name only says which backends carry the kernels
 static bool llama_dev_supports_paged_attn(
         ggml_backend_dev_t dev,
         ggml_type type_k, ggml_type type_v,
@@ -158,8 +152,7 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
-    // [TAG_EXACT_CONCURRENCY] read the knob through the same cached reader the graph and the CUDA
-    // dispatcher use, so a mid-process change cannot leave the two disagreeing
+    // [TAG_EXACT_CONCURRENCY] read the knob through the same cached reader the graph and the CUDA dispatcher use, so a mid-process change cannot leave them disagreeing
     exact_pages = llama_exact_concurrency();
 
     // shared cells view the source cache's K/V tensors, so the cell count
@@ -175,8 +168,7 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    // [TAG_EXACT_CONCURRENCY] all of these are reachable from the command line, so name the one
-    // that failed instead of aborting on a bare assert
+    // [TAG_EXACT_CONCURRENCY] all of these are reachable from the command line, so name the one that failed instead of aborting on a bare assert
     if (exact_pages) {
         const char * unsupported = nullptr;
 
@@ -321,8 +313,7 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        // [TAG_EXACT_CONCURRENCY] the paged kernel handles 256-wide K and V heads only; any other
-        // width would run unpaged while the mode reports itself as on
+        // [TAG_EXACT_CONCURRENCY] the paged kernel handles 256-wide K and V heads only; any other width would run unpaged while the mode reports itself as on
         if (exact_pages && (hparams.n_embd_head_k(il) != 256 || (!is_mla && hparams.n_embd_head_v(il) != 256) || is_mla)) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d has %u-wide K heads and %u-wide V heads%s, "
                     "and the paged attention kernel supports 256-wide K and V heads only\n",
@@ -346,8 +337,7 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("exact concurrency: KV cache layer is not on the CUDA backend");
         }
 
-        // [TAG_EXACT_CONCURRENCY] right backend; ask whether this layer's attention, with the
-        // page table attached, lands on one of its kernels at all
+        // [TAG_EXACT_CONCURRENCY] right backend; ask whether this layer's attention, with the page table attached, lands on one of its kernels at all
         if (exact_pages && !llama_dev_supports_paged_attn(model.dev_layer(il), type_k, type_v,
                     hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
                     hparams.n_head(il), hparams.n_head_kv(il), kv_size, exact_page_size)) {
@@ -540,7 +530,6 @@ void llama_kv_cache::exact_pages_sync() const {
     }
 
     if (debug > 0) {
-        // the incrementally maintained ownership has to say what the cells say
         const auto kept = exact_page_owner;
 
         exact_pages_rebuild();
@@ -556,7 +545,6 @@ void llama_kv_cache::exact_pages_sync() const {
 // [TAG_EXACT_CONCURRENCY]
 void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos) {
     if (exact_page_owner_dirty || exact_page_owner.empty()) {
-        // the next sync rebuilds from the cells anyway
         return;
     }
 
@@ -662,9 +650,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         return;
     }
 
-    // [TAG_EXACT_CONCURRENCY] a page belongs to one sequence, so cells cannot be shared between
-    // two. Refuse rather than abort the process, so an uncovered caller gets a failed copy it can
-    // report. After the shared-cells return, so a draft cache is unaffected.
+    // [TAG_EXACT_CONCURRENCY] a page belongs to one sequence, so refuse a copy that would share cells rather than abort. After the shared-cells return, so a draft cache is unaffected.
     if (exact_pages && seq_id_src != seq_id_dst) {
         LLAMA_LOG_ERROR("%s: exact concurrency does not support copying cells between "
                         "sequences (%d -> %d); ignoring the copy\n",
@@ -794,8 +780,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
-    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo the page size,
-    // so shifting positions would misplace every cell; say so rather than abort
+    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo the page size, so shifting positions would misplace every cell
     if (exact_pages && shift != 0) {
         LLAMA_LOG_ERROR("%s: exact concurrency does not support shifting positions "
                         "(seq %d, shift %d); ignoring the shift\n",
@@ -944,8 +929,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     GGML_UNUSED(embd_all);
 
     do {
-        // [TAG_EXACT_CONCURRENCY] a token shared by several sequences would be one cell in a page
-        // that belongs to one sequence; the placement asserts on it later, so refuse it here
+        // [TAG_EXACT_CONCURRENCY] a token shared by several sequences would be one cell in a page that belongs to one sequence, so refuse it here rather than assert at placement
         if (exact_pages && balloc.has_shared_tokens()) {
             LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
                     "give every token exactly one sequence id\n", __func__);
@@ -956,9 +940,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            // [TAG_EXACT_CONCURRENCY] split_simple packs every sequence's prompt into one ubatch,
-            // so a prefill would run at a width its solo run never sees. The sequence-set split
-            // gives each prompt its own ubatch; a plain decode step keeps taking split_simple.
+            // [TAG_EXACT_CONCURRENCY] split_simple packs every sequence's prompt into one ubatch, so a prefill would run at a width its solo run never sees; the set split gives each its own
             const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
 
             auto ubatch = n_stream == 1 && !isolate
@@ -1011,8 +993,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
 
-        // [TAG_EXACT_CONCURRENCY] page ownership before the ubatch, so undoing a speculative
-        // placement does not force a rebuild from every cell
+        // [TAG_EXACT_CONCURRENCY] page ownership before the ubatch, so undoing a speculative placement does not force a rebuild from every cell
         std::vector<exact_page> exact_page_owner_old;
     };
 
@@ -1063,8 +1044,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             head = it->v_heads_old[s];
         }
 
-        // [TAG_EXACT_CONCURRENCY] put back what the allocator knew, unless the placement also
-        // removed cells, in which case only the cells can say what is left
+        // [TAG_EXACT_CONCURRENCY] put back what the allocator knew, unless the placement also removed cells, when only the cells can say what is left
         if (!exact_page_owner_dirty) {
             exact_page_owner = it->exact_page_owner_old;
         }
@@ -1227,8 +1207,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     if (exact_pages) {
-        // ownership is maintained as cells are placed, so this reads one entry per page rather
-        // than scanning every cell; the claims are local and prepare() can still roll them back
+        // ownership is maintained as cells are placed, so this reads one entry per page rather than scanning every cell
         const auto & cells = v_cells[0];
 
         exact_pages_sync();
@@ -1251,7 +1230,6 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             const page_key key {ubatch.seq_id[i][0], ubatch.pos[i]/exact_page_size};
             auto it = pages.find(key);
             if (it == pages.end()) {
-                // round-robin free-page search, deliberately nonmonotonic in physical order
                 uint32_t page = v_heads[0]/exact_page_size;
                 uint32_t tested = 0;
                 while (tested < owner.size() && owner[page%owner.size()].seq >= 0) { ++page; ++tested; }
@@ -1485,15 +1463,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 uint32_t llama_kv_cache::alloc_granularity() const {
-    // [TAG_EXACT_CONCURRENCY] a page is given to one (sequence, position / page) pair, so n
-    // tokens hold round_up(n, exact_page_size) cells: the tail page is charged in full
+    // [TAG_EXACT_CONCURRENCY] a page is given to one (sequence, position / page) pair, so n tokens hold round_up(n, exact_page_size) cells: the tail page is charged in full
     return exact_pages ? exact_page_size : 1;
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo 256, so the pool
-    // cannot shift positions. Reporting it here is what disables --context-shift and
-    // --cache-reuse at load rather than failing on the first request that needs them.
+    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo 256, so the pool cannot shift positions; reporting it disables --context-shift and --cache-reuse at load
     if (exact_pages) {
         return false;
     }
@@ -1585,7 +1560,6 @@ void llama_kv_cache::set_input_pages(ggml_tensor * dst, const llama_ubatch * uba
         auto * row = data.data() + i*dst->ne[0];
         row[0] = 0;
         for (const auto & page : pages[ubatch->seq_id[i][0]]) {
-            // exclude wholly future pages even when prefill includes later query rows
             if (page.first*exact_page_size > uint32_t(ubatch->pos[i])) { break; }
             row[++row[0]] = page.second;
         }
@@ -1602,8 +1576,7 @@ void llama_kv_cache_context::set_input_pages(ggml_tensor * dst, const llama_ubat
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
-    // the physical view spans the pool; the per-query page map is the only loop bound for exact
-    // attention, so neighbours cannot extend it
+    // the per-query page map is the only loop bound for exact attention, so neighbours cannot extend it
     if (exact_pages) { return get_size(); }
     uint32_t result = 0;
 
@@ -2409,9 +2382,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // [TAG_EXACT_CONCURRENCY] a whole-cache restore writes cells at their recorded physical index,
-    // which the paged pool owns. Refused before a byte is read, so the clearing failure path below
-    // is never entered for it.
+    // [TAG_EXACT_CONCURRENCY] a whole-cache restore writes cells at their recorded physical index, which the paged pool owns; refused before a byte is read
     if (exact_pages && seq_id == -1) {
         LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state restore only\n", __func__);
         throw std::runtime_error("whole-cache restore is not supported with LLAMA_EXACT_CONCURRENCY");

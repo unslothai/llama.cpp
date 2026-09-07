@@ -547,8 +547,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
-    // [TAG_EXACT_CONCURRENCY] tokens left in the first set taken, when isolating: only sets with
-    // the same count join it, so that every set in the ubatch finishes in this ubatch
+    // [TAG_EXACT_CONCURRENCY] tokens left in the first set taken, when isolating: only sets with the same count join it, so every set in the ubatch finishes in it
     uint32_t n_left_first = 0;
 
     // determine the non-overlapping sequence sets participating in this ubatch
@@ -573,13 +572,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
-            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a
-            // prompt, and a prompt shares its arithmetic with whatever else is in the ubatch, so
-            // give it one of its own. Sets at or below that width are decode steps, kept exact by
-            // the backend's column policy, so keep grouping them or one prompt would serialize
-            // every concurrent decode. Grouped sets must have the same number of tokens left, or
-            // the equal-length expansion below would cut a longer set in two and a memory that
-            // reduces over a chunk of tokens would sum in a different order than the solo run.
+            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a prompt and gets an
+            // ubatch of its own; grouped sets need equal tokens left, or the expansion below changes their sum order
             if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 
@@ -607,8 +601,6 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 } else if (n_left != n_left_first) {
                     continue;
                 } else if ((cur_seq_set.size() + 1) * n_left_first > n_ubatch) {
-                    // one more set would not finish here, and the expansion below would then cut
-                    // every set part way: the chunking this guard exists to prevent
                     break;
                 }
             }
