@@ -280,7 +280,7 @@ jobs:
       # the launcher executables.
       - name: Sign Windows binaries
         id: sign_windows
-        uses: ./.github/actions/sign-windows
+        uses: ./tooling/.github/actions/sign-windows
         with:
           path: src/build/bin
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -316,7 +316,7 @@ jobs:
       - name: Verify every binary in the bundle is signed
         if: ${{ steps.sign_windows.outputs.signed == 'true' }}
         shell: pwsh
-        run: .github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip'
+        run: tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip'
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0

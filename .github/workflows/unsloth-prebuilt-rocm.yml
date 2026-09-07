@@ -477,6 +477,17 @@ jobs:
         Write-Host "Final build artifacts (including ROCm core files):"
         Get-ChildItem -Recurse | Format-Table Name, Length, LastWriteTime
 
+    # The build legs extract a source tarball rather than checking this repo
+    # out, so the signing action and its scripts are not on disk. Fetch just
+    # .github into a subdirectory: a checkout at the workspace root would
+    # clean the extracted source tree out from under the build.
+    - name: Fetch signing tooling
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      with:
+        path: signing-tooling
+        sparse-checkout: .github
+        persist-credentials: false
+
     # Authenticode-sign before packaging. The Studio installer downloads these
     # zips after its own signed installer has run, so nothing downstream signs
     # them. Smart App Control evaluates every binary as it loads and refuses
@@ -485,7 +496,7 @@ jobs:
     # the launcher executables.
     - name: Sign Windows binaries
       id: sign_windows
-      uses: ./.github/actions/sign-windows
+      uses: ./signing-tooling/.github/actions/sign-windows
       with:
         path: llama.cpp/build/bin
         azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -509,7 +520,7 @@ jobs:
     - name: Verify every binary in the bundle is signed
       if: ${{ steps.sign_windows.outputs.signed == 'true' }}
       shell: pwsh
-      run: .github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip'
+      run: signing-tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip'
 
     - name: Upload bundle artifact
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
