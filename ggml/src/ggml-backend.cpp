@@ -175,6 +175,10 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+bool ggml_backend_buffer_supports_2d(ggml_backend_buffer_t buffer) {
+    return buffer->iface.set_tensor_2d != NULL && buffer->iface.get_tensor_2d != NULL;
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;

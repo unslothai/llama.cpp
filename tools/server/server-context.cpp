@@ -1698,8 +1698,11 @@ private:
             };
 
             // [TAG_PREEMPT_ASYNC] one transfer per context, made once and reused for every
-            // park and resume this slot ever does, because each owns a backend and a stream
-            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+            // park and resume this slot ever does, because each owns a backend and a stream.
+            // Only where a park can happen at all (see update_preemption): a transfer also
+            // installs the fences the context records after every decode, which a server
+            // that will never park has no use for.
+            if (preempt_async_possible()) {
                 slot.preempt_cpy_tgt = llama_state_seq_copy_make(ctx_tgt);
 
                 if (slot.preempt_cpy_tgt && ctx_dft) {
@@ -1742,7 +1745,7 @@ private:
                 preempt_async_ok = preempt_async_ok && slot.preempt_is_async();
             }
 
-            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+            if (preempt_async_possible()) {
                 if (preempt_async_ok) {
                     // Pinned host memory is what lets a copy run beside the decode: one into or
                     // out of pageable memory is staged by the driver and blocks the thread that
@@ -5069,6 +5072,13 @@ private:
     // update_slots() rebuilds the batch from the survivors. The planner brings the parked
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
+    // [TAG_PREEMPT_ASYNC] whether a park can happen and go asynchronously: the conditions
+    // update_preemption() gates on, and the asynchronous switch
+    bool preempt_async_possible() const {
+        return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
+               slots.size() >= 2 && llama_get_memory(ctx_tgt) && !llama_model_is_recurrent(model_tgt);
+    }
+
     bool preempt_last_resort_possible() const {
         return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
