@@ -4661,6 +4661,7 @@ static struct ggml_backend_device_i ggml_backend_webgpu_device_i = {
     /* .event_new            = */ ggml_backend_webgpu_device_event_new,
     /* .event_free           = */ ggml_backend_webgpu_device_event_free,
     /* .event_synchronize    = */ ggml_backend_webgpu_device_event_synchronize,
+    /* .event_query          = */ NULL,
 };
 
 /* End GGML Backend Device Interface */

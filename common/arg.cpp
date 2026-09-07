@@ -1718,6 +1718,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREEMPT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--preempt-async"},
+        {"--no-preempt-async"},
+        "copy a parked sequence out of and back into the KV cache on a stream of its own, so the "
+        "slots that keep running do not wait for it (default: enabled, needs a backend that can "
+        "copy asynchronously, otherwise the copies are synchronous as before)",
+        [](common_params & params, bool value) {
+            params.preempt_async = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
