@@ -2808,14 +2808,19 @@ public:
             // matters is how many runs of adjacent cells they form, because that is how many
             // transfers they actually cost. Count the runs first, and only fall back to
             // staging the whole tensor when even the runs are too many.
-            size_t n_runs = 0;
-            llama_io_emit(rinfos, i, end,
-                    [&n_runs](ggml_tensor *, const uint8_t *, size_t, size_t, size_t, size_t, size_t) {
-                        n_runs++;
-                    });
-
             const size_t tensor_bytes = ggml_nbytes(tensor);
             auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+            // A strided set of rows is one transfer on a buffer that copies 2-D, and one
+            // per row on one that does not (the generic path expands it), so it is counted
+            // by what it costs on this buffer, not by the calls it makes.
+            const bool has_2d = ggml_backend_buffer_supports_2d(buffer);
+
+            size_t n_runs = 0;
+            llama_io_emit(rinfos, i, end,
+                    [&n_runs, has_2d](ggml_tensor *, const uint8_t *, size_t, size_t, size_t n_copies, size_t, size_t) {
+                        n_runs += has_2d ? 1 : n_copies;
+                    });
             // A fragmented sequence can require thousands of synchronous device
             // transfers per layer. For bounded tensors, stage the tensor once and
             // preserve every byte belonging to other sequences. Bound scratch RAM
@@ -3716,18 +3721,6 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
-        if (state_copy_fences.find(dev) == state_copy_fences.end()) {
-            ggml_backend_event_t fence = ggml_backend_event_new(dev);
-
-            if (!fence) {
-                ggml_backend_event_free(event);
-                ggml_backend_free(backend_cpy);
-                continue;
-            }
-
-            state_copy_fences[dev] = fence;
-        }
-
         auto & dc = cpy->devs[dev];
 
         dc.backend.reset(backend_cpy);
@@ -3737,9 +3730,6 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
     if (cpy->devs.empty()) {
         return nullptr;
     }
-
-    // the fences say where the compute streams are now, before any transfer asks
-    state_seq_copy_fence();
 
     // The devices above are the ones the graphs run on, not necessarily the ones the state
     // lives on: with most layers left on the CPU the KV cache is host memory, and a tensor
@@ -3772,6 +3762,35 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
     }
 
     cpy->can_pin = cpy->host_buffer_type() != ggml_backend_cpu_buffer_type();
+
+    // One fence per device, shared by every transfer on this context and recorded after
+    // every decode from now on. Installed only here, after the checks above: a transfer
+    // refused for its layout must leave nothing behind that every later decode would keep
+    // recording for nobody.
+    std::vector<ggml_backend_dev_t> fences_new;
+
+    for (const auto & it : cpy->devs) {
+        if (state_copy_fences.find(it.first) != state_copy_fences.end()) {
+            continue;
+        }
+
+        ggml_backend_event_t fence = ggml_backend_event_new(it.first);
+
+        if (!fence) {
+            for (auto dev : fences_new) {
+                ggml_backend_event_free(state_copy_fences[dev]);
+                state_copy_fences.erase(dev);
+            }
+
+            return nullptr;
+        }
+
+        state_copy_fences[it.first] = fence;
+        fences_new.push_back(it.first);
+    }
+
+    // the fences say where the compute streams are now, before any transfer asks
+    state_seq_copy_fence();
 
     return cpy.release();
 }

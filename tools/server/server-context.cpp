@@ -1765,8 +1765,11 @@ private:
             };
 
             // [TAG_PREEMPT_ASYNC] one transfer per context, made once and reused for every
-            // park and resume this slot ever does, because each owns a backend and a stream
-            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+            // park and resume this slot ever does, because each owns a backend and a stream.
+            // Only where a park can happen at all (see update_preemption): a transfer also
+            // installs the fences the context records after every decode, which a server
+            // that will never park has no use for.
+            if (preempt_async_possible()) {
                 slot.preempt_cpy_tgt = llama_state_seq_copy_make(ctx_tgt);
 
                 if (slot.preempt_cpy_tgt && ctx_dft) {
@@ -1809,7 +1812,7 @@ private:
                 preempt_async_ok = preempt_async_ok && slot.preempt_is_async();
             }
 
-            if (params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+            if (preempt_async_possible()) {
                 if (preempt_async_ok) {
                     // Pinned host memory is what lets a copy run beside the decode: one into or
                     // out of pageable memory is staged by the driver and blocks the thread that
@@ -3552,17 +3555,30 @@ private:
         }
     }
 
+    // cells of the mirrored prompt that a started slot's request keeps, by the rule the batch
+    // builder applies when it takes the slot: nothing when the request does not cache its
+    // prompt, otherwise the prefix the two share, cut short of an aLoRA invocation
+    size_t preempt_n_keep(const server_slot & slot) const {
+        if (!slot.task->params.cache_prompt) {
+            return 0;
+        }
+
+        size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+        if (slot.alora_invocation_start > 0) {
+            n_keep = std::min(n_keep, (size_t) (slot.alora_invocation_start - 1));
+        }
+
+        return n_keep;
+    }
+
     // cells of the slot's that its next step keeps: a slot just given a task still mirrors
-    // the previous request's prompt until the batch builder keeps the prefix the two share
-    // and drops the rest (all of it when the request does not cache its prompt), so what it
-    // holds, and what it is about to ask for, both count from that prefix
+    // the previous request's prompt until the batch builder keeps what preempt_n_keep()
+    // says and drops the rest, so what it holds, and what it is about to ask for, both
+    // count from that
     int32_t preempt_n_retained(const server_slot & slot) const {
         if (slot.state == SLOT_STATE_STARTED && slot.task) {
-            if (!slot.task->params.cache_prompt) {
-                return 0;
-            }
-
-            return (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+            return (int32_t) preempt_n_keep(slot);
         }
 
         return slot.prompt.n_tokens();
@@ -3768,7 +3784,7 @@ private:
             return;
         }
 
-        const size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        const size_t n_keep = preempt_n_keep(slot);
 
         if (n_keep >= slot.prompt.tokens.size()) {
             return;
@@ -5291,6 +5307,13 @@ private:
     // update_slots() rebuilds the batch from the survivors. The planner brings the parked
     // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
     // so it keeps the old path.
+    // [TAG_PREEMPT_ASYNC] whether a park can happen and go asynchronously: the conditions
+    // update_preemption() gates on, and the asynchronous switch
+    bool preempt_async_possible() const {
+        return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
+               slots.size() >= 2 && llama_get_memory(ctx_tgt) && !llama_model_is_recurrent(model_tgt);
+    }
+
     bool preempt_last_resort_possible() const {
         return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
