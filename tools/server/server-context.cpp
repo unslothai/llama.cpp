@@ -3273,6 +3273,18 @@ private:
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
             }
 
+            // a started slot whose request the STARTED block is about to reject gets its
+            // error on its own pass, and nothing before it: a park notice would open the
+            // stream and turn that error into 200 plus an in-stream one
+            if (slot.state == SLOT_STATE_STARTED) {
+                std::string msg;
+                error_type  type = ERROR_TYPE_SERVER;
+
+                if (slot_prompt_rejected(slot, msg, type)) {
+                    continue;
+                }
+            }
+
             if (!preempt_fits_budget(slot)) {
                 continue;
             }
@@ -3594,6 +3606,60 @@ private:
                     preempt_kv_used(), n_cells, n_used,
                     victim->n_preempt);
         }
+    }
+
+    // the checks a slot's request has to pass before its prompt is processed, run from the
+    // SLOT_STATE_STARTED block below. true when the request is rejected, with the message and
+    // the type of the error it gets. The empty prompt is not here: it is a final response and
+    // not an error.
+    // [TAG_PREEMPT] the planner asks the same question before it parks a started slot, so a
+    // request that is about to be errored is never given a park notice ahead of its error: a
+    // notice opens the stream, and the client would get 200 plus an in-stream error where the
+    // non-stream 4xx belongs.
+    bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
+        if (!slot.task) {
+            return false;
+        }
+
+        // TODO: support memory-less logits computation
+        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
+            msg  = "the current context does not logits computation. skipping";
+            type = ERROR_TYPE_SERVER;
+            return true;
+        }
+
+        if (!slot.can_split()) {
+            const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+            if (slot.task->n_tokens() > n_ubatch) {
+                msg = string_format(
+                    "input (%d tokens) is too large to process. increase the physical batch "
+                    "size (current batch size: %d)",
+                    slot.task->n_tokens(), n_ubatch);
+                type = ERROR_TYPE_SERVER;
+                return true;
+            }
+
+            if (slot.task->n_tokens() > slot.n_ctx) {
+                msg = string_format(
+                    "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                    slot.task->n_tokens(), slot.n_ctx);
+                type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (slot.task->n_tokens() >= slot.n_ctx) {
+            msg = string_format(
+                "request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
+                slot.task->n_tokens(), slot.n_ctx);
+            type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+            return true;
+        }
+
+        return false;
     }
 
     void update_slots() {
@@ -4002,46 +4068,18 @@ private:
                             return;
                         }
 
-                        // TODO: support memory-less logits computation
-                        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
-                            send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
-                            slot.release();
-                            return;
+                        {
+                            std::string msg;
+                            error_type  type = ERROR_TYPE_SERVER;
+
+                            if (slot_prompt_rejected(slot, msg, type)) {
+                                send_error(slot, msg, type);
+                                slot.release();
+                                return;
+                            }
                         }
 
-                        if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
-                                send_error(slot,
-                                           string_format(
-                                               "input (%d tokens) is too large to process. increase the physical batch "
-                                               "size (current batch size: %d)",
-                                               slot.task->n_tokens(), n_ubatch),
-                                           ERROR_TYPE_SERVER);
-                                slot.release();
-                                return;
-                            }
-
-                            if (slot.task->n_tokens() > slot.n_ctx) {
-                                send_error(
-                                    slot,
-                                    string_format(
-                                        "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-                        } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
-                                           string_format("request (%d tokens) exceeds the available context size (%d "
-                                                         "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-
+                        if (slot.can_split()) {
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
