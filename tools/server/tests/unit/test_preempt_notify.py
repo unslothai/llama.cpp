@@ -247,3 +247,40 @@ def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
         n_parked += len(seq) // 2
     # Both streams took turns: at least one park each, so at least two in all.
     assert n_parked >= 2, [r[0] for r in results]
+
+
+def test_an_oversized_prompt_is_errored_instead_of_parked():
+    # A slot that has just been given a task has not passed the prompt checks yet: they
+    # run on its first pass through update_slots. Parked before that, it would be told
+    # ": preempted" first, and the notice opens the stream, so a prompt larger than the
+    # context would come back as 200 plus an in-stream error instead of the plain error
+    # response it gets with nothing running. The planner leaves such a slot alone.
+    global server
+    server.n_ctx = 512
+    server.n_batch = 512 # the whole prompt in one batch, so the planner sees its size at once
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    server.start()
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    resident = _completion_payload(390) | {"prompt": " ".join(["Once upon a time there was a brave knight who"] * 6)}
+    oversized = _completion_payload(16) | {"prompt": " ".join(["The quick brown fox jumps over the lazy dog and"] * 80)}
+
+    started = threading.Event()
+
+    def _run_resident():
+        res = requests.post(url, json=resident, stream=True)
+        assert res.status_code == 200
+        for raw in res.iter_lines():
+            if raw.decode("utf-8").startswith("data: "):
+                started.set()
+
+    t = threading.Thread(target=_run_resident)
+    t.start()
+    try:
+        assert started.wait(60)
+        res = requests.post(url, json=oversized, stream=True)
+        body = res.text
+        assert res.status_code != 200, body
+        assert not body.lstrip().startswith(":"), body
+        assert "error" in json.loads(body), body
+    finally:
+        t.join(120)
