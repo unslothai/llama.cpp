@@ -6300,9 +6300,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
                 // [TAG_PREEMPT] a parked slot produces nothing for as long as the pool is
-                // full, so while parked the ping runs every 2 s regardless of --sse-ping and
-                // is named, so a client can tell "waiting for cells" from "slow".
-                const int64_t ping_ms = parked ? PREEMPT_KEEPALIVE_MS : (sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1);
+                // full, so while parked the ping runs at least every 2 s whether or not
+                // --sse-ping asked for one, and is named, so a client can tell "waiting for
+                // cells" from "slow". A shorter interval the request asked for is kept: a
+                // client that wants a ping every second wants it most while nothing else comes.
+                const int64_t ping_cfg = sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1;
+                const int64_t ping_ms  = parked ? (ping_cfg > 0 ? std::min(ping_cfg, PREEMPT_KEEPALIVE_MS) : PREEMPT_KEEPALIVE_MS) : ping_cfg;
                 auto result = rd.next([&timeout, &start_time, ping_ms, &effective_should_stop]() {
                     if (effective_should_stop()) {
                         return true; // should_stop condition met
