@@ -464,12 +464,26 @@ struct server_slot {
         i_batch = -1;
     }
 
-    bool preempt_save_poll() {
-        if (!llama_state_seq_copy_done(preempt_cpy_tgt.get())) {
-            return false;
+    bool preempt_copy_done() {
+        return llama_state_seq_copy_done(preempt_cpy_tgt.get()) &&
+               (!preempt_cpy_dft || llama_state_seq_copy_done(preempt_cpy_dft.get()));
+    }
+
+    // back in the state it was parked from, with a speculative context to match: the draft went out with the cells
+    bool preempt_resumed() {
+        n_preempt_fail = 0;
+
+        state = state_before_preempt;
+
+        if (state == SLOT_STATE_GENERATING && can_speculate()) {
+            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
         }
 
-        if (preempt_cpy_dft && !llama_state_seq_copy_done(preempt_cpy_dft.get())) {
+        return true;
+    }
+
+    bool preempt_save_poll() {
+        if (!preempt_copy_done()) {
             return false;
         }
 
@@ -481,11 +495,7 @@ struct server_slot {
     }
 
     bool preempt_restore_poll() {
-        if (!llama_state_seq_copy_done(preempt_cpy_tgt.get())) {
-            return false;
-        }
-
-        if (preempt_cpy_dft && !llama_state_seq_copy_done(preempt_cpy_dft.get())) {
+        if (!preempt_copy_done()) {
             return false;
         }
 
@@ -495,15 +505,7 @@ struct server_slot {
             llama_state_seq_copy_buf_resize(preempt_cpy_dft.get(), 0);
         }
 
-        n_preempt_fail = 0;
-
-        state = state_before_preempt;
-
-        if (state == SLOT_STATE_GENERATING && can_speculate()) {
-            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
-        }
-
-        return true;
+        return preempt_resumed();
     }
 
     // [TAG_PREEMPT_ASYNC] copy the sequence out and release its cells; with a transfer this returns once the copy is issued and the cells stay the slot's until preempt_save_poll() sees it land
@@ -620,14 +622,9 @@ struct server_slot {
         const size_t size_tgt = preempt_state_tgt.size();
         const size_t size_dft = preempt_state_dft.size();
 
-        if (llama_state_seq_set_data_ext(ctx_tgt, preempt_state_tgt.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
-            mem.seq_rm(id, -1, -1);
-            n_preempt_fail++;
-            return false;
-        }
-
-        if (size_dft > 0 &&
-            llama_state_seq_set_data_ext(ctx_dft, preempt_state_dft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
+        if (llama_state_seq_set_data_ext(ctx_tgt, preempt_state_tgt.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
+            (size_dft > 0 &&
+             llama_state_seq_set_data_ext(ctx_dft, preempt_state_dft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft)) {
             mem.seq_rm(id, -1, -1);
             n_preempt_fail++;
             return false;
@@ -635,15 +632,7 @@ struct server_slot {
 
         preempt_state_free();
 
-        n_preempt_fail = 0;
-
-        state = state_before_preempt;
-
-        if (state == SLOT_STATE_GENERATING && can_speculate()) {
-            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
-        }
-
-        return true;
+        return preempt_resumed();
     }
 
     // [TAG_PREEMPT] bring prompt.tokens back to what the cache holds, for a batch given up after it was built: never-decoded tokens and the draft come off, `sampled` is kept
@@ -659,12 +648,7 @@ struct server_slot {
             state = SLOT_STATE_PROCESSING_PROMPT;
         }
 
-        spec_draft.clear();
-        spec_i_batch.clear();
-        spec_ckpt.clear();
-        spec_is_replay = false;
-
-        i_batch = -1;
+        preempt_detach();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -3657,32 +3641,61 @@ private:
         return preempt_async_ok;
     }
 
+    // [TAG_PREEMPT] park a slot: a synchronous park is finished here, an asynchronous one only issued, and update_preempt_copies() counts it when its copy lands.
+    // The notice goes with the save, not the cell release: preempt_save() has already detached the slot, so a release-time notice would leave the copy's silence unexplained.
+    bool preempt_park(server_slot & slot, int64_t t_start) {
+        slot.t_preempt_copy_us = t_start;
+
+        if (!slot.preempt_save()) {
+            return false;
+        }
+
+        preempt_log_ram_kind(slot);
+
+        if (slot.state == SLOT_STATE_PREEMPTED) {
+            metrics.n_preempt++;
+        }
+
+        send_preempt_notice(slot, true);
+
+        return true;
+    }
+
+    // [TAG_PREEMPT_ASYNC] a park whose copy has landed; `note` says how it was waited for, if it was
+    void preempt_parked(server_slot & slot, const char * note) {
+        metrics.n_preempt++;
+
+        SLT_WRN(slot, "park completed after %.2f ms%s: %d cells released, %.1f MiB parked, kv %d/%d\n",
+                (ggml_time_us() - slot.t_preempt_copy_us) / 1e3, note,
+                slot.prompt.n_tokens(),
+                slot.preempt_state_size() / (1024.0 * 1024.0),
+                preempt_kv_used(), n_ctx);
+    }
+
+    // [TAG_PREEMPT] a resume whose copy has landed; announced here rather than where the restore was issued, this being the first moment the slot can be scheduled again
+    void preempt_restored(server_slot & slot, const char * note) {
+        metrics.n_resume++;
+
+        preempt_trim_ram(slot);
+
+        send_preempt_notice(slot, false);
+
+        SLT_WRN(slot, "restore completed after %.2f ms%s: %d tokens back in the cache, kv %d/%d, preemptions %d\n",
+                (ggml_time_us() - slot.t_preempt_copy_us) / 1e3, note,
+                slot.prompt.n_tokens(),
+                preempt_kv_used(), n_ctx,
+                slot.n_preempt);
+    }
+
     void update_preempt_copies() {
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_PREEMPTING) {
                 if (slot.preempt_save_poll()) {
-                    metrics.n_preempt++;
-
-                    SLT_WRN(slot, "park completed after %.2f ms: %d cells released, %.1f MiB parked, kv %d/%d\n",
-                            (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
-                            slot.prompt.n_tokens(),
-                            slot.preempt_state_size() / (1024.0 * 1024.0),
-                            preempt_kv_used(), n_ctx);
+                    preempt_parked(slot, "");
                 }
             } else if (slot.state == SLOT_STATE_RESTORING) {
                 if (slot.preempt_restore_poll()) {
-                    metrics.n_resume++;
-
-                    preempt_trim_ram(slot);
-
-                    // [TAG_PREEMPT] announced here rather than where the restore was issued: preempt_restore_poll() is the first moment the slot can be scheduled again
-                    send_preempt_notice(slot, false);
-
-                    SLT_WRN(slot, "restore completed after %.2f ms: %d tokens back in the cache, kv %d/%d, preemptions %d\n",
-                            (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
-                            slot.prompt.n_tokens(),
-                            preempt_kv_used(), n_ctx,
-                            slot.n_preempt);
+                    preempt_restored(slot, "");
                 }
             }
         }
@@ -3706,21 +3719,9 @@ private:
 
             slot.preempt_copy_wait();
 
-            if (!slot.preempt_restore_poll()) {
-                continue;
+            if (slot.preempt_restore_poll()) {
+                preempt_restored(slot, " (waited for, a context shift is due)");
             }
-
-            metrics.n_resume++;
-
-            preempt_trim_ram(slot);
-
-            send_preempt_notice(slot, false);
-
-            SLT_WRN(slot, "restore completed after %.2f ms (waited for, a context shift is due): %d tokens back in the cache, kv %d/%d, preemptions %d\n",
-                    (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
-                    slot.prompt.n_tokens(),
-                    preempt_kv_used(), n_ctx,
-                    slot.n_preempt);
         }
     }
 
@@ -3747,12 +3748,7 @@ private:
                 continue;
             }
 
-            metrics.n_preempt++;
-
-            SLT_WRN(slot, "park completed after %.2f ms (waited for): %d cells released, kv %d/%d\n",
-                    (ggml_time_us() - slot.t_preempt_copy_us) / 1e3,
-                    slot.prompt.n_tokens(),
-                    preempt_kv_used(), n_ctx);
+            preempt_parked(slot, " (waited for)");
 
             return true;
         }
@@ -3856,13 +3852,7 @@ private:
                 server_slot * head = parked.front();
 
                 // [TAG_PREEMPT_ASYNC] a park still copying holds its cells, so a rotation now would only park another resident on top
-                bool parking = false;
-
-                for (const auto & slot : slots) {
-                    parking = parking || slot.state == SLOT_STATE_PREEMPTING;
-                }
-
-                if (!parking && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
+                if (!preempt_copies_in_flight() && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
                     const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
                     const int32_t need     = preempt_n_need(*head) + preempt_n_margin(1);
 
@@ -3905,16 +3895,8 @@ private:
                                 params_base.preempt_ram_mib);
                     }
 
-                    if (pick && pick->preempt_save()) {
+                    if (pick && preempt_park(*pick, t_start)) {
                         server_slot & slot = *pick;
-
-                        slot.t_preempt_copy_us = t_start;
-
-                        if (slot.state != SLOT_STATE_PREEMPTING) {
-                            metrics.n_preempt++;
-                        }
-
-                        send_preempt_notice(slot, true);
 
                         SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
                                 slot.n_ctx_shift, slot.prompt.n_tokens(),
@@ -3986,22 +3968,9 @@ private:
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
                     (int32_t) slot.stats.n_gen >= (slot.n_preempt + 1) * preempt_test_every &&
-                    preempt_fits_budget(slot)) {
-                    slot.t_preempt_copy_us = ggml_time_us();
-
-                    if (slot.preempt_save()) {
-                        preempt_log_ram_kind(slot);
-
-                        // [TAG_PREEMPT_ASYNC] a slot left PREEMPTING is counted by update_preempt_copies() when its copy lands
-                        if (slot.state == SLOT_STATE_PREEMPTED) {
-                            metrics.n_preempt++;
-                        }
-
-                        send_preempt_notice(slot, true);
-
-                        SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
-                                (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
-                    }
+                    preempt_fits_budget(slot) && preempt_park(slot, ggml_time_us())) {
+                    SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
+                            (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
                 }
             }
         }
@@ -4043,16 +4012,9 @@ private:
             const int32_t n_tokens = victim->prompt.n_tokens();
             const int64_t t_start  = ggml_time_us();
 
-            victim->t_preempt_copy_us = t_start;
-
-            if (!victim->preempt_save()) {
+            if (!preempt_park(*victim, t_start)) {
                 break; // could not park it; the existing retry ladder is still behind us
             }
-
-            preempt_log_ram_kind(*victim);
-
-            // [TAG_PREEMPT] the notice goes with the save, not the cell release: preempt_save() has already detached the victim, so a release-time notice would leave the copy's silence unexplained
-            send_preempt_notice(*victim, true);
 
             // [TAG_PREEMPT_ASYNC] the copy has only been issued and the cells are still the victim's, so nothing further can be decided about the pool this iteration
             if (victim->state == SLOT_STATE_PREEMPTING) {
@@ -4072,8 +4034,6 @@ private:
 
                 break;
             }
-
-            metrics.n_preempt++;
 
             SLT_WRN(*victim, "preempted: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
@@ -5043,17 +5003,11 @@ private:
             const int32_t n_tokens = victim->prompt.n_tokens();
             const int64_t t_start  = ggml_time_us();
 
-            victim->t_preempt_copy_us = t_start;
-
-            if (!victim->preempt_save()) {
+            if (!preempt_park(*victim, t_start)) {
                 break;
             }
 
-            preempt_log_ram_kind(*victim);
-
             n_parked++;
-
-            send_preempt_notice(*victim, true);
 
             // [TAG_PREEMPT_ASYNC] the cells are wanted now, not next iteration: wait for the copy, which releases them
             if (victim->state == SLOT_STATE_PREEMPTING) {
@@ -5064,8 +5018,6 @@ private:
                         n_tokens, preempt_kv_used(), n_cells, n_used, victim->n_preempt);
                 continue;
             }
-
-            metrics.n_preempt++;
 
             SLT_WRN(*victim, "preempted as a last resort: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                     n_tokens,
