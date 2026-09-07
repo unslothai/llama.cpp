@@ -366,22 +366,33 @@ struct server_slot {
         return (bool) preempt_cpy_tgt;
     }
 
-    int64_t preempt_sync_us() const {
+    // the target's transfer and the draft's are always driven together, so a figure is the sum over both and a call is made on both
+    template <typename F>
+    auto preempt_sum(F f) const -> decltype(f(preempt_cpy_tgt.get())) {
         if (!preempt_is_async()) {
             return 0;
         }
 
-        return llama_state_seq_copy_sync_us(preempt_cpy_tgt.get()) +
-               (preempt_cpy_dft ? llama_state_seq_copy_sync_us(preempt_cpy_dft.get()) : 0);
+        return f(preempt_cpy_tgt.get()) + (preempt_cpy_dft ? f(preempt_cpy_dft.get()) : 0);
+    }
+
+    template <typename F>
+    void preempt_each(F f) const {
+        if (preempt_cpy_tgt) {
+            f(preempt_cpy_tgt.get());
+        }
+
+        if (preempt_cpy_dft) {
+            f(preempt_cpy_dft.get());
+        }
+    }
+
+    int64_t preempt_sync_us() const {
+        return preempt_sum(llama_state_seq_copy_sync_us);
     }
 
     size_t preempt_n_copies() const {
-        if (!preempt_is_async()) {
-            return 0;
-        }
-
-        return llama_state_seq_copy_n_copies(preempt_cpy_tgt.get()) +
-               (preempt_cpy_dft ? llama_state_seq_copy_n_copies(preempt_cpy_dft.get()) : 0);
+        return preempt_sum(llama_state_seq_copy_n_copies);
     }
 
     // [TAG_PREEMPT_ASYNC] a copy is running: the slot must not be scheduled but still owns cells, so it is neither running nor parked
@@ -400,24 +411,14 @@ struct server_slot {
     bool                 preempt_rotation_refused = false; // this park has logged a rotation refused for budget
 
     size_t preempt_state_size() const {
-        if (preempt_is_async()) {
-            // the capacity, not the live size: the pinned buffers are kept between parks, so --preempt-ram has to bound what is held
-            return llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()) +
-                   (preempt_cpy_dft ? llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()) : 0);
-        }
-
-        return preempt_state_tgt.size() + preempt_state_dft.size();
+        // for a transfer the capacity, not the live size: the pinned buffers are kept between parks, so --preempt-ram has to bound what is held
+        return preempt_is_async() ? preempt_sum(llama_state_seq_copy_buf_capacity)
+                                  : preempt_state_tgt.size() + preempt_state_dft.size();
     }
 
     void preempt_state_free() {
-        // wait for anything in flight first: release() is reached with a copy possibly still using the buffer
-        if (preempt_cpy_tgt) {
-            llama_state_seq_copy_buf_free(preempt_cpy_tgt.get());
-        }
-
-        if (preempt_cpy_dft) {
-            llama_state_seq_copy_buf_free(preempt_cpy_dft.get());
-        }
+        // waits for anything in flight first: release() is reached with a copy possibly still using the buffer
+        preempt_each(llama_state_seq_copy_buf_free);
 
         preempt_state_tgt.clear();
         preempt_state_tgt.shrink_to_fit();
@@ -426,13 +427,7 @@ struct server_slot {
     }
 
     void preempt_copy_wait() {
-        if (preempt_cpy_tgt) {
-            llama_state_seq_copy_wait(preempt_cpy_tgt.get());
-        }
-
-        if (preempt_cpy_dft) {
-            llama_state_seq_copy_wait(preempt_cpy_dft.get());
-        }
+        preempt_each(llama_state_seq_copy_wait);
     }
 
     size_t preempt_state_required() const {
@@ -3760,23 +3755,15 @@ private:
             server_slot * best = nullptr;
 
             // a parked slot that would not fit an empty pool can never be restored, so report it as the single-conversation overflow and rescan without it
-            {
-                server_slot * impossible = nullptr;
+            const auto impossible = std::find_if(parked.begin(), parked.end(),
+                    [this, n_cells](const server_slot * slot) { return preempt_n_need(*slot) > n_cells; });
 
-                for (auto * slot : parked) {
-                    if (preempt_n_need(*slot) > n_cells) {
-                        impossible = slot;
-                        break;
-                    }
-                }
-
-                if (impossible) {
-                    SLT_WRN(*impossible, "parked sequence of %d tokens cannot fit the pool of %d cells even alone, failing it\n",
-                            preempt_n_need(*impossible), n_cells);
-                    send_error(*impossible, "Context size has been exceeded.");
-                    impossible->release();
-                    continue;
-                }
+            if (impossible != parked.end()) {
+                SLT_WRN(**impossible, "parked sequence of %d tokens cannot fit the pool of %d cells even alone, failing it\n",
+                        preempt_n_need(**impossible), n_cells);
+                send_error(**impossible, "Context size has been exceeded.");
+                (*impossible)->release();
+                continue;
             }
 
             // room for the sequence and for the next step of everything running, the candidate included, or a resume immediately preempts somebody; with nobody resident an exact fit is let in
