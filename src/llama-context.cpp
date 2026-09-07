@@ -515,6 +515,10 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto & it : state_copy_fences) {
+        ggml_backend_event_free(it.second);
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1617,6 +1621,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+    if (!state_copy_fences.empty()) {
+        state_seq_copy_fence();
+    }
+
     return 0;
 }
 
@@ -2061,6 +2069,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (!state_copy_fences.empty()) {
+        state_seq_copy_fence();
+    }
 
     return 0;
 }
@@ -3192,8 +3204,6 @@ struct llama_state_seq_copy {
     struct dev_copy {
         ggml_backend_ptr     backend;
         ggml_backend_event_t event   = nullptr;
-        // recorded on the compute stream and waited for on the copy stream, see order_after()
-        ggml_backend_event_t fence   = nullptr;
         bool                 pending = false;
     };
 
@@ -3218,9 +3228,6 @@ struct llama_state_seq_copy {
         for (auto & it : devs) {
             if (it.second.event) {
                 ggml_backend_event_free(it.second.event);
-            }
-            if (it.second.fence) {
-                ggml_backend_event_free(it.second.fence);
             }
         }
     }
@@ -3267,19 +3274,20 @@ struct llama_state_seq_copy {
 
     // Order the copies about to be posted behind the compute already queued on each device:
     // the decode that produced the cells a park reads, or that a restore's cells were
-    // carved out of, has to be finished before the copy touches them. Recorded on the
-    // compute backend's stream and waited for on the copy stream, so the host drains
-    // nothing. Draining it (synchronize()) is what this replaces: with the wait that
-    // order_before() queues on the compute stream for the previous restore, a host drain
-    // blocked this thread until that copy had landed, and two restores issued in one pass
-    // ran one after the other with the whole transfer back on the decode loop.
-    void order_after(const std::vector<ggml_backend_ptr> & compute) {
+    // carved out of, has to be finished before the copy touches them. The copy stream waits
+    // for the context's fence on its device, an event the context records on the compute
+    // stream at the end of every decode, so the host drains nothing. The fence is recorded
+    // there and not here: recorded here, it would land behind the waits that order_before()
+    // queued for the restores issued earlier in the same pass, and each restore would then
+    // wait for the previous one's copies. Draining the host (synchronize()) is what this
+    // replaced: with those same waits on the compute stream, a host drain blocked this thread
+    // until the previous restore had landed.
+    void order_after(const std::map<ggml_backend_dev_t, ggml_backend_event_t> & fences) {
         for (auto & it : devs) {
-            for (const auto & backend : compute) {
-                if (ggml_backend_get_device(backend.get()) == it.first) {
-                    ggml_backend_event_record(it.second.fence, backend.get());
-                    ggml_backend_event_wait(it.second.backend.get(), it.second.fence);
-                }
+            const auto fence = fences.find(it.first);
+
+            if (fence != fences.end()) {
+                ggml_backend_event_wait(it.second.backend.get(), fence->second);
             }
         }
     }
@@ -3645,6 +3653,16 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
 // [TAG_STATE_ASYNC]
 
+void llama_context::state_seq_copy_fence() {
+    for (const auto & it : state_copy_fences) {
+        for (const auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == it.first) {
+                ggml_backend_event_record(it.second, backend.get());
+            }
+        }
+    }
+}
+
 llama_state_seq_copy * llama_context::state_seq_copy_init() {
     std::unique_ptr<llama_state_seq_copy> cpy(new llama_state_seq_copy());
 
@@ -3698,24 +3716,30 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
-        ggml_backend_event_t fence = ggml_backend_event_new(dev);
+        if (state_copy_fences.find(dev) == state_copy_fences.end()) {
+            ggml_backend_event_t fence = ggml_backend_event_new(dev);
 
-        if (!fence) {
-            ggml_backend_event_free(event);
-            ggml_backend_free(backend_cpy);
-            continue;
+            if (!fence) {
+                ggml_backend_event_free(event);
+                ggml_backend_free(backend_cpy);
+                continue;
+            }
+
+            state_copy_fences[dev] = fence;
         }
 
         auto & dc = cpy->devs[dev];
 
         dc.backend.reset(backend_cpy);
         dc.event = event;
-        dc.fence = fence;
     }
 
     if (cpy->devs.empty()) {
         return nullptr;
     }
+
+    // the fences say where the compute streams are now, before any transfer asks
+    state_seq_copy_fence();
 
     // The devices above are the ones the graphs run on, not necessarily the ones the state
     // lives on: with most layers left on the CPU the KV cache is host memory, and a tensor
@@ -3776,7 +3800,7 @@ size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size
     // finished before they are read: the copy stream waits for the compute stream, on the
     // device, see order_after(). Nothing stays on the caller's thread.
     const int64_t t_sync = ggml_time_us();
-    cpy.order_after(backends);
+    cpy.order_after(state_copy_fences);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 
     cpy.n_copies = 0;
@@ -3822,7 +3846,7 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
     // read), so the copy stream waits for the compute stream before it writes them: on the
     // device, see order_after(), rather than by draining the compute stream on this thread
     const int64_t t_sync = ggml_time_us();
-    cpy.order_after(backends);
+    cpy.order_after(state_copy_fences);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 
     cpy.n_copies = 0;
