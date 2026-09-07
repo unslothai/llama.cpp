@@ -62,6 +62,17 @@ jobs:
   build:
     name: x64/${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
+    # Every Azure Trusted Signing secret in this workflow is read by this job
+    # and no other. Naming an environment is what makes them gateable: without
+    # it there is no place to hang a required reviewer, so anyone who can
+    # dispatch the parent workflow can sign under our identity.
+    #
+    # Inert until protection rules exist. GitHub creates a referenced-but-absent
+    # environment on first run with no rules and no branch policy, and
+    # repository secrets keep resolving inside a job that names an environment,
+    # so this line alone changes nothing about how a build runs. Same shape as
+    # release-desktop.yml in unslothai/unsloth.
+    environment: release-signing
     # Hang guard only. Without it the job inherits GitHub's 360-minute default,
     # which is above both assemble's `timeout-minutes: 350` and, more to the
     # point, the "Wait for the build matrix" step's own 330-minute deadline in

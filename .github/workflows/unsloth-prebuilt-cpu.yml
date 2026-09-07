@@ -239,6 +239,17 @@ jobs:
     # windows-cpu job. CUDA stays on MSVC (mandatory for nvcc on Windows), but
     # the CPU build uses clang/LLVM to match upstream's proven CPU recipe.
     runs-on: windows-2025-vs2026
+    # Every Azure Trusted Signing secret in this workflow is read by this job
+    # and no other. Naming an environment is what makes them gateable: without
+    # it there is no place to hang a required reviewer, so anyone who can
+    # dispatch the parent workflow can sign under our identity.
+    #
+    # Inert until protection rules exist. GitHub creates a referenced-but-absent
+    # environment on first run with no rules and no branch policy, and
+    # repository secrets keep resolving inside a job that names an environment,
+    # so this line alone changes nothing about how a build runs. Same shape as
+    # release-desktop.yml in unslothai/unsloth.
+    environment: release-signing
     strategy:
       fail-fast: false
       matrix:
