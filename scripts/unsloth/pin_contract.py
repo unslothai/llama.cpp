@@ -57,22 +57,34 @@ PIN_RE = re.compile(
     r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/([0-9a-f]{40})/?$"
 )
 
-# identifier families that name a FEATURE, not every new symbol: a renamed helper is not a lost feature, a missing LLM_ARCH_ entry always is
+# Identifier families that name a FEATURE. Deliberately not "every new symbol":
+# a helper function renamed by a later upstream commit is not a lost feature,
+# but a missing LLM_ARCH_ entry always is. These are the tables that decide
+# whether an architecture, an op, a projector or a quant type exists at all.
 SYMBOL_FAMILIES = (
     "LLM_ARCH_", "LLM_TENSOR_", "LLM_KV_", "LLM_TYPE_",
     "PROJECTOR_TYPE_", "GGML_OP_", "GGML_TYPE_", "LLAMA_FTYPE_",
 )
 SYMBOL_RE = re.compile(r"\b(?:" + "|".join(SYMBOL_FAMILIES) + r")[A-Z0-9_]+\b")
 
+# The subset that names a whole feature rather than one of its tensors. Used
+# only to keep --emit readable; the check itself uses all of SYMBOL_FAMILIES.
 HEADLINE = ("LLM_ARCH_", "GGML_OP_", "GGML_TYPE_", "PROJECTOR_TYPE_", "LLAMA_FTYPE_")
 
+# A line worth tracking for survival. Comments and short punctuation drift with
+# every reformat and would make the check noise; a substantial code line does
+# not move on its own.
 TRIVIAL_RE = re.compile(r"^\s*(?://|/\*|\*|\*/|#\s|$)")
 MIN_LINE = 12
 
-# comments are stripped first: a pin that merely NAMES an arch in a comment has not registered it, and
-# holding the wording as a contract fails when upstream rewords it (unslothai#70)
+# Comments are stripped before anything is read off a line. A pin that merely
+# NAMES an arch in a comment has not registered it, and holding the comment's
+# wording as a contract fails the moment upstream rewords it. Observed on
+# unslothai#70, whose comment mentions GGML_OP_SSM_SCAN to explain why it does
+# NOT use it.
 COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|endif|pragma)).*$")
 
+# Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")
 
 
@@ -158,6 +170,9 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
             if code:
                 symbols[cur].update(SYMBOL_RE.findall(code))
 
+    # Only symbols the base does not ALREADY have in that file are evidence of
+    # this pin. Upstream naming an arch in a file the pin also touches is not
+    # something the pin is owed.
     new_symbols: dict[str, list[str]] = {}
     for path, names in symbols.items():
         fresh = sorted(n for n in names
@@ -291,6 +306,9 @@ def main() -> int:
 
         if args.emit:
             report["pins"].append(entry)
+            # Only the families that NAME a feature are printed. Every symbol
+            # is still checked; a new file legitimately contributes a hundred
+            # LLM_TENSOR_ names and listing them buries the one that matters.
             sym = sorted({s for v in contract["symbols"].values() for s in v
                           if s.startswith(HEADLINE)})
             print(f"{name:>18}  {entry['line_count']:>5} lines, "
@@ -327,6 +345,8 @@ def main() -> int:
     if args.emit:
         return 0
 
+    # Notices after the verdict lines, never mixed into them: "upstream took
+    # this, drop the entry" is housekeeping and must not read as a failure.
     for n in notices:
         print(f"note {n}")
     if failed:

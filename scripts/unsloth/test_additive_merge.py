@@ -97,7 +97,8 @@ check("overlapping add/add names the content line, not the braces",
       reason.endswith('twice: log("same");'), reason)
 
 # --- 3b. two independent case arms: braces are shared, content is not -------
-# the real clip.cpp shape; refusing it on `{` and `} break;` took the 09-02 nightly down
+# The real tools/mtmd/clip.cpp shape. Refusing this on `{` and `} break;` is
+# what took the 09-02 nightly's last pin down.
 base = "switch (t) {\n}\n"
 ours = ("switch (t) {\n    case PROJECTOR_TYPE_KIMIK3:\n        {\n"
         "            builder = std::make_unique<clip_graph_kimik3>(ctx, img);\n"
@@ -114,6 +115,8 @@ check("independent case arms keep both bodies once",
       txt.count("} break;") == 2 and txt.count("clip_graph_kimik3") == 1, txt)
 
 # --- 3b2. two case arms that share a body line, which is a coincidence ------
+# The clip.cpp shape after upstream landed DEEPSEEK4V: both arms set the same
+# rope_theta, and refusing on that is the shared-line check backwards.
 base = "switch (t) {\n}\n"
 ours = ("switch (t) {\n    case PROJECTOR_TYPE_KIMIK3:\n        {\n"
         "            hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;\n"

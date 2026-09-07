@@ -128,9 +128,9 @@ jobs:
           done
           exit "$fail"
 
-      # a pin nobody decided about is the failure this file exists to stop: being in
-      # `unchecked` with a reason is fine, being in neither map is how DiffusionGemma went
-      # five weeks with no coverage and no record of it
+      # A pin nobody decided about is the failure this whole file exists to stop.
+      # Being in `unchecked` with a reason is a fine answer; being in neither map
+      # is how DiffusionGemma went five weeks with no coverage and no record of it.
       - name: Every pin is either checked or knowingly unchecked
         run: |
           set -euo pipefail

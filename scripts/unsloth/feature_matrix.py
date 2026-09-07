@@ -37,6 +37,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Output that means "this did not run" from a process that exited 0.
 SKIP_RE = re.compile(r"\bSKIP\b|not supported|unsupported|no tests|0 tests", re.I)
 
 
@@ -77,6 +78,7 @@ def probe_arch(check: dict, b: Path, gpu: bool) -> str:
     rc, out = run([str(b / "test-llama-archs"), "-a", arch, "-s", "1234"], b, gpu)
     if rc != 0:
         raise Unproven(f"test-llama-archs -a {arch} exited {rc}")
+    # The arch's own rows, not the header and not another arch's.
     rows = [ln for ln in out.splitlines() if ln.strip().startswith("|") and f"|{arch:>16}|" in ln
             or (ln.strip().startswith("|") and ln.split("|")[1].strip() == arch)]
     if not rows:
@@ -117,7 +119,8 @@ def probe_mtmd(check: dict, b: Path, gpu: bool) -> str:
     m = re.search(r"assertions\s*:\s*(\d+)", out)
     if not m or int(m.group(1)) == 0:
         raise Unproven("test_projector_registry ran no assertions; the filter matched nothing")
-    # the test walks the whole enum, so it proves the table is sound; that this projector is IN the enum is pin_contract.py's job
+    # The registry test walks the whole enum, so it proves the table is sound.
+    # That the specific projector is IN the enum is pin_contract.py's job.
     return f"projector registry intact over {m.group(1)} assertions"
 
 
@@ -170,6 +173,8 @@ def main() -> int:
             print(f"ok   {name}: " + "; ".join(r["evidence"] for r in entry["results"])
                   + (f"  [{len(entry['deferred'])} needs a GPU]" if entry["deferred"] else ""))
         else:
+            # Nothing was shown either way. Not a failure here, but it must not
+            # read as one of the ok lines.
             print(f"--   {name}: nothing provable without a GPU "
                   f"({len(entry['deferred'])} check(s) deferred)")
 
@@ -183,6 +188,8 @@ def main() -> int:
     if failed:
         print(f"\n{failed} feature(s) could not be shown to work", file=sys.stderr)
         return 1
+    # Say what was NOT proven in the same breath as what was. A run that only
+    # ever prints a success line teaches the reader that green means covered.
     tail = f", {deferred} check(s) need a GPU and were not run" if deferred else ""
     print(f"\nall {len(report['features'])} features demonstrated"
           + (" on GPU" if args.gpu else " on CPU") + tail)
