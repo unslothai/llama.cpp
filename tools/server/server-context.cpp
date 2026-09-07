@@ -3522,7 +3522,13 @@ private:
                 charged.push_back(family);
             }
 
-            res += preempt_n_retained(slot);
+            // what the pool holds now, the previous request's prompt included for a slot just
+            // given a task: the batch builder trims that to the prefix the two share, but
+            // not until the slot is built into a batch, and with continuous batching off that
+            // can be a long time behind a running generation. Measured by the prefix, a
+            // restore was found to fit and attempted against cells still occupied. Under
+            // pressure the planner trims such slots itself, see preempt_normalize_started_all()
+            res += slot.prompt.n_tokens();
         }
 
         return res;
@@ -3618,6 +3624,29 @@ private:
     // budget or stay parked for room it will never use. Keeping only the shared prefix now
     // is what the batch builder does anyway; the chunk reuse it can add on top is given up
     // for a slot the planner has to touch, which is rare.
+    // every started slot, when the pool is short: true when any of them gave cells up
+    bool preempt_normalize_started_all() {
+        bool res = false;
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+                continue;
+            }
+
+            const int32_t before = slot.prompt.n_tokens();
+
+            preempt_normalize_started(slot);
+
+            if (slot.prompt.n_tokens() < before) {
+                SLT_INF(slot, "trimmed to the %d cells its request keeps ahead of the batch builder, %d released\n",
+                        slot.prompt.n_tokens(), before - slot.prompt.n_tokens());
+                res = true;
+            }
+        }
+
+        return res;
+    }
+
     void preempt_normalize_started(server_slot & slot) {
         if (slot.state != SLOT_STATE_STARTED || !slot.task) {
             return;
@@ -3931,7 +3960,18 @@ private:
                     }
                 }
 
-                if (best || !try_clear_idle_slots()) {
+                if (best) {
+                    break;
+                }
+
+                // a slot just given a task still holds the previous request's prompt until
+                // the batch builder trims it; trimmed here instead, the cells it will not
+                // keep are counted out and a parked slot that fits without them comes back
+                if (preempt_normalize_started_all()) {
+                    continue;
+                }
+
+                if (!try_clear_idle_slots()) {
                     break;
                 }
             }
