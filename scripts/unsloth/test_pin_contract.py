@@ -98,8 +98,7 @@ check("intact merge finds the new arch",
 check("intact merge reports no notices", rep["notices"] == [], rep)
 
 # --- 2. the arm is dropped from ONE file: a tree-wide grep would pass ------
-# The real shape: LLM_ARCH_INKLING survives in the enum and the dispatch arm
-# that makes it do anything is gone.
+# the real shape: LLM_ARCH_INKLING survives in the enum, the dispatch arm is gone
 repo, pr_set, sha = make_repo()
 p = repo / "src" / "llama-model.cpp"
 p.write_text(MODEL_CPP_BASE)
@@ -128,8 +127,8 @@ check("line survival names what went missing",
       any("do_the_banded_thing" in x for x in rep["pins"][0]["problems"]), rep)
 
 # --- 5. redundancy: the base already has everything the pin adds ----------
-# Built the way it happens for real: upstream lands the same work, so the base
-# tag has it and the pin is not an ancestor of anything.
+# as it happens for real: upstream lands the same work, so the base tag has it and
+# the pin is not an ancestor of anything
 d = Path(tempfile.mkdtemp(prefix="pc_"))
 git(d, "init", "-q", "-b", "main")
 (d / "src").mkdir()
@@ -163,8 +162,8 @@ check("--emit still derives the contract",
       rep["pins"][0]["added_files"] == ["src/inkling.cpp"], rep)
 
 # --- 7. a comment is not a contract ---------------------------------------
-# unslothai#70 has a comment naming GGML_OP_SSM_SCAN to say it does NOT use it.
-# Holding comment wording would fail the moment upstream rewords it.
+# unslothai#70 names GGML_OP_SSM_SCAN in a comment to say it does NOT use it, and
+# holding that wording would fail the moment upstream rewords it
 repo, pr_set, sha = make_repo()
 git(repo, "checkout", "-q", "pin")
 (repo / "src" / "note.cpp").write_text(

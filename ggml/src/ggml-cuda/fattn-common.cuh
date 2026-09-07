@@ -1091,8 +1091,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    // [TAG_BATCH_INVARIANT] Without this scan the KV loop runs to K->ne[1], which grows with the
-    // other sequences sharing the cache. Scanning the mask bounds it by the sequence's own extent.
+    // [TAG_BATCH_INVARIANT] without this scan the KV loop runs to K->ne[1], which grows with the
+    // other sequences sharing the cache; scanning the mask bounds it by the sequence's own extent
     const bool batch_invariant_KV_max = ggml_cuda_batch_invariant() != 0;
     if (!dst->src[5] && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || batch_invariant_KV_max)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
@@ -1152,9 +1152,8 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else if (dst->src[5] || ggml_cuda_batch_invariant()) {
-        // [TAG_BATCH_INVARIANT] How the KV cache is split between blocks, and therefore the order
-        // in which the partial attention results are combined, follows K->ne[1]. That length grows
-        // with the other sequences sharing the cache, so pin the split to a single block per tile.
+        // [TAG_BATCH_INVARIANT] the KV split between blocks, and so the order the partials combine
+        // in, follows K->ne[1], which grows with the other sequences: pin it to one block per tile
         parallel_blocks = 1;
 
         blocks_num.x = ntiles_x;

@@ -7842,8 +7842,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
-            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only the
-            // CUDA backend reads
+            // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
             if (op->src[5]) {
                 return false;
             }

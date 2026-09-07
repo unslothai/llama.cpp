@@ -1592,8 +1592,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
-            // [TAG_EXACT_CONCURRENCY] src[5] is the exact-concurrency page table, which only the
-            // CUDA backend reads; walking the pool in physical order here would be silently wrong
+            // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads;
+            // walking the pool in physical order here would be silently wrong
             if (op->src[5] != NULL) {
                 return false;
             }

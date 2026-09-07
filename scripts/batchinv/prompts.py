@@ -1,4 +1,4 @@
-# Four distinct prompts, each about 300 tokens of raw text (no chat template).
+# four distinct prompts, each about 300 tokens of raw text (no chat template)
 _BODIES = {
 "P0": """The history of numerical computing is a history of compromises between speed and exactness.
 Early machines used fixed point arithmetic because it was cheap, and programmers carried scaling

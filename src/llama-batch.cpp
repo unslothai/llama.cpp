@@ -573,18 +573,13 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
-            // [TAG_EXACT_CONCURRENCY] a sequence set that still has more tokens to place than a
-            // decode step carries is a prompt, and a prompt shares its arithmetic with whatever
-            // else is in the ubatch, so give it a ubatch of its own. Sets at or below that width
-            // are decode steps, plain or speculative, whose columns the backend's column policy
-            // already keeps exact, so keep grouping those: isolating them too would make one
-            // prompt serialize every concurrent decode for the whole of the prefill, and would run
-            // a speculative verify step once per sequence. Grouped sets must have the same number
-            // of tokens left: the equal-length expansion below would otherwise place a three-token
-            // verify step beside a two-token one as two tokens now and one later, and a memory
-            // that reduces over a chunk of tokens (a chunked state space scan) would then sum in a
-            // different order than the solo run's single three-token ubatch. A set with a
-            // different count waits for a later ubatch.
+            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a
+            // prompt, and a prompt shares its arithmetic with whatever else is in the ubatch, so
+            // give it one of its own. Sets at or below that width are decode steps, kept exact by
+            // the backend's column policy, so keep grouping them or one prompt would serialize
+            // every concurrent decode. Grouped sets must have the same number of tokens left, or
+            // the equal-length expansion below would cut a longer set in two and a memory that
+            // reduces over a chunk of tokens would sum in a different order than the solo run.
             if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 
@@ -612,8 +607,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 } else if (n_left != n_left_first) {
                     continue;
                 } else if ((cur_seq_set.size() + 1) * n_left_first > n_ubatch) {
-                    // one more set would not finish in this ubatch: the expansion below would
-                    // then cut every set part way, the chunking the guard exists to prevent
+                    // one more set would not finish here, and the expansion below would then cut
+                    // every set part way: the chunking this guard exists to prevent
                     break;
                 }
             }
