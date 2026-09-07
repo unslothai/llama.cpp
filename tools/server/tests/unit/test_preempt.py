@@ -497,7 +497,10 @@ def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_w
     server.enable_ctx_shift = True
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
     server.start()
-    n_predict = 6000
+    # long enough that the resident is still cycling through shifts two seconds after the
+    # heads were parked, which is when a rotation is first asked for: at 6000 this model
+    # finished in under three seconds on a fast host and nothing was ever refused
+    n_predict = 12000
     prompts = [
         "Once upon a time there was a brave knight who",
         "The quick brown fox jumps over the lazy dog and",
