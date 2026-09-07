@@ -3454,12 +3454,16 @@ private:
 
         int32_t res     = 0;
         int32_t res_pmt = 0;
+        int32_t n_pmt   = 0;
 
         // [TAG_EXACT_CONCURRENCY] reserve the cells the next step ADDS, not its tokens: the used figure already rounds every tail page up, and only a page crossing can empty the pool
         for (const auto & slot : slots) {
             const int32_t n_cur = slot.prompt.n_tokens();
 
-            switch (slot.state) {
+            // [TAG_PREEMPT_ASYNC] a restoring slot decodes as soon as its copy lands, so it is charged the step of the state it goes back to, or that first step preempts somebody else
+            const slot_state state = slot.state == SLOT_STATE_RESTORING ? slot.state_before_preempt : slot.state;
+
+            switch (state) {
                 case SLOT_STATE_GENERATING:
                 case SLOT_STATE_DONE_PROMPT:
                     {
@@ -3468,34 +3472,15 @@ private:
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
+                        // preempt_n_retained() reads the live state, so a restoring slot is charged from what it holds
                         const int32_t n_have = preempt_n_retained(slot);
                         const int32_t n_left = slot.task ? slot.task->n_tokens() - n_have : 0;
 
                         res_pmt += preempt_n_cells_step(n_have, std::max(1, std::min(n_batch, n_left)));
-                    } break;
-                case SLOT_STATE_RESTORING:
-                    {
-                        // [TAG_PREEMPT_ASYNC] it starts decoding as soon as its copy lands, so its step has to be reserved now, or its first step preempts somebody else
-                        if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
-                            res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
-                        } else {
-                            const int32_t n_left = slot.task ? slot.task->n_tokens() - n_cur : 0;
-
-                            res_pmt += preempt_n_cells_step(n_cur, std::max(1, std::min(n_batch, n_left)));
-                        }
+                        n_pmt++;
                     } break;
                 default:
                     break;
-            }
-        }
-
-        int32_t n_pmt = 0;
-
-        for (const auto & slot : slots) {
-            const slot_state state = slot.state == SLOT_STATE_RESTORING ? slot.state_before_preempt : slot.state;
-
-            if (state == SLOT_STATE_STARTED || state == SLOT_STATE_PROCESSING_PROMPT) {
-                n_pmt++;
             }
         }
 
