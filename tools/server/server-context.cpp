@@ -4290,6 +4290,11 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
 
+        // [TAG_PREEMPT_ASYNC] and once more here: a shift --cache-reuse asks for is found
+        // inside pre_decode(), after the wait above, and the decode below applies it in
+        // place like any other
+        preempt_wait_for_shift();
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {

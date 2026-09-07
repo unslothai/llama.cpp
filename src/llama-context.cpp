@@ -483,7 +483,12 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    // transfers outlive nothing: the server frees its slots before the contexts
+    // A transfer still alive is drained first: synchronize() covers the graph backends,
+    // not the copy backend a transfer owns, and the KV buffers it may still be reading or
+    // writing are about to go. It is then let go of, so freeing it later touches nothing
+    // of this context.
+    state_seq_copies_drain();
+
     for (auto & it : state_copy_fences) {
         ggml_backend_event_free(it.second);
     }
@@ -3193,7 +3198,7 @@ struct llama_state_seq_copy {
 
     ~llama_state_seq_copy() {
         if (counted) {
-            ctx->state_seq_copy_release();
+            ctx->state_seq_copy_release(this);
         }
 
         wait();
@@ -3626,10 +3631,20 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
 // [TAG_STATE_ASYNC]
 
-void llama_context::state_seq_copy_release() {
-    GGML_ASSERT(state_copy_live > 0);
+void llama_context::state_seq_copies_drain() {
+    for (auto * cpy : state_copies) {
+        cpy->wait();
+        cpy->ctx     = nullptr;
+        cpy->counted = false;
+    }
 
-    if (--state_copy_live == 0) {
+    state_copies.clear();
+}
+
+void llama_context::state_seq_copy_release(llama_state_seq_copy * cpy) {
+    GGML_ASSERT(state_copies.erase(cpy) == 1);
+
+    if (state_copies.empty()) {
         for (auto & it : state_copy_fences) {
             ggml_backend_event_free(it.second);
         }
@@ -3772,7 +3787,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
     // the fences say where the compute streams are now, before any transfer asks
     state_seq_copy_fence();
 
-    state_copy_live++;
+    state_copies.insert(cpy.get());
     cpy->counted = true;
 
     return cpy.release();
