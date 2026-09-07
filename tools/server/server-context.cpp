@@ -3741,7 +3741,11 @@ private:
         int32_t n_pmt = 0;
 
         for (const auto & slot : slots) {
-            if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            // a slot restoring into the prompt phase joins the next prompt batch too, and
+            // reserves its chunk above, so it can cross a boundary of its own as well
+            const slot_state state = slot.state == SLOT_STATE_RESTORING ? slot.state_before_preempt : slot.state;
+
+            if (state == SLOT_STATE_STARTED || state == SLOT_STATE_PROCESSING_PROMPT) {
                 n_pmt++;
             }
         }
@@ -3962,6 +3966,16 @@ private:
                     preempt_kv_used(), n_ctx,
                     slot.n_preempt);
         }
+    }
+
+    bool preempt_copies_in_flight() const {
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTING) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Wait for one outstanding park, the last thing tried before giving up on finding room.
@@ -4295,13 +4309,21 @@ private:
                 continue;
             }
 
-            // [TAG_PREEMPT_ASYNC] Out of room for the step about to be built, rather than
-            // merely short of the lookahead the asynchronous path keeps. A park that has
-            // been issued but not landed is holding cells that are already spoken for, and
-            // waiting for it is both quicker and more useful than parking somebody else,
-            // whose cells would not come back this iteration either.
-            if (n_used + preempt_n_margin() > n_cells && preempt_wait_in_flight()) {
-                continue;
+            // [TAG_PREEMPT_ASYNC] A park that has been issued but not landed is holding
+            // cells that are already spoken for. Out of room for the step about to be
+            // built, waiting for it is both quicker and more useful than parking somebody
+            // else, whose cells would not come back this iteration either. Short only of
+            // the lookahead the asynchronous path keeps, the step itself fits: it goes
+            // ahead beside the copy, which is the overlap the path exists for, and the
+            // planner looks again once the copy has landed.
+            if (preempt_copies_in_flight()) {
+                if (n_used > n_cells) {
+                    if (preempt_wait_in_flight()) {
+                        continue;
+                    }
+                } else {
+                    break;
+                }
             }
 
             server_slot * victim = preempt_pick_victim();
