@@ -3337,7 +3337,51 @@ private:
     }
 
     // whether parking this slot stays under --preempt-ram
-    bool preempt_fits_budget(const server_slot & slot) const {
+    // [TAG_PREEMPT_ASYNC] a restored slot keeps its pinned buffer for its next park, and
+    // that capacity counts against the budget while it holds no state. When a park does
+    // not fit, that idle capacity is what to give back first: largest first, never a
+    // buffer that still holds a parked sequence or has a copy in flight, and never the
+    // candidate's own, which it reuses. Without this a budget that holds one sequence was
+    // spent for good by the first restore: every later park was refused, and once the
+    // slot holding the buffer was the leader nothing could be parked at all.
+    void preempt_reclaim_idle_ram(size_t budget, size_t extra, const server_slot & keep) {
+        for (;;) {
+            if (preempt_ram_used() + extra <= budget) {
+                return;
+            }
+
+            server_slot * best = nullptr;
+
+            for (auto & other : slots) {
+                if (&other == &keep) {
+                    continue;
+                }
+
+                if (other.state == SLOT_STATE_PREEMPTED || other.state == SLOT_STATE_PREEMPTING || other.state == SLOT_STATE_RESTORING) {
+                    continue;
+                }
+
+                if (other.preempt_state_size() == 0) {
+                    continue;
+                }
+
+                if (!best || other.preempt_state_size() > best->preempt_state_size()) {
+                    best = &other;
+                }
+            }
+
+            if (!best) {
+                return;
+            }
+
+            SLT_INF(*best, "%.1f MiB of idle parked RAM returned so that another slot can park\n",
+                    best->preempt_state_size() / (1024.0 * 1024.0));
+
+            best->preempt_state_free();
+        }
+    }
+
+    bool preempt_fits_budget(const server_slot & slot) {
         if (params_base.preempt_ram_mib < 0) {
             return true;
         }
@@ -3350,6 +3394,8 @@ private:
         const size_t need  = slot.preempt_state_required();
         const size_t extra = need > held ? need - held : 0;
 
+        preempt_reclaim_idle_ram(budget, extra, slot);
+
         return preempt_ram_used() + extra <= budget;
     }
 
@@ -3360,17 +3406,26 @@ private:
     // [TAG_PREEMPT_ASYNC] an asynchronous head keeps its pinned buffer through the restore
     // (see preempt_state_size), so nothing of it leaves; what the resident already holds is
     // reused, as in preempt_fits_budget, and only the rest is charged.
-    bool preempt_fits_budget_for_rotation(const server_slot & slot, const server_slot & head) const {
+    bool preempt_fits_budget_for_rotation(const server_slot & slot, const server_slot & head) {
         if (params_base.preempt_ram_mib < 0) {
             return true;
         }
 
         const size_t budget  = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
-        const size_t used    = preempt_ram_used();
-        const size_t leaving = head.preempt_is_async() ? 0 : std::min(used, head.preempt_state_size());
         const size_t held    = slot.preempt_state_size();
         const size_t need    = slot.preempt_state_required();
         const size_t extra   = need > held ? need - held : 0;
+
+        // the head is parked, so it is never among the idle buffers given back here
+        {
+            const size_t used    = preempt_ram_used();
+            const size_t leaving = head.preempt_is_async() ? 0 : std::min(used, head.preempt_state_size());
+
+            preempt_reclaim_idle_ram(budget + leaving, extra, slot);
+        }
+
+        const size_t used    = preempt_ram_used();
+        const size_t leaving = head.preempt_is_async() ? 0 : std::min(used, head.preempt_state_size());
 
         return used - leaving + extra <= budget;
     }

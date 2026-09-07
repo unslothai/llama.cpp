@@ -719,3 +719,40 @@ def test_a_parent_and_child_that_do_not_fit_alone_get_the_context_error_and_the_
     after = _complete(8)
     assert after.status_code == 200
     assert after.body["timings"]["predicted_n"] == 8
+
+
+def test_a_restored_slot_gives_its_idle_buffer_back_when_another_slot_needs_to_park():
+    # Under a finite --preempt-ram an asynchronous slot keeps its pinned buffer after a
+    # restore, for its next park, and that idle capacity counted against the budget. With
+    # a budget that holds one sequence, the first restore spent it for good: every later
+    # park of the other slot was refused. The idle buffer is given back when another slot
+    # needs the room, and both slots go on being parked.
+    global server
+    # a pool of 8192 cells, but the model's own window is 2048, so each generation stays
+    # under that; 1800 tokens of this model's state is about 1.1 MiB, so a budget of
+    # 2 MiB holds one sequence and not two
+    server.n_ctx = 8192
+    server.n_gpu_layer = 99
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "256"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
+    text = _start_async()
+    _require_async(text)
+    log = LogReader(server.log_path)
+
+    n_predict = 1800
+    results = parallel_function_calls([
+        (_complete, (n_predict, "Once upon a time there was a brave knight who")),
+        (_complete, (n_predict, "The quick brown fox jumps over the lazy dog and")),
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "idle parked RAM returned" in text, "the idle buffer of a restored slot was never given back"
+    import re
+    parked = re.findall(r"id\s+(\d+) \| task \d+ \| preempted on request", text)
+    assert {"0", "1"} <= set(parked), f"only slots {sorted(set(parked))} were ever parked"
+
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["truncated"] is False
