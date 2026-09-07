@@ -165,6 +165,10 @@ struct llama_context {
     size_t state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id,      llama_state_seq_flags flags);
     size_t state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags);
 
+    // [TAG_STATE_ASYNC] mark the point the compute streams have reached, for the copies to
+    // wait for; recorded after every decode and encode once a transfer exists
+    void state_seq_copy_fence();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -356,6 +360,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // [TAG_STATE_ASYNC] one event per device that copies asynchronously, recorded on the
+    // compute stream at the end of every decode; see state_seq_copy_fence()
+    std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
