@@ -4244,6 +4244,12 @@ private:
             pre_decode_shift();
             update_preemption();
 
+            // [TAG_PREEMPT_ASYNC] before pre_decode(), not only before the target decode: the
+            // draft it asks for is a decode on the draft context, which applies that cache's
+            // pending shift in place, and a park or restore still copying draft cells would
+            // read through it or be overwritten by it just the same
+            preempt_wait_for_shift();
+
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
@@ -4279,8 +4285,6 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
-
-        preempt_wait_for_shift();
 
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);

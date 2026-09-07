@@ -169,6 +169,9 @@ struct llama_context {
     // wait for; recorded after every decode and encode once a transfer exists
     void state_seq_copy_fence();
 
+    // a transfer letting go of this context: the last one takes the fences with it
+    void state_seq_copy_release();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -364,6 +367,10 @@ private:
     // [TAG_STATE_ASYNC] one event per device that copies asynchronously, recorded on the
     // compute stream at the end of every decode; see state_seq_copy_fence()
     std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
+
+    // transfers alive on this context; the fences go when the last one does, so a server
+    // that made transfers and then gave them up records nothing after its decodes
+    int32_t state_copy_live = 0;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
