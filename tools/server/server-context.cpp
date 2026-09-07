@@ -39,16 +39,6 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// [TAG_EXACT_CONCURRENCY] read from the env: the answer is needed before a context exists
-static bool server_exact_concurrency() {
-    static const bool enabled = []() {
-        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
-        return val && atoi(val) != 0;
-    }();
-
-    return enabled;
-}
-
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -99,16 +89,12 @@ constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // a resident cyclin
 // [TAG_PREEMPT_ASYNC] an asynchronous park only releases its cells when its copy lands, so it must fire this many decode steps before the pool would run out
 constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
 
-struct llama_state_seq_copy_deleter {
-    void operator()(llama_state_seq_copy * cpy) const { llama_state_seq_copy_free(cpy); }
-};
-
 using llama_state_seq_copy_ptr = std::shared_ptr<llama_state_seq_copy>;
 
 static llama_state_seq_copy_ptr llama_state_seq_copy_make(llama_context * ctx) {
     llama_state_seq_copy * cpy = ctx ? llama_state_seq_copy_init(ctx) : nullptr;
 
-    return cpy ? llama_state_seq_copy_ptr(cpy, llama_state_seq_copy_deleter{}) : llama_state_seq_copy_ptr();
+    return cpy ? llama_state_seq_copy_ptr(cpy, llama_state_seq_copy_free) : llama_state_seq_copy_ptr();
 }
 
 // [TAG_EXACT_CONCURRENCY] the planner counts cells, not tokens: a page belongs to one sequence, so a token count sees room find_slot cannot find and nobody is ever parked
@@ -3323,12 +3309,13 @@ private:
         }
     }
 
-    bool preempt_fits_budget(const server_slot & slot) {
-        if (params_base.preempt_ram_mib < 0) {
-            return true;
-        }
+    // the --preempt-ram ceiling in bytes; the unlimited setting is a ceiling nothing reaches
+    size_t preempt_ram_budget() const {
+        return params_base.preempt_ram_mib < 0 ? SIZE_MAX : (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+    }
 
-        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+    bool preempt_fits_budget(const server_slot & slot) {
+        const size_t budget = preempt_ram_budget();
 
         // what this slot already holds is counted by preempt_ram_used() and reused, so a park costs only the rest
         const size_t held  = slot.preempt_state_size();
@@ -3342,13 +3329,7 @@ private:
 
     // [TAG_PREEMPT_ASYNC] over budget, a buffer held by a running slot would keep every other slot from being parked at all
     void preempt_trim_ram(server_slot & slot) {
-        if (params_base.preempt_ram_mib < 0) {
-            return;
-        }
-
-        const size_t budget = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
-
-        if (preempt_ram_used() > budget && slot.preempt_state_size() > 0) {
+        if (preempt_ram_used() > preempt_ram_budget() && slot.preempt_state_size() > 0) {
             SLT_INF(slot, "%.1f MiB of parked RAM returned: the pool is over its budget\n", slot.preempt_state_size() / (1024.0 * 1024.0));
             slot.preempt_state_free();
         }
@@ -3431,7 +3412,7 @@ private:
 
     // [TAG_PREEMPT_ASYNC] the room the pool is kept clear of, so everything still decoding has somewhere to put its tokens until a park lands; a resume candidate is charged the same runway
     int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
-        if (!preempt_async_active()) {
+        if (!preempt_async_ok) {
             // [TAG_EXACT_CONCURRENCY] a margin of eight cells is no margin where a step can cost a whole page
             return preempt_n_cells(PREEMPT_N_MARGIN);
         }
@@ -3493,10 +3474,6 @@ private:
         bool res = false;
 
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_STARTED || !slot.task) {
-                continue;
-            }
-
             const int32_t before = slot.prompt.n_tokens();
 
             preempt_normalize_started(slot);
@@ -3621,11 +3598,6 @@ private:
     }
 
     // called once per update_slots(), before the batch is built: every slot is then at a token boundary with no draft in flight, so it can be removed whole
-    // [TAG_PREEMPT_ASYNC] is any slot parking or resuming through a transfer right now
-    bool preempt_async_active() const {
-        return preempt_async_ok;
-    }
-
     // [TAG_PREEMPT] park a slot: a synchronous park is finished here, an asynchronous one only issued, and update_preempt_copies() counts it when its copy lands.
     // The notice goes with the save, not the cell release: preempt_save() has already detached the slot, so a release-time notice would leave the copy's silence unexplained.
     bool preempt_park(server_slot & slot, int64_t t_start) {
@@ -5732,7 +5704,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.oaicompat_model   = meta->model_name;
 
             // [TAG_EXACT_CONCURRENCY] exact mode gives a page to a single sequence, so refuse an n_cmpl > 1 child here, where it becomes a 400 rather than at seq_cp
-            if (task.params.n_cmpl > 1 && server_exact_concurrency()) {
+            if (task.params.n_cmpl > 1 && common_exact_concurrency()) {
                 throw std::runtime_error(
                     "n > 1 is not supported while LLAMA_EXACT_CONCURRENCY is set: each "
                     "completion needs its own sequence, and in exact mode a KV page belongs "
