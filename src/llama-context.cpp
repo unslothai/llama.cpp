@@ -104,7 +104,6 @@ llama_context::llama_context(
 
     // [TAG_EXACT_CONCURRENCY] the widest decode step this context can build, reported so a backend that splits columns covers it; reported at the end of the constructor
     if (llama_exact_concurrency()) {
-        // an explicit column bound below this context's width would leave decodes batched above it, so the report refuses it
         if (!llama_exact_check_n_seq(cparams.n_seq_max)) {
             throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
         }
@@ -1215,7 +1214,6 @@ void llama_context::set_causal_attn(bool value) {
         return;
     }
 
-    // [TAG_EXACT_CONCURRENCY] the paged attention is causal, so a context with a cache keeps causal attention rather than asserting in the next graph
     if (!value && memory && llama_exact_concurrency()) {
         LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so causal attention cannot be turned off; the change is refused\n", __func__);
         return;
@@ -4812,8 +4810,6 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
-// [TAG_STATE_ASYNC]
-
 llama_state_seq_copy * llama_state_seq_copy_init(llama_context * ctx) {
     return ctx->state_seq_copy_init();
 }
@@ -4851,7 +4847,6 @@ void llama_state_seq_copy_buf_free(llama_state_seq_copy * cpy) {
 }
 
 bool llama_state_seq_copy_buf_is_pinned(llama_state_seq_copy * cpy) {
-    // what was allocated, not what could be: a host buffer type is free to hand back ordinary memory, as CUDA does under GGML_CUDA_NO_PINNED
     return cpy->pinned;
 }
 

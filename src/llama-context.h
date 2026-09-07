@@ -40,7 +40,6 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
-// [TAG_STATE_ASYNC] defined in llama-context.cpp
 struct llama_state_seq_copy;
 
 struct llama_context {

@@ -174,7 +174,6 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
     }
 }
 
-// [TAG_EXACT_CONCURRENCY]
 bool llama_exact_concurrency() {
     static const bool enabled = []() {
         const char * val = getenv("LLAMA_EXACT_CONCURRENCY");

@@ -96,7 +96,6 @@ def _assert_completed(results, n_predict: int, whole: bool = False):
 
 
 def test_forced_preemption_does_not_change_the_output():
-    # park and restore the only running slot every 8 tokens: the batch shape is the same at every step, so any difference in the output is the preemption's fault
     _start(n_ctx=512)
     reference = _complete(64)
     assert reference.status_code == 200
@@ -203,7 +202,6 @@ def test_two_prompts_that_overflow_the_pool_together_both_finish():
 
 
 def test_a_generating_slot_and_a_large_prompt_both_finish():
-    # a long generation meets a large prompt arriving beside it: the prompt is admitted chunk by chunk, whoever is smaller is parked, and both finish
     log = _start(n_ctx=256)
 
     prompt_b, n_b = _prompt_of_about(150, "Charlie")
@@ -228,7 +226,6 @@ def test_a_generating_slot_and_a_large_prompt_both_finish():
 
 
 def test_preempt_ram_zero_disables_preemption():
-    # --preempt-ram 0 switches back to the old behaviour: nothing is parked and the KV-full path ends the requests
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
     log = _start(n_ctx=256)
 
@@ -289,7 +286,6 @@ def _require_async(text: str):
 
 
 def test_async_preemption_does_not_change_the_output():
-    # the synchronous determinism question asked of the asynchronous path: with one request the batch shape is fixed, so a continuation that is not byte-identical is the transfer's fault
     text = _start_async(n_ctx=512, n_gpu_layer=99)
     _require_async(text)
 
@@ -389,7 +385,6 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 
 
 def test_no_preempt_async_falls_back_to_the_synchronous_path():
-    # The flag has to really switch it off, so that the two can be compared on one binary.
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "0"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     log = _start(n_ctx=512, n_gpu_layer=99)
@@ -471,7 +466,6 @@ def test_the_last_resort_parks_instead_of_ending_everyone():
 
 
 def test_the_last_resort_works_with_an_unlimited_budget():
-    # --preempt-ram -1 is the documented unlimited setting and must enable the last resort too
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "-1"
     log = _start(n_ctx=256)
@@ -487,7 +481,6 @@ def test_the_last_resort_works_with_an_unlimited_budget():
 
 
 def test_the_last_resort_rewinds_a_prompt_in_flight():
-    # the failed chunk comes back off the slot's tokens and is processed again after the resume, neither skipped nor fed twice
     os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
     log = _start(n_ctx=256)
 
@@ -605,7 +598,6 @@ def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_w
 
 
 def test_a_recurrent_model_is_served_without_preemption():
-    # a recurrent cache holds one state per sequence whatever its length, so preemption is off for such a model and the forced-park knob parks nothing
     path = os.environ.get("LLAMA_SERVER_TEST_RECURRENT_MODEL")
     if path:
         server.model_file = path

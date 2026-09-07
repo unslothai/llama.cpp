@@ -71,8 +71,6 @@ constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the res
 constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a streaming slot is parked
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 
-// [TAG_PREEMPT] LLAMA_SERVER_PREEMPT_RESUME: head (the default) resumes by park time and lets nobody pass a head that does not fit; pass restores most-preempted-first
-// [TAG_PREEMPT] the SSE comment for a park or resume; prompt 0 keeps the bare form single-prompt clients match on
 static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
     std::string res = notice.parked ? ": preempted" : ": resumed";
 
@@ -353,7 +351,6 @@ struct server_slot {
         prompt.clear();
     }
 
-    // [TAG_PREEMPT] state of a slot whose cells were taken back; the task, sampler, text and stream stay, so a resume is a memcpy
     slot_state           state_before_preempt = SLOT_STATE_IDLE;
     std::vector<uint8_t> preempt_state_tgt;
     std::vector<uint8_t> preempt_state_dft;
@@ -366,7 +363,6 @@ struct server_slot {
         return (bool) preempt_cpy_tgt;
     }
 
-    // the target's transfer and the draft's are always driven together, so a figure is the sum over both and a call is made on both
     template <typename F>
     auto preempt_sum(F f) const -> decltype(f(preempt_cpy_tgt.get())) {
         if (!preempt_is_async()) {
@@ -450,7 +446,6 @@ struct server_slot {
                (!preempt_cpy_dft || llama_state_seq_copy_done(preempt_cpy_dft.get()));
     }
 
-    // back in the state it was parked from, with a speculative context to match: the draft went out with the cells
     bool preempt_resumed() {
         n_preempt_fail = 0;
 
@@ -690,7 +685,6 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        // [TAG_PREEMPT]
         preempt_state_free();
         state_before_preempt = SLOT_STATE_IDLE;
         n_preempt            = 0;
@@ -850,8 +844,7 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
-            // [TAG_PREEMPT] a parked slot's cells are already gone, so the mirror must not outlive them or the next task prefix-matches an empty cache
-            // [TAG_PREEMPT_ASYNC] wait for any copy first: its host buffer and its cells are about to be handed on
+            // [TAG_PREEMPT] [TAG_PREEMPT_ASYNC] a parked slot's cells are already gone, so the mirror must not outlive them or the next task prefix-matches an empty cache; wait for any copy first, its buffer and its cells are about to be handed on
             if (preempt_is_out()) {
                 preempt_copy_wait();
                 preempt_state_free();
@@ -1630,7 +1623,6 @@ private:
             }
         }
 
-        // [TAG_PREEMPT_ASYNC] the slots either all park through a transfer or none do
         {
             preempt_async_ok = !slots.empty();
 
@@ -1671,7 +1663,6 @@ private:
             }
         }
 
-        // [TAG_EXACT_CONCURRENCY] ask the cache how it allocates rather than assume a cell per token
         {
             preempt_alloc_granularity = (int32_t) std::max(1u, llama_memory_alloc_granularity(llama_get_memory(ctx_tgt)));
 
@@ -2428,7 +2419,6 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // [TAG_PREEMPT] tell a streaming client its slot was parked or restored; the HTTP layer sends an SSE comment, which a client that does not know about preemption never sees
     void send_preempt_notice(server_slot & slot, bool parked) {
         if (!slot.task || !slot.task->params.stream) {
             return;
@@ -3183,8 +3173,6 @@ private:
     };
 #endif
 
-    // [TAG_PREEMPT] server-side request preemption
-
 
     // LLAMA_SERVER_PREEMPT_EVERY=N: preempt every generating slot every N tokens, pressure or not, so the determinism test can blame any difference on the preemption
     int32_t preempt_test_every = 0;
@@ -3210,7 +3198,6 @@ private:
     // LLAMA_SERVER_PREEMPT_RESUME=head or pass, read at load, per context
     bool preempt_resume_head = true;
 
-    // a recurrent cache has no cell pool to run out of, so preemption is off for those models; a hybrid keeps its attention cache and stays on
     bool preempt_recurrent = false;
 
     bool preempt_batch_abandoned = false;
@@ -3222,7 +3209,6 @@ private:
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
-    // [TAG_PREEMPT_ASYNC] whether the kind of host memory the parks got has been reported; only knowable once a buffer exists
     bool preempt_ram_kind_logged = false;
 
     void preempt_log_ram_kind(const server_slot & slot) {
@@ -3266,7 +3252,7 @@ private:
         return res;
     }
 
-    // [TAG_PREEMPT_ASYNC] whether parking this slot stays under --preempt-ram; a restored slot keeps its pinned buffer, so idle capacity is given back largest first when a park does not fit
+    // [TAG_PREEMPT_ASYNC] a restored slot keeps its pinned buffer, so that idle capacity is given back largest first when a park does not fit under --preempt-ram
     void preempt_reclaim_idle_ram(size_t budget, size_t extra, const server_slot & keep) {
         for (;;) {
             if (preempt_ram_used() + extra <= budget) {
@@ -3304,7 +3290,6 @@ private:
         }
     }
 
-    // the --preempt-ram ceiling in bytes; the unlimited setting is a ceiling nothing reaches
     size_t preempt_ram_budget() const {
         return params_base.preempt_ram_mib < 0 ? SIZE_MAX : (size_t) params_base.preempt_ram_mib * 1024 * 1024;
     }
@@ -3322,7 +3307,6 @@ private:
         return preempt_ram_used() + extra <= budget;
     }
 
-    // [TAG_PREEMPT_ASYNC] over budget, a buffer held by a running slot would keep every other slot from being parked at all
     void preempt_trim_ram(server_slot & slot) {
         if (preempt_ram_used() > preempt_ram_budget() && slot.preempt_state_size() > 0) {
             SLT_INF(slot, "%.1f MiB of parked RAM returned: the pool is over its budget\n", slot.preempt_state_size() / (1024.0 * 1024.0));
@@ -3380,8 +3364,6 @@ private:
             }
 
             // [TAG_PREEMPT_ASYNC] deliberately not skipped: a slot with a copy in flight holds cells either way, and skipping it would hand the same cells out twice
-
-            // [TAG_EXACT_CONCURRENCY] the tail page is charged in full: it cannot be given to anybody else
 
             if (slot.state == SLOT_STATE_WAIT_OTHER) {
                 res += preempt_n_cells(slot.prompt.n_tokens());
@@ -3448,7 +3430,6 @@ private:
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
-                        // preempt_n_retained() reads the live state, so a restoring slot is charged from what it holds
                         const int32_t n_have = preempt_n_retained(slot);
                         const int32_t n_left = slot.task ? slot.task->n_tokens() - n_have : 0;
 
@@ -3463,7 +3444,6 @@ private:
         return res + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
     }
 
-    // keep the slot furthest along, it is the closest to giving its cells back; among the rest prefer one not preempted PREEMPT_N_STARVED times, then the smallest
     // [TAG_PREEMPT] trim a just-started slot to the prefix it keeps first, or it is copied out, charged and sized by the previous request's prompt
     bool preempt_normalize_started_all() {
         bool res = false;
@@ -3592,9 +3572,7 @@ private:
         return a.prompt.n_tokens() < b.prompt.n_tokens();
     }
 
-    // called once per update_slots(), before the batch is built: every slot is then at a token boundary with no draft in flight, so it can be removed whole
-    // [TAG_PREEMPT] park a slot: a synchronous park is finished here, an asynchronous one only issued, and update_preempt_copies() counts it when its copy lands.
-    // The notice goes with the save, not the cell release: preempt_save() has already detached the slot, so a release-time notice would leave the copy's silence unexplained.
+    // [TAG_PREEMPT] park a slot: a synchronous park is finished here, an asynchronous one only issued, and update_preempt_copies() counts it when its copy lands. The notice goes with the save, not the cell release: preempt_save() has already detached the slot, so a release-time notice would leave the copy's silence unexplained.
     bool preempt_park(server_slot & slot, int64_t t_start) {
         slot.t_preempt_copy_us = t_start;
 
@@ -3613,7 +3591,6 @@ private:
         return true;
     }
 
-    // [TAG_PREEMPT_ASYNC] a park whose copy has landed; `note` says how it was waited for, if it was
     void preempt_parked(server_slot & slot, const char * note) {
         metrics.n_preempt++;
 
@@ -3687,7 +3664,6 @@ private:
         return false;
     }
 
-    // wait for one outstanding park, the last thing tried before giving up on room: the decode then waits for the copy exactly as the synchronous path did
     bool preempt_wait_in_flight() {
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PREEMPTING) {
@@ -3754,7 +3730,6 @@ private:
 
             server_slot * best = nullptr;
 
-            // a parked slot that would not fit an empty pool can never be restored, so report it as the single-conversation overflow and rescan without it
             const auto impossible = std::find_if(parked.begin(), parked.end(),
                     [this, n_cells](const server_slot * slot) { return preempt_n_need(*slot) > n_cells; });
 
@@ -3882,7 +3857,6 @@ private:
                 break;
             }
 
-            // [TAG_PREEMPT_ASYNC] with a transfer the copy has only been issued; update_preempt_copies() counts and logs it when it lands
             if (best->state == SLOT_STATE_RESTORING) {
                 SLT_WRN(*best, "resumed after %.2f s: %d tokens, restore issued in %.2f ms (%zu transfers, %.2f ms sync), kv %d/%d, preemptions %d\n",
                         (ggml_time_us() - best->t_preempt_us) / 1e6,
@@ -3960,7 +3934,6 @@ private:
                 break; // could not park it; the existing retry ladder is still behind us
             }
 
-            // [TAG_PREEMPT_ASYNC] the copy has only been issued and the cells are still the victim's, so nothing further can be decided about the pool this iteration
             if (victim->state == SLOT_STATE_PREEMPTING) {
                 SLT_WRN(*victim, "preempted: %d cells, park issued in %.2f ms (%zu transfers, %.2f ms sync), %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
                         n_tokens,
@@ -3970,8 +3943,7 @@ private:
                         preempt_kv_used(), n_cells, n_used,
                         victim->n_preempt);
 
-                // [TAG_PREEMPT_ASYNC] short of the lookahead only, the step still fits and leaving is the point; out of room
-                // for it the cells are held until the copy lands, so the retry ladder ends every request instead of waiting
+                // [TAG_PREEMPT_ASYNC] short of the lookahead only, the step still fits and leaving is the point; out of room for it the cells are held until the copy lands, so the retry ladder ends every request instead of waiting
                 if (n_used + preempt_n_margin() > n_cells) {
                     continue;
                 }
@@ -3989,7 +3961,6 @@ private:
     }
 
     // the checks a request has to pass before its prompt is processed; true when it is rejected. An empty prompt is not here: it is a final response, not an error.
-    // [TAG_PREEMPT] the planner asks the same question before parking a started slot: a notice opens the stream, and a rejected request would get 200 plus an in-stream error
     bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
         if (!slot.task) {
             return false;
@@ -4136,7 +4107,6 @@ private:
 #endif
 
                 if (preempt_batch_abandoned) {
-                    // [TAG_PREEMPT] the rest of this batch never ran; the next pass rebuilds it
                     preempt_batch_abandoned = false;
                     break;
                 }
@@ -4170,7 +4140,6 @@ private:
 
     // apply context-shift if needed
     // TODO: simplify and improve
-    // [TAG_PREEMPT] runs before update_preemption() so the pool is measured after the shift
     void pre_decode_shift() {
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
@@ -4510,7 +4479,6 @@ private:
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
-                                            // [TAG_PREEMPT_ASYNC] applied in place inside the next llama_decode, like a context shift
                                             preempt_shift_pending = true;
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -4886,7 +4854,6 @@ private:
         }
     }
 
-    // [TAG_PREEMPT] the retry ladder ran out: give the batch up, rewind every resident to the token boundary the cache is at and park the smallest. Multimodal keeps the old path.
     // [TAG_PREEMPT_ASYNC] whether a park can happen at all and go asynchronously
     bool preempt_async_possible() const {
         return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
@@ -4897,6 +4864,7 @@ private:
         return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
+    // [TAG_PREEMPT] the retry ladder ran out: give the batch up, rewind every resident to the token boundary the cache is at and park the smallest. Multimodal keeps the old path.
     bool preempt_last_resort(int32_t off) {
         if (!preempt_last_resort_possible()) {
             return false;
@@ -4905,7 +4873,6 @@ private:
         int32_t n_running = 0;
 
         for (auto & slot : slots) {
-            // [TAG_PREEMPT_ASYNC] a slot in transfer is not in this batch either way
             if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED || slot.preempt_in_flight()) {
                 continue;
             }
@@ -4981,7 +4948,6 @@ private:
         return true;
     }
 
-    // [TAG_PREEMPT] whether a slot in the batch has its sampled token and a draft in it
     bool batch_has_spec_groups() const {
         for (const auto & slot : slots) {
             if (!slot.spec_i_batch.empty()) {
@@ -5056,7 +5022,6 @@ private:
                 }
 
                 if (n_batch == 1 && ret == 1) {
-                    // [TAG_PREEMPT] park instead of ending everyone, when there is a budget to park into
                     if (preempt_last_resort(off)) {
                         preempt_batch_abandoned = true;
                         return true;
@@ -5082,7 +5047,6 @@ private:
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
-                        // [TAG_PREEMPT] a parked slot is not part of this failure and comes back when there is room
                         if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED && !slot.preempt_in_flight()) {
                             send_error(slot, err);
                             slot.release();
@@ -5432,7 +5396,6 @@ private:
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
         metrics.n_decode++;
         for (const auto & slot : slots) {
-            // [TAG_PREEMPT] a parked slot is processing but took no part in this decode
             if (slot.is_processing() && !slot.preempt_is_out()) {
                 metrics.n_busy_slots++;
             }
@@ -5756,7 +5719,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::set<size_t> parked_idx; // prompts of this request that are parked right now
         auto first_result = rd.next(req.should_stop);
         if (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
-            // [TAG_PREEMPT] the stream starts now, with the notice, so the parked keepalive runs through the wait instead of the client seeing nothing
             const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
             preempt_prefix = preempt_notice_comment(*notice);
             if (notice->parked) {
@@ -5795,7 +5757,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         res->status = 200;
         res->content_type = "text/event-stream";
         res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked_idx](std::string & output) mutable -> bool {
-            // [TAG_PREEMPT] the keepalive runs while ANY prompt of the request is parked
             const bool parked = !parked_idx.empty();
 
             static auto format_error = [](task_response_type res_type, const json & res_json) {
@@ -5881,7 +5842,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
                 } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
-                    // [TAG_PREEMPT] an SSE comment: invisible to clients that do not know about preemption
                     if (notice->parked) {
                         parked_idx.insert(notice->index);
                     } else {

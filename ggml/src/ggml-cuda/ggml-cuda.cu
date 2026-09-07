@@ -1790,7 +1790,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
-    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single destination column only, so leaving it on would give a solo request a different code path from a batched one
     if (ggml_cuda_batch_invariant()) {
         return false;
     }
@@ -1962,7 +1961,6 @@ static int64_t ggml_cuda_mul_mat_invariant_width(
     return 1;
 }
 
-// recompute dst in slices of columns so each column sees the batch-of-one configuration; false when the batched launch already gives every column that value
 static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2085,7 +2083,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_ABORT("fatal error");
 }
 
-// [TAG_BATCH_INVARIANT] true when the policy computes this MUL_MAT_ID one token at a time
 static bool ggml_cuda_mul_mat_id_splits_tokens(const ggml_tensor * dst) {
     if (!ggml_cuda_batch_invariant()) {
         return false;

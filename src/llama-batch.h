@@ -111,7 +111,6 @@ public:
     // [TAG_EXACT_CONCURRENCY] true if some sequence still has more than n_tokens left to place, i.e. what remains of the batch holds a prompt
     bool has_seq_wider_than(uint32_t n_tokens) const;
 
-    // [TAG_EXACT_CONCURRENCY] true if some token carries more than one sequence id
     bool has_shared_tokens() const;
 
     // sequence-set-wise split - each ubatch contains a single sequence-set

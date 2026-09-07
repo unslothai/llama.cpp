@@ -467,7 +467,6 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
-    // [TAG_PREEMPT] slots parked to make room in the unified KV pool, and put back
     uint64_t n_preempt = 0;
     uint64_t n_resume  = 0;
 

@@ -168,7 +168,6 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    // [TAG_EXACT_CONCURRENCY] all of these are reachable from the command line, so name the one that failed instead of aborting on a bare assert
     if (exact_pages) {
         const char * unsupported = nullptr;
 
@@ -321,14 +320,12 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("exact concurrency: unsupported attention head size");
         }
 
-        // [TAG_EXACT_CONCURRENCY] the paged kernel has no soft-capped variant and would assert
         if (exact_pages && hparams.attn_soft_cap) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model soft-caps its attention logits (%.1f), "
                     "which the paged attention kernel does not apply\n", __func__, hparams.f_attn_logit_softcapping);
             throw std::runtime_error("exact concurrency: attention soft cap is not supported");
         }
 
-        // [TAG_EXACT_CONCURRENCY] a layer left anywhere else attends in physical cell order
         if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
                     "which has no paged attention: every layer must be offloaded to the CUDA backend "
@@ -492,7 +489,6 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
-// [TAG_EXACT_CONCURRENCY]
 void llama_kv_cache::exact_pages_rebuild() const {
     const auto & cells = v_cells[0];
 
@@ -521,7 +517,6 @@ void llama_kv_cache::exact_pages_rebuild() const {
     exact_page_owner_dirty = false;
 }
 
-// [TAG_EXACT_CONCURRENCY]
 void llama_kv_cache::exact_pages_sync() const {
     if (exact_page_owner_dirty) {
         exact_pages_rebuild();
@@ -542,7 +537,6 @@ void llama_kv_cache::exact_pages_sync() const {
     }
 }
 
-// [TAG_EXACT_CONCURRENCY]
 void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos) {
     if (exact_page_owner_dirty || exact_page_owner.empty()) {
         return;
@@ -750,7 +744,6 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
-    // [TAG_EXACT_CONCURRENCY] as in seq_rm, this can empty pages
     exact_page_owner_dirty = true;
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
@@ -838,7 +831,6 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
-    // [TAG_EXACT_CONCURRENCY] as in seq_add: dividing positions breaks the position/offset identity
     if (exact_pages && d != 1) {
         LLAMA_LOG_ERROR("%s: exact concurrency does not support dividing positions "
                         "(seq %d, d %d); ignoring the division\n",
@@ -1207,7 +1199,6 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     if (exact_pages) {
-        // ownership is maintained as cells are placed, so this reads one entry per page rather than scanning every cell
         const auto & cells = v_cells[0];
 
         exact_pages_sync();
@@ -1425,7 +1416,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
 
-            // [TAG_EXACT_CONCURRENCY] the page this cell belongs to is now owned by its sequence
             if (exact_pages) {
                 GGML_ASSERT(ubatch.n_seq_id[i] == 1);
 
@@ -1544,7 +1534,6 @@ ggml_tensor * llama_kv_cache::build_input_pages(ggml_context * ctx, const llama_
 void llama_kv_cache::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(exact_pages && dst->ne[1] == ubatch->n_tokens);
 
-    // [TAG_EXACT_CONCURRENCY] one entry per physical page, not one per cell
     exact_pages_sync();
 
     std::map<llama_seq_id, std::map<llama_pos, uint32_t>> pages;
@@ -2636,7 +2625,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     } else {
         // whole KV cache restore
 
-        // [TAG_EXACT_CONCURRENCY] refused at the top of state_read(), before anything is read
         GGML_ASSERT(!exact_pages);
 
         if (cell_count > cells.size()) {

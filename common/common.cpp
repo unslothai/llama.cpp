@@ -1450,7 +1450,6 @@ bool common_exact_concurrency() {
     return enabled;
 }
 
-// [TAG_EXACT_CONCURRENCY]
 int common_exact_decode_width(const common_params & params) {
     const int64_t n_slots = std::max(1, params.n_parallel);
 
@@ -1462,7 +1461,6 @@ int common_exact_decode_width(const common_params & params) {
     return n_cols > INT32_MAX ? -1 : (int) n_cols;
 }
 
-// [TAG_EXACT_CONCURRENCY]
 bool common_exact_concurrency_init(const common_params & params) {
     if (!common_exact_concurrency()) {
         return true;

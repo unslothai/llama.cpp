@@ -592,8 +592,7 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     sample_dst = blockIdx.z;
-    // [TAG_BATCH_INVARIANT] with ids, a sample is a token: every token goes on the z axis of one single-column
-    // launch, so each (token, expert slot) block runs the single-token configuration
+    // [TAG_BATCH_INVARIANT] with ids, a sample is a token: every token goes on the z axis of one single-column launch, so each (token, expert slot) block runs the single-token configuration
     channel_x  = ncols_dst == 1 && ids ? ids[sample_dst*ids_stride + channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y)      : channel_dst;
 
@@ -1282,8 +1281,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    // [TAG_BATCH_INVARIANT] a multi-token MUL_MAT_ID becomes one launch of the single-token configuration
-    // with the tokens on the sample axis, so the count is not bounded by the column templates
+    // [TAG_BATCH_INVARIANT] a multi-token MUL_MAT_ID becomes one launch of the single-token configuration with the tokens on the sample axis, so the count is not bounded by the column templates
     const bool tokens_as_samples = ids && ne2 > 1 && ggml_cuda_batch_invariant();
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || tokens_as_samples);

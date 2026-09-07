@@ -85,7 +85,6 @@ int main(int argc, char ** argv) {
             llama_state_seq_copy_buf_is_pinned(cpy) ? "pinned" : "pageable",
             llama_state_seq_copy_buf_can_pin(cpy)   ? "pinned" : "pageable");
 
-    // a size beyond the buffer the transfer owns is refused, on both directions
     CHECK(llama_state_seq_copy_get(cpy, size + 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_set(cpy, size + 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
 
@@ -114,7 +113,6 @@ int main(int argc, char ** argv) {
 
     llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
 
-    // the restore side too: a buffer claimed one byte short is refused before a copy is posted
     CHECK(llama_state_seq_copy_set(cpy, size - 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_n_copies(cpy) == 0);
     CHECK(llama_state_seq_copy_done(cpy));

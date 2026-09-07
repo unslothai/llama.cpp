@@ -172,7 +172,6 @@ def test_two_overflowing_streams_both_finish_and_the_parked_one_says_so():
 
 
 def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
-    # A request parked while still processing its prompt has no token to send yet, so the response starts with the notice instead of a silent connection.
     # n_batch: the whole prompt in one batch, so the planner sees its size at once
     _start(n_ctx=512, n_batch=512)
     url = f"http://{server.server_host}:{server.server_port}/completion"
@@ -229,7 +228,6 @@ def test_a_resident_rotated_out_for_a_parked_head_is_told_so():
 def test_an_oversized_prompt_is_errored_instead_of_parked():
     # A slot just given a task has not passed the prompt checks yet, and a notice opens the stream, so parking it would turn a plain error response into 200 plus an in-stream one.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    # n_batch: the whole prompt in one batch, so the planner sees its size at once
     _start(n_ctx=512, n_batch=512)
     url = f"http://{server.server_host}:{server.server_port}/completion"
     resident = _completion_payload(390) | {"prompt": " ".join([_PROMPT_A] * 6)}
