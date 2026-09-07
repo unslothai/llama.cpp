@@ -1784,6 +1784,10 @@ private:
         }
 
         {
+            // read on every load, so a reload after the variable changed, or another context
+            // loaded in the same process, gets its own order rather than the previous one's
+            g_preempt_resume_head_of_line = true;
+
             const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
             if (LLAMA_SERVER_PREEMPT_RESUME && strcmp(LLAMA_SERVER_PREEMPT_RESUME, "head") != 0) {
                 if (strcmp(LLAMA_SERVER_PREEMPT_RESUME, "pass") != 0) {
