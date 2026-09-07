@@ -3031,17 +3031,30 @@ private:
         return preempt_ram_used() + slot.preempt_state_required() <= budget;
     }
 
+    // cells of the mirrored prompt that a started slot's request keeps, by the rule the batch
+    // builder applies when it takes the slot: nothing when the request does not cache its
+    // prompt, otherwise the prefix the two share, cut short of an aLoRA invocation
+    size_t preempt_n_keep(const server_slot & slot) const {
+        if (!slot.task->params.cache_prompt) {
+            return 0;
+        }
+
+        size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+        if (slot.alora_invocation_start > 0) {
+            n_keep = std::min(n_keep, (size_t) (slot.alora_invocation_start - 1));
+        }
+
+        return n_keep;
+    }
+
     // cells of the slot's that its next step keeps: a slot just given a task still mirrors
-    // the previous request's prompt until the batch builder keeps the prefix the two share
-    // and drops the rest (all of it when the request does not cache its prompt), so what it
-    // holds, and what it is about to ask for, both count from that prefix
+    // the previous request's prompt until the batch builder keeps what preempt_n_keep()
+    // says and drops the rest, so what it holds, and what it is about to ask for, both
+    // count from that
     int32_t preempt_n_retained(const server_slot & slot) const {
         if (slot.state == SLOT_STATE_STARTED && slot.task) {
-            if (!slot.task->params.cache_prompt) {
-                return 0;
-            }
-
-            return (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+            return (int32_t) preempt_n_keep(slot);
         }
 
         return slot.prompt.n_tokens();
@@ -3152,7 +3165,7 @@ private:
             return;
         }
 
-        const size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        const size_t n_keep = preempt_n_keep(slot);
 
         if (n_keep >= slot.prompt.tokens.size()) {
             return;
