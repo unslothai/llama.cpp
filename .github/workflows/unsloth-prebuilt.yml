@@ -476,9 +476,12 @@ jobs:
       # Warm shards for the CUDA children (see their headers): each profile row
       # is dealt into `shards` parallel jobs that pre-compile a slice of the
       # ggml-cuda objects through ccache. Sized by cold cost on run
-      # 34168016006: portable 189 min (3 shards), older/newer 55-104 min (2),
-      # legacy 22 min (none), arm64 portable 42 min (2). An empty string, not an
-      # empty include list, tells the child to skip the job.
+      # 34168016006: Windows portable 189 / 138 min (4 shards; it is the
+      # critical path and 1.6x slower than Linux per object), Linux x64
+      # portable 117 / 103 min (3), older/newer 55-104 min (2), legacy 22 min
+      # (none), arm64 portable 42 min (2). The children restore up to four
+      # shards. An empty string, not an empty include list, tells the child to
+      # skip the job.
       # Its own step, not more script in `r`: GitHub caps one workflow string at
       # 21000 chars and that step is at it. See check_workflow_scalars.py.
       - name: Warm shard matrix for the CUDA children
@@ -489,19 +492,20 @@ jobs:
         run: |
           set -euo pipefail
           SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
-          expand_warm() {
-            jq -c ".include | [.[] | . as \$r | ($SHARDS) as \$k | select(\$k > 0) | range(\$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
+          WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 2 end'
+          expand_warm() { # $1 = shard rule
+            jq -c ".include | [.[] | . as \$r | ($1) as \$k | select(\$k > 0) | range(\$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
           }
           [ -n "${CUDA_MATRIX:-}" ] || CUDA_MATRIX='{"include":[]}'
           [ -n "${WIN_CUDA_MATRIX:-}" ] || WIN_CUDA_MATRIX='{"include":[]}'
-          CUDA_WARM="$(printf '%s' "$CUDA_MATRIX" | expand_warm)"
-          WIN_CUDA_WARM="$(printf '%s' "$WIN_CUDA_MATRIX" | expand_warm)"
+          CUDA_WARM="$(printf '%s' "$CUDA_MATRIX" | expand_warm "$SHARDS")"
+          WIN_CUDA_WARM="$(printf '%s' "$WIN_CUDA_MATRIX" | expand_warm "$WIN_SHARDS")"
           # The build rows learn their own shard count too: the build job
           # restores exactly that many shard caches before it merges them.
-          with_shards() { jq -c "{include: [.include[] | . + {shards: ($SHARDS)}]}"; }
+          with_shards() { jq -c "{include: [.include[] | . + {shards: ($1)}]}"; }
           {
-            echo "cuda_matrix=$(printf '%s' "$CUDA_MATRIX" | with_shards)"
-            echo "win_cuda_matrix=$(printf '%s' "$WIN_CUDA_MATRIX" | with_shards)"
+            echo "cuda_matrix=$(printf '%s' "$CUDA_MATRIX" | with_shards "$SHARDS")"
+            echo "win_cuda_matrix=$(printf '%s' "$WIN_CUDA_MATRIX" | with_shards "$WIN_SHARDS")"
             [ "$CUDA_WARM" = "[]" ] && echo "cuda_warm_matrix=" || echo "cuda_warm_matrix={\"include\":$CUDA_WARM}"
             [ "$WIN_CUDA_WARM" = "[]" ] && echo "win_cuda_warm_matrix=" || echo "win_cuda_warm_matrix={\"include\":$WIN_CUDA_WARM}"
           } >> "$GITHUB_OUTPUT"
