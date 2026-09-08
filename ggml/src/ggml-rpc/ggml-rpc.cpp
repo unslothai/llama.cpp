@@ -245,7 +245,6 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    // note: the uid of the last graph stored on the server is tracked per connection, see socket_t
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -375,7 +374,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-// writes one whole message; the caller must hold sock->conn.mtx_send
+// the caller must hold sock->conn.mtx_send
 static bool send_rpc_cmd_locked(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
@@ -413,11 +412,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return status;
 }
 
-// Reserves this thread's place in the response order of a connection. The server answers the
-// commands of one connection strictly in the order it received them, so the n-th response
-// belongs to the n-th response-bearing request that was written to the socket. The ticket is
-// taken while mtx_send is still held by the sender, and always released, so a failed send
-// cannot leave the later waiters stuck.
+// the server answers one connection strictly in request order
 struct rpc_response_ticket {
     rpc_conn_state & conn;
     uint64_t         seq;
@@ -465,8 +460,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         if (ggml_trace_flag) { t_send0 = ggml_trace_time_us(); }
         ticket.reset(new rpc_response_ticket(sock->conn));
         if (!send_rpc_cmd_locked(sock, cmd, input, input_size)) {
-            // still take our turn, so the ticket is released in order and no later waiter is
-            // woken with a response that is not theirs
+            // still take our turn, or a later waiter is woken with a response that is not theirs
             failed = true;
         }
         if (ggml_trace_flag) { t_send1 = ggml_trace_time_us(); }
@@ -478,7 +472,6 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         return false;
     }
 
-    // the response is read outside mtx_send, so the other threads can keep submitting
     ticket->wait();
     if (ggml_trace_flag) { t_wait = ggml_trace_time_us(); }
 
@@ -927,11 +920,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         ggml_trace_set_subject(cgraph->nodes[cgraph->n_nodes - 1]->name, cgraph->uid);
     }
 
-    // The graph stored by RPC_CMD_GRAPH_COMPUTE lives on the server per connection and device,
-    // and one connection is shared by every backend of this endpoint - including the backends of
-    // other llama_contexts. So the uid of the last graph sent has to be tracked per connection,
-    // and the check has to happen under the same lock as the send, or a RECOMPUTE could re-run
-    // the graph another context stored in between.
+    // the stored graph is per connection and device, and other llama_contexts share the connection:
+    // the uid check must stay under mtx_send, or RECOMPUTE re-runs a graph stored in between
     std::unique_lock<std::mutex> lock(sock->conn.mtx_send);
 
     const int64_t t_send0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
