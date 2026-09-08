@@ -1679,6 +1679,8 @@ private:
                 } else {
                     SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
                 }
+            } else if (params_base.preempt_async && !llama_model_is_recurrent(model_tgt) && preempt_state_relocates()) {
+                SRV_WRN("%s", "preemption: a recurrent state does not stay in one row, so a copy running beside the decode could read another sequence; parking and resuming synchronously\n");
             }
 
             if (!preempt_async_ok) {
@@ -4905,10 +4907,19 @@ private:
         }
     }
 
+    // [TAG_PREEMPT_ASYNC] a recurrent memory keeps no fixed row per sequence: find_slot() gathers the active ones into contiguous rows, so a decode beside a park moves or overwrites the row the copy is still reading. A hybrid carries that half too, and so can the draft.
+    static bool preempt_state_relocates(const llama_model * model) {
+        return model && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model));
+    }
+
+    bool preempt_state_relocates() const {
+        return preempt_state_relocates(model_tgt) || preempt_state_relocates(model_dft);
+    }
+
     // [TAG_PREEMPT_ASYNC] whether a park can happen at all and go asynchronously
     bool preempt_async_possible() const {
         return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
-               slots.size() >= 2 && llama_get_memory(ctx_tgt) && !llama_model_is_recurrent(model_tgt);
+               slots.size() >= 2 && llama_get_memory(ctx_tgt) && !preempt_state_relocates();
     }
 
     bool preempt_last_resort_possible() const {

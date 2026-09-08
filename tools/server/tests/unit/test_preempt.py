@@ -619,6 +619,32 @@ def test_a_recurrent_model_is_served_without_preemption():
     assert "Context size has been exceeded" not in text
 
 
+def test_a_hybrid_model_parks_synchronously():
+    # the recurrent half of a hybrid gathers the active sequences into contiguous rows on every batch, so a copy running beside the decode could read a row another sequence has been moved into
+    path = os.environ.get("LLAMA_SERVER_TEST_HYBRID_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_HYBRID_MODEL to a hybrid attention/recurrent gguf")
+    server.model_file = path
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.n_ctx = 1024
+    server.n_gpu_layer = 99
+    os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    server.start(timeout_seconds=600)
+
+    res = _complete(24, "Once upon a time")
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["predicted_n"] == 24
+
+    text = open(server.log_path).read()
+    assert "a recurrent state does not stay in one row" in text
+    assert _ASYNC_BANNER not in text
+    assert "park issued in" not in text
+    assert "preempted on request" in text
+    assert "resumed after" in text
+
+
 def _shift_completion(n_predict: int):
     """A completion whose context shifts, on a token prompt so its length is exact."""
     return server.make_request("POST", "/completion", data={
