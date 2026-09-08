@@ -29,6 +29,7 @@ def create_server():
     os.close(fd)
     yield
     os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
+    os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
 
 
 def _stream_raw(path: str, data: dict) -> tuple[list[str], list[str]]:
@@ -253,3 +254,40 @@ def test_an_oversized_prompt_is_errored_instead_of_parked():
         assert "error" in json.loads(body), body
     finally:
         t.join(120)
+
+
+def test_an_oversized_sibling_prompt_is_errored_before_a_valid_one_is_parked():
+    # A request can carry several prompts. A valid one can be parked, and its notice opens the stream, so the sibling that does not fit has to be found before any of them is queued.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
+    _start(n_ctx=256, n_slots=3, n_batch=512, kv_unified=True)
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    resident = _completion_payload(400) | {"prompt": " ".join([_PROMPT_A] * 3)}
+    siblings = {
+        "prompt": [[1] * 120, [1] * 300],
+        "n_predict": 8,
+        "ignore_eos": True,
+        "temperature": 0.0,
+        "seed": 42,
+        "stream": True,
+    }
+
+    started = threading.Event()
+
+    def _run_resident():
+        res = requests.post(url, json=resident, stream=True)
+        assert res.status_code == 200
+        for raw in res.iter_lines():
+            if raw.decode("utf-8").startswith("data: "):
+                started.set()
+
+    t = threading.Thread(target=_run_resident)
+    t.start()
+    try:
+        assert started.wait(60)
+        res = requests.post(url, json=siblings, stream=True)
+        body = res.text
+        assert res.status_code == 400, (res.status_code, body)
+        assert not body.lstrip().startswith(":"), body
+        assert "error" in json.loads(body), body
+    finally:
+        t.join(180)

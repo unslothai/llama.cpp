@@ -1174,6 +1174,30 @@ public:
         metrics.reset_bucket();
     }
 
+    // [TAG_PREEMPT] the first prompt of a request that cannot be served, with the error response it gets; false when every one of them passes.
+    // A park notice opens the stream of the member it belongs to, so a member rejected after that could only be told inside a stream that has already answered 200.
+    bool tasks_prompt_rejected(const std::vector<server_task> & tasks, json & error) const {
+        std::string msg;
+        error_type  type = ERROR_TYPE_SERVER;
+
+        for (const auto & task : tasks) {
+            if (!task_prompt_rejected(task, msg, type)) {
+                continue;
+            }
+
+            error = format_error_response(msg, type);
+
+            if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
+                error["n_prompt_tokens"] = task.n_tokens();
+                error["n_ctx"]           = n_ctx_slot;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1200,6 +1224,8 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+
+    int32_t n_ctx_slot = 0; // context of one slot, what every slot's n_ctx is set to
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1515,7 +1541,7 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -3976,34 +4002,35 @@ private:
     }
 
     // the checks a request has to pass before its prompt is processed; true when it is rejected. An empty prompt is not here: it is a final response, not an error.
-    bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
-        if (!slot.task) {
-            return false;
-        }
-
+    bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type) const {
         // TODO: support memory-less logits computation
-        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
+        if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
             msg  = "the current context does not logits computation. skipping";
             type = ERROR_TYPE_SERVER;
             return true;
         }
 
-        if (!slot.can_split()) {
+        // as server_slot::can_split(), from the task alone
+        const bool can_split =
+            !task.need_embd() ||
+            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+
+        if (!can_split) {
             const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-            if (slot.task->n_tokens() > n_ubatch) {
+            if (task.n_tokens() > n_ubatch) {
                 msg = string_format(
                     "input (%d tokens) is too large to process. increase the physical batch "
                     "size (current batch size: %d)",
-                    slot.task->n_tokens(), n_ubatch);
+                    task.n_tokens(), n_ubatch);
                 type = ERROR_TYPE_SERVER;
                 return true;
             }
 
-            if (slot.task->n_tokens() > slot.n_ctx) {
+            if (task.n_tokens() > n_ctx_slot) {
                 msg = string_format(
                     "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                    slot.task->n_tokens(), slot.n_ctx);
+                    task.n_tokens(), n_ctx_slot);
                 type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
                 return true;
             }
@@ -4011,15 +4038,23 @@ private:
             return false;
         }
 
-        if (slot.task->n_tokens() >= slot.n_ctx) {
+        if (task.n_tokens() >= n_ctx_slot) {
             msg = string_format(
                 "request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
-                slot.task->n_tokens(), slot.n_ctx);
+                task.n_tokens(), n_ctx_slot);
             type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
             return true;
         }
 
         return false;
+    }
+
+    bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
+        if (!slot.task) {
+            return false;
+        }
+
+        return task_prompt_rejected(*slot.task, msg, type);
     }
 
     void update_slots() {
@@ -5686,6 +5721,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             tasks.push_back(std::move(task));
+        }
+
+        // [TAG_PREEMPT] every prompt of the request, before any of them is queued: one member can be parked, and its notice opens the stream, before another member is rejected
+        {
+            json error;
+
+            if (ctx_server.tasks_prompt_rejected(tasks, error)) {
+                res->error(error);
+                return res;
+            }
         }
 
         rd.post_tasks(std::move(tasks));
