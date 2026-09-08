@@ -3,6 +3,7 @@ import re
 import time
 import tempfile
 import pytest
+import requests
 from utils import *
 
 # Preemption on a unified KV pool: one slot is parked, its sequence copied to host RAM and its cells released, instead of every slot being terminated. Needs --kv-unified.
@@ -595,6 +596,65 @@ def test_a_budget_that_holds_one_sequence_does_not_rotate_and_the_head_resumes_w
     assert "no rotation: --preempt-ram 2 MiB" in text
     assert "resumed after" in text
     assert "Context size has been exceeded" not in text
+
+
+def _stream_completion(n_predict: int, prompt: str) -> tuple[list[str], dict]:
+    """One streaming completion: its SSE comment lines and the last response object."""
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    res = requests.post(url, json={
+        "prompt": prompt, "n_predict": n_predict, "ignore_eos": True,
+        "temperature": 0.0, "seed": 42, "stream": True,
+    }, stream=True, timeout=600)
+    assert res.status_code == 200
+    comments, datas = [], []
+    for raw in res.iter_lines():
+        line = raw.decode("utf-8")
+        if line.startswith(":"):
+            comments.append(line)
+        elif line.startswith("data: ") and line[6:] != "[DONE]":
+            datas.append(json.loads(line[6:]))
+    return comments, datas[-1]
+
+
+def test_a_budget_that_holds_no_sequence_parks_by_dropping_the_cells():
+    # 1 MiB holds neither of these sequences, so no victim fits the budget: the park drops the cells and the resume re-prefills the tokens, instead of the pool overflowing and ending both
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    log = _start(n_ctx=3840)
+
+    n_predict = 2000
+    results = parallel_function_calls([
+        (_stream_completion, (n_predict, prompt)) for prompt in (_PROMPT_A, _PROMPT_B)
+    ])
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "tokens to re-prefill" in text, "no park fell back to recompute"
+
+    for comments, final in results:
+        assert "error" not in final, final
+        assert final["tokens_predicted"] == n_predict
+
+    parked = [c for comments, _ in results for c in comments if c == ": preempted"]
+    resumed = [c for comments, _ in results for c in comments if c == ": resumed"]
+    assert parked and resumed, f"no park was announced on either stream: {results[0][0]} {results[1][0]}"
+
+
+def test_the_last_resort_drops_the_cells_when_the_budget_holds_nothing():
+    # the retry ladder's last resort falls back the same way, so the all-slot context error stays out of reach while another slot can be parked
+    os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    log = _start(n_ctx=3840)
+
+    n_predict = 2000
+    results = _complete_all_raw(n_predict, (_PROMPT_A, _PROMPT_B))
+
+    text = log.drain()
+    assert "Context size has been exceeded" not in text
+    assert "preempted as a last resort by dropping its cells" in text
+
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] == n_predict
 
 
 def test_a_recurrent_model_is_served_without_preemption():
