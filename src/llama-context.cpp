@@ -4715,6 +4715,14 @@ uint32_t llama_memory_alloc_granularity(llama_memory_t mem) {
     return mem->alloc_granularity();
 }
 
+bool llama_memory_update(llama_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+
+    return ctx->memory_update(false);
+}
+
 // llama state API
 
 // deprecated

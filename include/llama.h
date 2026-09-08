@@ -798,6 +798,10 @@ extern "C" {
     // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible unit: 1 ordinarily, larger where a mode places cells in blocks, when n tokens occupy round_up(n, granularity)
     LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
 
+    // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
+    // takes the context because the update is a graph; returns true when one was run
+    LLAMA_API bool llama_memory_update(struct llama_context * ctx);
+
     // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1 plus the draft length. Never lowered; false when a column bound cannot cover it.
     LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);

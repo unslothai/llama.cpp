@@ -3654,6 +3654,21 @@ private:
         }
     }
 
+    // [TAG_PREEMPT] run the recorded shift here rather than leave it to the next llama_decode(): a park in between would serialize the positions the shift has already moved together with the K values it has not, and removing the sequence would drop the pending deltas with it
+    void preempt_apply_shift() {
+        if (!preempt_shift_pending) {
+            return;
+        }
+
+        preempt_wait_for_shift();
+
+        llama_memory_update(ctx_tgt);
+
+        if (ctx_dft) {
+            llama_memory_update(ctx_dft);
+        }
+    }
+
     bool preempt_copies_in_flight() const {
         for (const auto & slot : slots) {
             if (slot.state == SLOT_STATE_PREEMPTING) {
@@ -4050,10 +4065,11 @@ private:
         try {
             // [TAG_PREEMPT] make the pool fit the step about to be built, measured after any context shift; inside the guard because a shift or a park can throw
             pre_decode_shift();
-            update_preemption();
 
-            // [TAG_PREEMPT_ASYNC] before pre_decode(), not only the target decode: the draft it asks for applies the draft cache's pending shift in place
-            preempt_wait_for_shift();
+            // before update_preemption(), and not only before the decode: a slot must never be parked with a shift still pending on its cells
+            preempt_apply_shift();
+
+            update_preemption();
 
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();

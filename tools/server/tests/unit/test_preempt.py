@@ -617,3 +617,49 @@ def test_a_recurrent_model_is_served_without_preemption():
     assert "preemption: off, the recurrent cache holds one state per sequence" in text
     assert "preempted" not in text
     assert "Context size has been exceeded" not in text
+
+
+def _shift_completion(n_predict: int):
+    """A completion whose context shifts, on a token prompt so its length is exact."""
+    return server.make_request("POST", "/completion", data={
+        "prompt": [1] + list(range(10, 70)),
+        "n_predict": n_predict,
+        "n_keep": 16,
+        "n_discard": 64,
+        "ignore_eos": True,
+        "return_tokens": True,
+        "cache_prompt": False,
+        "temperature": 0.0,
+        "seed": 42,
+    })
+
+
+def test_a_park_right_after_a_context_shift_does_not_change_the_output():
+    # the shift moves the positions and leaves the K transformation for the next decode, so a park in between used to save the new positions with the old K
+    os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "0"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
+    _start(n_ctx=256, n_batch=32, n_ubatch=32, enable_ctx_shift=True, cache_ram=0)
+
+    n_predict = 320
+    reference = _shift_completion(n_predict)
+    assert reference.status_code == 200, reference.body
+    assert reference.body["timings"]["predicted_n"] == n_predict
+    n_prompt = reference.body["timings"]["prompt_n"]
+    server.stop()
+
+    # park on the step the shift lands on: the pool holds n_ctx cells, so the first shift is that many tokens in
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = str(256 - n_prompt)
+    log = _start()
+
+    parked = _shift_completion(n_predict)
+    assert parked.status_code == 200, parked.body
+    assert parked.body["timings"]["predicted_n"] == n_predict
+
+    text = log.drain()
+    assert "slot context shift" in text
+    assert "preempted on request" in text
+    assert "resumed after" in text
+
+    first_diff = next((i for i, (a, b) in enumerate(zip(reference.body["tokens"], parked.body["tokens"])) if a != b), None)
+    assert first_diff is None, f"the parked run diverged at token {first_diff}"
