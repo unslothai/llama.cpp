@@ -498,18 +498,16 @@ struct server_slot {
         return preempt_tokens.empty() ? (task ? task->n_tokens() : 0) : (int32_t) preempt_tokens.size();
     }
 
-    // [TAG_PREEMPT] park with the host budget spent: drop the cells, keep the tokens, re-prefill them on resume. The sampler and the counters are untouched, so the stream carries on from the same token; the resume is bit-exact only as far as prefill numerics match decode numerics.
+    // [TAG_PREEMPT] park with the host budget spent: drop the cells, keep the tokens, re-prefill them on resume. The sampler and the counters are untouched, so the stream carries on from the same token; the resume is bit-exact only as far as prefill numerics match decode numerics. A media chunk comes back the way it went in: the prompt step reads the chunk's data off the task and reserves its cells whole, so the placeholder the re-prefill list carries is all it needs
     bool preempt_save_recompute() {
-        if (prompt.tokens.has_mtmd) {
-            return false; // a media chunk in the cache cannot be re-prefilled from a token list
-        }
-
         preempt_state_free();
         preempt_detach();
 
         if (state == SLOT_STATE_GENERATING) {
             preempt_tokens = std::move(prompt.tokens);
             prompt.tokens  = server_tokens();
+
+            prompt.tokens.has_mtmd = preempt_tokens.has_mtmd; // the re-prefill pushes the chunk's placeholder back into it
         }
 
         prompt_clear();
@@ -3344,7 +3342,10 @@ private:
             return 0;
         }
 
-        res = std::min(res, slot.n_ctx - slot.prompt.n_tokens() - 2);
+        // a recompute park moved the prompt out of the slot, so the tokens it comes back with bound the draft, not the empty prompt: read as empty, a 2000-token sequence in a 2048-cell pool was charged a whole draft and failed as impossible
+        const int32_t n_tokens = std::max(slot.prompt.n_tokens(), slot.preempt_n_input());
+
+        res = std::min(res, slot.n_ctx - n_tokens - 2);
 
         if (slot.n_remaining() > 0) {
             res = std::min(res, slot.n_remaining() - 1);
@@ -3701,11 +3702,7 @@ private:
                 }
             }
 
-            if (recompute) {
-                if (slot.prompt.tokens.has_mtmd) {
-                    continue; // a media chunk in the cache cannot be re-prefilled from a token list
-                }
-            } else if (!preempt_fits_budget(slot)) {
+            if (!recompute && !preempt_fits_budget(slot)) {
                 continue;
             }
 
@@ -3749,6 +3746,11 @@ private:
 
             if (!preempt_recompute_logged) {
                 preempt_recompute_logged = true;
+
+                // [TAG_EXACT_CONCURRENCY] a state that comes back from host memory is the state that left; one rebuilt by re-prefilling is the same on CPU and differs in the last bits on CUDA, where a prefill of a token and a decode of it take different kernels
+                if (common_exact_concurrency()) {
+                    SRV_WRN("%s", "exact concurrency: a re-prefilled sequence is not guaranteed byte-identical to one that was never parked; raise --preempt-ram until every parked sequence fits it\n");
+                }
 
                 SRV_WRN("preemption: --preempt-ram %d MiB holds no further parked sequence, so a park drops its cells and the resume re-prefills its tokens\n",
                         params_base.preempt_ram_mib);
@@ -4185,6 +4187,13 @@ private:
         if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
             msg  = "the current context does not logits computation. skipping";
             type = ERROR_TYPE_SERVER;
+            return true;
+        }
+
+        // as launch_slot_with_task(), ahead of it: a sibling parked behind a running one used to fail inside a stream that had already opened 200
+        if (!task.tokens.validate(ctx_tgt)) {
+            msg  = "Prompt contains invalid tokens";
+            type = ERROR_TYPE_INVALID_REQUEST;
             return true;
         }
 
@@ -4997,6 +5006,11 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // [TAG_EXACT_CONCURRENCY] a token that was decoded goes back through the arithmetic that decoded it: one per step, in the narrow set beside the other decodes. Re-prefilled wide it went through batched arithmetic, and the output diverged at the second park
+                        if (slot.preempt_reprefill && common_exact_concurrency() && slot.prompt.n_tokens() >= slot.task->n_tokens()) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -5116,7 +5130,7 @@ private:
         return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
-    // [TAG_PREEMPT] the retry ladder ran out: give the batch up, rewind every resident to the token boundary the cache is at and park the smallest. Multimodal keeps the old path.
+    // [TAG_PREEMPT] the retry ladder ran out: give the batch up, rewind every resident to the token boundary the cache is at and park the smallest. A media chunk mid-prompt keeps the old path.
     bool preempt_last_resort(int32_t off) {
         if (!preempt_last_resort_possible()) {
             return false;
@@ -5129,7 +5143,8 @@ private:
                 continue;
             }
 
-            if (slot.prompt.tokens.has_mtmd) {
+            // a media chunk decodes whole through calls of its own, so a resident still inside its prompt cannot be rewound to a token boundary; one that is generating can
+            if (slot.prompt.tokens.has_mtmd && slot.state != SLOT_STATE_GENERATING) {
                 return false;
             }
 
@@ -6256,6 +6271,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_slots",              params.endpoint_slots },
         { "endpoint_props",              params.endpoint_props },
         { "endpoint_metrics",            params.endpoint_metrics },
+        // [TAG_EXACT_CONCURRENCY] a client that asked for the mode reads here whether this process runs it: a build that ignores the variable starts all the same
+        { "exact_concurrency",           common_exact_concurrency() },
         { "ui",                          params.ui },
         { "ui_settings",                 meta.json_ui_settings },
         { "chat_template",               tmpl_default },

@@ -64,8 +64,15 @@ def _require_async(text: str):
         pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")
 
 
-def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay: float = 0.0):
+def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay: float = 0.0, after_slot_busy=None):
     time.sleep(delay)
+    if after_slot_busy is not None:
+        # sent once that slot is processing, so the request queues behind it whatever the host's speed
+        for _ in range(200):
+            slots = server.make_request("GET", "/slots").body
+            if any(s["id"] == after_slot_busy and s["is_processing"] for s in slots):
+                break
+            time.sleep(0.02)
     return server.make_request("POST", "/completion", data={
         "n_predict": n_predict, "prompt": prompt, "id_slot": id_slot,
         "ignore_eos": True, "return_tokens": True, "temperature": 0.0, "seed": 42,
@@ -293,7 +300,7 @@ def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_ke
         (_complete, (60, _prompt_of(115, _PROMPT_C), 0)),
         (_complete, (100, _PROMPT_A, 1)),
         (_complete, (100, _PROMPT_B, 2)),
-        (_complete, (8, _PROMPT_C, 0, 0.05)),
+        (_complete, (8, _PROMPT_C, 0, 0.0, 0)),
     ])
 
     text = _log()
@@ -317,7 +324,8 @@ def test_a_recurrent_model_is_served_without_preemption():
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     server.start(timeout_seconds=300)
 
-    results = _complete_all(64, ["Once upon a time", "The quick brown fox"])
+    # not "Once upon a time": what this Q2_K model decodes from it on CUDA carries bytes the content parser refuses, master included, which is not what this test measures
+    results = _complete_all(64, ["The quick brown fox", "Hello world"])
     _assert_completed(results, 64)
 
     text = _log()
@@ -528,3 +536,99 @@ def test_a_park_right_after_a_context_shift_does_not_change_the_output():
     _assert_recovered(text, "preempted on request")
     first_diff = next((i for i, (a, b) in enumerate(zip(reference.body["tokens"], parked.body["tokens"])) if a != b), None)
     assert first_diff is None, f"the parked run diverged at token {first_diff}"
+
+
+def test_a_sibling_prompt_with_an_invalid_token_is_refused_before_anything_streams():
+    # validated with the others ahead of posting: parked behind a running sibling, it used to fail inside a stream that had already opened 200
+    _start(n_ctx=256, n_slots=2, n_batch=256)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": [[1] * 240, [1] * 240, [9999999]], "n_predict": 4, "temperature": 0.0, "seed": 42,
+    })
+    assert res.status_code == 400, res.body
+    assert "invalid tokens" in str(res.body)
+
+    text = _log()
+    assert "preempted" not in text
+
+
+def test_a_recompute_park_bounds_its_draft_by_the_tokens_it_comes_back_with():
+    # a recompute park moves the prompt out of the slot, and the draft was bounded by the empty prompt: 2000 tokens and a whole draft could not fit a 2048-cell pool "even alone", failing a request that fits
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "1"
+    server.spec_type = "ngram-mod"
+    _start(n_ctx=2048, n_slots=2, n_batch=2048, n_ubatch=512, spec_ngram_mod_n_max=128, spec_ngram_mod_n_min=1)
+
+    prompt = [1] + list(range(10, 110)) * 19 + list(range(10, 109))
+    assert len(prompt) == 2000
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 24, "ignore_eos": True, "temperature": 0.0, "seed": 42, "cache_prompt": False,
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 24
+
+    text = _log()
+    assert "tokens to re-prefill" in text
+    assert "cannot fit the pool" not in text
+    assert "Context size has been exceeded" not in text
+
+
+def test_props_says_whether_exact_concurrency_is_running():
+    # a client that asked for the mode reads the answer here: a build that ignores the variable starts all the same
+    _start(n_ctx=256)
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    assert res.body["exact_concurrency"] is False
+
+
+def test_props_reports_exact_concurrency_on():
+    server.model_file = _mrope_model()
+    server.model_hf_repo = server.model_hf_file = None
+    os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
+    _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    assert res.body["exact_concurrency"] is True
+
+
+def test_a_recompute_park_under_exact_concurrency_says_it_is_not_byte_identical():
+    # a state that comes back from host memory is the state that left; one rebuilt by re-prefilling differs in the last bits on CUDA, so the mode says so the first time it happens
+    server.model_file = _mrope_model()
+    server.model_hf_repo = server.model_hf_file = None
+    os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "4"
+    _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+
+    res = _complete(16, "Once upon a time")
+    assert res.status_code == 200, res.body
+    text = _log()
+    assert "tokens to re-prefill" in text
+    assert "not guaranteed byte-identical" in text
+
+
+def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
+    # a media chunk could not be parked by recompute, so with the host budget spent nothing could be parked at all and the pool overflowing ended both chats. The chunk comes back the way it went in: re-encoded off the task, its cells reserved whole
+    os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
+    server.model_hf_file = None
+    server.model_alias = "tinygemma3"
+    _start(n_ctx=1024, n_slots=2, n_batch=64, n_ubatch=64)
+
+    image = base64.b64encode(requests.get(_IMG_URL, timeout=60).content).decode()
+    prompt = {"prompt_string": "<__media__>\nWhat is in this image?", "multimodal_data": [image]}
+    n_predict = 700
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {
+            "prompt": prompt, "n_predict": n_predict, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        })) for _ in range(2)
+    ])
+
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    assert "failed to process mtmd chunk" not in text
+    assert "tokens to re-prefill" in text, "no park fell back to recompute"
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] == n_predict
