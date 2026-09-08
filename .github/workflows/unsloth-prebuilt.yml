@@ -109,8 +109,11 @@ jobs:
       ggml_tree: ${{ steps.r.outputs.ggml_tree }}
       ggml_version: ${{ steps.r.outputs.ggml_version }}
       exists: ${{ steps.r.outputs.exists }}
-      cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
-      win_cuda_matrix: ${{ steps.r.outputs.win_cuda_matrix }}
+      # The CUDA matrices pass through the `warm` step, which stamps `shards`.
+      cuda_matrix: ${{ steps.warm.outputs.cuda_matrix }}
+      win_cuda_matrix: ${{ steps.warm.outputs.win_cuda_matrix }}
+      cuda_warm_matrix: ${{ steps.warm.outputs.cuda_warm_matrix }}
+      win_cuda_warm_matrix: ${{ steps.warm.outputs.win_cuda_warm_matrix }}
       rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
       rocm_cutoff: ${{ steps.r.outputs.rocm_cutoff }}
       macos_matrix: ${{ steps.r.outputs.macos_matrix }}
@@ -409,6 +412,7 @@ jobs:
           # CUDA Windows reuses the x64 profiles (same arch lists / CUDA
           # versions), just on a Windows runner. arm64 has no CUDA Windows target.
           WIN_CUDA_INCLUDE="$(echo "$CUDA_INCLUDE" | jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]')"
+
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
 
@@ -443,6 +447,40 @@ jobs:
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); prs=$PRS; source_artifact=${SRC_ARTIFACT:-none}; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
+
+      # Warm shards for the CUDA children (see their headers): each profile row
+      # is dealt into `shards` parallel jobs that pre-compile a slice of the
+      # ggml-cuda objects through ccache. Sized by cold cost on run
+      # 34168016006: portable 189 min (3 shards), older/newer 55-104 min (2),
+      # legacy 22 min (none), arm64 portable 42 min (2). An empty string, not an
+      # empty include list, tells the child to skip the job.
+      # Its own step, not more script in `r`: GitHub caps one workflow string at
+      # 21000 chars and that step is at it. See check_workflow_scalars.py.
+      - name: Warm shard matrix for the CUDA children
+        id: warm
+        env:
+          CUDA_MATRIX: ${{ steps.r.outputs.cuda_matrix }}
+          WIN_CUDA_MATRIX: ${{ steps.r.outputs.win_cuda_matrix }}
+        run: |
+          set -euo pipefail
+          SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
+          expand_warm() {
+            jq -c ".include | [.[] | . as \$r | ($SHARDS) as \$k | select(\$k > 0) | range(\$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
+          }
+          [ -n "${CUDA_MATRIX:-}" ] || CUDA_MATRIX='{"include":[]}'
+          [ -n "${WIN_CUDA_MATRIX:-}" ] || WIN_CUDA_MATRIX='{"include":[]}'
+          CUDA_WARM="$(printf '%s' "$CUDA_MATRIX" | expand_warm)"
+          WIN_CUDA_WARM="$(printf '%s' "$WIN_CUDA_MATRIX" | expand_warm)"
+          # The build rows learn their own shard count too: the build job
+          # restores exactly that many shard caches before it merges them.
+          with_shards() { jq -c "{include: [.include[] | . + {shards: ($SHARDS)}]}"; }
+          {
+            echo "cuda_matrix=$(printf '%s' "$CUDA_MATRIX" | with_shards)"
+            echo "win_cuda_matrix=$(printf '%s' "$WIN_CUDA_MATRIX" | with_shards)"
+            [ "$CUDA_WARM" = "[]" ] && echo "cuda_warm_matrix=" || echo "cuda_warm_matrix={\"include\":$CUDA_WARM}"
+            [ "$WIN_CUDA_WARM" = "[]" ] && echo "win_cuda_warm_matrix=" || echo "win_cuda_warm_matrix={\"include\":$WIN_CUDA_WARM}"
+          } >> "$GITHUB_OUTPUT"
+          echo "warm shards: linux $(jq length <<<"$CUDA_WARM"), windows $(jq length <<<"$WIN_CUDA_WARM")"
 
       # A bad pin resolution can still build fine, so it must be caught before the source artifact ships. See merge_checks.py.
       # Its own step, not more script in `resolve`: GitHub caps one workflow string at 21000 chars and that step is near it. See check_workflow_scalars.py.
@@ -518,6 +556,7 @@ jobs:
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
+      warm_matrix: ${{ needs.resolve.outputs.cuda_warm_matrix }}
 
   build-windows-cuda:
     name: CUDA Windows
@@ -530,7 +569,31 @@ jobs:
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
+      warm_matrix: ${{ needs.resolve.outputs.win_cuda_warm_matrix }}
     secrets: inherit
+
+  # First of the two ccache prunes (scripts/unsloth/prune_ccache.sh has the
+  # whole rationale): before any leg restores, so the run starts from one
+  # generation per prefix and old + new fit under the limit while it builds.
+  # Never on the assemble waiter's critical path and never a reason to fail a
+  # release; the waiter excludes this job by name.
+  prune-ccache:
+    name: Prune superseded ccache generations
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
 
   build-rocm:
     name: ROCm
@@ -630,6 +693,12 @@ jobs:
           PREFIXES=('CUDA / ' 'CUDA Windows / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
           SELF='Assemble metadata + publish'
           ALERT='Report pipeline health'
+          # Housekeeping and best-effort jobs that must never gate a publish:
+          # the start-of-run ccache prune, and the CUDA children's warm shards
+          # ("CUDA / warm x64/cuda12-portable 0/3"), which only pre-fill the
+          # compiler cache for the real build legs.
+          PRUNE='Prune superseded ccache generations'
+          WARM=' / warm '
 
           POLL=60
           DEADLINE=$(( $(date +%s) + 330 * 60 ))
@@ -657,12 +726,28 @@ jobs:
             # Everything in the run except this job and the alert job that
             # reports on it. `resolve` stays in the set; it is already a
             # `needs:`, so it is a free consistency check.
-            SIBS="$(printf '%s\n' "$JOBS" | awk -F'\t' -v self="$SELF" -v alert="$ALERT" 'NF && $1 != self && $1 != alert')"
+            SIBS="$(printf '%s\n' "$JOBS" | awk -F'\t' -v self="$SELF" -v alert="$ALERT" -v prune="$PRUNE" -v warm="$WARM" \
+              'NF && $1 != self && $1 != alert && $1 != prune && index($1, warm) == 0')"
 
-            MISSING=""
+            # Two kinds of "not there yet". A child with no job record at all
+            # is the startup race and is fatal after STARTUP_DEADLINE. A child
+            # whose only records are warm shards is a CUDA child whose build
+            # legs sit behind `needs: warm`: GitHub creates those records only
+            # once the shards finish (52 minutes on a cold Windows profile,
+            # staging run 34205486511), so that case waits on the run's own
+            # deadline instead. Without the split, a run with warm shards
+            # either dies at 45 minutes or, worse, sees a moment where every
+            # existing record is complete and publishes without the builds.
+            MISSING=""; UNSCHEDULED=""
             for p in "${PREFIXES[@]}"; do
-              printf '%s\n' "$SIBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }' \
-                || MISSING="${MISSING} '${p}'"
+              if printf '%s\n' "$SIBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }'; then
+                continue
+              fi
+              if printf '%s\n' "$JOBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }'; then
+                UNSCHEDULED="${UNSCHEDULED} '${p}'"
+              else
+                MISSING="${MISSING} '${p}'"
+              fi
             done
             if [ -n "$MISSING" ]; then
               if [ "$(date +%s)" -gt "$STARTUP_DEADLINE" ]; then
@@ -670,6 +755,15 @@ jobs:
                 exit 1
               fi
               echo "waiting for job records to appear for:${MISSING}"
+              sleep "$POLL"
+              continue
+            fi
+            if [ -n "$UNSCHEDULED" ]; then
+              if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+                echo "ERROR: timed out before the build legs of${UNSCHEDULED} were scheduled behind their warm shards" >&2
+                exit 1
+              fi
+              echo "warm shards still running, build legs not yet scheduled for:${UNSCHEDULED}"
               sleep "$POLL"
               continue
             fi
@@ -1177,81 +1271,29 @@ jobs:
             echo "| delete failures | $failed |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The prune script lives in the tree; nothing above in this job needed a
+      # checkout. Read-only clone, no token left behind.
+      - name: Checkout build tooling (this repo)
+        if: ${{ needs.assemble.outputs.published == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+          persist-credentials: false
+
       # ── Keep the ccache budget inside the repo limit ──
       #
-      # ccache entries are immutable, so every run writes a NEW cache per
-      # (cuda, os, profile) and finds the previous one by restore-keys prefix.
-      # restore-keys returns only the MOST RECENT match, so older generations can
-      # never be selected again -- they are pure landfill. Measured 2026-08-08:
-      # 122 caches / 31.72 GiB, of which only 40 / 9.13 GiB were reachable.
-      #
-      # That matters for build time, not tidiness. The repo cache limit is 50 GB
-      # and there are ~40 prefixes; once the total hits the limit GitHub evicts by
-      # its own LRU, which can take a LIVE cache. A partial cache is far worse
-      # than none: measured locally over 513 real translation units, capping a
-      # cache to 30% of what the build needs drops the hit rate to 14.2% and
-      # flips hits from direct to preprocessed -- the exact 3-direct /
-      # 52-preprocessed signature seen in CI when the cap was 500 MB, which cost
-      # a 204-minute build instead of 54.
-      #
-      # Keeping 2 rather than 1: the second generation is the fallback when a job
-      # dies before saving, which is precisely the hole that forces a cold build.
+      # Second of the two prunes; the first runs right after `resolve`. See
+      # scripts/unsloth/prune_ccache.sh for the whole rationale. Published
+      # runs only, as before: a cancelled run's children may not have written
+      # their caches yet, and pruning against a half-written set could drop a
+      # live generation -- a partial cache is worse than a stale one.
       - name: Prune superseded ccache generations
-        # Unchanged trigger: this job now runs on every outcome for artifact
-        # cleanup, but cache pruning stays on published runs only. A cancelled
-        # run's children may not have written their caches yet, and pruning
-        # "superseded" generations against a half-written set could drop a live
-        # one -- a partial cache is worse than a stale one.
         if: ${{ needs.assemble.outputs.published == 'true' }}
         # Never fail a published release over cache housekeeping.
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          KEEP: 2
-        run: |
-          set -euo pipefail
-          repo="$GITHUB_REPOSITORY"
-          all="$RUNNER_TEMP/caches.tsv"
-          gh api --paginate "repos/$repo/actions/caches?per_page=100" \
-            -q '.actions_caches[] | "\(.id)\t\(.created_at)\t\(.size_in_bytes)\t\(.key)"' > "$all" || true
-          total=$(awk -F'\t' '{s+=$3} END {printf "%d", s+0}' "$all")
-          echo "$(grep -c . "$all" || true) caches, $(( total / 1073741824 )) GiB"
-
-          # Group by the restore-keys prefix: the key minus its -<tag>- suffix.
-          # Newest first, so anything past $KEEP is unreachable by restore-keys.
-          # The ROCm version comes off too, else every weekly toolchain becomes its own group and keeps 2 caches that can never hit again.
-          freed=0; deleted=0
-          while IFS=$'\t' read -r id created size key; do
-            [ -z "${id:-}" ] && continue
-            pre="$(printf '%s' "$key" | sed -E 's/-b[0-9]+(-mix-[0-9a-f]+)?-?$//; s/-[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+$//')"
-            printf '%s\t%s\t%s\t%s\n' "$pre" "$created" "$id" "$size"
-          done < "$all" | sort -t"$(printf '\t')" -k1,1 -k2,2r > "$RUNNER_TEMP/grouped.tsv"
-
-          prev=""; n=0
-          while IFS=$'\t' read -r pre created id size; do
-            [ -z "${pre:-}" ] && continue
-            if [ "$pre" != "$prev" ]; then prev="$pre"; n=1; else n=$(( n + 1 )); fi
-            [ "$n" -le "$KEEP" ] && continue
-            if gh api -X DELETE "repos/$repo/actions/caches/$id" --silent < /dev/null 2>/dev/null; then
-              freed=$(( freed + size )); deleted=$(( deleted + 1 ))
-            fi
-          done < "$RUNNER_TEMP/grouped.tsv"
-
-          after=$(( total - freed ))
-          echo "pruned $deleted superseded caches, freed $(( freed / 1073741824 )) GiB"
-          {
-            echo "### ccache budget"
-            echo ""
-            echo "| metric | value |"
-            echo "| --- | --- |"
-            echo "| kept per prefix | $KEEP |"
-            echo "| caches pruned | $deleted |"
-            echo "| freed | $(( freed / 1073741824 )) GiB |"
-            echo "| cache total after | $(( after / 1073741824 )) GiB of 50 GB |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$after" -gt 42949672960 ]; then
-            echo "::warning::ccache total is $(( after / 1073741824 )) GiB of the 50 GB repo limit; at the limit GitHub evicts by LRU and a partially evicted cache collapses the hit rate. Lower KEEP to 1, or raise the limit."
-          fi
+        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
 
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.

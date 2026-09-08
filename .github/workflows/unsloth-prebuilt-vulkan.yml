@@ -125,8 +125,24 @@ jobs:
             vulkan-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
+          # apt on ubuntu-22.04 ships ccache 4.5.1; the binary the action pins is
+          # 4.13, the same one the Windows legs already run.
+          install: binary
           max-size: 2G
           save: false
+
+      - name: Configure ccache
+        # compiler_check=content: the toolchain is reinstalled on every run, so an
+        # mtime identity (the Linux default) can miss on a byte-identical compiler.
+        # The timestamp sloppiness only relaxes ccache's same-second race guard,
+        # which a tarball-extracted source tree never needs; pch_defines and locale
+        # are the documented safe set. compression_level=6 trades a few seconds of
+        # zstd per miss for a smaller cache dir, so more objects fit under max-size
+        # and the actions/cache round trip moves fewer bytes.
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
 
       # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
       # the current backend and it has no glslc package. Install matching pinned
@@ -259,7 +275,7 @@ jobs:
         # it, and a 2 GB cache is not quick to write.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -275,7 +291,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}-
+          key: ccache-vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-windows:
     name: windows/x64
@@ -321,6 +337,19 @@ jobs:
           variant: ccache
           max-size: 2G
           save: false
+
+      - name: Configure ccache
+        # compiler_check=content: the toolchain is reinstalled on every run, so an
+        # mtime identity (the Linux default) can miss on a byte-identical compiler.
+        # The timestamp sloppiness only relaxes ccache's same-second race guard,
+        # which a tarball-extracted source tree never needs; pch_defines and locale
+        # are the documented safe set. compression_level=6 trades a few seconds of
+        # zstd per miss for a smaller cache dir, so more objects fit under max-size
+        # and the actions/cache round trip moves fewer bytes.
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -454,7 +483,7 @@ jobs:
         # it, and a 2 GB cache is not quick to write.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -470,4 +499,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-vulkan-windows-x64-${{ inputs.tag }}-
+          key: ccache-vulkan-windows-x64-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
