@@ -1,5 +1,7 @@
 import os
 import re
+import struct
+import subprocess
 import time
 import tempfile
 import pytest
@@ -643,6 +645,67 @@ def test_a_hybrid_model_parks_synchronously():
     assert "park issued in" not in text
     assert "preempted on request" in text
     assert "resumed after" in text
+
+
+# [TAG_EXACT_CONCURRENCY] the paged pool places a cell from the sequence and the position alone, so a layout that gives several tokens one position cannot be served
+
+def _server_bin() -> str:
+    return os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server")
+
+
+def _empty_gguf(path: str):
+    """A header-only gguf: enough for a projector argument that is never read."""
+    with open(path, "wb") as f:
+        f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+
+def _exact_env() -> dict:
+    return {**os.environ, "LLAMA_EXACT_CONCURRENCY": "1"}
+
+
+def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
+    # every token of one image shares a temporal position under M-RoPE, so the pool would give the second one the first one's cell and refuse the batch at the first image
+    path = os.environ.get("LLAMA_SERVER_TEST_MROPE_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_MROPE_MODEL to an M-RoPE gguf")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mmproj = os.path.join(tmp, "mmproj.gguf")
+        _empty_gguf(mmproj)
+        proc = subprocess.run([
+            _server_bin(), "--model", path, "--mmproj", mmproj,
+            "--host", "127.0.0.1", "--port", str(server.server_port),
+            "-c", "512", "--parallel", "2", "--kv-unified", "-fa", "on",
+            "-ngl", "99", "--no-warmup", "--no-webui",
+        ], env=_exact_env(), capture_output=True, text=True, timeout=900)
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "does not support M-RoPE together with a projector" in out, out
+
+
+def test_exact_concurrency_serves_an_mrope_model_without_a_projector():
+    # the refusal is about images, not the rope layout: a text prompt gives every token its own position, which the pool places
+    path = os.environ.get("LLAMA_SERVER_TEST_MROPE_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_MROPE_MODEL to an M-RoPE gguf")
+
+    os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
+    try:
+        server.model_file = path
+        server.model_hf_repo = None
+        server.model_hf_file = None
+        log = _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+
+        res = _complete(16, "Once upon a time")
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == 16
+
+        text = log.drain()
+        assert "does not support M-RoPE" not in text
+        assert "the kv pool allocates 256 cells at a time" in text
+    finally:
+        os.environ.pop("LLAMA_EXACT_CONCURRENCY", None)
 
 
 def _shift_completion(n_predict: int):

@@ -940,6 +940,9 @@ int common_exact_decode_width(const common_params & params);
 // report that width to the CUDA backend, refusing a smaller explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
 bool common_exact_concurrency_init(const common_params & params);
 
+// the same for what only the loaded model tells: false if the model must not be served in exact mode
+bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
+
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 

@@ -1344,6 +1344,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    if (!common_exact_concurrency_model(params, model)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to create a context, see the error above\n");
+        return;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1459,6 +1464,23 @@ int common_exact_decode_width(const common_params & params) {
     const int64_t n_cols = n_slots*(1 + n_draft);
 
     return n_cols > INT32_MAX ? -1 : (int) n_cols;
+}
+
+// [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists
+bool common_exact_concurrency_model(const common_params & params, const llama_model * model) {
+    if (!common_exact_concurrency() || params.mmproj.path.empty()) {
+        return true;
+    }
+
+    // the paged pool places a cell from the sequence and the position alone, and M-RoPE gives every token of one image the same temporal position, so the second of them lands on the first one's cell and the batch is refused at the first image
+    const llama_rope_type rope_type = llama_model_rope_type(model);
+
+    if (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support M-RoPE together with a projector: the tokens of one image share a temporal position and the paged pool would give them one cell\n");
+        return false;
+    }
+
+    return true;
 }
 
 bool common_exact_concurrency_init(const common_params & params) {
