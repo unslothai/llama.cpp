@@ -11,37 +11,26 @@
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
 
-// One deferred RPC data movement, queued by the asynchronous tensor entry points of the RPC
-// backend and executed on the connection at the next flush point (a synchronize, or any other
-// command that has to keep its place in the wire order).
 struct rpc_deferred_op {
     enum kind_t { GET, SET } kind;
 
-    // The tensor is serialized when the operation is queued, not when it is flushed: the graph
-    // result that owns it can be reset before the next flush point (one llama_decode allocates
-    // and resets a graph per ubatch), so keeping the pointer would leave a dangling read.
+    // serialized at queue time: the owning graph result is reset once per ubatch, so a pointer would dangle
     std::vector<uint8_t> tensor_bytes;
 
     void *   data   = nullptr;   // GET: host destination; SET: host staging source
     uint64_t offset = 0;
     uint64_t size   = 0;
 
-    // SET only: an event on the producing backend that must complete before the staging
-    // buffer holds the data. Opaque here so the transport stays free of ggml-backend types.
+    // SET only: must complete before the staging buffer holds the data. void to keep ggml-backend out.
     void * event = nullptr;
 };
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 
-// State shared by every client thread that uses one connection. A connection is looked up by
-// endpoint and is therefore shared by all backends of that endpoint, including the backends of
-// different llama_contexts, so all of it has to be serialised:
-//   - mtx_send makes a whole RPC message atomic on the wire
-//   - seq_* hands the responses out in request order (the server answers strictly in order),
-//     without holding mtx_send while waiting, so another thread can keep submitting work
-//   - last_graph_uid mirrors the server's per-connection stored graph for a device, so that
-//     RPC_CMD_GRAPH_RECOMPUTE can never re-run a graph submitted by another context
+// One connection is shared by every backend of an endpoint, across llama_contexts, so: mtx_send
+// keeps a message atomic on the wire; seq_* hands responses out in request order without holding
+// mtx_send; last_graph_uid stops RECOMPUTE re-running another context's graph.
 struct rpc_conn_state {
     std::mutex              mtx_send;
     std::mutex              mtx_seq;
@@ -51,11 +40,9 @@ struct rpc_conn_state {
 
     std::unordered_map<uint32_t, uint64_t> last_graph_uid;
 
-    // minor version reported by the server in HELLO, used to gate optional commands
     uint32_t server_minor = 0;
 
-    // deferred data movements, see rpc_deferred_op. Guarded by mtx_defer, which is always
-    // taken before mtx_send and never while holding it.
+    // lock order: mtx_defer before mtx_send, never the reverse
     std::mutex                   mtx_defer;
     std::vector<rpc_deferred_op> deferred;
 };
@@ -63,7 +50,6 @@ struct rpc_conn_state {
 struct socket_t {
     ~socket_t();
 
-    // guarded by conn.mtx_send / conn.mtx_seq, see rpc_conn_state
     rpc_conn_state conn;
 
     bool send_data(const void * data, size_t size);
