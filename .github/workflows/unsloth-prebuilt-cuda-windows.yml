@@ -46,6 +46,11 @@ on:
         required: false
         default: ''
         type: string
+      warm_only:
+        description: 'Run the warm shards only and save their deltas; skip the build job (daytime cache warming)'
+        required: false
+        default: false
+        type: boolean
 
     secrets:
       AZURE_CLIENT_ID:
@@ -98,6 +103,52 @@ jobs:
           archs: ${{ matrix.archs }}
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      # The shards restore the previous shard deltas too (any tag: the
+      # restore-keys fall back to a tagless prefix), so a daytime warm-only run
+      # leaves deltas the nightly's shards hit on, and each shard compiles only
+      # what changed since the newest delta, not since the last generation.
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          if (Test-Path shards) {
+            Get-ChildItem -Directory shards | ForEach-Object {
+              "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+              robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+            }
+            Remove-Item -Recurse -Force shards
+          }
+          ccache -z
+          exit 0
 
       # See the Linux child: the export below ships only what the compile adds.
       - name: Stamp the restored cache
@@ -154,7 +205,7 @@ jobs:
     name: x64/${{ matrix.profile }}
     # See the Linux child: shards are best effort, only a cancelled run stops here.
     needs: warm
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !inputs.warm_only }}
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -218,6 +269,7 @@ jobs:
           key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -226,6 +278,7 @@ jobs:
           key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 2
         if: ${{ matrix.shards >= 3 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -234,11 +287,8 @@ jobs:
           key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
 
-      # robocopy /E /XO: lay each delta over the cache, newer file wins (the
-      # cp -au of the Linux child; see there for why that is the right merge).
-      # robocopy exit codes below 8 are success variants, so the check is
-      # explicit.
       - name: Merge warm shards into the ccache
         if: ${{ matrix.shards >= 1 }}
         run: |

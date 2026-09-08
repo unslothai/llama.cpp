@@ -64,6 +64,11 @@ on:
         required: false
         default: ''
         type: string
+      warm_only:
+        description: 'Run the warm shards only and save their deltas; skip the build job (daytime cache warming)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -111,6 +116,50 @@ jobs:
           archs: ${{ matrix.archs }}
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      # The shards restore the previous shard deltas too (any tag: the
+      # restore-keys fall back to a tagless prefix), so a daytime warm-only run
+      # leaves deltas the nightly's shards hit on, and each shard compiles only
+      # what changed since the newest delta, not since the last generation.
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          set -euo pipefail
+          for d in shards/*/; do
+            [ -d "$d" ] || continue
+            echo "merging $d ($(find "$d" -type f | wc -l) files, $(du -sh "$d" | cut -f1))"
+            cp -au "$d." "${{ github.workspace }}/.ccache/"
+          done
+          rm -rf shards
+          ccache -z
 
       # Everything the restore put in place is older than this file; the
       # export below ships only what the compile adds. The sleeps keep a
@@ -173,7 +222,7 @@ jobs:
     # this profile set), failed or timed out all mean "fewer hits", not "no
     # release". Only a cancelled run stops here.
     needs: warm
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !inputs.warm_only }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -216,6 +265,7 @@ jobs:
           key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -224,6 +274,7 @@ jobs:
           key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 2
         if: ${{ matrix.shards >= 3 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -232,15 +283,8 @@ jobs:
           key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
             ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
 
-      # ccache stores each result under a path derived from its hash, so
-      # laying a shard delta over the restored generation is a valid cache
-      # dir; -u makes the shard's copy of a rewritten manifest (the newer,
-      # superset one) win over the generation's. Verified 2026-09-08 on this
-      # repo's CUDA objects with the b10830 -> b10840 churn: two disjoint
-      # deltas over the b10830 generation gave a direct hit on every CUDA
-      # object of the full b10840 build. -z resets the counters so the stats
-      # step below reads this build only.
       - name: Merge warm shards into the ccache
         if: ${{ matrix.shards >= 1 }}
         run: |
