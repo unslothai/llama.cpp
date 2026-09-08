@@ -113,6 +113,9 @@ public:
 
     bool has_shared_tokens() const;
 
+    // [TAG_EXACT_CONCURRENCY] true if a sequence has several tokens at one position, which the paged pool would give one cell
+    bool has_repeated_positions() const;
+
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 

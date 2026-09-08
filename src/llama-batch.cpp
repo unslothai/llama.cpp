@@ -517,6 +517,24 @@ bool llama_batch_allocr::has_shared_tokens() const {
     return false;
 }
 
+bool llama_batch_allocr::has_repeated_positions() const {
+    std::vector<size_t> n_per_seq(n_seq_max, 0);
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+            n_per_seq[batch.seq_id[i][s]]++;
+        }
+    }
+
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (n_per_seq[s] > seq_pos[s].size()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool llama_batch_allocr::has_seq_wider_than(uint32_t n_tokens) const {
     std::vector<uint32_t> n_per_seq(n_seq_max, 0);
 
