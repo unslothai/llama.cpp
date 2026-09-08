@@ -1731,6 +1731,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // [TAG_EXACT_CONCURRENCY] an invalid batch, not a full cache: left to the memory it came back as 1, which callers retry
+    if (llama_exact_concurrency() && balloc->has_shared_tokens()) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                "give every token exactly one sequence id\n", __func__);
+        return -1;
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
