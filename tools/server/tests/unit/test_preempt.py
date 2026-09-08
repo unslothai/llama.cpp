@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import time
@@ -41,6 +42,7 @@ def create_server():
     os.environ.pop("LLAMA_SERVER_PREEMPT_PLANNER", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
     os.environ.pop("LLAMA_ARG_PREEMPT_ASYNC", None)
+    os.environ.pop("LLAMA_MEDIA_MARKER", None)
 
 
 def _complete(n_predict: int, prompt: str = "Hi how are you"):
@@ -637,6 +639,35 @@ def test_a_budget_that_holds_no_sequence_parks_by_dropping_the_cells():
     parked = [c for comments, _ in results for c in comments if c == ": preempted"]
     resumed = [c for comments, _ in results for c in comments if c == ": resumed"]
     assert parked and resumed, f"no park was announced on either stream: {results[0][0]} {results[1][0]}"
+
+
+_IMG_URL = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
+
+
+def test_a_media_chunk_is_reserved_whole_before_it_is_decoded():
+    # a chunk is decoded whole inside one iteration, through decodes of its own that the kv-full retry does not cover: unless the planner reserves every cell it takes, the second of two image requests that each fit alone fails part way through its chunk
+    os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
+    server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
+    server.model_hf_file = None
+    server.model_alias = "tinygemma3"
+    log = _start(n_ctx=400, n_batch=64, n_ubatch=64)
+
+    image = base64.b64encode(requests.get(_IMG_URL, timeout=60).content).decode()
+    prompt = {"prompt_string": "<__media__>\nWhat is in this image?", "multimodal_data": [image]}
+
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {
+            "prompt": prompt, "n_predict": 4, "temperature": 0.0, "seed": 42,
+        })) for _ in range(2)
+    ])
+
+    text = log.drain()
+    assert "failed to process mtmd chunk" not in text
+    assert "preempted:" in text, "nothing was parked to make room for a chunk"
+
+    for res in results:
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["prompt_n"] > 64, "the chunk fits one batch, so it never spans several decodes"
 
 
 def test_the_last_resort_drops_the_cells_when_the_budget_holds_nothing():

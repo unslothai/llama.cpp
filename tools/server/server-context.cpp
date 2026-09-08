@@ -3422,15 +3422,40 @@ private:
         return slot.prompt.n_tokens();
     }
 
+    // [TAG_PREEMPT] the cells the media chunks pending at n_have take: pre_decode() runs a whole chunk through llama_decode() calls of its own, which no kv-full retry covers, so the planner reserves the lot before it is decoded
+    int32_t preempt_n_mtmd_pending(const server_slot & slot, int32_t n_have) const {
+        if (!slot.task || !slot.task->tokens.has_mtmd) {
+            return 0;
+        }
+
+        const auto & tokens = slot.task->tokens;
+
+        int32_t res = 0;
+
+        for (int32_t i = n_have; i >= 0 && i < (int32_t) tokens.size(); ) {
+            const int32_t n = (int32_t) tokens.chunk_n_tokens_at(i);
+
+            if (n <= 0) {
+                break;
+            }
+
+            res += n;
+            i   += n;
+        }
+
+        return res;
+    }
+
     int32_t preempt_n_need(const server_slot & slot) const {
         int32_t res = preempt_n_retained(slot);
 
         if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
             res += 1 + preempt_n_spec(slot);
         } else {
+            const int32_t n_mtmd = preempt_n_mtmd_pending(slot, res);
             const int32_t n_left = slot.preempt_n_input() - res;
 
-            res += std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
+            res += n_mtmd > 0 ? n_mtmd : std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
 
         // [TAG_EXACT_CONCURRENCY] a restore takes fresh pages and its tail page is charged in full; undercounting admits a resume find_slot cannot satisfy
@@ -3497,6 +3522,7 @@ private:
 
         int32_t res     = 0;
         int32_t res_pmt = 0;
+        int32_t res_mm  = 0;
         int32_t n_pmt   = 0;
 
         // [TAG_EXACT_CONCURRENCY] reserve the cells the next step ADDS, not its tokens: the used figure already rounds every tail page up, and only a page crossing can empty the pool
@@ -3516,6 +3542,14 @@ private:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
                         const int32_t n_have = preempt_n_retained(slot);
+                        const int32_t n_mtmd = preempt_n_mtmd_pending(slot, n_have);
+
+                        // a media chunk is decoded whole, past the batch cap below and past the kv-full retry
+                        if (n_mtmd > 0) {
+                            res_mm += preempt_n_cells_step(n_have, n_mtmd);
+                            break;
+                        }
+
                         const int32_t n_left = slot.preempt_n_input() - n_have;
 
                         res_pmt += preempt_n_cells_step(n_have, std::max(1, std::min(n_batch, n_left)));
@@ -3526,7 +3560,7 @@ private:
             }
         }
 
-        return res + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
+        return res + res_mm + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
     }
 
     // [TAG_PREEMPT] trim a just-started slot to the prefix it keeps first, or it is copied out, charged and sized by the previous request's prompt
@@ -4840,6 +4874,10 @@ private:
                             input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
                         ) {
                             break;
+                        }
+
+                        // [TAG_PREEMPT_ASYNC] the chunk decodes whole, past the kv-full retry, so a park the planner issued for it has to land first
+                        while (preempt_wait_in_flight()) {
                         }
 
                         // process the mtmd chunk
