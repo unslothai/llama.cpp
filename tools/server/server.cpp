@@ -28,11 +28,7 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
-// --pipeline-groups N: run the slots over N independent llama_contexts of the same model, each
-// with its own batch and decode thread. Useful with a layer split over two nodes (--rpc), where a
-// single context leaves each stage idle for half of every decode step.
-// The option is parsed here instead of in common/arg.cpp because it only means anything for the
-// server; everything it changes lives under tools/server.
+// parsed here rather than in common/arg.cpp: everything --pipeline-groups changes is under tools/server
 static int g_pipeline_groups = 1;
 
 static void server_take_pipeline_groups(int & argc, char ** argv) {
@@ -141,7 +137,6 @@ int llama_server(int argc, char ** argv) {
     // own arguments required by this example
     common_params params;
 
-    // strip the server-only --pipeline-groups before the common parser sees it
     server_take_pipeline_groups(argc, argv);
 
     common_init();
