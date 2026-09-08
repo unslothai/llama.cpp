@@ -159,12 +159,18 @@ jobs:
           ccache -z
           exit 0
 
-      # See the Linux child: the export below ships only what the compile adds.
-      - name: Stamp the restored cache
+      # See the Linux child: path + size for every file, a hash for the
+      # manifests, so the export ships only what the compile changed.
+      - name: Snapshot the restored cache
         run: |
-          Start-Sleep -Seconds 1
-          New-Item -ItemType File -Force -Path shard.stamp | Out-Null
-          Start-Sleep -Seconds 1
+          $src = "${{ github.workspace }}\.ccache"
+          $snap = @{}
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+          "$($snap.Count) files snapshotted"
 
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
@@ -190,11 +196,14 @@ jobs:
         run: |
           $src = "${{ github.workspace }}\.ccache"
           $dst = "${{ github.workspace }}\shards\${{ matrix.shard }}"
-          $stamp = (Get-Item "${{ github.workspace }}\shard.stamp").LastWriteTimeUtc
+          $before = @{}
+          (Get-Content -LiteralPath "${{ github.workspace }}\shard.before.json" -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $before[$_.Name] = $_.Value }
           New-Item -ItemType Directory -Force -Path $dst | Out-Null
           $n = 0; $bytes = 0
-          Get-ChildItem -LiteralPath $src -Recurse -File | Where-Object { $_.LastWriteTimeUtc -gt $stamp } | ForEach-Object {
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
             $rel = $_.FullName.Substring($src.Length + 1)
+            $now = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+            if ($before.ContainsKey($rel) -and $before[$rel] -eq $now) { return }
             $to = Join-Path $dst $rel
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
             Copy-Item -LiteralPath $_.FullName -Destination $to

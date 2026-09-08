@@ -170,11 +170,20 @@ jobs:
           rm -rf shards
           ccache -z
 
-      # Everything the restore put in place is older than this file; the
-      # export below ships only what the compile adds. The sleeps keep a
-      # same-second write on either side from landing on the wrong side.
-      - name: Stamp the restored cache
-        run: sleep 1 && touch shard.stamp && sleep 1
+      # Snapshot of the restored cache so the export below ships only what the
+      # compile changed. Not mtimes: ccache touches every result it hits (LRU
+      # bookkeeping), so on a warm night "newer than a stamp" is the whole
+      # slice again (426 of 426 files on a 100% hit rebuild, measured
+      # 2026-09-08) while one stats file had actually changed. Path + size
+      # catches new results and rewritten manifests (an entry added makes the
+      # manifest grow); the manifests are hashed as well because that is the
+      # one file ccache rewrites in place and it is small.
+      - name: Snapshot the restored cache
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort -k2 > "${{ github.workspace }}/shard.before.m"
 
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
@@ -197,21 +206,25 @@ jobs:
         run: ccache -s -v
 
       # Only the files this job added or rewrote: new results, the manifests
-      # of the TUs it compiled (ccache rewrites a manifest in place when it
-      # adds an entry) and the stats counters. The restored generation stays
-      # behind, so a shard is a few hundred MB, not another 4 GB copy of the
-      # generation; 40-odd shard caches a night have to fit next to the
-      # generations under the 75 GB repo limit. Tree layout preserved so the
-      # build job can lay the delta straight over its own cache dir.
+      # of the TUs it compiled and the stats counters. The restored generation
+      # stays behind, so a shard is MBs on a warm night and a couple of
+      # hundred MB on a cold one, not another 4 GB copy of the generation;
+      # 40-odd shard caches a night have to fit next to the generations under
+      # the 75 GB repo limit. Tree layout preserved so the build job can lay
+      # the delta straight over its own cache dir.
       - name: Export the shard delta
         if: ${{ always() }}
         run: |
           set -euo pipefail
-          mkdir -p "shards/${{ matrix.shard }}"
-          cd "${{ github.workspace }}/.ccache"
-          find . -type f -newer "${{ github.workspace }}/shard.stamp" -print0 \
-            | xargs -0 -r cp --parents -a -t "${{ github.workspace }}/shards/${{ matrix.shard }}/"
-          echo "$(find "${{ github.workspace }}/shards/${{ matrix.shard }}" -type f | wc -l) files, $(du -sh "${{ github.workspace }}/shards/${{ matrix.shard }}" | cut -f1)"
+          W="${{ github.workspace }}"
+          mkdir -p "$W/shards/${{ matrix.shard }}"
+          cd "$W/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "$W/shard.after"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort -k2 > "$W/shard.after.m"
+          { comm -13 "$W/shard.before" "$W/shard.after" | cut -f1
+            comm -13 "$W/shard.before.m" "$W/shard.after.m" | awk '{ print $2 }'; } | sort -u > "$W/shard.changed"
+          xargs -a "$W/shard.changed" -d '\n' -r cp --parents -a -t "$W/shards/${{ matrix.shard }}/"
+          echo "$(find "$W/shards/${{ matrix.shard }}" -type f | wc -l) files, $(du -sh "$W/shards/${{ matrix.shard }}" | cut -f1)"
 
       - name: Save shard ccache
         if: ${{ always() }}
