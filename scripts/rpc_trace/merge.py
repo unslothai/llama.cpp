@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
-"""Merge the event traces of the nodes of an RPC layer split.
-
-Each process writes JSON lines (see ggml/include/ggml-trace.h): one header, then one object per
-event. The client also writes the result of a four timestamp exchange with every peer it connects
-to, which gives the offset between the two monotonic clocks. This tool puts every file on the
-client's time line and produces
-
-  * a Chrome trace (chrome://tracing, or https://ui.perfetto.dev) with one row per node, thread
-    and pipeline group, plus a row per GPU carrying the CUDA event timings, and
-  * a text summary per decode step: local compute, transfer, peer compute, logits return,
-    sampling, and the idle fraction of each GPU.
-
-Usage:
-    merge.py client.jsonl peer.jsonl --chrome trace.json --summary summary.txt
+"""Merge the event traces of an RPC layer split onto the client's time line, into a Chrome trace
+and a per decode step summary: merge.py client.jsonl peer.jsonl --chrome t.json --summary s.txt
 """
 
 import argparse
@@ -22,14 +10,11 @@ import os
 import sys
 from collections import defaultdict
 
-# ---------------------------------------------------------------------------- reading
-
-
 class TraceFile:
     def __init__(self, path):
         self.path = path
         self.header = {}
-        self.offsets = []          # clock offset records written by the client
+        self.offsets = []
         self.events = []
         self.offset_us = 0         # this file's clock minus the client's clock
 
@@ -41,7 +26,7 @@ class TraceFile:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    # a trace of a process that was killed can end in a partial line
+                    # a killed process can leave a partial last line
                     continue
                 if "header" in rec:
                     self.header = rec
@@ -69,13 +54,12 @@ def load(paths):
     servers = [f for f in files if f.role == "rpc-server"]
 
     if not clients:
-        # a trace of the peer alone is still useful, it just has no common time line
+        # the peer alone is still useful, it just has no common time line
         return files, None
 
     client = clients[0]
 
-    # map each peer endpoint to its measured offset; the exchange is repeated per connection, the
-    # median is used so a single delayed reply does not move the alignment
+    # median over the connections, so one delayed reply does not move the alignment
     by_host = defaultdict(list)
     for rec in client.offsets:
         host = rec.get("peer", "").split(":")[0]
@@ -99,11 +83,7 @@ def load(paths):
     return files, client
 
 
-# ---------------------------------------------------------------------------- intervals
-
-
 def union_len(intervals):
-    """total length covered by a list of (t0, t1)"""
     if not intervals:
         return 0
     intervals = sorted(intervals)
@@ -142,7 +122,6 @@ def clip(intervals, w0, w1):
 
 
 def gaps(intervals, w0, w1):
-    """the holes of a union inside [w0, w1]"""
     out = []
     cur = w0
     for t0, t1 in union(clip(intervals, w0, w1)):
@@ -152,9 +131,6 @@ def gaps(intervals, w0, w1):
     if cur < w1:
         out.append((cur, w1))
     return out
-
-
-# ---------------------------------------------------------------------------- chrome trace
 
 
 def chrome_trace(files, client):
@@ -183,7 +159,7 @@ def chrome_trace(files, client):
             tid = e.get("tid", 0)
 
             if cat == "gpu":
-                # one row per device, well away from the host thread ids
+                # one row per device, away from the host thread ids
                 key = e.get("n", "gpu")
                 if key not in gpu_rows:
                     gpu_rows[key] = 10000 + len(gpu_rows)
@@ -202,7 +178,6 @@ def chrome_trace(files, client):
             out.append({"ph": "X", "pid": pid, "tid": tid, "cat": cat, "name": e.get("n", "?"),
                         "ts": t0, "dur": max(t1 - t0, 0), "args": args})
 
-            # the phases inside one RPC command, as slices nested in the command
             for name, a, b in sub_phases(e):
                 a -= f.offset_us + t_base
                 b -= f.offset_us + t_base
@@ -236,16 +211,11 @@ def sub_phases(e):
     return []
 
 
-# ---------------------------------------------------------------------------- summary
-
 LOGITS_MIN_BYTES = 64 * 1024
 
 
 class Index:
-    """intervals sorted by start, with a bisect lookup of the ones overlapping a window"""
-
     def __init__(self, items):
-        # items: list of (t0, t1, payload)
         self.items = sorted(items, key=lambda x: x[0])
         self.starts = [x[0] for x in self.items]
         self.max_dur = max((x[1] - x[0] for x in self.items), default=0)
@@ -270,7 +240,6 @@ def summarize(files, client, out):
     def shift(f, e):
         return (e["t0"] - f.offset_us, e["t1"] - f.offset_us)
 
-    # GPU busy intervals of each node, on the client's clock
     gpu_local = Index([shift(client, e) + (e,) for e in client.events if e.get("ph") == "gpu"])
     gpu_peer = Index([shift(f, e) + (e,) for f in servers for e in f.events if e.get("ph") == "gpu"])
 
@@ -291,7 +260,6 @@ def summarize(files, client, out):
 
     groups = sorted({e.get("grp", 0) for e in iters})
 
-    # one index per (category, name, group), so a step is a bisect and not a scan of the file
     idx = {}
     for e in client.events:
         key = (e.get("ph"), e.get("n"), e.get("grp", 0))
@@ -304,7 +272,6 @@ def summarize(files, client, out):
     def get(cat, name, grp):
         return idx.get((cat, name, grp), empty)
 
-    # the RPC commands of one group, all command types together
     rpc_by_grp = {}
     for grp in groups:
         rpc_by_grp[grp] = Index([(e["t0"], e["t1"], e) for e in client.events
@@ -357,8 +324,6 @@ def summarize(files, client, out):
             acc["logits"] += union_len(clip(logits, t0, t1))
             acc["stage"] += get("sched", "copy_stage", grp).covered(t0, t1)
 
-            # the stretches of the step in which neither GPU was busy, and what the host was
-            # doing in them: the single longest one, and the total attributed per phase
             hole = gaps(local_iv + peer_iv, t0, t1)
             acc["idle_both"] += union_len(hole)
             for g0, g1 in hole:
@@ -420,9 +385,6 @@ def name_gap(indexes, g0, g1):
     if best is None:
         return "nothing traced", 0
     return "%s/%s" % (best.get("ph"), best.get("n")), best_cov
-
-
-# ---------------------------------------------------------------------------- main
 
 
 def main():

@@ -73,8 +73,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
-    // clock alignment for the event tracer: the client sends it once per connection, right after
-    // HELLO, and only while tracing is on. The server always answers it.
+    // clock alignment, sent once per connection after HELLO and only while tracing is on
     RPC_CMD_TRACE_SYNC,
     RPC_CMD_COUNT,
 };
@@ -121,8 +120,6 @@ struct rpc_msg_hello_rsp {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
-// the peer's monotonic clock at the moment it received the request (t2) and at the moment it
-// replied (t3); with the client's t1 and t4 that is the usual four timestamp offset estimate
 struct rpc_msg_trace_sync_rsp {
     int64_t t2;
     int64_t t3;
@@ -285,14 +282,7 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
     return hash;
 }
 
-// -----------------------------------------------------------------------------
-// rpc-server side of the event tracer
-//
-// One record per command served: when the serve thread started waiting for it, when its opcode
-// and its payload arrived, when the handler ran, and when the reply left. The message helpers
-// below fill in the parts they are in a position to see, so the individual command handlers stay
-// untouched.
-// -----------------------------------------------------------------------------
+// one trace record per command served, filled in by the message helpers below
 
 struct rpc_server_trace {
     bool     active    = false;
@@ -400,9 +390,7 @@ static bool send_rpc_cmd_locked(socket_ptr sock, enum rpc_cmd cmd, const void * 
     return sock->flush();
 }
 
-// A command carries 1 byte of opcode and 8 bytes of length on the wire in addition to its
-// payload, and a reply carries 8 bytes of length. The trace counts those, so the byte totals add
-// up to what the link actually moved.
+// counted in the trace, so its byte totals match what the link actually moved
 static const size_t RPC_CMD_HEADER_BYTES = 1 + sizeof(uint64_t);
 static const size_t RPC_RSP_HEADER_BYTES = sizeof(uint64_t);
 
@@ -455,12 +443,7 @@ struct rpc_response_ticket {
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    // t_enq   the calling thread reaches the dispatcher
-    // t_send0 the connection is ours, the first byte goes out
-    // t_send1 the last byte of the request is flushed
-    // t_wait  our turn in the reply order has come
-    // t_recv0 the first bytes of the reply are in
-    // t_recv1 the reply is complete
+    // t_enq dispatcher, t_send0 connection ours, t_send1 flushed, t_wait our turn, t_recv* reply
     const int64_t t_enq = ggml_trace_flag ? ggml_trace_time_us() : 0;
     int64_t t_send0 = 0, t_send1 = 0, t_wait = 0, t_recv0 = 0, t_recv1 = 0;
 
@@ -518,8 +501,6 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return true;
 }
 
-// Four timestamp clock alignment, once per connection. Written into the trace header of the
-// client so the merge tool can put the peer's events on the client's time line.
 static void rpc_trace_sync(const std::shared_ptr<socket_t> & sock, const std::string & endpoint) {
     rpc_msg_trace_sync_rsp response = {};
 
@@ -2065,7 +2046,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
         if (ggml_trace_flag && tls_srv.active) {
             if (tls_srv.t_exec1 == 0) {
-                // a command with no reply, GRAPH_COMPUTE and SET_TENSOR are the hot ones
+                // a command with no reply
                 tls_srv.t_exec1 = ggml_trace_time_us();
             }
             ggml_trace_eventf("rpc.server", rpc_cmd_name((enum rpc_cmd) cmd),

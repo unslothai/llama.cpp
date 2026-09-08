@@ -704,7 +704,6 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
-// RAII span for the event tracer, one branch on ggml_trace_flag when tracing is off
 struct llama_trace_scope {
     const char * name;
     int64_t      t0;
@@ -2525,7 +2524,6 @@ ggml_status llama_context::graph_compute(
     }
 
     if (ggml_trace_flag) {
-        // the individual splits are traced by the scheduler itself, this is the whole submit
         ggml_trace_eventf("llama", "graph_compute", t0, ggml_trace_time_us(),
                           "\"n_splits\":%d,\"n_nodes\":%d,\"batched\":%d",
                           ggml_backend_sched_get_n_splits(sched.get()), ggml_graph_n_nodes(gf), batched ? 1 : 0);

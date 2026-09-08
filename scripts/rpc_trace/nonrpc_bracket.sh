@@ -1,7 +1,6 @@
 #!/bin/bash
-# Single GPU, no RPC backend involved: llama-batched-bench base/new/base plus one traced pass,
-# and a greedy md5 with the trace off and on, to show that a workload that does not use RPC is
-# not moved by the tracer.
+# Single GPU, no RPC: batched-bench and a greedy md5 with the trace off and on, to show the
+# tracer does not move a workload that does not use RPC.
 set -u
 W=/home/nvidianew/temp/wt_trace; B0=/home/nvidianew/temp/wt_base/build/bin; B1=$W/build/bin
 O=$W/bench; mkdir -p $O

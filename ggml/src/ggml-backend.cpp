@@ -492,9 +492,6 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG
-        // The staging path taken between two backends that cannot copy to each other directly.
-        // For a layer split over RPC this is the hidden state going GPU -> host -> peer, so the
-        // trace breaks it into the host allocation, the read back and the send.
         size_t nbytes = ggml_nbytes(src);
         const int64_t t0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
         void * data = malloc(nbytes);
@@ -1762,8 +1759,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (ggml_trace_flag) { t_inputs = ggml_trace_time_us(); }
 
-        // GPU span around the submit of this split, so the trace shows when the kernels really
-        // ran and not only when the launch returned
         const uint64_t gpu_tag = ggml_trace_flag ? ggml_trace_gpu_begin(split_backend, ggml_backend_name(split_backend)) : 0;
 
         if (!sched->callback_eval) {
@@ -1815,8 +1810,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (ggml_trace_flag) {
-            // note: the submit is asynchronous on most backends, so t1 is when the work was
-            //       queued, not when it finished; the GPU rows in the merged trace say that
+            // note: the submit is asynchronous, so t1 is when the work was queued, not finished
             ggml_trace_eventf("sched", "split", t_split0, ggml_trace_time_us(),
                               "\"split\":%d,\"n_splits\":%d,\"backend\":\"%s\",\"n_inputs\":%d,"
                               "\"n_nodes\":%d,\"inputs_us\":%lld,\"gpu_tag\":%llu",
@@ -2021,7 +2015,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         ggml_backend_synchronize(sched->backends[i]);
     }
     if (ggml_trace_flag) {
-        // everything is idle here, so this is where the completed GPU spans are collected
+        // everything is idle here, the only safe point to collect completed GPU spans
         ggml_trace_gpu_flush();
     }
     if (!sched->is_alloc) {

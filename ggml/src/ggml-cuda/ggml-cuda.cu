@@ -5472,18 +5472,8 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// -----------------------------------------------------------------------------
-// GPU timing marks for the event tracer (see ggml/include/ggml-trace.h)
-//
-// The RPC server needs to know when the kernels of a graph really ran on the GPU, not when the
-// launch returned, so it brackets ggml_backend_graph_compute with two CUDA events recorded on
-// the backend's compute stream. The events are resolved later, without blocking, against one
-// anchor event whose completion time on the host was measured once, which puts the GPU marks on
-// the same monotonic microsecond scale as every other event in the trace.
-//
-// Reached through ggml_backend_reg_get_proc_address, so the RPC backend does not have to link
-// against CUDA.
-// -----------------------------------------------------------------------------
+// GPU timing marks for the event tracer: CUDA events on the compute stream, resolved against one
+// anchor event, reached through ggml_backend_reg_get_proc_address so no caller links CUDA itself.
 
 struct ggml_cuda_trace_mark {
     uint64_t    tag;
@@ -5505,7 +5495,7 @@ static ggml_cuda_trace_state & ggml_cuda_trace() {
     return state;
 }
 
-// records a mark on the compute stream of `backend`; kind 0 = start of a span, 1 = end
+// kind 0 = start of a span, 1 = end
 extern "C" GGML_BACKEND_API void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t tag, int kind);
 extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t tag, int kind) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -5520,8 +5510,7 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
             return;
         }
         st.device = cuda_ctx->device;
-        // the host time of the instant the anchor completed on the GPU; every later mark is
-        // reported as anchor_us + elapsed(anchor, mark)
+        // every later mark is reported as anchor_us + elapsed(anchor, mark)
         cudaEventRecord(st.anchor, cuda_ctx->stream());
         cudaEventSynchronize(st.anchor);
         st.anchor_us = ggml_time_us();
@@ -5550,8 +5539,7 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
     st.pending.push_back({ tag, kind, event });
 }
 
-// collects the marks whose events have completed, without waiting for any of them. Returns the
-// number written; the caller loops until it gets less than `max`.
+// never waits: returns the marks already completed, so the caller loops until it gets < `max`.
 extern "C" GGML_BACKEND_API int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max);
 extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max) {
     ggml_cuda_trace_state & st = ggml_cuda_trace();

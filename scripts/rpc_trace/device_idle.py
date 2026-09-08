@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
-"""Where the idle time of ONE device goes, on a two node layer split.
-
-merge.py answers "where does a decode step go", per pipeline group. This answers a different
-question, and it is the one that decides what a fix would have to look like:
-
-  the bottleneck GPU is busy B percent of the window. The other 100-B percent is idle. Is it
-  idle while the OTHER device is computing, or while NEITHER device is computing?
-
-Those have different fixes. Idle while the other device computes is a scheduling problem: the
-pipeline groups are not offset, or a group is waiting at a synchronisation point, so the work
-that should have covered this device was somewhere else. Idle while neither device computes is a
-host problem: something on the CPU is between the two devices and nothing can run anywhere.
-
-The split is reported separately for the prefill phase and the decode phase of the cell, because
-a serving cell spends its first seconds prefilling every slot and a device that is idle there is
-idle for a completely different reason than one that is idle in steady decode.
-
-Usage:  device_idle.py client.jsonl peer.jsonl [--out report.txt]
+"""Splits one device's idle time into idle while the other computes (a scheduling problem) and
+idle while neither computes (a host problem), per phase: device_idle.py client.jsonl peer.jsonl
 """
 
 import argparse
@@ -29,13 +13,9 @@ from merge import load, union, union_len, clip, gaps, Index          # noqa: E40
 
 
 def phase_windows(client):
-    """(prefill, decode) lists of (t0,t1) iteration windows, per group.
-
-    An iteration is prefill when it submitted more tokens than it had slots processing: in decode
-    every slot contributes exactly one token, so n_tokens <= n_slots. The classification is per
-    iteration and not per time range, because the groups do not enter decode together.
-    """
-    subs = defaultdict(list)                      # grp -> [(t0,t1,n_tokens)]
+    """(prefill, decode) iteration windows per group; an iteration is prefill when it submitted
+    more tokens than it had slots processing, and groups do not enter decode together."""
+    subs = defaultdict(list)
     for e in client.events:
         if e.get("ph") == "server" and e.get("n") == "submit":
             subs[e.get("grp", 0)].append((e["t0"], e["t1"], e.get("n1", 0)))
@@ -74,10 +54,7 @@ def report(files, client, out):
     w0 = min(a for a, _ in all_iters)
     w1 = max(b for _, b in all_iters)
 
-    # Host phases, for attributing the stretches in which neither device computes.
-    # server/iteration is the PARENT span of every other server phase, so it is not a candidate:
-    # it would win every attribution and say nothing. What it does not cover inside an iteration
-    # is reported as "inside an iteration, untraced", which is a real answer and a different one.
+    # server/iteration is excluded: as the parent span it would win every attribution
     host = {}
     for e in client.events:
         if e.get("ph") in ("server", "sched", "llama") and e.get("n") != "iteration":
@@ -86,7 +63,6 @@ def report(files, client, out):
     iter_ix = Index([(e["t0"], e["t1"], e) for e in client.events
                      if e.get("ph") == "server" and e.get("n") == "iteration"])
 
-    # phase boundary: prefill of the cell is everything up to the last prefill iteration
     pre_all = union([iv for g in groups for iv in pre[g]])
     dec_all = union([iv for g in groups for iv in dec[g]])
     t_pre_end = max((b for _, b in pre_all), default=w0)
@@ -129,7 +105,6 @@ def report(files, client, out):
                 else:
                     n_host += 1
                     len_host.append(g1 - g0)
-                # the stretches of this hole in which the other device is ALSO idle
                 dead = gaps(clip(busy[other], g0, g1), g0, g1)
                 for d0, d1 in dead:
                     best, bestc = None, 0.0
@@ -169,7 +144,6 @@ def report(files, client, out):
                              other, (t_idle - covered) / n_steps / 1000.0))
         out.write("\n")
 
-    # how the two groups sit relative to each other: the overlap of their GPU demand
     out.write("=== group offset in the decode phase\n")
     for g in groups:
         d = clip(dec[g], t_pre_end, w1)

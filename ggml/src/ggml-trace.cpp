@@ -54,12 +54,9 @@ thread_local const char * tls_subject = nullptr;
 thread_local uint64_t     tls_uid     = 0;
 thread_local std::string  tls_line;
 
-// a traced process is usually stopped with a signal at the end of a run, and the tail of the
-// stdio buffer would be lost, so the file is flushed every so many lines. At the rate a decode
-// step produces events this is a handful of flushes per second.
+// a traced process is usually killed with a signal, so the buffer is flushed periodically
 const int64_t TRACE_FLUSH_EVERY = 128;
 
-// one line is built in the calling thread and handed to the file under the lock
 void emit(const std::string & line) {
     trace_state & s = state();
 
@@ -180,7 +177,7 @@ int ggml_trace_open(const char * path, const char * role) {
     line += ",\"t_open_us\":";
     append_i64(line, s.t_open);
     line += ",\"wall_us\":";
-    // CLOCK_REALTIME at the same instant, only a sanity check for the merge tool
+    // CLOCK_REALTIME at the same instant, a sanity check for the merge tool
     {
         struct timespec ts;
         timespec_get(&ts, TIME_UTC);
@@ -286,13 +283,7 @@ void ggml_trace_eventf(const char * phase, const char * name, int64_t t0, int64_
     ggml_trace_event(phase, name, t0, t1, fields);
 }
 
-// -----------------------------------------------------------------------------
-// GPU spans
-//
-// The timing hooks are looked up once through the backend registry, so ggml-base does not have
-// to link against any GPU runtime. A backend that does not offer them simply has no GPU rows in
-// the trace.
-// -----------------------------------------------------------------------------
+// GPU spans. The timing hooks come from the backend registry, so ggml-base links no GPU runtime.
 
 typedef void (*ggml_trace_gpu_mark_t)(ggml_backend_t backend, uint64_t tag, int kind);
 typedef int  (*ggml_trace_gpu_poll_t)(uint64_t * tags, int * kinds, int64_t * t_us, int max);
@@ -301,9 +292,7 @@ namespace {
 
 struct trace_gpu_state {
     std::mutex                                mutex;
-    // a scheduler runs over several backends and only some of them offer the hooks, so the answer
-    // is kept per registry: `probed` is every registry already asked, `supported` those that said
-    // yes. Handing a backend to the mark function of another backend's registry would be fatal.
+    // per registry: handing a backend to another registry's mark function would be fatal
     std::unordered_set<const void *>          probed;
     std::unordered_set<const void *>          supported;
     ggml_trace_gpu_mark_t                     mark   = nullptr;
@@ -318,7 +307,7 @@ trace_gpu_state & gpu() {
     return s;
 }
 
-// true when `backend` can record GPU marks; caller holds gpu().mutex
+// caller holds gpu().mutex
 bool gpu_probe(ggml_backend_t backend) {
     trace_gpu_state & st = gpu();
 
@@ -369,7 +358,6 @@ void ggml_trace_gpu_end(ggml_backend_t backend, uint64_t tag) {
     if (st.mark == nullptr || tag == 0) {
         return;
     }
-    // the tag is non zero only if this backend answered the probe
     st.mark(backend, tag, 1);
 }
 

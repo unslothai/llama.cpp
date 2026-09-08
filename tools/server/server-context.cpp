@@ -810,8 +810,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // With N > 1 the point is that while group A's batch is being computed on the second stage of a
 // layer split (the RPC peer), group B's batch can be computed on the first stage (the local GPU),
 // so both devices are busy instead of each idling half of every decode step.
-// RAII span for the event tracer (ggml/include/ggml-trace.h). Off unless GGML_RPC_TRACE is set,
-// and then one branch per call site.
+
 struct server_trace_scope {
     const char * name;
     int64_t      t0;
@@ -1940,8 +1939,6 @@ private:
 
     // the decode loop of one pipeline group, only used when n_groups > 1
     void group_loop(server_group & grp) {
-        // every event raised below this point, down to the individual RPC commands, is tagged
-        // with the group that caused it
         ggml_trace_set_group(grp.id);
 
         while (true) {
@@ -4525,8 +4522,7 @@ private:
             }
 
             if (to_sample.size() > 1) {
-                // one span for the whole pass, on this thread: the workers must not emit spans of
-                // their own, they would interleave and be counted several times over
+                // one span for the whole pass: worker spans would interleave and double count
                 server_trace_scope span("sampling", grp.id, (int) to_sample.size());
                 prof_timer ps(&grp.prof.t_sampl_par, prof_on);
 

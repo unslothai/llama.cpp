@@ -1,10 +1,6 @@
 #!/bin/bash
-# Smoke test for the event tracer with no GPU involved: two local rpc-servers on the CPU backend
-# and one llama-server splitting the layers over them, run once with the trace off and once with
-# it on. Checks that the generated text is identical either way and that the merge tool accepts
-# the result.
-#
-#   scripts/rpc_trace/cpu_check.sh <build-dir> <model.gguf> [outdir]
+# CPU-only smoke test: layers split over two rpc-servers, run with the trace off and on, checking
+# the text is identical and that merge.py accepts the result.
 set -u
 
 BUILD=${1:?usage: cpu_check.sh <build-dir> <model.gguf> [outdir]}
@@ -25,7 +21,7 @@ pids=()
 cleanup() { for p in "${pids[@]:-}"; do kill -9 "$p" 2>/dev/null; done; }
 trap cleanup EXIT
 
-# cell <tag>   (PEER_TRACE, if set, is the prefix of the peer trace files)
+# cell <tag>   (PEER_TRACE is the prefix of the peer trace files)
 cell() {
   local tag=$1; shift
   rm -f "$OUT/$tag.out.txt"

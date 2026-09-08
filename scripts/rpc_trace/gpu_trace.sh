@@ -1,6 +1,5 @@
 #!/bin/bash
-# Traced layer split cells on the Spark pair. Each configuration is run twice, once with the
-# tracer off and once with it on, so the overhead of the tracer is measured and not assumed.
+# Traced layer split cells on the Spark pair, each configuration run with the tracer off and on.
 set -u
 D=/home/nvidianew/temp/wt_trace
 O=$D/bench; S=$O/samples
@@ -41,12 +40,9 @@ export LD_LIBRARY_PATH=$BIN LLAMA_ARG_OFFLINE=1
 
 SRVPID=""; PEERPID=""
 
-# Kill every rpc-server this script started on the peer. By pid, and then by a match scoped to
-# our own port, because a server left behind holds the port and the next cell silently talks to
-# it instead ("Failed to create server socket" in its log and an empty trace).
+# by pid and then by port: a server left behind holds the port and the next cell talks to it
 stop_peer() {
-  # note: matched with pgrep -x on the binary name and then on the port in /proc, never with
-  #       pgrep -f or pkill -f, whose pattern also matches the remote shell running it
+  # note: never pgrep -f / pkill -f here, the pattern also matches the remote shell running it
   $SSH "kill -TERM $PEERPID 2>/dev/null; sleep 2; kill -9 $PEERPID 2>/dev/null;
         for p in \$(pgrep -x ggml-rpc-server 2>/dev/null); do
           if tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null | grep -q -- '-p $RPCPORT'; then
@@ -54,7 +50,6 @@ stop_peer() {
           fi
         done; true" 2>/dev/null
   PEERPID=""
-  # do not return until the port is free again
   for i in $(seq 1 30); do
     timeout 2 bash -c "</dev/tcp/$PEER/$RPCPORT" 2>/dev/null || return 0
     sleep 1
@@ -63,7 +58,6 @@ stop_peer() {
 }
 trap '[ -n "$SRVPID" ] && kill -9 $SRVPID 2>/dev/null; stop_peer' EXIT
 
-# cell <tag> <device order> <trace 0|1> [extra server args...]
 cell() {
   local tag=$1; local dev=$2; local trace=$3; shift 3
   guard; memcheck
@@ -71,8 +65,7 @@ cell() {
   local ptrace=""
   [ "$trace" = 1 ] && ptrace="--trace /tmp/trace_${tag}_peer.jsonl"
   stop_peer
-  # note: no setsid here. $! would then be the pid of setsid and the server, its child, would
-  #       survive every kill. -n so ssh does not hold the terminal open waiting for stdin.
+  # note: no setsid, $! would be its pid and the server would survive every kill
   PEERPID=$($SSH -n "cd $PEERDIR && LD_LIBRARY_PATH=$PEERDIR nohup ./ggml-rpc-server -H 0.0.0.0 -p $RPCPORT $ptrace > /tmp/trace_rpc_$tag.log 2>&1 < /dev/null & echo \$!")
   for i in $(seq 1 60); do timeout 2 bash -c "</dev/tcp/$PEER/$RPCPORT" 2>/dev/null && break; sleep 1; done
   if $SSH -n "grep -q 'Failed to create server socket' /tmp/trace_rpc_$tag.log" 2>/dev/null; then
