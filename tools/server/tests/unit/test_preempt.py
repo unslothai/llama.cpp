@@ -2,6 +2,7 @@ import os
 import re
 import struct
 import subprocess
+import threading
 import time
 import tempfile
 import pytest
@@ -247,6 +248,7 @@ def test_metrics_and_slots_report_the_parked_state():
     assert res.status_code == 200
     for slot in res.body:
         assert slot["is_preempted"] is False
+        assert slot["is_transferring"] is False
         assert slot["n_preempt"] == 0
 
     n_predict = 160
@@ -374,6 +376,7 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 
     for slot in res.body:
         assert slot["is_preempted"] is False
+        assert slot["is_transferring"] is False
 
     if server.server_metrics:
         res = server.make_request("GET", "/metrics")
@@ -706,6 +709,48 @@ def test_exact_concurrency_serves_an_mrope_model_without_a_projector():
         assert "the kv pool allocates 256 cells at a time" in text
     finally:
         os.environ.pop("LLAMA_EXACT_CONCURRENCY", None)
+
+
+def test_slots_reports_a_transferring_slot_apart_from_a_parked_one():
+    # a copy out still owns its cells and a restore has already taken them back, so a reader counting residency has to keep counting both; only a fully parked slot holds nothing
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "1"
+    text = _start_async(n_ctx=256, n_gpu_layer=99)
+    _require_async(text)
+
+    # two generations that do not fit the pool together: one is parked for real while the forced parks keep copies in flight. Without a context shift they stop at the pool, so only the parked and transferring states are pinned here.
+    n_predict = 900
+    done = []
+
+    def _run():
+        done.extend(_complete_all_raw(n_predict, (_PROMPT_A, _PROMPT_B)))
+
+    t = threading.Thread(target=_run)
+    t.start()
+
+    seen_parked = False
+    seen_transferring = False
+    try:
+        deadline = time.time() + 120
+        while time.time() < deadline and not (seen_parked and seen_transferring):
+            res = server.make_request("GET", "/slots")
+            assert res.status_code == 200
+            for slot in res.body:
+                parked = slot["is_preempted"]
+                transferring = slot["is_transferring"]
+                assert not (parked and transferring), slot
+                if transferring:
+                    seen_transferring = True
+                    assert slot["n_prompt_tokens"] > 0, "a slot with a copy in flight still holds its cells"
+                seen_parked = seen_parked or parked
+    finally:
+        t.join(180)
+
+    assert len(done) == 2, done
+    for res in done:
+        assert res.status_code == 200, res.body
+        assert res.body["tokens_predicted"] > 0
+    assert seen_parked, "no parked slot was ever reported"
+    assert seen_transferring, "no slot with a copy in flight was ever reported"
 
 
 def _shift_completion(n_predict: int):

@@ -989,12 +989,14 @@ struct server_slot {
         json res;
 
         res = {
-            {"id",            id},
-            {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
-            {"is_processing", is_processing()},
-            {"is_preempted",  preempt_is_out()},
-            {"n_preempt",     n_preempt},
+            {"id",              id},
+            {"n_ctx",           n_ctx},
+            {"speculative",     can_speculate()},
+            {"is_processing",   is_processing()},
+            // [TAG_PREEMPT] parked means the cells are gone; a copy out still owns them and a restore has already taken them back, so a scraper counting residency has to keep counting those two
+            {"is_preempted",    state == SLOT_STATE_PREEMPTED},
+            {"is_transferring", preempt_in_flight()},
+            {"n_preempt",       n_preempt},
         };
 
         const auto & ptask = task ? task : task_prev;
