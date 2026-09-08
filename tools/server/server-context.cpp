@@ -35,7 +35,6 @@
 #include <windows.h>
 #endif
 
-// used by the --pipeline-groups decode threads
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -201,12 +200,10 @@ struct server_batch {
 struct server_slot {
     int id;
 
-    // pipeline group that owns this slot, i.e. the index of ctx_tgt in server_context_impl::groups
-    // always 0 unless --pipeline-groups > 1
+    // pipeline group that owns this slot, index into server_context_impl::groups
     int id_group = 0;
 
-    // sequence id of this slot inside ctx_tgt / ctx_dft
-    // equal to id unless --pipeline-groups > 1, where each context only holds n_parallel/N sequences
+    // sequence id of this slot inside ctx_tgt / ctx_dft, equal to id unless --pipeline-groups > 1
     int seq_id = 0;
 
     llama_context * ctx_tgt = nullptr;
@@ -318,8 +315,7 @@ struct server_slot {
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
-    // token produced by the parallel sampling pass of post_decode, LLAMA_TOKEN_NULL if that pass
-    // did not run for this slot (then the sequential path samples it as before)
+    // token from the parallel sampling pass of post_decode, LLAMA_TOKEN_NULL if it did not run
     llama_token pre_sampled = LLAMA_TOKEN_NULL;
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -801,18 +797,6 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     return try_decode();
 }
 
-// A pipeline group is one llama_context with its own batch, its own decode loop and its own
-// contiguous range of slots. With --pipeline-groups 1 (the default) there is exactly one group:
-// it owns ctx_tgt and every slot, and its update loop runs on the main thread, as before.
-//
-// With N > 1 the point is that while group A's batch is being computed on the second stage of a
-// layer split (the RPC peer), group B's batch can be computed on the first stage (the local GPU),
-// so both devices are busy instead of each idling half of every decode step.
-
-// -----------------------------------------------------------------------------
-// per-group host-path profiling, enabled with LLAMA_SERVER_PIPE_PROF=1
-// -----------------------------------------------------------------------------
-
 static bool pipe_prof_enabled() {
     const char * e = getenv("LLAMA_SERVER_PIPE_PROF");
     return e != nullptr && atoi(e) != 0;
@@ -850,13 +834,7 @@ struct prof_timer {
 };
 
 
-// A tiny fixed worker pool used to sample the slots of one group in parallel.
-//
-// Sampling one row of a 250k-token vocabulary costs about 0.6 ms on this hardware, and it costs
-// six times that while the other pipeline group is driving the GPUs, so a serial pass over the
-// slots is tens of milliseconds sitting on the critical path between the decode and the next
-// submit. The rows are independent - each slot has its own sampler and reads its own row of the
-// logits - so they can be done at the same time. The output is identical either way.
+// each slot has its own sampler and its own row of the logits, so parallel sampling is exact
 struct server_par_for {
     std::vector<std::thread>        workers;
     std::mutex                      mtx;
@@ -943,7 +921,6 @@ private:
 
 struct server_group;
 
-// the group whose decode loop is running on this thread, used by the deep call sites
 static thread_local server_group * tls_group = nullptr;
 
 struct server_group {
@@ -953,13 +930,9 @@ struct server_group {
 
     server_batch batch;
 
-    // slots owned by this group, in slot id order (slots are partitioned contiguously)
     std::vector<server_slot *> slots;
 
-    // speculative decoding state of this group
-    // note: a common_speculative and its draft (or MTP) context are bound to one target context,
-    //       so each group owns its own set, sized for the group's sequences and indexed by
-    //       slot.seq_id (which is slot.id with a single group)
+    // note: bound to one target context, so each group owns its own set, indexed by slot.seq_id
     common_speculative_init_result_ptr spec_init;
 
     llama_model   * model_dft = nullptr;
@@ -969,25 +942,19 @@ struct server_group {
 
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
-    // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-    // note: kept out of server_metrics, which is copied as-is into the task result
+    // note: async, so only valid after a sync; kept out of server_metrics, which is copied as-is
     int64_t  t_decode_start  = 0; // start of the last submitted decode of this group
     int64_t  t_prompt_start  = 0; // start of the oldest queued prompt decode of this group
     uint64_t n_prompt_queued = 0;
 
     int n_empty_consecutive = 0;
 
-    // host-path profiling, only filled in when LLAMA_SERVER_PIPE_PROF=1
     server_group_prof prof;
 
-    // sampling of this group's slots, run over several threads (see server_par_for)
     server_par_for            pool;
     std::vector<server_slot *> to_sample;
 
-    // only used when n_groups > 1
-    // note: the lock is per group on purpose - the whole point of the feature is that the host
-    //       path of one group (pre_decode, sampling, streaming, post_decode) runs while the other
-    //       group is on the GPU, so nothing here may be shared between groups
+    // note: per group on purpose - one group's host path runs while the other is on the GPU
     std::thread thread;
     std::mutex              mtx;  // guards this group's slots, batch and the two fields below
     std::condition_variable cv;
@@ -1019,7 +986,6 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
-    // number of pipeline groups requested via --pipeline-groups, must be set before load_model()
     int n_pipeline_groups_req = 1;
 
     server_context_impl() {
@@ -1053,27 +1019,18 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
-    // pipeline groups, see --pipeline-groups and struct server_group
-    // groups[0]->ctx is always ctx_tgt; n_groups == 1 unless the user asked for more
     int n_groups = 1;
     std::vector<std::unique_ptr<server_group>> groups;
 
-    // LLAMA_SERVER_PIPE_PROF=1: time the host path of each group separately
     const bool prof_on = pipe_prof_enabled();
 
-    // number of sequences per context, == params_base.n_parallel when n_groups == 1
     int n_seq_per_group = 1;
 
-    // the following are only ever touched when n_groups > 1
     std::atomic<bool> groups_stop { false };
 
-    // server_metrics and the prompt cache are shared by every group, so they get their own locks
-    // instead of riding on a global engine lock. Both are off the per-token path.
     std::mutex mtx_metrics;
     std::mutex mtx_prompt_cache;
 
-    // note: the speculative decoding state (draft / MTP context, common_speculative) lives in
-    //       the groups, see struct server_group
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     bool add_bos_token = true;
@@ -1281,9 +1238,6 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // --pipeline-groups: run the slots over N independent contexts of one model, so that the
-        // stages of a layer split can be busy at the same time. N == 1 is the default and keeps
-        // every code path below exactly as it was.
         n_groups = std::max(1, n_pipeline_groups_req);
 
         if (n_groups > 1 && !validate_pipeline_groups(params_base, has_mmproj)) {
@@ -1297,8 +1251,7 @@ private:
         common_params & params_ctx = n_groups > 1 ? params_grp  : params_base;
 
         if (n_groups > 1) {
-            // each context gets 1/N of the sequences and 1/N of the total context, so the per-slot
-            // context (n_ctx / n_seq_max) and the total KV memory over all contexts are unchanged
+            // 1/N of the sequences and of the context each, so per-slot context and total KV hold
             params_ctx.n_parallel = n_seq_per_group;
             params_ctx.n_ctx      = params_base.n_ctx / n_groups;
         }
@@ -1331,7 +1284,6 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
-        // the remaining contexts of the pipeline are created from the same model
         {
             groups.clear();
             groups.reserve(n_groups);
@@ -1366,7 +1318,6 @@ private:
             }
         }
 
-        // the total context over all groups, as requested by the user
         n_ctx = llama_n_ctx(ctx_tgt) * n_groups;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -1376,8 +1327,6 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
-            // one draft / MTP context per group, each bound to the context of its group and sized
-            // for the group's sequences (with a single group params_ctx is params_base, as before)
             // note: with --model-draft the draft model is loaded once per group
             for (int g = 0; g < n_groups; ++g) {
                 server_group & grp = *groups[g];
@@ -1494,8 +1443,6 @@ private:
         }
 
         // try speculative decoding
-        // note: a common_speculative is bound to one target context, so each group gets its own,
-        //       sized for the group's sequences (n_seq_per_group == n_parallel with one group)
         for (auto & grp : groups) {
             if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 common_params_speculative params_spec = params_base.speculative;
@@ -1596,8 +1543,7 @@ private:
             }
         }
 
-        // sampling threads. The budget is the same however many groups there are, so that a
-        // pipeline-groups run is not simply given more CPU than the single-context run.
+        // the budget is split across the groups, so a pipeline run is not given more CPU
         {
             int n_sampling_threads = 8;
 
@@ -1608,7 +1554,6 @@ private:
             n_sampling_threads = std::min(n_sampling_threads, (int) std::thread::hardware_concurrency());
             n_sampling_threads = std::max(0, n_sampling_threads / n_groups);
 
-            // the calling thread takes a share too, so this many extra workers
             const int n_workers = std::max(0, n_sampling_threads - 1);
 
             for (auto & grp : groups) {
@@ -1667,7 +1612,6 @@ private:
         return true;
     }
 
-    // refuse everything we cannot make safe with more than one context, rather than half-support it
     bool validate_pipeline_groups(const common_params & params, bool has_mmproj) const {
         auto refuse = [](const char * what) {
             SRV_ERR("--pipeline-groups > 1 is not supported together with %s\n", what);
@@ -1690,22 +1634,17 @@ private:
             return false;
         }
 
-        // note: speculative decoding is fine - every group owns a draft / MTP context and a
-        //       common_speculative of its own, see struct server_group
-
         // mtmd_context is bound to one llama_context
         if (has_mmproj) {
             return refuse("multimodal (--mmproj)");
         }
 
-        // common_init_from_params() applies the control vector to the context it creates and only
-        // to that one, so the extra contexts would silently run without it
+        // common_init_from_params() applies it only to the context it creates
         if (!params.control_vectors.empty()) {
             return refuse("--control-vector");
         }
 
-        // entering / leaving the sleeping state destroys and rebuilds the contexts under the
-        // running group threads
+        // entering / leaving it rebuilds the contexts under the running group threads
         if (params.sleep_idle_seconds >= 0) {
             return refuse("--sleep-idle");
         }
@@ -1829,15 +1768,8 @@ private:
         return true;
     }
 
-    // Holds the engine so that the caller can look at the slot state safely, and, on request,
-    // waits for the in-flight decode of the groups whose context the caller is going to touch.
-    // Constructing this is a no-op when there is a single group: the single update loop and the
-    // task processing then run on the same thread, exactly as before.
-    //
-    // Taking every group's lock keeps every group out of a new iteration, so the slot state is
-    // stable as soon as the guard exists. Only touching a llama_context needs more than that,
-    // and only for the group that owns it: wait_for() drops the other groups' locks first, so
-    // their host path keeps running, then blocks until that group's decode is done.
+    // holds every group's lock, so the slot state is stable while the guard exists; a no-op with a
+    // single group. wait_for() then drops the other groups' locks and waits out one group's decode.
     struct engine_guard {
         server_context_impl * srv = nullptr;
         std::vector<std::unique_lock<std::mutex>> lks;
@@ -1849,10 +1781,7 @@ private:
 
             srv = srv_;
 
-            // take every group's lock, in group order, so that the slot state of the whole server
-            // is stable while the task is being routed. This blocks the host path of the groups,
-            // not their decodes, and it is released again as soon as the task knows which group
-            // it needs.
+            // always in group order, so two guards cannot deadlock against each other
             lks.resize(srv->groups.size());
 
             for (size_t g = 0; g < srv->groups.size(); ++g) {
@@ -1861,7 +1790,6 @@ private:
             }
         }
 
-        // let every group except id_group go, then wait until this one is not inside llama_decode
         void wait_for(int id_group) {
             if (srv == nullptr) {
                 return;
@@ -1879,7 +1807,6 @@ private:
             grp->cv.wait(lks[id_group], [&] { return !grp->busy; });
         }
 
-        // wait for every group, for tasks that are not tied to one slot
         void wait_for_all() {
             if (srv == nullptr) {
                 return;
@@ -1915,7 +1842,6 @@ private:
         }
     };
 
-    // the decode loop of one pipeline group, only used when n_groups > 1
     void group_loop(server_group & grp) {
         while (true) {
             if (groups_stop.load(std::memory_order_relaxed)) {
@@ -1926,7 +1852,6 @@ private:
                 continue;
             }
 
-            // nothing to do for this group, wait for a task to be assigned to one of its slots
             std::unique_lock<std::mutex> lk(grp.mtx);
             grp.cv.wait_for(lk, std::chrono::milliseconds(5),
                     [&] { return groups_stop.load(std::memory_order_relaxed); });
@@ -2091,16 +2016,12 @@ private:
             update_cache = false;
         }
 
-        // note: the caller runs update_prompt_cache() once it knows the slot is free and the group
-        //       that owns it is not decoding - reading and writing the sequence KV of a context
-        //       while that context is computing is not allowed
         need_cache_update = update_cache;
 
         return ret;
     }
 
-    // moves the slot's current prompt into the RAM cache and loads the best prefix for the new
-    // task. Touches the slot's context, so the owning group must be out of llama_decode.
+    // reads and writes the slot's sequence KV, so the owning group must be out of llama_decode
     void update_prompt_cache(server_slot & slot, const server_task & task) {
         SRV_TRC("%s", "updating prompt cache\n");
 
@@ -2129,7 +2050,6 @@ private:
             return res;
         }
 
-        // only slots of this group, their KV lives in this group's context
         for (auto * slot_ptr : grp.slots) {
             auto & slot = *slot_ptr;
 
@@ -2707,7 +2627,6 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot, int id_group) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            // the parent copies its KV into the children, so they must live in the same context
             if (slot.id_group != id_group) {
                 continue;
             }
@@ -2824,10 +2743,6 @@ private:
             return false;
         }
 
-        // with more than one group the update loops run on their own threads. Holding the engine
-        // is enough to look at and modify the slot state; the cases below additionally wait for
-        // the in-flight decode of the group whose context they touch, and only for that group.
-        // no-op with a single group.
         engine_guard guard(this);
 
         switch (task.type) {
@@ -2867,8 +2782,7 @@ private:
                         break;
                     }
 
-                    // from here on the slot's context is touched (prompt cache, KV), so the group
-                    // that owns it has to finish its decode. the other groups keep computing.
+                    // from here the slot's context is touched, so its group must finish its decode
                     guard.wait_for(slot->id_group);
 
                     if (need_cache_update) {
@@ -2878,9 +2792,7 @@ private:
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        // the children take their KV from the parent, so they must fit in the
-                        // parent's group. with a single group this is the limit the request
-                        // schema already enforces, so nothing changes there.
+                        // the children take their KV from the parent, so they must fit its group
                         if ((int) n_child_tasks + 1 > n_seq_per_group) {
                             send_error(task, string_format(
                                 "n_cmpl must not exceed the number of slots per pipeline group (%d)", n_seq_per_group),
@@ -2903,7 +2815,6 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
-                        // this walks every slot of every group
                         guard.wait_for_all();
 
                         for (auto & slot : slots) {
@@ -3033,7 +2944,6 @@ private:
                         break;
                     }
 
-                    // reads this slot's KV out of its context
                     guard.wait_for(slot->id_group);
 
                     const int64_t t_start = ggml_time_us();
@@ -3086,7 +2996,6 @@ private:
                         break;
                     }
 
-                    // writes this slot's KV into its context
                     guard.wait_for(slot->id_group);
 
                     const int64_t t_start = ggml_time_us();
@@ -3154,7 +3063,6 @@ private:
                         break;
                     }
 
-                    // prompt_clear() drops this slot's KV from its context
                     guard.wait_for(slot->id_group);
 
                     // Erase token cache
@@ -3278,7 +3186,6 @@ private:
     };
 #endif
 
-    // LLAMA_SERVER_PIPE_PROF=1: dump the host path of every group every 5 s and start a new window
     // note: called with the group's own lock held when n_groups > 1
     std::atomic<int64_t> t_prof_last { 0 };
 
@@ -3319,8 +3226,7 @@ private:
         }
     }
 
-    // runs one iteration of the decode loop of a single pipeline group
-    // returns true if the group had work to do
+    // one iteration of the decode loop of a single group, returns true if it had work to do
     bool update_slots(server_group & grp) {
         // shadow the single-context members - everything below operates on this group only
         auto * ctx_tgt = grp.ctx;
@@ -3329,7 +3235,6 @@ private:
 
         tls_group = &grp;
 
-        // when there is only one group there is only one thread and this lock is never engaged
         std::unique_lock<std::mutex> lk;
         if (n_groups > 1) {
             prof_timer tl(&grp.prof.t_lock, prof_on);
@@ -3384,8 +3289,7 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
-            // note: with more than one group each group drives its own loop, so there is no need
-            //       to keep the shared task loop spinning
+            // note: each group drives its own loop, so the shared task loop need not keep spinning
         }
 
         try {
@@ -3473,7 +3377,6 @@ private:
         auto & slots   = grp.slots;
         (void) ctx_tgt;
 
-        // the speculative state of this group
         auto & spec    = grp.spec;
         auto * ctx_dft = grp.ctx_dft;
         const auto ctx_dft_seq_rm_type = grp.ctx_dft_seq_rm_type;
@@ -3611,8 +3514,7 @@ private:
         });
 
         // generate the actual drafts (if any)
-        // note: only the main thread may yield to the task queue, and with several groups each
-        //       group drafts on its own thread and against its own draft context
+        // note: only the main thread may yield to the task queue
         if (!drafting.empty()) {
             if (n_groups > 1) {
                 common_speculative_draft(spec.get());
@@ -4228,7 +4130,6 @@ private:
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
 
-        // the speculative state of this group
         auto & spec      = grp.spec;
         auto * model_dft = grp.model_dft;
 
@@ -4264,11 +4165,8 @@ private:
 
         int ret = 0;
         if (n_groups > 1) {
-            // release the engine for the duration of the compute - this is the whole point of the
-            // feature: while this group is on one stage of the layer split, the other group can
-            // run its own pre_decode / post_decode and submit its batch to the other stage
-            // note: RAII, so a throwing decode cannot leave the group marked busy forever, nor
-            //       return to the caller's error handling without the engine lock held
+            // note: RAII, or a throwing decode leaves the group busy forever, or returns to the
+            //       caller's error handling without the engine lock held
             struct decode_window {
                 server_context_impl * srv;
                 server_group * grp;
@@ -4367,8 +4265,6 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        // note: only the main thread may yield to the task queue; with several groups the batch
-        //       goes through this group's draft context on this group's thread
         if (spec) {
             bool ok = true;
             if (n_groups > 1) {
@@ -4388,7 +4284,6 @@ private:
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
-        // note: children are always in the same group as the parent, see get_free_slots()
         for (auto * slot_ptr : slots) {
             auto & slot = *slot_ptr;
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -4416,12 +4311,9 @@ private:
     }
 
     void post_decode(server_group & grp, int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
-        // shadow the single-context members, as update_slots() does
         auto * ctx_tgt = grp.ctx;
         auto & slots   = grp.slots;
-
-        // the speculative state of this group
-        auto & spec = grp.spec;
+        auto & spec    = grp.spec;
         (void) ctx_tgt;
 
         // for checking if a given batch index is inside batch_view
@@ -4444,9 +4336,6 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
-        // sample the rows of this sub-batch in parallel, before the sequential pass below walks
-        // the slots. Each row has its own sampler and its own row of the logits, so the tokens
-        // are exactly the ones the sequential path would have produced.
         {
             auto & to_sample = grp.to_sample;
 
@@ -4481,8 +4370,7 @@ private:
             if (to_sample.size() > 1) {
                 prof_timer ps(&grp.prof.t_sampl_par, prof_on);
 
-                // resolve the first row on this thread: the first call after a decode may have to
-                // un-permute the output rows, which mutates the context
+                // the first call after a decode may un-permute the rows, which mutates the context
                 llama_get_logits_ith(grp.ctx, to_sample[0]->i_batch - off);
 
                 grp.pool.run((int) to_sample.size(), [&](int i) {
@@ -4490,8 +4378,7 @@ private:
                     try {
                         slot->pre_sampled = common_sampler_sample(slot->smpl.get(), slot->ctx_tgt, slot->i_batch - off);
                     } catch (const std::exception & e) {
-                        // leave it unsampled, the sequential pass below will hit the same error
-                        // in the place that knows how to report it
+                        // leave it unsampled, the sequential pass below reports the same error
                         SLT_ERR(*slot, "parallel sampling failed: %s\n", e.what());
                         slot->pre_sampled = LLAMA_TOKEN_NULL;
                     }
@@ -4773,8 +4660,7 @@ private:
         auto & batch = grp.batch;
 
         {
-            // note: only this group's slots - the other groups count their own, and their state
-            //       may not be read from here
+            // note: only this group's slots - another group's slot state may not be read here
             std::lock_guard<std::mutex> lk(mtx_metrics);
 
             metrics.n_decode++;
@@ -4875,7 +4761,6 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
 
-    // no-op unless --pipeline-groups > 1
     impl->start_groups();
 
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
