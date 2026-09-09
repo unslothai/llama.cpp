@@ -177,13 +177,13 @@ static run_result run_graph(
         bias = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, c.nkv, c.nq, c.hq, c.n_batch);
         ggml_set_name(bias, "dense_bias");
         ggml_tensor * scores = ggml_mul_mat(ctx.get(), k, q);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_prec_set_acc(scores, GGML_PREC_F32);
         scores = ggml_scale(ctx.get(), scores, 1.0f/float(c.d));
         scores = ggml_add(ctx.get(), scores, bias);
         scores = ggml_soft_max_ext(ctx.get(), scores, m, 1.0f, 0.0f);
         ggml_tensor * vt = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), v));
         out = ggml_mul_mat(ctx.get(), vt, scores);
-        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         out = ggml_cont(ctx.get(), ggml_permute(ctx.get(), out, 0, 2, 1, 3));
     }
     ggml_set_name(out, dense ? "out_dense" : "out_flash");

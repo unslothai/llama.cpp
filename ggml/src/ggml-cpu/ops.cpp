@@ -9389,6 +9389,7 @@ void ggml_compute_forward_flash_attn_ext(
         ggml_tensor * dst) {
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
+        case GGML_PREC_F32_PEDANTIC:
         case GGML_PREC_F32:
             {
                 // uses F32 accumulators

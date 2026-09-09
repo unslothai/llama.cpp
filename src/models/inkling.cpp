@@ -380,7 +380,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         ggml_tensor * proj = ggml_cont(ctx0, ggml_transpose(ctx0, layer.attn_rel_proj)); // {d_rel, E}
 
         ggml_tensor * rel = ggml_mul_mat(ctx0, proj, r2); // {E, n_head*n_tokens}
-        ggml_mul_mat_set_prec(rel, GGML_PREC_F32_PEDANTIC);
+        ggml_prec_set_acc(rel, GGML_PREC_F32_PEDANTIC);
         rel = ggml_reshape_3d(ctx0, rel, rel_extent, n_head, n_tokens);
 
         if (tau && !is_swa) {
@@ -465,7 +465,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
                     1.0f/float(head_dim), rel_extent);
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
@@ -652,7 +652,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         cur = build_lora_mm(
             model.output, cur, nullptr,
-            model.output->type == GGML_TYPE_F32 ? GGML_PREC_F32_PEDANTIC : GGML_PREC_DEFAULT);
+            model.output->type == GGML_TYPE_F32 ? GGML_PREC_F32_PEDANTIC : GGML_PREC_UNDEFINED);
 
         // padded vocab rows get -inf so samplers never emit a padded id
         if (vocab_mask) {

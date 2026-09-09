@@ -7783,7 +7783,7 @@ struct test_flash_attn_ext_banded : public test_case {
         }
 
         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
     }

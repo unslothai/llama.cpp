@@ -55,7 +55,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, nkv, hkv, 1);
     ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, nkv, nq, 1, 1);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/float(d), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     if (!ggml_backend_supports_op(backend, out)) {
         fprintf(stderr, "ordinary flash attention is unsupported on %s\n",
                 ggml_backend_dev_description(chosen));

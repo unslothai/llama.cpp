@@ -1653,7 +1653,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
-    if (dst->op_params[0] == GGML_PREC_F32) {
+    // [TAG_GGML_PREC] any acc rank at least as strict as F32 (F32, F32_PEDANTIC) forces F32 compute
+    const ggml_prec prec_acc = ggml_prec(dst->op_params[0]);
+    if (prec_acc != GGML_PREC_UNDEFINED && prec_acc <= GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -1675,7 +1677,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 
     // a scoped pedantic request overrides the process-wide compute type, for F32 weights only
-    if (src0->type == GGML_TYPE_F32 && ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC) {
+    if (src0->type == GGML_TYPE_F32 && prec_acc == GGML_PREC_F32_PEDANTIC) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -1909,6 +1911,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // same gate as ggml_cuda_mul_mat_id: a pedantic F32 request never takes the mmf path
+    const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
+        ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -1927,7 +1933,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (!f32_pedantic && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
@@ -2080,7 +2086,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
+        // [TAG_GGML_PREC] the slice stands in for dst: carry acc (0) and src precision (2, 3).
+        // Not op_params[1], the op hint, which describes the unsliced operands.
         dst_slice.op_params[0] = dst->op_params[0];
+        dst_slice.op_params[2] = dst->op_params[2];
+        dst_slice.op_params[3] = dst->op_params[3];
 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
