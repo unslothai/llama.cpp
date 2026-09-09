@@ -3354,6 +3354,9 @@ private:
 
     bool preempt_batch_abandoned = false;
 
+    // [TAG_EXACT_CONCURRENCY] a batch too small to hold a decode step and a whole ubatch is reported once, not per prefill
+    bool exact_prefill_warned = false;
+
     // [TAG_PREEMPT_ASYNC] a context shift was recorded this round; it is applied in place inside the next llama_decode
     bool preempt_shift_pending = false;
 
@@ -4967,6 +4970,32 @@ private:
                         }
                     }
 
+                    // [TAG_EXACT_CONCURRENCY] a prompt is isolated into ubatches of its own, so it gets the shapes it would get alone only if what it adds here is a whole number of ubatches: otherwise a neighbour's decoded token shortens the last one, and 512,512,512,509 is not 512,512,512,512
+                    int32_t n_batch_cur = n_batch;
+
+                    if (common_exact_concurrency() && slot.can_split() && !slot.prompt.tokens.has_mtmd) {
+                        const int32_t n_avail = n_batch - (int32_t) batch.size();
+                        const int32_t n_left  = n_input_tokens - slot.prompt.n_tokens();
+
+                        if (n_left > n_avail) {
+                            const int32_t n_take = n_avail - n_avail % n_ubatch;
+
+                            if (n_take > 0) {
+                                n_batch_cur = (int32_t) batch.size() + n_take;
+                            } else if (n_batch >= n_ubatch + common_exact_decode_width(params_base)) {
+                                // the batch holds a decode step and a whole ubatch, so waiting for the next iteration ends
+                                SLT_DBG(slot, "exact concurrency: %d of %d batch tokens left, short of a %d-token ubatch: the prefill waits\n",
+                                        n_avail, n_batch, n_ubatch);
+                                return;
+                            } else if (!exact_prefill_warned) {
+                                exact_prefill_warned = true;
+
+                                SRV_WRN("exact concurrency: --batch-size %d does not hold a decode step of %d tokens and a %d-token ubatch, so a prefill beside a running slot is split differently than it would be alone\n",
+                                        n_batch, common_exact_decode_width(params_base), n_ubatch);
+                            }
+                        }
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -5063,7 +5092,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < n_input_tokens && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < n_input_tokens && batch.size() < n_batch_cur) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

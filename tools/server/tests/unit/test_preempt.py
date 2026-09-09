@@ -38,6 +38,7 @@ def create_server():
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
                  "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
+                 "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY"):
         os.environ.pop(name, None)
 
@@ -555,6 +556,76 @@ def test_exact_concurrency_serves_an_mrope_model_without_a_projector():
     text = _log()
     assert "does not support M-RoPE" not in text
     assert "the kv pool allocates 256 cells at a time" in text
+
+
+def _ubatch_widths(text: str) -> list:
+    """The tokens of every ubatch a split produced, in order; needs LLAMA_BATCH_DEBUG."""
+    res = []
+    pending = False
+    for line in text.splitlines():
+        if "added ubatch to split" in line:
+            pending = True
+        elif pending and "n_tokens" in line:
+            res.append(int(line.split("=")[-1]))
+            pending = False
+    return res
+
+
+def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone():
+    # generated tokens enter the batch first and a prompt took what was left, so its ubatches were 512,512,512,509 beside three decoders and 512,512,512,512 alone: isolating the sequences does not make the shapes equal by itself
+    path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")
+    server.model_file = path
+    server.model_hf_repo = server.model_hf_file = None
+    os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
+    os.environ["LLAMA_BATCH_DEBUG"] = "1"
+    os.environ["LLAMA_ARG_LOG_VERBOSITY"] = "5"
+    os.environ["LLAMA_ARG_CTX_CHECKPOINTS"] = "0"
+    _start(n_ctx=16384, n_slots=4, n_batch=2048, n_ubatch=512, fa="on", n_gpu_layer=99, cache_ram=0)
+
+    def prefill(first_token: int) -> list:
+        mark = len(open(server.log_path, errors="replace").read())
+        res = server.make_request("POST", "/completion", data={
+            "prompt": list(range(first_token, first_token + 3500)), "n_predict": 1,
+            "cache_prompt": False, "temperature": 0.0, "seed": 42,
+        }, timeout=600)
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["prompt_n"] == 3500
+        text = open(server.log_path, errors="replace").read()[mark:]
+        # a decode step is one token per slot, so the prompt's own ubatches are the wide ones
+        return [w for w in _ubatch_widths(text) if w > 3]
+
+    alone = prefill(1000)
+    assert alone, "no ubatch was recorded, LLAMA_BATCH_DEBUG did not reach the log"
+
+    def decoder(i):
+        server.make_request("POST", "/completion", data={
+            "prompt": list(range(20000 + 100 * i, 20000 + 100 * i + 8)), "n_predict": 100000,
+            "cache_prompt": False, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        }, timeout=600)
+
+    threads = [threading.Thread(target=decoder, args=(i,), daemon=True) for i in range(3)]
+    for t in threads:
+        t.start()
+
+    try:
+        for _ in range(600):
+            slots = server.make_request("GET", "/slots").body
+            if sum(1 for s in slots if s["is_processing"] and s["n_prompt_tokens"] > 0) >= 3:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the decoders never started")
+        time.sleep(1.0)
+
+        beside = prefill(50000)
+    finally:
+        server.stop()
+        for t in threads:
+            t.join(30)
+
+    assert beside == alone, f"alone {alone}, beside three decoders {beside}"
 
 
 def test_slots_reports_a_transferring_slot_apart_from_a_parked_one():
