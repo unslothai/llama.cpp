@@ -844,8 +844,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     if (sock == nullptr) {
         return;
     }
-    // informational, not the data path, and queried at teardown when the peer may be gone: report 0,
-    // as an endpoint we cannot connect to already does.
+    // informational, queried at teardown when the peer may be gone: report 0, as an unreachable endpoint does.
     if (!get_device_memory(sock, device, free, total)) {
         GGML_LOG_ERROR("%s: failed to query device memory of %s, reporting 0\n", __func__, endpoint);
         *free = 0;
