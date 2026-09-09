@@ -160,27 +160,8 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     }
 }
 
-// Appends `text_added` to `text`, keeping in `pending` the trailing bytes of an incomplete UTF-8
-// sequence so that the next chunk can complete it, and replacing bytes that can never form a valid
-// codepoint with U+FFFD.
-//
-// The generated text is a raw byte stream and is not guaranteed to be valid UTF-8: a byte fallback
-// token, or a prompt that ends in the middle of a multi-byte character (the model then continues
-// with the remaining continuation bytes), makes it start with, or contain, bytes that do not decode.
-// The chat parsers reject malformed UTF-8 by design, and the exception thrown for it propagates out
-// of the streaming loop and cancels the task, so the request ends with no tokens at all. The JSON
-// serialiser already substitutes U+FFFD for those bytes on the way to the client, so doing the same
-// substitution before parsing keeps the parser input identical to what the client receives.
-// How many bytes the JSON serialiser's replace handler consumes for one failed sequence: the
-// lead byte plus the continuation bytes that actually followed it, never past the length the
-// lead announced. A byte that is itself a continuation is a failed sequence on its own, which
-// is why "\x80\x80" is two replacements rather than one.
-// The lead byte's own rules: how many bytes the sequence claims, and the range the FIRST
-// continuation must fall in. Four leads restrict that range, and they are the whole reason
-// overlong forms, surrogates and anything past U+10FFFF can be told apart from valid text:
-// E0 80 is an overlong encoding, ED A0 a surrogate, F0 80 overlong again, F4 90 out of range.
-// Returns false for a byte that can never begin a sequence: a bare continuation, C0 or C1
-// (only ever overlong), or F5..FF.
+// How many bytes a lead announces, and the range its FIRST continuation must fall in. Four leads
+// restrict that range, which is what separates overlong forms and surrogates from valid text.
 static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & lo, unsigned char & hi) {
     lo = 0x80;
     hi = 0xbf;
@@ -207,14 +188,9 @@ static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & 
     return false;
 }
 
-// Whether `len` bytes at `pos` are a legal Unicode scalar. `common_parse_utf8_codepoint` checks
-// continuation SHAPE only -- `(c & 0xc0) == 0x80` -- and never the lead's range, so it reports
-// SUCCESS for C0 80, ED A0 80 and F4 90 80 80. Copying those through unchanged is not harmless:
-// the JSON serialiser replaces them, so the client is shown something different from what a
-// parser receives, and the AST dump under `params.debug` uses a plain dump() with no error
-// handler, which throws on exactly these bytes and aborts the completion this change exists to
-// keep alive. The shared parser is left alone: it has other callers, and the check belongs where
-// the sanitising happens.
+// A legal scalar, which `common_parse_utf8_codepoint` does not check: it tests continuation shape
+// only and accepts C0 80. Passing that through diverges from what the client is shown, and the AST
+// dump under `params.debug` throws on it. Checked here: the shared parser has other callers.
 static bool utf8_is_scalar(const std::string & s, size_t pos, size_t len) {
     if (len == 0 || pos + len > s.size()) {
         return false;
@@ -234,8 +210,7 @@ static bool utf8_is_scalar(const std::string & s, size_t pos, size_t len) {
     return true;
 }
 
-// How many bytes the JSON serialiser treats as ONE failed sequence, so that one U+FFFD replaces
-// exactly the same span the client is shown.
+// One failed sequence as the serialiser counts it: "\xE2\x80A" is one replacement, "\xC3\xC3" two.
 static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
     size_t want = 0;
     unsigned char lo = 0, hi = 0;
@@ -254,6 +229,9 @@ static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
     return have;
 }
 
+// Generated text is a raw byte stream: a byte-fallback token, or a prompt cut mid-character, puts
+// undecodable bytes in it, the chat parsers throw on those, and the exception cancels the task.
+// Substituting as the serialiser already does keeps the parser and the client seeing one thing.
 static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added, bool is_final = false) {
     pending += text_added;
 
@@ -261,7 +239,6 @@ static void append_utf8_sanitized(std::string & text, std::string & pending, con
     while (pos < pending.size()) {
         const auto res = common_parse_utf8_codepoint(pending, pos);
         if (res.status == utf8_parse_result::INCOMPLETE && !is_final) {
-            // wait for the rest of the sequence
             break;
         }
         if (res.status == utf8_parse_result::SUCCESS && utf8_is_scalar(pending, pos, res.bytes_consumed)) {
@@ -269,14 +246,8 @@ static void append_utf8_sanitized(std::string & text, std::string & pending, con
             pos += res.bytes_consumed;
             continue;
         }
-        // One U+FFFD for the whole malformed prefix, which is where the JSON serialiser puts its
-        // boundaries: with error_handler_t::replace it renders "\xE2\x80A" as one replacement
-        // followed by A, not two replacements, and "\xC3\xC3" as two, because the second lead
-        // byte ends the first sequence rather than continuing it. Byte-at-a-time would disagree
-        // with what the client is shown, and the parsed message is preferred over the raw content.
-        // On the final call INCOMPLETE lands here too: nothing more is coming, and the parser
-        // reports INCOMPLETE for a short sequence without checking that what followed the lead
-        // was even a continuation, so "\xE2A" must give one replacement and keep the A.
+        // INCOMPLETE lands here on the final call: the parser does not check that what followed
+        // the lead was a continuation, so "\xE2A" must give one replacement and keep the A.
         text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
         pos += utf8_malformed_prefix(pending, pos);
     }
@@ -289,8 +260,7 @@ common_chat_msg task_result_state::update_chat_msg(
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    // On the last update nothing can complete a held-back sequence, so it is resolved here rather
-    // than left pending forever, which dropped it from the response entirely.
+    // Nothing can complete a held-back sequence after the last update; unresolved, it was dropped.
     append_utf8_sanitized(generated_text, generated_text_pending, text_added, !is_partial);
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
