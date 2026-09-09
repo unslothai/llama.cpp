@@ -675,6 +675,9 @@ While a request is streaming, the server sends SSE comment lines that a client r
 - `: preempted` - the slot was parked and the stream is silent until it comes back. A parked stream is kept alive with the same comment about every two seconds.
 - `: resumed` - the slot is running again.
 - `: recomputed` - sent right after `: resumed` when that resume re-prefilled the sequence rather than restoring its saved bytes, i.e. what follows is the continuation `preempt.recomputes` counts.
+- `: preempt-keepalive` - sent while the slot stays parked, at most every 2 seconds, or at the request's `sse_ping_interval` when that is shorter.
+
+A park can happen while the prompt is still being processed, before the request has produced a token. The notice is not held back for the first chunk in that case: the response headers and the `: preempted` line go out at the moment the slot is parked, on every streaming surface (`/completion`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`), so a client never has to tell that silence from a stall. `: resumed`, and `: recomputed` where it applies, follow when the slot runs again.
 
 With more than one prompt in the request, the index of the prompt follows the word, for example `: resumed 1`.
 

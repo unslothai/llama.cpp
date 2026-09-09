@@ -141,6 +141,68 @@ def test_every_park_in_a_stream_is_announced_paired_with_a_resume_and_changes_no
     assert _content(datas) == _content(ref_datas)
 
 
+def _prefill_payload(path: str, prompt: str, n_predict: int) -> dict:
+    """The same request on each streaming surface."""
+    if path == "/completion":
+        return {"prompt": prompt, "n_predict": n_predict, "ignore_eos": True,
+                "temperature": 0.0, "seed": 42, "stream": True}
+    if path == "/v1/responses":
+        return {"model": "test", "input": prompt, "max_output_tokens": n_predict,
+                "temperature": 0.0, "stream": True}
+    return {"model": "test", "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": n_predict, "temperature": 0.0, "stream": True}
+
+
+@pytest.mark.parametrize("path", ["/completion", "/v1/chat/completions", "/v1/responses", "/v1/messages"])
+def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
+    # a park before the first token is the case a client cannot tell from a stall, so the notice goes out with the response headers rather than waiting for a chunk that is not coming
+    import time
+
+    server.server_slots = True
+    _start(n_ctx=2048, n_batch=256)
+
+    def _resident():
+        res = _post("/completion", _completion_payload(1900, _PROMPT_A))
+        for _ in res.iter_lines():
+            pass
+
+    t = threading.Thread(target=_resident, daemon=True)
+    t.start()
+
+    # the pool has to be nearly full before the second prompt starts, so that its prefill is what runs out of cells
+    for _ in range(600):
+        slots = requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
+        if any(slot.get("n_prompt_tokens", 0) >= 1400 for slot in slots):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("the resident never grew into the pool")
+
+    res = _post(path, _prefill_payload(path, " ".join([_PROMPT_B] * 31), 8))
+    assert res.status_code == 200
+
+    t0 = time.time()
+    seen = []
+    for raw in res.iter_lines():
+        line = raw.decode("utf-8")
+        if line:
+            seen.append((time.time() - t0, line))
+    t.join(120)
+
+    text = open(server.log_path).read()
+    assert "preempted:" in text, "nothing was parked while the prompt was being processed"
+
+    comments = [(at, line) for at, line in seen if line.startswith(":")]
+    datas    = [(at, line) for at, line in seen if line.startswith("data:")]
+
+    assert comments and comments[0][1] == ": preempted", [line for _, line in seen[:4]]
+    assert datas, "the request never produced a chunk"
+
+    # sent when the slot was parked, not batched with the chunk that came later
+    assert comments[0][0] + 0.05 < datas[0][0], [(round(at, 3), line[:24]) for at, line in seen[:4]]
+    assert any(line == ": resumed" for _, line in comments), [line for _, line in comments[:4]]
+
+
 def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
     # n_batch: the whole prompt in one batch, so the planner sees its size at once
     _start(n_ctx=512, n_batch=512)
@@ -199,3 +261,4 @@ def test_an_oversized_sibling_prompt_is_errored_before_a_valid_one_is_parked():
     assert status == 400, (status, body)
     assert not body.lstrip().startswith(":"), body
     assert "error" in json.loads(body), body
+
