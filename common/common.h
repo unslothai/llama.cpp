@@ -672,6 +672,8 @@ struct common_params {
 
     bool log_json = false;
 
+    int32_t preempt_ram_mib = 4096; // host sequence snapshots; 0 disables preemption
+
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 

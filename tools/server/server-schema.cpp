@@ -14,6 +14,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         fields.emplace_back(f);
     };
 
+    add((new field_num("priority", params.priority))
+        ->set_hard_limits(INT32_MIN, INT32_MAX)
+        ->set_desc("Scheduling priority, higher values are more important (default: 0)"));
+
     add((new field_bool("verbose", params.verbose))
         ->set_desc("Include __verbose field in the response with additional debug information"));
 
@@ -518,6 +522,10 @@ task_params eval_llama_cmpl_schema(
                 const std::vector<llama_logit_bias> & logit_bias_eog,
                 const json & data) {
     task_params params;
+    if (data.contains("priority") && (!data.at("priority").is_number_integer() ||
+            data.at("priority").get<double>() < INT32_MIN || data.at("priority").get<double>() > INT32_MAX)) {
+        throw std::invalid_argument("priority must be a signed 32-bit integer");
+    }
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
     params.sampling      = params_base.sampling;
