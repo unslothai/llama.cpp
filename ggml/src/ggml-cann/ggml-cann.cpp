@@ -2660,6 +2660,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
+                if (op->src[5]) {
+                    return false;
+                }
 #ifdef ASCEND_310P
                 // FA not support on 310p device
                 return false;
@@ -2952,6 +2956,7 @@ static const ggml_backend_device_i ggml_backend_cann_device_interface = {
     /* .event_new               = */ ggml_backend_cann_device_event_new,
     /* .event_free              = */ ggml_backend_cann_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cann_device_event_synchronize,
+    /* .event_query             = */ NULL,
 };
 
 // backend reg

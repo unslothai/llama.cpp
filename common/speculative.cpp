@@ -810,7 +810,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // the per-call bound comes from the caller's remaining context, so it stops the loop as well as the configured maximum
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1193,7 +1195,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // the caller's remaining context bounds the block as well as the configured maximum: the whole block is decoded before any truncation
+            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1691,7 +1694,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // the per-call bound comes from the caller's remaining context, so it stops the loop as well as the configured maximum
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -62,6 +63,68 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// [TAG_EXACT_CONCURRENCY] the paged specialization lives in the CUDA sources; every other backend ignores src[5] and walks the pool in physical cell order
+static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+
+    return llama_exact_backend_name(ggml_backend_reg_name(reg));
+}
+
+// [TAG_EXACT_CONCURRENCY] whether the device can actually run the paged attention op for a layer of this shape: the registry name only says which backends carry the kernels
+static bool llama_dev_supports_paged_attn(
+        ggml_backend_dev_t dev,
+        ggml_type type_k, ggml_type type_v,
+        uint32_t n_embd_head_k, uint32_t n_embd_head_v,
+        uint32_t n_head, uint32_t n_head_kv,
+        uint32_t n_cells, uint32_t page_size) {
+    if (!llama_dev_has_paged_attn(dev)) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+
+    bool res = true;
+
+    const int64_t n_kv = page_size;
+
+    for (const int64_t n_tokens : { (int64_t) 1, (int64_t) 4, (int64_t) 16, (int64_t) 512 }) {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd_head_k, n_tokens, n_head,    1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k,        n_embd_head_k, n_kv,     n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_v,        n_embd_head_v, n_kv,     n_head_kv, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+
+        ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) n_embd_head_k), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+
+        op->src[5] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + n_cells/page_size, n_tokens);
+
+        if (!ggml_backend_dev_supports_op(dev, op)) {
+            res = false;
+            break;
+        }
+    }
+
+    ggml_free(ctx);
+
+    return res;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -86,6 +149,9 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
+    // [TAG_EXACT_CONCURRENCY] read the knob through the same cached reader the graph and the CUDA dispatcher use, so a mid-process change cannot leave them disagreeing
+    exact_pages = llama_exact_concurrency();
+
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
@@ -98,6 +164,27 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    if (exact_pages) {
+        const char * unsupported = nullptr;
+
+        if (!unified) {
+            unsupported = "it needs a unified KV cache (pass --kv-unified)";
+        } else if (v_trans) {
+            unsupported = "it needs a non-transposed V cache (pass --flash-attn on)";
+        } else if (n_swa != 0) {
+            unsupported = "the paged pool does not support sliding window attention";
+        } else if (type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
+            unsupported = "it needs an F16 KV cache (do not pass --cache-type-k or --cache-type-v)";
+        } else if (kv_size % exact_page_size != 0) {
+            unsupported = "the context size must be a multiple of 256 (pass -c as a multiple of 256)";
+        }
+
+        if (unsupported) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s\n", __func__, unsupported);
+            throw std::runtime_error("exact concurrency: unsupported KV cache configuration");
+        }
+    }
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -221,6 +308,39 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+
+        // [TAG_EXACT_CONCURRENCY] the paged kernel handles 256-wide K and V heads only; any other width would run unpaged while the mode reports itself as on
+        if (exact_pages && (hparams.n_embd_head_k(il) != 256 || (!is_mla && hparams.n_embd_head_v(il) != 256) || is_mla)) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d has %u-wide K heads and %u-wide V heads%s, "
+                    "and the paged attention kernel supports 256-wide K and V heads only\n",
+                    __func__, il, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), is_mla ? " (MLA)" : "");
+            throw std::runtime_error("exact concurrency: unsupported attention head size");
+        }
+
+        if (exact_pages && hparams.attn_soft_cap) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model soft-caps its attention logits (%.1f), "
+                    "which the paged attention kernel does not apply\n", __func__, hparams.f_attn_logit_softcapping);
+            throw std::runtime_error("exact concurrency: attention soft cap is not supported");
+        }
+
+        if (exact_pages && !(offload && llama_dev_has_paged_attn(model.dev_layer(il)))) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but layer %d keeps its KV cache on %s, "
+                    "which has no paged attention: every layer must be offloaded to the CUDA backend "
+                    "(pass -ngl to offload all layers and do not pass --no-kv-offload)\n",
+                    __func__, il, dev_name);
+            throw std::runtime_error("exact concurrency: KV cache layer is not on the CUDA backend");
+        }
+
+        // [TAG_EXACT_CONCURRENCY] right backend; ask whether this layer's attention, with the page table attached, lands on one of its kernels at all
+        if (exact_pages && !llama_dev_supports_paged_attn(model.dev_layer(il), type_k, type_v,
+                    hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                    hparams.n_head(il), hparams.n_head_kv(il), kv_size, exact_page_size)) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s cannot run the paged attention for layer %d "
+                    "(K %s, V %s, %u-wide heads): the build or the device has no flash attention kernel for it, "
+                    "and the op would fall to the CPU, which ignores the page table\n",
+                    __func__, dev_name, il, ggml_type_name(type_k), ggml_type_name(type_v), hparams.n_embd_head_k(il));
+            throw std::runtime_error("exact concurrency: the device cannot run the paged attention");
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -366,7 +486,99 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+void llama_kv_cache::exact_pages_rebuild() const {
+    const auto & cells = v_cells[0];
+
+    exact_page_owner.assign(cells.size()/exact_page_size, exact_page{});
+    exact_page_live .assign(cells.size()/exact_page_size, 0);
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+
+        GGML_ASSERT(cells.seq_count(i) == 1);
+
+        const auto pos = cells.pos_get(i);
+
+        GGML_ASSERT(pos >= 0 && uint32_t(pos)%exact_page_size == i%exact_page_size);
+
+        const exact_page cur { cells.seq_get(i), llama_pos(pos/(llama_pos) exact_page_size) };
+
+        auto & owner = exact_page_owner[i/exact_page_size];
+
+        GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
+
+        owner = cur;
+
+        ++exact_page_live[i/exact_page_size];
+    }
+
+    exact_page_owner_dirty = false;
+}
+
+void llama_kv_cache::exact_pages_sync() const {
+    if (exact_page_owner_dirty) {
+        exact_pages_rebuild();
+
+        return;
+    }
+
+    if (debug > 0) {
+        // what was maintained has to say what the cells say
+        const auto kept      = exact_page_owner;
+        const auto kept_live = exact_page_live;
+
+        exact_pages_rebuild();
+
+        GGML_ASSERT(kept.size() == exact_page_owner.size());
+
+        for (size_t p = 0; p < kept.size(); ++p) {
+            GGML_ASSERT(kept[p].seq == exact_page_owner[p].seq && kept[p].lpg == exact_page_owner[p].lpg);
+            GGML_ASSERT(kept_live[p] == exact_page_live[p]);
+        }
+    }
+}
+
+void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos) {
+    if (exact_page_owner_dirty || exact_page_owner.empty()) {
+        return;
+    }
+
+    const exact_page cur { seq, llama_pos(pos/(llama_pos) exact_page_size) };
+
+    auto & owner = exact_page_owner[idx/exact_page_size];
+
+    GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
+
+    owner = cur;
+
+    ++exact_page_live[idx/exact_page_size];
+}
+
+// [TAG_EXACT_CONCURRENCY] a page stays with its sequence for as long as one of its cells is live,
+// so a removal frees it only when it takes the last one. Counting per page is what keeps a removal
+// that empties nothing, such as the rejected tail of every accepted speculative step, from costing
+// a rescan of the pool.
+void llama_kv_cache::exact_pages_release(uint32_t idx) {
+    ++exact_page_n_release;
+
+    if (exact_page_owner_dirty || exact_page_owner.empty()) {
+        return;
+    }
+
+    const uint32_t page = idx/exact_page_size;
+
+    GGML_ASSERT(exact_page_live[page] > 0);
+
+    if (--exact_page_live[page] == 0) {
+        exact_page_owner[page] = exact_page{};
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
+    exact_page_owner_dirty = true;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -408,6 +620,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                // [TAG_EXACT_CONCURRENCY] the cell is gone; the page goes with the last of them
+                if (exact_pages) {
+                    exact_pages_release(i);
+                }
+
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -431,6 +648,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     continue;
                 }
 
+                if (exact_pages) {
+                    exact_pages_release(i);
+                }
+
                 cells.rm(i);
 
                 if (new_head == cells.size()) {
@@ -451,6 +672,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] a page belongs to one sequence, so refuse a copy that would share cells rather than abort. After the shared-cells return, so a draft cache is unaffected.
+    if (exact_pages && seq_id_src != seq_id_dst) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support copying cells between "
+                        "sequences (%d -> %d); ignoring the copy\n",
+                        __func__, seq_id_src, seq_id_dst);
         return;
     }
 
@@ -555,6 +784,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            // [TAG_EXACT_CONCURRENCY] as in seq_rm, the cell emptied here
+            if (exact_pages) {
+                exact_pages_release(i);
+            }
+
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -570,6 +804,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo the page size, so shifting positions would misplace every cell
+    if (exact_pages && shift != 0) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support shifting positions "
+                        "(seq %d, shift %d); ignoring the shift\n",
+                        __func__, seq_id, shift);
         return;
     }
 
@@ -620,6 +862,13 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    if (exact_pages && d != 1) {
+        LLAMA_LOG_ERROR("%s: exact concurrency does not support dividing positions "
+                        "(seq %d, d %d); ignoring the division\n",
+                        __func__, seq_id, d);
         return;
     }
 
@@ -706,11 +955,23 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     GGML_UNUSED(embd_all);
 
     do {
+        // [TAG_EXACT_CONCURRENCY] a token shared by several sequences would be one cell in a page that belongs to one sequence, so refuse it here rather than assert at placement
+        if (exact_pages && balloc.has_shared_tokens()) {
+            LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                    "give every token exactly one sequence id\n", __func__);
+            break;
+        }
+
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            // [TAG_EXACT_CONCURRENCY] split_simple packs every sequence's prompt into one ubatch, so a prefill would run at a width its solo run never sees; the set split gives each its own
+            const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
+
+            auto ubatch = n_stream == 1 && !isolate
+                ? balloc.split_simple(n_ubatch)
+                : balloc.split_equal(n_ubatch, n_stream > 1, 0, isolate);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -757,10 +1018,18 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        // [TAG_EXACT_CONCURRENCY] page ownership and occupancy before the ubatch, so undoing a speculative placement does not force a rebuild from every cell
+        std::vector<exact_page> exact_page_owner_old;
+        std::vector<uint32_t>   exact_page_live_old;
     };
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+
+    // [TAG_EXACT_CONCURRENCY] a placement can purge positions outside the cells it restores below,
+    // and those are not undone; count removals to notice
+    const uint64_t n_release_before = exact_page_n_release;
 
     bool success = true;
 
@@ -777,7 +1046,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_new, v_heads, {}, exact_page_owner, exact_page_live };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -794,6 +1063,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     GGML_ASSERT(!states.empty() || !success);
 
+    // [TAG_EXACT_CONCURRENCY] what the allocator knew is the answer unless the placement also
+    // removed cells, in which case only the cells can say what is left
+    const bool exact_rebuild = exact_page_owner_dirty || exact_page_n_release != n_release_before;
+
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         const auto & sinfo = it->sinfo;
@@ -805,6 +1078,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             cells.set(sinfo.idxs[s], it->v_cells[s]);
             head = it->v_heads_old[s];
         }
+
+        // [TAG_EXACT_CONCURRENCY] put back what the allocator knew, unless the placement also removed cells, when only the cells can say what is left
+        if (!exact_rebuild) {
+            exact_page_owner = it->exact_page_owner_old;
+            exact_page_live  = it->exact_page_live_old;
+        }
+    }
+
+    if (exact_rebuild) {
+        exact_page_owner_dirty = true;
     }
 
     if (!success) {
@@ -961,6 +1244,48 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 LLAMA_LOG_DEBUG("%s: stream[%d] min[%d] = %5d, max[%d] = %5d\n", __func__, stream_id, s, cells.seq_pos_min(s), s, cells.seq_pos_max(s));
             }
         }
+    }
+
+    if (exact_pages) {
+        const auto & cells = v_cells[0];
+
+        exact_pages_sync();
+
+        using page_key = std::pair<llama_seq_id, llama_pos>;
+
+        exact_page_owner_tmp = exact_page_owner;
+
+        auto & owner = exact_page_owner_tmp;
+
+        std::map<page_key, uint32_t> pages;
+
+        for (uint32_t p = 0; p < owner.size(); ++p) {
+            if (owner[p].seq >= 0) {
+                pages.emplace(page_key {owner[p].seq, owner[p].lpg}, p);
+            }
+        }
+
+        std::set<uint32_t> assigned;
+        slot_info res {0, 0, {0}, {{}}};
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            GGML_ASSERT(ubatch.n_seq_id[i] == 1 && ubatch.pos[i] >= 0);
+            const page_key key {ubatch.seq_id[i][0], ubatch.pos[i]/exact_page_size};
+            auto it = pages.find(key);
+            if (it == pages.end()) {
+                uint32_t page = v_heads[0]/exact_page_size;
+                uint32_t tested = 0;
+                while (tested < owner.size() && owner[page%owner.size()].seq >= 0) { ++page; ++tested; }
+                if (tested == owner.size()) { return {}; }
+                page %= owner.size();
+                owner[page] = exact_page {key.first, key.second};
+                it = pages.emplace(key, page).first;
+            }
+            const uint32_t idx = it->second*exact_page_size + ubatch.pos[i]%exact_page_size;
+            if (!cells.is_empty(idx) || !assigned.insert(idx).second) { return {}; }
+            res.idxs[0].push_back(idx);
+        }
+        if (cont && !res.is_contiguous()) { return {}; }
+        return res;
     }
 
     uint32_t n_tokens = ubatch.n_tokens;
@@ -1125,6 +1450,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                if (exact_pages) {
+                    exact_pages_release(idx);
+                }
+
                 cells.rm(idx);
             }
 
@@ -1153,6 +1482,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
+            }
+
+            if (exact_pages) {
+                GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+
+                exact_pages_claim(idx, ubatch.seq_id[i][0], ubatch.pos[i]);
             }
         }
     }
@@ -1185,7 +1520,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+uint32_t llama_kv_cache::alloc_granularity() const {
+    // [TAG_EXACT_CONCURRENCY] a page is given to one (sequence, position / page) pair, so n tokens hold round_up(n, exact_page_size) cells: the tail page is charged in full
+    return exact_pages ? exact_page_size : 1;
+}
+
 bool llama_kv_cache::get_can_shift() const {
+    // [TAG_EXACT_CONCURRENCY] a cell's offset in its page is its position modulo 256, so the pool cannot shift positions; reporting it disables --context-shift and --cache-reuse at load
+    if (exact_pages) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1247,7 +1591,50 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+ggml_tensor * llama_kv_cache::build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!exact_pages) { return nullptr; }
+    auto * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + get_size()/exact_page_size, ubatch.n_tokens);
+    ggml_set_input(pages);
+    ggml_set_name(pages, "attn_logical_pages");
+    return pages;
+}
+
+void llama_kv_cache::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(exact_pages && dst->ne[1] == ubatch->n_tokens);
+
+    exact_pages_sync();
+
+    std::map<llama_seq_id, std::map<llama_pos, uint32_t>> pages;
+    for (uint32_t p = 0; p < exact_page_owner.size(); ++p) {
+        const auto & owner = exact_page_owner[p];
+        if (owner.seq >= 0) {
+            pages[owner.seq][owner.lpg] = p;
+        }
+    }
+    std::vector<int32_t> data(ggml_nelements(dst), -1);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1);
+        auto * row = data.data() + i*dst->ne[0];
+        row[0] = 0;
+        for (const auto & page : pages[ubatch->seq_id[i][0]]) {
+            if (page.first*exact_page_size > uint32_t(ubatch->pos[i])) { break; }
+            row[++row[0]] = page.second;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int32_t));
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_pages(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_pages(dst, ubatch);
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    // the per-query page map is the only loop bound for exact attention, so neighbours cannot extend it
+    if (exact_pages) { return get_size(); }
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -2130,6 +2517,12 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    // [TAG_EXACT_CONCURRENCY] a whole-cache restore writes cells at their recorded physical index, which the paged pool owns; refused before a byte is read
+    if (exact_pages && seq_id == -1) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, which supports per-sequence state restore only\n", __func__);
+        throw std::runtime_error("whole-cache restore is not supported with LLAMA_EXACT_CONCURRENCY");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2448,6 +2841,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
     } else {
         // whole KV cache restore
+
+        GGML_ASSERT(!exact_pages);
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);

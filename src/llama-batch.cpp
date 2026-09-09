@@ -507,7 +507,54 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+bool llama_batch_allocr::has_shared_tokens() const {
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] > 1) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_batch_allocr::has_repeated_positions() const {
+    std::vector<size_t> n_per_seq(n_seq_max, 0);
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+            n_per_seq[batch.seq_id[i][s]]++;
+        }
+    }
+
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (n_per_seq[s] > seq_pos[s].size()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_batch_allocr::has_seq_wider_than(uint32_t n_tokens) const {
+    std::vector<uint32_t> n_per_seq(n_seq_max, 0);
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        // tokens already placed in an earlier ubatch do not make the rest of the batch a prompt
+        if (used[i]) {
+            continue;
+        }
+
+        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+            if (++n_per_seq[batch.seq_id[i][s]] > n_tokens) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t isolate_seqs_above) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -517,6 +564,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     std::vector<seq_set_t> cur_seq_set;
 
     llama_seq_id last_seq_id = -1;
+
+    // [TAG_EXACT_CONCURRENCY] tokens left in the first set taken, when isolating: only sets with the same count join it, so every set in the ubatch finishes in it
+    uint32_t n_left_first = 0;
 
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -540,6 +590,38 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
+            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a prompt and gets a ubatch of its own; grouped sets need equal tokens left, or the expansion below changes their sum order
+            if (isolate_seqs_above > 0) {
+                uint32_t n_left = 0;
+
+                for (const auto idx : seq_set_map[seq_set[i]]) {
+                    if (!used[idx]) {
+                        ++n_left;
+                    }
+                }
+
+                if (n_left > isolate_seqs_above) {
+                    if (!cur_seq_set.empty()) {
+                        // let the sets already taken have this ubatch; the prompt gets the next one
+                        break;
+                    }
+
+                    cur_seq_set.push_back(seq_set[i]);
+
+                    last_seq_id = batch.seq_id[i][0];
+
+                    break;
+                }
+
+                if (cur_seq_set.empty()) {
+                    n_left_first = n_left;
+                } else if (n_left != n_left_first) {
+                    continue;
+                } else if ((cur_seq_set.size() + 1) * n_left_first > n_ubatch) {
+                    break;
+                }
+            }
+
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];

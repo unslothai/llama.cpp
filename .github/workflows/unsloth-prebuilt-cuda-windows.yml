@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth prebuilt: CUDA Windows"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA Windows
+# bundles the parent's `resolve` job filtered into `matrix`. Each entry uploads
+# a single app-*.zip artifact for the parent's assemble step to pick up.
+#
+# Mirrors unsloth-prebuilt-cuda.yml (Linux), adapted for Windows: MSVC + Ninja
+# toolchain, BoringSSL instead of system OpenSSL, no RPATH (Windows resolves
+# DLLs from the executable's directory), and a .zip archive. CUDA compiles
+# entirely in software here -- no GPU is present on the runner.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name): ggml-org/llama.cpp for plain builds, or this repo for mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact (app-source-*) holding the stamped source tree; set by resolve for every build'
+        required: false
+        default: ''
+        type: string
+      matrix:
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: x64/${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    # Hang guard only. Without it the job inherits GitHub's 360-minute default,
+    # which is above both assemble's `timeout-minutes: 350` and, more to the
+    # point, the "Wait for the build matrix" step's own 330-minute deadline in
+    # unsloth-prebuilt.yml -- so a wedged leg burns a runner for an hour after
+    # the publish it was feeding has already given up.
+    #
+    # 345, not something tighter: x64/cuda12-portable legitimately reaches the
+    # low 300s on a cold ccache. Run 27347317849 took 305.1 minutes and
+    # SUCCEEDED (286.9 of it genuine compile). Across 62 historical runs of this
+    # leg the max is 305.1 and nothing falls between 215 and 305, so a tighter
+    # cap buys no hang detection and would have destroyed that publish -- one
+    # killed leg fails the bundle-coverage gate and the whole night ships
+    # nothing.
+    #
+    # Note this cannot by itself rescue a slow run: the waiter's 330-minute
+    # deadline is wall-clock from assemble start and INCLUDES the child's queue
+    # wait, while timeout-minutes starts at job start and excludes it. Raising
+    # the waiter deadline is the separate change that would actually save runs.
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # Report both fixed volumes at job start. The work is split across two:
+      # the CUDA toolkit, the tool cache and Program Files land on C:, while
+      # GITHUB_WORKSPACE -- the source tree, the CMake build tree and the ccache
+      # -- is on D:. A leg that dies mid-build can only be read against the
+      # volume it was writing to, so both are printed here and again after the
+      # toolkit install.
+      #
+      # No cleanup step, deliberately. One was written and then measured on a
+      # live windows-2022 runner: D: starts at 147.0 GB free of 150.0 and C: at
+      # 84.3 of 255.4, and the CUDA 12.8 toolkit is 4.79 GB, so C: never drops
+      # below about 106 GB. Reclaiming ~33 GB of preinstalled SDKs on every leg
+      # would have freed the volume that was not under pressure, on every
+      # release, forever. The 87-minute "runner lost communication" failure was
+      # not disk exhaustion, and unsloth-prebuilt-retry.yml already covers that
+      # class of infrastructure loss.
+      - name: Report disk space
+        run: |
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          }
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      # The parent's resolve job built the source tree (upstream base + any mix
+      # PRs, with the build number/commit and Unsloth fingerprint baked
+      # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
+      # instead of cloning -- no .git needed, the build number is already baked.
+      - name: Download source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}
+          restore-keys: |
+            cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+
+      # Jimver's action has no mapping for CUDA 13.3 yet, so for that version we
+      # fall back to llama.cpp's own install method: curl the individual NVIDIA
+      # redist component archives and assemble the toolkit by hand. Block copied
+      # verbatim from ggml-org/llama.cpp .github/actions/windows-setup-cuda
+      # (the cuda_version == '13.3' case). Any other version uses Jimver.
+      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
+        if: matrix.cuda == '13.3'
+        run: |
+          mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          choco install unzip -y
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.33-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.3.33-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.3.33-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.3.29-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.27-archive.zip"
+          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.3.1-archive.zip"
+          unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_crt-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_cudart-windows-x86_64-13.3.29-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvcc-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvrtc-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\libcublas-windows-x86_64-13.5.1.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\libnvvm-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvtx-windows-x86_64-13.3.29-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_profiler_api-windows-x86_64-13.3.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\visual_studio_integration-windows-x86_64-13.3.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cccl-windows-x86_64-13.3.3.3.1-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "CUDA_PATH_V13_3=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
+        if: matrix.cuda != '13.3'
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76  # v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: 'network'
+
+      - name: Set up CUDA environment (Jimver)
+        if: matrix.cuda != '13.3'
+        run: |
+          echo "CUDA_PATH=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$env:CUDA_PATH" >> $env:GITHUB_ENV
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      # Headroom going into the build, with the toolkit on C: and the restored
+      # ccache in the workspace on D:. First numbers to read if a leg dies
+      # mid-build; the build itself writes to the workspace volume.
+      - name: Report disk space before build
+        run: |
+          "workspace: $env:GITHUB_WORKSPACE"
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          }
+
+      - name: Configure
+        working-directory: src
+        run: |
+          # CMAKE_CUDA_ARCHITECTURES is the explicit per-profile arch list (the
+          # whole point of the matrix). ccache launchers cache nvcc + cl.exe;
+          # no RPATH knobs -- Windows loads sibling DLLs from the binary's dir.
+          $archs = "${{ matrix.archs }}".Replace(' ', ';')
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_CUB_3DOT2=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DCMAKE_CUDA_ARCHITECTURES="$archs" `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
+          # 4 vCPU / 16 GB GitHub-hosted runners (measured over a 1s sampler),
+          # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
+          # is ~2 physical cores + HT), so 3 is the sweet spot.
+          cmake --build build --config Release -j 3
+
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the Linux CUDA child for
+      # the rationale. package_bundle.py ships the .exe only if it was produced.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          if (-not (Test-Path "examples/diffusion-gemma-server")) {
+            Write-Host "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          }
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
+            exit 0
+          }
+          cmake --build build --config Release -j 3 `
+            --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          } else {
+            Write-Host "built DiffusionGemma binaries"
+          }
+          exit 0
+
+      - name: Package bundle
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+          SOURCE_REF_KIND: ${{ inputs.repo == 'ggml-org/llama.cpp' && 'tag' || 'mix' }}
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+          SMS: ${{ matrix.sms }}
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
+          path: dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        # !cancelled(), unlike the save below: on a timeout the job gets a
+        # single ~5 minute teardown window (measured ~4m50s after process
+        # kill), shared by every remaining step and not replenished. Evicting
+        # spends that window on housekeeping; the save is what actually needs
+        # it, and a 2 GB cache is not quick to write.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-

@@ -100,6 +100,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // [TAG_EXACT_CONCURRENCY] cells this module hands out in one indivisible unit: 1 unless a mode allocates in larger blocks, when n tokens occupy round_up(n, granularity) cells. Not pure, so old modules inherit 1.
+    virtual uint32_t alloc_granularity() const { return 1; }
+
     //
     // ops
     //

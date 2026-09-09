@@ -4,6 +4,9 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+// [TAG_BATCH_INVARIANT] true when an MMVQ launch of ncols_dst columns sums each destination element in the same order as a single-column launch, i.e. when nwarps is unchanged
+bool ggml_cuda_mmvq_matches_single_column(enum ggml_type type, int cc, int64_t ncols_dst);
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

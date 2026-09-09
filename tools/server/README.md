@@ -168,6 +168,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--preempt-ram N` | with a unified KV cache, park a slot in host RAM instead of failing every slot when the cache fills; N is the maximum host RAM for parked sequences in MiB (default: 8192, -1 - no limit, 0 - disable)<br/>(env: LLAMA_ARG_PREEMPT_RAM) |
+| `--preempt-async`, `--no-preempt-async` | copy a parked sequence out of and back into the KV cache on a stream of its own: the copy out overlaps with the slots that keep decoding, while a copy back in, and a kv-full retry behind a copy out that has not landed, wait for it (default: enabled, needs a backend that can copy asynchronously, otherwise the copies are synchronous as before)<br/>(env: LLAMA_ARG_PREEMPT_ASYNC) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -675,6 +677,18 @@ These words will not be included in the completion, so make sure to add them to 
 - `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
+- `preempt`: How the request was served while the unified KV cache was full (see `--preempt-ram`). `parks` is how often the request was parked to make room for another, and `recomputes` is how many of those parks dropped the sequence's cells because `--preempt-ram` was spent, so that the resume re-prefilled its tokens instead of restoring the bytes that were saved. A re-prefilled sequence continues from the same tokens, but its numerics are not guaranteed identical to the sequence that left, `LLAMA_EXACT_CONCURRENCY` included: raise `--preempt-ram` until `recomputes` stays 0 where that matters. Both fields are present in the final response of a streamed completion as well.
+
+While a request is streaming, the server sends SSE comment lines that a client reading raw lines can act on and every SSE event consumer ignores:
+
+- `: preempted` - the slot was parked and the stream is silent until it comes back. A parked stream is kept alive with the same comment about every two seconds.
+- `: resumed` - the slot is running again.
+- `: recomputed` - sent right after `: resumed` when that resume re-prefilled the sequence rather than restoring its saved bytes, i.e. what follows is the continuation `preempt.recomputes` counts.
+- `: preempt-keepalive` - sent while the slot stays parked, at most every 2 seconds, or at the request's `sse_ping_interval` when that is shorter.
+
+A park can happen while the prompt is still being processed, before the request has produced a token. The notice is not held back for the first chunk in that case: the response headers and the `: preempted` line go out at the moment the slot is parked, on every streaming surface (`/completion`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`), so a client never has to tell that silence from a stall. `: resumed`, and `: recomputed` where it applies, follow when the slot runs again.
+
+With more than one prompt in the request, the index of the prompt follows the word, for example `: resumed 1`.
 
 
 ### POST `/tokenize`: Tokenize a given text
@@ -980,6 +994,8 @@ This endpoint is enabled by default and can be disabled with `--no-slots`. It ca
 
 If query param `?fail_on_no_slot=1` is set, this endpoint will respond with status code 503 if there is no available slots.
 
+Every entry also reports how its request has been served under preemption (see `--preempt-ram`): `is_preempted` and `is_transferring` say whether the slot's cells have been released or a copy is in flight, `n_preempt` counts the parks of the current task, and `n_recompute` counts how many of those dropped the cells, so that the resume re-prefilled the sequence instead of restoring its saved bytes.
+
 **Response format**
 
 <details>
@@ -1147,6 +1163,11 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+| `llamacpp:n_preempt_total` | Counter | Slots parked to make room in the unified KV cache (0 unless `--kv-unified` with more than one slot). |
+| `llamacpp:n_resume_total` | Counter | Parked slots put back. |
+| `llamacpp:preempt_recompute_total` | Counter | Parks that dropped their cells because `--preempt-ram` was spent, so the resume re-prefills the sequence instead of restoring its saved bytes. |
+| `llamacpp:requests_preempted` | Gauge | Requests currently parked, waiting for room in the unified KV cache. |
+| `llamacpp:preempt_ram_bytes` | Gauge | Host RAM held by parked sequences. |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 

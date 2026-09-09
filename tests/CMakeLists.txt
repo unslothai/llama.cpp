@@ -325,6 +325,15 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Guards on the asynchronous per-sequence state transfer
+# Skips itself on a backend that cannot copy asynchronously
+llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool; skips itself where the mode cannot run
+llama_build_and_test(test-exact-pages.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-pages PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
@@ -346,6 +355,17 @@ unset(LLAMA_TEST_NAME)
 
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
+
+# [TAG_EXACT_CONCURRENCY] the batch shape and the buffer types the mode requires, checked without a model
+llama_build_and_test(test-exact-geometry.cpp)
+llama_build_and_test(test-exact-buft.cpp)
+
+# server helpers that need no model
+if (LLAMA_BUILD_TOOLS)
+    llama_build_and_test(test-server-tokens.cpp)
+    target_link_libraries(test-server-tokens PRIVATE server-context mtmd)
+    target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

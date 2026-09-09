@@ -1105,7 +1105,9 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // [TAG_BATCH_INVARIANT] without this scan the KV loop runs to K->ne[1], which grows with the other sequences; the mask bounds it by the sequence's own extent
+    const bool batch_invariant_KV_max = ggml_cuda_batch_invariant() != 0;
+    if (!use_sparse && !dst->src[5] && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || batch_invariant_KV_max)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1163,6 +1165,13 @@ void launch_fattn(
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
+    } else if (dst->src[5] || ggml_cuda_batch_invariant()) {
+        // [TAG_BATCH_INVARIANT] the KV split between blocks, and so the order the partials combine in, follows K->ne[1]: pin it to one block per tile
+        parallel_blocks = 1;
+
+        blocks_num.x = ntiles_x;
+        blocks_num.y = parallel_blocks;
+        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
@@ -1229,7 +1238,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        dst->src[5] ? (const int *) dst->src[5]->data : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

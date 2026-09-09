@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth: lint pr-set.json"
+
+# Tripwire for edits to the mix-build PR set: validates the file the moment a
+# push or PR touches it (the team usually edits it by pushing straight to
+# master, so the push trigger is the main hook). A bad entry can never build --
+# the nightly's resolve job re-runs the same checks, including that each
+# pinned commit actually belongs to the PR it is listed under -- but a red
+# lint does not stop the schedule; this just surfaces the mistake on the
+# commit within seconds instead of failing the 3 AM build.
+
+on:
+  push:
+    paths:
+      - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/sync_deletes.py
+      - scripts/unsloth/test_*.py
+      - scripts/unsloth/check_workflow_scalars.py
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
+      - .github/workflows/*.yml
+      - .github/workflows/*.yaml
+  pull_request:
+    paths:
+      - scripts/unsloth/pr-set.json
+      - scripts/unsloth/additive_merge.py
+      - scripts/unsloth/pin_merge.py
+      - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/carry_vintage.py
+      - scripts/unsloth/sync_deletes.py
+      - scripts/unsloth/test_*.py
+      - scripts/unsloth/check_workflow_scalars.py
+      # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
+      - .github/workflows/*.yml
+      - .github/workflows/*.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Validate pr-set.json
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - run: |
+          set -euo pipefail
+          FILE=scripts/unsloth/pr-set.json
+          # Mirrors the resolve step's schema: a bare url string (required),
+          # or {"url": ..., "required": false} for a pin the release may ship
+          # without.
+          jq -e '.prs | type == "array" and all(.[];
+                   type == "string"
+                   or (type == "object" and (.url | type == "string")
+                       and ((if .required == null then true else .required end) | type == "boolean")))' "$FILE" >/dev/null \
+            || { echo "::error file=$FILE::.prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
+          URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          fail=0
+          while read -r url REQUIRED; do
+            if ! [[ "$url" =~ $URL_RE ]]; then
+              echo "::error file=$FILE::malformed entry '$url' (expected https://github.com/{ggml-org,unslothai}/llama.cpp/pull/<n>/commits/<40-hex-sha>)"
+              fail=1
+              continue
+            fi
+            SRC="${BASH_REMATCH[1]}/llama.cpp"; NUM="${BASH_REMATCH[2]}"; PIN="${BASH_REMATCH[3]}"
+            # Don't let a 404 under set -e kill the collect-all-errors loop.
+            if ! PR_JSON="$(gh api "repos/${SRC}/pulls/${NUM}" --jq '{state: .state, commits: .commits, head: .head.sha}')"; then
+              echo "::error file=$FILE::could not fetch ${SRC}#${NUM} (nonexistent PR number in '$url', or a transient API failure)"
+              fail=1
+              continue
+            fi
+            STATE="$(jq -r .state <<<"$PR_JSON")"
+            COMMITS="$(jq -r .commits <<<"$PR_JSON")"
+            HEAD="$(jq -r .head <<<"$PR_JSON")"
+            if [ "$STATE" != "open" ]; then
+              if [ "$REQUIRED" != "false" ]; then
+                echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will keep merging its pinned commit (a no-op once the base tag contains it), so drop the entry when you no longer want that code"
+              else
+                echo "::warning file=$FILE::${SRC}#${NUM} is ${STATE}; the nightly will skip this optional entry"
+              fi
+            fi
+            # The commits listing is capped at 250 by the API; past that the
+            # membership check cannot be trusted, so skip it rather than
+            # false-fail a legitimate giant PR.
+            if [ "$COMMITS" -gt 250 ]; then
+              echo "::notice::${SRC}#${NUM} has ${COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$PIN"; then
+              echo "::error file=$FILE::pinned commit ${PIN} is not a commit of ${SRC}#${NUM}"
+              fail=1
+              continue
+            fi
+            [ "$PIN" = "$HEAD" ] || echo "::notice::${SRC}#${NUM} pin ${PIN} is behind its head ${HEAD}"
+            echo "OK: ${SRC}#${NUM} @ ${PIN} (${STATE}, required=${REQUIRED})"
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' "$FILE" | tr '\t' ' ')
+          exit "$fail"
+
+  resolver-tests:
+    # These tests existed for additive_merge.py and ran nowhere, so a change to a merge resolver was covered by nothing at all.
+    # Every resolver and check under scripts/unsloth/ runs here.
+    name: Resolver and merge-check tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { fetch-depth: 1 }
+
+      - name: Run the resolver tests
+        run: |
+          set -euo pipefail
+          fail=0
+          for t in scripts/unsloth/test_additive_merge.py \
+                   scripts/unsloth/test_pin_merge.py \
+                   scripts/unsloth/test_merge_checks.py \
+                   scripts/unsloth/test_sync_deletes.py \
+                   scripts/unsloth/test_carry_vintage.py \
+                   scripts/unsloth/test_pin_contract.py \
+                   scripts/unsloth/test_feature_matrix.py; do
+            echo "::group::$t"
+            python3 "$t" || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
+      # A pin nobody decided about is the failure this whole file exists to stop.
+      # Being in `unchecked` with a reason is a fine answer; being in neither map
+      # is how DiffusionGemma went five weeks with no coverage and no record of it.
+      - name: Every pin is either checked or knowingly unchecked
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, re, sys
+          pins = json.load(open("scripts/unsloth/pr-set.json"))["prs"]
+          doc  = json.load(open("scripts/unsloth/feature-checks.json"))
+          owned = {f["owner"] for f in doc["features"].values() if f.get("owner")}
+          known = owned | set(doc.get("unchecked", {}))
+          fail = 0
+          for entry in pins:
+              url = entry if isinstance(entry, str) else entry["url"]
+              m = re.match(r"https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/", url)
+              pin = f"{m.group(1)}#{m.group(2)}"
+              if pin not in known:
+                  print(f"::error file=scripts/unsloth/feature-checks.json::{pin} is pinned "
+                        "and appears in neither `features` nor `unchecked`; say which it is")
+                  fail = 1
+          for pin in sorted(owned & set(doc.get("unchecked", {}))):
+              print(f"::error file=scripts/unsloth/feature-checks.json::{pin} is in both "
+                    "`features` and `unchecked`")
+              fail = 1
+          print(f"{len(pins)} pin(s), {len(owned)} with a feature check, "
+                f"{len(doc.get('unchecked', {}))} knowingly unchecked")
+          sys.exit(fail)
+          PY
+
+      # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
+      - name: Check no workflow string is near GitHub's size limit
+        run: python3 scripts/unsloth/check_workflow_scalars.py --root .
+
