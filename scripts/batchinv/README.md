@@ -23,6 +23,14 @@ absent offload fails the load naming the layer. A recurrent-only model is held t
 the same rule for its state layers, since the grouping that keeps its decode
 ubatches equal relies on the batch-invariant dispatcher the CUDA sources carry. The V-less attention layouts have
 no page table either, and a model on one of those is refused at context creation.
+Every per-layer weight and the output head have to be there as well: a weight left
+in a host buffer is computed by the CPU backend, which picks its matmul kernel by
+the batch width, and the scheduler moves that operation to the GPU only once the
+batch is wide enough, so `--cpu-moe`, `--n-cpu-moe` and an `--override-tensor` onto
+the host are refused at context creation naming the tensor. `token_embd` may stay
+on the host: it feeds `get_rows`, a per-row copy that reports a batch size of 0 to
+the offload test, so it runs on the same backend at every width. A model that ties
+its head to the embedding uses that tensor as a matmul too, and is refused.
 Context shifting, position division, cross-sequence prefix copies, shared-prefix
 input tokens, and whole-context state loading are unsupported. Per-sequence state
 save and restore is supported. Unsupported cache transformations are refused with
