@@ -64,11 +64,11 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
     argc = n_kept;
     argv[n_kept] = nullptr;
 
-    // router mode strips the flag before server_models builds the preset it merges into every
-    // child, so the setting has to cross the process boundary in the environment instead
-    if (from_cli) {
-        common_set_env(env, std::to_string(g_pipeline_groups));
-    } else {
+    // the flag is stripped before server_models builds the preset it merges into every child, so
+    // router mode hands it to children as LLAMA_ARG_PIPELINE_GROUPS (see server_models::spawn) and
+    // they pick it up here. Not written into our own environment: get_environment() reads the Win32
+    // block while _putenv_s writes the CRT copy, and CRT to Win32 propagation is undocumented.
+    if (!from_cli) {
         const std::string from_env = common_get_env(env);
         if (!from_env.empty()) {
             g_pipeline_groups = std::atoi(from_env.c_str());
@@ -80,6 +80,10 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
         exit(1);
     }
 }
+
+// read by server_models::spawn to pass the setting to router children
+int server_get_pipeline_groups();
+int server_get_pipeline_groups() { return g_pipeline_groups; }
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
