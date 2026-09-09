@@ -120,8 +120,18 @@ jobs:
             cpu-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
+          # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
+          install: binary
           max-size: 2G
           save: false
+
+      - name: Configure ccache
+        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
 
       - name: Configure
         working-directory: src
@@ -214,7 +224,7 @@ jobs:
         # it, and a 2 GB cache is not quick to write.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -230,7 +240,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-
+          key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-windows:
     name: windows/${{ matrix.arch }}
@@ -286,6 +296,14 @@ jobs:
           variant: ccache
           max-size: 2G
           save: false
+
+      - name: Configure ccache
+        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -421,7 +439,7 @@ jobs:
         # it, and a 2 GB cache is not quick to write.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -437,4 +455,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}-
+          key: ccache-cpu-windows-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

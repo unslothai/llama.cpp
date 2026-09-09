@@ -11,6 +11,8 @@ name: "Unsloth prebuilt: CUDA Windows"
 # toolchain, BoringSSL instead of system OpenSSL, no RPATH (Windows resolves
 # DLLs from the executable's directory), and a .zip archive. CUDA compiles
 # entirely in software here -- no GPU is present on the runner.
+#
+# Same two-job shape as the Linux child; see its header and .github/actions/unsloth-cuda-windows-setup.
 
 on:
   workflow_call:
@@ -34,8 +36,13 @@ on:
         default: ''
         type: string
       matrix:
-        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job; each row carries `shards`'
         required: true
+        type: string
+      warm_matrix:
+        description: 'Matrix JSON {include:[...]} of (profile row x shard) for the warm job, or empty to skip warming'
+        required: false
+        default: ''
         type: string
 
     secrets:
@@ -59,8 +66,143 @@ permissions:
   contents: read
 
 jobs:
+  warm:
+    name: warm x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    if: ${{ inputs.warm_matrix != '' }}
+    runs-on: ${{ matrix.runner }}
+    # Best effort; no signing environment, shards ship nothing.
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.warm_matrix) }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-windows-setup
+        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
+          cuda: ${{ matrix.cuda }}
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          if (Test-Path shards) {
+            Get-ChildItem -Directory shards | ForEach-Object {
+              "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+              robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+            }
+            Remove-Item -Recurse -Force shards
+          }
+          ccache -z
+          exit 0
+
+      - name: Snapshot the restored cache
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $snap = @{}
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+          "$($snap.Count) files snapshotted"
+
+      - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build -t targets all \
+            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.obj:' | cut -d: -f1 | sort \
+            | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
+          echo "$(wc -l < shard.txt) CUDA objects in this shard"
+          xargs -a shard.txt ninja -C build -j 3
+
+      - name: ccache stats
+        if: ${{ always() }}
+        run: ccache -s -v
+
+      - name: Export the shard delta
+        if: ${{ always() }}
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $dst = "${{ github.workspace }}\shards\${{ matrix.shard }}"
+          $before = @{}
+          (Get-Content -LiteralPath "${{ github.workspace }}\shard.before.json" -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $before[$_.Name] = $_.Value }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $n = 0; $bytes = 0
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $now = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+            if ($before.ContainsKey($rel) -and $before[$rel] -eq $now) { return }
+            $to = Join-Path $dst $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $to
+            $n++; $bytes += $_.Length
+          }
+          "{0} files, {1:N0} MB" -f $n, ($bytes / 1MB)
+
+      - name: Save shard ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/${{ matrix.shard }}
+          key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
   build:
     name: x64/${{ matrix.profile }}
+    needs: warm
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -85,7 +227,7 @@ jobs:
     # leg the max is 305.1 and nothing falls between 215 and 305, so a tighter
     # cap buys no hang detection and would have destroyed that publish -- one
     # killed leg fails the bundle-coverage gate and the whole night ships
-    # nothing.
+    # nothing. Shards should make that history; the cap stays until cold nights show the new ceiling.
     #
     # Note this cannot by itself rescue a slow run: the waiter's 330-minute
     # deadline is wall-clock from assemble start and INCLUDES the child's queue
@@ -99,156 +241,71 @@ jobs:
       run:
         shell: pwsh
     steps:
-      # Report both fixed volumes at job start. The work is split across two:
-      # the CUDA toolkit, the tool cache and Program Files land on C:, while
-      # GITHUB_WORKSPACE -- the source tree, the CMake build tree and the ccache
-      # -- is on D:. A leg that dies mid-build can only be read against the
-      # volume it was writing to, so both are printed here and again after the
-      # toolkit install.
-      #
-      # No cleanup step, deliberately. One was written and then measured on a
-      # live windows-2022 runner: D: starts at 147.0 GB free of 150.0 and C: at
-      # 84.3 of 255.4, and the CUDA 12.8 toolkit is 4.79 GB, so C: never drops
-      # below about 106 GB. Reclaiming ~33 GB of preinstalled SDKs on every leg
-      # would have freed the volume that was not under pressure, on every
-      # release, forever. The 87-minute "runner lost communication" failure was
-      # not disk exhaustion, and unsloth-prebuilt-retry.yml already covers that
-      # class of infrastructure loss.
-      - name: Report disk space
-        run: |
-          "workspace: $env:GITHUB_WORKSPACE"
-          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
-            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
-          }
-
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           path: tooling
 
-      # The parent's resolve job built the source tree (upstream base + any mix
-      # PRs, with the build number/commit and Unsloth fingerprint baked
-      # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
-      # instead of cloning -- no .git needed, the build number is already baked.
-      - name: Download source @ ${{ inputs.tag }}
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-windows-setup
         with:
-          name: ${{ inputs.source_artifact }}
-          path: srcpkg
-      - name: Extract source
-        shell: bash
-        run: |
-          set -eux
-          mkdir -p src
-          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
-        with:
-          key: cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}
-          restore-keys: |
-            cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}
-          append-timestamp: false
-          variant: ccache
-          max-size: 2G
-          save: false
-
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: "3.11"
-
-      - name: Install Ninja
-        run: choco install ninja --no-progress
-
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
-
-      # Jimver's action has no mapping for CUDA 13.3 yet, so for that version we
-      # fall back to llama.cpp's own install method: curl the individual NVIDIA
-      # redist component archives and assemble the toolkit by hand. Block copied
-      # verbatim from ggml-org/llama.cpp .github/actions/windows-setup-cuda
-      # (the cuda_version == '13.3' case). Any other version uses Jimver.
-      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
-        if: matrix.cuda == '13.3'
-        run: |
-          mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-          choco install unzip -y
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.33-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.3.33-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.3.33-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.3.29-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.27-archive.zip"
-          curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.3.1-archive.zip"
-          unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_crt-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_cudart-windows-x86_64-13.3.29-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvcc-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvrtc-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\libcublas-windows-x86_64-13.5.1.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\libnvvm-windows-x86_64-13.3.33-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_nvtx-windows-x86_64-13.3.29-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cuda_profiler_api-windows-x86_64-13.3.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\visual_studio_integration-windows-x86_64-13.3.27-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\cccl-windows-x86_64-13.3.3.3.1-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" /E /I /H /Y
-          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "CUDA_PATH_V13_3=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
-        if: matrix.cuda != '13.3'
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76  # v0.2.35
-        id: cuda-toolkit
-        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
           cuda: ${{ matrix.cuda }}
-          method: 'network'
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      - name: Set up CUDA environment (Jimver)
-        if: matrix.cuda != '13.3'
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
         run: |
-          echo "CUDA_PATH=$env:CUDA_PATH" >> $env:GITHUB_ENV
-          echo "CUDA_HOME=$env:CUDA_PATH" >> $env:GITHUB_ENV
-
-      - name: Verify CUDA
-        run: nvcc --version
-
-      # Headroom going into the build, with the toolkit on C: and the restored
-      # ccache in the workspace on D:. First numbers to read if a leg dies
-      # mid-build; the build itself writes to the workspace volume.
-      - name: Report disk space before build
-        run: |
-          "workspace: $env:GITHUB_WORKSPACE"
-          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
-            "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+          if (Test-Path shards) {
+            Get-ChildItem -Directory shards | ForEach-Object {
+              "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+              robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+            }
+            Remove-Item -Recurse -Force shards
           }
-
-      - name: Configure
-        working-directory: src
-        run: |
-          # CMAKE_CUDA_ARCHITECTURES is the explicit per-profile arch list (the
-          # whole point of the matrix). ccache launchers cache nvcc + cl.exe;
-          # no RPATH knobs -- Windows loads sibling DLLs from the binary's dir.
-          $archs = "${{ matrix.archs }}".Replace(' ', ';')
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DGGML_NATIVE=OFF `
-            -DGGML_BACKEND_DL=ON `
-            -DGGML_CPU_ALL_VARIANTS=ON `
-            -DGGML_RPC=ON `
-            -DGGML_CUDA=ON `
-            -DGGML_CUDA_CUB_3DOT2=ON `
-            -DLLAMA_BUILD_TESTS=OFF `
-            -DLLAMA_BUILD_EXAMPLES=OFF `
-            -DLLAMA_BUILD_TOOLS=ON `
-            -DLLAMA_BUILD_SERVER=ON `
-            -DLLAMA_BUILD_BORINGSSL=ON `
-            -DCMAKE_CUDA_ARCHITECTURES="$archs" `
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          ccache -z
+          exit 0
 
       - name: Build
         working-directory: src
@@ -283,6 +340,19 @@ jobs:
           }
           exit 0
 
+      - name: ccache stats
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          ccache -s -v
+          {
+            echo "### ccache windows x64/${{ matrix.profile }}"
+            echo ""
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Authenticode-sign before packaging. The Studio installer downloads these
       # zips after its own signed installer has run, so nothing downstream signs
       # them. Smart App Control evaluates every binary as it loads and refuses
@@ -316,6 +386,8 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          # Provenance label kept byte for byte as under the Jimver install: bundles must stay
+          # identical, metadata included, and the compiler behind the label is the same nvcc.
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
           SMS: ${{ matrix.sms }}
@@ -337,14 +409,9 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
-        # !cancelled(), unlike the save below: on a timeout the job gets a
-        # single ~5 minute teardown window (measured ~4m50s after process
-        # kill), shared by every remaining step and not replenished. Evicting
-        # spends that window on housekeeping; the save is what actually needs
-        # it, and a 2 GB cache is not quick to write.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -360,4 +427,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

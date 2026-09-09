@@ -321,6 +321,14 @@ jobs:
         max-size: 2G
         save: false
 
+    - name: Configure ccache
+      # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+      # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+      run: |
+        ccache --set-config=compiler_check=content
+        ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+        ccache --set-config=compression_level=6
+
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
     # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
@@ -555,7 +563,7 @@ jobs:
       # it, and a 2 GB cache is not quick to write.
       if: ${{ !cancelled() }}
       continue-on-error: true
-      run: ccache --evict-older-than 14d
+      run: ccache --evict-older-than 7d
 
     - name: Save ccache
       # Save even when the build failed: the objects compiled before the
@@ -571,7 +579,7 @@ jobs:
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ github.workspace }}\.ccache
-        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-ubuntu:
     name: linux/${{ matrix.gfx_target }}
@@ -723,12 +731,18 @@ jobs:
           rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
+        # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
+        install: binary
         max-size: 2G
         save: false
 
-    # The action sets this on Windows and macOS but leaves Linux on mtime, and ROCm is re-extracted every run, so mtime is not a reliable compiler identity.
-    - name: Hash the compiler by content, not mtime
-      run: ccache --set-config=compiler_check=content
+    - name: Configure ccache
+      # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+      # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+      run: |
+        ccache --set-config=compiler_check=content
+        ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+        ccache --set-config=compression_level=6
 
     # The parent's resolve job built the source tree (upstream base + any mix
     # PRs, with the build number/commit and Unsloth fingerprint baked
@@ -923,7 +937,7 @@ jobs:
       # it, and a 2 GB cache is not quick to write.
       if: ${{ !cancelled() }}
       continue-on-error: true
-      run: ccache --evict-older-than 14d
+      run: ccache --evict-older-than 7d
 
     - name: Save ccache
       # Save even when the build failed: the objects compiled before the
@@ -939,4 +953,4 @@ jobs:
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ github.workspace }}/.ccache
-        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
