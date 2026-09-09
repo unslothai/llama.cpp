@@ -476,6 +476,26 @@ server_task_result_ptr server_response::take_result(const std::unordered_set<int
     return nullptr;
 }
 
+bool server_response::spans_waiters(const std::unordered_set<int> & id_tasks) const {
+    const waiter * first = nullptr;
+
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+        if (first == nullptr) {
+            first = it->second.get();
+            continue;
+        }
+        if (it->second.get() != first) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -497,10 +517,14 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
         // for these ids, which blocks this one connection and nothing else, so that is what it
         // does here too. The lookup is inside the loop rather than above it because a waiter
         // re-added while we wait should be picked up instead of waited out.
+        // ids registered by separate calls sit in separate waiters, and no one waiter's condition
+        // covers them, so those readers park on the shared one and send() notifies it for them
         auto w = find_waiter(id_tasks);
-        if (w == nullptr) {
+        if (w == nullptr || spans_waiters(id_tasks)) {
             // registration and terminate() both fire condition_gone; the timeout is only a backstop
+            if (w != nullptr) { n_split_readers++; }
             condition_gone.wait_for(lock, std::chrono::seconds(1));
+            if (w != nullptr) { n_split_readers--; }
             continue;
         }
 
@@ -531,13 +555,20 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
 
         auto w = find_waiter(id_tasks);
 
-        // The ids are not registered yet, or not any more. Wait on condition_gone rather than
-        // sleeping out the timeout: add_waiting_task_id(s) fires it, so a result that arrives
-        // during this call is still seen, which is what the single shared condition used to give.
-        // terminate() fires it too, so it is honoured here as well as on the waiter's own cv.
-        std::condition_variable & cv = w == nullptr ? condition_gone : w->cv;
+        // Park on the shared condition when the ids are not registered yet, or not any more, or
+        // when they span several waiters so that no one waiter's condition covers them.
+        // add_waiting_task_id(s) fires it, so a result that arrives during this call is still
+        // seen, which is what the single shared condition used to give; terminate() fires it too;
+        // and send() fires it while a split reader is parked.
+        const bool split = w != nullptr && spans_waiters(id_tasks);
 
-        if (cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+        std::condition_variable & cv = (w == nullptr || split) ? condition_gone : w->cv;
+
+        if (split) { n_split_readers++; }
+        const std::cv_status st = cv.wait_until(lock, deadline);
+        if (split) { n_split_readers--; }
+
+        if (st == std::cv_status::timeout) {
             if (!running) {
                 RES_DBG("%s : queue result stop\n", __func__);
                 std::terminate(); // we cannot return here since the caller is HTTP code
@@ -576,6 +607,11 @@ void server_response::send(server_task_result_ptr && result) {
     // not the single global one the shared vector used, so it is still O(1) in the common case
     // of one thread per reader.
     w.cv.notify_all();
+
+    // normally zero: only a reader whose ids span several waiters parks on the shared condition
+    if (n_split_readers > 0) {
+        condition_gone.notify_all();
+    }
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {
@@ -586,6 +622,10 @@ void server_response::broadcast(server_task_result_ptr && result) {
         res_copy->id = id_task; // override id with target task id
         w->results.emplace_back(std::move(res_copy));
         w->cv.notify_all();
+    }
+
+    if (n_split_readers > 0) {
+        condition_gone.notify_all();
     }
 }
 

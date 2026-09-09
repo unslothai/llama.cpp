@@ -172,14 +172,24 @@ private:
 
     std::mutex mutex_results;
 
-    // parks a reader whose ids left the waiting list, so it honours its timeout
+    // parks a reader whose ids left the waiting list, so it honours its timeout, and a reader
+    // whose ids span several waiters, for which no single waiter's condition is enough
     std::condition_variable condition_gone;
+
+    // how many readers are parked on condition_gone for ids that ARE registered, i.e. spread over
+    // more than one waiter. Normally zero, so send() pays one integer compare rather than a
+    // second notify: server_response_reader registers all of its ids in one call.
+    size_t n_split_readers = 0;
 
     // ids registered together share one waiter, so the first hit is the right one. mutex_results held.
     waiter_ptr find_waiter(const std::unordered_set<int> & id_tasks) const;
 
     // pop the oldest queued result whose id the caller asked for. mutex_results held.
     server_task_result_ptr take_result(const std::unordered_set<int> & id_tasks);
+
+    // true if the registered ids among id_tasks belong to more than one waiter, which happens
+    // only when they were registered by separate calls. mutex_results held.
+    bool spans_waiters(const std::unordered_set<int> & id_tasks) const;
 
 public:
     // add the id_task to the list of tasks waiting for response

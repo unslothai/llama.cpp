@@ -365,6 +365,36 @@ static void t_subset_receivers_are_all_woken() {
           "a subset receiver is woken even when siblings wait too", d);
 }
 
+
+// Ids registered by separate calls belong to separate waiters, so no single condition covers a
+// receive that names both. The receiver must be woken by a result for either of them, whichever
+// waiter the lookup happened to pick, so both directions are driven.
+static void t_ids_spanning_two_waiters_one(int base_id, int send_to, const char * label) {
+    server_response res;
+    res.add_waiting_task_id(base_id);       // two separate registrations, so two waiters
+    res.add_waiting_task_id(base_id + 1);
+
+    std::atomic<int> got{-1};
+    std::thread reader([&] {
+        auto r = res.recv_with_timeout({base_id, base_id + 1}, 3);
+        got.store(payload_of(r));
+    });
+    std::this_thread::sleep_for(ms(300));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    res.send(mk(send_to, 5000 + send_to));
+    reader.join();
+    const auto waited = std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - t0).count();
+
+    char d[96]; snprintf(d, sizeof(d), "%lldms, payload=%d", (long long) waited, got.load());
+    check(got.load() == 5000 + send_to && waited < 2500, label, d);
+}
+
+static void t_ids_spanning_two_waiters() {
+    t_ids_spanning_two_waiters_one(500, 500, "a receive over two waiters is woken by the first id");
+    t_ids_spanning_two_waiters_one(600, 601, "a receive over two waiters is woken by the second id");
+}
+
 static long rss_kb() {
     // Linux only; returns -1 elsewhere, and only the optional "leak" mode uses it
     FILE * f = fopen("/proc/self/status", "r");
@@ -418,6 +448,7 @@ int main(int argc, char ** argv) {
     t_terminate_while_parked_on_absent_ids();
     t_subset_recv_is_filtered();
     t_subset_receivers_are_all_woken();
+    t_ids_spanning_two_waiters();
     t_parked_reader_does_not_abort();
 
     printf("\nRESULT queue failures=%d\n", g_fail);
