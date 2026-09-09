@@ -538,9 +538,9 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # _generate_nvfp4_tensors already removed the NVFP4 tensors, so a leftover weight_scale is the FP8 group.
-                    # Only per-channel residual groups are handled: a "block" group's scales are a grid needing
-                    # block_structure expansion, and passing them straight to dequant_simple misapplies them.
+                    # NVFP4 tensors are gone by here, so a leftover weight_scale is the FP8 group.
+                    # Per-channel residuals only: a block group's scales are a grid needing
+                    # block_structure expansion, which dequant_simple would misapply.
                     for group in groups.values():
                         if not isinstance(group, dict) or group.get("format") == "nvfp4-pack-quantized":
                             continue
@@ -778,7 +778,7 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # ndim alone is not enough: the FP8 group also has a 2D [out, 1] weight_scale. NVFP4 is nibble-packed uint8, E4M3 scale, one per 16.
+            # ndim is not enough: FP8 also has a 2D [out,1] scale. NVFP4 is packed uint8, E4M3 per 16.
             if scale.ndim < 2:
                 continue
             if weight.dtype != torch.uint8 or scale.dtype != torch.float8_e4m3fn:
