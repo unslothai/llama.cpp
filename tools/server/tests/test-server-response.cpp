@@ -395,6 +395,58 @@ static void t_ids_spanning_two_waiters() {
     t_ids_spanning_two_waiters_one(600, 601, "a receive over two waiters is woken by the second id");
 }
 
+
+// Results must come back in arrival order even when the ids live in different waiters. The
+// shared vector scanned from the front, so it did. Both orders are driven, because which waiter
+// the lookup reaches first depends on the set's iteration order.
+static void t_fifo_across_waiters_one(int first, int second, const char * label) {
+    server_response res;
+    res.add_waiting_task_id(first);     // separate registrations, so separate waiters
+    res.add_waiting_task_id(second);
+
+    res.send(mk(first,  7000 + first));
+    res.send(mk(second, 7000 + second));
+
+    auto r1 = res.recv_with_timeout({first, second}, 1);
+    auto r2 = res.recv_with_timeout({first, second}, 1);
+
+    char d[96];
+    snprintf(d, sizeof(d), "got %d then %d, wanted %d then %d",
+             r1 ? r1->id : -1, r2 ? r2->id : -1, first, second);
+    check(r1 != nullptr && r2 != nullptr && r1->id == first && r2->id == second, label, d);
+}
+
+static void t_fifo_across_waiters() {
+    t_fifo_across_waiters_one(700, 701, "arrival order kept across waiters, low id first");
+    t_fifo_across_waiters_one(711, 710, "arrival order kept across waiters, high id first");
+}
+
+// A reader already parked on a waiter has to be woken when that waiter is discarded, or it will
+// wait out its deadline on a condition nothing will ever fire again while its id is re-registered
+// and served on a brand new waiter.
+static void t_waiter_replaced_under_a_parked_reader() {
+    server_response res;
+    res.add_waiting_task_id(800);
+
+    std::atomic<int> got{-1};
+    std::thread reader([&] {
+        auto r = res.recv_with_timeout({800}, 3);
+        got.store(payload_of(r));
+    });
+    std::this_thread::sleep_for(ms(300));   // let the reader select the current waiter and park
+
+    const auto t0 = std::chrono::steady_clock::now();
+    res.remove_waiting_task_id(800);        // discards the waiter the reader is parked on
+    res.add_waiting_task_id(800);           // a brand new waiter
+    res.send(mk(800, 8800));
+    reader.join();
+    const auto waited = std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - t0).count();
+
+    char d[80]; snprintf(d, sizeof(d), "%lldms, payload=%d", (long long) waited, got.load());
+    check(got.load() == 8800 && waited < 2500,
+          "a parked reader is woken when its waiter is replaced", d);
+}
+
 static long rss_kb() {
     // Linux only; returns -1 elsewhere, and only the optional "leak" mode uses it
     FILE * f = fopen("/proc/self/status", "r");
@@ -449,6 +501,8 @@ int main(int argc, char ** argv) {
     t_subset_recv_is_filtered();
     t_subset_receivers_are_all_woken();
     t_ids_spanning_two_waiters();
+    t_fifo_across_waiters();
+    t_waiter_replaced_under_a_parked_reader();
     t_parked_reader_does_not_abort();
 
     printf("\nRESULT queue failures=%d\n", g_fail);

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -160,15 +161,25 @@ private:
     // One waiter per reader, shared by every id it registered in one call. A single shared vector
     // plus one cv instead costs N wakeups and N scans per token, N^2 per decode step. A send
     // notifies this reader's own cv, so the wakeup is O(1) even though it is a notify_all.
+    // arrival order is global, not per waiter: a reader can name ids from several waiters and
+    // must still be served oldest first, which is what scanning the shared vector gave
+    struct pending {
+        uint64_t               seq;
+        server_task_result_ptr res;
+    };
+
     struct waiter {
         std::condition_variable cv;
 
-        std::deque<server_task_result_ptr> results;
+        std::deque<pending> results;
     };
 
     using waiter_ptr = std::shared_ptr<waiter>;
 
     std::unordered_map<int, waiter_ptr> waiting;
+
+    // stamped onto every queued result so arrival order survives being split across waiters
+    uint64_t next_seq = 0;
 
     std::mutex mutex_results;
 

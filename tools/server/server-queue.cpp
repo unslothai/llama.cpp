@@ -425,21 +425,41 @@ void server_response::remove_waiting_task_id(int id_task) {
     // the waiter is shared with the reader's other ids, so drop only this task's results
     auto & results = it->second->results;
     results.erase(
-        std::remove_if(results.begin(), results.end(), [id_task](const server_task_result_ptr & res) {
-            return res->id == id_task;
+        std::remove_if(results.begin(), results.end(), [id_task](const pending & p) {
+            return p.res->id == id_task;
         }),
         results.end());
 
+    // a reader may be parked on this waiter; it has to repeat the lookup rather than wait out its
+    // deadline on a condition that nothing will fire again
+    auto w = it->second;
     waiting.erase(it);
+    w->cv.notify_all();
+    condition_gone.notify_all();
 }
 
 void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
+    std::vector<waiter_ptr> removed;
+
     for (const auto & id_task : id_tasks) {
         RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting.size());
-        waiting.erase(id_task);
+
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+
+        removed.push_back(it->second);
+        waiting.erase(it);
     }
+
+    // same as the single id form: wake anyone parked on a waiter that no longer serves these ids
+    for (const auto & w : removed) {
+        w->cv.notify_all();
+    }
+    condition_gone.notify_all();
 }
 
 server_response::waiter_ptr server_response::find_waiter(const std::unordered_set<int> & id_tasks) const {
@@ -453,29 +473,8 @@ server_response::waiter_ptr server_response::find_waiter(const std::unordered_se
     return nullptr;
 }
 
-// A waiter is shared by every id its reader registered in one call, so its queue can hold a
-// sibling's result. Return only an id the caller asked for, in arrival order, which is what
-// scanning the shared vector did. The front normally matches, so this is O(1) in practice.
-server_task_result_ptr server_response::take_result(const std::unordered_set<int> & id_tasks) {
-    for (const auto & id_task : id_tasks) {
-        auto it = waiting.find(id_task);
-        if (it == waiting.end()) {
-            continue;
-        }
-
-        auto & results = it->second->results;
-        for (auto rit = results.begin(); rit != results.end(); ++rit) {
-            if (id_tasks.find((*rit)->id) != id_tasks.end()) {
-                server_task_result_ptr res = std::move(*rit);
-                results.erase(rit);
-                return res;
-            }
-        }
-    }
-
-    return nullptr;
-}
-
+// true when the ids the caller named were registered by separate calls, so they sit in more than
+// one waiter and no single waiter's condition covers them. Short-circuits on the first mismatch.
 bool server_response::spans_waiters(const std::unordered_set<int> & id_tasks) const {
     const waiter * first = nullptr;
 
@@ -494,6 +493,62 @@ bool server_response::spans_waiters(const std::unordered_set<int> & id_tasks) co
     }
 
     return false;
+}
+
+// A waiter is shared by every id its reader registered in one call, so its queue can hold a
+// sibling's result. Return only an id the caller asked for, and the oldest such result across
+// every waiter the ids map to, which is what scanning the shared vector did. Each waiter's queue
+// is already in arrival order, so its first match is its oldest and only the winners are compared.
+server_task_result_ptr server_response::take_result(const std::unordered_set<int> & id_tasks) {
+    auto first_match = [&](waiter * w) {
+        return std::find_if(w->results.begin(), w->results.end(), [&](const pending & p) {
+            return id_tasks.find(p.res->id) != id_tasks.end();
+        });
+    };
+
+    auto claim = [](waiter * w, std::deque<pending>::iterator it) {
+        server_task_result_ptr res = std::move(it->res);
+        w->results.erase(it);
+        return res;
+    };
+
+    // the ordinary case: every id the caller named shares one waiter, so no comparison is needed
+    if (!spans_waiters(id_tasks)) {
+        auto w = find_waiter(id_tasks);
+        if (w == nullptr) {
+            return nullptr;
+        }
+
+        auto it = first_match(w.get());
+        return it == w->results.end() ? nullptr : claim(w.get(), it);
+    }
+
+    waiter *                            best_w = nullptr;
+    std::deque<pending>::iterator       best_it;
+    uint64_t                            best_seq = 0;
+    std::vector<const waiter *>         examined;
+
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+
+        waiter * w = it->second.get();
+        if (std::find(examined.begin(), examined.end(), w) != examined.end()) {
+            continue; // ids commonly share a waiter, so do not scan the same queue twice
+        }
+        examined.push_back(w);
+
+        auto rit = first_match(w);
+        if (rit != w->results.end() && (best_w == nullptr || rit->seq < best_seq)) {
+            best_w   = w;
+            best_it  = rit;
+            best_seq = rit->seq;
+        }
+    }
+
+    return best_w == nullptr ? nullptr : claim(best_w, best_it);
 }
 
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
@@ -599,7 +654,7 @@ void server_response::send(server_task_result_ptr && result) {
 
     auto & w = *it->second;
 
-    w.results.emplace_back(std::move(result));
+    w.results.push_back(pending{next_seq++, std::move(result)});
 
     // notify_all, not notify_one: results are filtered by id, so waking a single waiter can wake
     // one taking a disjoint subset of this reader's ids, which finds nothing and sleeps again
@@ -620,7 +675,7 @@ void server_response::broadcast(server_task_result_ptr && result) {
         RES_DBG("task id = %d pushed to result queue\n", id_task);
         server_task_result_ptr res_copy(result->clone());
         res_copy->id = id_task; // override id with target task id
-        w->results.emplace_back(std::move(res_copy));
+        w->results.push_back(pending{next_seq++, std::move(res_copy)});
         w->cv.notify_all();
     }
 
