@@ -2127,11 +2127,11 @@ Details:
 - `N > 1` is refused at startup together with multimodal (`--mmproj`), `--control-vector` and
   `--sleep-idle-seconds`.
 - With `N = 1` nothing changes: one context, one batch and one update loop on the main thread.
-- Each group samples its own rows over a small worker pool, because a serial pass over the slots
-  costs tens of milliseconds per step between the decode and the next submit and, at `N > 1`,
-  competes for memory bandwidth with the other group's GPU work. The total number of sampling
-  threads is the same however many groups there are; `LLAMA_SERVER_SAMPLE_THREADS=1` turns the
-  pool off. The sampled tokens do not depend on how the pass is scheduled.
+- Each group samples its rows serially, on its own decode thread. Sampling them over a worker pool
+  was tried and removed: `common_sampler_sample` begins with `llama_synchronize`, which does
+  non-atomic read-modify-writes on the context's timing counters, and `set_logits` then re-enters
+  the same context through six more getters, so the workers raced on a context they shared. Making
+  that safe means duplicating a large part of the context API.
 - Use `--cache-ram 0` with a layer split. The RAM prompt cache moves a whole slot state on every
   slot handover, and on a split most of that state lives on the remote node, so it goes over the
   wire; at 32 concurrent clients on the pair it costs about a quarter of the throughput with one
