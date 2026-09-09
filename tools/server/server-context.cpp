@@ -846,6 +846,12 @@ struct server_group {
     // Declared after ctx so it outlives the llama_free() above groups.clear().
     std::unique_ptr<common_threadpools> threadpools;
 
+    // common_speculative_init_result owns only the model and the context and never attaches a
+    // pool, so the draft context falls back to a throwaway pool per graph and ignores the draft
+    // --cpu-mask-draft, --prio, --poll and --cpu-strict settings. Declared before spec_init so
+    // it is destroyed after the draft context it is attached to.
+    std::unique_ptr<common_threadpools> threadpools_dft;
+
     server_batch batch;
 
     std::vector<server_slot *> slots;
@@ -1279,6 +1285,11 @@ private:
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
+
+                // params_dft, not params_ctx: the draft has its own cpu params and this is the
+                // only place they can reach the draft context
+                grp.threadpools_dft = std::make_unique<common_threadpools>();
+                grp.threadpools_dft->init(grp.ctx_dft, params_dft);
 
                 if (n_groups > 1) {
                     SRV_INF("created draft context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
