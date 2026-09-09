@@ -685,11 +685,29 @@ struct server_slot {
 
     // [TAG_PREEMPT] bring prompt.tokens back to what the cache holds, for a batch given up after it was built: never-decoded tokens and the draft come off, `sampled` is kept
     void rewind_to_cache() {
-        const int32_t n_cached = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
+        // the memory counts positions, and with M-RoPE media a position is not a token, so convert before truncating
+        const llama_pos pos_cached = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
 
-        if (n_cached < prompt.n_tokens()) {
+        size_t n_cached = pos_cached > 0 ? prompt.tokens.size_up_to_pos(pos_cached) : 0;
+
+        // a cut inside a media chunk is not a token boundary: keep what precedes the chunk, and the cells of its head go too
+        bool split_chunk = false;
+
+        while (n_cached > 0 && prompt.tokens.pos_next(n_cached) > pos_cached) {
+            n_cached--;
+            split_chunk = true;
+        }
+
+        if (n_cached < (size_t) prompt.n_tokens()) {
             prompt.tokens.keep_first(n_cached);
         }
+
+        if (split_chunk) {
+            mem.seq_rm(id, prompt.tokens.pos_next(), -1);
+        }
+
+        // what is kept ends where the cache does, or the next decode is positioned from the wrong count
+        GGML_ASSERT(prompt.tokens.pos_next() <= pos_cached);
 
         // the last chunk was marked done when it was built but never ran, so it is not done
         if (state == SLOT_STATE_DONE_PROMPT && task && prompt.n_tokens() < preempt_n_input()) {

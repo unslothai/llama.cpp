@@ -330,6 +330,13 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
+# server helpers that need no model
+if (LLAMA_BUILD_TOOLS)
+    llama_build_and_test(test-server-tokens.cpp)
+    target_link_libraries(test-server-tokens PRIVATE server-context mtmd)
+    target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+endif()
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)
