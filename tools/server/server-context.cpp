@@ -1734,7 +1734,7 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(const server_task & task, bool * out_update_cache) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1829,24 +1829,32 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            if (update_cache) {
-                SRV_TRC("%s", "updating prompt cache\n");
-
-                const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
-                }
-
-                prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-            }
+            // the update itself is left to update_prompt_cache(), which the caller runs after it
+            // has waited for this slot's group. prompt_save() and prompt_load() call
+            // llama_state_seq_* on the slot's context, and with more than one pipeline group
+            // another slot of that group can still be inside llama_decode() at this point.
+            // Selecting a slot must not touch its context.
+            *out_update_cache = update_cache;
         }
 
         return ret;
+    }
+
+    // must be called with the slot's group waited for
+    void update_prompt_cache(server_slot & slot, const server_task & task) {
+        SRV_TRC("%s", "updating prompt cache\n");
+
+        const int64_t t_start = ggml_time_us();
+
+        slot.prompt_save(*prompt_cache);
+
+        if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+            slot.prompt_clear();
+        }
+
+        prompt_cache->update();
+
+        SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
     }
 
     // return true if at least one slot has been cleared
@@ -2570,7 +2578,8 @@ private:
 
                     const int id_task = task.id;
 
-                    server_slot * slot = get_available_slot(task);
+                    bool update_cache = false;
+                    server_slot * slot = get_available_slot(task, &update_cache);
 
                     //
                     // slot scheduling logic
@@ -2591,6 +2600,12 @@ private:
                     }
 
                     guard.wait_for(slot->id_group);
+
+                    // only now is every slot of this group out of llama_decode(), so the
+                    // llama_state_seq_* calls behind the prompt cache can touch its context
+                    if (update_cache) {
+                        update_prompt_cache(*slot, task);
+                    }
 
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
