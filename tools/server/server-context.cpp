@@ -1172,9 +1172,23 @@ private:
         common_params & params_ctx = n_groups > 1 ? params_grp  : params_base;
 
         if (n_groups > 1) {
-            // 1/N of the sequences and of the context each, so per-slot context and total KV hold
             params_ctx.n_parallel = n_seq_per_group;
-            params_ctx.n_ctx      = params_base.n_ctx / n_groups;
+
+            // Dividing n_ctx is right for one KV mode and wrong for the other, so it is only done
+            // for the mode it holds in. llama_context derives n_ctx_seq = n_ctx / n_seq_max when
+            // the KV is split, so dividing both gives (C/N) / (P/N) = C/P and the context a single
+            // request may use is unchanged, which is the intent. With --kv-unified it instead sets
+            // n_ctx_seq = n_ctx, so the same division would cut what one request may use from C to
+            // C/N: not a tighter limit but a different meaning for -c, decided by an unrelated
+            // flag, and invisible until a long request is truncated.
+            //
+            // So each group keeps the full n_ctx under unified KV. That does cost N times the
+            // unified KV, which reserve_extra_group_memory() below measures and charges to the fit
+            // margins like any other per-group cost, so a configuration that no longer fits comes
+            // back as a smaller n_ctx the fitter chose and reported, not as a silent halving.
+            if (!params_base.kv_unified) {
+                params_ctx.n_ctx = params_base.n_ctx / n_groups;
+            }
 
             // common_init_from_params fits ONE context and fixes the model placement from that
             // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
@@ -1549,7 +1563,8 @@ private:
             return false;
         }
 
-        if (params.n_ctx % n_groups != 0) {
+        // only the split-KV path divides n_ctx, so only it needs the size to divide evenly
+        if (!params.kv_unified && params.n_ctx % n_groups != 0) {
             SRV_ERR("--ctx-size (%d) must be a multiple of --pipeline-groups (%d)\n", params.n_ctx, n_groups);
             return false;
         }
