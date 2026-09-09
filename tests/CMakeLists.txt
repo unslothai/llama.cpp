@@ -334,8 +334,9 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
-# [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
+# [TAG_EXACT_CONCURRENCY] the batch shape and the buffer types the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
+llama_build_and_test(test-exact-buft.cpp)
 
 # server helpers that need no model
 if (LLAMA_BUILD_TOOLS)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
 #include <string>
 #include <type_traits>
@@ -109,6 +110,9 @@ bool llama_exact_concurrency();
 
 // [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's batch-invariant kernels
 bool llama_exact_backend_name(const char * reg_name);
+
+// [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by such a backend
+bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft);
 
 // [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend knows the width every context needs
 bool llama_exact_report_n_seq(uint32_t n_seq);

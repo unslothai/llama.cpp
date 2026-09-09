@@ -33,22 +33,6 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by a backend
-// that carries the mode's kernels. A host buffer is the interesting case: the scheduler runs an
-// operation on the backend holding its weight, and moves a host weight's operation to the GPU
-// only once the batch is wide enough (ggml_backend_cuda_device_offload_op), while the CPU matmul
-// picks between its SGEMM and its vector dot by the batch width too.
-static bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
-    if (!buft || ggml_backend_buft_is_host(buft)) {
-        return false;
-    }
-
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-
-    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg));
-}
-
 // [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks where the weights that
 // produce the tokens live. Every per-layer weight and the output head must be on a backend with
 // the mode's kernels, otherwise a sequence's own matmuls change with the width of the step it
@@ -57,7 +41,9 @@ static bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
 // token_embd is deliberately not required to move: it feeds get_rows, a per-row copy, and
 // GET_ROWS reports a batch size of 0 to the offload test, so it stays on the same backend at
 // every width. A model that ties its head to the embedding uses that same tensor for the output
-// matmul, and model.output points at it, so the head check below still covers that case.
+// matmul, and model.output points at it, so the head check below still covers that case. A lora
+// that adapts it is applied with a mul_mat instead, and MUL_MAT reports the ubatch width, so
+// llama_adapter_lora_init_impl() refuses one that inherits a host buffer.
 static void llama_exact_check_weights(const llama_model & model) {
     auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
         if (!t || !t->buffer) {
