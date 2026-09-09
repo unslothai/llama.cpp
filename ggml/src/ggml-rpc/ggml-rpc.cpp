@@ -87,11 +87,20 @@ struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+// Server feature flags, carried in the byte that used to be pure padding in the HELLO response.
+// Advertised here rather than by bumping the protocol minor: a client rejects any server whose
+// minor exceeds its own, so a bump locks out every already-deployed older client even when the new
+// command is purely additive and such a client would never send it. This byte is fixed size,
+// already on the wire, and read as padding by existing clients, which see zero.
+enum rpc_srv_flag {
+    RPC_SRV_FLAG_BATCHED_GET = 1 << 0,  // supports RPC_CMD_GET_TENSORS
+};
+
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t srv_flags;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -178,6 +187,14 @@ struct rpc_msg_get_tensor_req {
     uint64_t offset;
     uint64_t size;
 };
+
+// Ceiling on one batched GET_TENSORS response. Per-entry validation already bounds each region by
+// a really allocated buffer, but nothing bounds the number of entries naming the same large buffer,
+// so a handful of valid entries could still ask for a terabyte. This is far above any legitimate
+// batch: the deferred gets this batches are activations and single tensor regions, orders of
+// magnitude smaller, so the limit costs nothing real while keeping the sum in a range where the
+// checked addition below cannot wrap.
+static constexpr size_t MAX_GET_TENSORS_RESPONSE = 4ull * 1024 * 1024 * 1024;   // 4 GiB
 
 // GET_TENSORS request: | n_entries (4 bytes) | n_entries x entry |, response: regions in entry order
 struct rpc_msg_get_tensors_entry {
@@ -490,6 +507,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->conn.server_minor = response.minor;
+    sock->conn.server_flags = response.srv_flags;
 
     sock->update_caps(response.conn_caps);
     return true;
@@ -1011,7 +1029,7 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
 
 static bool rpc_supports_batched_get(const socket_ptr & sock) {
     static const bool disabled = std::getenv("GGML_RPC_NO_BATCHED_GET") != nullptr;
-    return !disabled && sock->conn.server_minor >= 2;
+    return !disabled && (sock->conn.server_flags & RPC_SRV_FLAG_BATCHED_GET);
 }
 
 static socket_ptr tensor_socket(const ggml_tensor * tensor) {
@@ -1404,7 +1422,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+    response.srv_flags = RPC_SRV_FLAG_BATCHED_GET;
+    LOG_DBG("[%s] version: %d.%d.%d flags: 0x%02x\n", __func__,
+            response.major, response.minor, response.patch, response.srv_flags);
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -1819,9 +1839,41 @@ bool rpc_server::get_tensors(const std::vector<uint8_t> & input, std::vector<uin
     }
     const auto * entries = (const rpc_msg_get_tensors_entry *) (input.data() + sizeof(uint32_t));
 
+    // Validate every entry before allocating anything. The sizes come straight off the wire, and
+    // the per-entry bounds check further down only constrains a region against its own source
+    // buffer, never against the response, so summing first and allocating on that sum was wrong
+    // two ways. An unchecked sum can exceed anything allocatable and throw an uncaught bad_alloc,
+    // which terminates the server. Worse, the sum is accumulated into size_t from uint64_t sizes,
+    // so it can wrap: a small total then allocates a small response while the copy loop below
+    // still writes entries[i].size bytes at out_offset, running off the end of the heap block.
     size_t total = 0;
     for (uint32_t i = 0; i < n_entries; i++) {
-        total += entries[i].size;
+        struct ggml_init_params vparams {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr vctx { ggml_init(vparams) };
+        GGML_ASSERT(vctx != nullptr);
+        ggml_tensor * t = deserialize_tensor(vctx.get(), &entries[i].tensor);
+        if (t == nullptr || t->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing tensor %u\n", __func__, i);
+            return false;
+        }
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(t->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(t->buffer);
+        if (entries[i].tensor.data + entries[i].offset < p0 ||
+            entries[i].tensor.data + entries[i].offset >= p1 ||
+            entries[i].size > (p1 - entries[i].tensor.data - entries[i].offset)) {
+            GGML_LOG_ERROR("[%s] requested tensor region out of buffer bounds\n", __func__);
+            return false;
+        }
+        if (entries[i].size > MAX_GET_TENSORS_RESPONSE - total) {   // checked add, no wrap
+            GGML_LOG_ERROR("[%s] batched read of %" PRIu64 " bytes exceeds the response limit\n",
+                           __func__, entries[i].size);
+            return false;
+        }
+        total += (size_t) entries[i].size;
     }
     response.resize(total, 0);
 
