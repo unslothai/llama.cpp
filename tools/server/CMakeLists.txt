@@ -74,4 +74,12 @@ if (LLAMA_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
     add_test(NAME ${TARGET} COMMAND ${TARGET})
+
+    set(TARGET test-server-response)
+
+    add_executable(${TARGET} tests/test-server-response.cpp)
+    target_link_libraries(${TARGET} PRIVATE server-context ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    add_test(NAME ${TARGET} COMMAND ${TARGET})
 endif()
