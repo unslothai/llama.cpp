@@ -174,6 +174,11 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
     }
 }
 
+// [TAG_EXACT_CONCURRENCY]
+bool llama_exact_backend_name(const char * reg_name) {
+    return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
+}
+
 bool llama_exact_concurrency() {
     static const bool enabled = []() {
         const char * val = getenv("LLAMA_EXACT_CONCURRENCY");

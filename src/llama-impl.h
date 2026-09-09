@@ -107,6 +107,9 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 // [TAG_EXACT_CONCURRENCY] opt-in mode under which a sequence's attention depends only on its own cells, so its output does not change when others share the KV cache
 bool llama_exact_concurrency();
 
+// [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's batch-invariant kernels
+bool llama_exact_backend_name(const char * reg_name);
+
 // [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend knows the width every context needs
 bool llama_exact_report_n_seq(uint32_t n_seq);
 

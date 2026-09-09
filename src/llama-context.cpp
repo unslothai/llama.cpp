@@ -33,6 +33,75 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by a backend
+// that carries the mode's kernels. A host buffer is the interesting case: the scheduler runs an
+// operation on the backend holding its weight, and moves a host weight's operation to the GPU
+// only once the batch is wide enough (ggml_backend_cuda_device_offload_op), while the CPU matmul
+// picks between its SGEMM and its vector dot by the batch width too.
+static bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
+    if (!buft || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg));
+}
+
+// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks where the weights that
+// produce the tokens live. Every per-layer weight and the output head must be on a backend with
+// the mode's kernels, otherwise a sequence's own matmuls change with the width of the step it
+// shares, while the mode still reports itself as on.
+//
+// token_embd is deliberately not required to move: it feeds get_rows, a per-row copy, and
+// GET_ROWS reports a batch size of 0 to the offload test, so it stays on the same backend at
+// every width. A model that ties its head to the embedding uses that same tensor for the output
+// matmul, and model.output points at it, so the head check below still covers that case.
+static void llama_exact_check_weights(const llama_model & model) {
+    auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
+        if (!t || !t->buffer) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+
+        return llama_exact_buft_invariant(buft) ? nullptr : buft;
+    };
+
+    auto refuse = [&model](const char * name, ggml_backend_buffer_type_t buft, const char * what) {
+        const std::string tname = name;
+
+        const char * fix = "pass -ngl to offload every layer, and no --override-tensor that keeps one on the host";
+
+        if (tname.find("_exps") != std::string::npos) {
+            fix = "do not pass --cpu-moe or --n-cpu-moe, and no --override-tensor that keeps an expert on the host";
+        } else if (model.has_tensor_overrides()) {
+            fix = "drop the --override-tensor that placed it there, and pass -ngl to offload every layer";
+        }
+
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s %s is in a %s buffer, which has no "
+                "batch-invariant kernels: its result would depend on how many sequences share the step (%s)\n",
+                __func__, what, tname.c_str(), ggml_backend_buft_name(buft), fix);
+
+        throw std::runtime_error("exact concurrency: a weight is not on the CUDA backend");
+    };
+
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (name.rfind("blk.", 0) != 0) {
+            continue;
+        }
+
+        if (auto * buft = host_buft(t)) {
+            refuse(name.c_str(), buft, "layer weight");
+        }
+    }
+
+    if (auto * buft = host_buft(model.output)) {
+        refuse(ggml_get_name(model.output), buft, "the output head");
+    }
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -106,6 +175,10 @@ llama_context::llama_context(
     if (llama_exact_concurrency()) {
         if (!llama_exact_check_n_seq(cparams.n_seq_max)) {
             throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
+        }
+
+        if (!hparams.vocab_only) {
+            llama_exact_check_weights(model);
         }
     }
 
