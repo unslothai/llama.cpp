@@ -473,26 +473,27 @@ server_response::waiter_ptr server_response::find_waiter(const std::unordered_se
     return nullptr;
 }
 
-// true when the ids the caller named were registered by separate calls, so they sit in more than
-// one waiter and no single waiter's condition covers them. Short-circuits on the first mismatch.
-bool server_response::spans_waiters(const std::unordered_set<int> & id_tasks) const {
-    const waiter * first = nullptr;
+// The waiter that covers every requested id, or nullptr when they sit in more than one waiter or
+// any of them is not registered yet. An absent id matters: it can be registered onto a different
+// waiter while the reader waits, so no single waiter's condition covers the call.
+server_response::waiter_ptr server_response::sole_waiter(const std::unordered_set<int> & id_tasks) const {
+    waiter_ptr found = nullptr;
 
     for (const auto & id_task : id_tasks) {
         auto it = waiting.find(id_task);
         if (it == waiting.end()) {
+            return nullptr;
+        }
+        if (found == nullptr) {
+            found = it->second;
             continue;
         }
-        if (first == nullptr) {
-            first = it->second.get();
-            continue;
-        }
-        if (it->second.get() != first) {
-            return true;
+        if (it->second != found) {
+            return nullptr;
         }
     }
 
-    return false;
+    return found;
 }
 
 // A waiter is shared by every id its reader registered in one call, so its queue can hold a
@@ -513,12 +514,7 @@ server_task_result_ptr server_response::take_result(const std::unordered_set<int
     };
 
     // the ordinary case: every id the caller named shares one waiter, so no comparison is needed
-    if (!spans_waiters(id_tasks)) {
-        auto w = find_waiter(id_tasks);
-        if (w == nullptr) {
-            return nullptr;
-        }
-
+    if (auto w = sole_waiter(id_tasks)) {
         auto it = first_match(w.get());
         return it == w->results.end() ? nullptr : claim(w.get(), it);
     }
@@ -572,14 +568,17 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
         // for these ids, which blocks this one connection and nothing else, so that is what it
         // does here too. The lookup is inside the loop rather than above it because a waiter
         // re-added while we wait should be picked up instead of waited out.
-        // ids registered by separate calls sit in separate waiters, and no one waiter's condition
-        // covers them, so those readers park on the shared one and send() notifies it for them
-        auto w = find_waiter(id_tasks);
-        if (w == nullptr || spans_waiters(id_tasks)) {
+        // Only a waiter that covers every requested id has a condition that covers the whole
+        // receive. Anything else parks on the shared one, and send() notifies that for readers
+        // whose ids are at least partly registered, so a result cannot be missed.
+        auto w = sole_waiter(id_tasks);
+        if (w == nullptr) {
+            const bool deliverable = find_waiter(id_tasks) != nullptr;
+
             // registration and terminate() both fire condition_gone; the timeout is only a backstop
-            if (w != nullptr) { n_split_readers++; }
+            if (deliverable) { n_split_readers++; }
             condition_gone.wait_for(lock, std::chrono::seconds(1));
-            if (w != nullptr) { n_split_readers--; }
+            if (deliverable) { n_split_readers--; }
             continue;
         }
 
@@ -608,20 +607,21 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             return res;
         }
 
-        auto w = find_waiter(id_tasks);
+        // Park on the shared condition unless one waiter covers every requested id: the ids may
+        // be spread over several waiters, or some of them may not be registered yet, and either
+        // way no one waiter's condition covers the call. add_waiting_task_id(s) fires the shared
+        // one, so a result that arrives during this call is still seen, which is what the single
+        // shared condition used to give; terminate() fires it too; and send() fires it while a
+        // reader that could already be served is parked there.
+        auto w = sole_waiter(id_tasks);
 
-        // Park on the shared condition when the ids are not registered yet, or not any more, or
-        // when they span several waiters so that no one waiter's condition covers them.
-        // add_waiting_task_id(s) fires it, so a result that arrives during this call is still
-        // seen, which is what the single shared condition used to give; terminate() fires it too;
-        // and send() fires it while a split reader is parked.
-        const bool split = w != nullptr && spans_waiters(id_tasks);
+        const bool deliverable = w == nullptr && find_waiter(id_tasks) != nullptr;
 
-        std::condition_variable & cv = (w == nullptr || split) ? condition_gone : w->cv;
+        std::condition_variable & cv = w == nullptr ? condition_gone : w->cv;
 
-        if (split) { n_split_readers++; }
+        if (deliverable) { n_split_readers++; }
         const std::cv_status st = cv.wait_until(lock, deadline);
-        if (split) { n_split_readers--; }
+        if (deliverable) { n_split_readers--; }
 
         if (st == std::cv_status::timeout) {
             if (!running) {

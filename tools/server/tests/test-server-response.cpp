@@ -447,6 +447,31 @@ static void t_waiter_replaced_under_a_parked_reader() {
           "a parked reader is woken when its waiter is replaced", d);
 }
 
+
+// A receive can name an id that is not registered yet. One waiter's condition does not cover
+// such a call, because the missing id may be registered on a different waiter while it waits.
+static void t_partially_registered_receive() {
+    server_response res;
+    res.add_waiting_task_id(900);            // 901 does not exist yet
+
+    std::atomic<int> got{-1};
+    std::thread reader([&] {
+        auto r = res.recv_with_timeout({900, 901}, 3);
+        got.store(payload_of(r));
+    });
+    std::this_thread::sleep_for(ms(300));    // let the reader park on whatever it picked
+
+    const auto t0 = std::chrono::steady_clock::now();
+    res.add_waiting_task_id(901);            // a separate waiter
+    res.send(mk(901, 9010));
+    reader.join();
+    const auto waited = std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - t0).count();
+
+    char d[80]; snprintf(d, sizeof(d), "%lldms, payload=%d", (long long) waited, got.load());
+    check(got.load() == 9010 && waited < 2500,
+          "a receive naming an id registered later is still woken", d);
+}
+
 static long rss_kb() {
     // Linux only; returns -1 elsewhere, and only the optional "leak" mode uses it
     FILE * f = fopen("/proc/self/status", "r");
@@ -503,6 +528,7 @@ int main(int argc, char ** argv) {
     t_ids_spanning_two_waiters();
     t_fifo_across_waiters();
     t_waiter_replaced_under_a_parked_reader();
+    t_partially_registered_receive();
     t_parked_reader_does_not_abort();
 
     printf("\nRESULT queue failures=%d\n", g_fail);

@@ -187,9 +187,10 @@ private:
     // whose ids span several waiters, for which no single waiter's condition is enough
     std::condition_variable condition_gone;
 
-    // how many readers are parked on condition_gone for ids that ARE registered, i.e. spread over
-    // more than one waiter. Normally zero, so send() pays one integer compare rather than a
-    // second notify: server_response_reader registers all of its ids in one call.
+    // how many readers are parked on condition_gone even though a result could already be
+    // delivered to them, i.e. their ids are spread over several waiters or only partly
+    // registered. Normally zero, so send() pays one integer compare rather than a second notify:
+    // server_response_reader registers all of its ids in one call, before it ever receives.
     size_t n_split_readers = 0;
 
     // ids registered together share one waiter, so the first hit is the right one. mutex_results held.
@@ -198,9 +199,11 @@ private:
     // pop the oldest queued result whose id the caller asked for. mutex_results held.
     server_task_result_ptr take_result(const std::unordered_set<int> & id_tasks);
 
-    // true if the registered ids among id_tasks belong to more than one waiter, which happens
-    // only when they were registered by separate calls. mutex_results held.
-    bool spans_waiters(const std::unordered_set<int> & id_tasks) const;
+    // The waiter that covers EVERY requested id, or nullptr when they are spread over several
+    // waiters or any of them is not registered. Only then does one waiter's condition cover the
+    // whole receive; an id that is absent now can be registered onto a different waiter while
+    // the reader waits. mutex_results held.
+    waiter_ptr sole_waiter(const std::unordered_set<int> & id_tasks) const;
 
 public:
     // add the id_task to the list of tasks waiting for response
