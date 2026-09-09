@@ -36,9 +36,9 @@ def _start(**kwargs):
     server.start()
 
 
-def _completion_payload(n_predict: int, prompt: str = "Hi how are you") -> dict:
+def _completion_payload(n_predict: int, prompt: str = "Hi how are you", **extra) -> dict:
     return {"n_predict": n_predict, "prompt": prompt, "ignore_eos": True,
-            "temperature": 0.0, "seed": 42, "stream": True}
+            "temperature": 0.0, "seed": 42, "stream": True, **extra}
 
 
 def _chat_payload(n_predict: int) -> dict:
@@ -64,9 +64,9 @@ def _stream_raw(path: str, data: dict) -> tuple[list[str], list[str]]:
     return comments, datas
 
 
-def _stream_all(n_predict: int, prompts):
+def _stream_all(n_predict: int, prompts, **extra):
     return parallel_function_calls([
-        (_stream_raw, ("/completion", _completion_payload(n_predict, prompt))) for prompt in prompts
+        (_stream_raw, ("/completion", _completion_payload(n_predict, prompt, **extra))) for prompt in prompts
     ])
 
 
@@ -234,7 +234,10 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
     _start(n_slots=3, n_ctx=2048, enable_ctx_shift=True)
 
     n_predict = 12000
-    results = _stream_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C))
+    # the default parked keepalive is 2 s, which is also when a resident is rotated out for the head:
+    # a park that ends with that rotation could beat its own keepalive. Ask for a 1 s ping instead, so
+    # any park that outlasts one rotation window is still required to say so
+    results = _stream_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C), sse_ping_interval=1)
     n_parked = n_keepalive = 0
     for comments, datas in results:
         assert _final(datas)["tokens_predicted"] == n_predict
@@ -243,7 +246,7 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
         n_parked += len(seq) // 2
         n_keepalive += comments.count(": preempt-keepalive")
     assert n_parked >= 2, [r[0] for r in results]
-    assert n_keepalive >= 1, "a parked stream was left silent past the 2 s keepalive"
+    assert n_keepalive >= 1, "a parked stream was left silent past its keepalive interval"
 
     text = open(server.log_path).read()
     assert "rotated out after" in text
