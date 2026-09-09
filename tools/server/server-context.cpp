@@ -2575,14 +2575,17 @@ private:
 
         SRV_TRC("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
 
-        // to be called in case of failure to release all launched slots
-        auto release_slots = [this, id_parent]() {
-            for (auto & slot : slots) {
-                if (slot.is_processing() && (
-                        slot.task->id == id_parent ||
-                        slot.task->id_parent == id_parent
+        // to be called in case of failure to release all launched slots.
+        // only this group's slots: the parent and its children are guaranteed to share a group, and
+        // wait_for() released every other group's lock, so a global scan would read state and task
+        // while their workers write them
+        auto release_slots = [this, id_parent, &parent_slot]() {
+            for (auto * slot : groups[parent_slot.id_group]->slots) {
+                if (slot->is_processing() && (
+                        slot->task->id == id_parent ||
+                        slot->task->id_parent == id_parent
                 )) {
-                    slot.release();
+                    slot->release();
                 }
             }
         };
