@@ -1507,7 +1507,10 @@ public:
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
-    ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+    // allow_foreign widens buffer validation from this session's buffers to every live buffer
+    // in the process. Only the peer-copy write path sets it, see set_tensor().
+    ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor,
+                                     bool allow_foreign = false);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
@@ -1637,7 +1640,7 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (shared.buffers.find(buffer) == shared.buffers.end()) {
+    if (owned_buffers.find(buffer) == owned_buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1666,7 +1669,7 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
 
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (shared.buffers.find(buffer) == shared.buffers.end()) {
+    if (owned_buffers.find(buffer) == owned_buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1722,7 +1725,8 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
     return true;
 }
 
-ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
+ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor,
+                                             bool allow_foreign) {
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
@@ -1748,7 +1752,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && shared.buffers.find(result->buffer) == shared.buffers.end()) {
+    // Validate against this session's own buffers by default. Before peer copies existed the
+    // registry was per connection, so naming another connection's buffer simply did not resolve;
+    // moving the registry into rpc_server_shared made every live buffer in the process reachable
+    // from every connection, which is a wider grant than the peer-copy write actually needs.
+    const auto & allowed = allow_foreign ? shared.buffers : owned_buffers;
+    if (result->buffer && allowed.find(result->buffer) == allowed.end()) {
         result->buffer = nullptr;
     }
 
@@ -1792,7 +1801,11 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    // The destination of a peer copy receives this command on the connection the source server
+    // opened, not on the connection of the client that allocated the buffer, so this is the one
+    // path that has to resolve a buffer belonging to another session. The write is still bounded
+    // by the buffer range checks in deserialize_tensor and below.
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor, /* allow_foreign */ true);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
