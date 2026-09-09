@@ -1415,6 +1415,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    if (!common_exact_concurrency_context(params, lctx)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to serve this context, see the error above\n");
+        pimpl->context.reset();
+        return;
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1531,7 +1537,7 @@ bool common_exact_concurrency_init(const common_params & params) {
     }
 
     // a prompt is added to a batch in whole ubatches, so a batch that cannot hold one beside a decode step of every slot would leave a prefill shorter ubatches than it gets alone, and the mode would report itself as on while a shared step changed the prompt's arithmetic
-    // a causal context clamps the batch to the context size, so that is the batch a prefill really gets
+    // a causal context clamps the batch to the context size, so that is the batch a prefill really gets; an unset -c is only known once the context exists, which common_exact_concurrency_context() checks
     const int n_batch_eff = params.n_ctx > 0 ? std::min(params.n_ctx, params.n_batch) : params.n_batch;
 
     int n_batch_min = 0;
@@ -1550,6 +1556,37 @@ bool common_exact_concurrency_init(const common_params & params) {
     if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
         !llama_set_exact_decode_width((uint32_t) n_cols)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool common_exact_concurrency_context(const common_params & params, const llama_context * ctx) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    const int n_cols = common_exact_decode_width(params);
+
+    if (n_cols < 0) {
+        return false; // already reported by common_exact_concurrency_init()
+    }
+
+    // the context clamps the batch to the context size and the ubatch to the batch, and an unset -c takes its size from the model or from the fit to device memory, so this is the geometry a prefill really gets
+    const int n_batch  = (int) llama_n_batch(ctx);
+    const int n_ubatch = (int) llama_n_ubatch(ctx);
+
+    int n_batch_min = 0;
+
+    if (!common_exact_batch_geometry(n_batch, n_ubatch, n_cols, &n_batch_min)) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY needs a batch of at least %d tokens for a %d-token ubatch "
+                "and a decode step of %d slots (%d columns), but the context was created with a batch "
+                "of %d: a context of %d tokens clamps it, so a prefill beside a running slot would be "
+                "split into shorter ubatches than the same prompt gets alone. Raise -c to at least %d "
+                "(-fitc as well when the context was fitted to device memory), or lower -ub.\n",
+                n_batch_min, n_ubatch, std::max(1, params.n_parallel), n_cols, n_batch,
+                (int) llama_n_ctx(ctx), n_batch_min);
         return false;
     }
 

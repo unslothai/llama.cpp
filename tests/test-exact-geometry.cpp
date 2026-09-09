@@ -39,6 +39,12 @@ int main() {
     assert(!common_exact_batch_geometry(512, 4096, 1, &n_min));
     assert(n_min == 513);
 
+    // the shape a context settles on when its size clamps the batch: n_batch becomes min(n_ctx, -b)
+    // and n_ubatch min(n_batch, -ub), so a context of 256 cells leaves the two equal and no column
+    // for a decode step, whatever -b and -ub asked for
+    assert(!common_exact_batch_geometry(256, 256, 2, &n_min));
+    assert(n_min == 258);
+
     // no slot decoding at all: the prompt has the batch to itself
     assert(common_exact_batch_geometry(512, 512, 0, &n_min));
     assert(n_min == 512);

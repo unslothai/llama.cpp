@@ -946,6 +946,9 @@ bool common_exact_concurrency_init(const common_params & params);
 // the same for what only the loaded model tells: false if the model must not be served in exact mode
 bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
 
+// the same for the geometry the created context settled on, which the context size may have clamped below what -b and -ub asked for
+bool common_exact_concurrency_context(const common_params & params, const struct llama_context * ctx);
+
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
