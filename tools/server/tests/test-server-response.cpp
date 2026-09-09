@@ -19,8 +19,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include <sys/wait.h>
-#include <unistd.h>
+#ifndef _WIN32
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 static int g_fail = 0;
 
@@ -281,6 +283,11 @@ static void t_single_timed_recv_before_registration() {
 // recv_with_timeout() promises std::terminate() there, because the caller is HTTP code that
 // cannot return. Run in a child: the correct outcome is that the child dies.
 static void t_terminate_while_parked_on_absent_ids() {
+#ifdef _WIN32
+    // needs fork(): the correct outcome is that the caller terminates, which cannot be asserted
+    // in-process. The behaviour itself is not platform specific.
+    printf("%-46s SKIP (needs fork())\n", "terminate() is honoured while parked on absent ids");
+#else
     fflush(stdout);
     pid_t pid = fork();
     if (pid == 0) {
@@ -301,6 +308,7 @@ static void t_terminate_while_parked_on_absent_ids() {
     if (died) { snprintf(d, sizeof(d), "child died on signal %d", WTERMSIG(status)); }
     else      { snprintf(d, sizeof(d), "child returned %d, terminate() ignored", WEXITSTATUS(status)); }
     check(died, "terminate() is honoured while parked on absent ids", d);
+#endif
 }
 
 // A result for a sibling id must not be handed to a caller that did not ask for it.
@@ -316,7 +324,49 @@ static void t_subset_recv_is_filtered() {
     check(r2 != nullptr && r2->id == 201, "the sibling's result is still delivered to its own reader");
 }
 
+
+// Two readers taking disjoint subsets of one registration share a waiter, so waking only one of
+// them can wake the wrong one: it finds nothing matching, sleeps again, and the reader whose
+// result is actually queued sits there until its timeout. The shared condition used to
+// notify_all(), so every subset receiver got a look.
+static void t_subset_receivers_are_all_woken() {
+    server_response res;
+    res.add_waiting_task_ids({400, 401});
+
+    std::atomic<int> parked{0};
+    std::atomic<int> got_a{-1};
+    std::vector<std::thread> others;
+
+    // four readers waiting on the sibling id park first, so a single notify picks one of them
+    for (int i = 0; i < 4; i++) {
+        others.emplace_back([&] {
+            parked.fetch_add(1);
+            auto r = res.recv_with_timeout({401}, 3);
+            (void) r;
+        });
+    }
+    while (parked.load() < 4) { std::this_thread::yield(); }
+    std::this_thread::sleep_for(ms(200));
+
+    std::thread reader_a([&] {
+        auto r = res.recv_with_timeout({400}, 3);
+        got_a.store(payload_of(r));
+    });
+    std::this_thread::sleep_for(ms(200));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    res.send(mk(400, 4000));
+    reader_a.join();
+    const auto waited = std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - t0).count();
+    for (auto & t : others) { t.join(); }
+
+    char d[80]; snprintf(d, sizeof(d), "%lldms, payload=%d", (long long) waited, got_a.load());
+    check(got_a.load() == 4000 && waited < 2500,
+          "a subset receiver is woken even when siblings wait too", d);
+}
+
 static long rss_kb() {
+    // Linux only; returns -1 elsewhere, and only the optional "leak" mode uses it
     FILE * f = fopen("/proc/self/status", "r");
     if (!f) { return -1; }
     char line[256];
@@ -367,6 +417,7 @@ int main(int argc, char ** argv) {
     t_single_timed_recv_before_registration();
     t_terminate_while_parked_on_absent_ids();
     t_subset_recv_is_filtered();
+    t_subset_receivers_are_all_woken();
     t_parked_reader_does_not_abort();
 
     printf("\nRESULT queue failures=%d\n", g_fail);

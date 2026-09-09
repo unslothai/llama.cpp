@@ -158,7 +158,8 @@ private:
     bool running = true;
 
     // One waiter per reader, shared by every id it registered in one call. A single shared vector
-    // plus one cv instead costs N wakeups and N scans per token, N^2 per decode step.
+    // plus one cv instead costs N wakeups and N scans per token, N^2 per decode step. A send
+    // notifies this reader's own cv, so the wakeup is O(1) even though it is a notify_all.
     struct waiter {
         std::condition_variable cv;
 

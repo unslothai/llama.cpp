@@ -569,7 +569,13 @@ void server_response::send(server_task_result_ptr && result) {
     auto & w = *it->second;
 
     w.results.emplace_back(std::move(result));
-    w.cv.notify_one();
+
+    // notify_all, not notify_one: results are filtered by id, so waking a single waiter can wake
+    // one taking a disjoint subset of this reader's ids, which finds nothing and sleeps again
+    // while the reader whose result this is stays asleep. This is one reader's own condition,
+    // not the single global one the shared vector used, so it is still O(1) in the common case
+    // of one thread per reader.
+    w.cv.notify_all();
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {
@@ -579,7 +585,7 @@ void server_response::broadcast(server_task_result_ptr && result) {
         server_task_result_ptr res_copy(result->clone());
         res_copy->id = id_task; // override id with target task id
         w->results.emplace_back(std::move(res_copy));
-        w->cv.notify_one();
+        w->cv.notify_all();
     }
 }
 
