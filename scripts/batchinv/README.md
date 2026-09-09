@@ -68,8 +68,18 @@ nonfinite logits and attention. `PROBE_B_REVERSE=1` fills neighbours before P0;
 neighbour. Compute rows can be compared across this relocation; physical cache
 views and index tensors must not be mistaken for sequence-0 compute outputs.
 
-`divergence.py --reference FILE` compares against an existing unparked solo token
-reference. `bench.py --modes 0,1 --pairs 3` measures default off against exact mode
+`divergence.py` captures a solo reference for every prompt before the concurrent
+rounds and compares each sequence with its own; `--reference FILE` replaces those
+with an existing unparked capture, either a `.solo.json` from a newer run or a
+legacy `.p0_solo.json` holding P0 alone. Requests send `ignore_eos`, and a response
+or a reference that is not exactly `--n-predict` tokens fails the run with the
+reason in `status` rather than comparing two short answers that never shared a
+batch. `--no-ignore-eos` is for natural-EOS runs, where the length is not checked.
+`--p0-only` keeps the older single-reference comparison and JSON shape.
+`test_divergence_assertions.py` runs the harness against a fake server, with no
+model and no GPU, and checks that one-token answers, a short neighbour and a
+neighbour that diverges while P0 matches all fail the run.
+`bench.py --modes 0,1 --pairs 3` measures default off against exact mode
 on, with 256 predicted tokens. Set `UNSLOTH_WORKSPACE` to the model parent workspace
 and `LD_LIBRARY_PATH` to this build's bin directory. The harness uses GPU 3;
 select a port in 9601-9610 explicitly.

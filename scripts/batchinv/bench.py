@@ -3,7 +3,7 @@
 import argparse, json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from divergence import Server, completion, run_concurrent
+from divergence import Server, completion, run_concurrent, short_responses
 from prompts import PROMPTS
 
 
@@ -27,6 +27,10 @@ def main():
                 completion(a.port, PROMPTS["P0"], 32)  # warm
                 solo = completion(a.port, PROMPTS["P0"], a.n_predict)
                 outs, wall = run_concurrent(a.port, ["P0", "P1", "P2", "P3"], a.n_predict)
+                # ignore_eos keeps every run the same length, so the rates compare like for like
+                short = short_responses(dict(outs, solo=solo), a.n_predict)
+                if short:
+                    raise RuntimeError(f"responses of {short} tokens, expected {a.n_predict}")
                 row = {
                     "pair": pair, "mode": mode, "spec": a.spec,
                     "solo_tok_per_s": solo["timings"]["predicted_per_second"],
