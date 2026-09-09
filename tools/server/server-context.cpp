@@ -867,6 +867,12 @@ struct server_group {
     // Declared after ctx so it outlives the llama_free() above groups.clear().
     std::unique_ptr<common_threadpools> threadpools;
 
+    // common_speculative_init_result owns only the model and the context and never attaches a
+    // pool, so the draft context falls back to a throwaway pool per graph and ignores the draft
+    // --cpu-mask-draft, --prio, --poll and --cpu-strict settings. Declared before spec_init so
+    // it is destroyed after the draft context it is attached to.
+    std::unique_ptr<common_threadpools> threadpools_dft;
+
     server_batch batch;
 
     std::vector<server_slot *> slots;
@@ -1301,6 +1307,11 @@ private:
                     return false;
                 }
 
+                // params_dft, not params_ctx: the draft has its own cpu params and this is the
+                // only place they can reach the draft context
+                grp.threadpools_dft = std::make_unique<common_threadpools>();
+                grp.threadpools_dft->init(grp.ctx_dft, params_dft);
+
                 if (n_groups > 1) {
                     SRV_INF("created draft context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
                             g, (int) llama_n_ctx(grp.ctx_dft), (int) llama_n_seq_max(grp.ctx_dft));
@@ -1707,7 +1718,10 @@ private:
 
         std::vector<size_t> added(params_ctx.fit_params_target.size(), 0);
 
-        auto reserve = [&](common_params p, bool as_mtp, bool count_weights) {
+        // device order the margins are indexed by, taken from the target measurement below
+        std::vector<ggml_backend_dev_t> devs_tgt;
+
+        auto reserve = [&](common_params p, bool as_mtp, bool count_weights, bool is_target) {
             auto mparams = common_model_params_to_llama(p);
             auto cparams = common_context_params_to_llama(p);
             if (as_mtp) {
@@ -1720,21 +1734,51 @@ private:
             const auto mem = common_get_device_memory_data(p.model.path.c_str(), &mparams, &cparams,
                                  devs, ngl, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
 
-            // margins and the memory data are indexed by the same device order
-            for (size_t i = 0; i < mem.size() && i < params_ctx.fit_params_target.size(); ++i) {
-                size_t per_group = mem[i].context + mem[i].compute;
-                if (count_weights) {
-                    per_group += mem[i].model;
+            if (is_target) {
+                devs_tgt = devs;
+            }
+
+            auto charge = [&](size_t id, const common_device_memory_data & md) {
+                if (id >= params_ctx.fit_params_target.size()) {
+                    return;
                 }
-                params_ctx.fit_params_target[i] += n_extra * per_group;
-                added[i] += n_extra * per_group;
+                size_t per_group = md.context + md.compute;
+                if (count_weights) {
+                    per_group += md.model;
+                }
+                params_ctx.fit_params_target[id] += n_extra * per_group;
+                added[id]                        += n_extra * per_group;
+            };
+
+            // mem holds one entry per device plus a host entry at the back, while fit_params_target
+            // is indexed by device alone (common/fit.cpp builds margins over the nd devices). With
+            // no device at all that single margin is the host one, so only then is the host entry
+            // charged; otherwise charging it would bill host memory to a device's margin.
+            if (devs_tgt.empty()) {
+                if (!mem.empty()) {
+                    charge(0, mem.back());
+                }
+                return;
+            }
+
+            for (size_t j = 0; j + 1 < mem.size() && j < devs.size(); ++j) {
+                // --device-draft may order the draft devices differently from the target, so match
+                // on device identity rather than position, the same way common_params_fit_impl maps
+                // its extra model. By position a draft allocation would be billed to another
+                // device's margin, approving a placement that then fails on the second context.
+                for (size_t id = 0; id < devs_tgt.size(); ++id) {
+                    if (devs[j] == devs_tgt[id]) {
+                        charge(id, mem[j]);
+                        break;
+                    }
+                }
             }
         };
 
-        reserve(params_ctx, false, false);
+        reserve(params_ctx, false, false, true);
 
         if (has_draft || spec_mtp) {
-            reserve(common_base_params_to_speculative(params_ctx), spec_mtp, has_draft);
+            reserve(common_base_params_to_speculative(params_ctx), spec_mtp, has_draft, false);
         }
 
         for (size_t i = 0; i < added.size(); ++i) {
