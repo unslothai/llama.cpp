@@ -179,7 +179,7 @@ jobs:
           set -euo pipefail
           cd "${{ github.workspace }}/.ccache"
           find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
-          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort -k2 > "${{ github.workspace }}/shard.before.m"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
 
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
@@ -216,7 +216,7 @@ jobs:
           mkdir -p "$W/shards/${{ matrix.shard }}"
           cd "$W/.ccache"
           find . -type f -printf '%p\t%s\n' | sort > "$W/shard.after"
-          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort -k2 > "$W/shard.after.m"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "$W/shard.after.m"
           { comm -13 "$W/shard.before" "$W/shard.after" | cut -f1
             comm -13 "$W/shard.before.m" "$W/shard.after.m" | awk '{ print $2 }'; } | sort -u > "$W/shard.changed"
           xargs -a "$W/shard.changed" -d '\n' -r cp --parents -a -t "$W/shards/${{ matrix.shard }}/"

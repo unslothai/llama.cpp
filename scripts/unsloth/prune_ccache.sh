@@ -59,8 +59,11 @@ echo "$(grep -c . "$all" || true) caches, $(gib "$total") GiB total: ccache $(gi
 
 # Group by the restore-keys prefix: the key minus its -<tag>- suffix, plus the
 # -<run id>-<attempt> suffix the non-CUDA legs append so a same-tag retry can
-# save an improved cache. The ROCm version comes off too, else every weekly
-# toolchain becomes its own group and keeps a cache that can never hit again.
+# save an improved cache. The ROCm toolchain version stays in the group
+# because it is in the restore prefix: a rocm_version=latest dispatch followed
+# by the weekly nightly would otherwise leave the newer toolchain's cache as
+# the only survivor, one the weekly legs cannot restore. A retired toolchain's
+# caches are removed by GitHub's 7-day unused-cache expiry instead.
 # Grouped per (ref, version) as well: a branch cannot restore a sibling's
 # cache and a path change mints a new version, so ranking across them would
 # let one scope evict another's only usable entry.
@@ -68,7 +71,7 @@ grouped="$tmp/grouped.tsv"; : > "$grouped"
 while IFS=$'\t' read -r id created size ref ver key; do
   [ -z "${id:-}" ] && continue
   case "$key" in ccache-*) ;; *) continue ;; esac
-  pre="$(printf '%s' "$key" | sed -E 's/-[0-9]+-[0-9]+$//; s/-b[0-9]+(-mix-[0-9a-f]+)?-?$//; s/-[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+$//')"
+  pre="$(printf '%s' "$key" | sed -E 's/-[0-9]+-[0-9]+$//; s/-b[0-9]+(-mix-[0-9a-f]+)?-?$//')"
   [ "$pre" = "$key" ] && continue
   printf '%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" >> "$grouped"
 done < "$all"

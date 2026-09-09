@@ -68,7 +68,11 @@ jobs:
             exit 0
           fi
 
-          FAILED="$(awk -F'\t' '$2 == "failure"' <<<"$JOBS")"
+          # Best-effort jobs never decide a retry: the start-of-run ccache prune
+          # and the CUDA warm shards run with continue-on-error, which the jobs
+          # API still reports as "failure". The names track unsloth-prebuilt.yml
+          # and its CUDA children; the assemble waiter excludes the same two.
+          FAILED="$(awk -F'\t' '$2 == "failure" && $3 != "Prune superseded ccache generations" && index($3, " / warm ") == 0' <<<"$JOBS")"
 
           # assemble waits on the build matrix from inside the job, so a leg
           # that dies fails assemble too. Alongside another failure that is a
