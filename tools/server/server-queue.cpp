@@ -450,13 +450,23 @@ server_response::waiter_ptr server_response::find_waiter(const std::unordered_se
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
-    auto w = find_waiter(id_tasks);
-    GGML_ASSERT(w && "recv() called for task ids that are not in the waiting list");
-
     while (true) {
         if (!running) {
             RES_DBG("%s : queue result stop\n", "recv");
             std::terminate(); // we cannot return here since the caller is HTTP code
+        }
+
+        // The waiter can be absent, so this cannot assert. A cancel or a cleanup drops the ids
+        // between the caller posting them and arriving here, and recv() runs on the HTTP
+        // thread: aborting there turns one stuck request into a dead server for every other
+        // client. Before the per-waiter queues this waited on a condition that no longer fires
+        // for these ids, which blocks this one connection and nothing else, so that is what it
+        // does here too. The lookup is inside the loop rather than above it because a waiter
+        // re-added while we wait should be picked up instead of waited out.
+        auto w = find_waiter(id_tasks);
+        if (w == nullptr) {
+            condition_gone.wait_for(lock, std::chrono::seconds(1));
+            continue;
         }
 
         if (!w->results.empty()) {
