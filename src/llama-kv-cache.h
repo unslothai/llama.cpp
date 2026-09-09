@@ -253,9 +253,15 @@ private:
     };
 
     mutable std::vector<exact_page> exact_page_owner;
-    mutable bool                    exact_page_owner_dirty = true;
 
-    // bring exact_page_owner up to date; rebuilds only when a removal marked it dirty
+    // live cells in each physical page, so a removal can free the page it emptied without
+    // rescanning the pool
+    mutable std::vector<uint32_t> exact_page_live;
+
+    mutable bool exact_page_owner_dirty = true;
+
+    // bring exact_page_owner up to date; rebuilds only when something marked it dirty, and
+    // with LLAMA_KV_CACHE_DEBUG set it also rebuilds to check what was maintained
     void exact_pages_sync() const;
 
     // recompute it from the live cells
@@ -263,6 +269,16 @@ private:
 
     // record that a cell of (seq, pos) now lives at physical cell idx
     void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
+
+    // record that the cell at physical index idx has just become empty
+    void exact_pages_release(uint32_t idx);
+
+    // how many cells have been released, so prepare() can tell whether a placement removed cells
+    // it is not going to restore
+    uint64_t exact_page_n_release = 0;
+
+    // scratch for find_slot(), which must not touch the ownership it reads
+    mutable std::vector<exact_page> exact_page_owner_tmp;
 
     bool v_trans = true;  // the value tensor is transposed
 
