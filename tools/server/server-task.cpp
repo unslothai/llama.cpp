@@ -178,18 +178,32 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
 static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
     const unsigned char lead = static_cast<unsigned char>(s[pos]);
     size_t want = 1;
-    if ((lead & 0xe0) == 0xc0) {
+    // The FIRST continuation is range restricted for four leads, and the serialiser's decoder
+    // rejects the sequence at that byte rather than absorbing it: E0 80 is an overlong form,
+    // ED A0 a surrogate, F0 80 overlong again and F4 90 past U+10FFFF. Each of those renders as
+    // TWO replacement characters, the lead alone and then the stray continuation, so treating
+    // every 10xxxxxx byte as part of the prefix would emit one and disagree with the client.
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) {
         want = 2;
-    } else if ((lead & 0xf0) == 0xe0) {
+    } else if (lead >= 0xe0 && lead <= 0xef) {
         want = 3;
-    } else if ((lead & 0xf8) == 0xf0) {
+        if (lead == 0xe0) { lo = 0xa0; }
+        if (lead == 0xed) { hi = 0x9f; }
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
         want = 4;
+        if (lead == 0xf0) { lo = 0x90; }
+        if (lead == 0xf4) { hi = 0x8f; }
     } else {
-        return 1; // a bare continuation, or a lead no encoding can use
+        return 1; // a bare continuation, C0/C1 overlong, or F5..FF: never a usable lead
     }
     size_t have = 1;
-    while (have < want && pos + have < s.size() &&
-           (static_cast<unsigned char>(s[pos + have]) & 0xc0) == 0x80) {
+    while (have < want && pos + have < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[pos + have]);
+        const bool ok = (have == 1) ? (c >= lo && c <= hi) : ((c & 0xc0) == 0x80);
+        if (!ok) {
+            break;
+        }
         have++;
     }
     return have;
