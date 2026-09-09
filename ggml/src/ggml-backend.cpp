@@ -507,7 +507,11 @@ static bool ggml_backend_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_
         }
     }
 
-    if (backend_src != NULL && backend_src->iface.cpy_tensor_from_async != NULL) {
+    // backend_dst must be a real backend before anything is delegated to the source. An
+    // implementation of the source role has to inspect the destination to decide whether it can
+    // help, so handing it a null destination pushes that dereference into every implementer.
+    // Guarding here keeps the invariant in one place instead of depending on all of them.
+    if (backend_src != NULL && backend_dst != NULL && backend_src->iface.cpy_tensor_from_async != NULL) {
         if (backend_src->iface.cpy_tensor_from_async(backend_src, backend_dst, src, dst)) {
             return true;
         }

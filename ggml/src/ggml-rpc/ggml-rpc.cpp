@@ -1051,6 +1051,12 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         return false;
     }
 
+    // ggml_backend_is_rpc() tolerates null, but nothing below does: a null destination against an
+    // RPC source passes the differing-kind test and then reaches ggml_backend_get_device(other).
+    if (backend_src == nullptr || backend_dst == nullptr) {
+        return false;
+    }
+
     const bool src_is_rpc = ggml_backend_is_rpc(backend_src);
     const bool dst_is_rpc = ggml_backend_is_rpc(backend_dst);
 
