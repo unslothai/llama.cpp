@@ -34,9 +34,11 @@ static int g_pipeline_groups = 1;
 
 static void server_take_pipeline_groups(int & argc, char ** argv) {
     static const char * opt = "--pipeline-groups";
+    static const char * env = "LLAMA_ARG_PIPELINE_GROUPS";
     const size_t opt_len = strlen(opt);
 
     int n_kept = 1;
+    bool from_cli = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -47,11 +49,13 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
                 exit(1);
             }
             g_pipeline_groups = std::atoi(argv[++i]);
+            from_cli = true;
             continue;
         }
 
         if (arg.size() > opt_len + 1 && arg.compare(0, opt_len, opt) == 0 && arg[opt_len] == '=') {
             g_pipeline_groups = std::atoi(arg.c_str() + opt_len + 1);
+            from_cli = true;
             continue;
         }
 
@@ -60,6 +64,17 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
 
     argc = n_kept;
     argv[n_kept] = nullptr;
+
+    // router mode strips the flag before server_models builds the preset it merges into every
+    // child, so the setting has to cross the process boundary in the environment instead
+    if (from_cli) {
+        common_set_env(env, std::to_string(g_pipeline_groups));
+    } else {
+        const std::string from_env = common_get_env(env);
+        if (!from_env.empty()) {
+            g_pipeline_groups = std::atoi(from_env.c_str());
+        }
+    }
 
     if (g_pipeline_groups < 1) {
         fprintf(stderr, "error: %s must be >= 1\n", opt);
