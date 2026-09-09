@@ -53,6 +53,22 @@ struct rpc_load_prof {
     rpc_load_prof(const char * tag) : tag(tag) {
         const char * e = std::getenv("GGML_RPC_LOADPROF");
         enabled = e != nullptr && e[0] != '0';
+        reset();
+    }
+
+    // The server profiler is a single global printed once per client connection, so without this
+    // the second and later clients report the first one's numbers as well: cumulative counters,
+    // a first_ns still pointing at the first client's first upload, and an ns_gap that has the
+    // idle time between clients folded into it. Every derived figure the report prints, the span,
+    // the gap total and the effective rates, is wrong for every connection after the first.
+    // Clearing last_end_ns matters as much as the counters: left set, the first upload of the next
+    // client is treated as a gap from the previous client's last one instead of as a new start.
+    void reset() {
+        calls.store(0);      bytes.store(0);
+        ns_hash.store(0);    ns_stage.store(0);   ns_wire.store(0);   ns_gap.store(0);
+        hash_calls.store(0); hash_hits.store(0);  hash_bytes.store(0);
+        last_end_ns.store(0); first_ns.store(0);
+        gap_max.store(0);    gaps_1ms.store(0);
         for (int i = 0; i < 5; i++) hist[i].store(0);
     }
 
@@ -2148,6 +2164,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fflush(stdout);
         rpc_serve_client(backends, cache_dir, client_socket);
         g_rpc_loadprof_server.print();
+        g_rpc_loadprof_server.reset();   // so the next client reports only its own load
         printf("Client connection closed\n");
         fflush(stdout);
     }
