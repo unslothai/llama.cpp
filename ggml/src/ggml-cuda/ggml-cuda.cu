@@ -5489,7 +5489,11 @@ struct ggml_cuda_trace_device {
     std::vector<ggml_cuda_trace_mark> pending;
     std::vector<cudaEvent_t>          spare;
     cudaEvent_t                       anchor    = nullptr;
-    int64_t                           anchor_us = 0;  // 0 until the anchor is first seen complete
+    int64_t                           anchor_us = 0;  // 0 until the anchor's wall clock is known
+    // the stream the anchor was recorded on, so poll can ask whether it is idle
+    cudaStream_t                      stream    = nullptr;
+    int                               device    = 0;
+    bool                              anchor_fixed = false;
 };
 
 struct ggml_cuda_trace_state {
@@ -5521,10 +5525,11 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
         // every later mark is reported as anchor_us + elapsed(anchor, mark). The anchor is only
         // recorded here, never waited on: synchronizing would drain whatever the scheduler has
         // already queued on this stream, so switching the tracer on would change the execution it
-        // is supposed to observe. Its wall clock is taken in poll, the first time it is seen
-        // complete, which leaves absolute timestamps with an offset bounded by the poll interval
-        // and leaves the spacing between marks exact.
+        // is supposed to observe. Its wall clock is established in poll, which ties it to real time
+        // through a probe event once the stream is idle, so waiting drains nothing. See there.
         cudaEventRecord(d.anchor, cuda_ctx->stream());
+        d.stream = cuda_ctx->stream();
+        d.device = cuda_ctx->device;
     }
 
     cudaEvent_t event = nullptr;
@@ -5560,11 +5565,56 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
         }
         // the anchor is recorded before any mark on this stream, so it always completes first.
         // Until it has, its wall clock is unknown and the marks simply stay pending.
-        if (d.anchor_us == 0) {
+        if (!d.anchor_fixed) {
             if (cudaEventQuery(d.anchor) != cudaSuccess) {
                 continue;
             }
-            d.anchor_us = ggml_time_us();
+
+            // Taking ggml_time_us() here dates the anchor to this poll rather than to when it
+            // actually completed, and every mark is reported as anchor_us + elapsed(anchor, mark),
+            // so the whole device timeline shifts forward by however long the anchor had already
+            // been complete. In the RPC server that delay is a full graph, because
+            // ggml_backend_graph_compute() synchronizes before the serve loop polls again, which
+            // is exactly the case cross-device overlap and idle attribution are computed from.
+            //
+            // Tie GPU time to wall time properly instead: record a probe, wait for it, and measure
+            // back to the anchor. Synchronizing is only safe when the stream is already idle, since
+            // otherwise it would drain queued work and change the execution being observed, which
+            // is why the anchor itself is never waited on. When the stream is idle the probe
+            // completes immediately, so the wait returns at its completion and costs nothing. That
+            // is the normal state at poll time in the serve loop.
+            if (cudaStreamQuery(d.stream) == cudaSuccess) {
+                ggml_cuda_set_device(d.device);
+
+                cudaEvent_t probe = nullptr;
+                if (!d.spare.empty()) {
+                    probe = d.spare.back();
+                    d.spare.pop_back();
+                } else if (cudaEventCreate(&probe) != cudaSuccess) {
+                    probe = nullptr;
+                }
+
+                if (probe != nullptr) {
+                    float ms = 0.0f;
+                    if (cudaEventRecord(probe, d.stream) == cudaSuccess &&
+                        cudaEventSynchronize(probe) == cudaSuccess &&
+                        cudaEventElapsedTime(&ms, d.anchor, probe) == cudaSuccess) {
+                        d.anchor_us    = ggml_time_us() - (int64_t)(ms * 1000.0f);
+                        d.anchor_fixed = true;
+                    }
+                    d.spare.push_back(probe);
+                }
+            }
+
+            if (!d.anchor_fixed) {
+                // Stream busy, or the probe failed. Fall back to the previous approximation rather
+                // than stalling the marks. Freeze it either way: refining the anchor on a later
+                // poll would move marks reported after the change relative to marks reported
+                // before it, putting a step in the middle of one device's timeline, which is
+                // harder to reason about than a consistent offset.
+                d.anchor_us    = ggml_time_us();
+                d.anchor_fixed = true;
+            }
         }
 
         size_t keep = 0;

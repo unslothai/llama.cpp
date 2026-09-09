@@ -800,13 +800,23 @@ struct server_trace_scope {
     int64_t      t0;
     int          n0;
     int          n1;
+    // -1 leaves the field out entirely. Set it to 0 or 1 to state, rather than let the reader
+    // guess, whether this span covers prompt processing. A reader cannot infer the phase from
+    // tokens per slot: under speculative decoding an ordinary decode submits several drafted
+    // tokens per slot, which is indistinguishable from a small prefill by that measure.
+    int          prompt = -1;
 
     server_trace_scope(const char * name, int n0, int n1) :
         name(name), t0(ggml_trace_flag ? ggml_trace_time_us() : 0), n0(n0), n1(n1) {}
 
     ~server_trace_scope() {
         if (ggml_trace_flag) {
-            ggml_trace_eventf("server", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
+            if (prompt < 0) {
+                ggml_trace_eventf("server", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
+            } else {
+                ggml_trace_eventf("server", name, t0, ggml_trace_time_us(),
+                                  "\"n0\":%d,\"n1\":%d,\"prompt\":%d", n0, n1, prompt);
+            }
         }
     }
 
@@ -3349,12 +3359,18 @@ private:
         }
 
         int n_slots_processing = 0;
+        int n_slots_prompt     = 0;
         if (ggml_trace_flag) {
             for (auto * slot : grp.slots) {
                 n_slots_processing += slot->is_processing() ? 1 : 0;
+                // read before pre_decode(), which is what acts on these states: a slot still
+                // working through its prompt contributes prompt tokens to this batch
+                n_slots_prompt += (slot->state == SLOT_STATE_STARTED ||
+                                   slot->state == SLOT_STATE_PROCESSING_PROMPT) ? 1 : 0;
             }
         }
         server_trace_scope span_iter("iteration", grp.id, n_slots_processing);
+        span_iter.prompt = n_slots_prompt > 0 ? 1 : 0;
 
         try {
             server_trace_scope span_build("batch_build", grp.id, n_slots_processing);

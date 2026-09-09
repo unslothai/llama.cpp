@@ -12,24 +12,70 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from merge import load, union, union_len, clip, gaps, Index          # noqa: E402
 
 
+def inside(outer, e):
+    return any(a <= e["t0"] and e["t1"] <= b for a, b in outer)
+
+
 def phase_windows(client):
-    """(prefill, decode) iteration windows per group; an iteration is prefill when it submitted
-    more tokens than it had slots processing, and groups do not enter decode together."""
+    """(prefill, decode) iteration windows per group; groups do not enter decode together.
+
+    The trace carries no explicit prompt/decode flag, so an iteration is classified by:
+
+    1. `prompt` on the iteration event, if the tracer ever starts emitting one;
+    2. drafting. With speculative decoding a generation step submits one sampled plus n_draft
+       drafted tokens per slot, which the token count alone cannot tell from a prompt chunk.
+       common_speculative_draft() runs the draft model inside pre_decode, so a nested one-token
+       llama/decode inside batch_build means the step is drafting, hence generating. The token
+       count is required so that a multimodal prompt chunk, which also decodes inside pre_decode
+       but a whole image at a time, is not mistaken for a draft;
+    3. tokens per processing slot, once the draft width seen in 2 is allowed for. With nothing
+       drafting anywhere the width is 1 and this is the plain "more tokens than slots" rule.
+    """
     subs = defaultdict(list)
+    builds = defaultdict(list)
     for e in client.events:
-        if e.get("ph") == "server" and e.get("n") == "submit":
+        if e.get("ph") != "server":
+            continue
+        if e.get("n") == "submit":
             subs[e.get("grp", 0)].append((e["t0"], e["t1"], e.get("n1", 0)))
+        elif e.get("n") == "batch_build":
+            builds[e.get("grp", 0)].append((e["t0"], e["t1"]))
     for g in subs:
         subs[g].sort()
 
-    pre, dec = defaultdict(list), defaultdict(list)
+    drafts = defaultdict(list)
+    for e in client.events:
+        if e.get("ph") == "llama" and e.get("n") == "decode" and e.get("n0", 0) == 1:
+            g = e.get("grp", 0)
+            if inside(builds.get(g, []), e):
+                drafts[g].append(e)
+
+    steps = []
     for e in client.events:
         if e.get("ph") != "server" or e.get("n") != "iteration":
             continue
         g = e.get("grp", 0)
-        n_slots = e.get("n1", 0)
+        n_slots = max(e.get("n1", 0), 1)
         toks = [n for a, b, n in subs.get(g, []) if a >= e["t0"] and b <= e["t1"]]
-        (pre if (toks and max(toks) > max(n_slots, 1)) else dec)[g].append((e["t0"], e["t1"]))
+        rate = -(-max(toks) // n_slots) if toks else 0    # tokens per processing slot
+        drafted = any(e["t0"] <= d["t0"] and d["t1"] <= e["t1"] for d in drafts.get(g, []))
+        steps.append((g, e, rate, drafted))
+
+    # the widest batch any drafting step submitted is the draft width, so a step that reuses a
+    # partial draft and therefore does not draft again is still recognised as generation
+    width = defaultdict(lambda: 1)
+    for g, _, rate, drafted in steps:
+        if drafted:
+            width[g] = max(width[g], rate)
+
+    pre, dec = defaultdict(list), defaultdict(list)
+    for g, e, rate, drafted in steps:
+        flag = e.get("prompt")
+        if flag is None:
+            is_pre = not drafted and rate > width[g]
+        else:
+            is_pre = bool(flag)
+        (pre if is_pre else dec)[g].append((e["t0"], e["t1"]))
     return pre, dec
 
 

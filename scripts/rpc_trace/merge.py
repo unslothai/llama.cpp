@@ -17,6 +17,7 @@ class TraceFile:
         self.offsets = []
         self.events = []
         self.offset_us = 0         # this file's clock minus the client's clock
+        self._syncs = None
 
         with open(path, "r", errors="replace") as f:
             for line in f:
@@ -46,6 +47,39 @@ class TraceFile:
     def label(self):
         return "%s %s" % (self.host or "node", self.role)
 
+    def sync_spans(self):
+        """(t0, t1) of every TRACE_SYNC this peer served, on the peer's own clock"""
+        if self._syncs is None:
+            self._syncs = [(e.get("t_recv0") or e["t0"], e.get("t_send1") or e["t1"])
+                           for e in self.events
+                           if e.get("ph") == "rpc.server" and e.get("n") == "TRACE_SYNC"]
+        return self._syncs
+
+
+def host_like(a, b):
+    return a == b or a.startswith(b + ".") or b.startswith(a + ".")
+
+
+def endpoint_host(endpoint):
+    """host part of "host:port", "[::1]:port" or a bare host"""
+    if endpoint.startswith("["):
+        return endpoint[1:endpoint.index("]")] if "]" in endpoint else endpoint[1:]
+    head, sep, tail = endpoint.rpartition(":")
+    return head if sep and tail.isdigit() else endpoint
+
+
+def served_the_sync(f, rec):
+    """did peer `f` answer this clock exchange?
+
+    The client stores the peer's own t2 (reply built) and t3 (reply sent) inside the record, and
+    the peer traced the very same TRACE_SYNC command on that same clock, so the record belongs to
+    the peer whose TRACE_SYNC span brackets [t2, t3]. No host name is involved.
+    """
+    t2, t3 = rec.get("t2"), rec.get("t3")
+    if t2 is None or t3 is None:
+        return False
+    return any(t0 <= t2 and t3 <= t1 for t0, t1 in f.sync_spans())
+
 
 def load(paths):
     files = [TraceFile(p) for p in paths]
@@ -59,24 +93,48 @@ def load(paths):
 
     client = clients[0]
 
-    # median over the connections, so one delayed reply does not move the alignment
-    by_host = defaultdict(list)
+    # keyed by the whole endpoint: two peers on one host differ only in the port, and a host name
+    # is not an identity at all once the peers are addressed by IP or by a DNS alias
+    by_ep = defaultdict(list)
     for rec in client.offsets:
-        host = rec.get("peer", "").split(":")[0]
-        by_host[host].append(rec.get("offset_us", 0))
+        by_ep[rec.get("peer", "")].append(rec)
+
+    taken = {}                 # id(file) -> offset samples
+    left = dict(by_ep)
+
+    # 1. the peer's own record of the clock exchange, which is unambiguous when it is there
+    for ep, recs in list(left.items()):
+        owners = [f for f in servers if any(served_the_sync(f, r) for r in recs)]
+        if len(owners) == 1:
+            taken.setdefault(id(owners[0]), []).extend(r.get("offset_us", 0) for r in recs)
+            del left[ep]
+
+    # 2. host name, only when the header carries one and it picks out a single endpoint. An empty
+    #    host (Windows, where the tracer writes no host at all) must never prefix-match.
+    for f in servers:
+        if id(f) in taken or not f.host:
+            continue
+        hits = [ep for ep in left
+                if endpoint_host(ep) and host_like(endpoint_host(ep), f.host)]
+        rivals = [g for g in servers
+                  if g is not f and id(g) not in taken and g.host == f.host]
+        if len(hits) == 1 and not rivals:
+            taken[id(f)] = [r.get("offset_us", 0) for r in left.pop(hits[0])]
+
+    # 3. one peer and one endpoint left over: they can only belong together
+    rest = [f for f in servers if id(f) not in taken]
+    if len(rest) == 1 and len(left) == 1:
+        taken[id(rest[0])] = [r.get("offset_us", 0) for r in left.popitem()[1]]
 
     for f in servers:
-        cand = None
-        for host, values in by_host.items():
-            if host == f.host or f.host.startswith(host) or host.startswith(f.host):
-                cand = values
-                break
-        if cand is None and len(by_host) == 1:
-            cand = list(by_host.values())[0]
-        if cand is None:
+        cand = taken.get(id(f))
+        if not cand:
             sys.stderr.write(
-                "warning: no clock offset for %s, its events are left on their own clock\n" % f.path)
+                "warning: no clock offset for %s, its events are left on their own clock "
+                "(no TRACE_SYNC span in it matches a clock exchange, and its header host %r does "
+                "not identify it)\n" % (f.path, f.host))
             continue
+        # median over the connections, so one delayed reply does not move the alignment
         cand = sorted(cand)
         f.offset_us = cand[len(cand) // 2]
 
@@ -211,7 +269,37 @@ def sub_phases(e):
     return []
 
 
+# only used for traces from a build that did not record the tensor name yet
 LOGITS_MIN_BYTES = 64 * 1024
+
+# the graph outputs llama.cpp reads back with GET_TENSOR: logits, embeddings and the norm the
+# pooled embedding is taken from. Anything else a layer split copies back (a staged hidden state,
+# a KV entry) also runs past 64 KiB, so the size alone says nothing about what the bytes were.
+OUTPUT_PREFIX = "result_"
+
+
+def is_output_tensor(subj):
+    if not subj:
+        return False
+    # the scheduler names a staging copy "<backend>#<tensor>#<n>"
+    return any(part.startswith(OUTPUT_PREFIX) for part in subj.split("#"))
+
+
+def get_tensor_subjects(client):
+    """(any GET_TENSOR at all, any of them naming its tensor)"""
+    gets = [e for e in client.events
+            if e.get("ph") == "rpc.client" and e.get("n") == "GET_TENSOR"]
+    return bool(gets), any(e.get("subj") for e in gets)
+
+
+def output_returns(cmds, by_subject):
+    """the GET_TENSOR replies that carried a graph output back to the client"""
+    gets = [e for e in cmds if e.get("n") == "GET_TENSOR"]
+    if by_subject:
+        gets = [e for e in gets if is_output_tensor(e.get("subj"))]
+    else:
+        gets = [e for e in gets if e.get("bytes_in", 0) >= LOGITS_MIN_BYTES]
+    return [(e["t0"], e.get("t_recv1", e["t1"])) for e in gets]
 
 
 class Index:
@@ -256,6 +344,12 @@ def summarize(files, client, out):
     for f in files:
         out.write("  %-28s %-14s offset %+.3f ms, %d events\n"
                   % (os.path.basename(f.path), f.label(), f.offset_us / 1000.0, len(f.events)))
+
+    any_get, by_subject = get_tensor_subjects(client)
+    if any_get and not by_subject:
+        out.write("note: no GET_TENSOR records a tensor name, so the logits column falls back to "
+                  "the %d kB size rule and may also count staged hidden states\n"
+                  % (LOGITS_MIN_BYTES // 1024))
     out.write("\n")
 
     groups = sorted({e.get("grp", 0) for e in iters})
@@ -302,8 +396,7 @@ def summarize(files, client, out):
             send = [(e.get("t_send0", e["t0"]), e.get("t_send1", e["t1"])) for e in cmds]
             recv = [(e.get("t_wait", 0), e.get("t_recv1", 0)) for e in cmds if e.get("reply")]
             recv = [r for r in recv if r[0] and r[1] > r[0]]
-            logits = [(e["t0"], e.get("t_recv1", e["t1"])) for e in cmds
-                      if e.get("n") == "GET_TENSOR" and e.get("bytes_in", 0) >= LOGITS_MIN_BYTES]
+            logits = output_returns(cmds, by_subject)
 
             wire_out += sum(e.get("bytes_out", 0) for e in cmds)
             wire_in += sum(e.get("bytes_in", 0) for e in cmds)

@@ -1684,7 +1684,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (ggml_trace_flag) {
         tls_srv.n_nodes = (int) n_nodes;
         tls_srv.device  = (int) device;
-        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], "GRAPH_COMPUTE");
+        // the GPU event carries only this name and the tag, so the device index has to go into the
+        // name or it is lost: one rpc-server exposing several GPUs would otherwise emit every
+        // device's span as plain GRAPH_COMPUTE, and the merge tool keys its per-device rows by
+        // name, collapsing them into a single row and a single peer-utilization figure
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_COMPUTE dev%u", device);
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     if (ggml_trace_flag) {
@@ -1708,7 +1714,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (ggml_trace_flag) {
         tls_srv.n_nodes = graph->n_nodes;
         tls_srv.device  = (int) device;
-        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], "GRAPH_RECOMPUTE");
+        // see graph_compute: the device index must be part of the name to survive into the trace
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_RECOMPUTE dev%u", device);
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     if (ggml_trace_flag) {
