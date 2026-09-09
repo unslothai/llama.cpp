@@ -631,7 +631,16 @@ struct rpc_staging {
     size_t                capacity = 0;
     size_t                used     = 0;
 
-    ggml_backend_event_t inflight = nullptr;
+    // Every event recorded for a copy still reading this arena. This was a single slot, which
+    // silently assumed that one arena is written from one backend: the last event recorded would
+    // then be ordered after all the earlier ones, so waiting on it alone was enough. The arena is
+    // keyed by socket, meaning one per endpoint, and with --pipeline-groups > 1 each llama_context
+    // drives its own destination backend and therefore its own stream. Two groups copying over the
+    // same endpoint then overwrote each other's event here, and the wrap below waited only on the
+    // survivor before recycling the whole arena, while the other group's copy could still be
+    // reading its region. Events on different streams have no ordering between them, so the fix is
+    // to keep all of them and wait for all of them.
+    std::vector<ggml_backend_event_t> outstanding;
 
     std::vector<ggml_backend_event_t> events;
     size_t                            events_used = 0;
@@ -643,16 +652,16 @@ static std::unordered_map<socket_t *, rpc_staging> rpc_staging_map;
 // caller must hold rpc_staging_mutex
 static uint8_t * rpc_staging_alloc(rpc_staging & st, ggml_backend_buffer_type_t host_buft, size_t size) {
     if (st.used + size > st.capacity) {
-        if (st.inflight != nullptr) {
-            ggml_backend_event_synchronize(st.inflight);
-            st.inflight = nullptr;
+        for (ggml_backend_event_t ev : st.outstanding) {
+            ggml_backend_event_synchronize(ev);
         }
+        st.outstanding.clear();
         st.used = 0;
         // recycle the event pool here too, not only in rpc_flush_deferred(): that reset is behind
         // rpc_flush_deferred_guarded()'s empty-queue early return, and the RPC-to-local copy path
         // blocks in ggml_backend_tensor_get() with nothing deferred, so it never ran and every
-        // copy allocated a new backend event that was never reused. Events are recorded on one
-        // backend in order, so synchronizing the last one above means the earlier ones are done.
+        // copy allocated a new backend event that was never reused. Recycling is safe because the
+        // loop above waited on every outstanding event, not merely the most recent one.
         st.events_used = 0;
 
         if (size > st.capacity) {
@@ -1182,7 +1191,7 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         ggml_backend_event_t event = rpc_staging_event(st, other_dev);
         if (event != nullptr) {
             ggml_backend_event_record(event, backend_dst);
-            st.inflight = event;
+            st.outstanding.push_back(event);
         } else {
             ggml_backend_synchronize(backend_dst);
         }
