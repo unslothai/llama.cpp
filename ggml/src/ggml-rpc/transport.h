@@ -40,6 +40,9 @@ struct rpc_conn_state {
 
     std::unordered_map<uint32_t, uint64_t> last_graph_uid;
 
+    // server feature flags from the HELLO response
+    uint8_t server_flags = 0;
+
     uint32_t server_minor = 0;
 
     // lock order: mtx_defer before mtx_send, never the reverse

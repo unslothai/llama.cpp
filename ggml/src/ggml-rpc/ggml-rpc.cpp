@@ -90,11 +90,20 @@ struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+// Server feature flags, carried in the byte that used to be pure padding in the HELLO response.
+// Features are advertised here rather than by bumping the protocol minor because a client rejects
+// any server whose minor exceeds its own, so a bump locks out every already-deployed older client
+// even when the new commands are purely additive. This byte is fixed size, already on the wire,
+// and ignored by every existing client, which reads it as padding and sees zero.
+enum rpc_srv_flag {
+    RPC_SRV_FLAG_PEER_COPY = 1 << 0,  // supports RPC_CMD_COPY_TENSOR_TO and RPC_CMD_PEER_BARRIER
+};
+
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t srv_flags;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -524,6 +533,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, bool may_fai
     }
 
     sock->conn.server_minor = response.minor;
+    sock->conn.server_flags = response.srv_flags;
 
     sock->update_caps(response.conn_caps);
     return true;
@@ -1047,7 +1057,7 @@ static bool rpc_supports_batched_get(const socket_ptr & sock) {
 static bool rpc_supports_p2p(const socket_ptr & sock) {
     static const char * env      = std::getenv("GGML_RPC_P2P");
     static const bool   disabled = env != nullptr && std::strcmp(env, "0") == 0;
-    return !disabled && sock != nullptr && sock->conn.server_minor >= 3;
+    return !disabled && sock != nullptr && (sock->conn.server_flags & RPC_SRV_FLAG_PEER_COPY);
 }
 
 // Server to server movement of a tensor that crosses a stage boundary of a layer split. The
@@ -1523,7 +1533,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+    response.srv_flags = RPC_SRV_FLAG_PEER_COPY;
+    LOG_DBG("[%s] version: %d.%d.%d flags: 0x%02x\n", __func__, response.major, response.minor,
+            response.patch, response.srv_flags);
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -2062,7 +2074,7 @@ socket_ptr rpc_server::get_peer_socket(const std::string & endpoint) {
         GGML_LOG_ERROR("[%s] failed to connect to %s\n", __func__, endpoint.c_str());
         return nullptr;
     }
-    if (sock->conn.server_minor < 3) {
+    if (!(sock->conn.server_flags & RPC_SRV_FLAG_PEER_COPY)) {
         GGML_LOG_ERROR("[%s] %s does not support peer to peer copies\n", __func__, endpoint.c_str());
         return nullptr;
     }
