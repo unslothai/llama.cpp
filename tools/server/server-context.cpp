@@ -1163,6 +1163,17 @@ private:
             // 1/N of the sequences and of the context each, so per-slot context and total KV hold
             params_ctx.n_parallel = n_seq_per_group;
             params_ctx.n_ctx      = params_base.n_ctx / n_groups;
+
+            // common_init_from_params fits ONE context and fixes the model placement from that
+            // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
+            // can no longer change. Fitting the undivided n_ctx instead would not be enough:
+            // measured with common_get_device_memory_data on a 1.5B, KV tracks n_ctx (112, 224 and
+            // 448 MiB at 4k, 8k and 16k) but the compute buffer does not (536 MiB across the same
+            // range), so that would budget the KV and still miss n_groups - 1 compute buffers.
+            // Reserve what the fitter will not see in its per-device margin.
+            if (params_ctx.fit_params) {
+                reserve_extra_group_memory(params_ctx, has_draft, spec_mtp);
+            }
         }
 
         llama_init = common_init_from_params(params_ctx);
@@ -1655,6 +1666,53 @@ private:
         }
 
         return true;
+    }
+
+    // Add what the extra pipeline groups will allocate to the fitter's per-device margin. Only the
+    // context and compute buffers for the target contexts, plus the draft contexts when speculation
+    // is on; the target weights are shared and already counted, and an MTP draft shares them too, so
+    // only a separate --model-draft adds weights per group.
+    void reserve_extra_group_memory(common_params & params_ctx, bool has_draft, bool spec_mtp) const {
+        const size_t n_extra = n_groups - 1;
+
+        std::vector<size_t> added(params_ctx.fit_params_target.size(), 0);
+
+        auto reserve = [&](common_params p, bool as_mtp, bool count_weights) {
+            auto mparams = common_model_params_to_llama(p);
+            auto cparams = common_context_params_to_llama(p);
+            if (as_mtp) {
+                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, n_ctx_train = 0, n_expert = 0;
+
+            const auto mem = common_get_device_memory_data(p.model.path.c_str(), &mparams, &cparams,
+                                 devs, ngl, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+
+            // margins and the memory data are indexed by the same device order
+            for (size_t i = 0; i < mem.size() && i < params_ctx.fit_params_target.size(); ++i) {
+                size_t per_group = mem[i].context + mem[i].compute;
+                if (count_weights) {
+                    per_group += mem[i].model;
+                }
+                params_ctx.fit_params_target[i] += n_extra * per_group;
+                added[i] += n_extra * per_group;
+            }
+        };
+
+        reserve(params_ctx, false, false);
+
+        if (has_draft || spec_mtp) {
+            reserve(common_base_params_to_speculative(params_ctx), spec_mtp, has_draft);
+        }
+
+        for (size_t i = 0; i < added.size(); ++i) {
+            if (added[i] > 0) {
+                SRV_INF("pipeline groups: reserved %.0f MiB on device %zu for %zu extra context(s)\n",
+                        added[i] / 1048576.0, i, n_extra);
+            }
+        }
     }
 
     // holds every group's lock, so the slot state is stable while the guard exists; a no-op with a
