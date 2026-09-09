@@ -466,8 +466,18 @@ jobs:
           WIN_CUDA_MATRIX: ${{ steps.r.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
-          SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
-          WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 2 end'
+          # Warm shards are DISABLED for now (every profile 0): the nightly runs
+          # its 42 jobs as before and the CUDA children skip their `warm` job.
+          # The caching fixes in this branch (ccache 4.13, content check,
+          # cache sizes, one generation per prefix, redist toolkit) do not
+          # depend on them. To enable, restore the measured sizing:
+          #   SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
+          #   WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 2 end'
+          # (staging run 34205486511: cuda12-older cold leg 100 -> 64 min on
+          # Windows, 53 -> 43 on Linux; every CUDA object a direct hit in the
+          # build after the shard merge).
+          SHARDS='0'
+          WIN_SHARDS='0'
           expand_warm() { # $1 = shard rule
             jq -c ".include | [.[] | . as \$r | ($1) as \$k | select(\$k > 0) | range(\$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
           }
