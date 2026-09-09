@@ -1375,9 +1375,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
-    // Whether to select the bounds-checked ("fallback") tile configuration. Decided by the caller in
-    // ggml_cuda_mul_mat_q so that the config chosen here matches the one the src1 padding was sized
-    // for; it is set whenever src0->ne[1] % 128 != 0, and additionally for mul_mat_id on Blackwell.
+    // set by ggml_cuda_mul_mat_q, not re-derived, so it matches the config src1 padding was sized for
     bool fallback;
 };
 

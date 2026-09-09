@@ -1236,7 +1236,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            // The block-scaled MMA takes C as an accumulator input, so accumulate into the running sum directly.
+            // block-scaled MMA takes C as an accumulator input: accumulate into the running sum.
             static_assert(sizeof(tile_C) == tile_C::ne * sizeof(float), "tile_C must be a plain float array");
             tile_C & C = *reinterpret_cast<tile_C *>(sum + (j0 / tile_C::J + n) * tile_C::ne);
 #pragma unroll
