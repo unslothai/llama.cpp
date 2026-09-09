@@ -41,6 +41,30 @@ using ssize_t = __int64;
 typedef int sockfd_t;
 #endif
 
+// Writing to a socket whose peer has gone away raises SIGPIPE on POSIX, and neither this library
+// nor the rpc-server executable installs a handler, so the default action terminates the whole
+// process. That was survivable while every send belonged to a client that aborts on a broken
+// connection anyway. It is not survivable now: a source server writes to a cached peer connection,
+// and a destination that was restarted is exactly the recoverable case that is supposed to end in
+// result = 0, not in the source server dying and taking every client it serves with it.
+//
+// Linux and most BSDs take MSG_NOSIGNAL per send. Apple has no MSG_NOSIGNAL and needs the
+// SO_NOSIGPIPE socket option instead, applied once per descriptor. Windows has no SIGPIPE at all.
+#if defined(MSG_NOSIGNAL)
+#  define RPC_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define RPC_SEND_FLAGS 0
+#endif
+
+static void set_no_sigpipe(sockfd_t sockfd) {
+#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int flag = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *) &flag, sizeof(flag));
+#else
+    (void) sockfd;
+#endif
+}
+
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
@@ -490,7 +514,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, RPC_SEND_FLAGS);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -646,11 +670,15 @@ socket_ptr socket_t::accept() {
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
     }
+    set_no_sigpipe(client_socket_fd);
+    // Adopt first here too: a TCP_NODELAY failure used to leak the accepted descriptor, and this
+    // one is reached once per client connection rather than once per process.
+    socket_ptr sock(new socket_t(std::make_unique<impl>(client_socket_fd)));
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    return sock;
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -658,6 +686,9 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    set_no_sigpipe(sockfd);
+    // Same reason as socket_t::connect: adopt first, so the failure paths below cannot leak.
+    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
     if (!set_reuse_addr(sockfd)) {
         GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
         return nullptr;
@@ -674,10 +705,10 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, 16) < 0) {
         return nullptr;
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return sock;
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
@@ -685,6 +716,15 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    set_no_sigpipe(sockfd);
+    // Adopt the descriptor before anything that can fail, so every early return below closes it.
+    // socket_t::impl's destructor already calls closesocket(); the leak was purely that the fd
+    // was carried raw until the last line. This used to cost at most one descriptor per process
+    // at startup, because a client that cannot connect aborts. A server calls this per peer copy
+    // through get_peer_socket(), failed peers are not cached, and a destination that refuses the
+    // connection is a recoverable condition that keeps being retried, so the same leak becomes one
+    // descriptor per tensor per boundary crossing and a long decode exhausts the limit.
+    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
@@ -701,7 +741,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return sock;
 }
 
 #ifdef _WIN32
