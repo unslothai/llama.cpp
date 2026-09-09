@@ -339,6 +339,12 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
+    // [TAG_PREEMPT] how the request was served: how often it was parked, and how many of those parks re-prefilled instead of restoring saved bytes
+    int32_t n_preempt   = 0;
+    int32_t n_recompute = 0;
+
+    json preempt_to_json() const;
+
     task_params generation_params;
 
     // response formatting
@@ -394,8 +400,9 @@ struct server_task_result_cmpl_final : server_task_result {
 
 // [TAG_PREEMPT] out-of-band notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") every existing client ignores
 struct server_task_result_preempt_notice : server_task_result {
-    bool    parked    = false; // true when the slot was just parked, false when restored
-    int32_t n_preempt = 0;     // how many times this task has been parked so far
+    bool    parked     = false; // true when the slot was just parked, false when restored
+    bool    recomputed = false; // this resume re-prefilled its tokens instead of restoring saved bytes
+    int32_t n_preempt  = 0;     // how many times this task has been parked so far
 
     virtual bool is_stop() override {
         return false;

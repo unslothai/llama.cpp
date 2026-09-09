@@ -400,7 +400,7 @@ def _stream_completion(n_predict: int, prompt: str) -> tuple[list[str], dict]:
         "prompt": prompt, "n_predict": n_predict, "ignore_eos": True,
         "temperature": 0.0, "seed": 42, "stream": True,
     }, stream=True, timeout=600)
-    assert res.status_code == 200
+    assert res.status_code == 200, res.text
     comments, datas = [], []
     for raw in res.iter_lines():
         line = raw.decode("utf-8")
@@ -692,6 +692,82 @@ def test_a_recompute_park_under_exact_concurrency_says_it_is_not_byte_identical(
     text = _log()
     assert "tokens to re-prefill" in text
     assert "not guaranteed byte-identical" in text
+
+
+def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
+    # a recompute resume re-prefills instead of restoring the saved bytes, so it is not the continuation the parked state would have given: the request, /slots and /metrics all say how often that happened
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    # a sequence this long holds more than the 1 MiB budget, so every park drops its cells
+    _start(n_ctx=2048, n_batch=2048)
+
+    n_predict = 24
+    prompt = _prompt_of(1950, _PROMPT_C)
+    comments, final = _stream_completion(n_predict, prompt)
+
+    assert "error" not in final, final
+    assert final["tokens_predicted"] == n_predict
+    assert final["preempt"]["parks"] >= 2, final["preempt"]
+    assert final["preempt"]["recomputes"] == final["preempt"]["parks"], final["preempt"]
+
+    # the notice comes right after the resume it belongs to
+    resumed = [i for i, c in enumerate(comments) if c.startswith(": resumed")]
+    assert len(resumed) == final["preempt"]["recomputes"], comments
+    for i in resumed:
+        assert comments[i + 1].startswith(": recomputed"), comments
+
+    metrics = _metrics()
+    assert metrics["preempt_recompute_total"] == final["preempt"]["recomputes"]
+    assert metrics["preempt_recompute_total"] == metrics["n_preempt_total"]
+
+    # a request that is never parked says so
+    plain = server.make_request("POST", "/completion", data={
+        "n_predict": 4, "prompt": _PROMPT_B, "temperature": 0.0, "seed": 42,
+    })
+    assert plain.status_code == 200, plain.body
+    assert plain.body["preempt"] == {"parks": 0, "recomputes": 0}
+
+
+def test_slots_reports_the_recomputes_of_the_current_task():
+    # a reader watching the slots sees the same count the request is given at the end
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start(n_ctx=2048, n_batch=2048)
+
+    done = []
+    prompt = _prompt_of(1950, _PROMPT_C)
+    t = threading.Thread(target=lambda: done.append(_complete(64, prompt)))
+    t.start()
+
+    seen = 0
+    try:
+        deadline = time.time() + 180
+        while time.time() < deadline and seen == 0 and t.is_alive():
+            res = server.make_request("GET", "/slots")
+            assert res.status_code == 200
+            for slot in res.body:
+                assert slot["n_recompute"] <= slot["n_preempt"]
+                seen = max(seen, slot["n_recompute"])
+            time.sleep(0.02)
+    finally:
+        t.join(180)
+
+    assert seen > 0, "no slot ever reported a recompute park"
+    assert done and done[0].status_code == 200, done
+    assert done[0].body["preempt"]["recomputes"] >= seen
+
+
+def test_a_swap_park_is_not_reported_as_a_recompute():
+    # the same park with room for its bytes keeps the sequence it saved, and the client is told so
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start(n_ctx=512)
+
+    comments, final = _stream_completion(24, _PROMPT_A)
+
+    assert final["preempt"]["parks"] >= 1, final["preempt"]
+    assert final["preempt"]["recomputes"] == 0, final["preempt"]
+    assert ": resumed" in comments and not any(c.startswith(": recomputed") for c in comments), comments
+    assert _metrics()["preempt_recompute_total"] == 0
 
 
 def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():

@@ -72,13 +72,16 @@ constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a s
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 
 static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
-    std::string res = notice.parked ? ": preempted" : ": resumed";
+    const std::string suffix = (notice.index > 0 ? " " + std::to_string(notice.index) : "") + "\n\n";
 
-    if (notice.index > 0) {
-        res += " " + std::to_string(notice.index);
+    std::string res = (notice.parked ? ": preempted" : ": resumed") + suffix;
+
+    // [TAG_PREEMPT] the resume rebuilt the sequence from its tokens, so what follows is not the continuation the saved bytes would have given
+    if (!notice.parked && notice.recomputed) {
+        res += ": recomputed" + suffix;
     }
 
-    return res + "\n\n";
+    return res;
 }
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
@@ -412,6 +415,7 @@ struct server_slot {
         return state == SLOT_STATE_PREEMPTED || preempt_in_flight();
     }
     int32_t              n_preempt      = 0;   // times the CURRENT task has been preempted
+    int32_t              n_recompute    = 0;   // ... of which parked by dropping the cells, so the resume re-prefilled
     int32_t              n_ctx_shift    = 0;   // context shifts it has made: it is at the pool's limit and cycling
     int32_t              n_preempt_fail = 0;   // consecutive failed restores
     int64_t              t_preempt_us   = 0;   // when it was parked
@@ -531,6 +535,7 @@ struct server_slot {
         preempt_rotation_refused = false;
 
         n_preempt++;
+        n_recompute++;
 
         return true;
     }
@@ -799,6 +804,7 @@ struct server_slot {
         preempt_reprefill    = false;
         state_before_preempt = SLOT_STATE_IDLE;
         n_preempt            = 0;
+        n_recompute          = 0;
         n_preempt_fail       = 0;
         n_ctx_shift          = 0;
         t_preempt_us         = 0;
@@ -1108,6 +1114,7 @@ struct server_slot {
             {"is_preempted",    state == SLOT_STATE_PREEMPTED},
             {"is_transferring", preempt_in_flight()},
             {"n_preempt",       n_preempt},
+            {"n_recompute",     n_recompute},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -2561,18 +2568,19 @@ private:
         queue_results.send(std::move(res));
     }
 
-    void send_preempt_notice(server_slot & slot, bool parked) {
+    void send_preempt_notice(server_slot & slot, bool parked, bool recomputed = false) {
         if (!slot.task || !slot.task->params.stream) {
             return;
         }
 
         auto res = std::make_unique<server_task_result_preempt_notice>();
 
-        res->id        = slot.task->id;
-        res->index     = slot.task->index;
-        res->id_slot   = slot.id;
-        res->parked    = parked;
-        res->n_preempt = slot.n_preempt;
+        res->id         = slot.task->id;
+        res->index      = slot.task->index;
+        res->id_slot    = slot.id;
+        res->parked     = parked;
+        res->recomputed = recomputed;
+        res->n_preempt  = slot.n_preempt;
 
         queue_results.send(std::move(res));
     }
@@ -2654,6 +2662,8 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+        res->n_preempt             = slot.n_preempt;
+        res->n_recompute           = slot.n_recompute;
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
@@ -3806,6 +3816,10 @@ private:
             metrics.n_preempt++;
         }
 
+        if (slot.preempt_recompute) {
+            metrics.n_preempt_recompute++;
+        }
+
         send_preempt_notice(slot, true);
 
         return true;
@@ -4136,7 +4150,7 @@ private:
             metrics.n_resume++;
 
             // [TAG_PREEMPT] the synchronous restore returns with the slot already back in its old state, so issue and landing are the same moment here
-            send_preempt_notice(*best, false);
+            send_preempt_notice(*best, false, recompute);
 
             if (recompute) {
                 SLT_WRN(*best, "resumed after %.2f s: %d tokens to re-prefill, kv %d/%d, preemptions %d\n",
