@@ -160,8 +160,8 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     }
 }
 
-// How many bytes a lead announces, and the range its FIRST continuation must fall in. Four leads
-// restrict that range, which is what separates overlong forms and surrogates from valid text.
+// Bytes a lead announces, and the range its FIRST continuation must fall in: that range is what
+// rejects overlong forms and surrogates.
 static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & lo, unsigned char & hi) {
     lo = 0x80;
     hi = 0xbf;
@@ -188,9 +188,8 @@ static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & 
     return false;
 }
 
-// A legal scalar, which `common_parse_utf8_codepoint` does not check: it tests continuation shape
-// only and accepts C0 80. Passing that through diverges from what the client is shown, and the AST
-// dump under `params.debug` throws on it. Checked here: the shared parser has other callers.
+// `common_parse_utf8_codepoint` tests continuation shape only and accepts C0 80, which the client
+// is never shown and the `params.debug` AST dump throws on. Checked here: that parser has other callers.
 static bool utf8_is_scalar(const std::string & s, size_t pos, size_t len) {
     if (len == 0 || pos + len > s.size()) {
         return false;
@@ -229,9 +228,8 @@ static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
     return have;
 }
 
-// Generated text is a raw byte stream: a byte-fallback token, or a prompt cut mid-character, puts
-// undecodable bytes in it, the chat parsers throw on those, and the exception cancels the task.
-// Substituting as the serialiser already does keeps the parser and the client seeing one thing.
+// A byte-fallback token, or a prompt cut mid-character, puts undecodable bytes in the stream and the
+// chat parsers throw on them, cancelling the task. Substitute as the serialiser already does.
 static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added, bool is_final = false) {
     pending += text_added;
 
@@ -246,8 +244,7 @@ static void append_utf8_sanitized(std::string & text, std::string & pending, con
             pos += res.bytes_consumed;
             continue;
         }
-        // INCOMPLETE lands here on the final call: the parser does not check that what followed
-        // the lead was a continuation, so "\xE2A" must give one replacement and keep the A.
+        // INCOMPLETE lands here on the final call, and "\xE2A" must give one replacement and keep the A.
         text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
         pos += utf8_malformed_prefix(pending, pos);
     }
