@@ -126,10 +126,13 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    // mul_mat_id takes the fallback entries to keep the stock 128-row tile: J comes from ncols_max
-    // but an expert holds only ncols_max*n_expert_used/n_experts of it, so a 64-row tile just doubles
-    // the row tiles paying for a mostly empty J. fallback only adds the src0->ne[1] range check.
-    const bool fallback = ne01 % 128 != 0 || (ids && blackwell_mma_available(cc));
+    // GB10 only, matching the tile table it belongs to: mul_mat_id takes the fallback entries to
+    // keep the stock 128-row tile, because J comes from ncols_max but an expert holds only
+    // ncols_max*n_expert_used/n_experts of it, so a 64-row tile just doubles the row tiles paying
+    // for a mostly empty J. fallback only adds the src0->ne[1] range check.
+    const bool spark = GGML_CUDA_CC_IS_NVIDIA(cc)
+        && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK;
+    const bool fallback = ne01 % 128 != 0 || (ids && spark);
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
