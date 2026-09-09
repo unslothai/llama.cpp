@@ -488,6 +488,7 @@ void llama_kv_cache::exact_pages_rebuild() const {
     const auto & cells = v_cells[0];
 
     exact_page_owner.assign(cells.size()/exact_page_size, exact_page{});
+    exact_page_live .assign(cells.size()/exact_page_size, 0);
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.is_empty(i)) {
@@ -507,6 +508,8 @@ void llama_kv_cache::exact_pages_rebuild() const {
         GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
 
         owner = cur;
+
+        ++exact_page_live[i/exact_page_size];
     }
 
     exact_page_owner_dirty = false;
@@ -520,7 +523,9 @@ void llama_kv_cache::exact_pages_sync() const {
     }
 
     if (debug > 0) {
-        const auto kept = exact_page_owner;
+        // what was maintained has to say what the cells say
+        const auto kept      = exact_page_owner;
+        const auto kept_live = exact_page_live;
 
         exact_pages_rebuild();
 
@@ -528,6 +533,7 @@ void llama_kv_cache::exact_pages_sync() const {
 
         for (size_t p = 0; p < kept.size(); ++p) {
             GGML_ASSERT(kept[p].seq == exact_page_owner[p].seq && kept[p].lpg == exact_page_owner[p].lpg);
+            GGML_ASSERT(kept_live[p] == exact_page_live[p]);
         }
     }
 }
@@ -544,6 +550,28 @@ void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos
     GGML_ASSERT(owner.seq < 0 || (owner.seq == cur.seq && owner.lpg == cur.lpg));
 
     owner = cur;
+
+    ++exact_page_live[idx/exact_page_size];
+}
+
+// [TAG_EXACT_CONCURRENCY] a page stays with its sequence for as long as one of its cells is live,
+// so a removal frees it only when it takes the last one. Counting per page is what keeps a removal
+// that empties nothing, such as the rejected tail of every accepted speculative step, from costing
+// a rescan of the pool.
+void llama_kv_cache::exact_pages_release(uint32_t idx) {
+    ++exact_page_n_release;
+
+    if (exact_page_owner_dirty || exact_page_owner.empty()) {
+        return;
+    }
+
+    const uint32_t page = idx/exact_page_size;
+
+    GGML_ASSERT(exact_page_live[page] > 0);
+
+    if (--exact_page_live[page] == 0) {
+        exact_page_owner[page] = exact_page{};
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -566,9 +594,6 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
-
-    // [TAG_EXACT_CONCURRENCY] a removal can empty a page, which only the cells know
-    exact_page_owner_dirty = true;
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -593,6 +618,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                // [TAG_EXACT_CONCURRENCY] the cell is gone; the page goes with the last of them
+                if (exact_pages) {
+                    exact_pages_release(i);
+                }
+
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -614,6 +644,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
+                }
+
+                if (exact_pages) {
+                    exact_pages_release(i);
                 }
 
                 cells.rm(i);
@@ -739,8 +773,6 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
-    exact_page_owner_dirty = true;
-
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -750,6 +782,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            // [TAG_EXACT_CONCURRENCY] as in seq_rm, the cell emptied here
+            if (exact_pages) {
+                exact_pages_release(i);
+            }
+
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -980,12 +1017,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
 
-        // [TAG_EXACT_CONCURRENCY] page ownership before the ubatch, so undoing a speculative placement does not force a rebuild from every cell
+        // [TAG_EXACT_CONCURRENCY] page ownership and occupancy before the ubatch, so undoing a speculative placement does not force a rebuild from every cell
         std::vector<exact_page> exact_page_owner_old;
+        std::vector<uint32_t>   exact_page_live_old;
     };
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+
+    // [TAG_EXACT_CONCURRENCY] a placement can purge positions outside the cells it restores below,
+    // and those are not undone; count removals to notice
+    const uint64_t n_release_before = exact_page_n_release;
 
     bool success = true;
 
@@ -1002,7 +1044,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {}, exact_page_owner };
+            state_t state = { sinfo_new, v_heads, {}, exact_page_owner, exact_page_live };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -1019,6 +1061,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     GGML_ASSERT(!states.empty() || !success);
 
+    // [TAG_EXACT_CONCURRENCY] what the allocator knew is the answer unless the placement also
+    // removed cells, in which case only the cells can say what is left
+    const bool exact_rebuild = exact_page_owner_dirty || exact_page_n_release != n_release_before;
+
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         const auto & sinfo = it->sinfo;
@@ -1032,9 +1078,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // [TAG_EXACT_CONCURRENCY] put back what the allocator knew, unless the placement also removed cells, when only the cells can say what is left
-        if (!exact_page_owner_dirty) {
+        if (!exact_rebuild) {
             exact_page_owner = it->exact_page_owner_old;
+            exact_page_live  = it->exact_page_live_old;
         }
+    }
+
+    if (exact_rebuild) {
+        exact_page_owner_dirty = true;
     }
 
     if (!success) {
@@ -1200,7 +1251,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         using page_key = std::pair<llama_seq_id, llama_pos>;
 
-        std::vector<exact_page> owner = exact_page_owner;
+        exact_page_owner_tmp = exact_page_owner;
+
+        auto & owner = exact_page_owner_tmp;
+
         std::map<page_key, uint32_t> pages;
 
         for (uint32_t p = 0; p < owner.size(); ++p) {
@@ -1393,6 +1447,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_pos    pos    = cells.pos_get(idx);
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+
+                if (exact_pages) {
+                    exact_pages_release(idx);
+                }
 
                 cells.rm(idx);
             }

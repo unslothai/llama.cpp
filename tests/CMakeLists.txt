@@ -304,6 +304,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool; skips itself where the mode cannot run
+llama_build_and_test(test-exact-pages.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-pages PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
