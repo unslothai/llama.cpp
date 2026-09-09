@@ -397,8 +397,7 @@ void server_response::add_waiting_task_id(int id_task) {
 void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
-    // one waiter for the whole set: these ids belong to a single reader, which waits for any
-    // of them at a time
+    // one waiter for the whole set: these ids belong to one reader
     auto w = std::make_shared<waiter>();
 
     for (const auto & id_task : id_tasks) {
@@ -417,8 +416,7 @@ void server_response::remove_waiting_task_id(int id_task) {
         return;
     }
 
-    // make sure to clean up all pending results of this task, the waiter may still be held by
-    // the other ids of the same reader
+    // the waiter is shared with the reader's other ids, so drop only this task's results
     auto & results = it->second->results;
     results.erase(
         std::remove_if(results.begin(), results.end(), [id_task](const server_task_result_ptr & res) {
@@ -467,8 +465,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
             return res;
         }
 
-        // bounded, so a terminate() that lands after the id was removed from the map still
-        // gets noticed here
+        // bounded: a terminate() landing after the id left the map is still noticed here
         w->cv.wait_for(lock, std::chrono::seconds(1));
     }
 
@@ -480,9 +477,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
 
     auto w = find_waiter(id_tasks);
     if (!w) {
-        // the tasks are no longer in the waiting list, so no result can arrive for them.
-        // wait out the timeout anyway, so the caller sees the poll interval it asked for
-        // instead of a busy loop
+        // no result can arrive now; still honour the timeout so the caller does not busy loop
         condition_gone.wait_for(lock, std::chrono::seconds(timeout));
         return nullptr;
     }
