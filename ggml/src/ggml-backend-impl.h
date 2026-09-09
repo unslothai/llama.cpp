@@ -8,7 +8,10 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    // 3: ggml_backend_i gained cpy_tensor_from_async. A dynamically loaded backend compiled
+    //    against version 2 supplies a struct one member short, so the version has to move with it
+    //    for the load-time check to reject that pairing instead of reading past the end.
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
