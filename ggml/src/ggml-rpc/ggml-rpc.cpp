@@ -393,8 +393,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    // releasing a remote buffer must not abort: this runs during teardown, and if the peer is
-    // already gone then so is the buffer. The local context is freed either way.
+    // teardown: if the peer is gone, so is the buffer. Never abort here.
     if (!send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0)) {
         GGML_LOG_ERROR("%s: failed to free the remote buffer, the connection is gone\n", __func__);
     }
@@ -845,10 +844,8 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     if (sock == nullptr) {
         return;
     }
-    // this is an informational device property, not part of the data path, and it is queried during
-    // teardown as well (the memory breakdown printed on exit), by which time the peer rpc-server may
-    // already be gone. A dead connection here must not abort the process: report the memory as
-    // unknown, which is what an endpoint we cannot connect to at all already reports.
+    // informational, not the data path, and queried at teardown when the peer may be gone: report 0,
+    // as an endpoint we cannot connect to already does.
     if (!get_device_memory(sock, device, free, total)) {
         GGML_LOG_ERROR("%s: failed to query device memory of %s, reporting 0\n", __func__, endpoint);
         *free = 0;
