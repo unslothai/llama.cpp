@@ -937,6 +937,9 @@ bool common_exact_concurrency();
 
 int common_exact_decode_width(const common_params & params);
 
+// [TAG_EXACT_CONCURRENCY] whether a batch of this shape holds a whole prompt ubatch beside a decode step of every slot, which a prefill needs to be split into the ubatches it would get alone; n_batch_min reports the batch size that would
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min = nullptr);
+
 // report that width to the CUDA backend, refusing a smaller explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
 bool common_exact_concurrency_init(const common_params & params);
 

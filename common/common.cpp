@@ -1466,6 +1466,19 @@ int common_exact_decode_width(const common_params & params) {
     return n_cols > INT32_MAX ? -1 : (int) n_cols;
 }
 
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min) {
+    // an unset ubatch is the whole batch, and a ubatch never exceeds it
+    const int n_ub = std::min(n_batch, n_ubatch <= 0 ? n_batch : n_ubatch);
+
+    const int n_min = n_ub + std::max(0, n_decode_width);
+
+    if (n_batch_min) {
+        *n_batch_min = n_min;
+    }
+
+    return n_batch >= n_min;
+}
+
 // [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists
 bool common_exact_concurrency_model(const common_params & params, const llama_model * model) {
     if (!common_exact_concurrency() || params.mmproj.path.empty()) {
@@ -1515,6 +1528,22 @@ bool common_exact_concurrency_init(const common_params & params) {
                     max_cols, n_cols, std::max(1, params.n_parallel), n_cols, n_cols);
             return false;
         }
+    }
+
+    // a prompt is added to a batch in whole ubatches, so a batch that cannot hold one beside a decode step of every slot would leave a prefill shorter ubatches than it gets alone, and the mode would report itself as on while a shared step changed the prompt's arithmetic
+    // a causal context clamps the batch to the context size, so that is the batch a prefill really gets
+    const int n_batch_eff = params.n_ctx > 0 ? std::min(params.n_ctx, params.n_batch) : params.n_batch;
+
+    int n_batch_min = 0;
+
+    if (!common_exact_batch_geometry(n_batch_eff, params.n_ubatch, n_cols, &n_batch_min)) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY needs a batch of at least %d tokens for a %d-token ubatch "
+                "and a decode step of %d slots (%d columns), but the batch is %d: a prefill beside "
+                "a running slot would be split into shorter ubatches than the same prompt gets alone. "
+                "Raise -b to %d (and -c to at least that), or lower -ub.\n",
+                n_batch_min, std::min(n_batch_eff, params.n_ubatch <= 0 ? n_batch_eff : params.n_ubatch),
+                std::max(1, params.n_parallel), n_cols, n_batch_eff, n_batch_min);
+        return false;
     }
 
     // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is; this also covers a caller that decodes before creating a context

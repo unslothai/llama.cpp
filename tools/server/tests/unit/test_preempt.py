@@ -542,12 +542,30 @@ def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
     assert "does not support M-RoPE together with a projector" in out, out
 
 
+def test_exact_concurrency_refuses_a_batch_that_cannot_hold_a_whole_ubatch():
+    # a prompt is added in whole ubatches, so -b 512 -ub 512 -np 2 would leave a prefill 511 tokens beside one decoder: the geometry is refused at startup rather than reported as exact and served short
+    path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")
+    proc = subprocess.run([
+        os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server"),
+        "--model", path, "--host", "127.0.0.1", "--port", str(server.server_port),
+        "-c", "2048", "-b", "512", "-ub", "512", "--parallel", "2", "--kv-unified",
+        "-fa", "on", "-ngl", "99", "--no-warmup", "--no-webui",
+    ], env={**os.environ, "LLAMA_EXACT_CONCURRENCY": "1"}, capture_output=True, text=True, timeout=900)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "needs a batch of at least 514 tokens for a 512-token ubatch" in out, out
+    assert "Raise -b to 514" in out, out
+
+
 def test_exact_concurrency_serves_an_mrope_model_without_a_projector():
     # the refusal is about images, not the rope layout: a text prompt gives every token its own position
     server.model_file = _mrope_model()
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
-    _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+    # the mode needs a batch that holds a whole ubatch beside a decode step of every slot
+    _start(n_ctx=512, n_slots=2, n_batch=512, n_ubatch=128, fa="on", n_gpu_layer=99)
 
     res = _complete(16, "Once upon a time")
     assert res.status_code == 200, res.body
@@ -573,6 +591,7 @@ def _ubatch_widths(text: str) -> list:
 
 def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone():
     # generated tokens enter the batch first and a prompt took what was left, so its ubatches were 512,512,512,509 beside three decoders and 512,512,512,512 alone: isolating the sequences does not make the shapes equal by itself
+    # geometry: -b 2048 -ub 512 -np 4, so the batch holds a whole ubatch beside a decode step of every slot (516 tokens), which is what common_exact_batch_geometry() requires of a start
     path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
     if not path:
         pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")
@@ -743,7 +762,7 @@ def test_props_reports_exact_concurrency_on():
     server.model_file = _mrope_model()
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
-    _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+    _start(n_ctx=512, n_slots=2, n_batch=512, n_ubatch=128, fa="on", n_gpu_layer=99)
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
     assert res.body["exact_concurrency"] is True
@@ -756,7 +775,7 @@ def test_a_recompute_park_under_exact_concurrency_says_it_is_not_byte_identical(
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "4"
-    _start(n_ctx=512, n_slots=2, fa="on", n_gpu_layer=99)
+    _start(n_ctx=512, n_slots=2, n_batch=512, n_ubatch=128, fa="on", n_gpu_layer=99)
 
     res = _complete(16, "Once upon a time")
     assert res.status_code == 200, res.body

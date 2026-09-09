@@ -3354,9 +3354,6 @@ private:
 
     bool preempt_batch_abandoned = false;
 
-    // [TAG_EXACT_CONCURRENCY] a batch too small to hold a decode step and a whole ubatch is reported once, not per prefill
-    bool exact_prefill_warned = false;
-
     // [TAG_PREEMPT_ASYNC] a context shift was recorded this round; it is applied in place inside the next llama_decode
     bool preempt_shift_pending = false;
 
@@ -4977,16 +4974,11 @@ private:
 
                             if (n_take > 0) {
                                 n_batch_cur = (int32_t) batch.size() + n_take;
-                            } else if (n_batch >= n_ubatch + common_exact_decode_width(params_base)) {
-                                // the batch holds a decode step and a whole ubatch, so waiting for the next iteration ends
+                            } else {
+                                // the waiting ends: common_exact_batch_geometry() refused a batch that cannot hold a whole ubatch beside a decode step of every slot, and the prompts ahead of this one in the same batch are finite
                                 SLT_DBG(slot, "exact concurrency: %d of %d batch tokens left, short of a %d-token ubatch: the prefill waits\n",
                                         n_avail, n_batch, n_ubatch);
                                 return;
-                            } else if (!exact_prefill_warned) {
-                                exact_prefill_warned = true;
-
-                                SRV_WRN("exact concurrency: --batch-size %d does not hold a decode step of %d tokens and a %d-token ubatch, so a prefill beside a running slot is split differently than it would be alone\n",
-                                        n_batch, common_exact_decode_width(params_base), n_ubatch);
                             }
                         }
                     }
