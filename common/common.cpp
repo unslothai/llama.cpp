@@ -2252,8 +2252,15 @@ bool common_prompt_batch_decode(
 }
 
 common_state_buffer_pool & common_state_buffer_pool::instance() {
-    static common_state_buffer_pool pool;
-    return pool;
+    // Deliberately leaked. A function-local static is destroyed in reverse order of completion of
+    // construction, so a common_prompt_checkpoint with static storage duration constructed before
+    // this one would be destroyed after it and its destructor would call put() on a destroyed
+    // object. [basic.start.term]/5 makes that undefined, and the try/catch in the destructor
+    // cannot help, because it is not an exception. No such holder exists today; this keeps it from
+    // becoming a silent use-after-free the day one does. The pool is process-wide and one
+    // allocation, so leaking it at exit costs nothing.
+    static common_state_buffer_pool * pool = new common_state_buffer_pool();
+    return *pool;
 }
 
 static size_t common_state_buffer_pool_cap() {
