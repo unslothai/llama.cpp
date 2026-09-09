@@ -19,6 +19,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 static int g_fail = 0;
 
 static void check(bool ok, const char * name, const char * detail = "") {
@@ -162,8 +165,7 @@ static void t_late_registration() {
 }
 
 // a reader whose ids were dropped parks itself and nothing else.
-// It must not assert: GGML_ASSERT is GGML_ABORT, and recv() runs on the HTTP thread, so one
-// dropped request would take the whole server down for every other client.
+// The parent commit of the head asserted here, which is GGML_ABORT on the HTTP thread.
 static void t_parked_reader_does_not_abort() {
     static server_response res;   // static: the parked thread outlives this function
     std::atomic<bool> returned{false};
@@ -251,17 +253,67 @@ static void t_stress() {
     check(received.load() > 0, "concurrent send/recv/register/remove churn survives", d);
 }
 
-// API hazard probe: recv() with a strict subset of the ids that share one waiter.
-// Not reachable from server_response_reader (it always passes the whole set), reported
-// as a latent sharp edge rather than a defect.
-static void t_subset_recv_probe() {
+
+// A single timed receive that starts before the ids exist must still return a result that
+// arrives during the call. The shared queue used to notify one condition on every send, so a
+// parked receiver woke; per waiter queues have to notify registration explicitly or the caller
+// sleeps out its whole timeout and reports a spurious nullptr.
+static void t_single_timed_recv_before_registration() {
+    server_response res;
+    std::atomic<bool> started{false};
+    std::thread producer([&] {
+        while (!started.load()) { std::this_thread::yield(); }
+        std::this_thread::sleep_for(ms(200));
+        res.add_waiting_task_id(300);
+        res.send(mk(300, 3000));
+    });
+    started.store(true);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = res.recv_with_timeout({300}, 5);          // ONE call, not a retry loop
+    const auto waited = std::chrono::duration_cast<ms>(std::chrono::steady_clock::now() - t0).count();
+    producer.join();
+    char d[80]; snprintf(d, sizeof(d), "%lldms, %s", (long long) waited, r ? "got result" : "nullptr");
+    check(r != nullptr && payload_of(r) == 3000 && waited < 4000,
+          "one timed recv sees a result that arrives while it waits", d);
+}
+
+// terminate() has to be honoured even when the caller is parked on ids that are not registered.
+// recv_with_timeout() promises std::terminate() there, because the caller is HTTP code that
+// cannot return. Run in a child: the correct outcome is that the child dies.
+static void t_terminate_while_parked_on_absent_ids() {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        auto * res = new server_response();
+        std::thread killer([res] {
+            std::this_thread::sleep_for(ms(300));
+            res->terminate();
+        });
+        auto r = res->recv_with_timeout({9999}, 5);
+        killer.join();
+        // reaching here at all means terminate() was ignored
+        _Exit(r == nullptr ? 20 : 21);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    const bool died = WIFSIGNALED(status);
+    char d[96];
+    if (died) { snprintf(d, sizeof(d), "child died on signal %d", WTERMSIG(status)); }
+    else      { snprintf(d, sizeof(d), "child returned %d, terminate() ignored", WEXITSTATUS(status)); }
+    check(died, "terminate() is honoured while parked on absent ids", d);
+}
+
+// A result for a sibling id must not be handed to a caller that did not ask for it.
+static void t_subset_recv_is_filtered() {
     server_response res;
     res.add_waiting_task_ids({200, 201});
     res.send(mk(201, 2010));
     auto r = res.recv_with_timeout({200}, 1);
-    printf("%-46s %s (id=%d)\n", "PROBE recv() with a subset of a shared waiter",
-           r == nullptr ? "returns nullptr (id filtered)" : "RETURNS THE SIBLING'S RESULT",
-           r ? r->id : -1);
+    char d[64]; snprintf(d, sizeof(d), "id=%d", r ? r->id : -1);
+    check(r == nullptr, "recv() does not return a result for an id it was not asked for", d);
+    // and the sibling's result is still there for the caller that does ask
+    auto r2 = res.recv_with_timeout({200, 201}, 1);
+    check(r2 != nullptr && r2->id == 201, "the sibling's result is still delivered to its own reader");
 }
 
 static long rss_kb() {
@@ -312,7 +364,9 @@ int main(int argc, char ** argv) {
     t_late_registration();
     t_timeout_honoured();
     t_stress();
-    t_subset_recv_probe();
+    t_single_timed_recv_before_registration();
+    t_terminate_while_parked_on_absent_ids();
+    t_subset_recv_is_filtered();
     t_parked_reader_does_not_abort();
 
     printf("\nRESULT queue failures=%d\n", g_fail);

@@ -392,6 +392,9 @@ void server_response::add_waiting_task_id(int id_task) {
     RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting.size());
 
     waiting.emplace(id_task, std::make_shared<waiter>());
+
+    // a reader may already be parked on these ids waiting for exactly this
+    condition_gone.notify_all();
 }
 
 void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
@@ -404,6 +407,9 @@ void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_ta
         RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting.size());
         waiting.emplace(id_task, w);
     }
+
+    // a reader may already be parked on these ids waiting for exactly this
+    condition_gone.notify_all();
 }
 
 void server_response::remove_waiting_task_id(int id_task) {
@@ -447,6 +453,29 @@ server_response::waiter_ptr server_response::find_waiter(const std::unordered_se
     return nullptr;
 }
 
+// A waiter is shared by every id its reader registered in one call, so its queue can hold a
+// sibling's result. Return only an id the caller asked for, in arrival order, which is what
+// scanning the shared vector did. The front normally matches, so this is O(1) in practice.
+server_task_result_ptr server_response::take_result(const std::unordered_set<int> & id_tasks) {
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+
+        auto & results = it->second->results;
+        for (auto rit = results.begin(); rit != results.end(); ++rit) {
+            if (id_tasks.find((*rit)->id) != id_tasks.end()) {
+                server_task_result_ptr res = std::move(*rit);
+                results.erase(rit);
+                return res;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -454,6 +483,11 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
         if (!running) {
             RES_DBG("%s : queue result stop\n", "recv");
             std::terminate(); // we cannot return here since the caller is HTTP code
+        }
+
+        server_task_result_ptr res = take_result(id_tasks);
+        if (res != nullptr) {
+            return res;
         }
 
         // The waiter can be absent, so this cannot assert. A cancel or a cleanup drops the ids
@@ -465,14 +499,9 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
         // re-added while we wait should be picked up instead of waited out.
         auto w = find_waiter(id_tasks);
         if (w == nullptr) {
+            // registration and terminate() both fire condition_gone; the timeout is only a backstop
             condition_gone.wait_for(lock, std::chrono::seconds(1));
             continue;
-        }
-
-        if (!w->results.empty()) {
-            server_task_result_ptr res = std::move(w->results.front());
-            w->results.pop_front();
-            return res;
         }
 
         // bounded: a terminate() landing after the id left the map is still noticed here
@@ -485,26 +514,34 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
-    auto w = find_waiter(id_tasks);
-    if (!w) {
-        // no result can arrive now; still honour the timeout so the caller does not busy loop
-        condition_gone.wait_for(lock, std::chrono::seconds(timeout));
-        return nullptr;
-    }
+    // one deadline for the whole call: waiting for a registration and then for a result must not
+    // add up to twice the timeout the caller asked for
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
 
     while (true) {
-        if (!w->results.empty()) {
-            server_task_result_ptr res = std::move(w->results.front());
-            w->results.pop_front();
-            return res;
-        }
-
-        std::cv_status cr_res = w->cv.wait_for(lock, std::chrono::seconds(timeout));
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
         }
-        if (cr_res == std::cv_status::timeout) {
+
+        server_task_result_ptr res = take_result(id_tasks);
+        if (res != nullptr) {
+            return res;
+        }
+
+        auto w = find_waiter(id_tasks);
+
+        // The ids are not registered yet, or not any more. Wait on condition_gone rather than
+        // sleeping out the timeout: add_waiting_task_id(s) fires it, so a result that arrives
+        // during this call is still seen, which is what the single shared condition used to give.
+        // terminate() fires it too, so it is honoured here as well as on the waiter's own cv.
+        std::condition_variable & cv = w == nullptr ? condition_gone : w->cv;
+
+        if (cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (!running) {
+                RES_DBG("%s : queue result stop\n", __func__);
+                std::terminate(); // we cannot return here since the caller is HTTP code
+            }
             return nullptr;
         }
     }

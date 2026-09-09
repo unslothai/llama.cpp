@@ -177,6 +177,9 @@ private:
     // ids registered together share one waiter, so the first hit is the right one. mutex_results held.
     waiter_ptr find_waiter(const std::unordered_set<int> & id_tasks) const;
 
+    // pop the oldest queued result whose id the caller asked for. mutex_results held.
+    server_task_result_ptr take_result(const std::unordered_set<int> & id_tasks);
+
 public:
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
