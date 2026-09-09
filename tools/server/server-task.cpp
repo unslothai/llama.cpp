@@ -199,6 +199,14 @@ common_chat_msg task_result_state::update_chat_msg(
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
     append_utf8_sanitized(generated_text, generated_text_pending, text_added);
+    if (!is_partial && !generated_text_pending.empty()) {
+        // Nothing can complete this sequence now (the generation hit its limit, or stopped, mid
+        // character), so it gets the one U+FFFD the JSON serialiser would show for it rather than
+        // being dropped: a nonempty parsed message is preferred over the raw content downstream,
+        // so leaving it pending silently loses the byte from the response.
+        generated_text += "\xEF\xBF\xBD";
+        generated_text_pending.clear();
+    }
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
