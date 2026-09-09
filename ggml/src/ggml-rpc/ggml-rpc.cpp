@@ -630,6 +630,12 @@ static uint8_t * rpc_staging_alloc(rpc_staging & st, ggml_backend_buffer_type_t 
             st.inflight = nullptr;
         }
         st.used = 0;
+        // recycle the event pool here too, not only in rpc_flush_deferred(): that reset is behind
+        // rpc_flush_deferred_guarded()'s empty-queue early return, and the RPC-to-local copy path
+        // blocks in ggml_backend_tensor_get() with nothing deferred, so it never ran and every
+        // copy allocated a new backend event that was never reused. Events are recorded on one
+        // backend in order, so synchronizing the last one above means the earlier ones are done.
+        st.events_used = 0;
 
         if (size > st.capacity) {
             const size_t want = std::max<size_t>(size * 4, 1024 * 1024);
