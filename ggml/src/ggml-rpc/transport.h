@@ -24,6 +24,10 @@ struct rpc_conn_state {
     uint64_t                seq_serving = 0;
 
     std::unordered_map<uint32_t, uint64_t> last_graph_uid;
+
+    // minor protocol version the peer reported in its HELLO, so commands added after a given
+    // minor are only sent to a peer that knows them
+    int server_minor = 0;
 };
 
 struct socket_t {

@@ -527,6 +527,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    sock->conn.server_minor = response.minor;
+
     sock->update_caps(response.conn_caps);
     return true;
 }
@@ -560,7 +562,10 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     ggml_trace_open(nullptr, "rpc-client");
-    if (ggml_trace_flag) {
+    // RPC_CMD_TRACE_SYNC arrived in minor 2. A minor 1 server passes the HELLO check above, but
+    // closes the connection on the unknown command, and get_socket() would then cache a dead
+    // socket that fails on the first real operation.
+    if (ggml_trace_flag && sock->conn.server_minor >= 2) {
         rpc_trace_sync(sock, endpoint);
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
