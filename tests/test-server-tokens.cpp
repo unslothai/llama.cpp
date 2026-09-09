@@ -36,7 +36,7 @@ struct chunk_writer {
 static mtmd::input_chunk_ptr make_image_chunk(uint32_t nx, uint32_t ny) {
     chunk_writer w;
 
-    w.put<uint64_t>(1);                          // MTMD_SERIALIZATION_VERSION
+    w.put<uint64_t>(2);                          // MTMD_SERIALIZATION_VERSION
     w.put<uint32_t>(MTMD_INPUT_CHUNK_TYPE_IMAGE);
     w.put<uint64_t>(0);                          // tokens_text
     w.put<uint8_t>(1);                           // tokens_image follows
@@ -50,6 +50,7 @@ static mtmd::input_chunk_ptr make_image_chunk(uint32_t nx, uint32_t ny) {
     w.put<uint64_t>(1);                          // one entry
     w.put<uint8_t>(0);                           // entry.add_viewsep
     w.put<uint8_t>(0);                           // entry.add_newline
+    w.put<int32_t>(0);                           // entry.lead_pad
     w.put<int32_t>(1);                           // entry.nx
     w.put<int32_t>(1);                           // entry.ny
     w.put<uint8_t>(0);                           // no tokens_audio
