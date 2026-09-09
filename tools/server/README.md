@@ -2109,14 +2109,10 @@ while group A is being computed on the second stage, group B is being computed o
 
 Details:
 
-- The value may also be given as `LLAMA_ARG_PIPELINE_GROUPS`. This is deliberate and is how router
-  mode reaches its children, which are spawned rather than given a command line; an explicit
-  `--pipeline-groups` always wins over the environment.
-- The flag is read by a small pre-scan that runs before the option table exists, and is removed
-  from `argv` before the normal parser sees it. The scan stops at a bare `--`, so operands after
-  the separator are untouched, but before it the scan cannot distinguish an option from the value
-  of a preceding option: a literal `--pipeline-groups` passed as another option's value is
-  consumed. Registering the option with the parser would remove that limitation.
+- The option is registered with the normal argument parser, so it appears in `--help` and accepts
+  `LLAMA_ARG_PIPELINE_GROUPS` from the environment like any other option, with an explicit flag
+  winning over the environment. That environment path is how router mode reaches its children,
+  which are spawned rather than given a command line.
 - The slots are partitioned contiguously: with `--parallel P` and `--pipeline-groups N`, group `g`
   owns slots `[g*P/N, (g+1)*P/N)`. `--parallel` must be a positive multiple of `--pipeline-groups`.
 - Each context is created with `n_seq_max = P/N` and the **full** `n_ctx = C`. `n_ctx` is never

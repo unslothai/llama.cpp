@@ -28,79 +28,9 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
-// parsed here, not in common/arg.cpp: everything it changes lives under tools/server
+// set from params right after parsing, read by server_models::spawn to pass the setting on
 static int g_pipeline_groups = 1;
 
-static void server_take_pipeline_groups(int & argc, char ** argv) {
-    static const char * opt = "--pipeline-groups";
-    static const char * env = "LLAMA_ARG_PIPELINE_GROUPS";
-    const size_t opt_len = strlen(opt);
-
-    int n_kept = 1;
-    bool from_cli = false;
-
-    // Everything after a bare "--" is an operand by convention, never an option, so the scan
-    // stops there and leaves the separator and the rest of argv untouched. That is as far as a
-    // pre-scan can go: it runs before the option table exists, so it cannot tell an option from
-    // the value of a preceding option, and a literal "--pipeline-groups" passed as some other
-    // option's value earlier in the line is still consumed. Registering the option with the
-    // parser is the only complete fix; see the note in tools/server/README.md.
-    bool operands_only = false;
-
-    for (int i = 1; i < argc; i++) {
-        const std::string arg = argv[i];
-
-        if (!operands_only && arg == "--") {
-            operands_only = true;
-            argv[n_kept++] = argv[i];
-            continue;
-        }
-
-        if (operands_only) {
-            argv[n_kept++] = argv[i];
-            continue;
-        }
-
-        if (arg == opt) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "error: %s requires a value\n", opt);
-                exit(1);
-            }
-            g_pipeline_groups = std::atoi(argv[++i]);
-            from_cli = true;
-            continue;
-        }
-
-        if (arg.size() > opt_len + 1 && arg.compare(0, opt_len, opt) == 0 && arg[opt_len] == '=') {
-            g_pipeline_groups = std::atoi(arg.c_str() + opt_len + 1);
-            from_cli = true;
-            continue;
-        }
-
-        argv[n_kept++] = argv[i];
-    }
-
-    argc = n_kept;
-    argv[n_kept] = nullptr;
-
-    // the flag is stripped before server_models builds the preset it merges into every child, so
-    // router mode hands it to children as LLAMA_ARG_PIPELINE_GROUPS (see server_models::spawn) and
-    // they pick it up here. Not written into our own environment: get_environment() reads the Win32
-    // block while _putenv_s writes the CRT copy, and CRT to Win32 propagation is undocumented.
-    if (!from_cli) {
-        const std::string from_env = common_get_env(env);
-        if (!from_env.empty()) {
-            g_pipeline_groups = std::atoi(from_env.c_str());
-        }
-    }
-
-    if (g_pipeline_groups < 1) {
-        fprintf(stderr, "error: %s must be >= 1\n", opt);
-        exit(1);
-    }
-}
-
-// read by server_models::spawn to pass the setting to router children
 int server_get_pipeline_groups();
 int server_get_pipeline_groups() { return g_pipeline_groups; }
 
@@ -175,9 +105,6 @@ int llama_server(int argc, char ** argv) {
     // own arguments required by this example
     common_params params;
 
-    // must run before the common parser, which rejects the unknown option
-    server_take_pipeline_groups(argc, argv);
-
     common_init();
 
     // start the stream session manager GC right after common init, before any HTTP route can
@@ -187,6 +114,8 @@ int llama_server(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
+
+    g_pipeline_groups = params.n_pipeline_groups;
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -250,7 +179,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // struct that contains llama context and inference
     server_context ctx_server;
-    ctx_server.set_pipeline_groups(g_pipeline_groups);
+    ctx_server.set_pipeline_groups(params.n_pipeline_groups);
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
