@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
+#include "ggml-trace.h"
 
 #include <array>
 #include <cinttypes>
@@ -72,8 +73,35 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    // clock alignment, sent once per connection after HELLO and only while tracing is on
+    RPC_CMD_TRACE_SYNC,
     RPC_CMD_COUNT,
 };
+
+static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:      return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:     return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:      return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:   return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:       return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:      return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:        return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:   return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:        return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:       return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:     return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY: return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:       return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:    return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:             return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
+        case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
+        case RPC_CMD_TRACE_SYNC:        return "TRACE_SYNC";
+        default:                        return "UNKNOWN";
+    }
+}
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
@@ -90,6 +118,11 @@ struct rpc_msg_hello_rsp {
     uint8_t patch;
     uint8_t padding;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+};
+
+struct rpc_msg_trace_sync_rsp {
+    int64_t t2;
+    int64_t t3;
 };
 
 struct rpc_msg_device_count_rsp {
@@ -248,14 +281,44 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
     return hash;
 }
 
+// one trace record per command served, filled in by the message helpers below
+
+struct rpc_server_trace {
+    bool     active    = false;
+    uint8_t  cmd       = 0;
+    int64_t  t_wait0   = 0;
+    int64_t  t_recv0   = 0;
+    int64_t  t_recv1   = 0;
+    int64_t  t_exec0   = 0;
+    int64_t  t_exec1   = 0;
+    int64_t  t_send0   = 0;
+    int64_t  t_send1   = 0;
+    size_t   bytes_in  = 0;
+    size_t   bytes_out = 0;
+    uint64_t gpu_tag   = 0;
+    int      n_nodes   = -1;
+    int      device    = -1;
+};
+
+static thread_local rpc_server_trace tls_srv;
+
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_exec1   = ggml_trace_time_us();
+        tls_srv.t_send0   = tls_srv.t_exec1;
+        tls_srv.bytes_out = msg_size + sizeof(uint64_t);
+    }
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
     if (!sock->send_data(msg, msg_size)) {
         return false;
     }
-    return sock->flush();
+    const bool ok = sock->flush();
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_send1 = ggml_trace_time_us();
+    }
+    return ok;
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -266,7 +329,13 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     if (size != msg_size) {
         return false;
     }
-    return sock->recv_data(msg, msg_size);
+    const bool ok = sock->recv_data(msg, msg_size);
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_recv1  = ggml_trace_time_us();
+        tls_srv.t_exec0  = tls_srv.t_recv1;
+        tls_srv.bytes_in = msg_size + sizeof(uint64_t) + 1;
+    }
+    return ok;
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
@@ -280,7 +349,13 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
         return false;
     }
-    return sock->recv_data(input.data(), size);
+    const bool ok = sock->recv_data(input.data(), size);
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_recv1  = ggml_trace_time_us();
+        tls_srv.t_exec0  = tls_srv.t_recv1;
+        tls_srv.bytes_in = size + sizeof(uint64_t) + 1;
+    }
+    return ok;
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
@@ -314,9 +389,27 @@ static bool send_rpc_cmd_locked(socket_ptr sock, enum rpc_cmd cmd, const void * 
     return sock->flush();
 }
 
+// counted in the trace, so its byte totals match what the link actually moved
+static const size_t RPC_CMD_HEADER_BYTES = 1 + sizeof(uint64_t);
+static const size_t RPC_RSP_HEADER_BYTES = sizeof(uint64_t);
+
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    const int64_t t_enq = ggml_trace_flag ? ggml_trace_time_us() : 0;
+
     std::lock_guard<std::mutex> lock(sock->conn.mtx_send);
-    return send_rpc_cmd_locked(sock, cmd, input, input_size);
+
+    const int64_t t_send0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
+    const bool    status  = send_rpc_cmd_locked(sock, cmd, input, input_size);
+
+    if (ggml_trace_flag) {
+        const int64_t t_send1 = ggml_trace_time_us();
+        ggml_trace_eventf("rpc.client", rpc_cmd_name(cmd), t_enq, t_send1,
+                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,\"reply\":0,\"ok\":%d",
+                          (long long) t_send0, (long long) t_send1,
+                          input_size + RPC_CMD_HEADER_BYTES, status ? 1 : 0);
+    }
+
+    return status;
 }
 
 // the server answers one connection strictly in request order
@@ -345,35 +438,73 @@ struct rpc_response_ticket {
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    // t_enq dispatcher, t_send0 connection ours, t_send1 flushed, t_wait our turn, t_recv* reply
+    const int64_t t_enq = ggml_trace_flag ? ggml_trace_time_us() : 0;
+    int64_t t_send0 = 0, t_send1 = 0, t_wait = 0, t_recv0 = 0, t_recv1 = 0;
+
+    auto trace = [&](int ok) {
+        if (ggml_trace_flag) {
+            ggml_trace_eventf("rpc.client", rpc_cmd_name(cmd), t_enq, t_recv1 ? t_recv1 : ggml_trace_time_us(),
+                              "\"t_send0\":%lld,\"t_send1\":%lld,\"t_wait\":%lld,\"t_recv0\":%lld,\"t_recv1\":%lld,"
+                              "\"bytes_out\":%zu,\"bytes_in\":%zu,\"reply\":1,\"ok\":%d",
+                              (long long) t_send0, (long long) t_send1, (long long) t_wait,
+                              (long long) t_recv0, (long long) t_recv1,
+                              input_size + RPC_CMD_HEADER_BYTES, output_size + RPC_RSP_HEADER_BYTES, ok);
+        }
+    };
+
     std::unique_ptr<rpc_response_ticket> ticket;
     bool failed = false;
     {
         std::lock_guard<std::mutex> lock(sock->conn.mtx_send);
+        if (ggml_trace_flag) { t_send0 = ggml_trace_time_us(); }
         ticket.reset(new rpc_response_ticket(sock->conn));
         if (!send_rpc_cmd_locked(sock, cmd, input, input_size)) {
             // still take our turn, or a later waiter is woken with a response that is not theirs
             failed = true;
         }
+        if (ggml_trace_flag) { t_send1 = ggml_trace_time_us(); }
     }
 
     if (failed) {
         ticket->wait();
+        trace(0);
         return false;
     }
 
     ticket->wait();
+    if (ggml_trace_flag) { t_wait = ggml_trace_time_us(); }
 
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        trace(0);
         return false;
     }
+    if (ggml_trace_flag) { t_recv0 = ggml_trace_time_us(); }
     if (out_size != output_size) {
+        trace(0);
         return false;
     }
     if (!sock->recv_data(output, output_size)) {
+        trace(0);
         return false;
     }
+    if (ggml_trace_flag) { t_recv1 = ggml_trace_time_us(); }
+    trace(1);
     return true;
+}
+
+static void rpc_trace_sync(const std::shared_ptr<socket_t> & sock, const std::string & endpoint) {
+    rpc_msg_trace_sync_rsp response = {};
+
+    const int64_t t1 = ggml_trace_time_us();
+    if (!send_rpc_cmd(sock, RPC_CMD_TRACE_SYNC, nullptr, 0, &response, sizeof(response))) {
+        GGML_LOG_ERROR("%s: peer %s does not support the trace clock sync\n", __func__, endpoint.c_str());
+        return;
+    }
+    const int64_t t4 = ggml_trace_time_us();
+
+    ggml_trace_clock_offset(endpoint.c_str(), t1, response.t2, response.t3, t4);
 }
 
 // RPC client-side implementation
@@ -395,6 +526,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
                        response.major, response.minor, response.patch);
         return false;
     }
+
+    sock->conn.server_minor = response.minor;
 
     sock->update_caps(response.conn_caps);
     return true;
@@ -427,6 +560,13 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     }
     if (!negotiate_hello(sock)) {
         return nullptr;
+    }
+    ggml_trace_open(nullptr, "rpc-client");
+    // RPC_CMD_TRACE_SYNC arrived in minor 2. A minor 1 server passes the HELLO check above, but
+    // closes the connection on the unknown command, and get_socket() would then cache a dead
+    // socket that fails on the first real operation.
+    if (ggml_trace_flag && sock->conn.server_minor >= 2) {
+        rpc_trace_sync(sock, endpoint);
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
@@ -531,6 +671,7 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
@@ -557,6 +698,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
@@ -778,9 +920,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     auto sock = get_socket(rpc_ctx->endpoint);
 
+    const int64_t t_enq = ggml_trace_flag ? ggml_trace_time_us() : 0;
+    if (ggml_trace_flag) {
+        ggml_trace_set_subject(cgraph->nodes[cgraph->n_nodes - 1]->name, cgraph->uid);
+    }
+
     // the stored graph is per connection and device, and other llama_contexts share the connection:
     // the uid check must stay under mtx_send, or RECOMPUTE re-runs a graph stored in between
     std::unique_lock<std::mutex> lock(sock->conn.mtx_send);
+
+    const int64_t t_send0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
 
     auto & last_uid = sock->conn.last_graph_uid[rpc_ctx->device];
     if (cgraph->uid != 0 && last_uid == cgraph->uid) {
@@ -788,14 +937,32 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         bool status = send_rpc_cmd_locked(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
+        if (ggml_trace_flag) {
+            const int64_t t_send1 = ggml_trace_time_us();
+            ggml_trace_eventf("rpc.client", "GRAPH_RECOMPUTE", t_enq, t_send1,
+                              "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,"
+                              "\"reply\":0,\"ok\":1,\"n_nodes\":%d,\"dev\":%u,\"serialize_us\":0",
+                              (long long) t_send0, (long long) t_send1,
+                              sizeof(request) + RPC_CMD_HEADER_BYTES, cgraph->n_nodes, rpc_ctx->device);
+        }
         return GGML_STATUS_SUCCESS;
     }
 
     last_uid = cgraph->uid;
     std::vector<uint8_t> input;
     serialize_graph(rpc_ctx->device, cgraph, input);
+    const int64_t t_ser = ggml_trace_flag ? ggml_trace_time_us() : 0;
     bool status = send_rpc_cmd_locked(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
+    if (ggml_trace_flag) {
+        const int64_t t_send1 = ggml_trace_time_us();
+        ggml_trace_eventf("rpc.client", "GRAPH_COMPUTE", t_enq, t_send1,
+                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,"
+                          "\"reply\":0,\"ok\":1,\"n_nodes\":%d,\"dev\":%u,\"serialize_us\":%lld",
+                          (long long) t_ser, (long long) t_send1,
+                          input.size() + RPC_CMD_HEADER_BYTES, cgraph->n_nodes, rpc_ctx->device,
+                          (long long) (t_ser - t_send0));
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1514,7 +1681,21 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    if (ggml_trace_flag) {
+        tls_srv.n_nodes = (int) n_nodes;
+        tls_srv.device  = (int) device;
+        // the GPU event carries only this name and the tag, so the device index has to go into the
+        // name or it is lost: one rpc-server exposing several GPUs would otherwise emit every
+        // device's span as plain GRAPH_COMPUTE, and the merge tool keys its per-device rows by
+        // name, collapsing them into a single row and a single peer-utilization figure
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_COMPUTE dev%u", device);
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
+    }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_end(backends[device], tls_srv.gpu_tag);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
@@ -1530,7 +1711,18 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+    if (ggml_trace_flag) {
+        tls_srv.n_nodes = graph->n_nodes;
+        tls_srv.device  = (int) device;
+        // see graph_compute: the device index must be part of the name to survive into the trace
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_RECOMPUTE dev%u", device);
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
+    }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_end(backends[device], tls_srv.gpu_tag);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
@@ -1595,8 +1787,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
+        int64_t t_wait0 = 0;
+        if (ggml_trace_flag) {
+            tls_srv = rpc_server_trace();
+            ggml_trace_gpu_flush();
+            t_wait0 = ggml_trace_time_us();
+        }
         if (!sock->recv_data(&cmd, 1)) {
             break;
+        }
+        if (ggml_trace_flag) {
+            tls_srv.active  = true;
+            tls_srv.cmd     = cmd;
+            tls_srv.t_wait0 = t_wait0;
+            tls_srv.t_recv0 = ggml_trace_time_us();
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -1607,6 +1811,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
                 return;
+            }
+            case RPC_CMD_TRACE_SYNC: {
+                rpc_msg_trace_sync_rsp response = {};
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                response.t2 = ggml_trace_time_us();
+                response.t3 = ggml_trace_time_us();
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
             }
             case RPC_CMD_DEVICE_COUNT: {
                 if (!recv_msg(sock, nullptr, 0)) {
@@ -1832,6 +2048,27 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 return;
             }
         }
+        if (ggml_trace_flag && tls_srv.active) {
+            if (tls_srv.t_exec1 == 0) {
+                // a command with no reply
+                tls_srv.t_exec1 = ggml_trace_time_us();
+            }
+            ggml_trace_eventf("rpc.server", rpc_cmd_name((enum rpc_cmd) cmd),
+                              tls_srv.t_recv0, tls_srv.t_send1 ? tls_srv.t_send1 : tls_srv.t_exec1,
+                              "\"t_wait0\":%lld,\"t_recv0\":%lld,\"t_recv1\":%lld,\"t_exec0\":%lld,"
+                              "\"t_exec1\":%lld,\"t_send0\":%lld,\"t_send1\":%lld,"
+                              "\"bytes_in\":%zu,\"bytes_out\":%zu,\"n_nodes\":%d,\"dev\":%d,\"gpu_tag\":%llu",
+                              (long long) tls_srv.t_wait0, (long long) tls_srv.t_recv0,
+                              (long long) tls_srv.t_recv1, (long long) tls_srv.t_exec0,
+                              (long long) tls_srv.t_exec1, (long long) tls_srv.t_send0,
+                              (long long) tls_srv.t_send1,
+                              tls_srv.bytes_in, tls_srv.bytes_out, tls_srv.n_nodes, tls_srv.device,
+                              (unsigned long long) tls_srv.gpu_tag);
+            tls_srv.active = false;
+        }
+    }
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_flush();
     }
 }
 
