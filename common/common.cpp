@@ -2256,8 +2256,6 @@ common_state_buffer_pool & common_state_buffer_pool::instance() {
     return pool;
 }
 
-// derived once, from host memory as the CPU backend device reports it. a host memory size that
-// cannot be trusted means no pooling at all, which is the safe direction.
 static size_t common_state_buffer_pool_cap() {
     size_t mem_free  = 0;
     size_t mem_total = 0;
@@ -2269,17 +2267,13 @@ static size_t common_state_buffer_pool_cap() {
 
     GGML_UNUSED(mem_free);
 
-    // zero means the CPU device could not report a size. an absurd size means the query itself
-    // failed without saying so: ggml_backend_cpu_device_get_memory() multiplies out
-    // sysconf(_SC_PHYS_PAGES) with no error check, so a -1 from a restricted container arrives
-    // here as ~1.8e19. treat both as unknown and keep nothing.
+    // ggml_backend_cpu_device_get_memory() multiplies out sysconf(_SC_PHYS_PAGES) unchecked, so a
+    // -1 from a restricted container arrives as ~1.8e19: absurd means unknown, not huge.
     if (mem_total == 0 || mem_total > (1ull << 50)) {
         return 0;
     }
 
-    // a fraction of TOTAL host memory, deliberately not of free: every non-Windows host reports
-    // free == total for the CPU device ("free system memory is ill-defined, assume all of it is
-    // free"), so a free-based cap would be the same number with a false claim attached to it.
+    // of total, not free: every non-Windows host reports free == total for the CPU device
     return mem_total / 16;
 }
 
@@ -2294,8 +2288,6 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
         t_last_us = ggml_time_us();
 
         if (dst.capacity() >= size) {
-            // the caller's own allocation is already big enough, so it is already resident.
-            // that is a reuse too, and the cheapest kind.
             st.n_hit++;
         } else {
             // best fit, so a large pooled buffer is not spent on a small request
@@ -2313,7 +2305,6 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
                 prev = std::move(free_bufs[best]);
                 free_bufs.erase(free_bufs.begin() + best);
 
-                // dst takes the pooled buffer and prev takes the caller's old one
                 std::swap(dst, prev);
 
                 st.n_hit++;
@@ -2321,14 +2312,11 @@ void common_state_buffer_pool::get(std::vector<uint8_t> & dst, size_t size) {
         }
     }
 
-    // the caller's old buffer was too small for this request but may still serve a smaller
-    // checkpoint later, so offer it back rather than dropping it on the floor
+    // too small here, but may still serve a smaller checkpoint later
     put(std::move(prev));
 
-    // on a hit the pooled buffer normally already has exactly this size, so this is a no-op and
-    // the stale bytes are left in place. that is safe because every caller overwrites the whole
-    // buffer and aborts if the state does not fill it. when the sizes differ, the fill only
-    // touches pages that are already resident.
+    // usually a no-op leaving stale bytes: callers overwrite the whole buffer and abort if the
+    // state does not fill it
     dst.resize(size);
 }
 
@@ -2354,11 +2342,6 @@ void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
         return; // one buffer of this size would spend the whole budget
     }
 
-    // eviction. make room by dropping the smallest pooled buffers, but only ones smaller than
-    // the buffer coming in. a pool already full of buffers at least this large has nothing to
-    // gain from the swap, so decline instead. that rule is what keeps a workload whose
-    // checkpoints grow through a prompt from wedging the pool full of small buffers that no
-    // later and larger request can use.
     while (free_bufs.size() >= MAX_BUFFERS || held_bytes + cap > cap_bytes) {
         size_t worst = 0;
         for (size_t i = 1; i < free_bufs.size(); ++i) {
@@ -2377,8 +2360,7 @@ void common_state_buffer_pool::put(std::vector<uint8_t> && src) {
         st.n_evict++;
     }
 
-    // the logical size is kept, not cleared: a later get() of the same size is then a no-op
-    // resize rather than a full zero fill of the buffer
+    // size kept, not cleared: a later get() of the same size is then a no-op resize
     free_bufs.push_back(std::move(src));
 
     held_bytes += cap;
@@ -2415,17 +2397,15 @@ common_state_buffer_pool::stats common_state_buffer_pool::get_stats() const {
 }
 
 common_prompt_checkpoint::~common_prompt_checkpoint() {
-    // a destructor is noexcept and put() can throw: it locks a mutex and pushes to a vector.
-    // that matters on exactly the path this has to survive, because server_prompt_cache::alloc()
-    // recovers from a std::bad_alloc by destroying cached prompts, and a throw from here would
-    // turn a graceful cache shrink into a terminate().
+    // put() locks and pushes, so it can throw, and a destructor is noexcept. that is fatal on the
+    // one path this must survive: server_prompt_cache::alloc() destroys cached prompts to recover
+    // from std::bad_alloc, and a throw here would make that graceful shrink a terminate().
     try {
         auto & pool = common_state_buffer_pool::instance();
 
         pool.put(std::move(data_tgt));
         pool.put(std::move(data_dft));
     } catch (...) {
-        // the buffers are freed by their own destructors instead
     }
 }
 

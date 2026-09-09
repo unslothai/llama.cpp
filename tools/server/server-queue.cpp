@@ -359,11 +359,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     break; // new task arrived or terminate
                 }
 
-                // nothing to do. hand back any checkpoint state buffers the pool is still
-                // holding, so a server that has gone quiet does not keep them for the life of
-                // the process. this is the only loop that runs while the queue is empty, so it
-                // is the only place the release can happen. done without the lock: trim()
-                // unmaps hundreds of MiB and must not delay an arriving task.
+                // the only loop running while the queue is empty, so the only place a quiet server
+                // gives pooled buffers back. unlocked: trim() unmaps hundreds of MiB.
                 lock.unlock();
                 common_state_buffer_pool::instance().trim(30ll*1000*1000);
 

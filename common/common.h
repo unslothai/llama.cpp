@@ -1135,58 +1135,19 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
-// A bounded, process-wide pool of reusable byte buffers for sequence-state checkpoints.
+// Bounded process-wide pool of reusable checkpoint state buffers. At hundreds of MiB each these
+// come from mmap() and go back on free, so every fresh buffer faults in all of its pages.
 //
-// Checkpoint buffers are large - for a hybrid/recurrent model the non-rollbackable state of a
-// single sequence runs to hundreds of MiB - and one is allocated and freed per prompt. Any
-// allocation that size comes straight from mmap() and goes straight back on free, so the first
-// write to a fresh buffer faults in every one of its pages. In llama-server that shows up as a
-// ~44 ms zero fill inside `update_tgt()` before the state copy can even start, repeated for
-// every checkpoint of every prompt.
+// Do NOT instead delete the zero fill this avoids: with a CUDA target context,
+// llama_state_seq_get_data_ext() into non-resident pageable host memory runs about 140x slower.
 //
-// Handing the buffer to this pool instead of to the allocator keeps the pages mapped, resident
-// and dirty, so the next checkpoint of the same size reuses them and pays neither the faults
-// nor the fill.
-//
-// Note that the zero fill itself is load bearing and must not simply be removed: with a CUDA
-// target context, `llama_state_seq_get_data_ext()` copying into pageable host memory that is
-// not yet resident runs about 140x slower than into memory that is. The pool removes the fill
-// by making it unnecessary, not by skipping it.
-//
-// Memory policy.
-//
-//  - Byte cap. At most `cap_bytes` is retained, derived once as 1/16 of total host memory, so
-//    the pool is proportionate to the machine it runs on. When host memory cannot be
-//    determined the pool keeps nothing.
-//  - Count cap. At most `MAX_BUFFERS` buffers. With `n_ctx_checkpoints` defaulting to 32 per
-//    slot a busy server can release far more than that at once, so this cap does bind, and
-//    the eviction rule below decides which buffers survive it.
-//  - Eviction. A buffer offered to a full pool displaces the smallest pooled buffer, but only
-//    one smaller than itself; otherwise it is declined. Without that rule a workload whose
-//    checkpoints grow through a prompt would fill the pool with small buffers that no later
-//    request can use, and the hit rate would fall to zero while the memory stayed held.
-//  - Size floor. Buffers below `MIN_BUFFER_BYTES` are never retained. Below the allocator's
-//    mmap threshold there is no fault storm to avoid, so pooling them would only hold memory.
-//  - Release. `trim()` drops buffers the pool has not touched for a while. The server calls it
-//    from the task queue's idle wait, so a server that goes quiet gives the memory back, and
-//    with a zero timeout from the prompt cache's out-of-memory recovery, so pooled bytes are
-//    always reclaimable under allocation pressure even though they are not counted against
-//    `--cache-ram`.
-//
-// When any cap is reached the buffer is simply freed, which is exactly the behaviour without
-// the pool: a machine that cannot afford the pool degrades to today's behaviour, never to
-// something worse.
-//
-// On the peak. The pool only ever receives buffers that the process had just freed, and hands
-// them straight back out, so for a steady workload the sum of live plus pooled buffers is the
-// count the process already peaked at without the pool. The byte cap and `trim()` bound the
-// one case where that is not true: a server whose live checkpoint count structurally shrinks.
+// A full pool only accepts a buffer by displacing a SMALLER one, else checkpoints growing through
+// a prompt wedge it full of small buffers no later request can use. trim() keeps pooled bytes
+// reclaimable, since they do not count against `--cache-ram`.
 struct common_state_buffer_pool {
-    // bound on the buffer count. this does bind in practice, see the eviction rule above
     static constexpr size_t MAX_BUFFERS = 64;
 
-    // buffers below this size are left to the allocator: they do not come from mmap(), so
-    // reusing them saves nothing
+    // below the allocator's mmap threshold there is no fault storm to avoid
     static constexpr size_t MIN_BUFFER_BYTES = 32ull*1024*1024;
 
     struct stats {
@@ -1200,17 +1161,11 @@ struct common_state_buffer_pool {
         size_t n_hwm      = 0; // high water mark of retained buffers
     };
 
-    // resize `dst` to `size`, reusing a pooled allocation when one fits.
-    // the previous contents of `dst` are not preserved; every caller overwrites the whole
-    // buffer immediately, and preserving them would defeat the point of the reuse.
+    // contents of `dst` are NOT preserved; every caller overwrites the whole buffer
     void get(std::vector<uint8_t> & dst, size_t size);
 
-    // offer `src` to the pool. if the policy declines it, `src` is left alone and freed by its
-    // own destructor, exactly as it would be without the pool.
     void put(std::vector<uint8_t> && src);
 
-    // free every pooled buffer if the pool has not been used for `idle_us`. cheap and safe to
-    // call often; the server calls it whenever all of its slots are idle.
     void trim(int64_t idle_us);
 
     stats get_stats() const;
@@ -1250,10 +1205,8 @@ struct common_prompt_checkpoint {
 
     common_prompt_checkpoint() = default;
 
-    // returns the state buffers to common_state_buffer_pool instead of to the allocator.
-    // the copy and move members are defaulted explicitly: declaring a destructor would
-    // otherwise suppress the implicit moves and turn every list splice into a deep copy of a
-    // multi-hundred-MiB buffer.
+    // the copy/move members below are defaulted explicitly: declaring this destructor suppresses
+    // the implicit moves, turning every list splice into a deep copy of a multi-hundred-MiB buffer.
     ~common_prompt_checkpoint();
 
     common_prompt_checkpoint(const common_prompt_checkpoint &) = default;

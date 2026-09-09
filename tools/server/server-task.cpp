@@ -1767,10 +1767,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        // the checkpoint buffer pool holds host memory that is reusable but not currently in
-        // use, and it is not counted against limit_size. release all of it before shrinking the
-        // cache: without this the retry reclaims nothing, because the cached prompts destroyed
-        // by update() below hand their buffers to the pool instead of to the allocator.
+        // release first or the retry reclaims nothing: update() below hands the destroyed prompts'
+        // buffers to the pool, which limit_size does not count, rather than to the allocator
         common_state_buffer_pool::instance().trim(0);
 
         limit_size = std::max<size_t>(1, 0.4*size());
