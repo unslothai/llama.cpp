@@ -125,20 +125,14 @@ jobs:
             vulkan-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
-          # apt on ubuntu-22.04 ships ccache 4.5.1; the binary the action pins is
-          # 4.13, the same one the Windows legs already run.
+          # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
           install: binary
           max-size: 2G
           save: false
 
       - name: Configure ccache
-        # compiler_check=content: the toolchain is reinstalled on every run, so an
-        # mtime identity (the Linux default) can miss on a byte-identical compiler.
-        # The timestamp sloppiness only relaxes ccache's same-second race guard,
-        # which a tarball-extracted source tree never needs; pch_defines and locale
-        # are the documented safe set. compression_level=6 trades a few seconds of
-        # zstd per miss for a smaller cache dir, so more objects fit under max-size
-        # and the actions/cache round trip moves fewer bytes.
+        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
         run: |
           ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
@@ -339,13 +333,8 @@ jobs:
           save: false
 
       - name: Configure ccache
-        # compiler_check=content: the toolchain is reinstalled on every run, so an
-        # mtime identity (the Linux default) can miss on a byte-identical compiler.
-        # The timestamp sloppiness only relaxes ccache's same-second race guard,
-        # which a tarball-extracted source tree never needs; pch_defines and locale
-        # are the documented safe set. compression_level=6 trades a few seconds of
-        # zstd per miss for a smaller cache dir, so more objects fit under max-size
-        # and the actions/cache round trip moves fewer bytes.
+        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
+        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
         run: |
           ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale

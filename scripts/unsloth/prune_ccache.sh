@@ -3,31 +3,14 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 # Prune superseded ccache generations from this repository's Actions cache.
 #
-# ccache entries are immutable, so every run writes a NEW cache per
-# (backend, os, profile) and finds the previous one by restore-keys prefix.
-# restore-keys returns only the MOST RECENT match, so older generations can
-# never be selected again -- they are pure landfill. Measured 2026-08-08:
-# 122 caches / 31.72 GiB, of which only 40 / 9.13 GiB were reachable.
-# Measured 2026-09-08: 76 caches / 46.8 GB, exactly two generations of 38
-# prefixes (25.0 + 21.8 GB), against a limit that was then 50 GB.
+# Entries are immutable, so every run writes a NEW cache per (backend, os, profile) and
+# restore-keys returns only the newest match: older generations are landfill. At the repo limit
+# GitHub evicts by its own LRU and can take a LIVE cache; a partial cache is worse than none
+# (a cache capped to 30% of need hit 14.2% and cost a 204-minute build instead of 54).
 #
-# That matters for build time, not tidiness. Once the total hits the repo
-# limit GitHub evicts by its own LRU, which can take a LIVE cache. A partial
-# cache is far worse than none: measured locally over 513 real translation
-# units, capping a cache to 30% of what the build needs drops the hit rate to
-# 14.2% and flips hits from direct to preprocessed -- the exact 3-direct /
-# 52-preprocessed signature seen in CI when the cap was 500 MB, which cost a
-# 204-minute build instead of 54.
-#
-# Runs twice per release: once right after `resolve`, before any leg restores,
-# and once after publish. Keeping ONE generation per prefix is safe at run
-# start because the prefix restore only ever returns the newest entry, and a
-# leg whose last save failed still has its previous entry as the newest of
-# its own prefix. Peak usage during a run is then old + new generation.
-#
-# Keys that are not ccache-* (the sccache/<hash> per-object entries the CUDA
-# legs write) are reported but never touched: GitHub's per-entry LRU and
-# 7-day expiry are their retention policy.
+# Runs after `resolve` and again after publish. One generation per prefix is safe at run start
+# because the prefix restore only returns the newest entry; peak usage during a run is
+# old + new. Keys that are not ccache-* are reported, never touched.
 #
 # Usage: prune_ccache.sh [--keep N] [--limit-gb N] [--dry-run]
 #   GH_TOKEN with actions:write on GITHUB_REPOSITORY; writes GITHUB_STEP_SUMMARY if set.
@@ -57,16 +40,10 @@ sc_total=$(awk -F'\t' '$6 !~ /^ccache-/ {s+=$3} END {printf "%d", s+0}' "$all")
 sc_count=$(awk -F'\t' '$6 !~ /^ccache-/' "$all" | grep -c . || true)
 echo "$(grep -c . "$all" || true) caches, $(gib "$total") GiB total: ccache $(gib "$cc_total") GiB, other (sccache etc.) $(gib "$sc_total") GiB in $sc_count entries"
 
-# Group by the restore-keys prefix: the key minus its -<tag>- suffix, plus the
-# -<run id>-<attempt> suffix the non-CUDA legs append so a same-tag retry can
-# save an improved cache. The ROCm toolchain version stays in the group
-# because it is in the restore prefix: a rocm_version=latest dispatch followed
-# by the weekly nightly would otherwise leave the newer toolchain's cache as
-# the only survivor, one the weekly legs cannot restore. A retired toolchain's
-# caches are removed by GitHub's 7-day unused-cache expiry instead.
-# Grouped per (ref, version) as well: a branch cannot restore a sibling's
-# cache and a path change mints a new version, so ranking across them would
-# let one scope evict another's only usable entry.
+# Group by restore prefix: the key minus -<tag>- and -<run id>-<attempt>. The ROCm toolchain
+# version stays in because the restore prefix has it: a rocm_version=latest dispatch before the
+# weekly nightly would otherwise leave only a cache the weekly legs cannot restore (retired
+# toolchains age out via GitHub's 7-day expiry). Per (ref, version) too: a branch cannot restore a sibling's cache.
 grouped="$tmp/grouped.tsv"; : > "$grouped"
 while IFS=$'\t' read -r id created size ref ver key; do
   [ -z "${id:-}" ] && continue

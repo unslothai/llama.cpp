@@ -12,9 +12,7 @@ name: "Unsloth prebuilt: CUDA Windows"
 # DLLs from the executable's directory), and a .zip archive. CUDA compiles
 # entirely in software here -- no GPU is present on the runner.
 #
-# Same two-job shape as the Linux child (warm shards through ccache, unioned
-# into the build job's cache); see its header and
-# .github/actions/unsloth-cuda-windows-setup.
+# Same two-job shape as the Linux child; see its header and .github/actions/unsloth-cuda-windows-setup.
 
 on:
   workflow_call:
@@ -70,11 +68,9 @@ permissions:
 jobs:
   warm:
     name: warm x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
-    # See the Linux child for why an empty string and not an empty include.
     if: ${{ inputs.warm_matrix != '' }}
     runs-on: ${{ matrix.runner }}
-    # Best effort; the parent's waiter excludes ` / warm ` jobs from its
-    # all-legs-green check. No signing environment: shards ship nothing.
+    # Best effort; no signing environment, shards ship nothing.
     continue-on-error: true
     timeout-minutes: 150
     strategy:
@@ -99,11 +95,6 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # The shards restore the previous shard deltas too (any tag: the
-      # restore-keys fall back to a tagless prefix), so a retry of the same
-      # tag, or a night whose base bump left some objects untouched, compiles
-      # only what changed since the newest delta, not since the last
-      # generation.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -155,8 +146,6 @@ jobs:
           ccache -z
           exit 0
 
-      # See the Linux child: path + size for every file, a hash for the
-      # manifests, so the export ships only what the compile changed.
       - name: Snapshot the restored cache
         run: |
           $src = "${{ github.workspace }}\.ccache"
@@ -173,8 +162,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # See the Linux child: every ggml-cuda object, stable order, dealt
-          # round-robin across the shards.
           ninja -C build -t targets all \
             | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.obj:' | cut -d: -f1 | sort \
             | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
@@ -185,8 +172,6 @@ jobs:
         if: ${{ always() }}
         run: ccache -s -v
 
-      # See the Linux child: only the files this job added or rewrote, tree
-      # layout preserved.
       - name: Export the shard delta
         if: ${{ always() }}
         run: |
@@ -212,12 +197,10 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/${{ matrix.shard }}
-          # See the Linux child for the key layout.
           key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build:
     name: x64/${{ matrix.profile }}
-    # See the Linux child: shards are best effort, only a cancelled run stops here.
     needs: warm
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
@@ -244,8 +227,7 @@ jobs:
     # leg the max is 305.1 and nothing falls between 215 and 305, so a tighter
     # cap buys no hang detection and would have destroyed that publish -- one
     # killed leg fails the bundle-coverage gate and the whole night ships
-    # nothing. The warm shards should make that history, but the cap stays
-    # until a few cold nights have shown the new ceiling.
+    # nothing. Shards should make that history; the cap stays until cold nights show the new ceiling.
     #
     # Note this cannot by itself rescue a slow run: the waiter's 330-minute
     # deadline is wall-clock from assemble start and INCLUDES the child's queue
@@ -274,7 +256,6 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # See the Linux child for the shard restore and merge rationale.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -359,7 +340,6 @@ jobs:
           }
           exit 0
 
-      # See the Linux child for how to read these.
       - name: ccache stats
         if: ${{ always() }}
         shell: bash
@@ -406,9 +386,8 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
-          # Provenance label kept byte for byte as it was under the Jimver
-          # install: the bundles must stay identical, metadata included, and
-          # the compiler behind the label is the same nvcc build either way.
+          # Provenance label kept byte for byte as under the Jimver install: bundles must stay
+          # identical, metadata included, and the compiler behind the label is the same nvcc.
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
           SMS: ${{ matrix.sms }}
@@ -430,7 +409,6 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
-        # See the Linux child: housekeeping before the save, 7 days not 14.
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
@@ -445,8 +423,6 @@ jobs:
         # the CANCELLATION path, not the failure path, so !cancelled() would
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
-        #
-        # Run id and attempt on the key, see the Linux child.
         if: ${{ always() }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:

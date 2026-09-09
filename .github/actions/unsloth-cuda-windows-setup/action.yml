@@ -32,20 +32,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # Report both fixed volumes at job start. The work is split across two:
-    # the CUDA toolkit, the tool cache and Program Files land on C:, while
-    # GITHUB_WORKSPACE -- the source tree and the CMake build tree -- is on D:.
-    # A leg that dies mid-build can only be read against the volume it was
-    # writing to, so both are printed here and again after the toolkit install.
-    #
-    # No cleanup step, deliberately. One was written and then measured on a
-    # live windows-2022 runner: D: starts at 147.0 GB free of 150.0 and C: at
-    # 84.3 of 255.4, and the CUDA 12.8 toolkit is 4.79 GB, so C: never drops
-    # below about 106 GB. Reclaiming ~33 GB of preinstalled SDKs on every leg
-    # would have freed the volume that was not under pressure, on every
-    # release, forever. The 87-minute "runner lost communication" failure was
-    # not disk exhaustion, and unsloth-prebuilt-retry.yml already covers that
-    # class of infrastructure loss.
+    # No cleanup step: D: starts 147 GB free, C: 84 GB with a 4.8 GB toolkit; the 87-minute
+    # runner-loss failure was not disk exhaustion (unsloth-prebuilt-retry.yml covers it).
     - name: Report disk space
       shell: pwsh
       run: |
@@ -54,18 +42,9 @@ runs:
           "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
         }
 
-    # No Defender exclusion step. The same profile builds 1.6x slower here
-    # than on the Linux runner (189 vs 117 minutes on run 34168016006), and
-    # real-time scanning of the per-arch .ptx / .cubin / .ii cascade was the
-    # suspect, so it was A/B tested on windows-2022 (2026-09-08, cold
-    # ggml-cuda for two arches, -j 3): 1675 s with the scan on, 1764 s with
-    # Add-MpPreference -ExclusionPath on the workspace and RUNNER_TEMP. The
-    # compile is CPU bound in nvcc; the scan is not where the 1.6x goes.
+    # No Defender exclusion: A/B on windows-2022 showed no gain (1675 s scan on vs 1764 s excluded).
 
-    # The parent's resolve job built the source tree (upstream base + any mix
-    # PRs, with the build number/commit and Unsloth fingerprint baked
-    # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
-    # instead of cloning -- no .git needed, the build number is already baked.
+    # Source tree is resolve's app-source artifact, build number and fingerprint already baked in.
     - name: Download source @ ${{ inputs.tag }}
       uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
       with:
@@ -82,8 +61,7 @@ runs:
       with:
         python-version: "3.11"
 
-    # Ninja is on the windows-2022 image; choco was a network round trip per
-    # job for the same binary. Fails loudly if an image update drops it.
+    # Ninja is on the image; choco was a network round trip for the same binary.
     - name: Check Ninja
       shell: pwsh
       run: |
@@ -93,19 +71,8 @@ runs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
-    # The toolkit comes straight from NVIDIA's redist CDN for every CUDA line,
-    # the way the 13.3 leg has always done it (block descended from
-    # ggml-org/llama.cpp .github/actions/windows-setup-cuda). Component
-    # versions are from NVIDIA's redistrib_<version>.json. Jimver/cuda-toolkit
-    # used to install 12.8.0 and took 7.3 to 7.7 minutes per Windows job on
-    # run 34168016006 against 0.8 to 1.0 for the redist path; with a warm
-    # shard in front of every build that install sat on the critical path
-    # twice. Same nvcc bytes either way, so the content-hashed ccache entries
-    # carry over: the 12.8.0 archives are the same nvcc V12.8.61 and libcublas
-    # 12.8.3.14 the Jimver installer put down (run 34168016006 logs), so the
-    # shipped bits do not change with the install method. (Linux maps 12.8.0
-    # to the 12.8.1 archives for the same reason; see that action.) bsdtar
-    # (tar.exe on the image) reads the zips, no choco.
+    # Toolkit from NVIDIA's redist CDN: about 1 min per job against 7 to 8 for Jimver. The 12.8.0
+    # archives are the same nvcc V12.8.61 and libcublas 12.8.3.14 Jimver installed, so shipped bits are unchanged.
     - name: Install CUDA toolkit ${{ inputs.cuda }} (NVIDIA redist)
       shell: pwsh
       run: |
@@ -141,8 +108,6 @@ runs:
       shell: pwsh
       run: nvcc --version
 
-    # Headroom going into the build, with the toolkit on C: and the build tree
-    # on D:. First numbers to read if a leg dies mid-build.
     - name: Report disk space before build
       shell: pwsh
       run: |
@@ -165,8 +130,6 @@ runs:
 
     - name: Configure ccache
       shell: pwsh
-      # Same policy as the Linux action; the action already sets
-      # compiler_check=content on Windows, repeated here so the two agree.
       run: |
         ccache --set-config=compiler_check=content
         ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
@@ -178,9 +141,7 @@ runs:
       shell: pwsh
       working-directory: src
       run: |
-        # CMAKE_CUDA_ARCHITECTURES is the explicit per-profile arch list (the
-        # whole point of the matrix). ccache launchers cache nvcc + cl.exe;
-        # no RPATH knobs -- Windows loads sibling DLLs from the binary's dir.
+        # Launchers cache nvcc and cl.exe; no RPATH knobs, Windows loads sibling DLLs from the binary's dir.
         $archs = "${{ inputs.archs }}".Replace(' ', ';')
         cmake -S . -B build -G Ninja `
           -DCMAKE_BUILD_TYPE=Release `

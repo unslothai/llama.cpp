@@ -7,32 +7,12 @@ name: "Unsloth prebuilt: CUDA"
 # the parent's `resolve` job filtered into `matrix`. Each entry uploads a
 # single app-*.tar.gz artifact for the parent's assemble step to pick up.
 #
-# Two jobs per profile since 2026-09:
-#
-#   warm   N shards (parent decides N per profile; 0 for legacy) that each
-#          restore the profile's newest ccache generation, compile a 1/N slice
-#          of the ggml-cuda objects through it (hits cost nothing, so only the
-#          objects the base bump actually invalidated get compiled), and save
-#          the DELTA (every cache file newer than a stamp taken after the
-#          restore) as a small shard cache. Best effort: a dead shard means
-#          the build compiles more itself, never that a release is lost.
-#   build  restores the same generation plus every shard delta, lays the
-#          deltas over the generation newest-file-wins (results are content
-#          addressed; a manifest a shard rewrote is a superset of the one it
-#          restored, and the slices are disjoint so no two shards rewrite the
-#          same manifest) and runs the full build as before, which then
-#          direct-hits everything the shards produced.
-#
-# This is how a 4 vCPU runner gets a cold CUDA leg down from ~190 minutes
-# (run 34168016006, Windows portable) to one shard's worth plus a mostly
-# hitting build. A base bump that edits ggml-cuda/common.cuh (every .cu
-# includes it; upstream touches it ~6x a month) invalidates every CUDA object
-# and no cache setting changes that, so parallelism is the lever that is
-# left without larger runners.
-#
-# Both jobs run the identical setup (.github/actions/unsloth-cuda-linux-setup)
-# so the hashes agree; that action also records why sccache was measured and
-# rejected for these legs.
+# Two jobs per profile since 2026-09. `warm` shards (N per profile from the parent, 0 = skipped)
+# each restore the newest ccache generation, compile a 1/N slice of the ggml-cuda objects and save
+# only what the compile added or rewrote; `build` merges the deltas over the generation
+# newest-file-wins (slices are disjoint) and runs the full build. Shards are best effort: a dead
+# one costs compile time, never a release. A base bump touching ggml-cuda/common.cuh invalidates
+# every CUDA object; parallel shards are the only lever without larger runners.
 
 on:
   workflow_call:
@@ -71,16 +51,12 @@ permissions:
 jobs:
   warm:
     name: warm ${{ matrix.arch }}/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
-    # An empty string, not an empty include list: a job whose `if` is false
-    # never evaluates its strategy, and fromJSON('{"include":[]}') would fail
-    # the job instead of skipping it.
+    # An empty string, not an empty include list: with the `if` false the strategy is never
+    # evaluated, while fromJSON('{"include":[]}') fails the job instead of skipping it.
     if: ${{ inputs.warm_matrix != '' }}
     runs-on: ${{ matrix.runner }}
-    # Best effort, see the header. The parent's waiter also excludes ` / warm `
-    # jobs from its all-legs-green check.
+    # Best effort (see header); the parent's waiter excludes ` / warm ` jobs.
     continue-on-error: true
-    # A shard is a third of a profile; the whole cold profile fit in 305
-    # minutes on the slowest night on record, so this is generous.
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -112,11 +88,7 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # The shards restore the previous shard deltas too (any tag: the
-      # restore-keys fall back to a tagless prefix), so a retry of the same
-      # tag, or a night whose base bump left some objects untouched, compiles
-      # only what changed since the newest delta, not since the last
-      # generation.
+      # Previous deltas are restored too (tagless fallback), so a retry compiles only what changed since them.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -166,14 +138,8 @@ jobs:
           rm -rf shards
           ccache -z
 
-      # Snapshot of the restored cache so the export below ships only what the
-      # compile changed. Not mtimes: ccache touches every result it hits (LRU
-      # bookkeeping), so on a warm night "newer than a stamp" is the whole
-      # slice again (426 of 426 files on a 100% hit rebuild, measured
-      # 2026-09-08) while one stats file had actually changed. Path + size
-      # catches new results and rewritten manifests (an entry added makes the
-      # manifest grow); the manifests are hashed as well because that is the
-      # one file ccache rewrites in place and it is small.
+      # Path + size, manifests by hash (the one file ccache rewrites in place). Not mtimes:
+      # ccache touches every hit, so on a warm night everything looks newer.
       - name: Snapshot the restored cache
         run: |
           set -euo pipefail
@@ -185,29 +151,18 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # Every ggml-cuda object target in the configured graph, in a stable
-          # order, dealt round-robin across the shards. The template-instance
-          # files dominate (2-8 minutes each for 8 arches) and are spread by
-          # name, which balances well enough; the build job compiles whatever a
-          # shard did not reach.
+          # Stable order, dealt round-robin; the build compiles whatever a shard did not reach.
           ninja -C build -t targets all \
             | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.o:' | cut -d: -f1 | sort \
             | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
           echo "$(wc -l < shard.txt) CUDA objects in this shard"
-          # -j 3: same reasoning as the build job below.
           xargs -a shard.txt ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
         run: ccache -s -v
 
-      # Only the files this job added or rewrote: new results, the manifests
-      # of the TUs it compiled and the stats counters. The restored generation
-      # stays behind, so a shard is MBs on a warm night and a couple of
-      # hundred MB on a cold one, not another 4 GB copy of the generation;
-      # 40-odd shard caches a night have to fit next to the generations under
-      # the 75 GB repo limit. Tree layout preserved so the build job can lay
-      # the delta straight over its own cache dir.
+      # Only what this job added or rewrote, tree layout preserved: never a 4 GB copy of the generation.
       - name: Export the shard delta
         if: ${{ always() }}
         run: |
@@ -227,18 +182,12 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/${{ matrix.shard }}
-          # The shard index sits in front of the profile so the composite's
-          # generation restore (prefix ccache-cuda-<cuda>-<arch>-<profile>)
-          # never picks a shard, and the pruner groups each shard as its own
-          # prefix; the run id and attempt keep every save unique so a retry
-          # of the same tag can save an improved shard.
+          # Shard index ahead of the profile so the generation prefix restore never picks a shard.
           key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build:
     name: ${{ matrix.arch }}/${{ matrix.profile }}
-    # Runs after the shards, whatever they did: `warm` skipped (no shards for
-    # this profile set), failed or timed out all mean "fewer hits", not "no
-    # release". Only a cancelled run stops here.
+    # Runs whatever the shards did (fewer hits at worst); only a cancelled run stops here.
     needs: warm
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
@@ -272,9 +221,7 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # One restore step per possible shard (the parent never asks for more
-      # than four). A shard that never saved is a cache miss here and nothing
-      # else. Prefix restore, newest first, so a retry sees the latest attempt.
+      # One restore per possible shard (max four); a shard that never saved is just a miss.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -333,9 +280,8 @@ jobs:
           # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
           # 4 vCPU / 16 GB GitHub-hosted runners (x64 and arm64 alike, measured
           # over a 1s sampler), so 3 parallel TUs leave ~13 GB free. -j 4 adds
-          # no speed (the runner is ~2 physical cores + HT), so 3 is the sweet
-          # spot. nvcc --threads was measured too (2026-09-08, 4 cores): -j 2
-          # with --threads 2 came in 5% under -j 3, not worth a flag change.
+          # no speed (the runner is ~2 physical cores + HT), so 3 is the sweet spot;
+          # -j 2 with nvcc --threads 2 measured within 5%, not worth the flag.
           cmake --build build --config Release -j 3
           strip build/bin/llama-* || true
 
@@ -363,9 +309,7 @@ jobs:
           fi
           exit 0
 
-      # The number to read when a leg is slow. Misses here after warm shards
-      # ran means the shards did not finish; misses on every CUDA TU with the
-      # C++ hitting is a base bump that touched a shared CUDA header.
+      # Misses on every CUDA TU with C++ hitting is a base bump that touched a shared CUDA header.
       - name: ccache stats
         if: ${{ always() }}
         run: |
@@ -394,9 +338,8 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
-          # Provenance label kept byte for byte as it was under the Jimver
-          # install: the bundles must stay identical, metadata included, and
-          # the compiler behind the label is the same nvcc build either way.
+          # Provenance label kept byte for byte as under the Jimver install: bundles must stay
+          # identical, metadata included, and the compiler behind the label is the same nvcc.
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
           SMS: ${{ matrix.sms }}
@@ -414,9 +357,8 @@ jobs:
         # single ~5 minute teardown window (measured ~4m50s after process
         # kill), shared by every remaining step and not replenished. Evicting
         # spends that window on housekeeping; the save is what actually needs
-        # it, and a multi-GB cache is not quick to write. 7 days, not 14: with
-        # a daily base bump an object that stopped hitting a week ago is dead,
-        # and the smaller dir is what keeps restore and save near a minute.
+        # it, and a multi-GB cache is not quick to write. 7 days: with a daily base bump an
+        # object idle for a week is dead, and the smaller dir keeps restore and save near a minute.
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
@@ -432,9 +374,8 @@ jobs:
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
         #
-        # Run id and attempt on the key: cache entries are immutable, so
-        # without them a retry of the same tag could never replace a partial
-        # save with a complete one. The restore prefix ignores the suffix.
+        # Run id and attempt on the key: entries are immutable, so a same-tag retry could
+        # otherwise never replace a partial save. The restore prefix ignores the suffix.
         if: ${{ always() }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:

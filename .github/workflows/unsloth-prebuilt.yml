@@ -448,17 +448,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Resolved $REQ -> $TAG ($COMMIT); prs=$PRS; source_artifact=${SRC_ARTIFACT:-none}; release exists=$EXISTS; only=$ONLY; gfx=$GFX"
 
-      # Warm shards for the CUDA children (see their headers): each profile row
-      # is dealt into `shards` parallel jobs that pre-compile a slice of the
-      # ggml-cuda objects through ccache. Sized by cold cost on run
-      # 34168016006: Windows portable 189 / 138 min (4 shards; it is the
-      # critical path and 1.6x slower than Linux per object), Linux x64
-      # portable 117 / 103 min (3), older/newer 55-104 min (2), legacy 22 min
-      # (none), arm64 portable 42 min (2). The children restore up to four
-      # shards. An empty string, not an empty include list, tells the child to
-      # skip the job.
-      # Its own step, not more script in `r`: GitHub caps one workflow string at
-      # 21000 chars and that step is at it. See check_workflow_scalars.py.
+      # Warm shards for the CUDA children: each profile row is dealt into `shards` jobs that
+      # pre-compile a slice of ggml-cuda through ccache; the children restore up to four. An
+      # empty string, not an empty include list, tells the child to skip the job. Its own step:
+      # GitHub caps one workflow string at 21000 chars and `r` is at it (check_workflow_scalars.py).
       - name: Warm shard matrix for the CUDA children
         id: warm
         env:
@@ -466,16 +459,11 @@ jobs:
           WIN_CUDA_MATRIX: ${{ steps.r.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
-          # Warm shards are DISABLED for now (every profile 0): the nightly runs
-          # its 42 jobs as before and the CUDA children skip their `warm` job.
-          # The caching fixes in this branch (ccache 4.13, content check,
-          # cache sizes, one generation per prefix, redist toolkit) do not
-          # depend on them. To enable, restore the measured sizing:
+          # Warm shards are DISABLED (every profile 0); the caching fixes do not depend on them.
+          # To re-enable, the sizing measured on run 34168016006:
           #   SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
           #   WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 2 end'
-          # (staging run 34205486511: cuda12-older cold leg 100 -> 64 min on
-          # Windows, 53 -> 43 on Linux; every CUDA object a direct hit in the
-          # build after the shard merge).
+          # (staging run 34205486511: cuda12-older cold leg 100 -> 64 min Windows, 53 -> 43 Linux).
           SHARDS='0'
           WIN_SHARDS='0'
           expand_warm() { # $1 = shard rule
@@ -485,8 +473,7 @@ jobs:
           [ -n "${WIN_CUDA_MATRIX:-}" ] || WIN_CUDA_MATRIX='{"include":[]}'
           CUDA_WARM="$(printf '%s' "$CUDA_MATRIX" | expand_warm "$SHARDS")"
           WIN_CUDA_WARM="$(printf '%s' "$WIN_CUDA_MATRIX" | expand_warm "$WIN_SHARDS")"
-          # The build rows learn their own shard count too: the build job
-          # restores exactly that many shard caches before it merges them.
+          # Build rows carry their shard count: the build restores exactly that many shard caches.
           with_shards() { jq -c "{include: [.include[] | . + {shards: ($1)}]}"; }
           {
             echo "cuda_matrix=$(printf '%s' "$CUDA_MATRIX" | with_shards "$SHARDS")"
@@ -586,11 +573,8 @@ jobs:
       warm_matrix: ${{ needs.resolve.outputs.win_cuda_warm_matrix }}
     secrets: inherit
 
-  # First of the two ccache prunes (scripts/unsloth/prune_ccache.sh has the
-  # whole rationale): before any leg restores, so the run starts from one
-  # generation per prefix and old + new fit under the limit while it builds.
-  # Never on the assemble waiter's critical path and never a reason to fail a
-  # release; the waiter excludes this job by name.
+  # First of two ccache prunes (see scripts/unsloth/prune_ccache.sh): one generation per prefix
+  # at run start so old + new fit under the limit. Never gates the waiter, which excludes it by name.
   prune-ccache:
     name: Prune superseded ccache generations
     needs: resolve
@@ -707,10 +691,8 @@ jobs:
           PREFIXES=('CUDA / ' 'CUDA Windows / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
           SELF='Assemble metadata + publish'
           ALERT='Report pipeline health'
-          # Housekeeping and best-effort jobs that must never gate a publish:
-          # the start-of-run ccache prune, and the CUDA children's warm shards
-          # ("CUDA / warm x64/cuda12-portable 0/3"), which only pre-fill the
-          # compiler cache for the real build legs.
+          # Best-effort jobs that never gate a publish: the start-of-run ccache prune and the
+          # CUDA warm shards ("CUDA / warm x64/cuda12-portable 0/3").
           PRUNE='Prune superseded ccache generations'
           WARM=' / warm '
 
@@ -743,15 +725,11 @@ jobs:
             SIBS="$(printf '%s\n' "$JOBS" | awk -F'\t' -v self="$SELF" -v alert="$ALERT" -v prune="$PRUNE" -v warm="$WARM" \
               'NF && $1 != self && $1 != alert && $1 != prune && index($1, warm) == 0')"
 
-            # Two kinds of "not there yet". A child with no job record at all
-            # is the startup race and is fatal after STARTUP_DEADLINE. A child
-            # whose only records are warm shards is a CUDA child whose build
-            # legs sit behind `needs: warm`: GitHub creates those records only
-            # once the shards finish (52 minutes on a cold Windows profile,
-            # staging run 34205486511), so that case waits on the run's own
-            # deadline instead. Without the split, a run with warm shards
-            # either dies at 45 minutes or, worse, sees a moment where every
-            # existing record is complete and publishes without the builds.
+            # Two kinds of "not there yet": no job record at all is the startup race, fatal
+            # after STARTUP_DEADLINE; only warm records means a CUDA child whose build legs sit
+            # behind `needs: warm` and get records once the shards finish (52 min cold, staging
+            # run 34205486511), so that waits on the run deadline. Without the split a shard
+            # night dies at 45 minutes or publishes while every existing record is complete.
             MISSING=""; UNSCHEDULED=""
             for p in "${PREFIXES[@]}"; do
               if printf '%s\n' "$SIBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }'; then
@@ -1285,8 +1263,7 @@ jobs:
             echo "| delete failures | $failed |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The prune script lives in the tree; nothing above in this job needed a
-      # checkout. Read-only clone, no token left behind.
+      # Nothing above needed a checkout; read-only clone, no token left behind.
       - name: Checkout build tooling (this repo)
         if: ${{ needs.assemble.outputs.published == 'true' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
@@ -1296,11 +1273,8 @@ jobs:
 
       # ── Keep the ccache budget inside the repo limit ──
       #
-      # Second of the two prunes; the first runs right after `resolve`. See
-      # scripts/unsloth/prune_ccache.sh for the whole rationale. Published
-      # runs only, as before: a cancelled run's children may not have written
-      # their caches yet, and pruning against a half-written set could drop a
-      # live generation -- a partial cache is worse than a stale one.
+      # Second prune (the first follows `resolve`). Published runs only: a cancelled run's
+      # children may not have saved yet, and pruning a half-written set could drop a live generation.
       - name: Prune superseded ccache generations
         if: ${{ needs.assemble.outputs.published == 'true' }}
         # Never fail a published release over cache housekeeping.
