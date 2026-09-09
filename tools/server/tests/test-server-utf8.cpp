@@ -16,6 +16,7 @@
 // exhaustive1, exhaustive2, exhaustive3, fuzz) runs just that one.
 
 #include "server-task.h"
+#include "server-common.h"
 #include "chat.h"
 #include <nlohmann/json.hpp>
 
@@ -181,6 +182,74 @@ static void named(const char * id, const char * desc, const std::string & text) 
     (void) desc;
 }
 
+
+// ---------------------------------------------------------------------------
+// The server token pipeline, not just update_chat_msg().
+//
+// tools/server/server-context.cpp process_token() appends the token text to the slot's own
+// generated_text and then, if validate_utf8() says the tail is a cut-off multi-byte sequence,
+// sends nothing at all for that token. So a trailing incomplete sequence is never delivered as
+// a partial, and send_final_response() supplies an empty content in stream mode, which means
+// update_chat_msg() never gets a chance to substitute for it. Non-streaming hands over the whole
+// text and does get substituted.
+//
+// The data loss in streaming predates this change: the held back bytes were dropped in both
+// modes before it. The divergence is new, because the non-streaming side is now substituted and
+// the streaming side still is not. Fixing the streaming side means changing what
+// process_token() sends, which is a different file and changes what streaming clients receive,
+// so it is pinned here rather than folded in. The hard assertion is the one that matters:
+// no decodable content may be lost in either mode.
+static int n_pipeline_asym = 0, n_pipe_stream_bad = 0, n_pipe_nostream_bad = 0;
+
+static void pipeline_case(const char * id, const std::vector<std::string> & tokens) {
+    // ---- streaming, as process_token() drives it ----
+    std::string slot_text;
+    size_t n_sent = 0;
+    common_chat_parser_params p;
+    task_result_state st_stream(p);
+    std::vector<common_chat_msg_diff> diffs;
+    std::string streamed;
+    bool threw = false;
+    try {
+        for (const auto & tok : tokens) {
+            slot_text += tok;
+            if (validate_utf8(slot_text) < slot_text.size()) {
+                continue;   // incomplete tail: process_token() sends nothing for this token
+            }
+            const std::string to_send = slot_text.substr(n_sent);
+            n_sent = slot_text.size();
+            st_stream.update_chat_msg(to_send, true, diffs);
+        }
+        // send_final_response() sets content to "" in stream mode
+        streamed = st_stream.update_chat_msg("", false, diffs).content;
+    } catch (const std::exception &) {
+        threw = true;
+    }
+
+    // ---- non-streaming: the whole text in one final call ----
+    outcome nostream = run_final(slot_text);
+
+    const std::string held_back = slot_text.substr(n_sent);
+    const std::string ref_sent  = ref_decode_replace(slot_text.substr(0, n_sent));
+    const std::string ref_all   = ref_decode_replace(slot_text);
+
+    const bool stream_ok   = !threw && streamed == ref_sent;
+    const bool nostream_ok = !nostream.threw && nostream.content == ref_all;
+    const bool agree       = !threw && !nostream.threw && streamed == nostream.content;
+
+    if (!agree)       { n_pipeline_asym++;    }
+    if (!stream_ok)   { n_pipe_stream_bad++;  }
+    if (!nostream_ok) { n_pipe_nostream_bad++; }
+
+    printf("PIPE %-14s text=[%-20s] held_back=[%-8s] stream=[%-14s] nostream=[%-14s] %s%s%s\n",
+           id, hex(slot_text).c_str(), hex(held_back).c_str(),
+           threw ? "THROW" : hex(streamed).c_str(),
+           nostream.threw ? "THROW" : hex(nostream.content).c_str(),
+           stream_ok ? "stream-ok" : "STREAM-LOST-CONTENT",
+           nostream_ok ? " nostream-ok" : " NOSTREAM-BAD",
+           agree ? " agree" : " ASYMMETRIC");
+}
+
 static int g_fail = 0;
 
 int main(int argc, char ** argv) {
@@ -257,6 +326,36 @@ int main(int argc, char ** argv) {
         printf("RESULT named threw_final=%d threw_stream=%d ref_diff=%d\n",
                n_threw_final, n_threw_stream, n_mismatch_ref);
         g_fail += n_threw_final + n_threw_stream + n_mismatch_ref;
+        if (!all) { return g_fail == 0 ? 0 : 1; }
+    }
+
+    if (all || mode == "pipeline") {
+        printf("== server token pipeline, streaming against non streaming ==\n");
+        // generation stops on a lead byte with nothing after it: the classic byte fallback tail
+        pipeline_case("tail-c3",   {"abc", "\xC3"});
+        pipeline_case("tail-e4",   {"abc", "\xE4"});
+        pipeline_case("tail-e4b8", {"abc", "\xE4", "\xB8"});
+        pipeline_case("tail-f0",   {"abc", "\xF0"});
+        pipeline_case("only-c3",   {"\xC3"});
+        // a run of lead bytes: validate_utf8() holds the last one back every time
+        pipeline_case("run-c3",    {"\xC3", "\xC3", "\xC3", "\xC3"});
+        // a complete but ill formed sequence at the end: not held back, so both modes see it
+        pipeline_case("surrogate", {"abc", "\xED\xA0\x80"});
+        pipeline_case("overlong",  {"abc", "\xC0\x80"});
+        pipeline_case("above-max", {"abc", "\xF4\x90\x80\x80"});
+        // a stray continuation byte: also not held back
+        pipeline_case("stray-80",  {"abc", "\x80"});
+        // valid characters split across tokens: nothing may be lost or duplicated
+        pipeline_case("split-cjk", {"a", "\xE4", "\xB8", "\xAD", "b"});
+        pipeline_case("split-emo", {"a", "\xF0\x9F", "\x98\x80", "b"});
+        pipeline_case("valid-mix", {"caf", "\xC3\xA9", " ", "\xE4\xB8\xAD"});
+        printf("RESULT pipeline stream_lost_content=%d nostream_bad=%d asymmetric=%d\n",
+               n_pipe_stream_bad, n_pipe_nostream_bad, n_pipeline_asym);
+        g_fail += n_pipe_stream_bad + n_pipe_nostream_bad;
+        printf("note: an asymmetric row means the held back bytes never reached update_chat_msg()\n"
+               "      in stream mode, so only the non-streaming side could substitute for them.\n"
+               "      Streaming dropped them before this change too, so nothing is lost that was\n"
+               "      not lost already; it is not counted as a failure.\n");
         if (!all) { return g_fail == 0 ? 0 : 1; }
     }
 
