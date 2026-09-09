@@ -78,6 +78,10 @@ enum rpc_cmd {
     RPC_CMD_GET_TENSORS,
     RPC_CMD_COPY_TENSOR_TO,
     RPC_CMD_PEER_BARRIER,
+    // sent by a source server on the link it opened to a destination server, to mark that link as
+    // server to server. Only such a link may write a buffer it does not own. Appended last so the
+    // existing command numbers, and RPC_CMD_HELLO in particular, do not move.
+    RPC_CMD_PEER_LINK,
     RPC_CMD_COUNT,
 };
 
@@ -384,6 +388,7 @@ static const char * rpc_cmd_name(int cmd) {
         case RPC_CMD_GET_TENSORS:       return "GET_TENSORS";
         case RPC_CMD_COPY_TENSOR_TO:    return "COPY_TENSOR_TO";
         case RPC_CMD_PEER_BARRIER:      return "PEER_BARRIER";
+        case RPC_CMD_PEER_LINK:         return "PEER_LINK";
         default:                        return "?";
     }
 }
@@ -1545,6 +1550,8 @@ public:
         ggml_cgraph          * graph;
     };
 
+    void set_peer_link() { is_peer_link = true; }
+
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     // allow_foreign widens buffer validation from this session's buffers to every live buffer
@@ -1566,10 +1573,25 @@ private:
     std::unordered_set<ggml_backend_buffer_t> owned_buffers;
     // connections to other servers, one per destination endpoint, closed with this connection
     std::unordered_map<std::string, socket_ptr> peer_socks;
+    // endpoints this server could not reach, and until when not to try again. See get_peer_socket.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> peer_failed_until;
+    std::unordered_map<std::string, std::chrono::seconds> peer_backoff;
     // reused staging for RPC_CMD_COPY_TENSOR_TO
     std::vector<uint8_t> p2p_buf;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+    // Set only by RPC_CMD_PEER_LINK, which a source server sends on the link it opened to push a
+    // peer copy. Ordinary coordinator connections never send it and so can never write a buffer
+    // belonging to another session, which they previously could: SET_TENSOR widened validation for
+    // every caller because the peer-copy destination is the one path that legitimately needs it.
+    //
+    // This is isolation, not authentication. The RPC protocol has no authentication of any kind and
+    // an untrusted client could send this command too, so it does not make the port safe to expose;
+    // what it does is stop an ordinary or buggy client from reaching another session's buffers at
+    // all, which is the difference between every connection holding the privilege and only the one
+    // that asked for it.
+    bool is_peer_link = false;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1846,7 +1868,11 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // opened, not on the connection of the client that allocated the buffer, so this is the one
     // path that has to resolve a buffer belonging to another session. The write is still bounded
     // by the buffer range checks in deserialize_tensor and below.
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor, /* allow_foreign */ true);
+    //
+    // Only a link that declared itself with RPC_CMD_PEER_LINK gets that widening. An ordinary
+    // client connection is held to its own buffers, so it can no longer overwrite another
+    // session's buffer by supplying that buffer's pointer.
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor, /* allow_foreign */ is_peer_link);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
@@ -2152,18 +2178,55 @@ socket_ptr rpc_server::get_peer_socket(const std::string & endpoint) {
     if (it != peer_socks.end()) {
         return it->second;
     }
+
+    // A destination the coordinator can reach but this server cannot, which is what asymmetric
+    // firewall or NAT rules produce, fails here on every single cross-server copy. Nothing about
+    // that failure was remembered, so each split boundary paid another blocking connect, and when
+    // the packets are dropped rather than refused that is the full OS TCP timeout, tens of seconds
+    // each time. The fallback path is meant to be a mild slowdown, not a stall. Remember the
+    // failure and stop retrying it until the backoff expires.
+    const auto now = std::chrono::steady_clock::now();
+    {
+        auto bad = peer_failed_until.find(endpoint);
+        if (bad != peer_failed_until.end()) {
+            if (now < bad->second) {
+                return nullptr;
+            }
+            peer_failed_until.erase(bad);
+        }
+    }
+
+    auto fail = [&](const char * why) -> socket_ptr {
+        // grows 1s, 2s, 4s ... to a cap, so a destination that is down briefly is retried soon
+        // while one that is unreachable by routing stops costing anything measurable
+        auto & backoff = peer_backoff[endpoint];
+        backoff = backoff == std::chrono::seconds(0) ? std::chrono::seconds(1)
+                                                     : std::min(backoff * 2, std::chrono::seconds(60));
+        peer_failed_until[endpoint] = now + backoff;
+        GGML_LOG_ERROR("[%s] %s: %s, not retrying for %llds\n", __func__, endpoint.c_str(), why,
+                       (long long) backoff.count());
+        return nullptr;
+    };
+
     // the same connect and HELLO negotiation a client does, so a server to server link uses
     // RDMA whenever both rails allow it and TCP otherwise
     // may_fail: a destination that is down or restarting is a recoverable condition here
     auto sock = get_socket(endpoint, /* may_fail */ true);
     if (sock == nullptr) {
-        GGML_LOG_ERROR("[%s] failed to connect to %s\n", __func__, endpoint.c_str());
-        return nullptr;
+        return fail("failed to connect");
     }
     if (!(sock->conn.server_flags & RPC_SRV_FLAG_PEER_COPY)) {
-        GGML_LOG_ERROR("[%s] %s does not support peer to peer copies\n", __func__, endpoint.c_str());
-        return nullptr;
+        return fail("does not support peer to peer copies");
     }
+    // Declare this link server to server before any write goes over it. The destination only
+    // widens buffer validation for links that have said this, so without it the copy would be
+    // rejected as a write to a buffer this session does not own.
+    rpc_msg_peer_barrier_rsp linked;
+    if (!send_rpc_cmd(sock, RPC_CMD_PEER_LINK, nullptr, 0, &linked, sizeof(linked)) || linked.result == 0) {
+        return fail("peer link handshake failed");
+    }
+
+    peer_backoff.erase(endpoint);
     peer_socks[endpoint] = sock;
     return sock;
 }
@@ -2435,6 +2498,18 @@ rpc_server::~rpc_server() {
     }
 }
 
+// connections currently being served, and the ceiling on them. See the accept loop.
+static std::atomic<int> rpc_live_conns{0};
+
+static int rpc_max_conns() {
+    static const int n = [] {
+        const char * e = getenv("GGML_RPC_MAX_CONNECTIONS");
+        const int v = e != nullptr ? atoi(e) : 0;
+        return v > 0 ? v : 64;
+    }();
+    return n;
+}
+
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              socket_ptr sock, rpc_server_shared & shared) {
     rpc_server server(backends, cache_dir, shared);
@@ -2699,6 +2774,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PEER_LINK: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                server.set_peer_link();
+                rpc_msg_peer_barrier_rsp response;
+                response.result = 1;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2820,12 +2907,29 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             fprintf(stderr, "Failed to accept client connection\n");
             return;
         }
+        // Every accepted socket used to get a detached thread before HELLO was validated, and that
+        // thread can sit in recv_data() indefinitely because the transport sets no read timeout. A
+        // host that opens connections and then says nothing therefore consumed a thread, its stack
+        // and a descriptor each time, without ever completing a handshake, until the server ran out
+        // of one of them. Cap the number of connections served at once and refuse beyond it, which
+        // costs a well behaved deployment nothing: the coordinator and its peers are few.
+        if (rpc_live_conns.load(std::memory_order_relaxed) >= rpc_max_conns()) {
+            fprintf(stderr, "Refusing client connection: already serving %d, limit %d "
+                            "(raise with GGML_RPC_MAX_CONNECTIONS)\n",
+                    rpc_live_conns.load(std::memory_order_relaxed), rpc_max_conns());
+            fflush(stderr);
+            // dropping the last reference closes it, so the peer sees the connection go away
+            continue;
+        }
+        rpc_live_conns.fetch_add(1, std::memory_order_relaxed);
+
         printf("Accepted client connection\n");
         fflush(stdout);
         // the state the threads share outlives this function, so a failed accept cannot pull
         // it out from under a connection that is still being served
         std::thread([backends, cache_dir, client_socket, shared]() {
             rpc_serve_client(backends, cache_dir, client_socket, *shared);
+            rpc_live_conns.fetch_sub(1, std::memory_order_relaxed);
             printf("Client connection closed\n");
             fflush(stdout);
         }).detach();
