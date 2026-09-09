@@ -39,8 +39,27 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
     int n_kept = 1;
     bool from_cli = false;
 
+    // Everything after a bare "--" is an operand by convention, never an option, so the scan
+    // stops there and leaves the separator and the rest of argv untouched. That is as far as a
+    // pre-scan can go: it runs before the option table exists, so it cannot tell an option from
+    // the value of a preceding option, and a literal "--pipeline-groups" passed as some other
+    // option's value earlier in the line is still consumed. Registering the option with the
+    // parser is the only complete fix; see the note in tools/server/README.md.
+    bool operands_only = false;
+
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
+
+        if (!operands_only && arg == "--") {
+            operands_only = true;
+            argv[n_kept++] = argv[i];
+            continue;
+        }
+
+        if (operands_only) {
+            argv[n_kept++] = argv[i];
+            continue;
+        }
 
         if (arg == opt) {
             if (i + 1 >= argc) {
