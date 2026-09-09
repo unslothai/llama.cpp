@@ -5481,13 +5481,20 @@ struct ggml_cuda_trace_mark {
     cudaEvent_t event;
 };
 
-struct ggml_cuda_trace_state {
-    std::mutex                        mutex;
+// elapsed time is only defined between events of the same device, so each device needs its own
+// anchor and its own queues. A single shared anchor bound to whichever device marked first made
+// every mark on the other devices undeliverable, and the tracer still handed out tags for them,
+// so a multi-GPU trace silently lost all work outside that one device.
+struct ggml_cuda_trace_device {
     std::vector<ggml_cuda_trace_mark> pending;
     std::vector<cudaEvent_t>          spare;
     cudaEvent_t                       anchor    = nullptr;
-    int64_t                           anchor_us = 0;
-    int                               device    = -1;
+    int64_t                           anchor_us = 0;  // 0 until the anchor is first seen complete
+};
+
+struct ggml_cuda_trace_state {
+    std::mutex                             mutex;
+    std::map<int, ggml_cuda_trace_device>  devs;
 };
 
 static ggml_cuda_trace_state & ggml_cuda_trace() {
@@ -5503,28 +5510,27 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
 
     std::lock_guard<std::mutex> lock(st.mutex);
 
-    if (st.anchor == nullptr) {
+    ggml_cuda_trace_device & d = st.devs[cuda_ctx->device];
+
+    if (d.anchor == nullptr) {
         ggml_cuda_set_device(cuda_ctx->device);
-        if (cudaEventCreate(&st.anchor) != cudaSuccess) {
-            st.anchor = nullptr;
+        if (cudaEventCreate(&d.anchor) != cudaSuccess) {
+            d.anchor = nullptr;
             return;
         }
-        st.device = cuda_ctx->device;
-        // every later mark is reported as anchor_us + elapsed(anchor, mark)
-        cudaEventRecord(st.anchor, cuda_ctx->stream());
-        cudaEventSynchronize(st.anchor);
-        st.anchor_us = ggml_time_us();
-    }
-
-    // elapsed time is only defined between events of the same device
-    if (cuda_ctx->device != st.device) {
-        return;
+        // every later mark is reported as anchor_us + elapsed(anchor, mark). The anchor is only
+        // recorded here, never waited on: synchronizing would drain whatever the scheduler has
+        // already queued on this stream, so switching the tracer on would change the execution it
+        // is supposed to observe. Its wall clock is taken in poll, the first time it is seen
+        // complete, which leaves absolute timestamps with an offset bounded by the poll interval
+        // and leaves the spacing between marks exact.
+        cudaEventRecord(d.anchor, cuda_ctx->stream());
     }
 
     cudaEvent_t event = nullptr;
-    if (!st.spare.empty()) {
-        event = st.spare.back();
-        st.spare.pop_back();
+    if (!d.spare.empty()) {
+        event = d.spare.back();
+        d.spare.pop_back();
     } else {
         if (cudaEventCreate(&event) != cudaSuccess) {
             return;
@@ -5532,11 +5538,11 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
     }
 
     if (cudaEventRecord(event, cuda_ctx->stream()) != cudaSuccess) {
-        st.spare.push_back(event);
+        d.spare.push_back(event);
         return;
     }
 
-    st.pending.push_back({ tag, kind, event });
+    d.pending.push_back({ tag, kind, event });
 }
 
 // never waits: returns the marks already completed, so the caller loops until it gets < `max`.
@@ -5545,28 +5551,40 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
     ggml_cuda_trace_state & st = ggml_cuda_trace();
 
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (st.anchor == nullptr) {
-        return 0;
-    }
 
     int n = 0;
-    size_t keep = 0;
-    for (size_t i = 0; i < st.pending.size(); i++) {
-        ggml_cuda_trace_mark & mark = st.pending[i];
-        if (n < max && cudaEventQuery(mark.event) == cudaSuccess) {
-            float ms = 0.0f;
-            if (cudaEventElapsedTime(&ms, st.anchor, mark.event) == cudaSuccess) {
-                tags [n] = mark.tag;
-                kinds[n] = mark.kind;
-                t_us [n] = st.anchor_us + (int64_t)(ms * 1000.0f);
-                n++;
-            }
-            st.spare.push_back(mark.event);
-        } else {
-            st.pending[keep++] = mark;
+    for (auto & entry : st.devs) {
+        ggml_cuda_trace_device & d = entry.second;
+        if (d.anchor == nullptr) {
+            continue;
         }
+        // the anchor is recorded before any mark on this stream, so it always completes first.
+        // Until it has, its wall clock is unknown and the marks simply stay pending.
+        if (d.anchor_us == 0) {
+            if (cudaEventQuery(d.anchor) != cudaSuccess) {
+                continue;
+            }
+            d.anchor_us = ggml_time_us();
+        }
+
+        size_t keep = 0;
+        for (size_t i = 0; i < d.pending.size(); i++) {
+            ggml_cuda_trace_mark & mark = d.pending[i];
+            if (n < max && cudaEventQuery(mark.event) == cudaSuccess) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, d.anchor, mark.event) == cudaSuccess) {
+                    tags [n] = mark.tag;
+                    kinds[n] = mark.kind;
+                    t_us [n] = d.anchor_us + (int64_t)(ms * 1000.0f);
+                    n++;
+                }
+                d.spare.push_back(mark.event);
+            } else {
+                d.pending[keep++] = mark;
+            }
+        }
+        d.pending.resize(keep);
     }
-    st.pending.resize(keep);
 
     return n;
 }
