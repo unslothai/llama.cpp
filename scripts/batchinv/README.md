@@ -19,7 +19,9 @@ before the inherited selective column dispatcher. Without this, the recurrent
 output projection bypasses batch invariance during concurrent prefill.
 It is measured on text prompts with Qwen3.5-4B on one B200. Every KV layer has to
 be on the CUDA backend, since no other backend reads the page table; a partial or
-absent offload fails the load naming the layer. The V-less attention layouts have
+absent offload fails the load naming the layer. A recurrent-only model is held to
+the same rule for its state layers, since the grouping that keeps its decode
+ubatches equal relies on the batch-invariant dispatcher the CUDA sources carry. The V-less attention layouts have
 no page table either, and a model on one of those is refused at context creation.
 Context shifting, position division, cross-sequence prefix copies, shared-prefix
 input tokens, and whole-context state loading are unsupported. Per-sequence state

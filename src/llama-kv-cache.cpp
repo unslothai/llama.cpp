@@ -75,12 +75,7 @@ static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
         return false;
     }
 
-    const char * name = ggml_backend_reg_name(reg);
-    if (!name) {
-        return false;
-    }
-
-    return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
+    return llama_exact_backend_name(ggml_backend_reg_name(reg));
 }
 
 // [TAG_EXACT_CONCURRENCY] whether the device can actually run the paged attention op for a layer
