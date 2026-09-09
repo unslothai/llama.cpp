@@ -4062,16 +4062,11 @@ private:
 
                     rotate_pick(false);
 
-                    // [TAG_PREEMPT] a resident the budget cannot swap out is rotated by dropping its cells, as ordinary victim selection does: waiting instead has no bound, a resident that keeps shifting need never finish
-                    if (!pick && budget_refused) {
-                        const int64_t t_waited = ggml_time_us() - head->t_preempt_us;
+                    // [TAG_PREEMPT] a resident the budget cannot swap out is rotated by dropping its cells, as ordinary victim selection does: waiting instead has no bound, a resident that keeps shifting need never finish. The head waits longer for this than for a swap: the rotated resident pays a whole re-prefill, and under exact concurrency it stops being the sequence that was parked
+                    if (!pick && budget_refused && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_RECOMPUTE_US) {
+                        rotate_pick(true);
 
-                        // [TAG_EXACT_CONCURRENCY] a re-prefilled resident is not the sequence that left, so under the mode the head waits first; the wait is bounded, and the request is told what it got
-                        if (!common_exact_concurrency() || t_waited >= PREEMPT_ROTATE_RECOMPUTE_US) {
-                            rotate_pick(true);
-
-                            recompute = pick != nullptr;
-                        }
+                        recompute = pick != nullptr;
                     }
 
                     const int64_t t_start   = ggml_time_us();
@@ -4080,7 +4075,7 @@ private:
                     if (!pick && budget_refused && !head->preempt_rotation_refused) {
                         head->preempt_rotation_refused = true;
 
-                        SLT_WRN(*head, "no rotation yet: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; under exact concurrency the head waits %.0f s before a resident is rotated out by dropping its cells\n",
+                        SLT_WRN(*head, "no rotation: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; the head waits for a resident to finish, or %.0f s for one to be rotated out by dropping its cells\n",
                                 params_base.preempt_ram_mib, PREEMPT_ROTATE_RECOMPUTE_US / 1e6);
                     }
 
