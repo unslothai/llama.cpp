@@ -840,6 +840,12 @@ struct server_group {
 
     llama_context * ctx = nullptr;
 
+    // groups after the first are made by llama_init_from_model(), which does not attach the
+    // pool common_init_from_params() builds for group 0. Without one the CPU backend makes a
+    // throwaway pool per graph and ignores --cpu-mask, --prio, --poll and --cpu-strict.
+    // Declared after ctx so it outlives the llama_free() above groups.clear().
+    std::unique_ptr<common_threadpools> threadpools;
+
     server_batch batch;
 
     std::vector<server_slot *> slots;
@@ -1232,6 +1238,9 @@ private:
                     groups.clear();
                     return false;
                 }
+
+                groups[g]->threadpools = std::make_unique<common_threadpools>();
+                groups[g]->threadpools->init(groups[g]->ctx, params_ctx);
 
                 SRV_INF("created llama_context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
                         g, (int) llama_n_ctx(groups[g]->ctx), (int) llama_n_seq_max(groups[g]->ctx));
