@@ -175,27 +175,72 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
 // lead byte plus the continuation bytes that actually followed it, never past the length the
 // lead announced. A byte that is itself a continuation is a failed sequence on its own, which
 // is why "\x80\x80" is two replacements rather than one.
-static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
-    const unsigned char lead = static_cast<unsigned char>(s[pos]);
-    size_t want = 1;
-    // The FIRST continuation is range restricted for four leads, and the serialiser's decoder
-    // rejects the sequence at that byte rather than absorbing it: E0 80 is an overlong form,
-    // ED A0 a surrogate, F0 80 overlong again and F4 90 past U+10FFFF. Each of those renders as
-    // TWO replacement characters, the lead alone and then the stray continuation, so treating
-    // every 10xxxxxx byte as part of the prefix would emit one and disagree with the client.
-    unsigned char lo = 0x80, hi = 0xbf;
+// The lead byte's own rules: how many bytes the sequence claims, and the range the FIRST
+// continuation must fall in. Four leads restrict that range, and they are the whole reason
+// overlong forms, surrogates and anything past U+10FFFF can be told apart from valid text:
+// E0 80 is an overlong encoding, ED A0 a surrogate, F0 80 overlong again, F4 90 out of range.
+// Returns false for a byte that can never begin a sequence: a bare continuation, C0 or C1
+// (only ever overlong), or F5..FF.
+static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & lo, unsigned char & hi) {
+    lo = 0x80;
+    hi = 0xbf;
+    if (lead < 0x80) {
+        want = 1;
+        return true;
+    }
     if (lead >= 0xc2 && lead <= 0xdf) {
         want = 2;
-    } else if (lead >= 0xe0 && lead <= 0xef) {
+        return true;
+    }
+    if (lead >= 0xe0 && lead <= 0xef) {
         want = 3;
         if (lead == 0xe0) { lo = 0xa0; }
         if (lead == 0xed) { hi = 0x9f; }
-    } else if (lead >= 0xf0 && lead <= 0xf4) {
+        return true;
+    }
+    if (lead >= 0xf0 && lead <= 0xf4) {
         want = 4;
         if (lead == 0xf0) { lo = 0x90; }
         if (lead == 0xf4) { hi = 0x8f; }
-    } else {
-        return 1; // a bare continuation, C0/C1 overlong, or F5..FF: never a usable lead
+        return true;
+    }
+    return false;
+}
+
+// Whether `len` bytes at `pos` are a legal Unicode scalar. `common_parse_utf8_codepoint` checks
+// continuation SHAPE only -- `(c & 0xc0) == 0x80` -- and never the lead's range, so it reports
+// SUCCESS for C0 80, ED A0 80 and F4 90 80 80. Copying those through unchanged is not harmless:
+// the JSON serialiser replaces them, so the client is shown something different from what a
+// parser receives, and the AST dump under `params.debug` uses a plain dump() with no error
+// handler, which throws on exactly these bytes and aborts the completion this change exists to
+// keep alive. The shared parser is left alone: it has other callers, and the check belongs where
+// the sanitising happens.
+static bool utf8_is_scalar(const std::string & s, size_t pos, size_t len) {
+    if (len == 0 || pos + len > s.size()) {
+        return false;
+    }
+    size_t want = 0;
+    unsigned char lo = 0, hi = 0;
+    if (!utf8_lead_bounds(static_cast<unsigned char>(s[pos]), want, lo, hi) || want != len) {
+        return false;
+    }
+    for (size_t i = 1; i < want; i++) {
+        const unsigned char c = static_cast<unsigned char>(s[pos + i]);
+        const bool ok = (i == 1) ? (c >= lo && c <= hi) : ((c & 0xc0) == 0x80);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// How many bytes the JSON serialiser treats as ONE failed sequence, so that one U+FFFD replaces
+// exactly the same span the client is shown.
+static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
+    size_t want = 0;
+    unsigned char lo = 0, hi = 0;
+    if (!utf8_lead_bounds(static_cast<unsigned char>(s[pos]), want, lo, hi) || want == 1) {
+        return 1;
     }
     size_t have = 1;
     while (have < want && pos + have < s.size()) {
@@ -219,7 +264,7 @@ static void append_utf8_sanitized(std::string & text, std::string & pending, con
             // wait for the rest of the sequence
             break;
         }
-        if (res.status == utf8_parse_result::SUCCESS) {
+        if (res.status == utf8_parse_result::SUCCESS && utf8_is_scalar(pending, pos, res.bytes_consumed)) {
             text.append(pending, pos, res.bytes_consumed);
             pos += res.bytes_consumed;
             continue;
