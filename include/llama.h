@@ -796,8 +796,12 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible unit: 1 ordinarily,
-    // larger where a mode places cells in blocks, and then n tokens occupy round_up(n, granularity)
-    // cells. A caller deciding whether the pool has room must round the same way.
+    // larger where a mode places cells in blocks, and then n contiguous tokens occupy
+    // round_up(n, granularity) cells. A caller deciding whether the pool has room must round the
+    // same way. round_up is the contiguous case only: a block is held for as long as any cell in
+    // it is live, so a sequence left with holes by a partial llama_memory_seq_rm still holds every
+    // block that has one, which can be far more than round_up of what it has left. Removing
+    // positions 1 to 510 of a 512-token sequence leaves two live cells holding two whole blocks.
     LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
 
     // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1
