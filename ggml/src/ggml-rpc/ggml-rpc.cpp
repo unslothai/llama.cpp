@@ -502,13 +502,19 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+// may_fail is for connections opened from inside a server: a destination that disconnects or
+// truncates its HELLO must not abort the source server and every client it is serving, so the
+// caller gets false and copy_tensor_to reports result = 0. A client keeps aborting as before.
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, bool may_fail = false) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
     sock->get_caps(request.conn_caps);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
+    if (!status && may_fail) {
+        return false;
+    }
     RPC_STATUS_ASSERT(status);
 
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
@@ -537,7 +543,7 @@ static std::shared_ptr<socket_t> find_socket(const std::string & endpoint) {
     return nullptr;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint, bool may_fail = false) {
     std::lock_guard<std::mutex> lock(g_sockets_mutex);
 
     auto it = g_sockets.find(endpoint);
@@ -560,7 +566,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, may_fail)) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -2035,7 +2041,8 @@ socket_ptr rpc_server::get_peer_socket(const std::string & endpoint) {
     }
     // the same connect and HELLO negotiation a client does, so a server to server link uses
     // RDMA whenever both rails allow it and TCP otherwise
-    auto sock = get_socket(endpoint);
+    // may_fail: a destination that is down or restarting is a recoverable condition here
+    auto sock = get_socket(endpoint, /* may_fail */ true);
     if (sock == nullptr) {
         GGML_LOG_ERROR("[%s] failed to connect to %s\n", __func__, endpoint.c_str());
         return nullptr;
