@@ -795,6 +795,33 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible unit: 1 ordinarily,
+    // larger where a mode places cells in blocks, and then n contiguous tokens occupy
+    // round_up(n, granularity) cells. A caller deciding whether the pool has room must round the
+    // same way. round_up is the contiguous case only: a block is held for as long as any cell in
+    // it is live, so a sequence left with holes by a partial llama_memory_seq_rm still holds every
+    // block that has one, which can be far more than round_up of what it has left. Removing
+    // positions 1 to 510 of a 512-token sequence leaves two live cells holding two whole blocks.
+    LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
+
+    // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1
+    // plus the draft length under speculative decoding. Under LLAMA_EXACT_CONCURRENCY a sequence
+    // set with more left to place is a prompt and is prefilled in a ubatch of its own; one at or
+    // below stays grouped with the other decodes. Process-wide, default 1, never lowered. Raising
+    // it widens every existing context's decode step and re-reports their width; returns false,
+    // and changes nothing, when an explicit column bound cannot cover that width.
+    LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
+    LLAMA_API uint32_t llama_exact_decode_tokens(void);
+
+    // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns: the
+    // sequences a context holds times the tokens each contributes. Every context reports its own
+    // at creation and a backend keeps the widest it has heard. A caller that builds wider steps
+    // reports the width itself, before the context or the first decode. Never lowered. Returns
+    // false, reporting nothing, when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is positive and below the
+    // width: that bound wins in the backend, so decodes above it would be left batched.
+    LLAMA_API bool     llama_set_exact_decode_width(uint32_t n_cols);
+    LLAMA_API uint32_t llama_exact_decode_width(void);
+
     //
     // State / sessions
     //

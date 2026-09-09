@@ -103,3 +103,21 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+// [TAG_EXACT_CONCURRENCY] opt-in mode under which a sequence's attention depends only on its own
+// cells, in position order, so its output does not change when others share the KV cache. Off by
+// default; reads the same variable as the paged KV cache and the CUDA backend.
+bool llama_exact_concurrency();
+
+// [TAG_EXACT_CONCURRENCY] whether a device's backend carries the mode's kernels: the paged
+// attention and the batch-invariant dispatcher live in the CUDA sources, also built as ROCm and
+// MUSA. Every other backend reduces in whatever order its batch shape dictates, so a layer placed
+// there would silently lose the guarantee. Takes the registry name (`ggml_backend_reg_name`).
+bool llama_exact_backend_name(const char * reg_name);
+
+// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend
+// knows the width every context needs and it follows llama_set_exact_decode_tokens
+bool llama_exact_report_n_seq(uint32_t n_seq);
+
+// the same check without the report, for a constructor that may still fail after asking
+bool llama_exact_check_n_seq(uint32_t n_seq);

@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1289,6 +1290,14 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure
+    // the explicit bound does not cover; this also covers a caller that skipped
+    // common_params_parse(). On failure nothing is loaded.
+    if (!model_only && !common_exact_concurrency_init(params)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
+        return;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1431,6 +1440,78 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool common_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+int common_exact_decode_width(const common_params & params) {
+    const int64_t n_slots = std::max(1, params.n_parallel);
+
+    // draft tokens a slot carries into the verify ubatch, from the same place the speculation
+    // code takes its own width
+    const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
+
+    // the product is handed to a backend as an int; one that overflows is reported, not wrapped
+    const int64_t n_cols = n_slots*(1 + n_draft);
+
+    return n_cols > INT32_MAX ? -1 : (int) n_cols;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool common_exact_concurrency_init(const common_params & params) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    // DFlash drafting turns causal attention off on its draft context, which the paged attention
+    // needs; say so instead of asserting in the graph. DSpark is the same implementation.
+    for (const auto type : params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
+            return false;
+        }
+    }
+
+    const int n_cols = common_exact_decode_width(params);
+
+    if (n_cols < 0) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY: a decode step of %d slots with %d draft tokens each is too wide to report\n",
+                std::max(1, params.n_parallel), std::max(0, (int) common_speculative_n_max(&params.speculative)));
+        return false;
+    }
+
+    const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+    if (bound) {
+        const int max_cols = atoi(bound);
+        if (max_cols > 0 && max_cols < n_cols) {
+            COM_ERR("GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at "
+                    "least %d to cover a decode step of %d slots, above which a matmul is left "
+                    "batched and its rows depend on the other rows in the ubatch. Raise it to %d, "
+                    "set it to 0 for no bound, or unset it to let it default to %d.\n",
+                    max_cols, n_cols, std::max(1, params.n_parallel), n_cols, n_cols);
+            return false;
+        }
+    }
+
+    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step
+    // is. A context created later reports n_seq_max times that, which is n_cols again; reporting
+    // n_cols here too covers a caller that decodes first, or contexts it created earlier.
+    if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
+        !llama_set_exact_decode_width((uint32_t) n_cols)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
+        return false;
+    }
+
+    return true;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {

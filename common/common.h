@@ -931,6 +931,17 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
+// [TAG_EXACT_CONCURRENCY] true when LLAMA_EXACT_CONCURRENCY is set for this process
+bool common_exact_concurrency();
+
+// the widest ubatch a decode step can build here: one column per slot times one plus its draft
+// tokens. Under exact mode the CUDA column policy has to cover this, and derives its bound from it.
+int common_exact_decode_width(const common_params & params);
+
+// report that width to the CUDA backend, refusing a smaller explicit
+// GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
+bool common_exact_concurrency_init(const common_params & params);
+
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 

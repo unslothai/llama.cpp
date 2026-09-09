@@ -32,6 +32,75 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by a backend
+// that carries the mode's kernels. A host buffer is the interesting case: the scheduler runs an
+// operation on the backend holding its weight, and moves a host weight's operation to the GPU
+// only once the batch is wide enough (ggml_backend_cuda_device_offload_op), while the CPU matmul
+// picks between its SGEMM and its vector dot by the batch width too.
+static bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
+    if (!buft || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg));
+}
+
+// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks where the weights that
+// produce the tokens live. Every per-layer weight and the output head must be on a backend with
+// the mode's kernels, otherwise a sequence's own matmuls change with the width of the step it
+// shares, while the mode still reports itself as on.
+//
+// token_embd is deliberately not required to move: it feeds get_rows, a per-row copy, and
+// GET_ROWS reports a batch size of 0 to the offload test, so it stays on the same backend at
+// every width. A model that ties its head to the embedding uses that same tensor for the output
+// matmul, and model.output points at it, so the head check below still covers that case.
+static void llama_exact_check_weights(const llama_model & model) {
+    auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
+        if (!t || !t->buffer) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+
+        return llama_exact_buft_invariant(buft) ? nullptr : buft;
+    };
+
+    auto refuse = [&model](const char * name, ggml_backend_buffer_type_t buft, const char * what) {
+        const std::string tname = name;
+
+        const char * fix = "pass -ngl to offload every layer, and no --override-tensor that keeps one on the host";
+
+        if (tname.find("_exps") != std::string::npos) {
+            fix = "do not pass --cpu-moe or --n-cpu-moe, and no --override-tensor that keeps an expert on the host";
+        } else if (model.has_tensor_overrides()) {
+            fix = "drop the --override-tensor that placed it there, and pass -ngl to offload every layer";
+        }
+
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but %s %s is in a %s buffer, which has no "
+                "batch-invariant kernels: its result would depend on how many sequences share the step (%s)\n",
+                __func__, what, tname.c_str(), ggml_backend_buft_name(buft), fix);
+
+        throw std::runtime_error("exact concurrency: a weight is not on the CUDA backend");
+    };
+
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (name.rfind("blk.", 0) != 0) {
+            continue;
+        }
+
+        if (auto * buft = host_buft(t)) {
+            refuse(name.c_str(), buft, "layer weight");
+        }
+    }
+
+    if (auto * buft = host_buft(model.output)) {
+        refuse(ggml_get_name(model.output), buft, "the output head");
+    }
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -99,6 +168,24 @@ llama_context::llama_context(
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+    }
+
+    // [TAG_EXACT_CONCURRENCY] the widest decode step this context can build: one column per
+    // sequence times the tokens a sequence contributes, reported so a backend splitting columns
+    // covers it (a caller that builds wider steps uses llama_set_exact_decode_width). The
+    // sequence count is what is reported, so a later rise in the tokens figure follows it here
+    // too. Checked now but reported at the end of the constructor, so a construction that fails
+    // later does not leave a width behind that no context needs.
+    if (llama_exact_concurrency()) {
+        // an explicit column bound wins in the backend, so one below this context's width would
+        // leave decodes batched above it; the report refuses that, and that is an error here
+        if (!llama_exact_check_n_seq(cparams.n_seq_max)) {
+            throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
+        }
+
+        if (!hparams.vocab_only) {
+            llama_exact_check_weights(model);
+        }
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
@@ -393,6 +480,13 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_EXACT_CONCURRENCY] the paged attention is causal, so a non-causal context with a
+        // cache would assert on its first graph
+        if (llama_exact_concurrency() && memory && !cparams.causal_attn) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so it cannot be created with non-causal attention\n", __func__);
+            throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
+        }
     }
 
     // init backends
@@ -475,6 +569,12 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // [TAG_EXACT_CONCURRENCY] nothing above can fail now, so publish the width; already checked
+    // against the explicit bound at the top, so a refusal here means the bound moved
+    if (llama_exact_concurrency() && !llama_exact_report_n_seq(cparams.n_seq_max)) {
+        throw std::runtime_error("exact concurrency: the explicit column bound is below this context's decode width");
     }
 }
 
@@ -1185,6 +1285,13 @@ void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (cparams.causal_attn == value) {
+        return;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] the paged attention is causal, so a context with a cache keeps
+    // causal attention rather than asserting in the next graph
+    if (!value && memory && llama_exact_concurrency()) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so causal attention cannot be turned off; the change is refused\n", __func__);
         return;
     }
 
@@ -2625,17 +2732,16 @@ public:
             }
             const size_t tensor_bytes = ggml_nbytes(tensor);
             auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-            // A fragmented sequence can require thousands of synchronous device
-            // transfers per layer. For bounded tensors, stage the tensor once and
-            // preserve every byte belonging to other sequences. Bound scratch RAM
-            // and leave ordinary contiguous transfers on their original fast path.
+            // a fragmented sequence can need thousands of synchronous device transfers per
+            // layer: stage a bounded tensor once instead, preserving other sequences' bytes and
+            // leaving ordinary contiguous transfers on their fast path
             if (end - i >= 64 && tensor_bytes <= 64 * 1024 * 1024 &&
                     !ggml_backend_buffer_is_host(buffer)) {
                 std::vector<uint8_t> staging;
                 try {
                     staging.resize(tensor_bytes);
                 } catch (const std::bad_alloc &) {
-                    // Fall back to the individual transfers below.
+                    // fall back to the individual transfers below
                 }
                 if (!staging.empty()) {
                     ggml_backend_tensor_get(tensor, staging.data(), 0, tensor_bytes);
@@ -3226,6 +3332,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical
+    // index, which the paged pool owns. Refused before anything is parsed, so the caller's cache
+    // is left as it was: the generic restore path clears it on failure.
+    if (memory && memory->alloc_granularity() > 1) {
+        throw std::runtime_error("whole-context restore is not supported with LLAMA_EXACT_CONCURRENCY, restore per sequence");
+    }
+
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4028,6 +4141,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+uint32_t llama_memory_alloc_granularity(llama_memory_t mem) {
+    if (!mem) {
+        return 1;
+    }
+
+    return mem->alloc_granularity();
 }
 
 // llama state API
