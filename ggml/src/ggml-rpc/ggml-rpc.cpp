@@ -1404,8 +1404,18 @@ bool rpc_server::set_tensor_stream(const socket_ptr & sock) {
         }
     }
 
-    // only a host buffer can take the payload directly; hashing for the cache also needs it contiguous
-    const bool direct = ggml_backend_buffer_is_host(tensor->buffer) && cache_dir == nullptr;
+    // Only a host buffer can take the payload directly; hashing for the cache also needs it
+    // contiguous. is_host alone is not enough: it says the memory is addressable, not that
+    // set_tensor is a plain memcpy. ggml-hexagon reports is_host when opt_hostbuf is set and its
+    // set_tensor repacks Q4_0, Q4_1, Q8_0, IQ4_NL and MXFP4 into a tiled layout, so receiving
+    // into tensor->data and skipping the hook would leave those weights in the wrong layout and
+    // silently produce wrong results. Restrict the shortcut to the CPU buffer type, whose
+    // set_tensor is a memcpy by construction; every other backend keeps the staged path and its
+    // hook. That costs nothing in practice, since a device-backed rpc-server is not host-visible
+    // and was already staging.
+    const bool direct = cache_dir == nullptr &&
+                        ggml_backend_buffer_is_host(tensor->buffer) &&
+                        ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_cpu_buffer_type();
     uint8_t * dst;
     if (direct) {
         dst = (uint8_t *) tensor->data + offset;
