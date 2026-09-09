@@ -335,23 +335,31 @@ bool socket_t::impl::rdma_probe() {
     if (!rdma->qp) return false;
     rdma->max_inline = qia.cap.max_inline_data;
 
-    // as many send slots as memlock allows, down to one, so a tight limit degrades instead of failing
+    // as many send slots as memlock allows, down to one, so a tight limit degrades instead of
+    // failing. RX has to be registered inside the loop: the limit that binds is TX and RX
+    // together, so the largest TX can register on its own and still leave no room for RX. With
+    // RX outside, that case fell straight back to TCP without ever trying a smaller TX depth.
+    // The RX buffer itself is a fixed size, so only its registration is retried.
+    rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
+    if (!rdma->rx_buf) return false;
     for (int d = rdma_load_opt() ? RDMA_TX_DEPTH : 1; d >= 1; d /= 2) {
         rdma->tx_buf = aligned_alloc(4096, static_cast<size_t>(d) * RDMA_CHUNK);
         if (!rdma->tx_buf) continue;
         rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, static_cast<size_t>(d) * RDMA_CHUNK,
                                  IBV_ACCESS_LOCAL_WRITE);
         if (rdma->tx_mr) {
-            rdma->tx_depth = d;
-            break;
+            rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+            if (rdma->rx_mr) {
+                rdma->tx_depth = d;
+                break;
+            }
+            ibv_dereg_mr(rdma->tx_mr);
+            rdma->tx_mr = nullptr;
         }
         free(rdma->tx_buf);
         rdma->tx_buf = nullptr;
     }
-    rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
-    if (!rdma->tx_buf || !rdma->rx_buf) return false;
-    rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
-                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!rdma->tx_mr || !rdma->rx_mr) return false;
 
     ibv_gid local_gid;
