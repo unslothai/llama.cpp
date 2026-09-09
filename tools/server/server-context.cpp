@@ -315,9 +315,6 @@ struct server_slot {
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
-    // token from the parallel sampling pass of post_decode, LLAMA_TOKEN_NULL if it did not run
-    llama_token pre_sampled = LLAMA_TOKEN_NULL;
-
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
     // corresponding to one token position (size = n_embd)
     std::vector<float> inp_embd;
@@ -336,7 +333,6 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void reset() {
-        pre_sampled = LLAMA_TOKEN_NULL;
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -813,11 +809,12 @@ struct server_group_prof {
     int64_t t_relock = 0; // re-taking the engine lock after the decode
     int64_t t_post   = 0; // post_decode
     int64_t t_sampl  = 0; //   of which: common_sampler_sample
-    int64_t t_sampl_par = 0; //   of which: the parallel sampling pass
     int64_t t_piece  = 0; //   of which: common_token_to_piece
     int64_t t_proc   = 0; //   of which: process_token (stop strings, streaming)
     int64_t t_send   = 0; //   of which: queue_results.send
     int64_t t_iter   = 0; // the whole iteration
+
+    int64_t t_prof_last = 0; // start of this group's reporting window
 };
 
 struct prof_timer {
@@ -833,91 +830,6 @@ struct prof_timer {
     prof_timer & operator=(const prof_timer &) = delete;
 };
 
-
-// each slot has its own sampler and its own row of the logits, so parallel sampling is exact
-struct server_par_for {
-    std::vector<std::thread>        workers;
-    std::mutex                      mtx;
-    std::condition_variable         cv_work;
-    std::condition_variable         cv_done;
-    const std::function<void(int)> * fn = nullptr;
-    int      n         = 0;
-    int      next      = 0;
-    int      n_running = 0;
-    uint64_t gen       = 0;
-    bool     stop      = false;
-
-    void start(int n_threads) {
-        for (int i = 0; i < n_threads; ++i) {
-            workers.emplace_back([this]() { worker(); });
-        }
-    }
-
-    // run fn(0..n_-1), the calling thread takes its share too
-    void run(int n_, const std::function<void(int)> & f) {
-        if (workers.empty() || n_ <= 1) {
-            for (int i = 0; i < n_; ++i) {
-                f(i);
-            }
-            return;
-        }
-
-        std::unique_lock<std::mutex> lk(mtx);
-
-        fn   = &f;
-        n    = n_;
-        next = 0;
-        gen++;
-
-        cv_work.notify_all();
-
-        take_jobs(lk);
-
-        cv_done.wait(lk, [&] { return next >= n && n_running == 0; });
-    }
-
-    ~server_par_for() {
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            stop = true;
-        }
-        cv_work.notify_all();
-        for (auto & t : workers) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
-    }
-
-private:
-    void take_jobs(std::unique_lock<std::mutex> & lk) {
-        while (next < n) {
-            const int i = next++;
-            n_running++;
-            lk.unlock();
-            // note: the job itself must not throw, the callers wrap it
-            (*fn)(i);
-            lk.lock();
-            n_running--;
-        }
-        if (n_running == 0) {
-            cv_done.notify_all();
-        }
-    }
-
-    void worker() {
-        std::unique_lock<std::mutex> lk(mtx);
-        uint64_t seen = 0;
-        while (true) {
-            cv_work.wait(lk, [&] { return stop || gen != seen; });
-            if (stop) {
-                return;
-            }
-            seen = gen;
-            take_jobs(lk);
-        }
-    }
-};
 
 struct server_group;
 
@@ -950,9 +862,6 @@ struct server_group {
     int n_empty_consecutive = 0;
 
     server_group_prof prof;
-
-    server_par_for            pool;
-    std::vector<server_slot *> to_sample;
 
     // note: per group on purpose - one group's host path runs while the other is on the GPU
     std::thread thread;
@@ -1543,26 +1452,6 @@ private:
             }
         }
 
-        // the budget is split across the groups, so a pipeline run is not given more CPU
-        {
-            int n_sampling_threads = 8;
-
-            if (const char * e = getenv("LLAMA_SERVER_SAMPLE_THREADS")) {
-                n_sampling_threads = atoi(e);
-            }
-
-            n_sampling_threads = std::min(n_sampling_threads, (int) std::thread::hardware_concurrency());
-            n_sampling_threads = std::max(0, n_sampling_threads / n_groups);
-
-            const int n_workers = std::max(0, n_sampling_threads - 1);
-
-            for (auto & grp : groups) {
-                grp->pool.start(n_workers);
-            }
-
-            SRV_INF("sampling threads per pipeline group: %d\n", n_sampling_threads);
-        }
-
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1812,6 +1701,19 @@ private:
                 return;
             }
 
+            // a preceding wait_for() released every other group, and waiting on an unowned
+            // unique_lock is undefined. drop what is left and retake all of them in group order,
+            // the same order the constructor uses, so two guards still cannot deadlock.
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                release(g);
+            }
+
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                lks[g].lock();
+                srv->groups[g]->n_pause_req++;
+            }
+
+            // a group cannot set busy without its own lock, so one already waited out stays idle
             for (size_t g = 0; g < srv->groups.size(); ++g) {
                 server_group * grp = srv->groups[g].get();
                 grp->cv.wait(lks[g], [&] { return !grp->busy; });
@@ -3186,44 +3088,42 @@ private:
     };
 #endif
 
-    // note: called with the group's own lock held when n_groups > 1
-    std::atomic<int64_t> t_prof_last { 0 };
+    // each group reports and resets only its own counters, under its own lock: a reporter elected
+    // across groups would read and clear the others while their workers are still updating them
+    void prof_report(server_group & grp) {
+        auto & pr = grp.prof;
 
-    void prof_report() {
-        const int64_t t_now = ggml_time_us();
-        int64_t t_last = t_prof_last.load();
+        const int64_t t_now  = ggml_time_us();
+        const int64_t t_last = pr.t_prof_last;
 
         if (t_last != 0 && t_now - t_last < 5 * 1000 * 1000) {
             return;
         }
-        if (!t_prof_last.compare_exchange_strong(t_last, t_now)) {
-            return;
-        }
+
+        pr.t_prof_last = t_now;
+
         if (t_last == 0) {
             return; // first call only arms the window
         }
 
         const double t_win = (t_now - t_last) / 1000.0; // ms
 
-        for (auto & g : groups) {
-            auto & pr = g->prof;
+        const double n_it  = std::max<int64_t>(1, pr.n_iter);
+        const double n_tk  = std::max<int64_t>(1, pr.n_tok);
+        auto per_it = [&](int64_t v) { return v / 1000.0 / n_it; };
+        auto per_tk = [&](int64_t v) { return v / 1000.0 / n_tk; };
 
-            const double n_it  = std::max<int64_t>(1, pr.n_iter);
-            const double n_tk  = std::max<int64_t>(1, pr.n_tok);
-            auto per_it = [&](int64_t v) { return v / 1000.0 / n_it; };
-            auto per_tk = [&](int64_t v) { return v / 1000.0 / n_tk; };
+        SRV_INF("PROF g%d win %.0f ms iters %" PRId64 " toks %" PRId64
+                " | per iter ms: lock %.2f pre %.2f submit %.2f sync %.2f relock %.2f post %.2f iter %.2f"
+                " | per tok ms: sampl %.3f piece %.3f proc %.3f send %.3f post %.3f\n",
+                grp.id, t_win, pr.n_iter, pr.n_tok,
+                per_it(pr.t_lock), per_it(pr.t_pre), per_it(pr.t_submit), per_it(pr.t_sync),
+                per_it(pr.t_relock), per_it(pr.t_post), per_it(pr.t_iter),
+                per_tk(pr.t_sampl), per_tk(pr.t_piece), per_tk(pr.t_proc),
+                per_tk(pr.t_send), per_tk(pr.t_post));
 
-            SRV_INF("PROF g%d win %.0f ms iters %" PRId64 " toks %" PRId64
-                    " | per iter ms: lock %.2f pre %.2f submit %.2f sync %.2f relock %.2f post %.2f iter %.2f"
-                    " | per tok ms: sampl %.3f sampl_par %.3f piece %.3f proc %.3f send %.3f post %.3f\n",
-                    g->id, t_win, pr.n_iter, pr.n_tok,
-                    per_it(pr.t_lock), per_it(pr.t_pre), per_it(pr.t_submit), per_it(pr.t_sync),
-                    per_it(pr.t_relock), per_it(pr.t_post), per_it(pr.t_iter),
-                    per_tk(pr.t_sampl), per_tk(pr.t_sampl_par), per_tk(pr.t_piece), per_tk(pr.t_proc),
-                    per_tk(pr.t_send), per_tk(pr.t_post));
-
-            pr = server_group_prof();
-        }
+        pr = server_group_prof();
+        pr.t_prof_last = t_now;
     }
 
     // one iteration of the decode loop of a single group, returns true if it had work to do
@@ -3248,7 +3148,7 @@ private:
         prof_timer ti(&grp.prof.t_iter, prof_on);
         if (prof_on) {
             grp.prof.n_iter++;
-            prof_report();
+            prof_report(grp);
         }
 
 #ifdef DEBUG_TIMINGS
@@ -4190,7 +4090,9 @@ private:
                 prof_timer ts(&grp.prof.t_submit, prof_on);
                 ret = llama_decode(ctx_tgt, batch_view);
             }
-            if (ret == 0 && has_output) {
+            // sync even with no output to read: ~decode_window clears busy, and a task thread that
+            // takes the guard must not touch ctx while the decode is still in flight
+            if (ret == 0) {
                 prof_timer ts(&grp.prof.t_sync, prof_on);
                 llama_synchronize(ctx_tgt);
             }
@@ -4336,56 +4238,6 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
-        {
-            auto & to_sample = grp.to_sample;
-
-            to_sample.clear();
-
-            for (auto * slot : slots) {
-                if (!is_inside_view(slot->i_batch)) {
-                    continue;
-                }
-                if (slot->state == SLOT_STATE_DONE_PROMPT) {
-                    if (slot->task->type == SERVER_TASK_TYPE_EMBEDDING ||
-                        slot->task->type == SERVER_TASK_TYPE_RERANK) {
-                        continue;
-                    }
-                } else if (slot->state != SLOT_STATE_GENERATING) {
-                    continue;
-                }
-                if (slot->can_speculate()) {
-                    continue; // the speculative pass owns the sampler of this slot
-                }
-                if (slot->task->params.sampling.backend_sampling) {
-                    continue; // the token comes from the device, leave it to the sequential path
-                }
-                if (slot->task->params.sampling.n_probs > 0) {
-                    continue; // populate_token_probs() reads the sampler state right after
-                }
-
-                slot->pre_sampled = LLAMA_TOKEN_NULL;
-                to_sample.push_back(slot);
-            }
-
-            if (to_sample.size() > 1) {
-                prof_timer ps(&grp.prof.t_sampl_par, prof_on);
-
-                // the first call after a decode may un-permute the rows, which mutates the context
-                llama_get_logits_ith(grp.ctx, to_sample[0]->i_batch - off);
-
-                grp.pool.run((int) to_sample.size(), [&](int i) {
-                    server_slot * slot = to_sample[i];
-                    try {
-                        slot->pre_sampled = common_sampler_sample(slot->smpl.get(), slot->ctx_tgt, slot->i_batch - off);
-                    } catch (const std::exception & e) {
-                        // leave it unsampled, the sequential pass below reports the same error
-                        SLT_ERR(*slot, "parallel sampling failed: %s\n", e.what());
-                        slot->pre_sampled = LLAMA_TOKEN_NULL;
-                    }
-                });
-            }
-        }
-
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4435,10 +4287,7 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
-            if (slot.pre_sampled != LLAMA_TOKEN_NULL) {
-                id = slot.pre_sampled;
-                slot.pre_sampled = LLAMA_TOKEN_NULL;
-            } else {
+            {
                 scoped_timer timer(t_sampl, n_sampl);
                 prof_timer ps(&grp.prof.t_sampl, prof_on);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
