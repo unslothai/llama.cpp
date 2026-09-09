@@ -538,10 +538,7 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # NVFP4 tensors were already repacked by _generate_nvfp4_tensors and removed
-                    # from model_tensors. For a "mixed-precision" checkpoint whatever weight_scale
-                    # entries are left belong to the non-NVFP4 config group (FP8 per-channel);
-                    # dequantize them exactly like the float-quantized branch above.
+                    # _generate_nvfp4_tensors already removed the NVFP4 tensors, so a leftover weight_scale is the FP8 group.
                     for name in self.model_tensors.keys():
                         if name.endswith(".weight_scale"):
                             weight_name = name.removesuffix("_scale")
@@ -770,10 +767,7 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales).
-            # In a compressed-tensors "mixed-precision" checkpoint the FP8 group also has a
-            # 2D weight_scale of shape [out, 1], so shape alone is not enough: an NVFP4
-            # tensor is nibble-packed uint8 with an E4M3 scale, one per 16 values.
+            # ndim alone is not enough: the FP8 group also has a 2D [out, 1] weight_scale. NVFP4 is nibble-packed uint8, E4M3 scale, one per 16.
             if scale.ndim < 2:
                 continue
             if weight.dtype != torch.uint8 or scale.dtype != torch.float8_e4m3fn:
