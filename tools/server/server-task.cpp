@@ -171,23 +171,55 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
 // of the streaming loop and cancels the task, so the request ends with no tokens at all. The JSON
 // serialiser already substitutes U+FFFD for those bytes on the way to the client, so doing the same
 // substitution before parsing keeps the parser input identical to what the client receives.
-static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added) {
+// How many bytes the JSON serialiser's replace handler consumes for one failed sequence: the
+// lead byte plus the continuation bytes that actually followed it, never past the length the
+// lead announced. A byte that is itself a continuation is a failed sequence on its own, which
+// is why "\x80\x80" is two replacements rather than one.
+static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
+    const unsigned char lead = static_cast<unsigned char>(s[pos]);
+    size_t want = 1;
+    if ((lead & 0xe0) == 0xc0) {
+        want = 2;
+    } else if ((lead & 0xf0) == 0xe0) {
+        want = 3;
+    } else if ((lead & 0xf8) == 0xf0) {
+        want = 4;
+    } else {
+        return 1; // a bare continuation, or a lead no encoding can use
+    }
+    size_t have = 1;
+    while (have < want && pos + have < s.size() &&
+           (static_cast<unsigned char>(s[pos + have]) & 0xc0) == 0x80) {
+        have++;
+    }
+    return have;
+}
+
+static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added, bool is_final = false) {
     pending += text_added;
 
     size_t pos = 0;
     while (pos < pending.size()) {
         const auto res = common_parse_utf8_codepoint(pending, pos);
-        if (res.status == utf8_parse_result::INCOMPLETE) {
+        if (res.status == utf8_parse_result::INCOMPLETE && !is_final) {
             // wait for the rest of the sequence
             break;
         }
-        if (res.status == utf8_parse_result::INVALID) {
-            text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
-            pos += 1;
+        if (res.status == utf8_parse_result::SUCCESS) {
+            text.append(pending, pos, res.bytes_consumed);
+            pos += res.bytes_consumed;
             continue;
         }
-        text.append(pending, pos, res.bytes_consumed);
-        pos += res.bytes_consumed;
+        // One U+FFFD for the whole malformed prefix, which is where the JSON serialiser puts its
+        // boundaries: with error_handler_t::replace it renders "\xE2\x80A" as one replacement
+        // followed by A, not two replacements, and "\xC3\xC3" as two, because the second lead
+        // byte ends the first sequence rather than continuing it. Byte-at-a-time would disagree
+        // with what the client is shown, and the parsed message is preferred over the raw content.
+        // On the final call INCOMPLETE lands here too: nothing more is coming, and the parser
+        // reports INCOMPLETE for a short sequence without checking that what followed the lead
+        // was even a continuation, so "\xE2A" must give one replacement and keep the A.
+        text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+        pos += utf8_malformed_prefix(pending, pos);
     }
 
     pending.erase(0, pos);
@@ -198,15 +230,9 @@ common_chat_msg task_result_state::update_chat_msg(
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    append_utf8_sanitized(generated_text, generated_text_pending, text_added);
-    if (!is_partial && !generated_text_pending.empty()) {
-        // Nothing can complete this sequence now (the generation hit its limit, or stopped, mid
-        // character), so it gets the one U+FFFD the JSON serialiser would show for it rather than
-        // being dropped: a nonempty parsed message is preferred over the raw content downstream,
-        // so leaving it pending silently loses the byte from the response.
-        generated_text += "\xEF\xBF\xBD";
-        generated_text_pending.clear();
-    }
+    // On the last update nothing can complete a held-back sequence, so it is resolved here rather
+    // than left pending forever, which dropped it from the response entirely.
+    append_utf8_sanitized(generated_text, generated_text_pending, text_added, !is_partial);
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
