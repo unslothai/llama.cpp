@@ -37,7 +37,7 @@ def create_server():
     yield
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
-                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE",
+                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY"):
         os.environ.pop(name, None)
 
@@ -463,6 +463,34 @@ def test_a_media_chunk_is_reserved_whole_before_it_is_decoded():
     for res in results:
         assert res.status_code == 200, res.body
         assert res.body["timings"]["prompt_n"] > 64, "the chunk fits one batch, so it never spans several decodes"
+
+
+def test_an_mtp_draft_stays_inside_the_reservation_it_was_priced_for():
+    # near the end of the pool the planner prices one draft token and one sampled token, but the draft loop stopped against the configured window and could attempt positions past the reservation
+    path = os.environ.get("LLAMA_SERVER_TEST_MTP_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_MTP_MODEL to a gguf carrying an MTP head")
+    server.model_file = path
+    server.model_hf_repo = server.model_hf_file = None
+    server.spec_type = "draft-mtp"
+    os.environ["LLAMA_ARG_SPEC_DRAFT_P_MIN"] = "0.0"   # nothing but the bounds stops the draft loop
+    os.environ["LLAMA_ARG_LOG_VERBOSITY"] = "5"        # the wrapper says so when it truncates what an implementation returned
+    _start(n_ctx=2048, n_slots=2, n_batch=2048, n_gpu_layer=99, spec_draft_n_max=128, spec_draft_n_min=1)
+
+    n_prompt = 2045
+    res = server.make_request("POST", "/completion", data={
+        "prompt": _prompt_of(n_prompt, _PROMPT_C), "n_predict": 2, "ignore_eos": True,
+        "temperature": 0.0, "seed": 42, "cache_prompt": False,
+    }, timeout=600)
+
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["prompt_n"] == n_prompt
+    assert res.body["tokens_predicted"] == 2
+
+    text = _log()
+    assert "truncating draft to" not in text, "the draft was scheduled past the tokens the planner reserved"
+    assert "llama_decode[" not in text
+    assert "Context size has been exceeded" not in text
 
 
 def test_a_hybrid_model_parks_synchronously():
