@@ -539,6 +539,17 @@ class ModelBase:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
                     # _generate_nvfp4_tensors already removed the NVFP4 tensors, so a leftover weight_scale is the FP8 group.
+                    # Only per-channel residual groups are handled: a "block" group's scales are a grid needing
+                    # block_structure expansion, and passing them straight to dequant_simple misapplies them.
+                    for group in groups.values():
+                        if not isinstance(group, dict) or group.get("format") == "nvfp4-pack-quantized":
+                            continue
+                        residual = group.get("weights") or {}
+                        if residual.get("strategy") != "channel" or residual.get("block_structure") is not None:
+                            raise NotImplementedError(
+                                f"compressed-tensors mixed-precision with NVFP4 plus a "
+                                f"{residual.get('strategy')!r} group is not yet supported"
+                            )
                     for name in self.model_tensors.keys():
                         if name.endswith(".weight_scale"):
                             weight_name = name.removesuffix("_scale")
