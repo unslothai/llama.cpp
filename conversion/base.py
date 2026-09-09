@@ -489,14 +489,14 @@ class ModelBase:
                     quant_format == "nvfp4-pack-quantized"
                     or quant_format == "mixed-precision"
                     and bool(groups)
-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
+                    and any(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
                 )
 
                 if len(groups) > 1 and not nvfp4_compressed_tensors:
                     raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
-                weight_config = tuple(groups.values())[0]["weights"]
 
                 if quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
+                    weight_config = tuple(groups.values())[0]["weights"]
                     block_size = weight_config.get("block_structure", None)
                     strategy = weight_config.get("strategy")
                     assert strategy == "channel" or strategy == "block"
@@ -516,6 +516,7 @@ class ModelBase:
                             if self._fp8_as_q8 and is_fp8:
                                 self._fp8_dequantized.add(weight_name)
                 elif quant_format == "pack-quantized":
+                    weight_config = tuple(groups.values())[0]["weights"]
                     assert weight_config.get("strategy") == "group"
                     assert weight_config.get("type", "int") == "int"
                     num_bits = weight_config.get("num_bits")
@@ -538,8 +539,63 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
-                    pass
+                    # NVFP4 is gone by here, so a leftover weight_scale is the FP8 group. Per-channel
+                    # only: block scales are a grid dequant_simple would misapply.
+                    for group in groups.values():
+                        if not isinstance(group, dict) or group.get("format") == "nvfp4-pack-quantized":
+                            continue
+                        residual = group.get("weights") or {}
+                        # dequant_simple is the only dequantizer reachable from here, so the
+                        # residual group has to be one that dequant_simple is correct for:
+                        # an unpacked weight with one scale per row. "pack-quantized" is not,
+                        # its weights are nibble-packed ints needing dequant_packed, and
+                        # prepare_tensors has already renamed its weight_packed to weight, so
+                        # nothing downstream can tell. Refusing beats a silently wrong file.
+                        group_format = group.get("format")
+                        if group_format not in (None, "float-quantized", "int-quantized", "naive-quantized"):
+                            raise NotImplementedError(
+                                f"compressed-tensors mixed-precision with NVFP4 plus a "
+                                f"{group_format!r} group is not yet supported"
+                            )
+                        if residual.get("block_structure") is not None:
+                            raise NotImplementedError(
+                                f"compressed-tensors mixed-precision with NVFP4 plus a group with "
+                                f"block_structure {residual.get('block_structure')!r} is not yet supported"
+                            )
+                        if residual.get("strategy") != "channel":
+                            raise NotImplementedError(
+                                f"compressed-tensors mixed-precision with NVFP4 plus a "
+                                f"{residual.get('strategy')!r} strategy group is not yet supported"
+                            )
+                    for name in self.model_tensors.keys():
+                        if name.endswith(".weight_scale"):
+                            weight_name = name.removesuffix("_scale")
+                            if weight_name not in self.model_tensors:
+                                tensors_to_remove.append(name)
+                                continue
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            # _generate_nvfp4_tensors consumed every tensor it recognised as
+                            # NVFP4, so a uint8 weight still here is one its dtype or geometry
+                            # guard skipped. dequant_simple would multiply packed nibbles by a
+                            # scale and write the result out as if it were real weights, which
+                            # for some shapes broadcasts cleanly and produces no error at all.
+                            # .dtype and .shape come off a device="meta" tensor, so this does
+                            # not materialize anything.
+                            w_meta = w()
+                            if w_meta.dtype == torch.uint8:
+                                raise NotImplementedError(
+                                    f"{weight_name!r} is still packed uint8 after NVFP4 repacking, so its "
+                                    f"block geometry is not one this converter understands "
+                                    f"(weight {tuple(w_meta.shape)}, scale {tuple(s().shape)})"
+                                )
+                            is_fp8 = self._fp8_as_q8 and w_meta.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                            self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
+                            tensors_to_remove.append(name)
+                            if is_fp8:
+                                self._fp8_dequantized.add(weight_name)
+                        elif name.endswith((".input_scale", ".k_scale", ".v_scale", ".weight_scale_2")):
+                            tensors_to_remove.append(name)
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
@@ -751,8 +807,12 @@ class ModelBase:
             weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
 
-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
+            # ndim is not enough: FP8 also has a 2D [out,1] scale. NVFP4 is packed uint8, E4M3 per 16.
             if scale.ndim < 2:
+                continue
+            if weight.dtype != torch.uint8 or scale.dtype != torch.float8_e4m3fn:
+                continue
+            if scale.shape[-1] * 16 != weight.shape[-1] * 2:
                 continue
 
             scale2 = LazyTorchTensor.to_eager(self.model_tensors.get(scale2_name, lambda: torch.tensor(1.0))())
@@ -858,7 +918,7 @@ class ModelBase:
             quant_format == "nvfp4-pack-quantized"
             or quant_format == "mixed-precision"
             and bool(quant_groups)
-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
+            and any(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
         )
         if quant_algo != "NVFP4":
             if nvfp4_compressed_tensors:
