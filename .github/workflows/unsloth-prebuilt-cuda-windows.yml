@@ -46,11 +46,6 @@ on:
         required: false
         default: ''
         type: string
-      warm_only:
-        description: 'Run the warm shards only and save their deltas; skip the build job (daytime cache warming)'
-        required: false
-        default: false
-        type: boolean
 
     secrets:
       AZURE_CLIENT_ID:
@@ -105,9 +100,10 @@ jobs:
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
       # The shards restore the previous shard deltas too (any tag: the
-      # restore-keys fall back to a tagless prefix), so a daytime warm-only run
-      # leaves deltas the nightly's shards hit on, and each shard compiles only
-      # what changed since the newest delta, not since the last generation.
+      # restore-keys fall back to a tagless prefix), so a retry of the same
+      # tag, or a night whose base bump left some objects untouched, compiles
+      # only what changed since the newest delta, not since the last
+      # generation.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -223,7 +219,7 @@ jobs:
     name: x64/${{ matrix.profile }}
     # See the Linux child: shards are best effort, only a cancelled run stops here.
     needs: warm
-    if: ${{ !cancelled() && !inputs.warm_only }}
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without

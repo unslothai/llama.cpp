@@ -29,14 +29,6 @@ name: Unsloth prebuilt (full release)
 on:
   schedule:
     - cron: '13 20 * * *'      # ~1PM San Francisco PDT / ~12PM PST (UTC; not DST adjusted)
-    # Daytime warm, six hours ahead of the nightly: resolves the newest
-    # upstream tag with no aging window (which is exactly the tag the nightly
-    # will pick six hours later, when it has aged six hours), runs only the
-    # CUDA warm shards against it and saves their deltas. The nightly's shards
-    # then restore those deltas and compile just what changed since 14:13
-    # instead of since yesterday. No bundle is built, nothing is published,
-    # so the shipped bits cannot change; it is purely cache preparation.
-    - cron: '13 14 * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -80,11 +72,6 @@ on:
         default: false
         required: false
         type: boolean
-      warm_only:
-        description: 'Only run the CUDA warm shards and save their cache deltas (what the 14:13 UTC schedule does); no bundles, no publish'
-        default: false
-        required: false
-        type: boolean
 
 permissions:
   contents: write
@@ -95,8 +82,6 @@ env:
   # release has time to be caught and yanked before we compile and ship it. An
   # explicit b#### tag (manual run) skips it. Per-run override via min_age_hours.
   UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS: "6"
-  # The schedule entry that means "warm the CUDA caches, build nothing".
-  UNSLOTH_LLAMA_WARM_CRON: "13 14 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'scheduled' }}
@@ -124,7 +109,6 @@ jobs:
       ggml_tree: ${{ steps.r.outputs.ggml_tree }}
       ggml_version: ${{ steps.r.outputs.ggml_version }}
       exists: ${{ steps.r.outputs.exists }}
-      warm_only: ${{ steps.w.outputs.warm_only }}
       # The CUDA matrices pass through the `warm` step, which stamps `shards`.
       cuda_matrix: ${{ steps.warm.outputs.cuda_matrix }}
       win_cuda_matrix: ${{ steps.warm.outputs.win_cuda_matrix }}
@@ -140,14 +124,6 @@ jobs:
       # in-place to merge the PRs.
       - name: Checkout (pr-set.json + mix merge workspace)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
-      # Warm-only mode: the 14:13 schedule, or the warm_only dispatch input.
-      - id: w
-        run: |
-          WARM_ONLY=false
-          if [ '${{ github.event.schedule }}' = "$UNSLOTH_LLAMA_WARM_CRON" ] || [ '${{ inputs.warm_only }}' = 'true' ]; then WARM_ONLY=true; fi
-          echo "WARM_ONLY=$WARM_ONLY" >> "$GITHUB_ENV"
-          echo "warm_only=$WARM_ONLY" >> "$GITHUB_OUTPUT"
-          echo "warm_only=$WARM_ONLY"
       - id: r
         run: |
           set -euo pipefail
@@ -171,7 +147,6 @@ jobs:
               *) echo "refusing to publish operating_systems='$OS_LIST': both windows and ubuntu ROCm bundles are required. Use publish=false for a subset test." >&2; exit 1 ;;
             esac
           fi
-          [ "$WARM_ONLY" = true ] && AGE_H=0
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           if [ "$REQ" = "latest" ]; then
             # Newest published b#### build release that has been public for
@@ -586,7 +561,6 @@ jobs:
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.cuda_matrix }}
       warm_matrix: ${{ needs.resolve.outputs.cuda_warm_matrix }}
-      warm_only: ${{ needs.resolve.outputs.warm_only == 'true' }}
 
   build-windows-cuda:
     name: CUDA Windows
@@ -600,7 +574,6 @@ jobs:
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
       warm_matrix: ${{ needs.resolve.outputs.win_cuda_warm_matrix }}
-      warm_only: ${{ needs.resolve.outputs.warm_only == 'true' }}
     secrets: inherit
 
   # First of the two ccache prunes (scripts/unsloth/prune_ccache.sh has the
@@ -629,7 +602,7 @@ jobs:
   build-rocm:
     name: ROCm
     needs: resolve
-    if: ${{ (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -644,7 +617,7 @@ jobs:
   build-macos:
     name: macOS
     needs: resolve
-    if: ${{ (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-macos.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -655,7 +628,7 @@ jobs:
   build-cpu:
     name: CPU
     needs: resolve
-    if: ${{ (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-cpu.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -666,7 +639,7 @@ jobs:
   build-vulkan:
     name: Vulkan
     needs: resolve
-    if: ${{ (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-vulkan.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -688,7 +661,7 @@ jobs:
     # `needs:`: that step blocks until every sibling build job is finished and
     # exits non-zero unless all of them succeeded, so a failed leg still
     # publishes nothing. The installer needs the full bundle set or it'll fail.
-    if: ${{ (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     # Consumed by the reclaim job below: 'true' only when THIS run's publish
     # step actually ran and succeeded.
@@ -1332,9 +1305,7 @@ jobs:
   alert:
     name: Report pipeline health
     needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
-    # Not for the warm-only schedule: it builds no bundle, so there is no
-    # publish to miss.
-    if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.warm_only != 'true' }}
+    if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
