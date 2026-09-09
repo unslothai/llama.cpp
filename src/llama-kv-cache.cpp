@@ -110,7 +110,7 @@ static bool llama_dev_supports_paged_attn(
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
 
         ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) n_embd_head_k), 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+        ggml_prec_set_acc(op, GGML_PREC_F32);
 
         op->src[5] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + n_cells/page_size, n_tokens);
 
