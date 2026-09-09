@@ -89,6 +89,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // a page belongs to one sequence, so a cross-sequence copy is refused whole rather than half
+    // applied: the pool logs the refusal and leaves the destination empty and the source as it was
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+
+    if (llama_memory_seq_pos_max(mem, 1) != -1 || llama_memory_seq_pos_max(mem, 0) != 599) {
+        fprintf(stderr, "%s : a refused copy left sequence 1 at %d and sequence 0 at %d\n", __func__,
+                llama_memory_seq_pos_max(mem, 1), llama_memory_seq_pos_max(mem, 0));
+        return 1;
+    }
+
     // the removal every accepted speculative step makes: a rejected tail that is not there. It
     // must leave the pool alone, ownership included
     if (!llama_memory_seq_rm(mem, 0, 600, -1) || llama_memory_seq_pos_max(mem, 0) != 599) {
