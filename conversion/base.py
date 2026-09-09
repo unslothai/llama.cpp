@@ -538,9 +538,8 @@ class ModelBase:
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 elif nvfp4_compressed_tensors:
-                    # NVFP4 tensors are gone by here, so a leftover weight_scale is the FP8 group.
-                    # Per-channel residuals only: a block group's scales are a grid needing
-                    # block_structure expansion, which dequant_simple would misapply.
+                    # NVFP4 is gone by here, so a leftover weight_scale is the FP8 group. Per-channel
+                    # only: block scales are a grid dequant_simple would misapply.
                     for group in groups.values():
                         if not isinstance(group, dict) or group.get("format") == "nvfp4-pack-quantized":
                             continue
