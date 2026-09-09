@@ -37,6 +37,7 @@ def create_server():
     yield
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
+                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY"):
         os.environ.pop(name, None)
 
@@ -259,6 +260,64 @@ def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_h
     text = _log()
     _assert_recovered(text, "rotated out after")
     assert "slot context shift" in text
+
+
+def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
+    # the budget grants permission to allocate, not a successful allocation: a failed save used to stop the planner and leave the pool to overflow, although the same victim could be parked by dropping its cells
+    os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
+    _start(n_ctx=256)
+
+    n_predict = 160
+    results = _complete_all(n_predict)
+
+    text = _log()
+    assert "could not take the host memory" in text, "the injected allocation failure never fired"
+    assert "tokens to re-prefill" in text, "the failed save did not fall back to recompute"
+    assert "Context size has been exceeded" not in text
+    _assert_completed(results, n_predict)
+
+
+def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
+    # 1 MiB holds no snapshot, so rotation refused every resident and only logged that the head waits: a resident that keeps context-shifting need never finish, and the head waited behind it for good
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    _start(n_ctx=2048, n_slots=2, n_batch=2048, enable_ctx_shift=True)
+
+    # a small n_discard keeps the resident near the end of the pool, so its state never fits the budget
+    def unending_request():
+        return server.make_request("POST", "/completion", data={
+            "n_predict": 100000, "prompt": _PROMPT_A, "n_keep": 1, "n_discard": 64,
+            "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        }, timeout=600)
+
+    unending = []
+    t = threading.Thread(target=lambda: unending.append(unending_request()))
+    t.start()
+
+    try:
+        # the resident has to be at the pool's limit and cycling before a second prompt cannot fit beside it
+        for _ in range(3000):
+            if "slot context shift" in _log():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the resident never reached the end of the pool")
+
+        waiting = server.make_request("POST", "/completion", data={
+            "n_predict": 8, "prompt": _prompt_of(1800, _PROMPT_C),
+            "ignore_eos": True, "temperature": 0.0, "seed": 42,
+        }, timeout=300)
+
+        assert waiting.status_code == 200, waiting.body
+        assert waiting.body["timings"]["predicted_n"] == 8, "the second request never made progress"
+        assert not unending, "the first request ended before the second made progress"
+    finally:
+        server.stop()
+        t.join(60)
+
+    text = _log()
+    assert "slot context shift" in text
+    assert re.search(r"rotated out after .* cells dropped", text), "the rotation did not fall back to recompute"
+    assert "Context size has been exceeded" not in text
 
 
 def test_cancel_while_a_copy_is_in_flight_frees_the_slot():

@@ -83,9 +83,21 @@ static std::string preempt_notice_comment(const server_task_result_preempt_notic
 constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // failed restores before the slot is given up on
 constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // ... and only after this long parked
 constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // a resident cycling through context shifts gives way to a parked head that has waited this long
+constexpr int64_t PREEMPT_ROTATE_RECOMPUTE_US = 30ll * 1000 * 1000;  // ... and after this long it gives way even where that costs the resident a re-prefill
 
 // [TAG_PREEMPT_ASYNC] an asynchronous park only releases its cells when its copy lands, so it must fire this many decode steps before the pool would run out
 constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
+
+// [TAG_PREEMPT] test knob: LLAMA_SERVER_PREEMPT_FAIL_SAVE=N fails the host allocation of the Nth park, which no budget check can rule out, so that the fall back to a recompute park is exercised
+static bool preempt_fail_save() {
+    static int32_t n_left = []() {
+        const char * val = getenv("LLAMA_SERVER_PREEMPT_FAIL_SAVE");
+
+        return val ? std::max(0, atoi(val)) : 0;
+    }();
+
+    return n_left > 0 && --n_left == 0;
+}
 
 using llama_state_seq_copy_ptr = std::shared_ptr<llama_state_seq_copy>;
 
@@ -554,6 +566,12 @@ struct server_slot {
 
     // [TAG_PREEMPT_ASYNC] copy the sequence out and release its cells; with a transfer this returns once the copy is issued and the cells stay the slot's until preempt_save_poll() sees it land
     bool preempt_save() {
+        if (preempt_fail_save()) {
+            SLT_ERR(*this, "%s", "failed to allocate the host memory for the preemption state (test knob)\n");
+            preempt_state_free();
+            return false;
+        }
+
         const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -3757,6 +3775,13 @@ private:
     bool preempt_park(server_slot & slot, int64_t t_start, bool recompute = false) {
         slot.t_preempt_copy_us = t_start;
 
+        // [TAG_PREEMPT] a budget check grants permission to allocate, not a successful allocation: preempt_save() unwinds and waits for whatever it issued, so the same victim can still be parked by dropping its cells
+        if (!recompute && !slot.preempt_save()) {
+            SLT_WRN(slot, "%s", "the park could not take the host memory the budget allowed, so it drops its cells instead and the resume re-prefills its tokens\n");
+
+            recompute = true;
+        }
+
         if (recompute) {
             if (!slot.preempt_save_recompute()) {
                 return false;
@@ -3773,8 +3798,6 @@ private:
                 SRV_WRN("preemption: --preempt-ram %d MiB holds no further parked sequence, so a park drops its cells and the resume re-prefills its tokens\n",
                         params_base.preempt_ram_mib);
             }
-        } else if (!slot.preempt_save()) {
-            return false;
         }
 
         preempt_log_ram_kind(slot);
@@ -3990,51 +4013,78 @@ private:
                     server_slot * pick           = nullptr;
                     bool          pick_enough    = false;
                     bool          budget_refused = false;
+                    bool          recompute      = false;
 
-                    for (auto & slot : slots) {
-                        if (slot.state != SLOT_STATE_GENERATING || slot.n_ctx_shift == 0) {
-                            continue;
+                    auto rotate_pick = [&](bool with_recompute) {
+                        for (auto & slot : slots) {
+                            if (slot.state != SLOT_STATE_GENERATING || slot.n_ctx_shift == 0) {
+                                continue;
+                            }
+
+                            if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+                                continue;
+                            }
+
+                            // the head's own bytes are not credited as leaving: the resident is parked before the head is restored and freed, so both states are held at once
+                            if (!with_recompute && !preempt_fits_budget(slot)) {
+                                budget_refused = true;
+                                continue;
+                            }
+
+                            const bool enough = occupied - preempt_n_cells(slot.prompt.n_tokens()) + need <= n_cells;
+
+                            if (!pick ||
+                                (enough && !pick_enough) ||
+                                (enough == pick_enough && (enough ? slot.prompt.n_tokens() < pick->prompt.n_tokens()
+                                                                  : slot.prompt.n_tokens() > pick->prompt.n_tokens()))) {
+                                pick        = &slot;
+                                pick_enough = enough;
+                            }
                         }
+                    };
 
-                        if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
-                            continue;
-                        }
+                    rotate_pick(false);
 
-                        // the head's own bytes are not credited as leaving: the resident is parked before the head is restored and freed, so both states are held at once
-                        if (!preempt_fits_budget(slot)) {
-                            budget_refused = true;
-                            continue;
-                        }
+                    // [TAG_PREEMPT] a resident the budget cannot swap out is rotated by dropping its cells, as ordinary victim selection does: waiting instead has no bound, a resident that keeps shifting need never finish
+                    if (!pick && budget_refused) {
+                        const int64_t t_waited = ggml_time_us() - head->t_preempt_us;
 
-                        const bool enough = occupied - preempt_n_cells(slot.prompt.n_tokens()) + need <= n_cells;
+                        // [TAG_EXACT_CONCURRENCY] a re-prefilled resident is not the sequence that left, so under the mode the head waits first; the wait is bounded, and the request is told what it got
+                        if (!common_exact_concurrency() || t_waited >= PREEMPT_ROTATE_RECOMPUTE_US) {
+                            rotate_pick(true);
 
-                        if (!pick ||
-                            (enough && !pick_enough) ||
-                            (enough == pick_enough && (enough ? slot.prompt.n_tokens() < pick->prompt.n_tokens()
-                                                              : slot.prompt.n_tokens() > pick->prompt.n_tokens()))) {
-                            pick        = &slot;
-                            pick_enough = enough;
+                            recompute = pick != nullptr;
                         }
                     }
 
-                    const int64_t t_start = ggml_time_us();
+                    const int64_t t_start   = ggml_time_us();
+                    const int32_t n_rotated = pick ? pick->prompt.n_tokens() : 0;
 
                     if (!pick && budget_refused && !head->preempt_rotation_refused) {
                         head->preempt_rotation_refused = true;
 
-                        SLT_WRN(*head, "no rotation: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; the head waits for a resident to finish\n",
-                                params_base.preempt_ram_mib);
+                        SLT_WRN(*head, "no rotation yet: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; under exact concurrency the head waits %.0f s before a resident is rotated out by dropping its cells\n",
+                                params_base.preempt_ram_mib, PREEMPT_ROTATE_RECOMPUTE_US / 1e6);
                     }
 
-                    if (pick && preempt_park(*pick, t_start)) {
+                    if (pick && preempt_park(*pick, t_start, recompute)) {
                         server_slot & slot = *pick;
 
-                        SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
-                                slot.n_ctx_shift, slot.prompt.n_tokens(),
-                                slot.preempt_state_size() / (1024.0 * 1024.0),
-                                (ggml_time_us() - head->t_preempt_us) / 1e6,
-                                pick_enough ? "" : " (not enough room by itself)",
-                                slot.n_preempt);
+                        if (slot.preempt_recompute) {
+                            SLT_WRN(slot, "rotated out after %d context shifts: %d cells dropped, %d tokens to re-prefill on resume, a head parked %.1f s takes its turn%s, preemptions %d\n",
+                                    slot.n_ctx_shift, n_rotated,
+                                    slot.preempt_n_input(),
+                                    (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                    pick_enough ? "" : " (not enough room by itself)",
+                                    slot.n_preempt);
+                        } else {
+                            SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
+                                    slot.n_ctx_shift, slot.prompt.n_tokens(),
+                                    slot.preempt_state_size() / (1024.0 * 1024.0),
+                                    (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                    pick_enough ? "" : " (not enough room by itself)",
+                                    slot.n_preempt);
+                        }
 
                         // [TAG_PREEMPT_ASYNC] a synchronous park has released its cells, so the head is re-examined now; an asynchronous one on the pass that sees the copy land
                         if (slot.state == SLOT_STATE_PREEMPTED) {
@@ -4181,7 +4231,7 @@ private:
                 break;
             }
 
-            if (recompute) {
+            if (victim->preempt_recompute) {
                 SLT_WRN(*victim, "preempted: %d cells dropped in %.2f ms, %d tokens to re-prefill on resume, kv %d/%d (wanted %d), preemptions %d\n",
                         n_tokens,
                         (ggml_time_us() - t_start) / 1e3,
@@ -5218,7 +5268,7 @@ private:
             }
 
             SLT_WRN(*victim, "preempted as a last resort%s: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
-                    recompute ? " by dropping its cells" : "",
+                    victim->preempt_recompute ? " by dropping its cells" : "",
                     n_tokens,
                     (ggml_time_us() - t_start) / 1e3,
                     victim->preempt_state_size() / (1024.0 * 1024.0),
