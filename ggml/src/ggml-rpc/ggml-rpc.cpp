@@ -93,10 +93,18 @@ struct rpc_msg_hello_req {
 // Server feature flags, carried in the byte that used to be pure padding in the HELLO response.
 // Features are advertised here rather than by bumping the protocol minor because a client rejects
 // any server whose minor exceeds its own, so a bump locks out every already-deployed older client
-// even when the new commands are purely additive. This byte is fixed size, already on the wire,
-// and ignored by every existing client, which reads it as padding and sees zero.
+// even when the new commands are purely additive and such a client would never send them. This byte
+// is fixed size, already on the wire, and ignored by every existing client, which reads it as
+// padding and sees zero.
+//
+// One bit per feature, and the bits are not interchangeable: batched get and peer copy were
+// developed on separate branches and each started life at bit 0. Keeping both at bit 0 would make a
+// server that only implements batched get look, to a client that knows about peer copy, like it
+// supports peer copy too, and that client would then send it RPC_CMD_COPY_TENSOR_TO. Batched get
+// keeps bit 0 because it is the value already published on this branch.
 enum rpc_srv_flag {
-    RPC_SRV_FLAG_PEER_COPY = 1 << 0,  // supports RPC_CMD_COPY_TENSOR_TO and RPC_CMD_PEER_BARRIER
+    RPC_SRV_FLAG_BATCHED_GET = 1 << 0,  // supports RPC_CMD_GET_TENSORS
+    RPC_SRV_FLAG_PEER_COPY   = 1 << 1,  // supports RPC_CMD_COPY_TENSOR_TO and RPC_CMD_PEER_BARRIER
 };
 
 struct rpc_msg_hello_rsp {
@@ -190,6 +198,14 @@ struct rpc_msg_get_tensor_req {
     uint64_t offset;
     uint64_t size;
 };
+
+// Ceiling on one batched GET_TENSORS response. Per-entry validation already bounds each region by
+// a really allocated buffer, but nothing bounds the number of entries naming the same large buffer,
+// so a handful of valid entries could still ask for a terabyte. This is far above any legitimate
+// batch: the deferred gets this batches are activations and single tensor regions, orders of
+// magnitude smaller, so the limit costs nothing real while keeping the sum in a range where the
+// checked addition below cannot wrap.
+static constexpr size_t MAX_GET_TENSORS_RESPONSE = 4ull * 1024 * 1024 * 1024;   // 4 GiB
 
 // GET_TENSORS request: | n_entries (4 bytes) | n_entries x entry |, response: regions in entry order
 struct rpc_msg_get_tensors_entry {
@@ -657,7 +673,16 @@ struct rpc_staging {
     size_t                capacity = 0;
     size_t                used     = 0;
 
-    ggml_backend_event_t inflight = nullptr;
+    // Every event recorded for a copy still reading this arena. This was a single slot, which
+    // silently assumed that one arena is written from one backend: the last event recorded would
+    // then be ordered after all the earlier ones, so waiting on it alone was enough. The arena is
+    // keyed by socket, meaning one per endpoint, and with --pipeline-groups > 1 each llama_context
+    // drives its own destination backend and therefore its own stream. Two groups copying over the
+    // same endpoint then overwrote each other's event here, and the wrap below waited only on the
+    // survivor before recycling the whole arena, while the other group's copy could still be
+    // reading its region. Events on different streams have no ordering between them, so the fix is
+    // to keep all of them and wait for all of them.
+    std::vector<ggml_backend_event_t> outstanding;
 
     std::vector<ggml_backend_event_t> events;
     size_t                            events_used = 0;
@@ -669,11 +694,17 @@ static std::unordered_map<socket_t *, rpc_staging> rpc_staging_map;
 // caller must hold rpc_staging_mutex
 static uint8_t * rpc_staging_alloc(rpc_staging & st, ggml_backend_buffer_type_t host_buft, size_t size) {
     if (st.used + size > st.capacity) {
-        if (st.inflight != nullptr) {
-            ggml_backend_event_synchronize(st.inflight);
-            st.inflight = nullptr;
+        for (ggml_backend_event_t ev : st.outstanding) {
+            ggml_backend_event_synchronize(ev);
         }
+        st.outstanding.clear();
         st.used = 0;
+        // recycle the event pool here too, not only in rpc_flush_deferred(): that reset is behind
+        // rpc_flush_deferred_guarded()'s empty-queue early return, and the RPC-to-local copy path
+        // blocks in ggml_backend_tensor_get() with nothing deferred, so it never ran and every
+        // copy allocated a new backend event that was never reused. Recycling is safe because the
+        // loop above waited on every outstanding event, not merely the most recent one.
+        st.events_used = 0;
 
         if (size > st.capacity) {
             const size_t want = std::max<size_t>(size * 4, 1024 * 1024);
@@ -1049,7 +1080,7 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
 
 static bool rpc_supports_batched_get(const socket_ptr & sock) {
     static const bool disabled = std::getenv("GGML_RPC_NO_BATCHED_GET") != nullptr;
-    return !disabled && sock->conn.server_minor >= 2;
+    return !disabled && (sock->conn.server_flags & RPC_SRV_FLAG_BATCHED_GET);
 }
 
 // true when the server understands RPC_CMD_COPY_TENSOR_TO and RPC_CMD_PEER_BARRIER.
@@ -1165,6 +1196,12 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         return false;
     }
 
+    // ggml_backend_is_rpc() tolerates null, but nothing below does: a null destination against an
+    // RPC source passes the differing-kind test and then reaches ggml_backend_get_device(other).
+    if (backend_src == nullptr || backend_dst == nullptr) {
+        return false;
+    }
+
     const bool src_is_rpc = ggml_backend_is_rpc(backend_src);
     const bool dst_is_rpc = ggml_backend_is_rpc(backend_dst);
 
@@ -1275,7 +1312,7 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         ggml_backend_event_t event = rpc_staging_event(st, other_dev);
         if (event != nullptr) {
             ggml_backend_event_record(event, backend_dst);
-            st.inflight = event;
+            st.outstanding.push_back(event);
         } else {
             ggml_backend_synchronize(backend_dst);
         }
@@ -1381,6 +1418,9 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    // safe in the source role: it checks ggml_backend_is_rpc on both sides and declines unless
+    // exactly one of them is an RPC backend, so it never reinterprets a foreign backend_dst
+    /* .cpy_tensor_from_async   = */ ggml_backend_rpc_cpy_tensor_async,
 };
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
@@ -1536,9 +1576,10 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.srv_flags = RPC_SRV_FLAG_PEER_COPY;
-    LOG_DBG("[%s] version: %d.%d.%d flags: 0x%02x\n", __func__, response.major, response.minor,
-            response.patch, response.srv_flags);
+    // this server implements both, so it advertises both
+    response.srv_flags = RPC_SRV_FLAG_BATCHED_GET | RPC_SRV_FLAG_PEER_COPY;
+    LOG_DBG("[%s] version: %d.%d.%d flags: 0x%02x\n", __func__,
+            response.major, response.minor, response.patch, response.srv_flags);
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -1991,9 +2032,41 @@ bool rpc_server::get_tensors(const std::vector<uint8_t> & input, std::vector<uin
     }
     const auto * entries = (const rpc_msg_get_tensors_entry *) (input.data() + sizeof(uint32_t));
 
+    // Validate every entry before allocating anything. The sizes come straight off the wire, and
+    // the per-entry bounds check further down only constrains a region against its own source
+    // buffer, never against the response, so summing first and allocating on that sum was wrong
+    // two ways. An unchecked sum can exceed anything allocatable and throw an uncaught bad_alloc,
+    // which terminates the server. Worse, the sum is accumulated into size_t from uint64_t sizes,
+    // so it can wrap: a small total then allocates a small response while the copy loop below
+    // still writes entries[i].size bytes at out_offset, running off the end of the heap block.
     size_t total = 0;
     for (uint32_t i = 0; i < n_entries; i++) {
-        total += entries[i].size;
+        struct ggml_init_params vparams {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr vctx { ggml_init(vparams) };
+        GGML_ASSERT(vctx != nullptr);
+        ggml_tensor * t = deserialize_tensor(vctx.get(), &entries[i].tensor);
+        if (t == nullptr || t->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing tensor %u\n", __func__, i);
+            return false;
+        }
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(t->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(t->buffer);
+        if (entries[i].tensor.data + entries[i].offset < p0 ||
+            entries[i].tensor.data + entries[i].offset >= p1 ||
+            entries[i].size > (p1 - entries[i].tensor.data - entries[i].offset)) {
+            GGML_LOG_ERROR("[%s] requested tensor region out of buffer bounds\n", __func__);
+            return false;
+        }
+        if (entries[i].size > MAX_GET_TENSORS_RESPONSE - total) {   // checked add, no wrap
+            GGML_LOG_ERROR("[%s] batched read of %" PRIu64 " bytes exceeds the response limit\n",
+                           __func__, entries[i].size);
+            return false;
+        }
+        total += (size_t) entries[i].size;
     }
     response.resize(total, 0);
 

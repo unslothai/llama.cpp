@@ -37,6 +37,15 @@ static void server_take_pipeline_groups(int & argc, char ** argv) {
 
     int n_kept = 1;
 
+    // the router strips this flag from argv before handing argv to server_models, so a child
+    // spawned by the router would otherwise always run at one group no matter what the operator
+    // asked for. the router re-exports the resolved value and the child picks it up here, which
+    // is the same channel LLAMA_ARG_HF_REPO and LLAMA_SERVER_ROUTER_PORT already use.
+    // an explicit flag on the command line still wins over the inherited value.
+    if (const char * env = getenv("LLAMA_ARG_PIPELINE_GROUPS")) {
+        g_pipeline_groups = std::atoi(env);
+    }
+
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
 
@@ -230,6 +239,22 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
+        // the router itself never loads a model, so it cannot check the group settings the way a
+        // normal server does. children can only satisfy --pipeline-groups > 1 if they are also
+        // given a context size, and the router only renders --ctx-size into the child args when the
+        // operator passed one. without this check every model request would fail at load time with
+        // an error from a subprocess, long after the mistake was made.
+        if (g_pipeline_groups > 1 && params.n_ctx <= 0) {
+            SRV_ERR("%s", "--pipeline-groups > 1 in router mode requires an explicit context size, pass -c N\n");
+            return 1;
+        }
+
+        // server_models snapshots the environment at construction and passes that snapshot to every
+        // child it spawns. --pipeline-groups has already been stripped from argv by this point, so
+        // exporting it here is what actually carries the operator's setting through to the children
+        // that do the loading. must happen before the emplace below, which takes the snapshot.
+        common_set_env("LLAMA_ARG_PIPELINE_GROUPS", std::to_string(g_pipeline_groups));
+
         // setup server instances manager
         try {
             models_routes.emplace(params, argc, argv);
