@@ -1264,6 +1264,9 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    // safe in the source role: it checks ggml_backend_is_rpc on both sides and declines unless
+    // exactly one of them is an RPC backend, so it never reinterprets a foreign backend_dst
+    /* .cpy_tensor_from_async   = */ ggml_backend_rpc_cpy_tensor_async,
 };
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {

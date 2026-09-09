@@ -507,9 +507,8 @@ static bool ggml_backend_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_
         }
     }
 
-    if (backend_src != NULL && backend_src->iface.cpy_tensor_async != NULL &&
-        (backend_dst == NULL || backend_src->iface.cpy_tensor_async != backend_dst->iface.cpy_tensor_async)) {
-        if (backend_src->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
+    if (backend_src != NULL && backend_src->iface.cpy_tensor_from_async != NULL) {
+        if (backend_src->iface.cpy_tensor_from_async(backend_src, backend_dst, src, dst)) {
             return true;
         }
     }
