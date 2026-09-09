@@ -13,8 +13,7 @@ static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 struct socket_t {
     ~socket_t();
 
-    // features the peer advertised in its HELLO response (RPC_SRV_FLAG_* in ggml-rpc.cpp).
-    // Zero for a server that predates the flag, which is also the conservative value.
+    // peer HELLO features (RPC_SRV_FLAG_* in ggml-rpc.cpp); zero for an older server
     uint8_t srv_flags = 0;
 
     bool send_data(const void * data, size_t size);

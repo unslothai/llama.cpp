@@ -29,12 +29,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------------
-// Env-gated load profiler (GGML_RPC_LOADPROF=1). Off by default and zero cost
-// when off: one relaxed atomic load per set_tensor. It breaks the weight upload
-// down into hashing, host staging, wire time and the gap between calls, which is
-// what tells a protocol problem apart from a bandwidth problem.
-// ---------------------------------------------------------------------------
+// Env-gated load profiler (GGML_RPC_LOADPROF=1): one relaxed atomic load per set_tensor when off.
 struct rpc_load_prof {
     bool enabled = false;
     const char * tag = "client";
@@ -99,8 +94,7 @@ struct rpc_load_prof {
     ~rpc_load_prof() { print(); }
 };
 
-// GGML_RPC_LOAD_OPT=0 restores the pre-optimisation upload path: always try SET_TENSOR_HASH,
-// stage every tensor into one contiguous buffer before sending, one RDMA chunk in flight.
+// GGML_RPC_LOAD_OPT=0: always hash, stage contiguously, one chunk in flight (pre-optimisation path).
 static bool rpc_load_opt() {
     static const bool opt = [] {
         const char * e = std::getenv("GGML_RPC_LOAD_OPT");
@@ -112,8 +106,6 @@ static bool rpc_load_opt() {
 static rpc_load_prof g_rpc_loadprof_client("client");
 static rpc_load_prof g_rpc_loadprof_server("server");
 
-// Per command client side accounting, so the load can be attributed to a command and not just
-// to "somewhere in the RPC backend". Same env gate, same zero cost when off.
 static const char * rpc_cmd_name(int cmd);
 
 struct rpc_cmd_prof {
@@ -237,13 +229,11 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    // was a padding byte, always zero. A server that predates this reports no features, which
-    // is the conservative answer, so the message keeps its size and old and new interoperate.
+    // was a padding byte: an old server reports no features, so the size is unchanged and both interoperate.
     uint8_t flags;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
-// the server keeps a local tensor cache, so RPC_CMD_SET_TENSOR_HASH can save an upload
 #define RPC_SRV_FLAG_HAS_CACHE (1 << 0)
 
 struct rpc_msg_device_count_rsp {
@@ -452,11 +442,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
-// Same wire format as send_rpc_cmd below, with the request written from two buffers instead of
-// one. It exists so that a tensor upload does not have to be copied into a staging buffer whose
-// only purpose is to make the header and the payload contiguous: for a 27B layer split that copy
-// is several gigabytes of pure memory traffic, plus the zero fill of the buffer that receives it.
-// The bytes on the wire are identical, so a server built before this change sees no difference.
+// send_rpc_cmd with the request in two buffers, so an upload skips the staging copy. Same wire bytes.
 static bool send_rpc_cmd_hdr_payload(socket_ptr sock, enum rpc_cmd cmd,
                                      const void * hdr, size_t hdr_size,
                                      const void * payload, size_t payload_size) {
@@ -707,10 +693,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         prof.bucket(size);
     }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    // Hashing a tensor only pays off if the server keeps a cache to match it against. Without
-    // one the reply is always "not cached", so the FNV pass over every large tensor is pure
-    // cost: on a 27B split it hashes gigabytes at about 1.2 GiB/s and then uploads them anyway.
-    // The server now says at HELLO whether it has a cache.
+    // hash only when the server advertised a cache at HELLO; otherwise the FNV pass is pure cost
     const bool try_hash = !rpc_load_opt() || (ctx->sock->srv_flags & RPC_SRV_FLAG_HAS_CACHE);
     if (size > HASH_THRESHOLD && try_hash) {
         rpc_msg_set_tensor_hash_req request;
@@ -746,7 +729,6 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(hdr + sizeof(rpc_tensor), &offset, sizeof(offset));
     std::vector<uint8_t> input;
     if (!rpc_load_opt()) {
-        // pre-optimisation path, kept for A/B: one contiguous buffer for header and payload
         input.resize(sizeof(hdr) + size, 0);
         memcpy(input.data(), hdr, sizeof(hdr));
         memcpy(input.data() + sizeof(hdr), data, size);
@@ -1371,11 +1353,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-// Reads one RPC_CMD_SET_TENSOR message straight off the connection instead of into a
-// std::vector sized to the whole message. The vector cost two full passes over every tensor,
-// one to zero the fresh buffer and one to copy the payload out of it, and for a host backend
-// the payload can be received into its final home with no copy at all.
-// The wire format is unchanged: | rpc_tensor | offset (8 bytes) | data (size bytes) |.
+// Wire format unchanged: | rpc_tensor | offset (8 bytes) | data (size bytes) |.
 bool rpc_server::set_tensor_stream(const socket_ptr & sock) {
     constexpr size_t hdr_size = sizeof(rpc_tensor) + sizeof(uint64_t);
 
@@ -1426,8 +1404,7 @@ bool rpc_server::set_tensor_stream(const socket_ptr & sock) {
         }
     }
 
-    // a host buffer can take the payload directly; anything else, or a run that has to hash the
-    // payload for the cache, needs it contiguous in host memory first
+    // only a host buffer can take the payload directly; hashing for the cache also needs it contiguous
     const bool direct = ggml_backend_buffer_is_host(tensor->buffer) && cache_dir == nullptr;
     uint8_t * dst;
     if (direct) {
