@@ -1174,21 +1174,23 @@ private:
         if (n_groups > 1) {
             params_ctx.n_parallel = n_seq_per_group;
 
-            // Dividing n_ctx is right for one KV mode and wrong for the other, so it is only done
-            // for the mode it holds in. llama_context derives n_ctx_seq = n_ctx / n_seq_max when
-            // the KV is split, so dividing both gives (C/N) / (P/N) = C/P and the context a single
-            // request may use is unchanged, which is the intent. With --kv-unified it instead sets
-            // n_ctx_seq = n_ctx, so the same division would cut what one request may use from C to
-            // C/N: not a tighter limit but a different meaning for -c, decided by an unrelated
-            // flag, and invisible until a long request is truncated.
+            // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked
+            // every request to be able to reach, and splitting the server into groups is an
+            // internal arrangement that should not quietly redefine it. Each group is built with
+            // the full n_ctx.
             //
-            // So each group keeps the full n_ctx under unified KV. That does cost N times the
-            // unified KV, which reserve_extra_group_memory() below measures and charges to the fit
-            // margins like any other per-group cost, so a configuration that no longer fits comes
-            // back as a smaller n_ctx the fitter chose and reported, not as a silent halving.
-            if (!params_base.kv_unified) {
-                params_ctx.n_ctx = params_base.n_ctx / n_groups;
-            }
+            // What that means per slot differs by mode, because llama_context derives the
+            // per-request context differently. Unified KV sets n_ctx_seq = n_ctx, so every
+            // request can reach C, which is the point. Split KV sets n_ctx_seq = n_ctx /
+            // n_seq_max, and n_seq_max here is P/N, so a slot gets C*N/P: N times what it had when
+            // n_ctx was divided as well, not the same. That is more context per slot than before,
+            // never less, so nothing that used to fit stops fitting.
+            //
+            // The cost is aggregate KV of roughly N*C rather than C. That is real, and it is what
+            // reserve_extra_group_memory() below exists to account for: it measures each extra
+            // context and charges it to the fit margins, so a configuration that no longer fits
+            // comes back as an n_ctx the fitter lowered and reported rather than a silent
+            // shrinking of what was asked for.
 
             // common_init_from_params fits ONE context and fixes the model placement from that
             // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
@@ -1560,12 +1562,6 @@ private:
 
         if (params.n_ctx <= 0) {
             SRV_ERR("%s", "--pipeline-groups > 1 requires an explicit context size, pass -c N\n");
-            return false;
-        }
-
-        // only the split-KV path divides n_ctx, so only it needs the size to divide evenly
-        if (!params.kv_unified && params.n_ctx % n_groups != 0) {
-            SRV_ERR("--ctx-size (%d) must be a multiple of --pipeline-groups (%d)\n", params.n_ctx, n_groups);
             return false;
         }
 

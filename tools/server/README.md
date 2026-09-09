@@ -2111,16 +2111,22 @@ Details:
 
 - The slots are partitioned contiguously: with `--parallel P` and `--pipeline-groups N`, group `g`
   owns slots `[g*P/N, (g+1)*P/N)`. `--parallel` must be a positive multiple of `--pipeline-groups`.
-- Each context is created with `n_seq_max = P/N`. What happens to `n_ctx` depends on the KV mode,
-  because `llama_context` derives the per-request context differently in each:
-  - **Split KV** (the default): `n_ctx = C/N`. Since the per-request context is `n_ctx / n_seq_max`,
-    dividing both leaves it at `C/P`, and the total KV memory over all groups is the same as with a
-    single context. `-c` must be given explicitly and must be a multiple of `N`.
-  - **Unified KV** (`--kv-unified`): `n_ctx` is **not** divided, and each group is created with the
-    full `C`. Here the per-request context *is* `n_ctx`, so dividing it would cut the longest
-    request the server accepts from `C` to `C/N`, which changes what `-c` means rather than how the
-    slots are arranged. The cost is that the KV memory is `N` times that of a single context; it is
-    included in the parameter fit, so if it does not fit, the fitter lowers `n_ctx` and says so.
+- Each context is created with `n_seq_max = P/N` and the **full** `n_ctx = C`. `n_ctx` is never
+  divided by the group count: `-c` is what every request should be able to reach, and splitting the
+  server into groups is an internal arrangement that should not redefine it. `-c` must still be
+  given explicitly, but it no longer has to be a multiple of `N`.
+
+  What that gives a single request depends on the KV mode, because `llama_context` derives the
+  per-request context differently:
+  - **Unified KV** (`--kv-unified`): the per-request context *is* `n_ctx`, so every request can
+    reach the full `C`. This is the intended arrangement.
+  - **Split KV**: the per-request context is `n_ctx / n_seq_max`, which here is `C*N/P`. That is
+    `N` times what a slot got when `n_ctx` was divided as well, so slots gain context rather than
+    lose it, but a single request still cannot reach `C` unless the KV is unified.
+
+  The cost either way is that the KV memory over all groups is roughly `N` times that of a single
+  context, rather than equal to it. That is included in the parameter fit, so if it does not fit,
+  the fitter lowers `n_ctx` and reports it rather than the server quietly serving less than asked.
 - Slot selection for an incoming request still runs over *all* slots, so prompt cache similarity and
   the slot save / restore endpoints work exactly as before: a returning conversation lands on the
   slot that still holds its prefix, whichever group that slot belongs to.
