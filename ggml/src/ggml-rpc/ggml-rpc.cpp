@@ -644,14 +644,61 @@ struct rpc_staging {
 
     std::vector<ggml_backend_event_t> events;
     size_t                            events_used = 0;
+
+    // Regions handed out by rpc_staging_alloc() that are not yet represented in `outstanding`.
+    // The allocation and the event that makes the region trackable cannot happen under one lock,
+    // because the copy in between blocks and holding the mutex across it would serialize the
+    // pipeline groups this arena exists to keep concurrent. So the region is reserved instead: a
+    // wrap waits for every reservation to be handed over before it resets `used`, otherwise it
+    // could give the same bytes to another group while the first is still reading into them or
+    // its destination stream is still consuming them.
+    size_t                  in_flight = 0;
+    std::condition_variable cv_reserved;
+
+    rpc_staging() = default;
+
+    // The arena is pinned host memory and the events are driver objects. Nothing used to free
+    // either: the map is keyed by a raw socket_t * and kept its entry after the socket expired
+    // from the weak cache, so a process that opens and closes RPC connections over its lifetime
+    // retained every connection's pinned allocation until it exited.
+    ~rpc_staging() {
+        for (ggml_backend_event_t ev : outstanding) {
+            ggml_backend_event_synchronize(ev);
+        }
+        for (ggml_backend_event_t ev : events) {
+            ggml_backend_event_free(ev);
+        }
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+
+    rpc_staging(const rpc_staging &)             = delete;
+    rpc_staging & operator=(const rpc_staging &) = delete;
 };
 
 static std::mutex rpc_staging_mutex;
 static std::unordered_map<socket_t *, rpc_staging> rpc_staging_map;
 
-// caller must hold rpc_staging_mutex
-static uint8_t * rpc_staging_alloc(rpc_staging & st, ggml_backend_buffer_type_t host_buft, size_t size) {
+// called from socket_t's destructor, which is where a raw-pointer key stops being valid. Without
+// this the entry outlives the socket, leaks its pinned buffer and events, and a later socket
+// allocated at the same address would inherit a stale arena.
+void rpc_staging_drop(socket_t * sock) {
+    std::lock_guard<std::mutex> lock(rpc_staging_mutex);
+    rpc_staging_map.erase(sock);
+}
+
+// caller must hold rpc_staging_mutex through `lock`. On success the returned region is reserved
+// and the caller must hand it over with rpc_staging_commit() once it is safe to recycle.
+static uint8_t * rpc_staging_alloc(std::unique_lock<std::mutex> & lock, rpc_staging & st,
+                                   ggml_backend_buffer_type_t host_buft, size_t size) {
     if (st.used + size > st.capacity) {
+        // Wait for regions that have been handed out but are not yet in `outstanding`. Without
+        // this the synchronize below sees an incomplete picture and the reset hands live bytes to
+        // the next caller. The wait releases the mutex, and every reservation is released without
+        // needing anything from this thread, so it cannot deadlock against us.
+        st.cv_reserved.wait(lock, [&st] { return st.in_flight == 0; });
+
         for (ggml_backend_event_t ev : st.outstanding) {
             ggml_backend_event_synchronize(ev);
         }
@@ -681,7 +728,16 @@ static uint8_t * rpc_staging_alloc(rpc_staging & st, ggml_backend_buffer_type_t 
 
     uint8_t * ptr = st.base + st.used;
     st.used += size;
+    st.in_flight++;
     return ptr;
+}
+
+// caller must hold rpc_staging_mutex. Ends the reservation taken by rpc_staging_alloc(), either
+// because the region's event is now in `outstanding` or because the copy has been synchronized.
+static void rpc_staging_commit(rpc_staging & st) {
+    GGML_ASSERT(st.in_flight > 0);
+    st.in_flight--;
+    st.cv_reserved.notify_all();
 }
 
 // caller must hold rpc_staging_mutex
@@ -1138,13 +1194,17 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         uint8_t * staging = nullptr;
         ggml_backend_event_t event = nullptr;
         {
-            std::lock_guard<std::mutex> lock(rpc_staging_mutex);
+            std::unique_lock<std::mutex> lock(rpc_staging_mutex);
             rpc_staging & st = rpc_staging_map[sock.get()];
-            staging = rpc_staging_alloc(st, host_buft, size);
+            staging = rpc_staging_alloc(lock, st, host_buft, size);
             if (staging == nullptr) {
                 return false;
             }
             event = rpc_staging_event(st, other_dev);
+            if (event == nullptr) {
+                // the region was reserved, so it has to be handed back or a later wrap waits forever
+                rpc_staging_commit(st);
+            }
         }
         if (event == nullptr) {
             return false;
@@ -1152,6 +1212,18 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
 
         ggml_backend_tensor_get_async(backend_src, src, staging, 0, size);
         ggml_backend_event_record(event, backend_src);
+
+        {
+            // Make the region trackable before releasing it. This event was previously known only
+            // to the deferred op, so a wrap driven from the other staging path reset `used` without
+            // waiting for this read to land. It is still the flush on wrap above that keeps the
+            // bytes alive until the deferred send has copied them out; this only ensures a reset
+            // never happens while the fill is still in flight.
+            std::lock_guard<std::mutex> lock(rpc_staging_mutex);
+            rpc_staging & st = rpc_staging_map[sock.get()];
+            st.outstanding.push_back(event);
+            rpc_staging_commit(st);
+        }
 
         const rpc_tensor rpc_dst = serialize_tensor(dst);
 
@@ -1172,11 +1244,26 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         return false;
     }
 
+    // a wrap here has to send whatever is already queued before it can recycle the arena, and that
+    // cannot be done from inside rpc_staging_alloc() because rpc_flush_deferred() takes
+    // rpc_staging_mutex itself. Predict it the same way the other staging path does.
+    {
+        bool wraps = false;
+        {
+            std::lock_guard<std::mutex> lock(rpc_staging_mutex);
+            rpc_staging & st = rpc_staging_map[sock.get()];
+            wraps = st.used + size > st.capacity;
+        }
+        if (wraps) {
+            rpc_flush_deferred_guarded(sock);
+        }
+    }
+
     uint8_t * staging = nullptr;
     {
-        std::lock_guard<std::mutex> lock(rpc_staging_mutex);
+        std::unique_lock<std::mutex> lock(rpc_staging_mutex);
         rpc_staging & st = rpc_staging_map[sock.get()];
-        staging = rpc_staging_alloc(st, host_buft, size);
+        staging = rpc_staging_alloc(lock, st, host_buft, size);
     }
     if (staging == nullptr) {
         return false;
@@ -1195,6 +1282,8 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         } else {
             ggml_backend_synchronize(backend_dst);
         }
+        // the destination stream's progress is now either tracked by the event or already complete
+        rpc_staging_commit(st);
     }
     return true;
 }

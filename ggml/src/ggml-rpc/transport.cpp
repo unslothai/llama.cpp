@@ -598,7 +598,13 @@ bool socket_t::impl::flush() {
 
 socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
 
-socket_t::~socket_t() = default;
+// defined in ggml-rpc.cpp, which owns the staging arenas keyed by socket
+void rpc_staging_drop(socket_t * sock);
+
+socket_t::~socket_t() {
+    // the arena is keyed by this pointer, so this is the last moment the entry can be found
+    rpc_staging_drop(this);
+}
 
 bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);

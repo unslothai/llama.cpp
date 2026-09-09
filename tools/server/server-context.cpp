@@ -1118,6 +1118,16 @@ private:
             params_ctx.n_ctx      = params_base.n_ctx / n_groups;
         }
 
+        // common_init_from_params() fits the model to device memory for the single context it
+        // creates, but this server then builds n_groups - 1 more contexts from the same model.
+        // Their KV and compute buffers are invisible to the fit, so without this the fit would
+        // happily offload enough layers to fill the devices and a later group would fail to
+        // allocate. Reserve the aggregate memory of the extra contexts up front, the same way
+        // the mmproj estimate above does.
+        if (n_groups > 1 && params_ctx.fit_params) {
+            reserve_memory_for_extra_groups(params_ctx);
+        }
+
         llama_init = common_init_from_params(params_ctx);
 
         model_tgt = llama_init->model();
@@ -1441,6 +1451,75 @@ private:
         return true;
     }
 
+    // Account for the pipeline group contexts that are created after common_init_from_params().
+    // The fit only ever sees one context, so measure what a single group context costs per device
+    // and add (n_groups - 1) times that to the per-device margins the fit has to leave free.
+    void reserve_memory_for_extra_groups(common_params & params_ctx) const {
+        GGML_ASSERT(n_groups > 1);
+
+        const int n_extra = n_groups - 1;
+
+        auto mparams = common_model_params_to_llama(params_ctx);
+        auto cparams = common_context_params_to_llama(params_ctx);
+
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_n_ctx_train = 0;
+        uint32_t hp_n_expert = 0;
+
+        common_device_memory_data_vec dmd;
+
+        const int64_t t_start = ggml_time_us();
+
+        try {
+            dmd = common_get_device_memory_data(params_ctx.model.path.c_str(), &mparams, &cparams,
+                    devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+                    params_ctx.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        } catch (const std::exception & e) {
+            SRV_WRN("failed to estimate the memory of the extra pipeline group contexts (%s), "
+                    "the fit will only account for one of the %d groups\n", e.what(), n_groups);
+            return;
+        }
+
+        const int64_t t_elapsed = ggml_time_us() - t_start;
+
+        // dmd is indexed like devs, with the host buffers in the extra last entry
+        if (dmd.size() != devs.size() + 1) {
+            SRV_WRN("%s", "unexpected memory breakdown size, skipping pipeline group memory reservation\n");
+            return;
+        }
+
+        size_t total_per_ctx = 0;
+
+        // the fit assumes host memory is unlimited, so it is only reported, never reserved
+        const size_t host_per_ctx = dmd.back().context + dmd.back().compute;
+
+        // note: common_fit_params() indexes the margins by the model device order, which is
+        // exactly the order of devs / dmd here, not by the global ggml_backend_dev_get() order
+        for (size_t i = 0; i < devs.size() && i < params_ctx.fit_params_target.size(); i++) {
+            // model weights are shared by every group, only the KV cache and the compute buffers
+            // are paid for again by each additional context
+            const size_t per_ctx = dmd[i].context + dmd[i].compute;
+
+            total_per_ctx += per_ctx;
+
+            if (per_ctx == 0) {
+                continue;
+            }
+
+            SRV_DBG("reserving %.2f MiB (%d x %.2f MiB) on device %s for the extra pipeline group contexts\n",
+                    n_extra * per_ctx / (1024.0 * 1024.0), n_extra, per_ctx / (1024.0 * 1024.0),
+                    ggml_backend_dev_name(devs[i]));
+
+            params_ctx.fit_params_target[i] += n_extra * per_ctx;
+        }
+
+        SRV_INF("fitting %d pipeline groups: one context of n_ctx = %d needs %.2f MiB of device memory "
+                "(+ %.2f MiB host), reserving %.2f MiB of device memory for the %d extra group(s) (took %.2f ms)\n",
+                n_groups, params_ctx.n_ctx, total_per_ctx / (1024.0 * 1024.0), host_per_ctx / (1024.0 * 1024.0),
+                n_extra * total_per_ctx / (1024.0 * 1024.0), n_extra, t_elapsed / 1000.0);
+    }
+
     bool validate_pipeline_groups(const common_params & params, bool has_spec, bool has_mmproj) const {
         auto refuse = [](const char * what) {
             SRV_ERR("--pipeline-groups > 1 is not supported together with %s\n", what);
@@ -1743,10 +1822,29 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task, bool * out_update_cache) {
+    // n_slots_needed is the total number of slots the task occupies at once, i.e. n_cmpl:
+    // the parent slot plus one slot per child task. The children take their KV from the parent,
+    // so all of them have to come from the parent's pipeline group and only groups with that
+    // many idle slots are eligible - otherwise a group whose siblings are busy would be picked
+    // by LRU / LCP and the task deferred while another group sits completely idle.
+    server_slot * get_available_slot(const server_task & task, bool * out_update_cache, size_t n_slots_needed = 1) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        std::vector<int> n_free_per_group(n_groups, 0);
+
+        if (n_slots_needed > 1) {
+            for (const server_slot & slot : slots) {
+                if (!slot.is_processing()) {
+                    n_free_per_group[slot.id_group]++;
+                }
+            }
+        }
+
+        auto group_has_room = [&](const server_slot & slot) {
+            return n_slots_needed <= 1 || (size_t) n_free_per_group[slot.id_group] >= n_slots_needed;
+        };
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1768,6 +1866,13 @@ private:
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                    continue;
+                }
+
+                // skip the slot if its group cannot host all the children as well
+                if (!group_has_room(slot)) {
+                    SLT_TRC(slot, " - skipping, group %d has %d free slots < %zu needed\n",
+                            slot.id_group, n_free_per_group[slot.id_group], n_slots_needed);
                     continue;
                 }
 
@@ -1815,6 +1920,13 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // skip the slot if its group cannot host all the children as well
+                if (!group_has_room(slot)) {
+                    SLT_TRC(slot, " - skipping, group %d has %d free slots < %zu needed\n",
+                            slot.id_group, n_free_per_group[slot.id_group], n_slots_needed);
                     continue;
                 }
 
@@ -2587,8 +2699,20 @@ private:
 
                     const int id_task = task.id;
 
+                    // the children take their KV from the parent, so they must fit its group.
+                    // check this before selecting a slot, otherwise an impossible request would
+                    // find no eligible group and be deferred forever instead of being rejected.
+                    const size_t n_slots_needed = task.child_tasks.size() + 1;
+
+                    if (task.is_parent() && (int) n_slots_needed > n_seq_per_group) {
+                        send_error(task, string_format(
+                            "n_cmpl must not exceed the number of slots per pipeline group (%d)", n_seq_per_group),
+                            ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
                     bool update_cache = false;
-                    server_slot * slot = get_available_slot(task, &update_cache);
+                    server_slot * slot = get_available_slot(task, &update_cache, n_slots_needed);
 
                     //
                     // slot scheduling logic
@@ -2619,13 +2743,6 @@ private:
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        // the children take their KV from the parent, so they must fit its group
-                        if ((int) n_child_tasks + 1 > n_seq_per_group) {
-                            send_error(task, string_format(
-                                "n_cmpl must not exceed the number of slots per pipeline group (%d)", n_seq_per_group),
-                                ERROR_TYPE_INVALID_REQUEST);
-                            break;
-                        }
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id, slot->id_group);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
