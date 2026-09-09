@@ -2076,13 +2076,8 @@ bool rpc_server::copy_tensor_to(const std::vector<uint8_t> & input, rpc_msg_copy
     }
     const std::string endpoint((const char *) input.data() + sizeof(hdr), hdr.endpoint_len);
 
-    const size_t msg_size = sizeof(rpc_tensor) + sizeof(uint64_t) + (size_t) hdr.size;
-    if (p2p_buf.size() < msg_size) {
-        p2p_buf.resize(msg_size);
-    }
-    const uint64_t dst_offset = 0;
-    memcpy(p2p_buf.data(), &hdr.dst, sizeof(rpc_tensor));
-    memcpy(p2p_buf.data() + sizeof(rpc_tensor), &dst_offset, sizeof(dst_offset));
+    // sized below, once hdr.size has been checked against the source tensor
+    size_t msg_size = 0;
 
     // read the source out of this server's device; the peer connection is used without this
     // lock, so a ring of servers cannot deadlock on each other's execution mutex
@@ -2114,6 +2109,18 @@ bool rpc_server::copy_tensor_to(const std::vector<uint8_t> & input, rpc_msg_copy
             GGML_LOG_ERROR("[%s] source region larger than the tensor\n", __func__);
             return false;
         }
+
+        // only now is hdr.size known to fit both the buffer and the tensor. Sizing the staging
+        // buffer before these checks let a client pick any 64 bit length: a large one aborts the
+        // server on an uncaught bad_alloc, and one near SIZE_MAX wraps msg_size so that the two
+        // header copies below run past the end of an undersized vector.
+        const uint64_t dst_offset = 0;
+        msg_size = sizeof(rpc_tensor) + sizeof(dst_offset) + (size_t) hdr.size;
+        if (p2p_buf.size() < msg_size) {
+            p2p_buf.resize(msg_size);
+        }
+        memcpy(p2p_buf.data(), &hdr.dst, sizeof(rpc_tensor));
+        memcpy(p2p_buf.data() + sizeof(rpc_tensor), &dst_offset, sizeof(dst_offset));
 
         ggml_backend_tensor_get(tensor, p2p_buf.data() + sizeof(rpc_tensor) + sizeof(dst_offset), 0, hdr.size);
     }
