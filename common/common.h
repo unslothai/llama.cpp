@@ -561,6 +561,9 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    int32_t preempt_high   = 94;    // unified server pool high watermark, percent
+    int32_t preempt_low    = 80;    // restore only below this watermark, percent
+    int32_t preempt_ram_mib = 8192; // maximum host memory for parked sequence snapshots
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
