@@ -1,7 +1,14 @@
 #!/bin/bash
 # CPU-only smoke test: layers split over two rpc-servers, run with the trace off and on, checking
 # the text is identical and that merge.py accepts the result.
+#
+# pipefail matters here: the completions run as `curl | parser`, and without it the status of a
+# failed request is thrown away and two empty output files compare equal, so the test would
+# report PASS without ever generating a token. errexit is deliberately not set, because the
+# teardown deals in `kill` and `grep -q` calls that are expected to fail; every step that can
+# fail is checked by hand instead.
 set -u
+set -o pipefail
 
 BUILD=${1:?usage: cpu_check.sh <build-dir> <model.gguf> [outdir]}
 MODEL=${2:?usage: cpu_check.sh <build-dir> <model.gguf> [outdir]}
@@ -20,6 +27,49 @@ export CUDA_VISIBLE_DEVICES=      # CPU backend only
 pids=()
 cleanup() { for p in "${pids[@]:-}"; do kill -9 "$p" 2>/dev/null; done; }
 trap cleanup EXIT
+
+PROMPTS=("the capital of France is" "two plus two equals" "the colour of the sky is")
+
+# complete <tag> <prompt> -- one completion appended to $OUT/$tag.out.txt, non-zero on any failure
+complete() {
+  local tag=$1 prompt=$2
+  local body="$OUT/$tag.resp.json" code rc
+
+  code=$(curl -sS --max-time 300 -o "$body" -w '%{http_code}' \
+           http://127.0.0.1:$PORT/completion -H 'Content-Type: application/json' \
+           -d "{\"prompt\":\"$prompt\",\"n_predict\":32,\"temperature\":0,\"top_k\":1,\"seed\":1}")
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "$tag: request for '$prompt' failed, curl exit $rc (is anything listening on $PORT?)" >&2
+    return 1
+  fi
+  if [ "$code" != "200" ]; then
+    echo "$tag: request for '$prompt' returned HTTP $code, body:" >&2
+    head -c 400 "$body" >&2; echo >&2
+    return 1
+  fi
+  # a reply without a usable "content" is a failure too, not an empty line in the output file
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    sys.exit("response is not valid JSON: %s" % e)
+if not isinstance(d, dict):
+    sys.exit("response is not a JSON object")
+if "content" not in d:
+    sys.exit("response has no \"content\" (keys: %s)" % ", ".join(sorted(map(str, d))))
+if not isinstance(d["content"], str) or not d["content"].strip():
+    sys.exit("response \"content\" is empty")
+sys.stdout.write("=== %s\n%s\n" % (sys.argv[2], d["content"]))
+' "$body" "$prompt" >> "$OUT/$tag.out.txt"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "$tag: could not read a completion for '$prompt' out of the reply" >&2
+    return 1
+  fi
+  return 0
+}
 
 # cell <tag>   (PEER_TRACE is the prefix of the peer trace files)
 cell() {
@@ -41,32 +91,60 @@ cell() {
   fi
 
   : > "$OUT/$tag.out.txt"
-  for p in "the capital of France is" "two plus two equals" "the colour of the sky is"; do
-    curl -s http://127.0.0.1:$PORT/completion -H 'Content-Type: application/json' \
-      -d "{\"prompt\":\"$p\",\"n_predict\":32,\"temperature\":0,\"top_k\":1,\"seed\":1}" \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin)["content"])' >> "$OUT/$tag.out.txt"
+  local ok=0 rc=0
+  for p in "${PROMPTS[@]}"; do
+    if complete "$tag" "$p"; then ok=$((ok + 1)); else rc=1; fi
   done
+  # the point of the test is comparing generated text, so a missing response is a failure and
+  # must not be allowed to leave an empty file that would compare equal to another empty file
+  if [ $ok -ne ${#PROMPTS[@]} ]; then
+    echo "$tag: only $ok of ${#PROMPTS[@]} completions were recorded" >&2
+    rc=1
+  fi
+  if [ ! -s "$OUT/$tag.out.txt" ]; then
+    echo "$tag: no generated text at all in $OUT/$tag.out.txt" >&2
+    rc=1
+  fi
 
   kill -TERM $sp 2>/dev/null
   for i in $(seq 1 30); do kill -0 $sp 2>/dev/null || break; sleep 1; done
   kill -9 $sp 2>/dev/null
   sleep 1
-  for p in "${pids[@]}"; do kill -TERM "$p" 2>/dev/null; done
+  for p in "${pids[@]:-}"; do kill -TERM "$p" 2>/dev/null; done
   sleep 2
-  for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
+  for p in "${pids[@]:-}"; do kill -9 "$p" 2>/dev/null; done
   pids=()
+  return $rc
 }
 
 echo "== trace off"
 unset GGML_RPC_TRACE
-cell off
+if ! cell off; then
+  echo "the untraced run did not produce all ${#PROMPTS[@]} completions: FAIL"
+  exit 1
+fi
 
 echo "== trace on"
 export GGML_RPC_TRACE=$OUT/on.client.jsonl
-PEER_TRACE=$OUT/on.peer cell on
+if ! PEER_TRACE=$OUT/on.peer cell on; then
+  echo "the traced run did not produce all ${#PROMPTS[@]} completions: FAIL"
+  exit 1
+fi
 unset GGML_RPC_TRACE
 
 echo
+# belt and braces: never compare two files that hold nothing
+for f in "$OUT/off.out.txt" "$OUT/on.out.txt"; do
+  if [ ! -s "$f" ]; then echo "no generated text in $f, nothing was compared: FAIL"; exit 1; fi
+done
+for f in "$OUT/off.out.txt" "$OUT/on.out.txt"; do
+  got=$(grep -c '^=== ' "$f")
+  if [ "$got" -ne ${#PROMPTS[@]} ]; then
+    echo "$f holds $got of ${#PROMPTS[@]} responses: FAIL"; exit 1
+  fi
+done
+echo "compared ${#PROMPTS[@]} completions, $(wc -c < "$OUT/on.out.txt") bytes of generated text"
+
 if cmp -s "$OUT/off.out.txt" "$OUT/on.out.txt"; then
   echo "output identical with the trace off and on: PASS"
 else

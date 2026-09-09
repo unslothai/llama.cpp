@@ -800,22 +800,30 @@ struct server_trace_scope {
     int64_t      t0;
     int          n0;
     int          n1;
-    // -1 leaves the field out entirely. Set it to 0 or 1 to state, rather than let the reader
-    // guess, whether this span covers prompt processing. A reader cannot infer the phase from
-    // tokens per slot: under speculative decoding an ordinary decode submits several drafted
-    // tokens per slot, which is indistinguishable from a small prefill by that measure.
-    int          prompt = -1;
+    // -1 leaves both fields out entirely. Otherwise these are the prompt and decode token counts
+    // of the batch that was actually submitted, which states the phase rather than leaving the
+    // reader to guess it. A reader cannot infer the phase from tokens per slot, because under
+    // speculative decoding an ordinary decode submits several drafted tokens per slot and looks
+    // exactly like a small prefill.
+    //
+    // Two counts rather than one flag, because continuous batching genuinely produces iterations
+    // that are both: a slot still working through its prompt alongside slots already generating.
+    // Collapsing that to "this iteration is prompt" would charge the generation work in it to
+    // prefill and drag the end of the prefill phase forward every time a request arrives late.
+    int          n_prompt = -1;
+    int          n_decode = -1;
 
     server_trace_scope(const char * name, int n0, int n1) :
         name(name), t0(ggml_trace_flag ? ggml_trace_time_us() : 0), n0(n0), n1(n1) {}
 
     ~server_trace_scope() {
         if (ggml_trace_flag) {
-            if (prompt < 0) {
+            if (n_prompt < 0) {
                 ggml_trace_eventf("server", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
             } else {
                 ggml_trace_eventf("server", name, t0, ggml_trace_time_us(),
-                                  "\"n0\":%d,\"n1\":%d,\"prompt\":%d", n0, n1, prompt);
+                                  "\"n0\":%d,\"n1\":%d,\"prompt\":%d,\"decode\":%d",
+                                  n0, n1, n_prompt, n_decode);
             }
         }
     }
@@ -3359,18 +3367,12 @@ private:
         }
 
         int n_slots_processing = 0;
-        int n_slots_prompt     = 0;
         if (ggml_trace_flag) {
             for (auto * slot : grp.slots) {
                 n_slots_processing += slot->is_processing() ? 1 : 0;
-                // read before pre_decode(), which is what acts on these states: a slot still
-                // working through its prompt contributes prompt tokens to this batch
-                n_slots_prompt += (slot->state == SLOT_STATE_STARTED ||
-                                   slot->state == SLOT_STATE_PROCESSING_PROMPT) ? 1 : 0;
             }
         }
         server_trace_scope span_iter("iteration", grp.id, n_slots_processing);
-        span_iter.prompt = n_slots_prompt > 0 ? 1 : 0;
 
         try {
             server_trace_scope span_build("batch_build", grp.id, n_slots_processing);
@@ -3384,6 +3386,20 @@ private:
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return true;
+        }
+
+        if (ggml_trace_flag) {
+            // Counted from the batch that was actually built, not from slot states before
+            // pre_decode(). A slot can be in a prompt state and contribute nothing this iteration,
+            // because the batch filled up before it was admitted, and continuous batching routinely
+            // mixes one slot's prompt with other slots' generation in a single batch. Both cases
+            // are invisible to any pre-decode reading of the states.
+            int n_prompt = 0;
+            for (const auto & tok : batch.tokens) {
+                n_prompt += tok.is_prompt ? 1 : 0;
+            }
+            span_iter.n_prompt = n_prompt;
+            span_iter.n_decode = (int) batch.tokens.size() - n_prompt;
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);

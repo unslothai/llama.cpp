@@ -19,9 +19,15 @@ def inside(outer, e):
 def phase_windows(client):
     """(prefill, decode) iteration windows per group; groups do not enter decode together.
 
-    The trace carries no explicit prompt/decode flag, so an iteration is classified by:
+    An iteration is classified by, in order of preference:
 
-    1. `prompt` on the iteration event, if the tracer ever starts emitting one;
+    0. `prompt` and `decode`, the token counts of the batch that was actually submitted. An
+       iteration carrying both is genuinely mixed: continuous batching puts one slot's prompt
+       alongside other slots' generation. Charging the whole iteration to prefill would drag the
+       end of the prefill phase forward every time a request arrives late, so a mixed iteration
+       counts as decode once any generation is present, and only a batch that is entirely prompt
+       tokens is prefill. An iteration that submitted nothing at all is neither;
+    1. `prompt` alone, for traces written before `decode` was emitted alongside it;
     2. drafting. With speculative decoding a generation step submits one sampled plus n_draft
        drafted tokens per slot, which the token count alone cannot tell from a prompt chunk.
        common_speculative_draft() runs the draft model inside pre_decode, so a nested one-token
@@ -70,11 +76,18 @@ def phase_windows(client):
 
     pre, dec = defaultdict(list), defaultdict(list)
     for g, e, rate, drafted in steps:
-        flag = e.get("prompt")
-        if flag is None:
-            is_pre = not drafted and rate > width[g]
+        n_prompt = e.get("prompt")
+        n_decode = e.get("decode")
+
+        if n_prompt is not None and n_decode is not None:
+            if n_prompt == 0 and n_decode == 0:
+                continue                      # nothing was submitted, so it is neither phase
+            is_pre = n_decode == 0            # mixed batches count as decode, see the docstring
+        elif n_prompt is not None:
+            is_pre = bool(n_prompt)
         else:
-            is_pre = bool(flag)
+            is_pre = not drafted and rate > width[g]
+
         (pre if is_pre else dec)[g].append((e["t0"], e["t1"]))
     return pre, dec
 

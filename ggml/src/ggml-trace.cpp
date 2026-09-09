@@ -31,6 +31,7 @@ struct trace_state {
     std::string role;
     int64_t     t_open = 0;
     int64_t     n_unflushed = 0;
+    int64_t     t_flush     = 0;  // when the buffer was last flushed, see emit()
 
     ~trace_state() {
         if (f) {
@@ -54,8 +55,23 @@ thread_local const char * tls_subject = nullptr;
 thread_local uint64_t     tls_uid     = 0;
 thread_local std::string  tls_line;
 
-// a traced process is usually killed with a signal, so the buffer is flushed periodically
-const int64_t TRACE_FLUSH_EVERY = 128;
+// A traced process is usually killed with a signal, and neither ggml-rpc-server nor the capture
+// scripts install a handler, so nothing runs ggml_trace_close() or the static destructors: whatever
+// is still in the stdio buffer is lost. Counting records alone is not enough of a bound, because a
+// tail shorter than the count is dropped no matter how long the run was, and a capture short enough
+// to never reach the count keeps only its explicitly flushed header.
+//
+// So the flush is bounded in time as well as in records. The loss window becomes the interval below
+// rather than "however many events were left over", for any signal including SIGKILL, which no
+// shutdown path could catch anyway.
+//
+// A handler that closed the trace was the other option and is deliberately not used: fflush and
+// fclose are not async-signal-safe, and a signal arriving while emit() holds this mutex would
+// deadlock the handler against the thread it interrupted. Ten flushes a second cannot perturb what
+// this tracer measures, whereas flushing on every record would put a write syscall inside the
+// intervals being timed, and non-perturbation is a property this tooling is supposed to have.
+const int64_t TRACE_FLUSH_EVERY    = 128;
+const int64_t TRACE_FLUSH_EVERY_US = 100 * 1000;
 
 void emit(const std::string & line) {
     trace_state & s = state();
@@ -65,8 +81,11 @@ void emit(const std::string & line) {
         return;
     }
     fwrite(line.data(), 1, line.size(), s.f);
-    if (++s.n_unflushed >= TRACE_FLUSH_EVERY) {
+
+    const int64_t now = ggml_time_us();
+    if (++s.n_unflushed >= TRACE_FLUSH_EVERY || now - s.t_flush >= TRACE_FLUSH_EVERY_US) {
         s.n_unflushed = 0;
+        s.t_flush     = now;
         fflush(s.f);
     }
 }
@@ -152,6 +171,12 @@ int ggml_trace_open(const char * path, const char * role) {
     if (path == nullptr || path[0] == '\0') {
         return 0;
     }
+
+    // llama_server() and rpc-server both open the trace before llama_backend_init(), which is what
+    // normally initializes ggml's timer. On Windows ggml_time_us() divides by timer_freq, so
+    // reaching it first is a division by zero during startup rather than a traced server. This is
+    // idempotent, so calling it here costs nothing when the backend has already been initialized.
+    ggml_time_init();
 
     s.f = fopen(path, "wb");
     if (s.f == nullptr) {

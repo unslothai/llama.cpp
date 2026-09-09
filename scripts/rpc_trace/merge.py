@@ -420,11 +420,16 @@ def summarize(files, client, out):
             hole = gaps(local_iv + peer_iv, t0, t1)
             acc["idle_both"] += union_len(hole)
             for g0, g1 in hole:
-                name, cov = name_gap(host, g0, g1)
+                cov = attribute_gap(host, g0, g1)
                 if g1 - g0 > worst[0]:
-                    worst = (g1 - g0, "%s (%.0f%% of the gap)" % (name, 100.0 * cov / max(g1 - g0, 1)), g0)
-                idle_by[name] += cov
-                idle_by["unattributed"] += (g1 - g0) - cov
+                    name, share = max(cov.items(), key=lambda kv: kv[1],
+                                      default=("nothing traced", 0))
+                    worst = (g1 - g0,
+                             "%s (%.0f%% of the gap)" % (name, 100.0 * share / max(g1 - g0, 1)),
+                             g0)
+                for name, v in cov.items():
+                    idle_by[name] += v
+                idle_by["unattributed"] += (g1 - g0) - sum(cov.values())
 
         if n == 0:
             continue
@@ -448,7 +453,8 @@ def summarize(files, client, out):
         out.write("group %d: %.1f kB out and %.1f kB in per step over RPC; "
                   "biggest idle gap %.1f ms in %s\n"
                   % (grp, wo / n / 1024.0, wi / n / 1024.0, worst[0] / 1000.0, worst[1]))
-        top = sorted(idle_by.items(), key=lambda kv: -kv[1])[:4]
+        # now that a gap is split over every phase it touches there are more names to show
+        top = sorted(idle_by.items(), key=lambda kv: -kv[1])[:6]
         out.write("         idle with neither GPU busy, per step: %s\n"
                   % ", ".join("%s %.1f ms" % (k, v / n / 1000.0) for k, v in top if v > 0))
 
@@ -465,19 +471,36 @@ def summarize(files, client, out):
         out.write("note: no GPU spans from the peer, so the peer GPU row is empty\n")
 
 
-def name_gap(indexes, g0, g1):
-    """what the host was doing during a stretch in which no GPU was busy"""
-    best = None
-    best_cov = 0
+def attribute_gap(indexes, g0, g1):
+    """what the host was doing during a stretch in which no GPU was busy
+
+    Returns {"ph/name": microseconds} for every traced phase that covers part of the gap, so a
+    gap that runs batch_build -> submit -> synchronize back to back is fully accounted for
+    instead of being credited to whichever single phase happened to be the longest.
+
+    Phases nest (a sched/split inside a server/submit) and can straddle each other (an
+    llama/graph_compute reaching from a submit into the following synchronize), so a point in
+    the gap is charged to exactly one phase: the innermost scope covering it, that is the
+    shortest one, ties broken by the later start and then by the name so the split is stable.
+    Every microsecond is therefore counted at most once and the total can never exceed g1 - g0.
+    """
+    spans = []
     for ix in indexes:
         for a, b, e in ix.overlapping(g0, g1):
-            cov = min(b, g1) - max(a, g0)
-            if cov > best_cov:
-                best_cov = cov
-                best = e
-    if best is None:
-        return "nothing traced", 0
-    return "%s/%s" % (best.get("ph"), best.get("n")), best_cov
+            a, b = max(a, g0), min(b, g1)
+            if b > a:
+                spans.append((a, b, "%s/%s" % (e.get("ph"), e.get("n"))))
+    cov = defaultdict(float)
+    if not spans:
+        return cov
+
+    edges = sorted({p for a, b, _ in spans for p in (a, b)})
+    for lo, hi in zip(edges, edges[1:]):
+        here = [s for s in spans if s[0] <= lo and s[1] >= hi]
+        if here:
+            inner = min(here, key=lambda s: (s[1] - s[0], -s[0], s[2]))
+            cov[inner[2]] += hi - lo
+    return cov
 
 
 def main():
