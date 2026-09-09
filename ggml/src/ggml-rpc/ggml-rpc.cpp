@@ -1081,6 +1081,21 @@ static bool ggml_backend_rpc_cpy_tensor_p2p(ggml_backend_t backend_src, ggml_bac
     // anything queued for the destination has to be on the wire before the peer write lands
     rpc_flush_deferred_guarded(dst_sock);
 
+    // and it has to have been served, not merely sent. The peer write arrives on a different
+    // connection, so flushing this one orders the bytes but nothing else: an earlier
+    // GRAPH_COMPUTE or SET_TENSOR that has not yet taken the destination's execution mutex can
+    // still run after the peer's SET_TENSOR and read or overwrite a reused split input buffer.
+    // One connection is served in order, so a command with a reply is the barrier: when this
+    // returns, everything sent earlier on dst_sock is done. Failure is recoverable, the caller
+    // falls back to routing the tensor through the client.
+    {
+        rpc_msg_peer_barrier_rsp barrier;
+        if (!send_rpc_cmd(dst_sock, RPC_CMD_PEER_BARRIER, nullptr, 0, &barrier, sizeof(barrier))) {
+            GGML_LOG_ERROR("[%s] %s did not acknowledge the barrier\n", __func__, dst_ctx->endpoint.c_str());
+            return false;
+        }
+    }
+
     const std::string & endpoint = dst_ctx->endpoint;
     rpc_msg_copy_tensor_to_hdr hdr;
     hdr.src          = serialize_tensor(src);
