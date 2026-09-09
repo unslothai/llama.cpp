@@ -797,6 +797,12 @@ struct server_group {
 
     llama_context * ctx = nullptr;
 
+    // groups run concurrently, so they cannot share one thread pool: common_init_from_params only
+    // builds and attaches a pool for group 0's context. without this every extra group falls back
+    // to a disposable pool per graph, which ignores the configured cpu mask, priority and strict
+    // placement. one pool per concurrently executing context.
+    common_threadpools threadpools;
+
     server_batch batch;
 
     std::vector<server_slot *> slots;
@@ -1170,6 +1176,9 @@ private:
 
                 SRV_INF("created llama_context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
                         g, (int) llama_n_ctx(groups[g]->ctx), (int) llama_n_seq_max(groups[g]->ctx));
+
+                // group 0 already has the pool common_init_from_params attached to ctx_tgt
+                groups[g]->threadpools.init(groups[g]->ctx, params_ctx);
             }
         }
 
