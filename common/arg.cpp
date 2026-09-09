@@ -1725,9 +1725,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--preempt-async"},
         {"--no-preempt-async"},
-        "copy a parked sequence out of and back into the KV cache on a stream of its own, so the "
-        "slots that keep running do not wait for it (default: enabled, needs a backend that can "
-        "copy asynchronously, otherwise the copies are synchronous as before)",
+        "copy a parked sequence out of and back into the KV cache on a stream of its own: the copy out "
+        "overlaps with the slots that keep decoding, while a copy back in, and a kv-full retry behind a "
+        "copy out that has not landed, wait for it (default: enabled, needs a backend that can copy "
+        "asynchronously, otherwise the copies are synchronous as before)",
         [](common_params & params, bool value) {
             params.preempt_async = value;
         }
