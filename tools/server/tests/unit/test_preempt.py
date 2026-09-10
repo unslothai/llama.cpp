@@ -940,6 +940,42 @@ def test_a_swap_park_is_not_reported_as_a_recompute():
     assert _metrics()["preempt_recompute_total"] == 0
 
 
+def _stream_responses(n_predict: int, prompt: str) -> dict:
+    """One streaming /v1/responses request: the data of its response.completed event."""
+    url = f"http://{server.server_host}:{server.server_port}/v1/responses"
+    res = requests.post(url, json={
+        "model": "test", "input": prompt, "max_output_tokens": n_predict,
+        "temperature": 0.0, "stream": True,
+    }, stream=True, timeout=600)
+    assert res.status_code == 200, res.text
+    completed = None
+    for raw in res.iter_lines():
+        line = raw.decode("utf-8")
+        if line.startswith("data: "):
+            data = json.loads(line[6:])
+            if data.get("type") == "response.completed":
+                completed = data
+    assert completed is not None, "the stream never reached response.completed"
+    return completed
+
+
+def test_a_streamed_response_carries_the_preempt_record_where_a_plain_one_does():
+    # what a client keeps from a streamed /v1/responses is data["response"], so the record has to be in that object, the same place the non-streamed body carries it
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start(n_ctx=512)
+
+    completed = _stream_responses(24, _PROMPT_A)
+
+    assert completed["response"]["preempt"]["parks"] >= 1, completed["response"]
+    assert completed["response"]["preempt"]["recomputes"] == 0, completed["response"]
+
+    plain = server.make_request("POST", "/v1/responses", data={
+        "model": "test", "input": _PROMPT_B, "max_output_tokens": 4, "temperature": 0.0,
+    })
+    assert plain.status_code == 200, plain.body
+    assert sorted(plain.body["preempt"]) == sorted(completed["response"]["preempt"]) == ["parks", "recomputes"]
+
+
 def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
     # a media chunk could not be parked by recompute, so with the host budget spent nothing could be parked at all and the pool overflowing ended both chats. The chunk comes back the way it went in: re-encoded off the task, its cells reserved whole
     os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
