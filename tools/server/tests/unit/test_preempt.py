@@ -69,7 +69,8 @@ def _require_async(text: str):
         pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")
 
 
-def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay: float = 0.0, after_slot_busy=None):
+def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay: float = 0.0, after_slot_busy=None,
+              timeout: float = DEFAULT_REQUEST_TIMEOUT):
     time.sleep(delay)
     if after_slot_busy is not None:
         # sent once that slot is processing, so the request queues behind it whatever the host's speed
@@ -81,11 +82,11 @@ def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay:
     return server.make_request("POST", "/completion", data={
         "n_predict": n_predict, "prompt": prompt, "id_slot": id_slot,
         "ignore_eos": True, "return_tokens": True, "temperature": 0.0, "seed": 42,
-    })
+    }, timeout=timeout)
 
 
-def _complete_all(n_predict: int, prompts=(_PROMPT_A, _PROMPT_B)):
-    return parallel_function_calls([(_complete, (n_predict, prompt)) for prompt in prompts])
+def _complete_all(n_predict: int, prompts=(_PROMPT_A, _PROMPT_B), timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    return parallel_function_calls([(_complete, (n_predict, prompt, -1, 0.0, None, timeout)) for prompt in prompts])
 
 
 def _wait_processing(slot_ids, timeout: float = 30.0):
@@ -303,8 +304,9 @@ def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_h
     # with context shift on a resident would hold its cells for as long as it generates, so once the head has waited its turn the resident is parked and the two take turns
     _start(n_slots=3, n_ctx=384, enable_ctx_shift=True)
 
+    # the rotation waits on a clock, not on a token count, so the generation has to be long enough on a fast host; that is a lot of tokens for a slow one, and it takes turns with two others, so it is given more than the usual wait
     n_predict = 9000
-    _assert_completed(_complete_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C)), n_predict)
+    _assert_completed(_complete_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C), timeout=1800), n_predict)
 
     text = _log()
     _assert_recovered(text, "rotated out after")
@@ -338,8 +340,16 @@ def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
             "ignore_eos": True, "temperature": 0.0, "seed": 42,
         }, timeout=600)
 
+    # the server is stopped below with this request still in flight, so the disconnect it then sees is expected and must not surface as an unhandled thread exception
     unending = []
-    t = threading.Thread(target=lambda: unending.append(unending_request()))
+
+    def run_unending():
+        try:
+            unending.append(unending_request())
+        except requests.exceptions.RequestException:
+            pass
+
+    t = threading.Thread(target=run_unending)
     t.start()
 
     try:
