@@ -850,7 +850,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 // 2. This scan derives the current grouping from mem_idx and marks the pools the ubatch touches or completes as is_new, during decode that's one pool every kpool tokens, zero elsewise.
 // 3. The graph pools only the is_new pools and set_rows each result into the pooled slot of the pool's last member row.
 // 4. All pools are gathered in one get_rows via pool_cells, fresh ones just written, older ones from whatever batch last wrote them.
-// Any seq_* edit regroups the pools, so it sets mem_idx_stale and the first ubatch of the next batch re-pools everything from the still-valid key | gate rows, rewriting the (possibly different) rep rows. 
+// Any seq_* edit regroups the pools, so it sets mem_idx_stale and the first ubatch of the next batch re-pools everything from the still-valid key | gate rows, rewriting the (possibly different) rep rows.
 // Orphaned pooled slots are never cleared, a slot is only ever read through pool_cells, which is derived from the current grouping every ubatch.
 llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kpool_build_state(
         const llama_ubatch & ubatch) const {
