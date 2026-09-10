@@ -744,13 +744,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    if (dst->src[5]) {
+    if (const ggml_tensor * pages = ggml_cuda_fattn_pages(dst)) {
         GGML_ASSERT(dst->src[0]->ne[0] == 256 && dst->src[2]->ne[0] == 256);
         GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
         GGML_ASSERT(dst->src[3] && dst->src[0]->ne[3] == 1);
-        GGML_ASSERT(dst->src[5]->type == GGML_TYPE_I32 && ggml_is_contiguous(dst->src[5]));
-        GGML_ASSERT(dst->src[5]->ne[0] == 1 + dst->src[1]->ne[1]/FATTN_KQ_STRIDE);
-        GGML_ASSERT(dst->src[5]->ne[1] == dst->src[0]->ne[1]);
+        GGML_ASSERT(pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages));
+        GGML_ASSERT(pages->ne[0] == 1 + dst->src[1]->ne[1]/FATTN_KQ_STRIDE);
+        GGML_ASSERT(pages->ne[1] == dst->src[0]->ne[1]);
         float softcap;
         memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
         GGML_ASSERT(softcap == 0.0f);
