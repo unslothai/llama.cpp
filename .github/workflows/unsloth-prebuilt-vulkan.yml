@@ -166,11 +166,18 @@ jobs:
           echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
           mkdir -p "$source"
           tar -xzf "$archive" -C "$source"
+          # ENABLE_PCH=OFF: glslang builds a clang precompiled header, and ccache
+          # hands the cached .pch back on the next run. Clang validates a PCH by
+          # the mtime of every system header it saw, so the first run after the
+          # runner image reinstalls linux-libc-dev fails with "has been modified
+          # since the precompiled header was built" (run 34459747884). Without the
+          # PCH every object is an ordinary ccache hit and the build is unchanged.
           cmake -S "$source" -B "$source/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSHADERC_SKIP_TESTS=ON \
             -DSHADERC_SKIP_EXAMPLES=ON \
             -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DENABLE_PCH=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
