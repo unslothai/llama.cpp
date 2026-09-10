@@ -62,6 +62,8 @@ extern "C" {
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    // whether the buffer copies a strided set of rows in one call (see ggml_backend_tensor_set_2d); without it the generic path issues one transfer per row
+    GGML_API bool                           ggml_backend_buffer_supports_2d   (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
@@ -125,6 +127,8 @@ extern "C" {
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
+    // non-blocking: true once everything recorded before the event has completed. Backends without a query implementation fall back to a blocking synchronize.
+    GGML_API bool                 ggml_backend_event_query(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
     //
@@ -190,6 +194,8 @@ extern "C" {
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
+    // whether ggml_backend_event_query() on this device really is non-blocking, rather than falling back to a blocking synchronize
+    GGML_API bool                          ggml_backend_dev_supports_event_query(ggml_backend_dev_t device);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
 

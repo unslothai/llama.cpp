@@ -626,6 +626,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // [TAG_BATCH_INVARIANT] every choice below switches on Q->ne[1] or K->ne[1], both of which grow with the other sequences, so pin the kernel a batch of one would use
+    if (ggml_cuda_batch_invariant() && can_use_vector_kernel && Q->ne[1] == 1) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
@@ -738,6 +743,52 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (const ggml_tensor * pages = ggml_cuda_fattn_pages(dst)) {
+        GGML_ASSERT(dst->src[0]->ne[0] == 256 && dst->src[2]->ne[0] == 256);
+        GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
+        GGML_ASSERT(dst->src[3] && dst->src[0]->ne[3] == 1);
+        GGML_ASSERT(pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages));
+        GGML_ASSERT(pages->ne[0] == 1 + dst->src[1]->ne[1]/FATTN_KQ_STRIDE);
+        GGML_ASSERT(pages->ne[1] == dst->src[0]->ne[1]);
+        float softcap;
+        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+        GGML_ASSERT(softcap == 0.0f);
+        fattn_kernel_t kernel = flash_attn_ext_vec<256, 1, GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
+        launch_fattn<256, 1, 1>(ctx, dst, kernel, 4, 0, 128, false, false, false, /*use_sparse =*/ false);
+        return;
+    }
+
+    // [TAG_BATCH_INVARIANT] attend one query row at a time, as a batch of one would
+    const int fattn_max_cols = ggml_cuda_batch_invariant_max_cols();
+    if (ggml_cuda_batch_invariant() && dst->src[0]->ne[1] > 1 && dst->src[0]->ne[3] == 1 &&
+            (fattn_max_cols <= 0 || dst->src[0]->ne[1] <= fattn_max_cols)) {
+        const ggml_tensor * Q    = dst->src[0];
+        const ggml_tensor * mask = dst->src[3];
+
+        for (int64_t i = 0; i < Q->ne[1]; ++i) {
+            ggml_tensor Q_row = *Q;
+            Q_row.ne[1] = 1;
+            Q_row.data  = (char *) Q->data + i*Q->nb[1];
+
+            ggml_tensor mask_row;
+            ggml_tensor dst_row = *dst;
+            // ne[2] runs to the end of dst so the F16 K/V scratch behind dst stays in place
+            dst_row.ne[2] = dst->ne[2] - i;
+            dst_row.data  = (char *) dst->data + i*dst->nb[2];
+            dst_row.src[0] = &Q_row;
+            if (mask) {
+                mask_row = *mask;
+                mask_row.ne[1] = 1;
+                mask_row.data  = (char *) mask->data + i*mask->nb[1];
+                dst_row.src[3] = &mask_row;
+            }
+
+            ggml_cuda_flash_attn_ext(ctx, &dst_row);
+        }
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

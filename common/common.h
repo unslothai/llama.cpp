@@ -630,6 +630,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t preempt_ram_mib     = 0;     // host RAM for parked (preempted) sequences: 0 = preemption off (the default), -1 = no limit
+    bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -946,6 +948,23 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// [TAG_EXACT_CONCURRENCY] true when LLAMA_EXACT_CONCURRENCY is set for this process
+bool common_exact_concurrency();
+
+int common_exact_decode_width(const common_params & params);
+
+// [TAG_EXACT_CONCURRENCY] whether a batch of this shape holds a whole prompt ubatch beside a decode step of every slot, which a prefill needs to be split into the ubatches it would get alone; n_batch_min reports the batch size that would
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min = nullptr);
+
+// report that width to the CUDA backend, refusing a smaller explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
+bool common_exact_concurrency_init(const common_params & params);
+
+// the same for what only the loaded model tells: false if the model must not be served in exact mode
+bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
+
+// the same for the geometry the created context settled on, which the context size may have clamped below what -b and -ub asked for
+bool common_exact_concurrency_context(const common_params & params, const struct llama_context * ctx);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -215,6 +215,9 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) non-blocking completion test for an event. Kept last: a missing entry is NULL and ggml_backend_event_query() then blocks instead.
+        bool                 (*event_query)       (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {

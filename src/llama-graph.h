@@ -320,6 +320,7 @@ public:
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
+    ggml_tensor * self_pages = nullptr; // I32 [1 + physical pages, n_tokens]
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -1188,7 +1189,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * pages = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
