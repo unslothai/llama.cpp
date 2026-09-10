@@ -1,13 +1,5 @@
-// [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool: a removal that empties nothing,
-// a removal that leaves holes, and the pages those holes keep reserved.
-//
-// LLAMA_KV_CACHE_DEBUG=1 makes the pool rebuild its page ownership from the live cells on every
-// ubatch and assert that it says what the incrementally maintained one says, so this test drives
-// the removal paths and lets that oracle check them.
-//
-// The mode needs a CUDA (or ROCm/MUSA) build, 256-wide K and V heads and a fully offloaded F16 KV
-// cache. Where the context cannot be created the test reports what it skipped and passes: it has
-// nothing to say about a build without those.
+// [TAG_EXACT_CONCURRENCY] drives the removal paths of the paged KV pool - a removal that empties nothing, one that leaves holes, and the pages those holes keep reserved - while LLAMA_KV_CACHE_DEBUG=1 makes the pool cross-check page ownership against the live cells every ubatch.
+// Needs a CUDA build with 256-wide heads and a fully offloaded F16 cache; without one the test reports what it skipped and passes.
 
 #include "arg.h"
 #include "common.h"
