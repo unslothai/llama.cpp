@@ -139,6 +139,9 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // [TAG_PREEMPT] this request yielded more than one task, so index tells its results apart and the preempt notices carry it
+    bool batched = false;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -403,6 +406,7 @@ struct server_task_result_preempt_notice : server_task_result {
     bool    parked     = false; // true when the slot was just parked, false when restored
     bool    recomputed = false; // this resume re-prefilled its tokens instead of restoring saved bytes
     int32_t n_preempt  = 0;     // how many times this task has been parked so far
+    bool    batched    = false; // one of several tasks of its request, so the notice names which one by index
 
     virtual bool is_stop() override {
         return false;

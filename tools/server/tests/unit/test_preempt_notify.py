@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import threading
 import pytest
@@ -257,6 +258,20 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
     assert "no rotation: --preempt-ram 2 MiB" in text
     assert "resumed after" in text
     assert "Context size has been exceeded" not in text
+
+
+def test_every_notice_of_a_multi_prompt_stream_names_the_prompt_it_is_about():
+    # one request, two prompts: a client reading the shared stream can only tell the notices apart by their index, so index 0 has to be spelled out like any other
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start(n_ctx=512)
+
+    comments, datas = _stream_raw("/completion", _completion_payload(32) | {"prompt": [_PROMPT_A, _PROMPT_B]})
+    notices = [c for c in comments if c.startswith(": preempted") or c.startswith(": resumed")]
+    assert notices, comments
+    assert all(re.fullmatch(r": (preempted|resumed) [01]", c) for c in notices), notices
+    for index in (0, 1):
+        assert f": preempted {index}" in notices, notices
+        assert f": resumed {index}" in notices, notices
 
 
 def test_an_oversized_sibling_prompt_is_errored_before_a_valid_one_is_parked():
