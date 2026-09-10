@@ -5177,8 +5177,12 @@ private:
                         }
 
                         metrics_queue_prompt(n_tokens_out);
-                        slot.stats.n_prompt_processed += n_tokens_out;
-                        slot.stats.update_prompt_last();
+
+                        // [TAG_PREEMPT] a re-prefill puts back what a park dropped: real compute, counted above, but it is not the request's prompt
+                        if (!slot.preempt_reprefill) {
+                            slot.stats.n_prompt_processed += n_tokens_out;
+                            slot.stats.update_prompt_last();
+                        }
 
                         // add the mtmd chunk to cache
                         {
@@ -5918,7 +5922,8 @@ private:
             n_prompt_tokens++;
 
             auto & slot = slots[t.id_slot];
-            if (slot.stats.is_set()) {
+            // [TAG_PREEMPT] replayed tokens stay out of the slot's prompt count, they were counted when the request first processed its prompt
+            if (slot.stats.is_set() && !slot.preempt_reprefill) {
                 slot.stats.n_prompt_processed++;
             }
         }
@@ -5936,7 +5941,8 @@ private:
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
             auto & slot = slots[t.id_slot];
-            if (t.is_prompt && slot.stats.is_set()) {
+            // [TAG_PREEMPT] a re-prefill must not move the prompt/generation boundary: n_gen carries across the park, so the generation time would then cover only the tokens after it
+            if (t.is_prompt && slot.stats.is_set() && !slot.preempt_reprefill) {
                 slot.stats.set_prompt_last(t_now);
             }
         }

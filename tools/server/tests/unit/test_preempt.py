@@ -878,6 +878,26 @@ def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
     assert plain.body["preempt"] == {"parks": 0, "recomputes": 0}
 
 
+def test_a_recompute_restore_does_not_count_its_replay_as_prompt():
+    # the re-prefill puts back what the park dropped: counted as prompt it would move the prompt/generation boundary, and since n_gen carries across the park the generation time would then cover only the tokens after the last re-prefill
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start(n_ctx=2048, n_batch=2048)
+
+    n_prompt = 1950
+    n_predict = 24
+    res = _complete(n_predict, _prompt_of(n_prompt, _PROMPT_C))
+
+    assert res.status_code == 200, res.body
+    assert res.body["preempt"]["recomputes"] >= 1, res.body["preempt"]
+
+    timings = res.body["timings"]
+    assert timings["prompt_n"] == n_prompt, timings
+    assert timings["predicted_n"] == n_predict, timings
+    # every re-prefill happens inside the generation, so the generation holds the longer time of the two
+    assert timings["predicted_ms"] > timings["prompt_ms"], timings
+
+
 def test_slots_reports_the_recomputes_of_the_current_task():
     # a reader watching the slots sees the same count the request is given at the end
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
