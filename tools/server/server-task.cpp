@@ -714,14 +714,15 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"output_tokens", n_decoded},
                     {"total_tokens",  n_decoded + n_prompt_tokens},
                     {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-                }}
+                }},
+                // [TAG_PREEMPT] inside the response object, where the non-streaming body carries it: that object is what a client keeps from the stream
+                {"preempt",    preempt_to_json()},
             }},
         }}
     });
 
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
-        server_sent_events.back().at("data")["preempt"] = preempt_to_json();
     }
 
     return server_sent_events;
