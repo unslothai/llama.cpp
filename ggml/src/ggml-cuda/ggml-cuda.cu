@@ -85,6 +85,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -94,6 +95,28 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+// Whether an environment variable is set to a value that means "on".
+//
+// Most ggml switches test presence only, and for a name like GGML_CUDA_NO_PINNED
+// that is right: the only sensible use is to set it. GGML_CUDA_ENABLE_UNIFIED_MEMORY
+// is spelled as a positive, so people reasonably write =0 to turn it off, and under a
+// presence test that enabled the very path they were trying to leave. GGML_CUDA_DISABLE_FUSION
+// in this file already parses its value for the same reason.
+//
+// Empty and the usual falsy spellings are off, anything else is on, so =1, =true,
+// =on and =yes all keep working exactly as before.
+static bool ggml_cuda_env_enabled(const char * name) {
+    const char * val = getenv(name);
+    if (val == nullptr || val[0] == '\0') {
+        return false;
+    }
+    std::string v(val);
+    for (char & c : v) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return !(v == "0" || v == "false" || v == "no" || v == "off");
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -139,7 +162,26 @@ int ggml_cuda_get_device() {
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+    if (ggml_cuda_env_enabled("GGML_CUDA_ENABLE_UNIFIED_MEMORY")) {
+#if defined(GGML_USE_HIP)
+        // Say so once. Every report of this path going wrong has come from someone
+        // who did not know a front-end had set the variable for them.
+        //
+        // This deliberately does NOT warn about corrupted output. An earlier draft
+        // did, pointing at ggml-org#26148, but that defect is the cpy 2D fast path
+        // using cudaMemcpyDeviceToDevice on managed pages, and it is fixed
+        // separately. Warning about it in a tree that carries the fix would send
+        // users chasing a bug their build does not have.
+        //
+        // What remains true is the cost. On an integrated GPU managed allocation
+        // draws host RAM instead of the device carve-out rather than adding to it,
+        // so it is usually slower and can lower the ceiling: a model that loads
+        // without the variable may be OOM-killed with it.
+        GGML_LOG_WARN_ONCE("GGML_CUDA_ENABLE_UNIFIED_MEMORY is set, allocating device memory as managed. "
+                           "On integrated GPUs this draws host RAM instead of the device carve-out, which is "
+                           "usually slower and can reduce the largest model that will load. Unset the variable "
+                           "to disable it.\n");
+#endif // defined(GGML_USE_HIP)
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
@@ -4789,7 +4831,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
 
     // Check if UMA is explicitly enabled via environment variable
-    bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
+    bool uma_env = ggml_cuda_env_enabled("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
     bool is_uma = prop.integrated > 0 || uma_env;
 
     if (is_uma) {
