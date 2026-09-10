@@ -33,17 +33,8 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks where the weights that
-// produce the tokens live. Every per-layer weight and the output head must be on a backend with
-// the mode's kernels, otherwise a sequence's own matmuls change with the width of the step it
-// shares, while the mode still reports itself as on.
-//
-// token_embd is deliberately not required to move: it feeds get_rows, a per-row copy, and
-// GET_ROWS reports a batch size of 0 to the offload test, so it stays on the same backend at
-// every width. A model that ties its head to the embedding uses that same tensor for the output
-// matmul, and model.output points at it, so the head check below still covers that case. A lora
-// that adapts it is applied with a mul_mat instead, and MUL_MAT reports the ubatch width, so
-// llama_adapter_lora_init_impl() refuses one that inherits a host buffer.
+// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks the weights. Every per-layer weight and the output head must sit on a backend with the mode's kernels, else a sequence's own matmuls change with the width of the step it shares.
+// token_embd is exempt: it feeds GET_ROWS, a per-row copy that reports a batch size of 0 to the offload test, so it stays put at every width. A tied head is that same tensor and model.output points at it, so the head check covers it; a lora on it runs as MUL_MAT, which llama_adapter_lora_init_impl() refuses on a host buffer.
 static void llama_exact_check_weights(const llama_model & model) {
     auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
         if (!t || !t->buffer) {
