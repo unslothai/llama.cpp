@@ -1880,7 +1880,8 @@ private:
                 } else {
                     SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
                 }
-            } else if (params_base.preempt_async && !llama_model_is_recurrent(model_tgt) && preempt_state_relocates()) {
+            } else if (params_base.preempt_ram_mib != 0 && params_base.preempt_async &&
+                       !llama_model_is_recurrent(model_tgt) && preempt_state_relocates()) {
                 SRV_WRN("%s", "preemption: a recurrent state does not stay in one row, so a copy running beside the decode could read another sequence; parking and resuming synchronously\n");
             }
 
@@ -1903,7 +1904,7 @@ private:
 
                 SRV_WRN("LLAMA_SERVER_PREEMPT_GRANULARITY = %d (test knob: planning the kv pool in blocks of %d cells)\n",
                         preempt_alloc_granularity, preempt_alloc_granularity);
-            } else if (preempt_alloc_granularity > 1) {
+            } else if (preempt_alloc_granularity > 1 && params_base.preempt_ram_mib != 0) {
                 SRV_INF("preemption: the kv pool allocates %d cells at a time, planning in pages\n",
                         preempt_alloc_granularity);
             }
@@ -1949,7 +1950,7 @@ private:
             // assigned, not only set: a context reloaded with an attention model after a recurrent one gets preemption back
             preempt_recurrent = llama_model_is_recurrent(model_tgt);
 
-            if (preempt_recurrent) {
+            if (preempt_recurrent && params_base.preempt_ram_mib != 0) {
                 SRV_WRN("%s", "preemption: off, the recurrent cache holds one state per sequence whatever its length, so there is no cell pool to run out of\n");
             }
         }
