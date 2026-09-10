@@ -593,6 +593,10 @@ struct server_slot {
         if (preempt_tokens.empty()) {
             state = state_before_preempt; // its prompt had not been processed yet, so it is processed again from the start
 
+            // the park dropped the cells the prompt step had already filled, and the restart does not pass through SLOT_STATE_STARTED, where these two are set: left alone they would count the dropped prefix a second time
+            stats.n_prompt_cached    = 0;
+            stats.n_prompt_processed = 0;
+
             return true;
         }
 
