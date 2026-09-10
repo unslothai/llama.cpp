@@ -179,10 +179,8 @@ bool llama_exact_backend_name(const char * reg_name) {
     return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
 }
 
-// [TAG_EXACT_CONCURRENCY] a host buffer is the interesting case: the scheduler runs an operation on
-// the backend holding its weight, and moves a host weight's operation to the GPU only once the batch
-// is wide enough (ggml_backend_cuda_device_offload_op), while the CPU matmul picks between its SGEMM
-// and its vector dot by the batch width too.
+// [TAG_EXACT_CONCURRENCY] a host buffer is the case that matters: the scheduler runs an op on the backend that holds its weight, and moves a host weight's op to the GPU only once the batch is wide enough (ggml_backend_cuda_device_offload_op).
+// The CPU matmul picks between its SGEMM and its vector dot by the batch width too.
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
     if (!buft || ggml_backend_buft_is_host(buft)) {
         return false;
