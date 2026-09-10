@@ -109,6 +109,17 @@ def _wait_processing(slot_ids, timeout: float = 30.0):
     pytest.fail(f"slots {slot_ids} never showed as processing")
 
 
+def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    """A leader on slot 0 and a follower on slot 1 that certainly overlap: the follower is sent once the leader is seen processing, so the lengths and not the client's speed decide what the pool has to hold."""
+    leader = _prompt_of(n_prompt[0], _PROMPT_A)
+    other  = _prompt_of(n_prompt[1], _PROMPT_B)
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(_complete, n_predict[0], leader, 0, 0.0, None, timeout)
+        _wait_processing([0])
+        second = _complete(n_predict[1], other, 1, 0.0, None, timeout)
+    return [first.result(), second]
+
+
 def _wait_preempted(timeout: float = 30.0) -> bool:
     """True once some slot is parked: its cells are in host RAM and it wants them back."""
     deadline = time.time() + timeout
@@ -191,7 +202,7 @@ def test_forced_parks_do_not_change_the_output(mode):
 
 @pytest.mark.parametrize("knob", ["planner", "pages", "async", "last-resort", "last-resort-unlimited"])
 def test_two_generations_that_do_not_fit_together_both_finish(knob):
-    # each request fits the pool alone (168 of 256 cells) but not together; without preemption both end with "Context size has been exceeded"
+    # each request fits the pool alone (960 and 600 of 1024 cells) but not together; without preemption both end with "Context size has been exceeded"
     if knob == "pages":
         # a block allocator gives a whole block to one sequence, so the planner has to count cells: counting tokens it sees room the allocator cannot find
         os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
@@ -199,19 +210,24 @@ def test_two_generations_that_do_not_fit_together_both_finish(knob):
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
     if knob == "last-resort-unlimited":
         os.environ["LLAMA_ARG_PREEMPT_RAM"] = "-1"
-    (_start_async if knob == "async" else _start)(n_ctx=256)
+    n_ctx = 1024
+    (_start_async if knob == "async" else _start)(n_ctx=n_ctx)
 
-    n_predict = 160
-    results = _complete_all(n_predict)
+    # the lengths, not the client's speed, decide the overlap: two equal requests fired together did not overlap on a Windows runner, the first finished before the second arrived, and the last resort never saw the two residents it needs.
+    # the follower is sent once the leader is seen processing, so it holds its cells while the leader grows into the rest of the pool
+    n_predict = (460, 400)
+    results = _complete_overlapping(n_predict, (500, 200))
+
     text = _log()
     _assert_recovered(text, "preempted as a last resort" if knob.startswith("last-resort") else "preempted:")
-    _assert_completed(results, n_predict)
-    for res in results:
+    for res, n_wanted in zip(results, n_predict):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_wanted
         assert res.body["truncated"] is False
-        assert len(res.body["tokens"]) == n_predict
+        assert len(res.body["tokens"]) == n_wanted
 
     if knob == "pages":
-        held   = [int(n) for n in re.findall(r"kv (\d+)/256", text)]
+        held   = [int(n) for n in re.findall(rf"kv (\d+)/{n_ctx}", text)]
         wanted = [int(n) for n in re.findall(r"\(wanted (\d+)\)", text)]
         assert held and wanted, f"the planner logged no figures:\n{text}"
         assert all(n % 64 == 0 for n in held + wanted), f"not whole blocks: {held} {wanted}"
@@ -236,7 +252,8 @@ def test_a_request_that_cannot_be_helped_gets_the_context_error_and_the_server_l
     _start(n_ctx=256)
 
     if knob == "ram-0":
-        assert any(res.status_code != 200 for res in _complete_all(160))
+        # the overflow has to be a matter of lengths: two equal requests fired together did not overlap on a Windows runner, and each one fits the pool alone
+        assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
     else:
         res = server.make_request("POST", "/completion", data={
             "n_predict": 160, "n_cmpl": 2, "prompt": _PROMPT_A,
@@ -263,7 +280,8 @@ def test_a_server_that_never_asked_for_parking_behaves_as_upstream():
     assert "preemption:" not in text, "a server that did not ask for parking announced it"
     assert _ASYNC_BANNER not in text, "the async park path was set up without being asked for"
 
-    assert any(res.status_code != 200 for res in _complete_all(160))
+    # as above, the two have to be resident together for the pool to overflow at all
+    assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
 
     text = _log()
     assert "Context size has been exceeded" in text
