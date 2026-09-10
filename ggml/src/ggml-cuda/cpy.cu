@@ -474,8 +474,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+        // cudaMemcpyDefault, not DeviceToDevice: under
+        // GGML_CUDA_ENABLE_UNIFIED_MEMORY these buffers come from
+        // hipMallocManaged, and managed pages are not guaranteed device
+        // resident. DeviceToDevice asserts that they are, so the runtime skips
+        // residency resolution and a migrated page is read as garbage. Default
+        // lets it infer per pointer, and is a no-op when both really are on the
+        // device.
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
-                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+                                     mc_width, mc_height, cudaMemcpyDefault, main_stream));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
