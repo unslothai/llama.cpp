@@ -532,9 +532,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
     // Match FLA l2 norm
     constexpr float l2_eps = 1e-6f;
-    const float l2_scale = 1.0f / std::sqrt((float) head_dim);
-    Qcur = ggml_scale(ctx0, ggml_rms_norm(ctx0, Qcur, l2_eps / (float) head_dim), l2_scale);
-    Kcur = ggml_scale(ctx0, ggml_rms_norm(ctx0, Kcur, l2_eps / (float) head_dim), l2_scale);
+    Qcur = build_gdn_l2_norm(ctx0, Qcur, l2_eps);
+    Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
 
     auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
 
