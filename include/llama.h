@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -214,6 +214,12 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -314,6 +320,8 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
+
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -437,6 +445,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -795,6 +804,22 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible block: 1 ordinarily, larger where a mode places cells in blocks
+    // n contiguous tokens then occupy round_up(n, granularity) cells; a sequence left with holes still holds every block one live cell is in
+    LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
+
+    // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
+    // takes the context because the update is a graph; returns true when one was run
+    LLAMA_API bool llama_memory_update(struct llama_context * ctx);
+
+    // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1 plus the draft length. Never lowered; false when a column bound cannot cover it.
+    LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
+    LLAMA_API uint32_t llama_exact_decode_tokens(void);
+
+    // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns; never lowered, and false when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is below it
+    LLAMA_API bool     llama_set_exact_decode_width(uint32_t n_cols);
+    LLAMA_API uint32_t llama_exact_decode_width(void);
+
     //
     // State / sessions
     //
@@ -926,6 +951,47 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // [TAG_STATE_ASYNC] asynchronous per-sequence state transfer, polled with llama_state_seq_copy_done().
+    // Until it completes the caller must not touch the buffer, free the cells read, or decode what is written.
+    struct llama_state_seq_copy;
+
+    // NULL when the backends cannot copy asynchronously, or cannot say whether a copy has finished without waiting for it; the caller then uses the synchronous calls
+    // Also NULL for a recurrent or hybrid model: its states move between rows on every decode, so a transfer beside a decode can read another sequence
+    LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
+    LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
+
+    // size the transfer's host buffer, keeping no contents; NULL on failure. Grow-only: page-locking is far too slow to redo per transfer, so only llama_state_seq_copy_buf_free() frees it.
+    LLAMA_API uint8_t * llama_state_seq_copy_buf_resize  (struct llama_state_seq_copy * cpy, size_t size);
+    LLAMA_API uint8_t * llama_state_seq_copy_buf         (struct llama_state_seq_copy * cpy);
+    LLAMA_API size_t    llama_state_seq_copy_buf_size    (struct llama_state_seq_copy * cpy);
+    LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
+    LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
+
+    // true when the buffer held right now is page-locked. False while no buffer is held: ask llama_state_seq_copy_buf_can_pin() instead.
+    LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
+
+    LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
+
+    // issue the copies; the bytes covered, 0 on failure. size must be within llama_state_seq_copy_buf_size(), and LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused.
+    LLAMA_API size_t llama_state_seq_copy_get(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_copy_set(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_copy_n_copies(struct llama_state_seq_copy * cpy);
+
+    LLAMA_API int64_t llama_state_seq_copy_sync_us(struct llama_state_seq_copy * cpy);
+
+    LLAMA_API bool llama_state_seq_copy_done(struct llama_state_seq_copy * cpy);
+    LLAMA_API void llama_state_seq_copy_wait(struct llama_state_seq_copy * cpy);
 
     //
     // Decoding

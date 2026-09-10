@@ -355,11 +355,20 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
+        {"preempt",             preempt_to_json()},
     };
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
+}
+
+// [TAG_PREEMPT] how the request was served: a recompute resume re-prefilled its tokens, so its continuation is not the bytes that were parked
+json server_task_result_cmpl_final::preempt_to_json() const {
+    return json {
+        {"parks",      n_preempt},
+        {"recomputes", n_recompute},
+    };
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
@@ -406,6 +415,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
+        res["preempt"] = preempt_to_json();
     }
 
     return res;
@@ -454,6 +464,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
+        res["preempt"] = preempt_to_json();
     }
 
     return res;
@@ -515,6 +526,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
+        deltas.back()["preempt"] = preempt_to_json();
     }
 
     // extra fields for debugging purposes
@@ -591,6 +603,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
+        {"preempt",      preempt_to_json()},
     };
 
     return res;
@@ -701,7 +714,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"output_tokens", n_decoded},
                     {"total_tokens",  n_decoded + n_prompt_tokens},
                     {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-                }}
+                }},
+                // [TAG_PREEMPT] inside the response object, where the non-streaming body carries it: that object is what a client keeps from the stream
+                {"preempt",    preempt_to_json()},
             }},
         }}
     });
@@ -724,6 +739,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
+        {"preempt", preempt_to_json()},
     };
     return event;
 }
@@ -788,7 +804,8 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"cache_read_input_tokens", n_prompt_tokens_cache},
             {"input_tokens", n_prompt_tokens - n_prompt_tokens_cache},
             {"output_tokens", n_decoded}
-        }}
+        }},
+        {"preempt", preempt_to_json()}
     };
 
     return res;
@@ -968,7 +985,8 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             }},
             {"usage", {
                 {"output_tokens", n_decoded}
-            }}
+            }},
+            {"preempt", preempt_to_json()}
         }}
     });
 
@@ -1021,6 +1039,14 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
         }
     }
+}
+
+json server_task_result_preempt_notice::to_json() {
+    return json {
+        {"preempted",  parked},
+        {"recomputed", recomputed},
+        {"n_preempt",  n_preempt},
+    };
 }
 
 json server_task_result_cmpl_partial::to_json() {
@@ -1570,6 +1596,10 @@ std::string server_task_result_metrics::to_metrics() {
             "n_resume_total",
             "Preemption: Total parked slots put back",
             (double) metrics.n_resume
+        }, {
+            "preempt_recompute_total",
+            "Preemption: Total parks that dropped their cells, whose resume re-prefills instead of restoring the saved bytes",
+            (double) metrics.n_preempt_recompute
         },
     };
 

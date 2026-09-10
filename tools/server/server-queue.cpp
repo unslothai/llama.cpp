@@ -448,6 +448,9 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    // [TAG_PREEMPT] the timeout is a deadline, not a per-wait duration: send() notify_all()s for every result of every task, and with wait_for() each wakeup restarted the wait
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -459,7 +462,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
@@ -527,12 +530,16 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
     size_t index = 0;
+    // [TAG_PREEMPT] several prompts, or several completions of one prompt, all number their results, and their preempt notices have to say which one they belong to
+    const bool batched = id_tasks.size() > 1;
     for (auto & task : tasks) {
-        task.index = index++;
+        task.index   = index++;
+        task.batched = batched;
         states.push_back(task.create_state());
         // for child tasks
         for (auto & child_task : task.child_tasks) {
-            child_task.index = index++;
+            child_task.index   = index++;
+            child_task.batched = batched;
             states.push_back(child_task.create_state());
         }
     }

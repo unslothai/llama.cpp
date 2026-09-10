@@ -105,7 +105,16 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // isolate_seqs_above = [TAG_EXACT_CONCURRENCY] when > 0, a sequence set with more than this many tokens left is a prompt and gets a ubatch of its own
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t isolate_seqs_above = 0);
+
+    // [TAG_EXACT_CONCURRENCY] true if some sequence still has more than n_tokens left to place, i.e. what remains of the batch holds a prompt
+    bool has_seq_wider_than(uint32_t n_tokens) const;
+
+    bool has_shared_tokens() const;
+
+    // [TAG_EXACT_CONCURRENCY] true if a sequence has several tokens at one position, which the paged pool would give one cell
+    bool has_repeated_positions() const;
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

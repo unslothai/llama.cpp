@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <list>
 #include <set>
 #include <sstream>
 #include <string>
@@ -269,7 +270,7 @@ struct common_params_sampling {
         COMMON_SAMPLER_TYPE_TEMPERATURE,
     };
 
-    common_grammar              grammar;      // optional grammar constraint (user / output-format / tool-calls)
+    common_grammar                      grammar;          // optional grammar constraint (user / output-format / tool-calls)
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
     std::set<llama_token>               preserved_tokens;
@@ -369,6 +370,9 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    double synth_len = -1.0;
+    std::vector<double> synth_rates;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -381,6 +385,10 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool has_synth() const {
+        return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
@@ -474,6 +482,8 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+
+    enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -589,6 +599,11 @@ struct common_params {
     int image_max_tokens = -1;
     int mtmd_batch_max_tokens = 1024;
 
+    // for video input
+    float       video_fps                   = 4.0f;
+    int64_t     video_timestamp_interval_ms = 5000;
+    std::string video_ffmpeg_bin_dir        = "";
+
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
@@ -612,9 +627,11 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t preempt_ram_mib     = 8192;  // host RAM for parked (preempted) sequences: -1 = no limit, 0 = disable preemption
+    int32_t preempt_ram_mib     = 0;     // host RAM for parked (preempted) sequences: 0 = preemption off (the default), -1 = no limit
+    bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -642,6 +659,7 @@ struct common_params {
     std::string ssl_file_cert = "";                                                                         // NOLINT
 
     std::map<std::string, std::string> default_template_kwargs;
+    bool preserve_reasoning_specified = false;
 
     // CLI params
     std::string server_base; // if set, connect to this server instead of starting a new one
@@ -931,6 +949,23 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
+// [TAG_EXACT_CONCURRENCY] true when LLAMA_EXACT_CONCURRENCY is set for this process
+bool common_exact_concurrency();
+
+int common_exact_decode_width(const common_params & params);
+
+// [TAG_EXACT_CONCURRENCY] whether a batch of this shape holds a whole prompt ubatch beside a decode step of every slot, which a prefill needs to be split into the ubatches it would get alone; n_batch_min reports the batch size that would
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min = nullptr);
+
+// report that width to the CUDA backend, refusing a smaller explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
+bool common_exact_concurrency_init(const common_params & params);
+
+// the same for what only the loaded model tells: false if the model must not be served in exact mode
+bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
+
+// the same for the geometry the created context settled on, which the context size may have clamped below what -b and -ub asked for
+bool common_exact_concurrency_context(const common_params & params, const struct llama_context * ctx);
+
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
@@ -1109,17 +1144,28 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 }
 
 //
-// MoE utils
+// FFN offload utils
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-inline std::string llm_ffn_exps_block_regex(int idx) {
-    return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
+const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
+
+inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
+    return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}
+
+inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
+    // keep strings alive and avoid leaking memory by storing them in a static list
+    static std::list<std::string> buft_override_strings;
+    for (int i = 0; i < n; ++i) {
+        buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
+        overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
+    }
 }
 
 //
