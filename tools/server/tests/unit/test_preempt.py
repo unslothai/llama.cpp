@@ -61,7 +61,16 @@ def _start_async(**kwargs):
 
 
 def _log() -> str:
-    return open(server.log_path).read()
+    """The server log once its writer thread has stopped growing it: on a loaded host the log lags the response that came from it."""
+    deadline = time.time() + 5.0
+    last = -1
+    while time.time() < deadline:
+        size = os.path.getsize(server.log_path)
+        if size == last:
+            break
+        last = size
+        time.sleep(0.1)
+    return open(server.log_path, errors="replace").read()
 
 
 def _require_async(text: str):
@@ -688,14 +697,14 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
     _start(n_ctx=16384, n_slots=4, n_batch=2048, n_ubatch=512, fa="on", n_gpu_layer=99, cache_ram=0)
 
     def prefill(first_token: int) -> list:
-        mark = len(open(server.log_path, errors="replace").read())
+        mark = len(_log())
         res = server.make_request("POST", "/completion", data={
             "prompt": list(range(first_token, first_token + 3500)), "n_predict": 1,
             "cache_prompt": False, "temperature": 0.0, "seed": 42,
         }, timeout=600)
         assert res.status_code == 200, res.body
         assert res.body["timings"]["prompt_n"] == 3500
-        text = open(server.log_path, errors="replace").read()[mark:]
+        text = _log()[mark:]
         # a decode step is one token per slot, so the prompt's own ubatches are the wide ones
         return [w for w in _ubatch_widths(text) if w > 3]
 

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import threading
 import pytest
 import requests
@@ -47,6 +48,19 @@ def _completion_payload(n_predict: int, prompt: str = "Hi how are you", **extra)
 def _chat_payload(n_predict: int) -> dict:
     return {"max_tokens": n_predict, "messages": [{"role": "user", "content": "Hi how are you"}],
             "temperature": 0.0, "seed": 42, "stream": True}
+
+
+def _log() -> str:
+    """The server log once its writer thread has stopped growing it: on a loaded host the log lags the response that came from it."""
+    deadline = time.time() + 5.0
+    last = -1
+    while time.time() < deadline:
+        size = os.path.getsize(server.log_path)
+        if size == last:
+            break
+        last = size
+        time.sleep(0.1)
+    return open(server.log_path, errors="replace").read()
 
 
 def _post(path: str, data: dict):
@@ -159,8 +173,6 @@ def _prefill_payload(path: str, prompt: str, n_predict: int) -> dict:
 @pytest.mark.parametrize("path", ["/completion", "/v1/chat/completions", "/v1/responses", "/v1/messages"])
 def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     # a park before the first token is the case a client cannot tell from a stall, so the notice goes out with the response headers rather than waiting for a chunk that is not coming
-    import time
-
     server.server_slots = True
     _start(n_ctx=2048, n_batch=256)
 
@@ -194,7 +206,7 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
             seen.append((time.time() - t0, line))
     t.join(120)
 
-    text = open(server.log_path).read()
+    text = _log()
     assert "preempted:" in text, "nothing was parked while the prompt was being processed"
 
     comments = [(at, line) for at, line in seen if line.startswith(":")]
@@ -253,7 +265,7 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
     assert n_parked >= 2, [r[0] for r in results]
     assert n_keepalive >= 1, "a parked stream was left silent past its keepalive interval"
 
-    text = open(server.log_path).read()
+    text = _log()
     assert "rotated out after" in text
     assert "no rotation: --preempt-ram 2 MiB" in text
     assert "resumed after" in text
