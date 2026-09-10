@@ -688,7 +688,7 @@ While a request is streaming, the server sends SSE comment lines that a client r
 
 A park can happen while the prompt is still being processed, before the request has produced a token. The notice is not held back for the first chunk in that case: the response headers and the `: preempted` line go out at the moment the slot is parked, on every streaming surface (`/completion`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`), so a client never has to tell that silence from a stall. `: resumed`, and `: recomputed` where it applies, follow when the slot runs again.
 
-With more than one prompt in the request, the index of the prompt follows the word, for example `: resumed 1`.
+When the request asks for more than one completion, either several prompts or `n` above one, the index of the completion follows the word, for example `: resumed 1`, including index `0`. A request with a single completion carries no index.
 
 
 ### POST `/tokenize`: Tokenize a given text

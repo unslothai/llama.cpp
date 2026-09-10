@@ -117,7 +117,7 @@ constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a s
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 
 static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
-    const std::string suffix = (notice.index > 0 ? " " + std::to_string(notice.index) : "") + "\n\n";
+    const std::string suffix = (notice.batched ? " " + std::to_string(notice.index) : "") + "\n\n";
 
     std::string res = (notice.parked ? ": preempted" : ": resumed") + suffix;
 
@@ -2684,6 +2684,7 @@ private:
         res->parked     = parked;
         res->recomputed = recomputed;
         res->n_preempt  = slot.n_preempt;
+        res->batched    = slot.task->batched;
 
         queue_results.send(std::move(res));
     }
