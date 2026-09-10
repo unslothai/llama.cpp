@@ -630,7 +630,7 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t preempt_ram_mib     = 8192;  // host RAM for parked (preempted) sequences: -1 = no limit, 0 = disable preemption
+    int32_t preempt_ram_mib     = 0;     // host RAM for parked (preempted) sequences: 0 = preemption off (the default), -1 = no limit
     bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
 
     std::string hostname      = "127.0.0.1";

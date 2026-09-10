@@ -1736,7 +1736,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--preempt-ram"}, "N",
         string_format("with a unified KV cache, park a slot in host RAM instead of failing every slot when the cache fills; "
-            "N is the maximum host RAM for parked sequences in MiB (default: %d, -1 - no limit, 0 - disable)", params.preempt_ram_mib),
+            "N is the maximum host RAM for parked sequences in MiB (default: %d - disabled, -1 - no limit)", params.preempt_ram_mib),
         [](common_params & params, int value) {
             params.preempt_ram_mib = value;
         }

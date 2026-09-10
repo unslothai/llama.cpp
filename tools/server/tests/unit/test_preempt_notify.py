@@ -21,6 +21,8 @@ def create_server():
     server = ServerPreset.tinyllama2()
     server.n_slots = 2
     server.kv_unified = True
+    # the server parks only when asked: --preempt-ram defaults to 0, and this suite is about parking
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     server.temperature = 0.0
     server.seed = 42
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
