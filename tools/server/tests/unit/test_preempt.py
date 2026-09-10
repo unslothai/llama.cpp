@@ -5,6 +5,7 @@ import re
 import struct
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import tempfile
 import pytest
@@ -85,6 +86,17 @@ def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay:
 
 def _complete_all(n_predict: int, prompts=(_PROMPT_A, _PROMPT_B)):
     return parallel_function_calls([(_complete, (n_predict, prompt)) for prompt in prompts])
+
+
+def _wait_processing(slot_ids, timeout: float = 30.0):
+    """Return once every one of these slots is processing; a request that ended first is a failure, not a hang."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        slots = server.make_request("GET", "/slots").body
+        if all(any(s["id"] == i and s["is_processing"] for s in slots) for i in slot_ids):
+            return
+        time.sleep(0.005)
+    pytest.fail(f"slots {slot_ids} never showed as processing")
 
 
 def _prompt_of(n_tokens: int, text: str) -> list:
@@ -392,18 +404,20 @@ def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_ke
     # the last request waits for slot 0 and is started on it holding the first request's cells; counted by the prompt it keeps instead, the pool looks free and a parked slot is restored into cells that are still taken
     _start(n_ctx=256, n_slots=3)
 
-    results = parallel_function_calls([
-        (_complete, (60, _prompt_of(115, _PROMPT_C), 0)),
-        (_complete, (100, _PROMPT_A, 1)),
-        (_complete, (100, _PROMPT_B, 2)),
-        (_complete, (8, _PROMPT_C, 0, 0.0, 0)),
-    ])
+    # queued behind a busy slot 0, so it starts on the cells the first request keeps while the two long ones still want the pool; polling for a busy slot 0 with all four in flight missed a short first request on a Windows runner and sent the follower into an idle pool
+    with ThreadPoolExecutor(3) as pool:
+        long_ones = [pool.submit(_complete, 200, _PROMPT_A, 1), pool.submit(_complete, 200, _PROMPT_B, 2)]
+        _wait_processing([1, 2])
+        first = pool.submit(_complete, 100, _prompt_of(115, _PROMPT_C), 0)
+        _wait_processing([0])
+        follower = _complete(8, _PROMPT_C, 0)
+    results = [first.result(), long_ones[0].result(), long_ones[1].result(), follower]
 
     text = _log()
     assert "trimmed to the" in text, "the started slot kept the cells of the request before it"
     assert "resume failed" not in text
     assert "Context size has been exceeded" not in text
-    for res, n_predict in zip(results, (60, 100, 100, 8)):
+    for res, n_predict in zip(results, (100, 200, 200, 8)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
 

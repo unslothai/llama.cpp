@@ -160,6 +160,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    # [TAG_EXACT_CONCURRENCY] the buffer types the mode treats as invariant, through llama-impl.h
+    llama_build_and_test(test-exact-buft.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -364,9 +366,8 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
-# [TAG_EXACT_CONCURRENCY] the batch shape and the buffer types the mode requires, checked without a model
+# [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
-llama_build_and_test(test-exact-buft.cpp)
 
 # server helpers that need no model
 if (LLAMA_BUILD_TOOLS)

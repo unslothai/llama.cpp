@@ -172,7 +172,9 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     t.start()
 
     # the pool has to be nearly full before the second prompt starts, so that its prefill is what runs out of cells
-    for _ in range(600):
+    # the resident grows by decoding: 1400 tokens took over 12 s on a loaded CI runner
+    deadline = time.time() + 90
+    while t.is_alive() and time.time() < deadline:
         slots = requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
         if any(slot.get("n_prompt_tokens", 0) >= 1400 for slot in slots):
             break
