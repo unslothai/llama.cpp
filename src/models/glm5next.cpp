@@ -409,7 +409,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     // sign-unconstrained head weights; PREC_F32 is load-bearing, bf16 swaps near-tied pools
     ggml_tensor * w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
-    ggml_mul_mat_set_prec(w, GGML_PREC_F32);
+    ggml_prec_set_acc(w, GGML_PREC_F32);
     w = ggml_reshape_4d(ctx0, w, n_ihead, n_tps, 1, n_stream);
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
     cb(w, "indexer_weights", il);
