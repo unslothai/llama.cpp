@@ -1767,11 +1767,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
+        // limit_size does not count pooled bytes, so both trims are needed: the first releases
+        // what was already pooled, the second the buffers update() just evicted, which the
+        // checkpoint destructors hand to the pool rather than to the allocator.
+        common_state_buffer_pool::instance().trim(0);
+
         limit_size = std::max<size_t>(1, 0.4*size());
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
         update();
+
+        common_state_buffer_pool::instance().trim(0);
 
         return nullptr;
     }
