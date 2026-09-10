@@ -63,6 +63,13 @@ int main(int argc, char ** argv) {
 
     llama_state_seq_copy * cpy = llama_state_seq_copy_init(ctx);
 
+    // a recurrent state does not stay in one row, so these models are refused a transfer whatever the backend can do
+    if (llama_model_is_recurrent(llama_init->model()) || llama_model_is_hybrid(llama_init->model())) {
+        CHECK(cpy == nullptr);
+        fprintf(stderr, "%s : a recurrent or hybrid model is refused a transfer, as it must be\n", __func__);
+        return 0;
+    }
+
     if (cpy == nullptr) {
         fprintf(stderr, "%s : this backend cannot copy sequence states asynchronously, skipping\n", __func__);
         return 0;

@@ -957,6 +957,7 @@ extern "C" {
     struct llama_state_seq_copy;
 
     // NULL when the backends cannot copy asynchronously, or cannot say whether a copy has finished without waiting for it; the caller then uses the synchronous calls
+    // Also NULL for a recurrent or hybrid model: its states move between rows on every decode, so a transfer beside a decode can read another sequence
     LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
     LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
 
