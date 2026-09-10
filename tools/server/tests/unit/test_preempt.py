@@ -327,16 +327,24 @@ def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_h
 def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
     # the budget grants permission to allocate, not a successful allocation: a failed save used to stop the planner and leave the pool to overflow, although the same victim could be parked by dropping its cells
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
-    _start(n_ctx=256)
+    _start(n_ctx=1024, n_slots=2)
 
-    n_predict = 160
-    results = _complete_all(n_predict)
+    # lengths decide the overlap, not the host's speed: two 171-cell requests fired together did not overlap on a Windows runner, so nothing was parked. The leader ends at 960 of 1024 cells, so the second is parked whatever the client's lag
+    leader = _prompt_of(500, _PROMPT_A)
+    other = _prompt_of(200, _PROMPT_B)
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(_complete, 460, leader, 0)
+        _wait_processing([0])
+        second = _complete(400, other, 1)
+    results = [first.result(), second]
 
     text = _log()
     assert "could not take the host memory" in text, "the injected allocation failure never fired"
     assert "tokens to re-prefill" in text, "the failed save did not fall back to recompute"
     assert "Context size has been exceeded" not in text
-    _assert_completed(results, n_predict)
+    for res, n_predict in zip(results, (460, 400)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
 
 
 def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
