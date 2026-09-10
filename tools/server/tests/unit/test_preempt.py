@@ -100,6 +100,17 @@ def _wait_processing(slot_ids, timeout: float = 30.0):
     pytest.fail(f"slots {slot_ids} never showed as processing")
 
 
+def _wait_preempted(timeout: float = 30.0) -> bool:
+    """True once some slot is parked: its cells are in host RAM and it wants them back."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        slots = server.make_request("GET", "/slots").body
+        if any(s["is_preempted"] for s in slots):
+            return True
+        time.sleep(0.005)
+    return False
+
+
 def _prompt_of(n_tokens: int, text: str) -> list:
     """A prompt of exactly n_tokens tokens, as ids: no BOS is added to one of those."""
     base = server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]
@@ -412,22 +423,27 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 
 def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_keeps():
     # the last request waits for slot 0 and is started on it holding the first request's cells; counted by the prompt it keeps instead, the pool looks free and a parked slot is restored into cells that are still taken
-    _start(n_ctx=256, n_slots=3)
+    _start(n_ctx=1024, n_slots=3)
 
-    # queued behind a busy slot 0, so it starts on the cells the first request keeps while the two long ones still want the pool; polling for a busy slot 0 with all four in flight missed a short first request on a Windows runner and sent the follower into an idle pool
-    with ThreadPoolExecutor(3) as pool:
-        long_ones = [pool.submit(_complete, 200, _PROMPT_A, 1), pool.submit(_complete, 200, _PROMPT_B, 2)]
-        _wait_processing([1, 2])
-        first = pool.submit(_complete, 100, _prompt_of(115, _PROMPT_C), 0)
+    # the lengths, not the host's speed, decide who is parked: the three prompts (500 + 200 + 200) fit the 1024 cells, so both of the others are parked holding at least their whole prompt once slot 0 grows into the rest, and slot 0 is the largest slot throughout, which the planner never picks as a victim. Slot 0 ends holding 960 of the 1024 cells, too few left for either parked slot to come back
+    ids = _prompt_of(500, _PROMPT_C)
+
+    with ThreadPoolExecutor(4) as pool:
+        first = pool.submit(_complete, 460, ids, 0)
         _wait_processing([0])
-        follower = _complete(8, _PROMPT_C, 0)
-    results = [first.result(), long_ones[0].result(), long_ones[1].result(), follower]
+        # queued behind slot 0 whatever the host's speed, and a real prefix of what slot 0 holds: it starts on 960 cells while keeping 8 of them
+        follower = pool.submit(_complete, 8, ids[:8], 0)
+        long_ones = [pool.submit(_complete, 400, _prompt_of(200, _PROMPT_A), 1),
+                     pool.submit(_complete, 400, _prompt_of(200, _PROMPT_B), 2)]
+        parked = _wait_preempted()
+    results = [first.result(), follower.result(), long_ones[0].result(), long_ones[1].result()]
 
     text = _log()
+    assert parked, "the pool never came under pressure, so no slot was waiting for the cells slot 0 keeps"
     assert "trimmed to the" in text, "the started slot kept the cells of the request before it"
     assert "resume failed" not in text
     assert "Context size has been exceeded" not in text
-    for res, n_predict in zip(results, (100, 200, 200, 8)):
+    for res, n_predict in zip(results, (460, 8, 400, 400)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
 
