@@ -3701,6 +3701,12 @@ void llama_context::state_seq_copy_fence() {
 }
 
 llama_state_seq_copy * llama_context::state_seq_copy_init() {
+    // [TAG_STATE_ASYNC] a recurrent state keeps no fixed row: find_slot() gathers the live rows together, so a decode beside a transfer moves or overwrites the row the transfer reads. A hybrid carries that half too
+    if (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch)) {
+        LLAMA_LOG_INFO("%s: this model moves sequence states between rows, so they are copied synchronously\n", __func__);
+        return nullptr;
+    }
+
     std::unique_ptr<llama_state_seq_copy> cpy(new llama_state_seq_copy());
 
     cpy->ctx = this;
