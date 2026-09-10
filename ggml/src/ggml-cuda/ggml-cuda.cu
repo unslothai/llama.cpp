@@ -2002,7 +2002,8 @@ static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // recurrent output projections broadcast one weight matrix over sequence planes, so normalize each plane before applying the column policy
-    if (ggml_cuda_exact_concurrency() && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+    // every mode owes the caller the batch-of-one column policy, and a plane the policy never sees is left batched
+    if (ggml_cuda_batch_invariant() && src0->ne[2] == 1 && src0->ne[3] == 1 &&
             (dst->ne[2] > 1 || dst->ne[3] > 1) &&
             src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
         for (int64_t i3 = 0; i3 < dst->ne[3]; ++i3) {
