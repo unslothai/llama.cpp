@@ -100,6 +100,14 @@ def _assert_completed(results, n_predict: int):
         assert res.body["timings"]["predicted_n"] == n_predict
 
 
+_PARK_MARKERS = ("preempted:", "preempted as a last resort", "preempted on request")
+
+
+def _assert_nothing_parked(text: str):
+    # the park log lines, not the bare word: a verbose log prints every slot's "is_preempted"
+    assert not any(m in text for m in _PARK_MARKERS), "nothing could be parked here"
+
+
 def _assert_recovered(text: str, parked: str = "preempted:"):
     """Nothing was ended for want of cells: a slot was parked and came back."""
     assert "Context size has been exceeded" not in text
@@ -206,7 +214,7 @@ def test_a_request_that_cannot_be_helped_gets_the_context_error_and_the_server_l
 
     text = _log()
     assert "Context size has been exceeded" in text
-    assert "preempted" not in text, "nothing could be parked here"
+    _assert_nothing_parked(text)
     assert "GGML_ASSERT" not in text
     after = _complete(8)
     assert after.status_code == 200
@@ -226,7 +234,7 @@ def test_a_server_that_never_asked_for_parking_behaves_as_upstream():
 
     text = _log()
     assert "Context size has been exceeded" in text
-    assert "preempted" not in text
+    _assert_nothing_parked(text)
     assert "last resort" not in text, "the retry ladder consulted the planner"
     assert "GGML_ASSERT" not in text
 
@@ -418,7 +426,7 @@ def test_a_recurrent_model_is_served_without_preemption():
 
     text = _log()
     assert "preemption: off, the recurrent cache holds one state per sequence" in text
-    assert "preempted" not in text
+    _assert_nothing_parked(text)
     assert "Context size has been exceeded" not in text
 
 
@@ -754,7 +762,7 @@ def test_a_sibling_prompt_with_an_invalid_token_is_refused_before_anything_strea
     assert "invalid tokens" in str(res.body)
 
     text = _log()
-    assert "preempted" not in text
+    _assert_nothing_parked(text)
 
 
 def test_a_recompute_park_bounds_its_draft_by_the_tokens_it_comes_back_with():

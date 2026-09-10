@@ -1173,7 +1173,7 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
     case GGML_OP_FLASH_ATTN_EXT: {
         // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
         if (op->src[5]) {
-            return true;
+            return {false, "FLASH_ATTN_EXT with a page table is CUDA only"};
         }
         float scale = 1.0f;
         float max_bias = 0.0f;

@@ -42,10 +42,22 @@ static bool decode_range(llama_context * ctx, llama_seq_id seq, llama_pos first,
     return ok;
 }
 
+// Windows has no setenv
+static void set_env_default(const char * name, const char * value) {
+    if (getenv(name)) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+
 int main(int argc, char ** argv) {
     // read before the model is loaded: both are latched on first use
-    setenv("LLAMA_EXACT_CONCURRENCY", "1", 0);
-    setenv("LLAMA_KV_CACHE_DEBUG",    "1", 0);
+    set_env_default("LLAMA_EXACT_CONCURRENCY", "1");
+    set_env_default("LLAMA_KV_CACHE_DEBUG",    "1");
 
     common_params params;
 
