@@ -1025,3 +1025,43 @@ def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
     for res in results:
         assert res.status_code == 200, res.body
         assert res.body["tokens_predicted"] == n_predict
+
+
+def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
+    # a park with no budget for the state drops the cells of a prompt that is still being processed, and the resume starts that prefill again from nothing: what it had counted before the park has to go with the cells, or the request reports more prompt tokens than it has
+    # the park is made to fail its host allocation, so it drops the cells instead: the state of a half processed prompt is small enough to fit any budget
+    os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
+    _start(n_ctx=2048, n_batch=256)
+
+    resident = []
+    t = threading.Thread(target=lambda: resident.append(_complete(1900, _PROMPT_A)), daemon=True)
+    t.start()
+
+    # the pool has to be nearly full before the second prompt starts, so that it is that prefill which runs out of cells
+    deadline = time.time() + 90
+    while t.is_alive() and time.time() < deadline:
+        slots = server.make_request("GET", "/slots").body
+        if any(slot.get("n_prompt_tokens", 0) >= 1600 for slot in slots):
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("the resident never grew into the pool")
+
+    n_prompt = 500
+    n_predict = 8
+    comments, final = _stream_completion(n_predict, _prompt_of(n_prompt, _PROMPT_B))
+    t.join(120)
+
+    assert resident and resident[0].status_code == 200, resident
+    assert "error" not in final, final
+    assert comments and comments[0] == ": preempted", comments
+
+    # a park that dropped fewer cells than the resume has tokens to put back is a park taken mid-prefill, which is the case this test is about
+    parks = [(int(cells), int(again)) for cells, again in re.findall(
+        r"preempted: (\d+) cells dropped .*? (\d+) tokens to re-prefill", _log())]
+    assert any(0 < cells < again for cells, again in parks), parks
+
+    timings = final["timings"]
+    assert timings["prompt_n"] == n_prompt, timings
+    assert timings["cache_n"] == 0, timings
+    assert timings["predicted_n"] == n_predict, timings
