@@ -617,7 +617,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
         ggml_tensor * logits = ggml_add(ctx0, pg, layer.indexer_kpool_ape);
         logits = ggml_cont(ctx0, ggml_permute(ctx0, logits, 1, 0, 2, 3)); // [kpool, head_dim, n_new]
+        logits = ggml_reshape_2d(ctx0, logits, kpool, n_embd_indexer * n_new);
         ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+        probs  = ggml_reshape_3d(ctx0, probs, kpool, n_embd_indexer, n_new);
 
         pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
         pooled_new = ggml_sum_rows(ctx0, ggml_mul(ctx0, probs, pk)); // [1, head_dim, n_new]
