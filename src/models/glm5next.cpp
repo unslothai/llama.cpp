@@ -383,7 +383,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * ape = ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
     gate_t = ggml_add(ctx0, gate_t, ggml_reshape_4d(ctx0, ape, r, d_idx, 1, 1));
 
-    // count new pools along ne1: soft_max launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+    // soft_max maps ne2/ne3 to gridDim.y/z (65535 cap); fold into ne1
     ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, gate_t, r, d_idx*n_new_max*n_stream));
     probs = ggml_reshape_4d(ctx0, probs, r, d_idx, n_new_max, n_stream);
     cb(probs, "indexer_pool_probs", il);
