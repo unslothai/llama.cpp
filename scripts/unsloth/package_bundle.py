@@ -141,7 +141,11 @@ class WindowsStrategy(PlatformStrategy):
 
     # No portable readelf/otool equivalent; the project's own DLLs live beside
     # the binaries in build/bin/Release, so bundle those by name convention.
-    LOCAL_DLL_PREFIXES = ("ggml", "llama", "mtmd")
+    # libomp: the Windows arm64 CPU bundle is a clang build with GGML_OPENMP=ON
+    # and carries the VS LLVM redist's libomp140.aarch64.dll beside the binaries.
+    # ggml-cpu.dll imports it by name, so a curated bundle built from that tree
+    # (the arm64 CUDA leg) has to keep it or nothing in the bundle loads.
+    LOCAL_DLL_PREFIXES = ("ggml", "llama", "mtmd", "libomp")
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
         return [

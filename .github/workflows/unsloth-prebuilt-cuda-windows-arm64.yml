@@ -1,0 +1,391 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth prebuilt: CUDA Windows ARM64"
+
+# Reusable child of unsloth-prebuilt.yml. Produces the one Windows-on-ARM CUDA
+# bundle (app-<tag>-windows-arm64-cuda13-portable.zip) the installer looks for
+# before it falls back to ggml-org's single llama-bin-win-cuda-13.4-arm64.zip.
+#
+# Why this is a separate child rather than an arm64 row in
+# unsloth-prebuilt-cuda-windows.yml:
+#
+#   * There is no ARM64 Windows runner with a CUDA toolkit. The leg cross
+#     compiles on an x64 runner with the amd64_arm64 MSVC toolset, the same way
+#     unsloth-prebuilt-cpu.yml already cross compiles the Windows arm64 CPU
+#     bundle, and the same way ggml-org's release.yml builds its arm64 CUDA zip.
+#   * Only CUDA 13.4 ships Windows ARM64 target libraries (cudart + cublas), and
+#     only from packages.nvidia.com rather than the redist CDN the x64 legs use,
+#     so it needs its own component list, not another row in the x64 table.
+#   * It builds one target (ggml-cuda), not the whole tool set: everything else
+#     in the bundle comes from the arm64 CPU bundle this run already builds.
+#     That is exactly upstream's arrangement -- their arm64 CUDA job packs
+#     ggml-cuda.dll alone and the release merges it into the arm64 CPU zip --
+#     and it keeps the leg down to one backend's compile instead of a full
+#     cross-compiled tree with BoringSSL, the server and the tools.
+#
+# Because of that last point the job does not use the shared
+# .github/actions/unsloth-cuda-windows-setup composite: that action exists so
+# the x64 `warm` shards and `build` job configure byte-identically and share
+# ccache entries, and there is one job here.
+#
+# The arm64 CPU bundle is a sibling job in the same run, not a `needs:`. The
+# parent's "Wait for the build matrix" step fails a publish if a child has no
+# job record within 45 minutes of the run starting, and a `needs:` here would
+# hold this job's record back until the whole CPU child finished. So the leg
+# starts immediately, compiles for an hour or more, and only then waits for the
+# artifact -- which by that point has long since been uploaded.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name): ggml-org/llama.cpp for plain builds, or this repo for mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact (app-source-*) holding the stamped source tree; set by resolve for every build'
+        required: false
+        default: ''
+        type: string
+
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'Azure Trusted Signing client id; empty on forks, which then build unsigned'
+        required: false
+      AZURE_CLIENT_SECRET:
+        description: 'Azure Trusted Signing client secret'
+        required: false
+      AZURE_TENANT_ID:
+        description: 'Azure Trusted Signing tenant id'
+        required: false
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:
+        description: 'Azure Trusted Signing account name'
+        required: false
+      AZURE_CERTIFICATE_PROFILE_NAME:
+        description: 'Azure Trusted Signing certificate profile name'
+        required: false
+
+permissions:
+  contents: read
+  # The CPU bundle wait below reads this run's artifact list.
+  actions: read
+
+env:
+  # One profile, and it is not a copy of an x64 row. Windows on ARM CUDA hosts
+  # are Blackwell only -- NVIDIA's ARM64 Windows driver and its 13.4 toolkit
+  # target the GB10 class parts (sm_121) and discrete RTX 50 (sm_120); there is
+  # no Windows ARM64 machine with a Pascal, Turing, Ampere, Ada or Hopper GPU
+  # to cover. Building those archs anyway would double a cross-compiled leg's
+  # runtime to ship PTX nothing can load. Linux arm64 keeps 90/100 because
+  # Grace-Hopper and GB200 servers are real there.
+  PROFILE: cuda13-portable
+  LINE: cuda13
+  KLASS: portable
+  RANK: '60'
+  CUDA: '13.4'
+  ARCHS: '120 121'
+
+jobs:
+  build:
+    name: arm64/cuda13-portable
+    runs-on: windows-2022
+    # Same reasoning as the x64 child: this is the only job that reads the
+    # Azure Trusted Signing secrets, and naming an environment is what makes
+    # them gateable. Inert until protection rules exist.
+    environment: release-signing
+    # Hang guard, below assemble's 350 and the waiter's 330-minute deadline.
+    # Two archs of one backend, so this is far under the x64 legs' ceiling;
+    # the cap is here to stop a wedged leg holding a runner, not to fit a
+    # measured ceiling that does not exist yet.
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      - name: Download source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+          test -f src/cmake/arm64-windows-msvc-cuda.cmake
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Check Ninja
+        run: |
+          (Get-Command ninja.exe -ErrorAction Stop).Source
+          ninja --version
+
+      # amd64_arm64: x64 host binaries emitting ARM64 code. The toolchain file
+      # picks cl.exe out of Hostx64/arm64 for nvcc's host pass, so this has to
+      # be the cross toolset, not the native one.
+      - name: Setup MSVC (amd64_arm64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: amd64_arm64
+
+      # The x64 legs install from the redist CDN, which has no ARM64 target
+      # libraries at any version. 13.4 is the first toolkit that ships them and
+      # it lives in the bin-archive pool instead; the host-side pieces (nvcc,
+      # crt, nvvm, cccl) stay x86_64 because the compiler runs on this runner.
+      # Same component set and same pool ggml-org's release.yml installs.
+      - name: Install CUDA toolkit 13.4 (x86_64 host, ARM64 target)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pool = 'https://packages.nvidia.com/bin-archive/pool'
+          $guid = '5B515474-7E78-11F1-8656-C51E4F4B317F'
+          $components = @(
+            "windows-x86_64/$guid/cccl-windows-x86_64-13.3.4.1.2-archive",
+            "windows-x86_64/$guid/cuda_crt-windows-x86_64-13.4.46-archive",
+            "windows-x86_64/$guid/cuda_nvcc-windows-x86_64-13.4.46-archive",
+            "windows-x86_64/$guid/libnvvm-windows-x86_64-13.4.46-archive",
+            "windows-arm64/$guid/cuda_cudart-windows-arm64-13.4.46-archive",
+            "windows-arm64/$guid/libcublas-windows-arm64-13.7.0.10-archive"
+          )
+          $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA }}"
+          $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+          foreach ($component in $components) {
+            $name = Split-Path $component -Leaf
+            $zip = Join-Path $stage "$name.zip"
+            curl.exe -fsSL --retry 3 -o $zip "$pool/$component.zip"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $component" }
+            tar.exe -xf $zip -C $stage
+            if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }
+            robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copy failed: $name ($LASTEXITCODE)" }
+            Remove-Item -Recurse -Force $zip, (Join-Path $stage $name)
+          }
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_HOME=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V13_4=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+
+      # The toolchain file points CMake straight at lib/arm64; if the archive
+      # ever stops shipping it, fail here with the reason rather than in a
+      # CMake error that reads like a missing CUDA install.
+      - name: Verify the toolkit has ARM64 target libraries
+        run: |
+          nvcc --version
+          $libs = "$env:CUDA_PATH\lib\arm64"
+          if (-not (Test-Path $libs)) { throw "no ARM64 target libraries under $libs" }
+          foreach ($lib in @('cudart.lib', 'cublas.lib', 'cublasLt.lib')) {
+            if (-not (Test-Path (Join-Path $libs $lib))) { throw "missing $lib in $libs" }
+          }
+          Get-ChildItem $libs | Select-Object -ExpandProperty Name
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}
+          restore-keys: |
+            cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 3G
+          save: false
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+          ccache --set-config=compression_level=6
+          ccache -z
+
+      # GGML_CPU=OFF: the CPU backend, the server and the tools come from the
+      # arm64 CPU bundle, which is built with clang (upstream's proven Windows
+      # arm64 CPU toolchain) rather than cross MSVC. GGML_BACKEND_DL=ON is what
+      # makes that split legal -- ggml loads ggml-cuda.dll through the backend
+      # registry, a C ABI, so the two compilers never share a C++ interface.
+      - name: Configure
+        working-directory: src
+        run: |
+          $archs = "${{ env.ARCHS }}".Replace(' ', ';')
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU=OFF `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_CUB_3DOT2=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=OFF `
+            -DLLAMA_BUILD_SERVER=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="$archs" `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build ggml-cuda
+        working-directory: src
+        run: |
+          # -j 3 for the same reason as the x64 legs: 4 vCPU / 16 GB runners,
+          # and nvcc peaks around 3 GB of host RSS per translation unit.
+          cmake --build build --config Release -j 3 --target ggml-cuda
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Nothing downstream would notice an x64 ggml-cuda.dll until a user's ARM64
+      # host refused to load it, so check the PE machine field here.
+      - name: Check the backend is ARM64
+        run: |
+          $dll = 'src/build/bin/ggml-cuda.dll'
+          if (-not (Test-Path $dll)) { throw "the build produced no $dll" }
+          $stream = [System.IO.File]::OpenRead((Resolve-Path $dll))
+          try {
+            $reader = New-Object System.IO.BinaryReader($stream)
+            $stream.Position = 0x3C
+            $stream.Position = $reader.ReadInt32() + 4
+            $machine = $reader.ReadUInt16()
+          } finally { $stream.Dispose() }
+          "ggml-cuda.dll machine 0x{0:X4}" -f $machine
+          if ($machine -ne 0xAA64) { throw "ggml-cuda.dll is not an ARM64 image (machine 0x$('{0:X4}' -f $machine))" }
+
+      - name: ccache stats
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          ccache -s -v
+          {
+            echo "### ccache windows arm64/${PROFILE}"
+            echo ""
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Sign only what this leg built. Everything else in the finished bundle
+      # was signed by the CPU leg that produced it, and re-signing a signed
+      # image is wasted signing quota.
+      - name: Stage the backend for signing
+        run: |
+          New-Item -ItemType Directory -Force -Path cudabin | Out-Null
+          Copy-Item src/build/bin/ggml-cuda.dll cudabin/
+
+      - name: Sign Windows binaries
+        id: sign_windows
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: cudabin
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      # Sibling job, not a `needs:` (see the header). Poll rather than assume:
+      # on a warm ccache this leg can finish before the CPU child does.
+      - name: Wait for the Windows ARM64 CPU bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: app-${{ inputs.tag }}-windows-arm64-cpu
+        shell: bash
+        run: |
+          set -uo pipefail
+          DEADLINE=$(( $(date +%s) + 90 * 60 ))
+          while :; do
+            if NAMES="$(gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+                  --jq '.artifacts[].name' 2>/dev/null)"; then
+              if printf '%s\n' "$NAMES" | grep -qxF "$ARTIFACT"; then
+                echo "${ARTIFACT} is available"
+                exit 0
+              fi
+            fi
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+              echo "ERROR: ${ARTIFACT} never appeared; the Windows ARM64 CPU leg must succeed before this bundle can be packed" >&2
+              exit 1
+            fi
+            echo "waiting for ${ARTIFACT}"
+            sleep 60
+          done
+
+      - name: Download the Windows ARM64 CPU bundle
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-arm64-cpu
+          path: cpubundle
+
+      # The CPU zip is the whole build/bin/Release tree plus the OpenMP runtime.
+      # Dropping the backend in beside it gives package_bundle.py the same shape
+      # of input directory a native build tree would have.
+      - name: Compose the bundle input
+        run: |
+          $zip = "cpubundle/app-${{ inputs.tag }}-windows-arm64-cpu.zip"
+          if (-not (Test-Path $zip)) { throw "the CPU leg's artifact does not contain $zip" }
+          Expand-Archive -Path $zip -DestinationPath bin -Force
+          Copy-Item cudabin/ggml-cuda.dll bin/ -Force
+          foreach ($required in @('llama-server.exe', 'ggml-base.dll', 'ggml-cpu.dll')) {
+            if (-not (Test-Path (Join-Path 'bin' $required))) { throw "the CPU bundle is missing $required" }
+          }
+          Get-ChildItem bin | Select-Object -ExpandProperty Name
+
+      - name: Package bundle
+        env:
+          PLATFORM: windows
+          ARCH: arm64
+          BIN_DIR: ${{ github.workspace }}/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+          SOURCE_REF_KIND: ${{ inputs.repo == 'ggml-org/llama.cpp' && 'tag' || 'mix' }}
+          PROFILE: ${{ env.PROFILE }}
+          LINE: ${{ env.LINE }}
+          KLASS: ${{ env.KLASS }}
+          RANK: ${{ env.RANK }}
+          TOOLKIT_LINE: ${{ env.CUDA }}
+          DOCKER_IMAGE: github-hosted windows-2022 cross-compiled to arm64, CUDA ${{ env.CUDA }} (NVIDIA bin-archive)
+          ARCHS: ${{ env.ARCHS }}
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Verify every binary in the bundle is signed
+        if: ${{ steps.sign_windows.outputs.signed == 'true' }}
+        run: tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}.zip'
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}
+          path: dist/app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}.zip
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 7d
+
+      - name: Save ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

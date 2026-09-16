@@ -4,14 +4,15 @@
 name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
-# release per upstream b#### tag. Splits the heavy build work into six reusable
+# release per upstream b#### tag. Splits the heavy build work into seven reusable
 # children:
-#   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-cuda-windows.yml  -- CUDA Windows bundles (x64, matrix profiles)
-#   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
-#   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
-#   unsloth-prebuilt-cpu.yml           -- CPU-only bundles (Linux + Windows, x64 + arm64)
-#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux x64/arm64 + Windows x64)
+#   unsloth-prebuilt-cuda.yml              -- Linux CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows.yml      -- CUDA Windows bundles (x64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows-arm64.yml -- CUDA Windows bundle (arm64, cross-compiled)
+#   unsloth-prebuilt-rocm.yml              -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-macos.yml             -- macOS bundles (arm64 Metal + x64 CPU)
+#   unsloth-prebuilt-cpu.yml               -- CPU-only bundles (Linux + Windows, x64 + arm64)
+#   unsloth-prebuilt-vulkan.yml            -- Vulkan bundles (Linux x64/arm64 + Windows x64)
 #
 # Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
@@ -573,6 +574,28 @@ jobs:
       warm_matrix: ${{ needs.resolve.outputs.win_cuda_warm_matrix }}
     secrets: inherit
 
+  # Windows on ARM CUDA. Separate child, not a row in the x64 matrix: it cross
+  # compiles on an x64 runner with the only toolkit that has ARM64 target
+  # libraries (13.4) and builds just the ggml-cuda backend, which it merges into
+  # the arm64 CPU bundle the `CPU` child builds in this same run. See that
+  # workflow's header.
+  build-windows-cuda-arm64:
+    name: CUDA Windows ARM64
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    # actions: read is for the step that waits on the CPU child's artifact; a
+    # called workflow cannot request more than the caller's job grants it.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/unsloth-prebuilt-cuda-windows-arm64.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      commit: ${{ needs.resolve.outputs.commit }}
+    secrets: inherit
+
   # First of two ccache prunes (see scripts/unsloth/prune_ccache.sh): one generation per prefix
   # at run start so old + new fit under the limit. Never gates the waiter, which excludes it by name.
   prune-ccache:
@@ -688,7 +711,7 @@ jobs:
           # job list as "<caller job name> / <called job name>", e.g.
           # "CUDA / x64/cuda12-legacy". One prefix per build child; every one of
           # them must be represented or we are not looking at a complete run.
-          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
+          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'CUDA Windows ARM64 / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
           SELF='Assemble metadata + publish'
           ALERT='Report pipeline health'
           # Best-effort jobs that never gate a publish: the start-of-run ccache prune and the
@@ -1114,7 +1137,7 @@ jobs:
     # Every build leg, not just assemble.
     # assemble needs only resolve, so one failing leg fails it immediately while slower legs are still building, and with always() this job then deleted the app-source-* artifact out from under them.
     # On 08-27 one arm64 CPU failure became ten: nine ROCm legs died on "Artifact not found" seconds later, which reads as a ROCm fault and is not.
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
+    needs: [resolve, build-cuda, build-windows-cuda, build-windows-cuda-arm64, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     # always(), so a run that publishes NOTHING still cleans up after itself.
     # Gating this on `published` leaked every non-publishing run's bundles: a
     # workflow_dispatch defaults to publish:false, and a cancelled run never
@@ -1288,7 +1311,7 @@ jobs:
   # Runs on publish-intent runs only, so subset test dispatches stay quiet.
   alert:
     name: Report pipeline health
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
+    needs: [resolve, build-cuda, build-windows-cuda, build-windows-cuda-arm64, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
     runs-on: ubuntu-24.04
     permissions:
