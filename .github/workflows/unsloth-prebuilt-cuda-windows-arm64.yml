@@ -228,7 +228,7 @@ jobs:
           $archs = "${{ env.ARCHS }}".Replace(' ', ';')
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake `
+            '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake' `
             -DGGML_NATIVE=OFF `
             -DGGML_BACKEND_DL=ON `
             -DGGML_CPU=OFF `
