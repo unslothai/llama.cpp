@@ -30,6 +30,8 @@ on:
 
 permissions:
   contents: read
+  # write covers the rerun POST and the job-log read the transient-failure
+  # test needs; those logs are where a bad download shows up.
   actions: write
   # The runner-loss test reads each failed job's annotation, which lives on
   # the check run rather than in the job log.
@@ -40,12 +42,16 @@ jobs:
     name: Rerun an externally broken run once
     # run_attempt caps this at one retry: the rerun fires this workflow again
     # as attempt 2, which no longer matches. A hand-cancelled workflow_dispatch
-    # is someone stopping their own build, so leave it stopped.
+    # is someone stopping their own build, so leave it stopped -- but only when
+    # it was cancelled. A dispatched run that FAILED on infrastructure is no
+    # different from a scheduled one, and excluding the whole event left run
+    # 35343257137 dead after a bad ccache download took out two of 44 legs.
     if: >-
       (github.event.workflow_run.conclusion == 'cancelled'
         || github.event.workflow_run.conclusion == 'failure')
       && github.event.workflow_run.run_attempt == 1
-      && github.event.workflow_run.event != 'workflow_dispatch'
+      && !(github.event.workflow_run.conclusion == 'cancelled'
+           && github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     steps:
       - name: Rerun the run when nothing about the build actually failed
@@ -91,12 +97,23 @@ jobs:
             exit 0
           fi
 
-          # For an outright failure, retry only when every failed job died
-          # because its runner went away. A compile error repeats identically
-          # and must be read, not rerun; a lost runner is infrastructure and a
-          # rerun is the whole fix. Anything we cannot positively identify as
-          # runner loss counts as a real failure, so an unreadable annotation
-          # fails closed and the run stays put.
+          # For an outright failure, retry only when every failed job died of
+          # something positively identified as infrastructure. A compile error
+          # repeats identically and must be read, not rerun. Anything we cannot
+          # name fails closed and the run stays put.
+          #
+          # Two recognised classes. Runner loss, which only appears as a check
+          # annotation. And a transient network failure in an install or fetch
+          # step, which only appears in the log: on 09-18 the ccache action
+          # downloaded 92 bytes instead of a tarball and killed two of 44 legs.
+          #
+          # "This does not look like a tar archive" is deliberately NOT in the
+          # list. A corrupt archive is not provably transient and could be a
+          # truncated or tampered asset, so it is not something to retry into.
+          # The ccache step is now best-effort in the children instead, which
+          # is the right place to absorb it.
+          INFRA_LOG='Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
+
           if [ "$CONCLUSION" = failure ]; then
             if [ -z "$FAILED" ]; then
               echo "not retrying ${RUN_ID}: it concluded failure with no failed job, so there is nothing to rerun" \
@@ -107,12 +124,20 @@ jobs:
               [ -n "${JOB_ID:-}" ] || continue
               NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs/${JOB_ID}/annotations" \
                          --jq '.[].message' 2>/dev/null)"
-              if ! grep -qF 'lost communication with the server' <<<"$NOTES"; then
-                echo "not retrying ${RUN_ID}: \`${JOB_NAME}\` failed for a reason other than runner loss, so read it rather than repeat it" \
-                  | tee -a "$GITHUB_STEP_SUMMARY"
-                exit 0
+              if grep -qF 'lost communication with the server' <<<"$NOTES"; then
+                echo "runner loss: ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+                continue
               fi
-              echo "runner loss: ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+              # Logs are only readable for a few days; a 410 here simply means
+              # we cannot identify the cause, which fails closed as it should.
+              LOG="$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)"
+              if MATCH="$(grep -oE "$INFRA_LOG" <<<"$LOG" | head -1)" && [ -n "$MATCH" ]; then
+                echo "transient infrastructure (\`${MATCH}\`): ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              echo "not retrying ${RUN_ID}: \`${JOB_NAME}\` failed for a reason we cannot identify as infrastructure, so read it rather than repeat it" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
             done <<<"$FAILED"
           fi
 

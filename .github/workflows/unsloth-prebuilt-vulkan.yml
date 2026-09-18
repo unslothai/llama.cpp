@@ -118,6 +118,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: ccache
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}
@@ -131,12 +133,27 @@ jobs:
           save: false
 
       - name: Configure ccache
-        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
-        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
+        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
+        # archive". A cache accelerator must never fail a release build. So verify ccache
+        # POSITIVELY here and, when it is missing or older than the options below require,
+        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
+        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
+        # would quietly change cache semantics rather than announce itself.
         run: |
-          ccache --set-config=compiler_check=content
-          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
-          ccache --set-config=compression_level=6
+          set -uo pipefail
+          need=4.10
+          have="$(ccache --version 2>/dev/null | head -1 | awk '{print $3}')"
+          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" = "$need" ]; then
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            echo "CCACHE_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "::warning::ccache unusable (found '${have:-none}', need >= $need); building without a cache"
+          echo "- ccache unusable (found \`${have:-none}\`); this leg built without a cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "CCACHE_LAUNCHER=" >> "$GITHUB_ENV"
 
       # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
       # the current backend and it has no glslc package. Install matching pinned
@@ -147,7 +164,7 @@ jobs:
           set -eux
           package="$RUNNER_TEMP/vulkan-headers.deb"
           staging="$RUNNER_TEMP/vulkan-headers"
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 \
             "https://packages.lunarg.com/vulkan/pool/main/v/vulkan-headers/vulkan-headers_1.4.313.0~rc1-1lunarg22.04-1_all.deb" \
             -o "$package"
           echo "587b2d8e79416b394170ab61557c98765570cd153730f819a917866d78f45e1a  $package" | sha256sum -c -
@@ -160,7 +177,7 @@ jobs:
           set -eux
           archive="$RUNNER_TEMP/shaderc.tar.gz"
           source="$RUNNER_TEMP/shaderc"
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 \
             "https://packages.lunarg.com/vulkan/pool/main/s/shaderc/shaderc_2025.2~rc1-1lunarg22.04.orig.tar.gz" \
             -o "$archive"
           echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
@@ -178,8 +195,8 @@ jobs:
             -DSHADERC_SKIP_EXAMPLES=ON \
             -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
             -DENABLE_PCH=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
           cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
           sudo install -m 0755 "$source/build/glslc/glslc" /usr/local/bin/glslc
           glslc --version
@@ -213,8 +230,8 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
       - name: Build
         working-directory: src
@@ -329,6 +346,8 @@ jobs:
           tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
 
       - name: ccache
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: vulkan-windows-x64-${{ inputs.tag }}
@@ -340,12 +359,28 @@ jobs:
           save: false
 
       - name: Configure ccache
-        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
-        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
+        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
+        # archive". A cache accelerator must never fail a release build. So verify ccache
+        # POSITIVELY here and, when it is missing or older than the options below require,
+        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
+        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
+        # would quietly change cache semantics rather than announce itself.
         run: |
-          ccache --set-config=compiler_check=content
-          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
-          ccache --set-config=compression_level=6
+          $ErrorActionPreference = 'Continue'
+          $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
+          $ok = $false
+          if ($have) { try { $ok = [version]($have -replace '[^0-9.].*$','') -ge [version]'4.10' } catch { $ok = $false } }
+          if ($ok) {
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            Write-Output "::warning::ccache unusable (found '$have', need >= 4.10); building without a cache"
+            "- ccache unusable (found ``$have``); this leg built without a cache" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            "CCACHE_LAUNCHER=" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -387,8 +422,8 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
       - name: Build
         working-directory: src

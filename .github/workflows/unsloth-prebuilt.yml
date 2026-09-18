@@ -115,9 +115,9 @@ jobs:
       win_cuda_matrix: ${{ steps.warm.outputs.win_cuda_matrix }}
       cuda_warm_matrix: ${{ steps.warm.outputs.cuda_warm_matrix }}
       win_cuda_warm_matrix: ${{ steps.warm.outputs.win_cuda_warm_matrix }}
-      rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
-      rocm_cutoff: ${{ steps.r.outputs.rocm_cutoff }}
-      macos_matrix: ${{ steps.r.outputs.macos_matrix }}
+      rocm_matrix: ${{ steps.m.outputs.rocm_matrix }}
+      rocm_cutoff: ${{ steps.m.outputs.rocm_cutoff }}
+      macos_matrix: ${{ steps.m.outputs.macos_matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -128,6 +128,31 @@ jobs:
       - id: r
         run: |
           set -euo pipefail
+
+          # This one step resolves the tag, fetches the base, merges every pinned
+          # PR and bakes build-info. 5 of the 12 failures in the 19 runs before
+          # 09-18 died somewhere inside it and could not be attributed afterwards,
+          # because GitHub serves 410 for run and job logs after a few days. PHASE
+          # names the section and the trap copies it, the line and the failing
+          # command into the run summary, which survives log expiry.
+          PHASE='startup'
+          on_err() {
+            local rc=$? line=$1
+            {
+              echo "### Resolve failed"
+              echo
+              echo "| field | value |"
+              echo "|---|---|"
+              echo "| phase | \`${PHASE}\` |"
+              echo "| line | ${line} |"
+              echo "| command | \`${BASH_COMMAND}\` |"
+              echo "| exit | ${rc} |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "resolve failed in phase '${PHASE}' at line ${line}: ${BASH_COMMAND} (exit ${rc})" >&2
+          }
+          trap 'on_err $LINENO' ERR
+
+          PHASE='read inputs'
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
           GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
@@ -188,6 +213,7 @@ jobs:
                        and ((if .required == null then true else .required end) | type == "boolean")))' \
              scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
+          PHASE='parse pr-set.json'
           PRS='[]'
           URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           while read -r url REQUIRED; do
@@ -262,6 +288,7 @@ jobs:
             TAG="${BASE}-mix-${SETHASH}"
             REPO="$GITHUB_REPOSITORY"
           fi
+          PHASE='check for an existing release'
           SRC_ARTIFACT="app-source-${TAG}"
           COMMIT=""
           GGML_TREE=""
@@ -285,6 +312,7 @@ jobs:
           # place. Nothing is pushed (GITHUB_TOKEN may never push commits touching
           # .github/workflows, which upstream history routinely does).
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PHASE='fetch base + merge pins'
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
             # The upstream checkout below takes scripts/unsloth/ away. Copy the
             # whole dir out, not file by file: see the note above the step.
@@ -328,6 +356,7 @@ jobs:
                     echo "::warning::${SRC}#${NUM} needed an additive merge; every conflict was a pure add/add and both sides were kept"
                   else
                     git merge --abort 2>/dev/null
+                    echo "- pin \`${SRC}#${NUM}\` (\`${SHA}\`) does not merge onto \`${BASE}\` + the pins before it" >> "$GITHUB_STEP_SUMMARY"
                     echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1
                   fi
                 fi
@@ -395,6 +424,24 @@ jobs:
           # cuda12 installs via Jimver; cuda13 is pinned to 13.3 (matching
           # upstream) which Jimver lacks, so those install via NVIDIA redist in
           # the build children -- on the same runners, so the glibc floor holds.
+          # The matrix construction below moved into its own step: this one was at 98% of
+          # GitHub's 21000-character limit per run string, and a step that exceeds it makes
+          # the whole workflow refuse to compile with no annotation anywhere. A step boundary
+          # resets the budget. These are the variables the second half reads.
+          for v in BASE COMMIT EXISTS GFX GGML_TREE GGML_VERSION ONLY PRS REPO REQ SRC_ARTIFACT TAG; do
+            printf "%s<<__UNSLOTH_EOF__\n%s\n__UNSLOTH_EOF__\n" "$v" "${!v}" >> "$GITHUB_ENV"
+          done
+
+      # Second half of resolve. Same script, same order, its own name so a failure
+      # here is attributable instead of being another anonymous line in one 300-line
+      # step. Reads the first half's variables from the environment.
+      - id: m
+        run: |
+          set -euo pipefail
+          PHASE='build the child matrices'
+          on_err() { local rc=$? line=$1; printf '### Resolve (matrices) failed\n\nphase `%s`, line %s, command `%s`, exit %s\n' "$PHASE" "$line" "$BASH_COMMAND" "$rc" >> "$GITHUB_STEP_SUMMARY"; }
+          trap 'on_err $LINENO' ERR
+
           ALL='[
             {"profile":"cuda12-legacy",  "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"legacy",  "rank":5, "cuda":"12.8.0","toolkit_line":"12.8","archs":"50-virtual 61-virtual","sms":"50 52 60 61"},
             {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
@@ -456,8 +503,8 @@ jobs:
       - name: Warm shard matrix for the CUDA children
         id: warm
         env:
-          CUDA_MATRIX: ${{ steps.r.outputs.cuda_matrix }}
-          WIN_CUDA_MATRIX: ${{ steps.r.outputs.win_cuda_matrix }}
+          CUDA_MATRIX: ${{ steps.m.outputs.cuda_matrix }}
+          WIN_CUDA_MATRIX: ${{ steps.m.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
           # Warm shards are DISABLED (every profile 0); the caching fixes do not depend on them.
@@ -666,155 +713,82 @@ jobs:
 
   assemble:
     name: Assemble metadata + publish
-    # Only `resolve`, so this job starts alongside the build matrix instead of
-    # after it. It used to `needs:` every build child, which meant it began
-    # queueing for a runner only once the last leg went green: on the reference
-    # run that queue wait was 109 minutes to then run a 10-second job. Starting
-    # early overlaps the wait with the build. The cost is one runner slot held
-    # for the length of the run.
-    needs: [resolve]
-    # No `if: always()`. Atomicity is unchanged in effect, but it is now
-    # enforced by the "Wait for the build matrix" step below rather than by
-    # `needs:`: that step blocks until every sibling build job is finished and
-    # exits non-zero unless all of them succeeded, so a failed leg still
-    # publishes nothing. The installer needs the full bundle set or it'll fail.
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    # `needs:` every build child, so GitHub does the waiting. It used to need
+    # only `resolve` and poll the jobs API from inside the job, to overlap a
+    # 109-minute post-build runner queue with the build. That traded a latency
+    # win for a correctness bug: a job cannot outlive GitHub's 6h cap, so the
+    # waiter carried a 330-minute deadline, and on 09-10 (run 34538187859) all
+    # 42 builds passed and nothing was published because `macOS / arm64` sat in
+    # the runner queue for 6h25m, built in 3m46s, and finished 59 minutes after
+    # the waiter had already given up. Whenever the macOS queue is long the old
+    # design could not publish however healthy the build was.
+    #
+    # `needs:` has no cap, holds no runner while it waits, and cannot time out.
+    # The cost is the 109-minute queue coming back; a nightly that publishes
+    # late beats one that cannot publish at all.
+    needs: [resolve, build-cuda, build-windows-cuda, build-windows-cuda-arm64,
+            build-rocm, build-macos, build-cpu, build-vulkan]
+    # always(), because plain `needs:` SKIPS this job when a leg fails, and a
+    # skip is the silent no-publish the pipeline exists to avoid. The results
+    # check below is what actually enforces atomicity, and it is at least as
+    # strict as `needs:` was: publishing a partial release is far worse than
+    # publishing late. The installer needs the full bundle set or it'll fail.
+    if: >-
+      ${{ always()
+          && (needs.resolve.result == 'success' || needs.resolve.result == 'skipped')
+          && (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     # Consumed by the reclaim job below: 'true' only when THIS run's publish
     # step actually ran and succeeded.
     outputs:
       published: ${{ steps.publish.outcome == 'success' }}
-    # The waiter holds this job open for the whole build. GitHub's 6h job cap
-    # would kill it with no useful message; stop short of that deliberately,
-    # leaving room for the download/verify/publish steps that follow.
-    timeout-minutes: 350
+    # No longer holds a runner for the length of the build, so this only has to
+    # cover download + verify + publish.
+    timeout-minutes: 60
     # A job-level block replaces the workflow-level one, so contents:write has
-    # to be repeated here; actions:read is what lets the waiter read the run's
-    # job list (the `alert` job already needs it for the same reason).
+    # to be repeated here; actions:read is what the release-asset lookups use
+    # (the `alert` job already needs it for the same reason).
     permissions:
       contents: write
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      # Reimplements the `needs:` success check that the trimmed-down `needs:`
-      # above gave away. It has to be at least as strict as `needs:` was --
-      # publishing a partial release is far worse than publishing late.
-      - name: Wait for the build matrix
+      # Replaces a 110-line jobs-API waiter. `needs:` above already blocked
+      # until every leg finished; this only has to read how they finished.
+      # At least as strict as `needs:` was, with one deliberate exception that
+      # the waiter also made: a subset dispatch (say operating_systems=ubuntu,
+      # publish=false) SKIPS legs on purpose, and those runs must still
+      # assemble their artifacts. When we intend to publish, a skipped leg is
+      # a missing bundle and blocks.
+      - name: Check the build matrix results
         env:
           # Same expression that gates the verify/publish steps below.
           PUBLISH_INTENT: ${{ github.event_name == 'schedule' || inputs.publish }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
 
-          # Build jobs live in called workflows, so they appear in this run's
-          # job list as "<caller job name> / <called job name>", e.g.
-          # "CUDA / x64/cuda12-legacy". One prefix per build child; every one of
-          # them must be represented or we are not looking at a complete run.
-          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'CUDA Windows ARM64 / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
-          SELF='Assemble metadata + publish'
-          ALERT='Report pipeline health'
-          # Best-effort jobs that never gate a publish: the start-of-run ccache prune and the
-          # CUDA warm shards ("CUDA / warm x64/cuda12-portable 0/3").
-          PRUNE='Prune superseded ccache generations'
-          WARM=' / warm '
+          BAD="$(jq -r --arg strict "$PUBLISH_INTENT" '
+            to_entries
+            | map(select(.key != "resolve"))
+            | map(select(.value.result != "success"))
+            | map(select($strict == "true" or .value.result != "skipped"))
+            | .[] | "  \(.key) (\(.value.result))"' <<<"$RESULTS")"
 
-          POLL=60
-          DEADLINE=$(( $(date +%s) + 330 * 60 ))
-          # Called-workflow job records do not all exist the moment the run
-          # starts, so a missing prefix is only fatal once this has passed.
-          STARTUP_DEADLINE=$(( $(date +%s) + 45 * 60 ))
-          API_FAILS=0
-
-          while :; do
-            if ! JOBS="$(gh api --paginate \
-                  "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
-                  --jq '.jobs[] | [.name, .status, (.conclusion // "none")] | @tsv' 2>/dev/null)"; then
-              # A blip in the jobs API must not throw away a finished build.
-              API_FAILS=$(( API_FAILS + 1 ))
-              if [ "$API_FAILS" -ge 10 ]; then
-                echo "ERROR: the jobs API failed 10 times running; cannot confirm the build matrix finished" >&2
-                exit 1
-              fi
-              echo "jobs API call failed (${API_FAILS}/10); retrying in ${POLL}s"
-              sleep "$POLL"
-              continue
-            fi
-            API_FAILS=0
-
-            # Everything in the run except this job and the alert job that
-            # reports on it. `resolve` stays in the set; it is already a
-            # `needs:`, so it is a free consistency check.
-            SIBS="$(printf '%s\n' "$JOBS" | awk -F'\t' -v self="$SELF" -v alert="$ALERT" -v prune="$PRUNE" -v warm="$WARM" \
-              'NF && $1 != self && $1 != alert && $1 != prune && index($1, warm) == 0')"
-
-            # Two kinds of "not there yet": no job record at all is the startup race, fatal
-            # after STARTUP_DEADLINE; only warm records means a CUDA child whose build legs sit
-            # behind `needs: warm` and get records once the shards finish (52 min cold, staging
-            # run 34205486511), so that waits on the run deadline. Without the split a shard
-            # night dies at 45 minutes or publishes while every existing record is complete.
-            MISSING=""; UNSCHEDULED=""
-            for p in "${PREFIXES[@]}"; do
-              if printf '%s\n' "$SIBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }'; then
-                continue
-              fi
-              if printf '%s\n' "$JOBS" | awk -F'\t' -v p="$p" 'index($1, p) == 1 { found = 1 } END { exit !found }'; then
-                UNSCHEDULED="${UNSCHEDULED} '${p}'"
-              else
-                MISSING="${MISSING} '${p}'"
-              fi
-            done
-            if [ -n "$MISSING" ]; then
-              if [ "$(date +%s)" -gt "$STARTUP_DEADLINE" ]; then
-                echo "ERROR: no job records for build child(ren):${MISSING}; refusing to publish without confirming they ran" >&2
-                exit 1
-              fi
-              echo "waiting for job records to appear for:${MISSING}"
-              sleep "$POLL"
-              continue
-            fi
-            if [ -n "$UNSCHEDULED" ]; then
-              if [ "$(date +%s)" -gt "$DEADLINE" ]; then
-                echo "ERROR: timed out before the build legs of${UNSCHEDULED} were scheduled behind their warm shards" >&2
-                exit 1
-              fi
-              echo "warm shards still running, build legs not yet scheduled for:${UNSCHEDULED}"
-              sleep "$POLL"
-              continue
-            fi
-
-            # Fail on the first finished leg that did not succeed rather than
-            # sitting on a runner for another hour to reach the same answer.
-            # `skipped` is the one conclusion that needs a judgement call: a
-            # publish run is pinned by `resolve` to the full default matrix, so
-            # a skipped leg there means something is wrong and must block, but a
-            # publish=false subset dispatch (say operating_systems=ubuntu) skips
-            # legs on purpose and `needs:` tolerated that before.
-            BAD="$(printf '%s\n' "$SIBS" | awk -F'\t' -v strict="$PUBLISH_INTENT" '
-              !NF || $2 != "completed" { next }
-              $3 == "success" { next }
-              $3 == "skipped" && strict != "true" { next }
-              { printf "  %s (%s)\n", $1, $3 }
-            ')"
-            if [ -n "$BAD" ]; then
-              echo "ERROR: refusing to publish, these build jobs did not succeed:" >&2
-              printf '%s\n' "$BAD" >&2
-              exit 1
-            fi
-
-            TOTAL="$(printf '%s\n' "$SIBS" | grep -c . || true)"
-            PENDING="$(printf '%s\n' "$SIBS" | awk -F'\t' 'NF && $2 != "completed"' | grep -c . || true)"
-            if [ "$PENDING" -eq 0 ]; then
-              echo "all ${TOTAL} build jobs finished and succeeded"
-              break
-            fi
-            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
-              echo "ERROR: timed out waiting for the build matrix; ${PENDING} of ${TOTAL} jobs still running" >&2
-              exit 1
-            fi
-            echo "${PENDING} of ${TOTAL} build jobs still running; polling again in ${POLL}s"
-            sleep "$POLL"
-          done
+          if [ -n "$BAD" ]; then
+            {
+              echo "### Not publishing: the build matrix did not fully succeed"
+              echo
+              echo '```'
+              printf '%s\n' "$BAD"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ERROR: refusing to publish, these build children did not succeed:" >&2
+            printf '%s\n' "$BAD" >&2
+            exit 1
+          fi
+          echo "every build child succeeded"
 
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0

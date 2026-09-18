@@ -200,6 +200,8 @@ jobs:
           Get-ChildItem $libs | Select-Object -ExpandProperty Name
 
       - name: ccache
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}
@@ -211,11 +213,29 @@ jobs:
           save: false
 
       - name: Configure ccache
+        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
+        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
+        # archive". A cache accelerator must never fail a release build. So verify ccache
+        # POSITIVELY here and, when it is missing or older than the options below require,
+        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
+        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
+        # would quietly change cache semantics rather than announce itself.
         run: |
-          ccache --set-config=compiler_check=content
-          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
-          ccache --set-config=compression_level=6
-          ccache -z
+          $ErrorActionPreference = 'Continue'
+          $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
+          $ok = $false
+          if ($have) { try { $ok = [version]($have -replace '[^0-9.].*$','') -ge [version]'4.10' } catch { $ok = $false } }
+          if ($ok) {
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            ccache -z
+            "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            Write-Output "::warning::ccache unusable (found '$have', need >= 4.10); building without a cache"
+            "- ccache unusable (found ``$have``); this leg built without a cache" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            "CCACHE_LAUNCHER=" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
 
       # GGML_CPU=OFF: the CPU backend, the server and the tools come from the
       # arm64 CPU bundle, which is built with clang (upstream's proven Windows
@@ -239,9 +259,9 @@ jobs:
             -DLLAMA_BUILD_TOOLS=OFF `
             -DLLAMA_BUILD_SERVER=OFF `
             -DCMAKE_CUDA_ARCHITECTURES="$archs" `
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build ggml-cuda
