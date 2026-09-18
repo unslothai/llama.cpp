@@ -112,7 +112,13 @@ jobs:
           # truncated or tampered asset, so it is not something to retry into.
           # The ccache step is now best-effort in the children instead, which
           # is the right place to absorb it.
-          INFRA_LOG='Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
+          # PUBLISH_DEFERRED_WAITER_DEADLINE is the assemble waiter hitting GitHub's per-job
+          # ceiling while the build matrix was still going. That is not a build problem and
+          # a rerun is the entire fix: the legs have finished by then, so the reran waiter
+          # sees them all green immediately and publishes. Before this, run 34538187859 had
+          # all 42 builds pass and published nothing, because macOS/arm64 sat in the runner
+          # queue for 6h25m and the waiter had already exited.
+          INFRA_LOG='PUBLISH_DEFERRED_WAITER_DEADLINE|Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
 
           if [ "$CONCLUSION" = failure ]; then
             if [ -z "$FAILED" ]; then
