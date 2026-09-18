@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <algorithm>
 #include <fstream>
 
@@ -1134,6 +1135,58 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Bounded process-wide pool of reusable checkpoint state buffers. At hundreds of MiB each these
+// come from mmap() and go back on free, so every fresh buffer faults in all of its pages.
+//
+// Do NOT instead delete the zero fill this avoids: with a CUDA target context,
+// llama_state_seq_get_data_ext() into non-resident pageable host memory runs about 140x slower.
+//
+// A full pool only accepts a buffer by displacing a SMALLER one, else checkpoints growing through
+// a prompt wedge it full of small buffers no later request can use. trim() keeps pooled bytes
+// reclaimable, since they do not count against `--cache-ram`.
+struct common_state_buffer_pool {
+    static constexpr size_t MAX_BUFFERS = 64;
+
+    // below the allocator's mmap threshold there is no fault storm to avoid
+    static constexpr size_t MIN_BUFFER_BYTES = 32ull*1024*1024;
+
+    struct stats {
+        uint64_t n_get  = 0; // buffers requested
+        uint64_t n_hit  = 0; // ... served from the pool
+        uint64_t n_put  = 0; // buffers offered back
+        uint64_t n_keep  = 0; // ... retained
+        uint64_t n_evict = 0; // pooled buffers displaced to make room
+        size_t held_bytes = 0;
+        size_t cap_bytes  = 0;
+        size_t n_hwm      = 0; // high water mark of retained buffers
+    };
+
+    // contents of `dst` are NOT preserved; every caller overwrites the whole buffer
+    void get(std::vector<uint8_t> & dst, size_t size);
+
+    void put(std::vector<uint8_t> && src);
+
+    void trim(int64_t idle_us);
+
+    stats get_stats() const;
+
+    static common_state_buffer_pool & instance();
+
+private:
+    mutable std::mutex mtx;
+
+    std::vector<std::vector<uint8_t>> free_bufs;
+
+    size_t held_bytes = 0;
+    size_t cap_bytes  = 0;
+    size_t n_hwm      = 0;
+    bool   cap_known  = false;
+
+    int64_t t_last_us = 0;
+
+    stats st;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1149,6 +1202,18 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    common_prompt_checkpoint() = default;
+
+    // the copy/move members below are defaulted explicitly: declaring this destructor suppresses
+    // the implicit moves, turning every list splice into a deep copy of a multi-hundred-MiB buffer.
+    ~common_prompt_checkpoint();
+
+    common_prompt_checkpoint(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint(common_prompt_checkpoint &&) noexcept = default;
+
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint &&) noexcept = default;
 
     size_t size() const;
 
