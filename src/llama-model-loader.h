@@ -244,7 +244,9 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // token_embd/output/output_norm from the target. null unless the file declares the flag.
-    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
+    // borrows_without_target: borrowed, but no target attached (measurement load only)
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne,
+            bool * borrows_without_target = nullptr);
 
     void done_getting_tensors(bool partial = false) const;
 
