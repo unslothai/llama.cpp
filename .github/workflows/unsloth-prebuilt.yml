@@ -101,15 +101,15 @@ jobs:
     permissions:
       contents: read
     outputs:
-      tag: ${{ steps.r.outputs.tag }}
-      repo: ${{ steps.r.outputs.repo }}
-      base: ${{ steps.r.outputs.base }}
-      prs: ${{ steps.r.outputs.prs }}
-      source_artifact: ${{ steps.r.outputs.source_artifact }}
-      commit: ${{ steps.r.outputs.commit }}
-      ggml_tree: ${{ steps.r.outputs.ggml_tree }}
-      ggml_version: ${{ steps.r.outputs.ggml_version }}
-      exists: ${{ steps.r.outputs.exists }}
+      tag: ${{ steps.m.outputs.tag }}
+      repo: ${{ steps.m.outputs.repo }}
+      base: ${{ steps.m.outputs.base }}
+      prs: ${{ steps.m.outputs.prs }}
+      source_artifact: ${{ steps.m.outputs.source_artifact }}
+      commit: ${{ steps.m.outputs.commit }}
+      ggml_tree: ${{ steps.m.outputs.ggml_tree }}
+      ggml_version: ${{ steps.m.outputs.ggml_version }}
+      exists: ${{ steps.m.outputs.exists }}
       # The CUDA matrices pass through the `warm` step, which stamps `shards`.
       cuda_matrix: ${{ steps.warm.outputs.cuda_matrix }}
       win_cuda_matrix: ${{ steps.warm.outputs.win_cuda_matrix }}
@@ -552,8 +552,8 @@ jobs:
         # titles, which are third-party text, and `${{ }}` pastes them into the
         # shell source before bash ever sees it.
         env:
-          PRS: ${{ steps.r.outputs.prs }}
-          BASE: ${{ steps.r.outputs.base }}
+          PRS: ${{ steps.m.outputs.prs }}
+          BASE: ${{ steps.m.outputs.base }}
         run: |
           set -euo pipefail
           if ! python3 "${RUNNER_TEMP}/us/pin_contract.py" --root . --base "$BASE" \
@@ -586,11 +586,11 @@ jobs:
       # produced when we build, so guard on the same condition as the build jobs
       # (resolve skips source prep on a scheduled no-op, leaving no tarball).
       - name: Upload source artifact
-        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ steps.m.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
-          name: ${{ steps.r.outputs.source_artifact }}
-          path: ${{ runner.temp }}/llama.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
+          name: ${{ steps.m.outputs.source_artifact }}
+          path: ${{ runner.temp }}/llama.cpp-source-${{ steps.m.outputs.tag }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 

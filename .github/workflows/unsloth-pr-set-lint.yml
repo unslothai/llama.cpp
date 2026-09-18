@@ -22,6 +22,7 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
+      - scripts/unsloth/check_workflow_outputs.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
@@ -35,6 +36,7 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
+      - scripts/unsloth/check_workflow_outputs.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
@@ -161,4 +163,10 @@ jobs:
       # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
       - name: Check no workflow string is near GitHub's size limit
         run: python3 scripts/unsloth/check_workflow_scalars.py --root .
+
+      # A dangling steps.<id>.outputs.<key> is substituted with the empty string rather than
+      # erroring, so it surfaces somewhere else entirely. On 09-18 it surfaced four steps later
+      # as a JSONDecodeError inside pin_contract.py. See check_workflow_outputs.py.
+      - name: Check every steps.*.outputs reference is actually produced
+        run: python3 scripts/unsloth/check_workflow_outputs.py .
 
