@@ -41,6 +41,25 @@ on:
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
 
+# Latest-only on a pull request, and per-commit on master.
+#
+# Every other pull-request workflow this fork actually runs already supersedes: the
+# upstream CI legs carry upstream's own `cancel-in-progress: true`, and this was the one
+# file that did not, so a second push to the same pull request left the older lint running
+# to completion. Two ubuntu-24.04 jobs is not much on its own, but this is the workflow
+# with the most pull-request runs of the unsloth-* set, and the whole point of it is to
+# report on the commit within seconds -- a superseded run reporting later than the one that
+# replaced it is worse than not running.
+#
+# The master half is deliberately NOT latest-only. Pushes to master here land in bursts
+# (the team edits pr-set.json by pushing straight to master, which is why the push trigger
+# is the main hook), and GitHub discards a PENDING run the moment a newer one queues into
+# its group regardless of cancel-in-progress. Keying the group on the SHA gives each commit
+# its own group, so a burst cannot make the lint silently skip the commit that broke it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
