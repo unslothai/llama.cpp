@@ -40,6 +40,7 @@ has to be argued for in the file rather than assumed.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -68,6 +69,35 @@ def triggers(doc) -> set[str]:
     return set()
 
 
+def _block_scalar_lines(lines: list[str]) -> set[int]:
+    """Indices of every line inside a YAML block scalar (`run: |`, `script: >` ...).
+
+    `#` starts a comment in YAML and in shell alike, so a `#` line inside a `run: |`
+    body looks exactly like a YAML comment to a line-by-line reader. The waiver would
+    then be honoured for a marker the workflow merely ECHOES, which is content a fork's
+    own script can contain. A block scalar runs until the indentation drops back to the
+    key's level, blank lines included, so its extent is computable without a YAML parser.
+    """
+    inside: set[int] = set()
+    opener = re.compile(r"^(\s*)(?:-\s+)?[\w.\"'-]+:\s*[|>][-+]?\d*\s*(?:#.*)?$")
+    i = 0
+    while i < len(lines):
+        m = opener.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        indent = len(m.group(1))
+        j = i + 1
+        while j < len(lines):
+            line = lines[j]
+            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                break
+            inside.add(j)
+            j += 1
+        i = j
+    return inside
+
+
 def waiver_status(text: str) -> tuple[bool, str]:
     """Is the workflow_run waiver present AS A COMMENT, and does it carry a reason?
 
@@ -76,19 +106,24 @@ def waiver_status(text: str) -> tuple[bool, str]:
     without making the argument the marker is supposed to record, which is the whole
     value of requiring it. The reason may sit on the marker line or on the comment lines
     directly beneath it, since that is how the justification reads naturally.
+
+    Lines inside a block scalar do not count, however much they look like comments:
+    `run: |` followed by `# lint:...-allow-workflow_run reason` is shell text, not a
+    statement by the workflow's author about the workflow.
     """
     lines = text.split("\n")
+    in_block = _block_scalar_lines(lines)
     for i, line in enumerate(lines):
         stripped = line.strip()
         # A comment line, not a marker buried in a string or a run: body.
-        if not stripped.startswith("#") or ALLOW_COMMENT.lstrip("# ") not in stripped:
+        if i in in_block or not stripped.startswith("#") or ALLOW_COMMENT.lstrip("# ") not in stripped:
             continue
         tail = stripped.split(ALLOW_COMMENT.lstrip("# "), 1)[1].strip(" #:-")
         if tail:
             return True, ""
-        for follow in lines[i + 1:]:
+        for k, follow in enumerate(lines[i + 1:], start = i + 1):
             f = follow.strip()
-            if not f.startswith("#"):
+            if k in in_block or not f.startswith("#"):
                 break
             if f.lstrip("# ").strip():
                 return True, ""

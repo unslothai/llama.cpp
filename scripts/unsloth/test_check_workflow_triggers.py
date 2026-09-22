@@ -109,5 +109,35 @@ rc, out = run(Path(tempfile.mkdtemp()))
 check("a missing workflows directory is an error", rc == 2, out)
 
 print()
+# A marker inside a `run: |` BODY is shell text the workflow prints, not a statement by
+# its author. `#` opens a comment in YAML and in shell alike, so the two are
+# indistinguishable line by line, and honouring the block-scalar form would let the
+# waiver be claimed by content the workflow merely echoes. The sibling check above covers
+# the single-line quoted form; this is the multi-line one, which is how `run:` is
+# actually written.
+WFRUN_MARKER_IN_BLOCK = (
+    "name: wr\n"
+    "on:\n  workflow_run:\n    workflows: ['x']\n    types: [completed]\n"
+    "jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: |\n"
+    "          # lint:workflow_triggers-allow-workflow_run consumes no artifact\n"
+    "          echo hi\n"
+)
+rc, out = run(build({"wr.yml": WFRUN_MARKER_IN_BLOCK}))
+check("the marker inside a run: block scalar does not count as a waiver", rc == 1, out)
+check(
+    "and the finding says the marker is absent rather than unreasoned",
+    "has no '# lint:workflow_triggers-allow-workflow_run' comment" in out,
+    out,
+)
+
+# The same file with a real YAML comment carrying a reason passes, so the rule above
+# rejects the location and not the justification.
+rc, out = run(build({
+    "wr.yml": "# lint:workflow_triggers-allow-workflow_run consumes no artifact\n"
+              + WFRUN_MARKER_IN_BLOCK,
+}))
+check("a real YAML comment with a reason still passes", rc == 0, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
