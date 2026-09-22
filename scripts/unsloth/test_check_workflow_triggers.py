@@ -166,5 +166,29 @@ rc, out = run(build({
 }))
 check("a real YAML comment with a reason still passes", rc == 0, out)
 
+# `run : |` is valid YAML and PyYAML reads the value as a block scalar just the same. The
+# lexical opener matched only `run:`, so the body went back into scope as ordinary comment
+# lines. The ranges now come from the parser, which is what makes enumerating spellings
+# unnecessary rather than merely tedious: every miss was a full bypass, not a rough edge.
+rc, out = run(build({"wr.yml": WFRUN_MARKER_IN_BLOCK.replace("run: |", "run : |")}))
+check("the marker inside a 'run : |' body does not count either", rc == 1, out)
+
+# The inline label must not stand in for the reason it introduces. Stripping punctuation
+# turned a bare `Justified:` into the non-empty string `Justified` and accepted it, so the
+# inline spelling passed where the separate `# Justified:` line was correctly refused.
+inline_label = WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run Justified:\nname: wr\n",
+)
+rc, out = run(build({"wr.yml": inline_label}))
+check("an inline 'Justified:' with nothing after it is not a justification", rc == 1, out)
+
+inline_real = WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run Justified: no checkout at all\nname: wr\n",
+)
+rc, out = run(build({"wr.yml": inline_real}))
+check("an inline 'Justified: <reason>' passes", rc == 0, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)

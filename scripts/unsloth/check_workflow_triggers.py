@@ -72,38 +72,45 @@ def triggers(doc) -> set[str]:
     return set()
 
 
-def _block_scalar_lines(lines: list[str]) -> set[int]:
+def _block_scalar_lines(text: str) -> set[int]:
     """Indices of every line inside a YAML block scalar (`run: |`, `script: >` ...).
 
     `#` starts a comment in YAML and in shell alike, so a `#` line inside a `run: |`
     body looks exactly like a YAML comment to a line-by-line reader. The waiver would
     then be honoured for a marker the workflow merely ECHOES, which is content a fork's
-    own script can contain. A block scalar runs until the indentation drops back to the
-    key's level, blank lines included, so its extent is computable without a YAML parser.
+    own script can contain.
+
+    The ranges come from the parser, via `yaml.compose` and each node's `start_mark` and
+    `end_mark`, rather than from a regex over the source. Two attempts at recognising the
+    opener lexically both had holes, and they were holes of the same shape: first only
+    `|-2` and not the equally valid `|2-`, then only `run:` and not `run :`. Every miss
+    puts an entire script body back in scope as ordinary comment lines, so each one is a
+    full bypass, and the supply of valid spellings is larger than the supply of patience
+    for enumerating them. PyYAML already knows exactly which lines are scalar content;
+    asking it is both shorter and complete.
     """
     inside: set[int] = set()
-    # `|`, `>`, and either order of the two optional indicators: `|-`, `|2`, `|-2`, `|2-`.
-    # YAML fixes no order between the chomping and indentation indicators, and matching
-    # only one order left `run: |2-` unrecognised, which put its whole body back in scope
-    # as ordinary comment lines.
-    opener = re.compile(
-        r"^(\s*)(?:-\s+)?[\w.\"'-]+:\s*[|>](?:\d+[-+]?|[-+]?\d*)\s*(?:#.*)?$"
-    )
-    i = 0
-    while i < len(lines):
-        m = opener.match(lines[i])
-        if not m:
-            i += 1
-            continue
-        indent = len(m.group(1))
-        j = i + 1
-        while j < len(lines):
-            line = lines[j]
-            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
-                break
-            inside.add(j)
-            j += 1
-        i = j
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return inside
+    if root is None:
+        return inside
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, yaml.ScalarNode):
+            if node.style in ("|", ">"):
+                # start_mark.line is the line holding the indicator; the body begins
+                # after it and runs to end_mark.line.
+                for i in range(node.start_mark.line + 1, node.end_mark.line + 1):
+                    inside.add(i)
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend(node.value)
+        elif isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                stack.append(key)
+                stack.append(value)
     return inside
 
 
@@ -128,14 +135,21 @@ def waiver_status(text: str) -> tuple[bool, str]:
     statement by the workflow's author about the workflow.
     """
     lines = text.split("\n")
-    in_block = _block_scalar_lines(lines)
+    in_block = _block_scalar_lines(text)
     for i, line in enumerate(lines):
         stripped = line.strip()
         # A comment line, not a marker buried in a string or a run: body.
         if i in in_block or not stripped.startswith("#") or ALLOW_COMMENT.lstrip("# ") not in stripped:
             continue
-        tail = stripped.split(ALLOW_COMMENT.lstrip("# "), 1)[1].strip(" #:-")
-        if tail:
+        tail = stripped.split(ALLOW_COMMENT.lstrip("# "), 1)[1].strip(" #-")
+        # The label is optional inline, but writing it must not itself count as the
+        # reason. `strip(" #:-")` turned a bare `Justified:` into the non-empty string
+        # `Justified` and accepted it, so the inline spelling passed where the separate
+        # `# Justified:` line was correctly refused. The label is removed explicitly and
+        # what remains has to be text.
+        if tail.casefold().startswith(JUSTIFIED.casefold()):
+            tail = tail[len(JUSTIFIED):]
+        if tail.strip(" #:-"):
             return True, ""
         for k, follow in enumerate(lines[i + 1:], start = i + 1):
             f = follow.strip()
