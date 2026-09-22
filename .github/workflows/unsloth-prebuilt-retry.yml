@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# lint:workflow_triggers-allow-workflow_run
+# Justified: this workflow has NO actions/checkout step at all, so no code from any ref
+# is fetched or executed, and it reads no artifact from the run that triggered it. It
+# holds no secrets. Its one privilege, `actions: write`, is used only to POST a rerun of
+# a run in this same repository, and the workflow it watches is schedule and dispatch
+# only, so the triggering run is never fork-controlled. The guard below restricts it
+# further to a single retry of attempt 1.
 
 name: Unsloth prebuilt retry
 

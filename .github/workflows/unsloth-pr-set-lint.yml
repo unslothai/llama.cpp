@@ -142,7 +142,8 @@ jobs:
                    scripts/unsloth/test_sync_deletes.py \
                    scripts/unsloth/test_carry_vintage.py \
                    scripts/unsloth/test_pin_contract.py \
-                   scripts/unsloth/test_feature_matrix.py; do
+                   scripts/unsloth/test_feature_matrix.py \
+                   scripts/unsloth/test_check_workflow_triggers.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
             echo "::endgroup::"
@@ -182,6 +183,13 @@ jobs:
       # An over-limit run: script makes the whole file uncompilable, and nothing else sees it: yaml, actionlint and GitHub's own parser all pass it. See check_workflow_scalars.py.
       - name: Check no workflow string is near GitHub's size limit
         run: python3 scripts/unsloth/check_workflow_scalars.py --root .
+
+      # pull_request_target runs with this repo's secrets while the pull request supplies
+      # the code. bench.yml.disabled was exactly that until it was deleted, and deleting it
+      # does not stop an upstream sync reintroducing upstream's bench.yml under its active
+      # name; the sync guard checks ancestry, not what the synced workflows do.
+      - name: No pull_request_target, no unjustified workflow_run
+        run: python3 scripts/unsloth/check_workflow_triggers.py --root .
 
       # A dangling steps.<id>.outputs.<key> is substituted with the empty string rather than
       # erroring, so it surfaces somewhere else entirely. On 09-18 it surfaced four steps later
