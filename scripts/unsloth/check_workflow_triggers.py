@@ -72,8 +72,8 @@ def triggers(doc) -> set[str]:
     return set()
 
 
-def _block_scalar_lines(text: str) -> set[int]:
-    """Indices of every line inside a YAML block scalar (`run: |`, `script: >` ...).
+def _scalar_content_lines(text: str) -> set[int]:
+    """Indices of every line that is the CONTINUATION of a multi-line YAML scalar.
 
     `#` starts a comment in YAML and in shell alike, so a `#` line inside a `run: |`
     body looks exactly like a YAML comment to a line-by-line reader. The waiver would
@@ -82,12 +82,23 @@ def _block_scalar_lines(text: str) -> set[int]:
 
     The ranges come from the parser, via `yaml.compose` and each node's `start_mark` and
     `end_mark`, rather than from a regex over the source. Two attempts at recognising the
-    opener lexically both had holes, and they were holes of the same shape: first only
-    `|-2` and not the equally valid `|2-`, then only `run:` and not `run :`. Every miss
-    puts an entire script body back in scope as ordinary comment lines, so each one is a
-    full bypass, and the supply of valid spellings is larger than the supply of patience
-    for enumerating them. PyYAML already knows exactly which lines are scalar content;
-    asking it is both shorter and complete.
+    opener lexically both had holes of the same shape: first only `|-2` and not the
+    equally valid `|2-`, then only `run:` and not `run :`. Every miss puts an entire
+    script body back in scope as ordinary comment lines, so each one is a full bypass,
+    and the supply of valid spellings is larger than the supply of patience for
+    enumerating them.
+
+    Every style counts, not just `|` and `>`. A double-quoted scalar may span lines too,
+    and a continuation line of one can begin with `#`, which PyYAML reads as content and
+    a `|`-and-`>`-only version read as a comment. The general rule needs no enumeration
+    at all: whatever lies strictly inside a scalar's extent is that scalar's value, by
+    definition of the marks.
+
+    The end is exclusive when `end_mark.column` is 0. PyYAML reports a block scalar that
+    is followed by a dedented line as ending at (that line, column 0), so including the
+    endpoint unconditionally swallowed the line AFTER the block. When that line held a
+    real waiver comment the file failed with "has no comment", which is the opposite
+    error and a worse one: a false failure on a correct file.
     """
     inside: set[int] = set()
     try:
@@ -100,11 +111,12 @@ def _block_scalar_lines(text: str) -> set[int]:
     while stack:
         node = stack.pop()
         if isinstance(node, yaml.ScalarNode):
-            if node.style in ("|", ">"):
-                # start_mark.line is the line holding the indicator; the body begins
-                # after it and runs to end_mark.line.
-                for i in range(node.start_mark.line + 1, node.end_mark.line + 1):
-                    inside.add(i)
+            start = node.start_mark.line
+            end = node.end_mark.line
+            if node.end_mark.column == 0:
+                end -= 1          # the scalar stopped before this line began
+            for i in range(start + 1, end + 1):
+                inside.add(i)
         elif isinstance(node, yaml.SequenceNode):
             stack.extend(node.value)
         elif isinstance(node, yaml.MappingNode):
@@ -130,12 +142,12 @@ def waiver_status(text: str) -> tuple[bool, str]:
     while saying nothing at all. Every workflow in this repository opens with that header,
     which made it the easiest reason in the tree to borrow by accident.
 
-    Lines inside a block scalar do not count, however much they look like comments:
-    `run: |` followed by `# lint:...-allow-workflow_run reason` is shell text, not a
-    statement by the workflow's author about the workflow.
+    Lines inside a multi-line scalar do not count, however much they look like
+    comments: `run: |` followed by `# lint:...-allow-workflow_run reason` is shell text,
+    not a statement by the workflow's author about the workflow.
     """
     lines = text.split("\n")
-    in_block = _block_scalar_lines(text)
+    in_block = _scalar_content_lines(text)
     for i, line in enumerate(lines):
         stripped = line.strip()
         # A comment line, not a marker buried in a string or a run: body.

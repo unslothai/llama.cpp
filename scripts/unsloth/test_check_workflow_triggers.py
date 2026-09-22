@@ -190,5 +190,34 @@ inline_real = WFRUN.replace(
 rc, out = run(build({"wr.yml": inline_real}))
 check("an inline 'Justified: <reason>' passes", rc == 0, out)
 
+# A real waiver comment sitting immediately after a `run: |` block must survive. PyYAML
+# reports such a block as ending at (the following line, column 0), so including the
+# endpoint unconditionally swallowed that line; when it held the waiver the file failed
+# with "has no comment", which is a false failure on a correct file and the worse of the
+# two errors this rule can make.
+after_block = (
+    "name: wr\n"
+    "on:\n  workflow_run:\n    workflows: ['x']\n    types: [completed]\n"
+    "jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: |\n"
+    "          echo hi\n"
+    "# lint:workflow_triggers-allow-workflow_run Justified: no checkout at all\n"
+)
+rc, out = run(build({"wr.yml": after_block}))
+check("a waiver comment right after a run: | block still counts", rc == 0, out)
+
+# A multi-line QUOTED scalar is scalar content too, and a continuation line of one can
+# begin with `#`. Recording only `|` and `>` nodes read that as a real comment.
+quoted_multiline = (
+    "name: wr\n"
+    "on:\n  workflow_run:\n    workflows: ['x']\n    types: [completed]\n"
+    "jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+    '      - run: "echo one\n'
+    "          # lint:workflow_triggers-allow-workflow_run Justified: fake\n"
+    '          echo two"\n'
+)
+rc, out = run(build({"wr.yml": quoted_multiline}))
+check("the marker inside a multiline quoted scalar does not count", rc == 1, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
