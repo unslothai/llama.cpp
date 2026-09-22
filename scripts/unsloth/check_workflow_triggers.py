@@ -73,15 +73,18 @@ def triggers(doc) -> set[str]:
 
 
 def _is_reason(text: str) -> bool:
-    """Is this a written argument, or just leftover punctuation?
+    r"""Is this a written argument, or just leftover punctuation?
 
     `strip(" #:-")` left `!!!` and `***` standing as non-empty strings, so a marker
-    followed by punctuation claimed the waiver while recording nothing. The threshold is
-    three word characters, which is arbitrary in the way any threshold here would be, and
-    it is the honest scope of this check: it rules out the degenerate case only. Whether
-    an argument is a GOOD argument is a question for the reviewer, not for a lint.
+    followed by punctuation claimed the waiver while recording nothing.
+
+    Counted as LETTERS, not as `\w`, because Python's `\w` includes the underscore and
+    digits: `___` cleared a word-character threshold while saying exactly as much as
+    `!!!` did. Three is arbitrary in the way any threshold here would be, and that is the
+    honest scope of this check -- it rules out the degenerate case only. Whether an
+    argument is a GOOD argument is a question for the reviewer, not for a lint.
     """
-    return len(re.findall(r"\w", text)) >= 3
+    return len(re.findall(r"[^\W\d_]", text)) >= 3
 
 
 def _scalar_content_lines(text: str) -> set[int]:

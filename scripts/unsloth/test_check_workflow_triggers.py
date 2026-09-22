@@ -253,7 +253,8 @@ for mid in (
 
 # Punctuation is not a safety argument. `strip(" #:-")` left `!!!` standing as a non-empty
 # string, so a marker followed by punctuation claimed the waiver while recording nothing.
-for junk in ("!!!", "***", "-- --", "..."):
+# `\w` would accept `___` and `123`, which say exactly as much as `!!!` does.
+for junk in ("!!!", "***", "-- --", "...", "___", "123", "_ _ _"):
     body = f"# lint:workflow_triggers-allow-workflow_run {junk}"
     rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", body + "\nname: wr\n")}))
     check(f"punctuation is not a justification: {junk!r}", rc == 1, out)
