@@ -95,12 +95,33 @@ in_string = WFRUN.replace(
 rc, out = run(build({"wr.yml": in_string}))
 check("the marker inside a run: string does not count as a waiver", rc == 1, out)
 
+# A continuation line must announce itself with `Justified:`. Accepting any adjacent
+# comment meant this repository's own SPDX/Copyright header served as the safety
+# argument, and every workflow here opens with that header, so it was the easiest reason
+# in the tree to borrow by accident.
 under = WFRUN.replace(
     "name: wr\n",
-    "# lint:workflow_triggers-allow-workflow_run\n# no checkout, reruns a failed release\nname: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run\n"
+    "# Justified: no checkout, reruns a failed release\nname: wr\n",
 )
 rc, out = run(build({"wr.yml": under}))
-check("a reason on the comment line beneath the marker passes", rc == 0, out)
+check("a 'Justified:' line beneath the marker passes", rc == 0, out)
+
+header = WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run\n"
+    "# SPDX-License-Identifier: AGPL-3.0-only\n"
+    "# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.\nname: wr\n",
+)
+rc, out = run(build({"wr.yml": header}))
+check("the license header is not a justification", rc == 1, out)
+
+bare_justified = WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run\n# Justified:\nname: wr\n",
+)
+rc, out = run(build({"wr.yml": bare_justified}))
+check("'Justified:' with nothing after it is not a justification", rc == 1, out)
 
 # --- 7. an empty or missing tree is an error, not a pass -----------------
 rc, out = run(build({}))
@@ -123,6 +144,12 @@ WFRUN_MARKER_IN_BLOCK = (
     "          # lint:workflow_triggers-allow-workflow_run consumes no artifact\n"
     "          echo hi\n"
 )
+# YAML fixes no order between the chomping and indentation indicators, so `|2-` is as
+# valid as `|-2`. Matching one order only left the whole body of a `run: |2-` step back
+# in scope as ordinary comment lines.
+rc, out = run(build({"wr.yml": WFRUN_MARKER_IN_BLOCK.replace("run: |", "run: |2-")}))
+check("the marker inside a run: |2- body does not count either", rc == 1, out)
+
 rc, out = run(build({"wr.yml": WFRUN_MARKER_IN_BLOCK}))
 check("the marker inside a run: block scalar does not count as a waiver", rc == 1, out)
 check(

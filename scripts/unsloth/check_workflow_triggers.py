@@ -53,6 +53,9 @@ except ImportError:
 BANNED = ("pull_request_target",)
 RESTRICTED = ("workflow_run",)
 ALLOW_COMMENT = "# lint:workflow_triggers-allow-workflow_run"
+# The introducer a continuation line must use. Any adjacent comment used to count, which
+# let this repository's own SPDX/Copyright header serve as the safety argument.
+JUSTIFIED = "Justified:"
 
 
 def triggers(doc) -> set[str]:
@@ -79,7 +82,13 @@ def _block_scalar_lines(lines: list[str]) -> set[int]:
     key's level, blank lines included, so its extent is computable without a YAML parser.
     """
     inside: set[int] = set()
-    opener = re.compile(r"^(\s*)(?:-\s+)?[\w.\"'-]+:\s*[|>][-+]?\d*\s*(?:#.*)?$")
+    # `|`, `>`, and either order of the two optional indicators: `|-`, `|2`, `|-2`, `|2-`.
+    # YAML fixes no order between the chomping and indentation indicators, and matching
+    # only one order left `run: |2-` unrecognised, which put its whole body back in scope
+    # as ordinary comment lines.
+    opener = re.compile(
+        r"^(\s*)(?:-\s+)?[\w.\"'-]+:\s*[|>](?:\d+[-+]?|[-+]?\d*)\s*(?:#.*)?$"
+    )
     i = 0
     while i < len(lines):
         m = opener.match(lines[i])
@@ -104,8 +113,15 @@ def waiver_status(text: str) -> tuple[bool, str]:
     A bare substring test accepted the marker anywhere, including inside a quoted `run:`
     string, and accepted it with no reason at all. Both let a workflow claim the waiver
     without making the argument the marker is supposed to record, which is the whole
-    value of requiring it. The reason may sit on the marker line or on the comment lines
-    directly beneath it, since that is how the justification reads naturally.
+    value of requiring it. The reason may sit on the marker line, or on a following
+    comment line introduced by `Justified:`, which is how both live waivers here are
+    written.
+
+    That introducer is required rather than decorative. Accepting any adjacent comment
+    meant the file's own `# SPDX-License-Identifier` and `# Copyright` header counted as
+    the argument, so putting the bare marker directly above the header waived the trigger
+    while saying nothing at all. Every workflow in this repository opens with that header,
+    which made it the easiest reason in the tree to borrow by accident.
 
     Lines inside a block scalar do not count, however much they look like comments:
     `run: |` followed by `# lint:...-allow-workflow_run reason` is shell text, not a
@@ -125,10 +141,14 @@ def waiver_status(text: str) -> tuple[bool, str]:
             f = follow.strip()
             if k in in_block or not f.startswith("#"):
                 break
-            if f.lstrip("# ").strip():
-                return True, ""
+            body = f.lstrip("# ").strip()
+            if body.casefold().startswith(JUSTIFIED.casefold()):
+                if body[len(JUSTIFIED):].strip(" #:-"):
+                    return True, ""
+                break
         return False, (
-            f"carries '{ALLOW_COMMENT}' with no reason written next to or under it."
+            f"carries '{ALLOW_COMMENT}' with no reason written next to it or on a "
+            f"following '# {JUSTIFIED} ...' comment line."
         )
     return False, f"has no '{ALLOW_COMMENT}' comment."
 
@@ -178,8 +198,9 @@ def main() -> int:
                 findings.append(
                     f"{path.name}: RESTRICTED trigger '{t}' {why} It is privileged, and "
                     "consuming an artifact from an untrusted run is the usual way it goes "
-                    f"wrong, so it needs '{ALLOW_COMMENT}' on a comment line followed by "
-                    "the reason, either on the same line or on the comment lines under it."
+                    f"wrong, so it needs '{ALLOW_COMMENT}' on a comment line with the "
+                    f"reason either on that line or on a following '# {JUSTIFIED} ...' "
+                    "comment line."
                 )
 
     if findings:
