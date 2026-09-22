@@ -3511,6 +3511,39 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // MiMo-V2.6-Distill-Qwen-9B packs the tags with no newlines. Parse-only: the template
+        // renders the newline form, so there is no reconstruction to check.
+        tst.test("<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Half-packed: newline after the opening tags, none after </parameter>.
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1</parameter></function></tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Packed and parallel: a strict "\n</parameter>\n" delimiter swallowed the second call
+        // into the first argument.
+        tst.test(
+               "<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>"
+               "<tool_call><function=special_function_with_opt><parameter=arg1>1</parameter>"
+               "<parameter=arg2>2</parameter></function></tool_call>")
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
         // Some models skip the opening <tool_call> and go straight to <function=>
         tst.test(
                "<function=special_function>\n"

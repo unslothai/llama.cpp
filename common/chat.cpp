@@ -1246,9 +1246,18 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // Newlines around the XML tags are optional: Qwen3-Coder emits `<parameter=k>\nv\n</parameter>\n`,
+            // MiMo-V2.6-Distill-Qwen-9B packs them as `<parameter=k>v</parameter></function></tool_call>`.
+            // With a hardcoded "\n</parameter>\n" the first packed argument swallowed every later
+            // tag, the grammar never accepted, and generation ran to max_tokens.
+            // Scan longest-first so a trailing "\n" stays out of the value for models that emit it.
+            const std::vector<std::string> arg_close_scan = { "\n</parameter>", "</parameter>" };
+            auto arg_close  = p.tool_arg_close(p.optional(p.literal("\n")) + p.literal("</parameter>"));
+            // ac() builds its automaton from the delimiter alone, so keep it to the bare
+            // "</parameter>" (a longer variant is a prefix trap) and absorb trailing whitespace outside.
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of(arg_close_scan)) + arg_close,
+                     std::string("</parameter>")) + p.space());
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
@@ -1265,11 +1274,13 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
                 foreach_parameter(function, [&](const std::string & param_name, const json & param_schema, bool is_required) {
                     auto rule_name = "tool-" + name + "-arg-" + param_name;
 
-                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
+                    // one optional "\n", not space(), so further leading whitespace stays in the value
+                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) +
+                                                    ">" + p.optional(p.literal("\n")));
 
                     auto arg_value = schema_info.resolves_to_string(param_schema) ?
                         arg_string :
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close + p.space();
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
@@ -1283,9 +1294,10 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
                     args = args + p.zero_or_more(p.choice(optional_args));
                 }
 
-                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
+                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) +
+                                               ">" + p.optional(p.literal("\n"))) +
                                    p.tool_args(args) +
-                                   p.tool_close(p.literal("</function>\n")));
+                                   p.tool_close(p.literal("</function>") + p.space()));
 
                 tool_choice |= p.rule("tool-" + name, func);
             });
@@ -1293,11 +1305,12 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
             auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 
             auto tool_call_body = tool_choice + "</tool_call>" + p.space();
-            auto tool_call      = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+            auto tool_call_open = p.literal("<tool_call>") + p.optional(p.literal("\n"));
+            auto tool_call      = p.rule("tool-call", tool_call_open + tool_call_body);
 
             // Qwen3-Coder models may occasionally omit the <tool_call> token.
             auto tool_call_first = is_qwen3_coder ?
-                p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body) :
+                p.rule("tool-call-first", p.optional(tool_call_open) + tool_call_body) :
                 tool_call;
 
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
