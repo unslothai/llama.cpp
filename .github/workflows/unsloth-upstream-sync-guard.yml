@@ -17,6 +17,13 @@ name: "Unsloth: upstream sync guard"
 on:
   push:
     branches: [master]
+  # Unfiltered, deliberately. The trigger check below has to be able to BLOCK a sync, and
+  # a push-only host first runs after the merge, by which point a reintroduced
+  # `pull_request_target` workflow is already active on master. No `paths:` here either,
+  # because GitHub evaluates a paths filter against only the first 300 changed files and
+  # a sync is routinely larger than that, which is the whole reason this second host
+  # exists.
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -33,6 +40,8 @@ jobs:
         with: { fetch-depth: 1 }
 
       - name: Check the recorded sync point is still an ancestor of master
+        # Asks about master's own history, so it is meaningless on a pull request head.
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           FILE=scripts/unsloth/upstream-sync.json
@@ -56,6 +65,8 @@ jobs:
           esac
 
       - name: Check the fork still owns only CI
+        # Asks about master's own history, so it is meaningless on a pull request head.
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           FILE=scripts/unsloth/upstream-sync.json
@@ -77,3 +88,22 @@ jobs:
             exit 1
           fi
           echo "fork delta is ${TOTAL} path(s), all under .github/ or scripts/unsloth/"
+
+      # The trigger check has a second home here, and this is the one that matters for
+      # the case it was written for. It runs on BOTH events, so it can block a sync pull
+      # request rather than only reporting after the merge.
+      #
+      # Its usual host, unsloth-pr-set-lint.yml, filters on `paths`, and GitHub evaluates
+      # a `paths` filter against only the FIRST 300 changed files. An upstream sync is
+      # routinely far larger than that, so a sync that reintroduces upstream's
+      # `bench.yml` under its active name could land without the host ever starting --
+      # precisely the scenario the check exists for, skipped precisely when it applies.
+      #
+      # This workflow has no `paths` filter at all and runs on every pull request as well
+      # as every push to master, so hosting it here removes that dependency and can still
+      # BLOCK a sync. A push-only placement would have reported the problem only after
+      # the merge, with the reintroduced workflow already active, which is a notification
+      # rather than a guard. Keeping it in both places is deliberate: the lint host gives
+      # fast feedback on an ordinary pull request, this one gives the guarantee.
+      - name: No workflow may subscribe to pull_request_target
+        run: python3 scripts/unsloth/check_workflow_triggers.py

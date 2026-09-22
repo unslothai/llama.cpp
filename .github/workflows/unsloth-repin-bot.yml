@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# lint:workflow_triggers-allow-workflow_run
+# Justified: the checkout here takes no `ref:`, so on a workflow_run event it resolves to
+# the DEFAULT branch rather than any pull request head, and no pull-request-authored code
+# is executed. `persist-credentials: false` is set deliberately so the automatic
+# GITHUB_TOKEN extraheader cannot shadow REPIN_TOKEN, which is step-scoped and scrubbed
+# out of every log line it could reach. The workflow it watches is `Unsloth pin
+# preflight`, which is not fork-triggerable.
 
 name: Unsloth repin bot
 
