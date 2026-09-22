@@ -3511,14 +3511,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
-        // MiMo-V2.6-Distill-Qwen-9B packs the tags with no newlines. Parse-only: the template
-        // renders the newline form, so there is no reconstruction to check.
+        // Packed, no newlines (MiMo-V2.6-Distill-Qwen-9B)
         tst.test("<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>")
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .run();
 
-        // Half-packed: newline after the opening tags, none after </parameter>.
+        // Half-packed
         tst.test(
                "<tool_call>\n"
                "<function=special_function>\n"
@@ -3528,8 +3527,23 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call)
             .run();
 
-        // Packed and parallel: a strict "\n</parameter>\n" delimiter swallowed the second call
-        // into the first argument.
+        // Literal </parameter> inside a string value
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "print(\"</parameter>\")\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", R"j({"code": "print(\"</parameter>\")"})j", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Packed parallel calls
         tst.test(
                "<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>"
                "<tool_call><function=special_function_with_opt><parameter=arg1>1</parameter>"

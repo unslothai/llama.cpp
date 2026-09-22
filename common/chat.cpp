@@ -1246,18 +1246,24 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            // Newlines around the XML tags are optional: Qwen3-Coder emits `<parameter=k>\nv\n</parameter>\n`,
-            // MiMo-V2.6-Distill-Qwen-9B packs them as `<parameter=k>v</parameter></function></tool_call>`.
-            // With a hardcoded "\n</parameter>\n" the first packed argument swallowed every later
-            // tag, the grammar never accepted, and generation ran to max_tokens.
-            // Scan longest-first so a trailing "\n" stays out of the value for models that emit it.
-            const std::vector<std::string> arg_close_scan = { "\n</parameter>", "</parameter>" };
+            // Newlines around tags are optional (MiMo-V2.6-Distill-Qwen-9B emits none). A value ends
+            // at </parameter> only when the next tag follows, so a literal </parameter> is kept.
+            std::vector<std::string> arg_close_scan;
+            for (const char * nl : { "\n", "" }) {
+                for (const char * ws : { "", "\n", "\n\n", "\r\n", " " }) {
+                    for (const char * next : { "<parameter=", "</function>" }) {
+                        arg_close_scan.push_back(std::string(nl) + "</parameter>" + ws + next);
+                    }
+                }
+            }
             auto arg_close  = p.tool_arg_close(p.optional(p.literal("\n")) + p.literal("</parameter>"));
-            // ac() builds its automaton from the delimiter alone, so keep it to the bare
-            // "</parameter>" (a longer variant is a prefix trap) and absorb trailing whitespace outside.
+            // peek: do not close the value early while streaming
+            auto next_tag   = p.peek(p.space() + p.choice({ p.literal("<parameter="), p.literal("</function>") }));
+            auto arg_value  = p.tool_arg_string_value(p.until_one_of(arg_close_scan)) +
+                              p.tool_arg_close(p.optional(p.literal("\n")) + p.literal("</parameter>") + next_tag);
+            // grammar: newline form or packed form
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until_one_of(arg_close_scan)) + arg_close,
-                     std::string("</parameter>")) + p.space());
+                p.choice({ p.ac(arg_value, "\n</parameter>\n"), p.ac(arg_value, "</parameter>") }) + p.space());
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
@@ -1274,7 +1280,6 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
                 foreach_parameter(function, [&](const std::string & param_name, const json & param_schema, bool is_required) {
                     auto rule_name = "tool-" + name + "-arg-" + param_name;
 
-                    // one optional "\n", not space(), so further leading whitespace stays in the value
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) +
                                                     ">" + p.optional(p.literal("\n")));
 
