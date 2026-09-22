@@ -219,5 +219,26 @@ quoted_multiline = (
 rc, out = run(build({"wr.yml": quoted_multiline}))
 check("the marker inside a multiline quoted scalar does not count", rc == 1, out)
 
+# The directive has to end at a token boundary. A substring test accepted
+# `...-allow-workflow_runs` and then read the trailing `s` as the justification, so one
+# mistyped character both claimed the waiver and supplied its own reason -- and the
+# canonical bare marker was correctly refused on the very same input.
+for near in (
+    "# lint:workflow_triggers-allow-workflow_runs",
+    "# lint:workflow_triggers-allow-workflow_run-anyway",
+    "# lint:workflow_triggers-allow-workflow_run_now",
+):
+    rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", near + "\nname: wr\n")}))
+    check(f"a near-match directive is not the waiver: {near.split(':', 1)[1]}", rc == 1, out)
+
+# And the canonical directive followed by real punctuation still reads its reason.
+for good in (
+    "# lint:workflow_triggers-allow-workflow_run no checkout at all",
+    "# lint:workflow_triggers-allow-workflow_run: no checkout at all",
+    "# lint:workflow_triggers-allow-workflow_run Justified: no checkout at all",
+):
+    rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", good + "\nname: wr\n")}))
+    check(f"the canonical directive still reads its reason: {good[-24:]}", rc == 0, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)

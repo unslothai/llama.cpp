@@ -151,9 +151,17 @@ def waiver_status(text: str) -> tuple[bool, str]:
     for i, line in enumerate(lines):
         stripped = line.strip()
         # A comment line, not a marker buried in a string or a run: body.
-        if i in in_block or not stripped.startswith("#") or ALLOW_COMMENT.lstrip("# ") not in stripped:
+        if i in in_block or not stripped.startswith("#"):
             continue
-        tail = stripped.split(ALLOW_COMMENT.lstrip("# "), 1)[1].strip(" #-")
+        # The directive has to END here, not merely appear. A substring test accepted
+        # `...-allow-workflow_runs` and then read the trailing `s` as the justification,
+        # so one mistyped character both claimed the waiver and supplied its own reason.
+        found = re.search(
+            re.escape(ALLOW_COMMENT.lstrip("# ")) + r"(?![\w-])", stripped
+        )
+        if found is None:
+            continue
+        tail = stripped[found.end():].strip(" #-")
         # The label is optional inline, but writing it must not itself count as the
         # reason. `strip(" #:-")` turned a bare `Justified:` into the non-empty string
         # `Justified` and accepted it, so the inline spelling passed where the separate
