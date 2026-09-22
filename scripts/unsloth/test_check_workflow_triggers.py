@@ -83,6 +83,25 @@ justified = WFRUN.replace(
 rc, out = run(build({"wr.yml": justified}))
 check("justified workflow_run passes", rc == 0, out)
 
+# --- 6b. the waiver must be a COMMENT and must carry a reason ------------
+bare = WFRUN.replace("name: wr\n", "# lint:workflow_triggers-allow-workflow_run\nname: wr\n")
+rc, out = run(build({"wr.yml": bare}))
+check("the marker alone, with no reason, fails", rc == 1, out)
+
+in_string = WFRUN.replace(
+    "      - run: true\n",
+    '      - run: echo "# lint:workflow_triggers-allow-workflow_run"\n',
+)
+rc, out = run(build({"wr.yml": in_string}))
+check("the marker inside a run: string does not count as a waiver", rc == 1, out)
+
+under = WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run\n# no checkout, reruns a failed release\nname: wr\n",
+)
+rc, out = run(build({"wr.yml": under}))
+check("a reason on the comment line beneath the marker passes", rc == 0, out)
+
 # --- 7. an empty or missing tree is an error, not a pass -----------------
 rc, out = run(build({}))
 check("an empty workflows directory is an error", rc == 2, out)

@@ -22,6 +22,7 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
+      - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
@@ -36,6 +37,7 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
+      - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml

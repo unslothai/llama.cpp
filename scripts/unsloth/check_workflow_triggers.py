@@ -68,6 +68,36 @@ def triggers(doc) -> set[str]:
     return set()
 
 
+def waiver_status(text: str) -> tuple[bool, str]:
+    """Is the workflow_run waiver present AS A COMMENT, and does it carry a reason?
+
+    A bare substring test accepted the marker anywhere, including inside a quoted `run:`
+    string, and accepted it with no reason at all. Both let a workflow claim the waiver
+    without making the argument the marker is supposed to record, which is the whole
+    value of requiring it. The reason may sit on the marker line or on the comment lines
+    directly beneath it, since that is how the justification reads naturally.
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # A comment line, not a marker buried in a string or a run: body.
+        if not stripped.startswith("#") or ALLOW_COMMENT.lstrip("# ") not in stripped:
+            continue
+        tail = stripped.split(ALLOW_COMMENT.lstrip("# "), 1)[1].strip(" #:-")
+        if tail:
+            return True, ""
+        for follow in lines[i + 1:]:
+            f = follow.strip()
+            if not f.startswith("#"):
+                break
+            if f.lstrip("# ").strip():
+                return True, ""
+        return False, (
+            f"carries '{ALLOW_COMMENT}' with no reason written next to or under it."
+        )
+    return False, f"has no '{ALLOW_COMMENT}' comment."
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=".", help="repository root to scan")
@@ -106,12 +136,15 @@ def main() -> int:
                 )
 
         for t in RESTRICTED:
-            if t in found and ALLOW_COMMENT not in path.read_text():
+            if t not in found:
+                continue
+            ok, why = waiver_status(path.read_text())
+            if not ok:
                 findings.append(
-                    f"{path.name}: RESTRICTED trigger '{t}' needs an explicit "
-                    f"'{ALLOW_COMMENT}' comment in the file, with the reason. It is "
-                    "privileged, and consuming an artifact from an untrusted run is the "
-                    "usual way it goes wrong."
+                    f"{path.name}: RESTRICTED trigger '{t}' {why} It is privileged, and "
+                    "consuming an artifact from an untrusted run is the usual way it goes "
+                    f"wrong, so it needs '{ALLOW_COMMENT}' on a comment line followed by "
+                    "the reason, either on the same line or on the comment lines under it."
                 )
 
     if findings:
