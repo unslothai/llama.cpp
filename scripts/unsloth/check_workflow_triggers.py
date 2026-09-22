@@ -72,6 +72,18 @@ def triggers(doc) -> set[str]:
     return set()
 
 
+def _is_reason(text: str) -> bool:
+    """Is this a written argument, or just leftover punctuation?
+
+    `strip(" #:-")` left `!!!` and `***` standing as non-empty strings, so a marker
+    followed by punctuation claimed the waiver while recording nothing. The threshold is
+    three word characters, which is arbitrary in the way any threshold here would be, and
+    it is the honest scope of this check: it rules out the degenerate case only. Whether
+    an argument is a GOOD argument is a question for the reviewer, not for a lint.
+    """
+    return len(re.findall(r"\w", text)) >= 3
+
+
 def _scalar_content_lines(text: str) -> set[int]:
     """Indices of every line that is the CONTINUATION of a multi-line YAML scalar.
 
@@ -172,7 +184,7 @@ def waiver_status(text: str) -> tuple[bool, str]:
         # what remains has to be text.
         if tail.casefold().startswith(JUSTIFIED.casefold()):
             tail = tail[len(JUSTIFIED):]
-        if tail.strip(" #:-"):
+        if _is_reason(tail.strip(" #:-")):
             return True, ""
         for k, follow in enumerate(lines[i + 1:], start = i + 1):
             f = follow.strip()
@@ -180,7 +192,7 @@ def waiver_status(text: str) -> tuple[bool, str]:
                 break
             body = f.lstrip("# ").strip()
             if body.casefold().startswith(JUSTIFIED.casefold()):
-                if body[len(JUSTIFIED):].strip(" #:-"):
+                if _is_reason(body[len(JUSTIFIED):].strip(" #:-")):
                     return True, ""
                 break
         return False, (

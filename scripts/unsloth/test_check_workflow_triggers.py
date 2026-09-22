@@ -251,5 +251,22 @@ for mid in (
     rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", mid + "\nname: wr\n")}))
     check(f"a mid-comment mention is not the waiver: {mid[2:28]}...", rc == 1, out)
 
+# Punctuation is not a safety argument. `strip(" #:-")` left `!!!` standing as a non-empty
+# string, so a marker followed by punctuation claimed the waiver while recording nothing.
+for junk in ("!!!", "***", "-- --", "..."):
+    body = f"# lint:workflow_triggers-allow-workflow_run {junk}"
+    rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", body + "\nname: wr\n")}))
+    check(f"punctuation is not a justification: {junk!r}", rc == 1, out)
+    body = f"# lint:workflow_triggers-allow-workflow_run\n# Justified: {junk}"
+    rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", body + "\nname: wr\n")}))
+    check(f"nor on a continuation line: {junk!r}", rc == 1, out)
+
+# And a short but real reason still passes, so the threshold rules out the degenerate
+# case rather than demanding an essay.
+rc, out = run(build({"wr.yml": WFRUN.replace(
+    "name: wr\n",
+    "# lint:workflow_triggers-allow-workflow_run no checkout\nname: wr\n")}))
+check("a short written reason still passes", rc == 0, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
