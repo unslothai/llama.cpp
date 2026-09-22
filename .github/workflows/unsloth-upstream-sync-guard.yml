@@ -77,3 +77,19 @@ jobs:
             exit 1
           fi
           echo "fork delta is ${TOTAL} path(s), all under .github/ or scripts/unsloth/"
+
+      # The trigger check has a second home here, and this is the one that matters for
+      # the case it was written for.
+      #
+      # Its usual host, unsloth-pr-set-lint.yml, filters on `paths`, and GitHub evaluates
+      # a `paths` filter against only the FIRST 300 changed files. An upstream sync is
+      # routinely far larger than that, so a sync that reintroduces upstream's
+      # `bench.yml` under its active name could land without the host ever starting --
+      # precisely the scenario the check exists for, skipped precisely when it applies.
+      #
+      # This workflow has no `paths` filter at all and already runs on every push to
+      # master, which is how a sync arrives, so hosting it here removes that dependency.
+      # Keeping it in both places is deliberate: the lint host gives fast feedback on an
+      # ordinary pull request, this one gives the guarantee.
+      - name: No workflow may subscribe to pull_request_target
+        run: python3 scripts/unsloth/check_workflow_triggers.py

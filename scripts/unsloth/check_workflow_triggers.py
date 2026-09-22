@@ -153,15 +153,18 @@ def waiver_status(text: str) -> tuple[bool, str]:
         # A comment line, not a marker buried in a string or a run: body.
         if i in in_block or not stripped.startswith("#"):
             continue
-        # The directive has to END here, not merely appear. A substring test accepted
-        # `...-allow-workflow_runs` and then read the trailing `s` as the justification,
-        # so one mistyped character both claimed the waiver and supplied its own reason.
-        found = re.search(
-            re.escape(ALLOW_COMMENT.lstrip("# ")) + r"(?![\w-])", stripped
-        )
+        # The directive must OPEN the comment and END at a token boundary. A substring
+        # search accepted it anywhere in any sentence, so
+        # `# Never use lint:...-allow-workflow_run without review` waived the trigger and
+        # offered `without review` as the justification -- a comment saying the opposite
+        # of a waiver, read as one. Requiring `...-allow-workflow_runs` to end cleanly
+        # closed the suffix half of the same problem, where one mistyped character both
+        # claimed the waiver and supplied its own reason.
+        body = stripped.lstrip("#").strip()
+        found = re.match(re.escape(ALLOW_COMMENT.lstrip("# ")) + r"(?![\w-])", body)
         if found is None:
             continue
-        tail = stripped[found.end():].strip(" #-")
+        tail = body[found.end():].strip(" #-")
         # The label is optional inline, but writing it must not itself count as the
         # reason. `strip(" #:-")` turned a bare `Justified:` into the non-empty string
         # `Justified` and accepted it, so the inline spelling passed where the separate

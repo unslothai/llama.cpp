@@ -240,5 +240,16 @@ for good in (
     rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", good + "\nname: wr\n")}))
     check(f"the canonical directive still reads its reason: {good[-24:]}", rc == 0, out)
 
+# The directive must OPEN the comment, not merely appear in it. An unanchored search read
+# a sentence that says the opposite of a waiver as a waiver, and took the rest of the
+# sentence as the justification.
+for mid in (
+    "# Never use lint:workflow_triggers-allow-workflow_run without review",
+    "# TODO: drop the lint:workflow_triggers-allow-workflow_run below",
+    "# see docs for lint:workflow_triggers-allow-workflow_run details",
+):
+    rc, out = run(build({"wr.yml": WFRUN.replace("name: wr\n", mid + "\nname: wr\n")}))
+    check(f"a mid-comment mention is not the waiver: {mid[2:28]}...", rc == 1, out)
+
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
