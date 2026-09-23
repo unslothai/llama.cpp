@@ -1467,7 +1467,13 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 64;
+    // NOTE: tensor-parallel (-sm tensor, meta backend) models dispatch one subgraph per AllReduce
+    // split point to every simple backend (~2 per layer for qwen4exp -> >100 keys per device).
+    // The old cap of 64 made the LRU evict entries every token, permanently resetting CUDA graph
+    // warmup and forcing fully eager decode (V100 x8, qwen4exp Q4_K_XL: TP4 6.8 -> 44 t/s after
+    // this change; nsys: cudaGraphLaunch 0 -> 48888 over a tg64 run). 512 covers large TP graphs;
+    // the 10s idle sweep below still bounds memory for steady state.
+    static const size_t max_cuda_graphs = 512;
 
     int64_t last_graph_eviction_sweep = 0;
 
