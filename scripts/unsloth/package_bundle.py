@@ -12,9 +12,9 @@ implementing one PlatformStrategy (its dependency-walk tool, lib-name
 convention, backend glob, and archive format), not writing a new packaging
 script.
 
-The CUDA runtime (libcudart/libcublas, cudart DLLs) is intentionally NOT
-bundled: the installer pairs it with the user's PyTorch runtime, selected by
-runtime_line.
+The installer normally uses PyTorch's CUDA runtime, selected by runtime_line.
+BUNDLE_CUDA_RUNTIME=1 includes cudart/cublas DLLs for Windows ARM64, where
+PyTorch has no CUDA build.
 
 Linux is the CI-validated path. macOS/Windows strategies follow the correct
 platform conventions (otool/@loader_path/tar.gz; dir-local DLLs/zip) but have
@@ -146,11 +146,15 @@ class WindowsStrategy(PlatformStrategy):
     # ggml-cpu.dll imports it by name, so a curated bundle built from that tree
     # (the arm64 CUDA leg) has to keep it or nothing in the bundle loads.
     LOCAL_DLL_PREFIXES = ("ggml", "llama", "mtmd", "libomp")
+    CUDA_RUNTIME_DLL_PREFIXES = ("cudart64_", "cublas64_", "cublaslt64_")
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
+        prefixes = self.LOCAL_DLL_PREFIXES
+        if os.environ.get("BUNDLE_CUDA_RUNTIME") == "1":
+            prefixes += self.CUDA_RUNTIME_DLL_PREFIXES
         return [
             p.name for p in bin_dir.glob("*.dll")
-            if p.name.lower().startswith(self.LOCAL_DLL_PREFIXES)
+            if p.name.lower().startswith(prefixes)
         ]
 
     def backend_patterns(self) -> list[str]:

@@ -232,9 +232,8 @@ jobs:
           Write-Host "Using target with -all suffix: $archiveTarget"
         }
 
-        # TheRock publishes nightlies to the multi-arch tarball index. The
-        # static HTML page embeds a JSON `files` array with names and mtimes.
-        $baseUrl = "https://rocm.nightlies.amd.com/tarball-multi-arch"
+        # The index embeds a JSON `files` array with names and mtimes.
+        $baseUrl = "https://nightly.repo.amd.com/rocm/core/tarball"
         if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
           # weekly: see the Linux job.
           $cutoff = "99999999"
@@ -409,11 +408,11 @@ jobs:
         REM Configure the project
         REM Only the C/CXX launchers here: ggml-hip forces CXX_IS_HIPCC on
         REM WIN32, so the device sources compile as C++, not the HIP language.
+        REM Keep native CPU detection; select CPU variants at runtime.
         cmake .. -G Ninja ^
           -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
           -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
           -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
-          -DCMAKE_CROSSCOMPILING=ON ^
           -DCMAKE_BUILD_TYPE=Release ^
           -DGPU_TARGETS="%mapped_target%" ^
           -DBUILD_SHARED_LIBS=ON ^
@@ -426,9 +425,10 @@ jobs:
           -DLLAMA_BUILD_BORINGSSL=ON ^
           -DGGML_NATIVE=OFF ^
           -DGGML_STATIC=OFF ^
+          -DGGML_BACKEND_DL=ON ^
+          -DGGML_CPU_ALL_VARIANTS=ON ^
           -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} ^
-          -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} ^
-          -DCMAKE_SYSTEM_NAME=Windows
+          -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
         REM Build the project
         cmake --build . -j %NUMBER_OF_PROCESSORS%
@@ -455,7 +455,8 @@ jobs:
             "hipblaslt.dll",
             "libhipblaslt.dll",
             "hipblas.dll",
-            "origami.dll"
+            "origami.dll",
+            "libtensilelite-host.dll"
           )
 
           foreach ($pattern in $filesToCopy) {
@@ -507,6 +508,33 @@ jobs:
           Write-Error "ROCm bin directory not found: $rocmBinPath"
           exit 1
         }
+
+    # Catch runtime dependencies missing from the manual copy list.
+    - name: Check the bundle carries every ROCm DLL it imports
+      run: |
+        python -m pip install --quiet --disable-pip-version-check pefile
+        @'
+        import os, sys, pefile
+        bundle, rocm = r"llama.cpp\build\bin", r"C:\opt\rocm\bin"
+        have = {f.lower() for f in os.listdir(bundle)}
+        rocm_dlls = {f.lower() for f in os.listdir(rocm) if f.lower().endswith(".dll")}
+        dirs = [pefile.DIRECTORY_ENTRY[d] for d in ("IMAGE_DIRECTORY_ENTRY_IMPORT", "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT")]
+        missing = []
+        for name in sorted(have):
+            if not name.endswith((".dll", ".exe")):
+                continue
+            pe = pefile.PE(os.path.join(bundle, name), fast_load=True)
+            pe.parse_data_directories(directories=dirs)
+            for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) + getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
+                dep = entry.dll.decode().lower()
+                if dep in rocm_dlls and dep not in have:
+                    missing.append(f"{name} -> {dep}")
+        if missing:
+            print("\n".join(missing))
+            print("::error::the bundle imports ROCm DLLs it does not carry")
+            sys.exit(1)
+        print("every imported ROCm DLL is in the bundle")
+        '@ | python -
 
     - name: List build artifacts (including ROCm files)
       run: |
@@ -659,9 +687,8 @@ jobs:
           echo "Using target with -all suffix: $archive_target"
         fi
 
-        # TheRock publishes nightlies to the multi-arch tarball index. The
-        # static HTML page embeds a JSON `files` array with names and mtimes.
-        base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
+        # The index embeds a JSON `files` array with names and mtimes.
+        base_url="https://nightly.repo.amd.com/rocm/core/tarball"
         if [ "$rocm_version" = "latest" ] || [ "$rocm_version" = "weekly" ]; then
           # weekly: take the newest alpha up to the Saturday before the last SF Sunday, so a whole week uses one toolchain and the ccache hits.
           # The cutoff day must be settled before the first run reads it: TheRock usually publishes the evening before, but has landed as late as 18:33 PT on the named day, which splits the week.
@@ -826,11 +853,12 @@ jobs:
         # CXX compiler is ROCm's clang++ (not hipcc), so ggml-hip leaves
         # CXX_IS_HIPCC false and calls enable_language(HIP), putting the device
         # sources on the HIP language rather than CXX.
+        # Setting CMAKE_SYSTEM_NAME without a processor forces generic CPU code.
+        # Keep native detection and select CPU variants at runtime.
         cmake .. -G Ninja \
           -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
           -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
           -DCMAKE_CXX_FLAGS="-I/opt/rocm/include" \
-          -DCMAKE_CROSSCOMPILING=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DGPU_TARGETS="$mapped_target" \
           -DBUILD_SHARED_LIBS=ON \
@@ -843,10 +871,11 @@ jobs:
           -DLLAMA_BUILD_BORINGSSL=ON \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
+          -DGGML_BACKEND_DL=ON \
+          -DGGML_CPU_ALL_VARIANTS=ON \
           -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
           -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
-          -DCMAKE_HIP_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
-          -DCMAKE_SYSTEM_NAME=Linux
+          -DCMAKE_HIP_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
         # Build the project
         cmake --build . -j $(nproc)
@@ -907,11 +936,14 @@ jobs:
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
         cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
         cp -v /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
+        cp -v /opt/rocm/lib/libtensilelite-host.so* "$build_bin_path/" 2>/dev/null || echo "libtensilelite-host.so* not found"
         cp -v /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
         cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
         cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
+        # libtensilelite-host needs the unversioned libomp.so; cp follows the symlink.
+        cp -v /opt/rocm/lib/llvm/lib/libomp.so "$build_bin_path/" 2>/dev/null || echo "libomp.so not found"
 
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
         cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
@@ -937,6 +969,33 @@ jobs:
         for file in *.so* llama-*; do
           [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
         done
+
+    # Reject missing dependencies and runner libraries that mask an incomplete
+    # bundle. Only glibc, libstdc++ and libgcc_s may resolve outside the bundle.
+    - name: Check the bundle resolves its own dependencies
+      run: |
+        cd llama.cpp/build/bin
+        bundle="$(pwd -P)"
+        system='^((libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)$'
+        bad=""
+        for file in *.so* llama-*; do
+          [ -f "$file" ] && [ ! -L "$file" ] || continue
+          while read -r name arrow path _; do
+            # vdso (and on some hosts the dynamic loader) is listed without "=>".
+            [ "$arrow" = "=>" ] || continue
+            if [ "$path" = "not" ]; then
+              bad+="$file: $name not found"$'\n'
+            elif [[ ! "$name" =~ $system ]] && [ "$(dirname "$(readlink -f "$path")")" != "$bundle" ]; then
+              bad+="$file: $name resolved outside the bundle ($path)"$'\n'
+            fi
+          done < <(env -u LD_LIBRARY_PATH ldd "$file" 2>/dev/null || true)
+        done
+        if [ -n "$bad" ]; then
+          printf '%s' "$bad"
+          echo "::error::the bundle has dependencies it does not carry"
+          exit 1
+        fi
+        echo "every packaged library resolves inside the bundle or to the base C/C++ runtime"
 
     - name: List build artifacts (including ROCm files)
       run: |
