@@ -348,7 +348,6 @@ jobs:
           name: app-${{ inputs.tag }}-windows-arm64-cpu
           path: cpubundle
 
-      # Add the CUDA backend to the CPU bundle, which includes OpenMP.
       # Bundle the CUDA runtime because PyTorch has no Windows ARM64 CUDA wheels.
       - name: Compose the bundle input
         run: |

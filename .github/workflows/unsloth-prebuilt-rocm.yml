@@ -509,7 +509,6 @@ jobs:
           exit 1
         }
 
-    # Catch runtime dependencies missing from the manual copy list.
     - name: Check the bundle carries every ROCm DLL it imports
       run: |
         python -m pip install --quiet --disable-pip-version-check pefile
