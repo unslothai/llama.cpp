@@ -14,9 +14,8 @@ name: "Unsloth prebuilt: CUDA Windows ARM64"
 #     compiles on an x64 runner with the amd64_arm64 MSVC toolset, the same way
 #     unsloth-prebuilt-cpu.yml already cross compiles the Windows arm64 CPU
 #     bundle, and the same way ggml-org's release.yml builds its arm64 CUDA zip.
-#   * Only CUDA 13.4 ships Windows ARM64 target libraries (cudart + cublas), and
-#     only from packages.nvidia.com rather than the redist CDN the x64 legs use,
-#     so it needs its own component list, not another row in the x64 table.
+#   * CUDA 13.4 needs a separate component list: x86_64 host tools and ARM64
+#     target libraries.
 #   * It builds one target (ggml-cuda), not the whole tool set: everything else
 #     in the bundle comes from the arm64 CPU bundle this run already builds.
 #     That is exactly upstream's arrangement -- their arm64 CUDA job packs
@@ -148,23 +147,19 @@ jobs:
         with:
           arch: amd64_arm64
 
-      # The x64 legs install from the redist CDN, which has no ARM64 target
-      # libraries at any version. 13.4 is the first toolkit that ships them and
-      # it lives in the bin-archive pool instead; the host-side pieces (nvcc,
-      # crt, nvvm, cccl) stay x86_64 because the compiler runs on this runner.
-      # Same component set and same pool ggml-org's release.yml installs.
+      # CUDA 13.4.1 GA: x86_64 compiler tools and ARM64 runtime libraries,
+      # matching ggml-org/llama.cpp#28687.
       - name: Install CUDA toolkit 13.4 (x86_64 host, ARM64 target)
         run: |
           $ErrorActionPreference = 'Stop'
-          $pool = 'https://packages.nvidia.com/bin-archive/pool'
-          $guid = '5B515474-7E78-11F1-8656-C51E4F4B317F'
+          $pool = 'https://developer.download.nvidia.com/compute/cuda/redist'
           $components = @(
-            "windows-x86_64/$guid/cccl-windows-x86_64-13.3.4.1.2-archive",
-            "windows-x86_64/$guid/cuda_crt-windows-x86_64-13.4.46-archive",
-            "windows-x86_64/$guid/cuda_nvcc-windows-x86_64-13.4.46-archive",
-            "windows-x86_64/$guid/libnvvm-windows-x86_64-13.4.46-archive",
-            "windows-arm64/$guid/cuda_cudart-windows-arm64-13.4.46-archive",
-            "windows-arm64/$guid/libcublas-windows-arm64-13.7.0.10-archive"
+            "cccl/windows-x86_64/cccl-windows-x86_64-13.3.4.2.1-archive",
+            "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.4.59-archive",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.4.59-archive",
+            "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.4.59-archive",
+            "cuda_cudart/windows-arm64/cuda_cudart-windows-arm64-13.4.49-archive",
+            "libcublas/windows-arm64/libcublas-windows-arm64-13.7.0.27-archive"
           )
           $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA }}"
           $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
@@ -353,15 +348,18 @@ jobs:
           name: app-${{ inputs.tag }}-windows-arm64-cpu
           path: cpubundle
 
-      # The CPU zip is the whole build/bin/Release tree plus the OpenMP runtime.
-      # Dropping the backend in beside it gives package_bundle.py the same shape
-      # of input directory a native build tree would have.
+      # Bundle the CUDA runtime because PyTorch has no Windows ARM64 CUDA wheels.
       - name: Compose the bundle input
         run: |
           $zip = "cpubundle/app-${{ inputs.tag }}-windows-arm64-cpu.zip"
           if (-not (Test-Path $zip)) { throw "the CPU leg's artifact does not contain $zip" }
           Expand-Archive -Path $zip -DestinationPath bin -Force
           Copy-Item cudabin/ggml-cuda.dll bin/ -Force
+          foreach ($dll in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll')) {
+            $src = Join-Path "$env:CUDA_PATH\bin\arm64" $dll
+            if (-not (Test-Path $src)) { throw "the toolkit has no $src" }
+            Copy-Item $src bin/ -Force
+          }
           foreach ($required in @('llama-server.exe', 'ggml-base.dll', 'ggml-cpu.dll')) {
             if (-not (Test-Path (Join-Path 'bin' $required))) { throw "the CPU bundle is missing $required" }
           }
@@ -383,7 +381,8 @@ jobs:
           KLASS: ${{ env.KLASS }}
           RANK: ${{ env.RANK }}
           TOOLKIT_LINE: ${{ env.CUDA }}
-          DOCKER_IMAGE: github-hosted windows-2022 cross-compiled to arm64, CUDA ${{ env.CUDA }} (NVIDIA bin-archive)
+          DOCKER_IMAGE: github-hosted windows-2022 cross-compiled to arm64, CUDA ${{ env.CUDA }} (NVIDIA redist)
+          BUNDLE_CUDA_RUNTIME: '1'
           ARCHS: ${{ env.ARCHS }}
         run: python tooling/scripts/unsloth/package_bundle.py
 
