@@ -409,9 +409,12 @@ jobs:
         REM Only the C/CXX launchers here: ggml-hip forces CXX_IS_HIPCC on
         REM WIN32, so the device sources compile as C++, not the HIP language.
         REM Keep native CPU detection; select CPU variants at runtime.
+        REM ROCm's clang rejects ggml's _mm_prefetch calls against MSVC's declaration
+        REM (arch/x86/quants.c); upstream avoids it by building only ggml-hip here.
         cmake .. -G Ninja ^
           -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
           -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+          -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" ^
           -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
           -DCMAKE_BUILD_TYPE=Release ^
           -DGPU_TARGETS="%mapped_target%" ^
