@@ -2539,6 +2539,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--pipeline-groups"}, "N",
+            string_format("run the server slots over N independent contexts of one model, so one "
+                          "group decodes while another is between steps (default: %d)", params.n_pipeline_groups),
+            [](common_params & params, int value) {
+                if (value < 1) {
+                    throw std::invalid_argument("error: --pipeline-groups must be >= 1\n");
+                }
+                params.n_pipeline_groups = value;
+            }
+        ).set_env("LLAMA_ARG_PIPELINE_GROUPS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
