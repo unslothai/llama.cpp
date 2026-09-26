@@ -41,6 +41,7 @@ json task_params::to_json(bool only_metrics) const {
 
     if (only_metrics) {
         return json {
+            {"priority",                  priority},
             {"seed",                      sampling.seed},
             {"temperature",               sampling.temp},
             {"dynatemp_range",            sampling.dynatemp_range},
@@ -93,6 +94,7 @@ json task_params::to_json(bool only_metrics) const {
     }
 
     return json {
+        {"priority",                  priority},
         {"seed",                      sampling.seed},
         {"temperature",               sampling.temp},
         {"dynatemp_range",            sampling.dynatemp_range},
@@ -1522,6 +1524,10 @@ json server_task_result_metrics::to_json() {
 // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
 std::string server_task_result_metrics::to_metrics() {
     const std::vector<metric_item> counters = {
+        { "preemptions_total", "Sequences parked", (double) metrics.n_preempt },
+        { "preempt_restores_total", "Sequences restored", (double) metrics.n_restore },
+        { "preempt_blocked_total", "Scheduling attempts blocked by snapshot RAM or policy", (double) metrics.n_preempt_blocked },
+        { "preempt_copy_seconds_total", "Time copying sequence snapshots to and from host RAM", metrics.preempt_copy_us / 1.e6 },
         {
             "prompt_tokens_total",
             "Number of prompt tokens processed, excluding cached tokens",
@@ -1566,6 +1572,8 @@ std::string server_task_result_metrics::to_metrics() {
     };
 
     const std::vector<metric_item> gauges = {
+        { "preempt_ram_bytes", "Host RAM held by sequence snapshots", (double) metrics.preempt_ram_bytes },
+        { "requests_preempted", "Requests parked with live streams", (double) metrics.n_preempted },
         {
             "prompt_tokens_seconds",
             "Average prompt throughput in tokens/s",
