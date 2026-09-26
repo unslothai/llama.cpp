@@ -73,6 +73,14 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "%s : saved seq 1 state, %zu bytes\n", __func__, ncopy);
 
+    // A fragmented restore may stage a whole device tensor. Check every
+    // sequence byte-for-byte, including the neighbours that must be preserved.
+    std::vector<std::vector<uint8_t>> before(params.n_parallel);
+    for (int s = 0; s < params.n_parallel; ++s) {
+        before[s].resize(llama_state_seq_get_size(ctx, s));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, before[s].data(), before[s].size(), s) == before[s].size());
+    }
+
     // clear seq 1 to create a "hole" in the KV cache (fragmentation)
     // 0.20.20.20.2....
     llama_memory_t mem = llama_get_memory(ctx);
@@ -95,6 +103,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "%s : restored state into seq 1, %zu bytes\n", __func__, nset);
+
+    for (int s = 0; s < params.n_parallel; ++s) {
+        std::vector<uint8_t> after(llama_state_seq_get_size(ctx, s));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, after.data(), after.size(), s) == after.size());
+        GGML_ASSERT(before[s] == after);
+    }
+    fprintf(stderr, "%s : all %d sequence snapshots are byte-identical after restore\n", __func__, params.n_parallel);
 
     // Verify we can decode with the restored state
     // Generate one token to verify the restored state is usable
