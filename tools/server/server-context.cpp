@@ -431,6 +431,12 @@ struct server_slot {
             return;
         }
 
+        // only send_final_response() reads this, and only with n_probs > 0; otherwise every token
+        // copied a string and a vector into a list grown for the whole generation, then dropped
+        if (task->params.sampling.n_probs <= 0) {
+            return;
+        }
+
         generated_token_probs.push_back(token);
     }
 
