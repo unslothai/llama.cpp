@@ -1522,6 +1522,13 @@ json server_task_result_metrics::to_json() {
 // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
 std::string server_task_result_metrics::to_metrics() {
     const std::vector<metric_item> counters = {
+        {"preemptions_total", "Successful sequence parks", (double) metrics.preempt_total},
+        {"preempt_restores_total", "Successful sequence restores", (double) metrics.preempt_restore_total},
+        {"preempt_forced_total", "Parks caused by the test interval", (double) metrics.preempt_forced_total},
+        {"preempt_ram_denied_total", "Parks denied by the host RAM limit or allocation failure", (double) metrics.preempt_ram_denied_total},
+        {"preempt_restore_failures_total", "Sequence restores to retry", (double) metrics.preempt_restore_fail_total},
+        {"preempt_unused_cells_total", "Sum of unused pool cells immediately before parks", (double) metrics.preempt_unused_cells_total},
+        {"preempt_copy_seconds_total", "Time copying and removing sequence snapshots", metrics.preempt_copy_us / 1.e6},
         {
             "prompt_tokens_total",
             "Number of prompt tokens processed, excluding cached tokens",
@@ -1566,6 +1573,13 @@ std::string server_task_result_metrics::to_metrics() {
     };
 
     const std::vector<metric_item> gauges = {
+        {"preempt_parked", "Currently parked requests", (double) metrics.preempt_parked},
+        {"preempt_ram_bytes", "Host bytes used by parked snapshots", (double) metrics.preempt_ram_bytes},
+        {"preempt_resident_cells", "Conservative resident sequence cell count", (double) metrics.preempt_resident_cells},
+        {"preempt_projected_cells", "Projected cells including the next prefill or draft", (double) metrics.preempt_projected_cells},
+        {"preempt_high_cells", "High watermark in cells", (double) metrics.preempt_high_cells},
+        {"preempt_low_cells", "Low watermark in cells", (double) metrics.preempt_low_cells},
+        {"preempt_restore_max_cells", "Largest projected cell count at any restore", (double) metrics.preempt_restore_max_cells},
         {
             "prompt_tokens_seconds",
             "Average prompt throughput in tokens/s",

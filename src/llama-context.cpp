@@ -2617,8 +2617,42 @@ public:
 
     ~llama_io_read_host() {
         // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+        for (size_t i = 0; i < rinfos.size();) {
+            auto * tensor = rinfos[i].tensor;
+            size_t end = i + 1;
+            while (end < rinfos.size() && rinfos[end].tensor == tensor) {
+                end++;
+            }
+            const size_t tensor_bytes = ggml_nbytes(tensor);
+            auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+            // A fragmented sequence can require thousands of synchronous device
+            // transfers per layer. For bounded tensors, stage the tensor once and
+            // preserve every byte belonging to other sequences. Bound scratch RAM
+            // and leave ordinary contiguous transfers on their original fast path.
+            if (end - i >= 64 && tensor_bytes <= 64 * 1024 * 1024 &&
+                    !ggml_backend_buffer_is_host(buffer)) {
+                std::vector<uint8_t> staging;
+                try {
+                    staging.resize(tensor_bytes);
+                } catch (const std::bad_alloc &) {
+                    // Fall back to the individual transfers below.
+                }
+                if (!staging.empty()) {
+                    ggml_backend_tensor_get(tensor, staging.data(), 0, tensor_bytes);
+                    for (size_t j = i; j < end; ++j) {
+                        const auto & rinfo = rinfos[j];
+                        GGML_ASSERT(rinfo.offset <= tensor_bytes && rinfo.size <= tensor_bytes - rinfo.offset);
+                        memcpy(staging.data() + rinfo.offset, rinfo.ptr, rinfo.size);
+                    }
+                    ggml_backend_tensor_set(tensor, staging.data(), 0, tensor_bytes);
+                    i = end;
+                    continue;
+                }
+            }
+            for (; i < end; ++i) {
+                const auto & rinfo = rinfos[i];
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
         }
     }
 
