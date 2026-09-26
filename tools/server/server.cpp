@@ -14,8 +14,11 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <signal.h>
+#include <string>
 #include <thread> // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
@@ -24,6 +27,53 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+// parsed here rather than in common/arg.cpp: everything --pipeline-groups changes is under tools/server
+static int g_pipeline_groups = 1;
+
+static void server_take_pipeline_groups(int & argc, char ** argv) {
+    static const char * opt = "--pipeline-groups";
+    const size_t opt_len = strlen(opt);
+
+    int n_kept = 1;
+
+    // the router strips this flag from argv before handing argv to server_models, so a child
+    // spawned by the router would otherwise always run at one group no matter what the operator
+    // asked for. the router re-exports the resolved value and the child picks it up here, which
+    // is the same channel LLAMA_ARG_HF_REPO and LLAMA_SERVER_ROUTER_PORT already use.
+    // an explicit flag on the command line still wins over the inherited value.
+    if (const char * env = getenv("LLAMA_ARG_PIPELINE_GROUPS")) {
+        g_pipeline_groups = std::atoi(env);
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const std::string arg = argv[i];
+
+        if (arg == opt) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s requires a value\n", opt);
+                exit(1);
+            }
+            g_pipeline_groups = std::atoi(argv[++i]);
+            continue;
+        }
+
+        if (arg.size() > opt_len + 1 && arg.compare(0, opt_len, opt) == 0 && arg[opt_len] == '=') {
+            g_pipeline_groups = std::atoi(arg.c_str() + opt_len + 1);
+            continue;
+        }
+
+        argv[n_kept++] = argv[i];
+    }
+
+    argc = n_kept;
+    argv[n_kept] = nullptr;
+
+    if (g_pipeline_groups < 1) {
+        fprintf(stderr, "error: %s must be >= 1\n", opt);
+        exit(1);
+    }
+}
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -95,6 +145,8 @@ int llama_server(int argc, char ** argv) {
 
     // own arguments required by this example
     common_params params;
+
+    server_take_pipeline_groups(argc, argv);
 
     common_init();
 
@@ -168,6 +220,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // struct that contains llama context and inference
     server_context ctx_server;
+    ctx_server.set_pipeline_groups(g_pipeline_groups);
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
@@ -186,6 +239,22 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
+        // the router itself never loads a model, so it cannot check the group settings the way a
+        // normal server does. children can only satisfy --pipeline-groups > 1 if they are also
+        // given a context size, and the router only renders --ctx-size into the child args when the
+        // operator passed one. without this check every model request would fail at load time with
+        // an error from a subprocess, long after the mistake was made.
+        if (g_pipeline_groups > 1 && params.n_ctx <= 0) {
+            SRV_ERR("%s", "--pipeline-groups > 1 in router mode requires an explicit context size, pass -c N\n");
+            return 1;
+        }
+
+        // server_models snapshots the environment at construction and passes that snapshot to every
+        // child it spawns. --pipeline-groups has already been stripped from argv by this point, so
+        // exporting it here is what actually carries the operator's setting through to the children
+        // that do the loading. must happen before the emplace below, which takes the snapshot.
+        common_set_env("LLAMA_ARG_PIPELINE_GROUPS", std::to_string(g_pipeline_groups));
+
         // setup server instances manager
         try {
             models_routes.emplace(params, argc, argv);

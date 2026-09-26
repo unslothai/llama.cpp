@@ -2074,6 +2074,40 @@ Note that the following endpoints are exempt from being considered as incoming t
 - `GET /models`
 - `GET /metrics`
 
+## Pipeline groups
+
+`--pipeline-groups N` (default `1`) runs the server's slots over `N` independent `llama_context`
+objects created from the same model. Each group has its own batch, its own sampling and its own
+decode thread; the model weights, the task queue, the results queue and the HTTP layer are shared.
+
+This is meant for a layer split across two machines, e.g.
+
+```sh
+llama-server -m model.gguf -c 32768 --parallel 16 \
+    --rpc peer:50052 --device CUDA0,RPC0 -sm layer -ngl 99 \
+    --pipeline-groups 2
+```
+
+With one context, a layer split is a two-stage pipeline that is fed one batch at a time, so each
+stage is idle while the other one computes. With two groups there are two batches in flight, so
+while group A is being computed on the second stage, group B is being computed on the first one.
+
+Details:
+
+- The slots are partitioned contiguously: with `--parallel P` and `--pipeline-groups N`, group `g`
+  owns slots `[g*P/N, (g+1)*P/N)`. `--parallel` must be a positive multiple of `--pipeline-groups`.
+- Each context is created with `n_seq_max = P/N` and `n_ctx = C/N`, so the per-slot context and the
+  total KV memory over all groups are the same as with a single context. `-c` must be given
+  explicitly and must be a multiple of `N`.
+- Slot selection for an incoming request still runs over *all* slots, so prompt cache similarity and
+  the slot save / restore endpoints work exactly as before: a returning conversation lands on the
+  slot that still holds its prefix, whichever group that slot belongs to.
+- Task processing briefly pauses the decode loops, so `/slots`, `/metrics` and cancellations are
+  answered after the in-flight decode of each group finishes rather than during it.
+- `N > 1` is refused at startup together with speculative decoding (`--model-draft`, MTP),
+  multimodal (`--mmproj`) and `--sleep-idle-seconds`.
+- With `N = 1` nothing changes: one context, one batch and one update loop on the main thread.
+
 ## More examples
 
 ### Interactive mode
