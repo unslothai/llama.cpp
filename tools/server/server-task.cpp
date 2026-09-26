@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "unicode.h"
 
 #include <sstream>
 
@@ -159,12 +160,105 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     }
 }
 
+// Bytes a lead announces, and the range its FIRST continuation must fall in: that range is what
+// rejects overlong forms and surrogates.
+static bool utf8_lead_bounds(unsigned char lead, size_t & want, unsigned char & lo, unsigned char & hi) {
+    lo = 0x80;
+    hi = 0xbf;
+    if (lead < 0x80) {
+        want = 1;
+        return true;
+    }
+    if (lead >= 0xc2 && lead <= 0xdf) {
+        want = 2;
+        return true;
+    }
+    if (lead >= 0xe0 && lead <= 0xef) {
+        want = 3;
+        if (lead == 0xe0) { lo = 0xa0; }
+        if (lead == 0xed) { hi = 0x9f; }
+        return true;
+    }
+    if (lead >= 0xf0 && lead <= 0xf4) {
+        want = 4;
+        if (lead == 0xf0) { lo = 0x90; }
+        if (lead == 0xf4) { hi = 0x8f; }
+        return true;
+    }
+    return false;
+}
+
+// `common_parse_utf8_codepoint` tests continuation shape only and accepts C0 80, which the client
+// is never shown and the `params.debug` AST dump throws on. Checked here: that parser has other callers.
+static bool utf8_is_scalar(const std::string & s, size_t pos, size_t len) {
+    if (len == 0 || pos + len > s.size()) {
+        return false;
+    }
+    size_t want = 0;
+    unsigned char lo = 0, hi = 0;
+    if (!utf8_lead_bounds(static_cast<unsigned char>(s[pos]), want, lo, hi) || want != len) {
+        return false;
+    }
+    for (size_t i = 1; i < want; i++) {
+        const unsigned char c = static_cast<unsigned char>(s[pos + i]);
+        const bool ok = (i == 1) ? (c >= lo && c <= hi) : ((c & 0xc0) == 0x80);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One failed sequence as the serialiser counts it: "\xE2\x80A" is one replacement, "\xC3\xC3" two.
+static size_t utf8_malformed_prefix(const std::string & s, size_t pos) {
+    size_t want = 0;
+    unsigned char lo = 0, hi = 0;
+    if (!utf8_lead_bounds(static_cast<unsigned char>(s[pos]), want, lo, hi) || want == 1) {
+        return 1;
+    }
+    size_t have = 1;
+    while (have < want && pos + have < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[pos + have]);
+        const bool ok = (have == 1) ? (c >= lo && c <= hi) : ((c & 0xc0) == 0x80);
+        if (!ok) {
+            break;
+        }
+        have++;
+    }
+    return have;
+}
+
+// A byte-fallback token, or a prompt cut mid-character, puts undecodable bytes in the stream and the
+// chat parsers throw on them, cancelling the task. Substitute as the serialiser already does.
+static void append_utf8_sanitized(std::string & text, std::string & pending, const std::string & text_added, bool is_final = false) {
+    pending += text_added;
+
+    size_t pos = 0;
+    while (pos < pending.size()) {
+        const auto res = common_parse_utf8_codepoint(pending, pos);
+        if (res.status == utf8_parse_result::INCOMPLETE && !is_final) {
+            break;
+        }
+        if (res.status == utf8_parse_result::SUCCESS && utf8_is_scalar(pending, pos, res.bytes_consumed)) {
+            text.append(pending, pos, res.bytes_consumed);
+            pos += res.bytes_consumed;
+            continue;
+        }
+        // INCOMPLETE lands here on the final call, and "\xE2A" must give one replacement and keep the A.
+        text += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+        pos += utf8_malformed_prefix(pending, pos);
+    }
+
+    pending.erase(0, pos);
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    generated_text += text_added;
+    // Nothing can complete a held-back sequence after the last update; unresolved, it was dropped.
+    append_utf8_sanitized(generated_text, generated_text_pending, text_added, !is_partial);
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(

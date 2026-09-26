@@ -107,7 +107,8 @@ struct task_result_state {
     std::vector<common_chat_msg_diff> diffs;
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
-    std::string generated_text; // append new chunks of generated text here
+    std::string generated_text; // append new chunks of generated text here, see update_chat_msg()
+    std::string generated_text_pending; // trailing bytes of an incomplete UTF-8 sequence
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 

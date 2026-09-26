@@ -63,3 +63,16 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# UTF-8 sanitising unit test: needs no model, so it stays out of the default build
+
+if (LLAMA_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    set(TARGET test-server-utf8)
+
+    add_executable(${TARGET} tests/test-server-utf8.cpp)
+    target_link_libraries(${TARGET} PRIVATE server-context ${CMAKE_THREAD_LIBS_INIT})
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    add_test(NAME ${TARGET} COMMAND ${TARGET})
+endif()
