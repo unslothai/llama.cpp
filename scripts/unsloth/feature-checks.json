@@ -99,6 +99,7 @@
     "unslothai#149": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 env parsing; needs a CUDA or HIP host, and no runner in the pipeline has one",
     "unslothai#152": "per-run mmap of a context's tensors; a memory-layout change with no observable output difference",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
-    "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host"
+    "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
+    "unslothai#210": "server-side KV preemption (--preempt-ram, --preempt-async) and opt-in exact concurrency (--exact-concurrency); the server parks and restores slots and pins per-sequence output, which no arch, backend-op or mtmd probe can observe. Covered by test-exact-geometry and the server preemption tests carried in unslothai#197, which need a CUDA host for the exact path"
   }
 }
