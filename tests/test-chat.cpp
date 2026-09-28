@@ -7519,9 +7519,9 @@ static void test_qwen3_coder_unparsed_tail() {
         make_peg_parser parser(tmpls.get(), inputs);
 
         const std::string prose = "Here is the fix:\n\nconst SPEED: f32 =\n";
-        for (const std::string tail : {
-                 std::string("<tool_call>\n<function="),
-                 std::string("<tool_call>\n<function=web_fetch>\n<parameter=url>\nx\n</parameter>\n</function>\n</tool_call>"),
+        for (const char * tail : {
+                 "<tool_call>\n<function=",
+                 "<tool_call>\n<function=web_fetch>\n<parameter=url>\nx\n</parameter>\n</function>\n</tool_call>",
              }) {
             auto msg = streamed(parser, prose + tail);
             assert_equals(prose + tail, msg.content);
