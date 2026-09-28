@@ -1467,6 +1467,16 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
     }
 
+    auto make_mapper = [&](common_chat_msg & msg) -> std::unique_ptr<common_chat_peg_mapper> {
+        if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
+            return std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+        }
+        if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
+            return std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
+        }
+        return std::make_unique<common_chat_peg_mapper>(msg);
+    };
+
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);
 
@@ -1477,15 +1487,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             // Try to extract any partial results from what was successfully parsed
             common_chat_msg msg;
             msg.role = "assistant";
-            std::unique_ptr<common_chat_peg_mapper> mapper;
-            if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
-            } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
-                mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
-            } else {
-                mapper = std::make_unique<common_chat_peg_mapper>(msg);
-            }
-            mapper->from_ast(ctx.ast, result);
+            make_mapper(msg)->from_ast(ctx.ast, result);
 
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
@@ -1501,15 +1503,24 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_chat_msg msg;
     msg.role = "assistant";
 
-    std::unique_ptr<common_chat_peg_mapper> mapper;
-    if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-        mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
-    } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
-        mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
-    } else {
-        mapper = std::make_unique<common_chat_peg_mapper>(msg);
+    make_mapper(msg)->from_ast(ctx.ast, result);
+
+    // a final parse that needs more input can end inside a construct and drop the rest
+    // retry strictly so a parser with a fallback for it (e.g. qwen3-coder) can keep the whole output
+    // skip it when the output still ends with the parsed text: nothing was dropped (plain replies)
+    auto ends_with_parsed = [&](const std::string & s) { return !s.empty() && string_ends_with(input, s); };
+    if (!is_partial && result.need_more_input() && msg.tool_calls.empty() && !input.empty() &&
+        !ends_with_parsed(msg.content) && !ends_with_parsed(msg.reasoning_content)) {
+        common_peg_parse_context strict_ctx(effective_input, params.debug ? COMMON_PEG_PARSE_FLAG_DEBUG
+                                                                          : COMMON_PEG_PARSE_FLAG_NONE);
+        auto strict = parser.parse(strict_ctx);
+        if (strict.success() && strict.end == effective_input.size()) {
+            common_chat_msg strict_msg;
+            strict_msg.role = "assistant";
+            make_mapper(strict_msg)->from_ast(strict_ctx.ast, strict);
+            msg = std::move(strict_msg);
+        }
     }
-    mapper->from_ast(ctx.ast, result);
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
