@@ -1505,9 +1505,12 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
 
     make_mapper(msg)->from_ast(ctx.ast, result);
 
-    // a final parse that needs more input ended inside a construct and drops the rest
+    // a final parse that needs more input can end inside a construct and drop the rest
     // retry strictly so a parser with a fallback for it (e.g. qwen3-coder) can keep the whole output
-    if (!is_partial && result.need_more_input() && msg.tool_calls.empty()) {
+    // skip it when the output still ends with the parsed text: nothing was dropped (plain replies)
+    auto ends_with_parsed = [&](const std::string & s) { return !s.empty() && string_ends_with(input, s); };
+    if (!is_partial && result.need_more_input() && msg.tool_calls.empty() && !input.empty() &&
+        !ends_with_parsed(msg.content) && !ends_with_parsed(msg.reasoning_content)) {
         common_peg_parse_context strict_ctx(effective_input, params.debug ? COMMON_PEG_PARSE_FLAG_DEBUG
                                                                           : COMMON_PEG_PARSE_FLAG_NONE);
         auto strict = parser.parse(strict_ctx);
