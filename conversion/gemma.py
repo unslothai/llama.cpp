@@ -700,7 +700,7 @@ class Gemma4Model(Gemma3Model):
         self.gguf_writer.add_key_length_swa(head_dim_swa)
         self.gguf_writer.add_value_length_swa(head_dim_swa)
 
-        expert_intermediate_size = self.find_hparam(["expert_intermediate_size", "moe_intermediate_size"])
+        expert_intermediate_size = self.find_hparam(["expert_intermediate_size", "moe_intermediate_size"], optional=True)
         if expert_intermediate_size is not None:
             self.gguf_writer.add_expert_feed_forward_length(expert_intermediate_size)
 
@@ -808,6 +808,31 @@ class Gemma4Model(Gemma3Model):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("EmbeddingGemma2Model")
+# TODO: add example model
+class EmbeddingGemma2Model(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.GEMMA_EMBEDDING2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hparams["num_kv_shared_layers"] = 0
+
+    def set_vocab(self):
+        Gemma3Model.set_vocab(self)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # HF sliding_window is bidirectional, llama.cpp expects the full window size
+        self.gguf_writer.add_sliding_window(2 * self.hparams["sliding_window"])
+        self.gguf_writer.add_embedding_length_out(self.hparams["embedding_dim"])
+        self.gguf_writer.add_causal_attention(False)
+        self._try_set_pooling_type()
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # default rope on all layers, no rope_freqs needed
+        return iter(())
 
 
 @ModelBase.register("Gemma4DSparkModel")
