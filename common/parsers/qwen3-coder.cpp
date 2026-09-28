@@ -166,8 +166,15 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
 
-            return generation_prompt +
-                   (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
+            auto body = reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls;
+
+            // keep output that is not a valid tool call (unknown tool, call cut by EOS) as content instead of dropping it
+            // only for auto: the required grammar is built from the whole parser and would accept it
+            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO) {
+                body = body + p.content(p.rest());
+            }
+
+            return generation_prompt + body;
         }
 
         // Content only parser

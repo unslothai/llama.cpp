@@ -7478,6 +7478,73 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 }
 
+// output that is not a valid tool call must be kept as content, not dropped
+// parsed directly: peg_tester also checks the input against the grammar, which rejects these calls
+static void test_qwen3_coder_unparsed_tail() {
+    LOG_DBG("%s\n", __func__);
+
+    auto streamed = [](const make_peg_parser & parser, const std::string & input) {
+        common_chat_msg prev;
+        common_chat_msg accum;
+        prev.role = accum.role = "assistant";
+        for (size_t i = 1; i <= input.size(); ++i) {
+            auto current = parser.parse(input.substr(0, i), i < input.size());
+            for (const auto & diff : common_chat_msg_diff::compute_diffs(prev, current)) {
+                accum.content += diff.content_delta;
+                if (diff.tool_call_index != std::string::npos) {
+                    while (accum.tool_calls.size() <= diff.tool_call_index) {
+                        accum.tool_calls.push_back({ "", "", "" });
+                    }
+                    auto & call = accum.tool_calls[diff.tool_call_index];
+                    if (!diff.tool_call_delta.name.empty()) {
+                        call.name = diff.tool_call_delta.name;
+                    }
+                    call.arguments += diff.tool_call_delta.arguments;
+                }
+            }
+            prev = current;
+        }
+        assert_msg_equals(parser.parse(input, false), accum, true);
+        return accum;
+    };
+
+    for (const char * path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen3-Coder.jinja" }) {
+        auto tmpls = read_templates(path);
+
+        common_chat_templates_inputs inputs;
+        inputs.messages         = { message_user };
+        inputs.tools            = { special_function_tool };
+        inputs.enable_thinking  = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        make_peg_parser parser(tmpls.get(), inputs);
+
+        const std::string prose = "Here is the fix:\n\nconst SPEED: f32 =\n";
+        for (const std::string tail : {
+                 std::string("<tool_call>\n<function="),
+                 std::string("<tool_call>\n<function=web_fetch>\n<parameter=url>\nx\n</parameter>\n</function>\n</tool_call>"),
+             }) {
+            auto msg = streamed(parser, prose + tail);
+            assert_equals(prose + tail, msg.content);
+            assert_equals((size_t) 0, msg.tool_calls.size());
+        }
+
+        const std::string call = "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+        auto msg = streamed(parser, prose + call);
+        assert_equals(prose, msg.content);
+        assert_equals((size_t) 1, msg.tool_calls.size());
+        assert_equals(std::string("special_function"), msg.tool_calls[0].name);
+
+        msg = streamed(parser, prose + call + "\nDone.");
+        assert_equals((size_t) 1, msg.tool_calls.size());
+        assert_equals(prose + "Done.", msg.content);
+
+        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        make_peg_parser required(tmpls.get(), inputs);
+        msg = required.parse(call, false);
+        assert_equals((size_t) 1, msg.tool_calls.size());
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7629,6 +7696,7 @@ int main(int argc, char ** argv) {
 #endif
     {
         test_msg_diffs_compute();
+        test_qwen3_coder_unparsed_tail();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
