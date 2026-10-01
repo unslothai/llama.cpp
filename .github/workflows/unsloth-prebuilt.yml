@@ -1138,6 +1138,39 @@ jobs:
             echo "::warning::whisper.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
           fi
 
+      # audio.cpp vendors its own patched ggml, so a llama release changes
+      # nothing it ships. The event is only a wake-up: audio.cpp ignores the
+      # payload and re-resolves the newest aged upstream audio.cpp release, so
+      # a new upstream tag is published within hours instead of at its cron.
+      - name: Notify audio.cpp
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        # Never fail a published release because the notification did not land.
+        continue-on-error: true
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUDIO_CPP_DISPATCH_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          # No -x here: it would trace the token into the log.
+          set -eu
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::AUDIO_CPP_DISPATCH_TOKEN is not set; audio.cpp will only pick this up on its own schedule"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg t "$TAG" --arg r "$GITHUB_RUN_ID" \
+            '{event_type: "llama-published", client_payload: {llama_tag: $t, run_id: $r}}')"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/unslothai/audio.cpp/dispatches \
+            -d "$PAYLOAD")"
+          # 204 is "event accepted", not "audio.cpp published". Its dead-man
+          # check is what catches a dropped or ignored event.
+          if [ "$CODE" = "204" ]; then
+            echo "notified audio.cpp of ${TAG}"
+          else
+            echo "::warning::audio.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
+          fi
+
   # Reclaim this run's Actions artifact storage once the release is canonical.
   #
   # Every prebuilt is stored TWICE: as an Actions artifact (billed against the
