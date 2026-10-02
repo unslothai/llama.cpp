@@ -433,6 +433,21 @@ struct server_slot_stats {
 struct server_metrics {
     int64_t t_start = 0;
 
+    uint64_t preempt_total = 0;
+    uint64_t preempt_restore_total = 0;
+    uint64_t preempt_forced_total = 0;
+    uint64_t preempt_ram_denied_total = 0;
+    uint64_t preempt_restore_fail_total = 0;
+    uint64_t preempt_unused_cells_total = 0;
+    uint64_t preempt_copy_us = 0;
+    uint64_t preempt_parked = 0;
+    uint64_t preempt_ram_bytes = 0;
+    uint64_t preempt_resident_cells = 0;
+    uint64_t preempt_projected_cells = 0;
+    uint64_t preempt_high_cells = 0;
+    uint64_t preempt_low_cells = 0;
+    uint64_t preempt_restore_max_cells = 0;
+
     struct bucket {
         uint64_t count = 0; // number of tokens
         uint64_t steps = 0; // number of decode steps,

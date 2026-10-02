@@ -1718,6 +1718,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--preempt-high"}, "PERCENT",
+        "unified server pool high watermark (default: 94, 0 disables preemption)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 100) {
+                throw std::invalid_argument("--preempt-high must be in [0, 100]");
+            }
+            params.preempt_high = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_HIGH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--preempt-low"}, "PERCENT",
+        "unified server pool restore watermark (default: 80, must be below high)",
+        [](common_params & params, int value) {
+            if (value <= 0 || value >= 100) {
+                throw std::invalid_argument("--preempt-low must be in (0, 100)");
+            }
+            params.preempt_low = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_LOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--preempt-ram"}, "MIB",
+        "maximum host RAM for parked sequence snapshots (default: 8192, 0 disables parking)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--preempt-ram must be nonnegative");
+            }
+            params.preempt_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
