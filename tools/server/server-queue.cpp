@@ -387,84 +387,247 @@ void server_queue::cleanup_pending_task(int id_target) {
 //
 
 void server_response::add_waiting_task_id(int id_task) {
-    RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
-
     std::unique_lock<std::mutex> lock(mutex_results);
-    waiting_task_ids.insert(id_task);
+
+    RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting.size());
+
+    waiting.emplace(id_task, std::make_shared<waiter>());
+
+    // a reader may already be parked on these ids waiting for exactly this
+    condition_gone.notify_all();
 }
 
 void server_response::add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
+    // one waiter for the whole set: these ids belong to one reader
+    auto w = std::make_shared<waiter>();
+
     for (const auto & id_task : id_tasks) {
-        RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
-        waiting_task_ids.insert(id_task);
+        RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting.size());
+        waiting.emplace(id_task, w);
     }
+
+    // a reader may already be parked on these ids waiting for exactly this
+    condition_gone.notify_all();
 }
 
 void server_response::remove_waiting_task_id(int id_task) {
-    RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
-
     std::unique_lock<std::mutex> lock(mutex_results);
-    waiting_task_ids.erase(id_task);
-    // make sure to clean up all pending results
-    queue_results.erase(
-        std::remove_if(queue_results.begin(), queue_results.end(), [id_task](const server_task_result_ptr & res) {
-            return res->id == id_task;
+
+    RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting.size());
+
+    auto it = waiting.find(id_task);
+    if (it == waiting.end()) {
+        return;
+    }
+
+    // the waiter is shared with the reader's other ids, so drop only this task's results
+    auto & results = it->second->results;
+    results.erase(
+        std::remove_if(results.begin(), results.end(), [id_task](const pending & p) {
+            return p.res->id == id_task;
         }),
-        queue_results.end());
+        results.end());
+
+    // a reader may be parked on this waiter; it has to repeat the lookup rather than wait out its
+    // deadline on a condition that nothing will fire again
+    auto w = it->second;
+    waiting.erase(it);
+    w->cv.notify_all();
+    condition_gone.notify_all();
 }
 
 void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 
+    std::vector<waiter_ptr> removed;
+
     for (const auto & id_task : id_tasks) {
-        RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
-        waiting_task_ids.erase(id_task);
+        RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting.size());
+
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+
+        removed.push_back(it->second);
+        waiting.erase(it);
     }
+
+    // same as the single id form: wake anyone parked on a waiter that no longer serves these ids
+    for (const auto & w : removed) {
+        w->cv.notify_all();
+    }
+    condition_gone.notify_all();
+}
+
+server_response::waiter_ptr server_response::find_waiter(const std::unordered_set<int> & id_tasks) const {
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it != waiting.end()) {
+            return it->second;
+        }
+    }
+
+    return nullptr;
+}
+
+// The waiter that covers every requested id, or nullptr when they sit in more than one waiter or
+// any of them is not registered yet. An absent id matters: it can be registered onto a different
+// waiter while the reader waits, so no single waiter's condition covers the call.
+server_response::waiter_ptr server_response::sole_waiter(const std::unordered_set<int> & id_tasks) const {
+    waiter_ptr found = nullptr;
+
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            return nullptr;
+        }
+        if (found == nullptr) {
+            found = it->second;
+            continue;
+        }
+        if (it->second != found) {
+            return nullptr;
+        }
+    }
+
+    return found;
+}
+
+// A waiter is shared by every id its reader registered in one call, so its queue can hold a
+// sibling's result. Return only an id the caller asked for, and the oldest such result across
+// every waiter the ids map to, which is what scanning the shared vector did. Each waiter's queue
+// is already in arrival order, so its first match is its oldest and only the winners are compared.
+server_task_result_ptr server_response::take_result(const std::unordered_set<int> & id_tasks) {
+    auto first_match = [&](waiter * w) {
+        return std::find_if(w->results.begin(), w->results.end(), [&](const pending & p) {
+            return id_tasks.find(p.res->id) != id_tasks.end();
+        });
+    };
+
+    auto claim = [](waiter * w, std::deque<pending>::iterator it) {
+        server_task_result_ptr res = std::move(it->res);
+        w->results.erase(it);
+        return res;
+    };
+
+    // the ordinary case: every id the caller named shares one waiter, so no comparison is needed
+    if (auto w = sole_waiter(id_tasks)) {
+        auto it = first_match(w.get());
+        return it == w->results.end() ? nullptr : claim(w.get(), it);
+    }
+
+    waiter *                            best_w = nullptr;
+    std::deque<pending>::iterator       best_it;
+    uint64_t                            best_seq = 0;
+    std::vector<const waiter *>         examined;
+
+    for (const auto & id_task : id_tasks) {
+        auto it = waiting.find(id_task);
+        if (it == waiting.end()) {
+            continue;
+        }
+
+        waiter * w = it->second.get();
+        if (std::find(examined.begin(), examined.end(), w) != examined.end()) {
+            continue; // ids commonly share a waiter, so do not scan the same queue twice
+        }
+        examined.push_back(w);
+
+        auto rit = first_match(w);
+        if (rit != w->results.end() && (best_w == nullptr || rit->seq < best_seq)) {
+            best_w   = w;
+            best_it  = rit;
+            best_seq = rit->seq;
+        }
+    }
+
+    return best_w == nullptr ? nullptr : claim(best_w, best_it);
 }
 
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
-    while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-        condition_results.wait(lock, [&]{
-            if (!running) {
-                RES_DBG("%s : queue result stop\n", "recv");
-                std::terminate(); // we cannot return here since the caller is HTTP code
-            }
-            return !queue_results.empty();
-        });
+    std::unique_lock<std::mutex> lock(mutex_results);
 
-        for (size_t i = 0; i < queue_results.size(); i++) {
-            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                server_task_result_ptr res = std::move(queue_results[i]);
-                queue_results.erase(queue_results.begin() + i);
-                return res;
-            }
+    while (true) {
+        if (!running) {
+            RES_DBG("%s : queue result stop\n", "recv");
+            std::terminate(); // we cannot return here since the caller is HTTP code
         }
+
+        server_task_result_ptr res = take_result(id_tasks);
+        if (res != nullptr) {
+            return res;
+        }
+
+        // The waiter can be absent, so this cannot assert. A cancel or a cleanup drops the ids
+        // between the caller posting them and arriving here, and recv() runs on the HTTP
+        // thread: aborting there turns one stuck request into a dead server for every other
+        // client. Before the per-waiter queues this waited on a condition that no longer fires
+        // for these ids, which blocks this one connection and nothing else, so that is what it
+        // does here too. The lookup is inside the loop rather than above it because a waiter
+        // re-added while we wait should be picked up instead of waited out.
+        // Only a waiter that covers every requested id has a condition that covers the whole
+        // receive. Anything else parks on the shared one, and send() notifies that for readers
+        // whose ids are at least partly registered, so a result cannot be missed.
+        auto w = sole_waiter(id_tasks);
+        if (w == nullptr) {
+            const bool deliverable = find_waiter(id_tasks) != nullptr;
+
+            // registration and terminate() both fire condition_gone; the timeout is only a backstop
+            if (deliverable) { n_split_readers++; }
+            condition_gone.wait_for(lock, std::chrono::seconds(1));
+            if (deliverable) { n_split_readers--; }
+            continue;
+        }
+
+        // bounded: a terminate() landing after the id left the map is still noticed here
+        w->cv.wait_for(lock, std::chrono::seconds(1));
     }
 
     // should never reach here
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+
+    // one deadline for the whole call: waiting for a registration and then for a result must not
+    // add up to twice the timeout the caller asked for
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+
     while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
-        for (int i = 0; i < (int) queue_results.size(); i++) {
-            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                server_task_result_ptr res = std::move(queue_results[i]);
-                queue_results.erase(queue_results.begin() + i);
-                return res;
-            }
-        }
-
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
         }
-        if (cr_res == std::cv_status::timeout) {
+
+        server_task_result_ptr res = take_result(id_tasks);
+        if (res != nullptr) {
+            return res;
+        }
+
+        // Park on the shared condition unless one waiter covers every requested id: the ids may
+        // be spread over several waiters, or some of them may not be registered yet, and either
+        // way no one waiter's condition covers the call. add_waiting_task_id(s) fires the shared
+        // one, so a result that arrives during this call is still seen, which is what the single
+        // shared condition used to give; terminate() fires it too; and send() fires it while a
+        // reader that could already be served is parked there.
+        auto w = sole_waiter(id_tasks);
+
+        const bool deliverable = w == nullptr && find_waiter(id_tasks) != nullptr;
+
+        std::condition_variable & cv = w == nullptr ? condition_gone : w->cv;
+
+        if (deliverable) { n_split_readers++; }
+        const std::cv_status st = cv.wait_until(lock, deadline);
+        if (deliverable) { n_split_readers--; }
+
+        if (st == std::cv_status::timeout) {
+            if (!running) {
+                RES_DBG("%s : queue result stop\n", __func__);
+                std::terminate(); // we cannot return here since the caller is HTTP code
+            }
             return nullptr;
         }
     }
@@ -481,31 +644,54 @@ void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
-        if (result->id == id_task) {
-            RES_DBG("task id = %d pushed to result queue\n", result->id);
 
-            queue_results.emplace_back(std::move(result));
-            condition_results.notify_all();
-            return;
-        }
+    auto it = waiting.find(result->id);
+    if (it == waiting.end()) {
+        return;
+    }
+
+    RES_DBG("task id = %d pushed to result queue\n", result->id);
+
+    auto & w = *it->second;
+
+    w.results.push_back(pending{next_seq++, std::move(result)});
+
+    // notify_all, not notify_one: results are filtered by id, so waking a single waiter can wake
+    // one taking a disjoint subset of this reader's ids, which finds nothing and sleeps again
+    // while the reader whose result this is stays asleep. This is one reader's own condition,
+    // not the single global one the shared vector used, so it is still O(1) in the common case
+    // of one thread per reader.
+    w.cv.notify_all();
+
+    // normally zero: only a reader whose ids span several waiters parks on the shared condition
+    if (n_split_readers > 0) {
+        condition_gone.notify_all();
     }
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {
     std::unique_lock<std::mutex> lock(mutex_results);
-    for (const auto & id_task : waiting_task_ids) {
+    for (const auto & [id_task, w] : waiting) {
         RES_DBG("task id = %d pushed to result queue\n", id_task);
         server_task_result_ptr res_copy(result->clone());
         res_copy->id = id_task; // override id with target task id
-        queue_results.emplace_back(std::move(res_copy));
+        w->results.push_back(pending{next_seq++, std::move(res_copy)});
+        w->cv.notify_all();
     }
-    condition_results.notify_all();
+
+    if (n_split_readers > 0) {
+        condition_gone.notify_all();
+    }
 }
 
 void server_response::terminate() {
+    std::unique_lock<std::mutex> lock(mutex_results);
     running = false;
-    condition_results.notify_all();
+    for (const auto & [id_task, w] : waiting) {
+        (void) id_task;
+        w->cv.notify_all();
+    }
+    condition_gone.notify_all();
 }
 
 //

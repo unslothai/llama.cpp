@@ -63,3 +63,23 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# server-queue unit test: needs no model, so it stays out of the default build
+
+if (LLAMA_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    set(TARGET test-server-queue)
+
+    add_executable(${TARGET} tests/test-server-queue.cpp)
+    target_link_libraries(${TARGET} PRIVATE server-context ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    add_test(NAME ${TARGET} COMMAND ${TARGET})
+
+    set(TARGET test-server-response)
+
+    add_executable(${TARGET} tests/test-server-response.cpp)
+    target_link_libraries(${TARGET} PRIVATE server-context ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    add_test(NAME ${TARGET} COMMAND ${TARGET})
+endif()
