@@ -1467,7 +1467,10 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 64;
+    // tensor split needs ~2*n_layers+1 graphs per device per shape, so the cap doubles whenever the
+    // LRU victim was used within the last second; the 10s sweep still drops stale entries
+    size_t max_cuda_graphs = 64;
+    static constexpr size_t max_cuda_graphs_limit = 2048;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1494,6 +1497,10 @@ struct ggml_backend_cuda_context {
                     if (c->second->last_used_time < lru->second->last_used_time) {
                         lru = c;
                     }
+                }
+                if (time_now - lru->second->last_used_time < 1'000'000 && max_cuda_graphs < max_cuda_graphs_limit) {
+                    max_cuda_graphs = std::min(2 * max_cuda_graphs, max_cuda_graphs_limit);
+                    continue;
                 }
                 cuda_graphs.erase(lru);
             }
