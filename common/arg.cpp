@@ -1710,6 +1710,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--preempt-ram"}, "N",
+        string_format("with a unified KV cache, park a slot in host RAM instead of failing every slot when the cache fills; "
+            "N is the maximum host RAM for parked sequences in MiB (default: %d, -1 - no limit, 0 - disable)", params.preempt_ram_mib),
+        [](common_params & params, int value) {
+            params.preempt_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

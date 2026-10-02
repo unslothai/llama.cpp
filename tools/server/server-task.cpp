@@ -1562,6 +1562,14 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "n_preempt_total",
+            "Preemption: Total slots parked to make room in the unified KV cache",
+            (double) metrics.n_preempt
+        }, {
+            "n_resume_total",
+            "Preemption: Total parked slots put back",
+            (double) metrics.n_resume
         },
     };
 
@@ -1586,6 +1594,14 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "requests_preempted",
+            "Preemption: Number of requests currently parked, waiting for room in the unified KV cache",
+            (double) n_preempted_slots
+        }, {
+            "preempt_ram_bytes",
+            "Preemption: Host RAM held by parked sequences",
+            (double) preempt_ram_bytes
         },
     };
 
