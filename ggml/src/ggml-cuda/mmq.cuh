@@ -216,6 +216,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-pascal.cuh"
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
+#include "mmq-config-dgx-spark.cuh"
 
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
@@ -241,6 +242,12 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
+    // Ahead of the Blackwell branch, and an exact match rather than a range: the swept tiles
+    // below are a GB10 measurement and every other sm_12x part has its own SM count and memory.
+    // highest_compiled_arch, like mmvq.cu, so the host picks the table the device was built with.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
+        return ggml_cuda_mmq_get_config_dgx_spark(type, J, fallback);
+    }
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
@@ -264,7 +271,11 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 #endif // CDNA
 #else
-#ifdef BLACKWELL_MMA_AVAILABLE
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    // Must mirror the host selector above, or the host would size shared memory for one config
+    // while the kernel compiled another.
+    return ggml_cuda_mmq_get_config_dgx_spark(type, J, fallback);
+#elif defined(BLACKWELL_MMA_AVAILABLE)
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
@@ -1375,6 +1386,8 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // set by ggml_cuda_mul_mat_q, not re-derived, so it matches the config src1 padding was sized for
+    bool fallback;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1551,7 +1564,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    if (args.nrows_x % 128 == 0) {
+    if (!args.fallback) {
         constexpr bool fallback = false;
         mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
     } else {

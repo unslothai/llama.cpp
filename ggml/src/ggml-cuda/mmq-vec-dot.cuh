@@ -1236,6 +1236,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+            // GB10 only, like the tile table this PR adds. Block-scaled MMA takes C as an
+            // accumulator input, so accumulating into the running sum removes a zeroed temporary
+            // per instruction, 805 FADD and all of the register spilling. It was swept on a DGX
+            // Spark and nowhere else, and PTX leaves mma's accumulation order unspecified, so it
+            // stays off every other Blackwell part for the same reason the tiles do.
+            static_assert(sizeof(tile_C) == tile_C::ne * sizeof(float), "tile_C must be a plain float array");
+            tile_C & C = *reinterpret_cast<tile_C *>(sum + (j0 / tile_C::J + n) * tile_C::ne);
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+            }
+#else
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
                 tile_C C = {};
@@ -1245,6 +1258,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                     sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];
                 }
             }
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
         }
     }
 }
