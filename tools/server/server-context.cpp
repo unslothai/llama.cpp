@@ -59,6 +59,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_PREEMPTED, // task, sampler and stream stay alive; sequence memory is on host
 };
 
 struct server_slot; // forward declaration
@@ -247,6 +248,30 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+
+    // These objects survive parking, including speculative replay and sampler state.
+    slot_state preempt_state = SLOT_STATE_IDLE;
+    std::vector<uint8_t> preempt_tgt;
+    std::vector<uint8_t> preempt_dft;
+    bool preempt_manual = false;
+    uint64_t n_preempt = 0;
+    uint64_t preempt_forced_at = 0;
+    int64_t preempt_since = 0;
+    int64_t preempt_paused_us = 0;
+
+    size_t preempt_bytes() const {
+        return preempt_tgt.size() + preempt_dft.size();
+    }
+
+    int64_t effective_priority() const {
+        return task ? (int64_t) task->params.priority + (int64_t) (n_preempt / 3) : 0;
+    }
+
+    void preempt_clear() {
+        std::vector<uint8_t>().swap(preempt_tgt);
+        std::vector<uint8_t>().swap(preempt_dft);
+        preempt_manual = false;
+    }
 
     server_prompt prompt;
 
@@ -503,6 +528,11 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
+            if (state == SLOT_STATE_PREEMPTED) {
+                // Cancellation must not leave a cache entry for nonresident tokens.
+                prompt_clear();
+            }
+            preempt_clear();
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
@@ -645,6 +675,12 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"priority",      task ? task->params.priority : (task_prev ? task_prev->params.priority : 0)},
+            {"effective_priority", effective_priority()},
+            {"is_preempted",  state == SLOT_STATE_PREEMPTED},
+            {"preempt_manual", preempt_manual},
+            {"n_preempt",     n_preempt},
+            {"preempt_ram_bytes", preempt_bytes()},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -863,6 +899,13 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+    uint64_t preempt_every = 0;
+    int preempt_drain_task = -1; // finish this task before automatic restoration
+
+    bool preempt_enabled() const {
+        return params_base.kv_unified && params_base.preempt_ram_mib > 0 && !mctx &&
+               llama_get_memory(ctx_tgt) != nullptr;
+    }
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1256,6 +1299,17 @@ private:
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
+        }
+
+        if (const char * value = getenv("LLAMA_SERVER_PREEMPT_EVERY")) {
+            const std::string text(value);
+            if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("LLAMA_SERVER_PREEMPT_EVERY must be a nonnegative integer");
+            }
+            preempt_every = std::stoull(text);
+        }
+        if (preempt_enabled() && params_base.sleep_idle_seconds > 0) {
+            throw std::invalid_argument("preemption requires --sleep-idle-seconds disabled (or --preempt-ram 0)");
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -1717,6 +1771,9 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        slot.n_preempt = 0;
+        slot.preempt_forced_at = 0;
+        slot.preempt_paused_us = 0;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -1841,7 +1898,7 @@ private:
             slot.has_new_line = true;
 
             // if we have seen a new line, we stop after a certain time limit, but only upon another new line
-            if (slot.task->params.t_max_predict_ms > 0 && slot.stats.t_gen_ms() > slot.task->params.t_max_predict_ms) {
+            if (slot.task->params.t_max_predict_ms > 0 && slot.stats.t_gen_ms() - slot.preempt_paused_us / 1000.0 > slot.task->params.t_max_predict_ms) {
                 slot.stop           = STOP_TYPE_LIMIT;
                 slot.has_next_token = false;
 
@@ -2397,6 +2454,11 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    metrics.preempt_ram_bytes = preempt_ram_used();
+                    metrics.n_preempted = 0;
+                    for (const auto & slot : slots) {
+                        metrics.n_preempted += slot.state == SLOT_STATE_PREEMPTED;
+                    }
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -2424,6 +2486,34 @@ private:
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
 
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_PARK:
+            case SERVER_TASK_TYPE_SLOT_UNPARK:
+                {
+                    server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                    if (!preempt_enabled()) {
+                        send_error(task, "Parking requires unified KV, text input and --preempt-ram > 0", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!slot || !slot->is_processing() || slot->task->is_parent() || slot->task->is_child()) {
+                        send_error(task, "Parking requires an active, independent slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.type == SERVER_TASK_TYPE_SLOT_PARK) {
+                        if (slot->state != SLOT_STATE_PREEMPTED && !preempt_park(*slot, true)) {
+                            send_error(task, "Unable to park slot within --preempt-ram", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        slot->preempt_manual = true;
+                    } else {
+                        // Acknowledge the request now; scheduling performs the restore.
+                        slot->preempt_manual = false;
+                    }
+                    auto res = std::make_unique<server_task_result_slots>();
+                    res->id = task.id;
+                    res->slots_data = slot->to_json(true);
+                    res->n_idle_slots = 0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
@@ -2674,6 +2764,257 @@ private:
     };
 #endif
 
+    size_t preempt_ram_used() const {
+        size_t bytes = 0;
+        for (const auto & slot : slots) {
+            bytes += slot.preempt_bytes();
+        }
+        return bytes;
+    }
+
+    // Token positions are a conservative upper bound for full-attention cells.
+    // In particular, hybrid seq_pos_min() only describes the recurrent rollback
+    // window and must NOT be used to count the attention KV cells.
+    int64_t preempt_resident() const {
+        int64_t cells = 0;
+        for (const auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PREEMPTED) {
+                cells += slot.prompt.tokens.pos_next();
+            }
+        }
+        return cells;
+    }
+
+    int64_t preempt_step(const server_slot & slot) const {
+        const auto state = slot.state == SLOT_STATE_PREEMPTED ? slot.preempt_state : slot.state;
+        if (state == SLOT_STATE_GENERATING) {
+            const int n_draft = slot.can_speculate() ? std::max(0, std::min(
+                    common_speculative_n_max(&params_base.speculative), slot.get_n_draft_max())) : 0;
+            return 1 + std::max<int64_t>(n_draft, slot.spec_draft.size());
+        }
+        return state == SLOT_STATE_STARTED || state == SLOT_STATE_PROCESSING_PROMPT ? 1 : 0;
+    }
+
+    int64_t preempt_demand() const {
+        int64_t cells = preempt_resident();
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
+                cells += preempt_step(slot);
+            }
+        }
+        return cells;
+    }
+
+    bool preempt_candidate(const server_slot & slot) const {
+        return slot.task && !slot.task->is_parent() && !slot.task->is_child() &&
+               (slot.state == SLOT_STATE_GENERATING || slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                slot.state == SLOT_STATE_STARTED);
+    }
+
+    bool preempt_park(server_slot & slot, bool manual) {
+        if (!preempt_candidate(slot)) {
+            return false;
+        }
+        const int64_t start = ggml_time_us();
+        const size_t tgt_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t dft_size = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t limit = (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+        const size_t used = preempt_ram_used();
+        if (used > limit || tgt_size > limit - used || dft_size > limit - used - tgt_size) {
+            return false;
+        }
+        try {
+            std::vector<uint8_t> tgt(tgt_size), dft(dft_size);
+            if (llama_state_seq_get_data_ext(ctx_tgt, tgt.data(), tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != tgt.size() ||
+                    (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, dft.data(), dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != dft.size())) {
+                return false;
+            }
+            // No sampler reset, task release, token replay, or stream termination.
+            // Per-sequence MTP hidden rows and draft samplers remain in `spec`.
+            slot.preempt_tgt = std::move(tgt);
+            slot.preempt_dft = std::move(dft);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+        slot.mem.seq_rm(slot.id, -1, -1);
+        slot.preempt_state = slot.state;
+        slot.state = SLOT_STATE_PREEMPTED;
+        slot.preempt_manual = manual;
+        slot.preempt_since = ggml_time_us();
+        ++slot.n_preempt;
+        ++metrics.n_preempt;
+        metrics.preempt_copy_us += ggml_time_us() - start;
+        SLT_INF(slot, "parked: priority=%d, n_preempt=%" PRIu64 ", tokens=%d, ram=%zu, manual=%d\n",
+                slot.task->params.priority, slot.n_preempt, slot.prompt.n_tokens(), slot.preempt_bytes(), manual);
+        return true;
+    }
+
+    bool preempt_restore(server_slot & slot) {
+        const int64_t start = ggml_time_us();
+        const bool tgt_ok = llama_state_seq_set_data_ext(ctx_tgt, slot.preempt_tgt.data(), slot.preempt_tgt.size(),
+                slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == slot.preempt_tgt.size();
+        const bool dft_ok = tgt_ok && (!ctx_dft || llama_state_seq_set_data_ext(ctx_dft, slot.preempt_dft.data(),
+                slot.preempt_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == slot.preempt_dft.size());
+        if (!dft_ok) {
+            // set_data may have partially populated either context. Keep the host
+            // snapshot intact and remove the partial restore before retrying.
+            slot.mem.seq_rm(slot.id, -1, -1);
+            return false;
+        }
+        if (slot.preempt_state == SLOT_STATE_GENERATING) {
+            slot.preempt_paused_us += ggml_time_us() - slot.preempt_since;
+        }
+        slot.state = slot.preempt_state;
+        slot.preempt_clear();
+        ++metrics.n_restore;
+        metrics.preempt_copy_us += ggml_time_us() - start;
+        SLT_INF(slot, "restored: n_preempt=%" PRIu64 ", tokens=%d\n", slot.n_preempt, slot.prompt.n_tokens());
+        return true;
+    }
+
+    bool preempt_schedule() {
+        // Common path: one O(P) scan, no snapshots, sorting or allocations.
+        if (preempt_every == 0 && preempt_drain_task == -1) {
+            int64_t demand = 0;
+            bool parked = false;
+            bool runnable = false;
+            for (const auto & slot : slots) {
+                parked |= slot.state == SLOT_STATE_PREEMPTED;
+                if (slot.state != SLOT_STATE_PREEMPTED) {
+                    demand += slot.prompt.tokens.pos_next();
+                    if (slot.is_processing()) {
+                        runnable = true;
+                        demand += preempt_step(slot);
+                    }
+                }
+            }
+            if (!parked && demand <= n_ctx) {
+                return runnable;
+            }
+        }
+        bool draining = false;
+        for (const auto & slot : slots) {
+            draining |= slot.task && slot.task->id == preempt_drain_task && slot.state != SLOT_STATE_PREEMPTED;
+        }
+        if (!draining) {
+            preempt_drain_task = -1;
+            std::vector<server_slot *> waiting;
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PREEMPTED && !slot.preempt_manual) {
+                    waiting.push_back(&slot);
+                }
+            }
+            if (!waiting.empty()) {
+                // A completed survivor can leave interleaved cells throughout the
+                // pool. Clear idle caches before restoring, even if the cell count
+                // already fits, to avoid thousands of small scatter transfers.
+                while (try_clear_idle_slots()) {}
+            }
+            std::sort(waiting.begin(), waiting.end(), [](const server_slot * a, const server_slot * b) {
+                if (a->effective_priority() != b->effective_priority()) {
+                    return a->effective_priority() > b->effective_priority();
+                }
+                if (a->n_preempt != b->n_preempt) {
+                    return a->n_preempt > b->n_preempt;
+                }
+                return a->preempt_since < b->preempt_since;
+            });
+            for (auto * slot : waiting) {
+                const int64_t needed = slot->prompt.tokens.pos_next() + preempt_step(*slot);
+                while (preempt_demand() + needed > n_ctx && try_clear_idle_slots()) {}
+                if (preempt_demand() + needed <= n_ctx) {
+                    preempt_restore(*slot); // fit-first: skip a larger snapshot that does not fit
+                }
+            }
+        }
+
+        // Test-only round trips happen at the same safe boundary as real parks.
+        // The interval is crossed rather than tested for equality: MTP accepts
+        // several tokens in one step. Record before parking to avoid retriggering.
+        if (preempt_every > 0) {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && preempt_candidate(slot) &&
+                        slot.stats.n_gen / preempt_every > slot.preempt_forced_at) {
+                    slot.preempt_forced_at = slot.stats.n_gen / preempt_every;
+                    if (preempt_park(slot, false)) {
+                        preempt_restore(slot);
+                    }
+                }
+            }
+        }
+
+        while (preempt_demand() > n_ctx && try_clear_idle_slots()) {}
+        if (preempt_demand() > n_ctx || draining) {
+            std::vector<server_slot *> active;
+            for (auto & slot : slots) {
+                if (preempt_candidate(slot)) {
+                    active.push_back(&slot);
+                }
+            }
+            // Candidates are the lowest-priority tier. Protect the longest
+            // sequence within that tier unless it is the only candidate; a
+            // lower-priority long request must not displace an important one.
+            // Newest task wins ties among otherwise eligible victims.
+            std::sort(active.begin(), active.end(), [](const server_slot * a, const server_slot * b) {
+                if (a->effective_priority() != b->effective_priority()) {
+                    return a->effective_priority() < b->effective_priority();
+                }
+                return a->task->id > b->task->id;
+            });
+            size_t remaining = active.size();
+            std::vector<server_slot *> candidates = active;
+            while (remaining > 1 && !candidates.empty()) {
+                server_slot * longest = nullptr;
+                for (auto * slot : active) {
+                    if (slot->state != SLOT_STATE_PREEMPTED &&
+                            (!longest || slot->prompt.n_tokens() > longest->prompt.n_tokens() ||
+                             (slot->prompt.n_tokens() == longest->prompt.n_tokens() &&
+                              slot->effective_priority() > longest->effective_priority()))) {
+                        longest = slot;
+                    }
+                }
+                auto it = candidates.begin();
+                if ((*it)->task->id == preempt_drain_task) {
+                    candidates.erase(it);
+                    continue;
+                }
+                if (*it == longest && !draining) {
+                    auto alternative = std::find_if(it + 1, candidates.end(), [&](const server_slot * other) {
+                        return other->effective_priority() == longest->effective_priority() &&
+                               other->task->id != preempt_drain_task;
+                    });
+                    if (alternative != candidates.end()) {
+                        it = alternative;
+                    }
+                }
+                auto * victim = *it;
+                candidates.erase(it);
+                if (preempt_park(*victim, false)) {
+                    --remaining;
+                }
+            }
+            if (remaining == 1) {
+                for (auto * slot : active) {
+                    if (slot->state != SLOT_STATE_PREEMPTED) {
+                        preempt_drain_task = slot->task->id;
+                    }
+                }
+            }
+            if (preempt_demand() > n_ctx) {
+                // RAM exhaustion or an unparkable shared-prompt group: preserve
+                // live tasks. A cancellation/control request can release room.
+                ++metrics.n_preempt_blocked;
+                return false;
+            }
+        }
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2687,6 +3028,13 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        if (preempt_enabled() && !preempt_schedule()) {
+            // No runnable slots (e.g. all explicitly parked). The task queue sleeps
+            // until a control request or cancellation arrives; do not busy-loop.
+            metrics_flush_idle();
+            return;
+        }
 
         // check if all slots are idle
         {
@@ -3000,7 +3348,7 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing()) {
+                if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
                     return;
                 }
 
@@ -3404,8 +3752,14 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    int32_t prompt_batch_limit = n_batch;
+                    if (preempt_enabled()) {
+                        prompt_batch_limit = std::min<int64_t>(n_batch,
+                                batch.size() + std::max<int64_t>(0, n_ctx - preempt_resident()));
+                    }
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < prompt_batch_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4642,11 +4996,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
         std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
@@ -4659,6 +5008,30 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "park" || action == "unpark") {
+            if (!params.endpoint_slots) {
+                res->error(format_error_response("Slot control requires --slots", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            server_task task(action == "park" ? SERVER_TASK_TYPE_SLOT_PARK : SERVER_TASK_TYPE_SLOT_UNPARK);
+            task.id = res->rd.get_new_id();
+            task.slot_action.id_slot = id_slot;
+            res->rd.post_task(std::move(task), true);
+            auto result = res->rd.next(req.should_stop);
+            if (!result) {
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+            } else {
+                res->ok(result->to_json());
+            }
+            return res;
+        }
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }

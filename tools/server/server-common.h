@@ -464,6 +464,13 @@ struct server_metrics {
 
     uint64_t n_tokens_max = 0;
 
+    uint64_t n_preempt = 0;
+    uint64_t n_restore = 0;
+    uint64_t n_preempt_blocked = 0;
+    uint64_t preempt_copy_us = 0;
+    uint64_t preempt_ram_bytes = 0;
+    uint64_t n_preempted = 0;
+
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
