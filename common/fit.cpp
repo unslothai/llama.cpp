@@ -1,5 +1,6 @@
 #include "fit.h"
 
+#include "llama-cpp.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
@@ -34,7 +35,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        const char * path_lend = nullptr,
+        const llama_model_params * mparams_lend = nullptr,
+        const llama_context_params * cparams_lend = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -62,7 +66,27 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    // a draft head can ship without token_embd/output and borrow them from the model it drafts for,
+    // so it only takes a context when lent one to borrow from
+    llama_model_ptr      model_lend;
+    llama_context_ptr    ctx_lend;
+    llama_context_params cparams_copy = *cparams;
+
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
+    if (ctx == nullptr && path_lend != nullptr) {
+        llama_model_params mparams_lend_copy = *mparams_lend;
+        mparams_lend_copy.no_alloc  = true;
+        mparams_lend_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+        model_lend.reset(llama_model_load_from_file(path_lend, mparams_lend_copy));
+        if (model_lend) {
+            ctx_lend.reset(llama_init_from_model(model_lend.get(), *cparams_lend));
+        }
+        if (ctx_lend) {
+            cparams_copy.ctx_other = ctx_lend.get();
+            ctx = llama_init_from_model(model, cparams_copy);
+        }
+    }
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -220,7 +244,8 @@ static void common_params_fit_impl(
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                    path_model, mparams, cparams);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
