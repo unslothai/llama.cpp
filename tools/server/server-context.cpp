@@ -2644,6 +2644,114 @@ private:
         }
     }
 
+    // Terminate ONE slot to make room, rather than every conversation on the server.
+    //
+    // This is the TODO sitting above the context-exceeded handler: "try to terminate only
+    // the largest active slot/sequence and continue with the rest / need to remove the
+    // tokens from the current batch too". The second sentence is the hard part, and it is
+    // tractable here only because `off` splits the batch cleanly: everything at index
+    // `>= off` has not been decoded yet, by construction of the loop in update_slots.
+    //
+    // Safe to leave the survivors running because a `ret == 1` decode committed nothing.
+    // That return comes from LLAMA_MEMORY_STATUS_FAILED_PREPARE in llama_context::decode,
+    // before output_reserve, before the sampling transaction opens and before any compute,
+    // so no cells were assigned and no survivor's KV was touched by the failed call.
+    //
+    // Returns false when there is nobody to spare, and then the caller's original
+    // behaviour -- error everyone, which is now just the one slot -- is the correct one.
+    bool terminate_one_slot(int32_t off, const std::string & reason) {
+        server_slot * victim = nullptr;
+        int n_processing = 0;
+        iterate(slots, [&](server_slot & slot) {
+            if (!slot.is_processing()) {
+                return;
+            }
+            n_processing++;
+            // Largest sequence, as the TODO says: on a crash path the figure that matters
+            // is cells freed per conversation lost. (Scheduling preemption elsewhere is
+            // better served by newest-first; this is not that, and the two should not be
+            // made to agree for the sake of it.)
+            if (victim == nullptr || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                victim = &slot;
+            }
+        });
+
+        if (victim == nullptr || n_processing <= 1) {
+            return false;
+        }
+
+        const int32_t victim_id = victim->id;
+
+        SRV_WRN("terminating slot %d (%d tokens) to free space, %d other slot(s) continue\n",
+                victim_id, (int) victim->prompt.n_tokens(), n_processing - 1);
+
+        send_error(*victim, reason);
+        victim->release();
+        // seq_rm inside frees this sequence's cells, which is the entire point of the
+        // exercise; the tokens it already decoded below `off` go with them.
+        victim->prompt_clear();
+        victim->i_batch = -1;
+        victim->spec_i_batch.clear();
+
+        // Drop the victim's UNDECODED entries and remember where every survivor moved to.
+        std::vector<int32_t> remap(batch.tokens.size(), -1);
+        std::vector<server_batch::token> kept;
+        kept.reserve(batch.tokens.size());
+        // In embd mode `embd` is a flat n_embd-per-token array running parallel to
+        // `tokens`, and render() hands embd.data() straight to the batch. Compacting one
+        // without the other misaligns every embedding after the first removal, silently.
+        std::vector<float> kept_embd;
+        if (batch.has_embd) {
+            kept_embd.reserve(batch.embd.size());
+        }
+        for (int32_t i = 0; i < (int32_t) batch.tokens.size(); i++) {
+            if (i >= off && batch.tokens[i].id_slot == victim_id) {
+                continue;
+            }
+            remap[i] = (int32_t) kept.size();
+            kept.push_back(batch.tokens[i]);
+            if (batch.has_embd) {
+                const size_t stride = (size_t) batch.n_embd;
+                const size_t begin  = (size_t) i * stride;
+                if (begin + stride <= batch.embd.size()) {
+                    kept_embd.insert(kept_embd.end(),
+                                     batch.embd.begin() + begin,
+                                     batch.embd.begin() + begin + stride);
+                }
+            }
+        }
+        batch.tokens = std::move(kept);
+        if (batch.has_embd) {
+            batch.embd = std::move(kept_embd);
+        }
+        batch.batch_rendered = false;
+        batch.render();
+
+        // render() rebuilds the batch wholesale from `tokens`, so every surviving entry
+        // after a removed one shifts DOWN. `i_batch` and `spec_i_batch` are absolute
+        // indices into that batch and must move with it. Skipping this does not throw:
+        // post_decode goes on to sample from whatever logits now sit at the stale index,
+        // silently, which is a worse outcome than the crash being fixed here.
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.i_batch >= 0 && slot.i_batch < (int32_t) remap.size()) {
+                slot.i_batch = remap[slot.i_batch];
+            }
+            for (auto & i : slot.spec_i_batch) {
+                if (i >= 0 && i < (int32_t) remap.size()) {
+                    i = remap[i];
+                }
+            }
+        });
+
+        // `batch.slot_batched` may be the victim, and is intentionally left alone. It is
+        // not dereferenced inside the decode loop -- the lora and embedding settings it
+        // supplies were applied once before the loop -- and `slots` is a fixed vector, so
+        // release() does not destroy the object and the pointer does not dangle. Every
+        // survivor passed can_batch_with() against it, so those settings remain correct
+        // for the tokens that are left.
+        return true;
+    }
+
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
@@ -3592,6 +3700,18 @@ private:
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                    // Out of KV space, which is a capacity problem with one sequence too
+                    // many in it, not a fault in every conversation on the server. Free
+                    // the largest and carry on with the rest. Only for ret == 1: an
+                    // invalid batch or a compute error says nothing about capacity, and
+                    // dropping a slot would not address either.
+                    if (ret == 1 && n_batch == 1 && terminate_one_slot(off, err)) {
+                        // A whole sequence just went, so the halving that got us down to
+                        // 1 no longer describes what will fit.
+                        n_batch = llama_n_batch(ctx_tgt);
+                        return false; // retry, with the batch minus that slot
+                    }
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
