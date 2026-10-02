@@ -3511,6 +3511,53 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // Packed, no newlines (MiMo-V2.6-Distill-Qwen-9B)
+        tst.test("<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Half-packed
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1</parameter></function></tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Literal </parameter> inside a string value
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "print(\"</parameter>\")\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", R"j({"code": "print(\"</parameter>\")"})j", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Packed parallel calls
+        tst.test(
+               "<tool_call><function=special_function><parameter=arg1>1</parameter></function></tool_call>"
+               "<tool_call><function=special_function_with_opt><parameter=arg1>1</parameter>"
+               "<parameter=arg2>2</parameter></function></tool_call>")
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
         // Some models skip the opening <tool_call> and go straight to <function=>
         tst.test(
                "<function=special_function>\n"
