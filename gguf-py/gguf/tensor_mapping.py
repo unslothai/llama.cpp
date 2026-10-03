@@ -48,6 +48,7 @@ class TensorNameMap:
         # Token type embeddings
         MODEL_TENSOR.TOKEN_TYPES: (
             "embeddings.token_type_embeddings",  # bert nomic-bert
+            "type_emb",  # laya
         ),
 
         # Normalization of token embeddings
@@ -216,6 +217,7 @@ class TensorNameMap:
             "layers.{bid}.input_layernorm",                         # qwen3-embedding
             "model.layers.{bid}.attention_layernorm",               # apertus
             "model.layers.{bid}.pre_attention_layernorm",           # kormo
+            "head.layers.{bid}.norm1",  # laya
         ),
 
         # Attention norm 2
@@ -250,6 +252,7 @@ class TensorNameMap:
             "layers.{bid}.attn.Wqkv",                                              # modern-bert
             "model.layers.{bid}.self_attn.language_expert_query_key_value",        # cogvlm
             "model.layers.{bid}.linear_attn.in_proj_qkv",                          # qwen3.5
+            "head.layers.{bid}.self_attn.in_proj",  # laya
         ),
 
         # Attention query
@@ -355,6 +358,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.o_proj",                           # nemotron-h
             "model.layers.{bid}.self_attn.language_expert_dense",           # cogvlm
             "model.blocks.{bid}.attn.attn_resid",                           # talkie
+            "head.layers.{bid}.self_attn.out_proj",  # laya
         ),
 
         # Attention output norm
@@ -385,6 +389,7 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_SINKS: (
             "model.layers.{bid}.self_attn.sinks", # openai-moe
             "model.layers.{bid}.self_attn.attention_sink_bias", # mimov2
+            "model.layers.{bid}.self_attn.learnable_sink_param", # hy-v4
         ),
 
         MODEL_TENSOR.ATTN_GATE: (
@@ -392,6 +397,7 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.in_proj_z",  # qwen3.5
             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
             "model.layers.{bid}.self_attn.output_gate",  # minimax-01
+            "model.layers.{bid}.self_attn.linear_gate",  # hy-v4
         ),
 
         # Feed-forward norm
@@ -418,7 +424,8 @@ class TensorNameMap:
             "layers.{bid}.post_attention_layernorm",                         # qwen3-embedding
             "model.layers.{bid}.feedforward_layernorm",                      # apertus
             "model.layers.{bid}.pre_mlp_layernorm",                          # kormo
-            "layers.{bid}.mlp_norm"                                          # modern-bert
+            "layers.{bid}.mlp_norm",                                         # modern-bert
+            "head.layers.{bid}.norm2",  # laya
         ),
 
         # Pre feed-forward norm
@@ -531,6 +538,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.up_proj",                    # nemotron-h
             "model.layers.{bid}.mlp.language_mlp.up_proj",            # cogvlm
             "model.blocks.{bid}.mlp.mlp_linear",                      # talkie
+            "head.layers.{bid}.linear1",  # laya
         ),
 
         MODEL_TENSOR.FFN_UP_EXP: (
@@ -661,6 +669,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.down_proj",                  # nemotron-h
             "model.layers.{bid}.mlp.language_mlp.down_proj",          # cogvlm
             "model.blocks.{bid}.mlp.mlp_resid",                       # talkie
+            "head.layers.{bid}.linear2",  # laya
         ),
 
         MODEL_TENSOR.FFN_DOWN_EXP: (
@@ -1317,6 +1326,14 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.indexer.wq_b", # DSA
         ),
 
+        MODEL_TENSOR.INDEXER_KPOOL_GATE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_gate", # glm5-next
+        ),
+
+        MODEL_TENSOR.INDEXER_KPOOL_APE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_ape", # glm5-next
+        ),
+
         MODEL_TENSOR.INDEXER_Q_PROJ: (
             "model.layers.{bid}.self_attn.index_q_proj", # MSA
         ),
@@ -1327,6 +1344,48 @@ class TensorNameMap:
 
         MODEL_TENSOR.INDEXER_Q_NORM: (
             "model.layers.{bid}.self_attn.index_q_norm", # MSA
+        ),
+
+        MODEL_TENSOR.HC_ATTN_FN: (
+            "model.layers.{bid}.hc_attn_layer.hc_pre.hc_fn", # hy-v4
+            "model.layers.{bid}.hc_attn_fn",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_ATTN_BASE: (
+            "model.layers.{bid}.hc_attn_layer.hc_pre.hc_base", # hy-v4
+            "model.layers.{bid}.hc_attn_base",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_ATTN_SCALE: (
+            "model.layers.{bid}.hc_attn_layer.hc_pre.hc_scale", # hy-v4
+            "model.layers.{bid}.hc_attn_scale",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_FFN_FN: (
+            "model.layers.{bid}.hc_mlp_layer.hc_pre.hc_fn", # hy-v4
+            "model.layers.{bid}.hc_ffn_fn",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_FFN_BASE: (
+            "model.layers.{bid}.hc_mlp_layer.hc_pre.hc_base", # hy-v4
+            "model.layers.{bid}.hc_ffn_base",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_FFN_SCALE: (
+            "model.layers.{bid}.hc_mlp_layer.hc_pre.hc_scale", # hy-v4
+            "model.layers.{bid}.hc_ffn_scale",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_HEAD_FN: (
+            "model.hc_head.hc_head_fn",  # hy-v4
+        ),
+
+        MODEL_TENSOR.HC_HEAD_BASE: (
+            "model.hc_head.hc_head_base", # hy-v4
+        ),
+
+        MODEL_TENSOR.HC_HEAD_SCALE: (
+            "model.hc_head.hc_head_scale", # hy-v4
         ),
 
         ############################################################################
@@ -1389,14 +1448,17 @@ class TensorNameMap:
             "pre_classifier",   # distillbert
             "dense",            # neobert
             "head.dense",       # modern-bert
+            "scorer.1",  # laya
         ),
 
         MODEL_TENSOR.CLS_OUT: (
             "classifier.out_proj", # roberta
+            "scorer.3",  # laya
         ),
 
         MODEL_TENSOR.CLS_NORM: (
             "head.norm", # modern-bert
+            "scorer.0",  # laya
         ),
         #############################################################################
 
@@ -2764,6 +2826,16 @@ class TensorNameMap:
             ),
             MODEL_TENSOR.HC_HEAD_UP: (
                 "model.hyper_connection_mixer.input_mix_weight_up",
+            ),
+            # the MTP block's own mixer, renamed to its layer by the converter
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
+                "model.layers.{bid}.nextn_hc_head.hc_norm",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
+                "model.layers.{bid}.nextn_hc_head.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
+                "model.layers.{bid}.nextn_hc_head.input_mix_weight_up",
             ),
             MODEL_TENSOR.INDEXER_Q_NORM: (
                 "model.layers.{bid}.self_attn.indexer.q_layernorm",
