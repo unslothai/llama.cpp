@@ -295,12 +295,21 @@ class _QwenMtpMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.block_count = self.hparams["num_hidden_layers"]
+        hparams = {**self.hparams, **self.hparams.get("text_config", {})}
+        self.block_count = hparams["num_hidden_layers"]
         if not self.no_mtp:
-            n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+            n_mtp = hparams.get("mtp_num_hidden_layers", 0)
             # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
+            # Qwen3.5/3.6 nests it under text_config — handled by the merge above.
             if n_mtp == 0:
-                assert self.opt_num_mtp_layers != 0
+                # opt_num_mtp_layers is recovered from tensor names in
+                # filter_tensors, which runs later during index_tensors.
+                if self.opt_num_mtp_layers == 0:
+                    raise ValueError(
+                        "MTP layer count not found in config (checked top level and "
+                        "text_config) and not yet recovered from tensor names. "
+                        "Re-export with --no-mtp, or add mtp_num_hidden_layers to config."
+                    )
                 n_mtp = self.opt_num_mtp_layers
             self.block_count += n_mtp
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
