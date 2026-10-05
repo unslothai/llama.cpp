@@ -603,6 +603,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     // mtmd embd rows arrive pre-normalized; embed_norm applies to text token lookups only
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
         cur = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
         cb(cur, "inkling_embd_norm", -1);

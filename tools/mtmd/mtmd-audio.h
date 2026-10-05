@@ -54,6 +54,7 @@ struct mtmd_audio_preprocessor {
     const clip_hparams & hparams;
 
     mtmd_audio_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)) {}
+    mtmd_audio_preprocessor(const clip_hparams & hparams): hparams(hparams) {}
 
     virtual ~mtmd_audio_preprocessor() = default;
     virtual void initialize() = 0; // NOT thread-safe
@@ -81,6 +82,7 @@ private:
 
 struct mtmd_audio_preprocessor_conformer : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_conformer(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
+    mtmd_audio_preprocessor_conformer(const clip_hparams & hparams) : mtmd_audio_preprocessor(hparams) {}
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) const override;
 
