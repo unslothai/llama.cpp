@@ -818,9 +818,6 @@ class EmbeddingGemma2Model(Gemma4Model):
         super().__init__(*args, **kwargs)
         self.hparams["num_kv_shared_layers"] = 0
 
-    def set_vocab(self):
-        Gemma3Model.set_vocab(self)
-
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         # HF sliding_window is bidirectional, llama.cpp expects the full window size
@@ -953,6 +950,14 @@ class Gemma4VisionAudioModel(MmprojModel):
                 data_torch = data_torch.permute(0, 3, 1, 2).contiguous()
             mapped_name = self.map_tensor_name(name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min"))
             yield (mapped_name, data_torch)
+
+
+@ModelBase.register("EmbeddingGemma2Model")
+# TODO: add example model
+class EmbeddingGemma2VisionAudioModel(Gemma4VisionAudioModel):
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # same towers as Gemma4, but the tensor names have no "model." prefix
+        yield from super().modify_tensors(data_torch, "model." + name, bid)
 
 
 @ModelBase.register("Gemma4UnifiedForConditionalGeneration")
