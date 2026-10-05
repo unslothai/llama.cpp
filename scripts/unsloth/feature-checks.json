@@ -52,9 +52,9 @@
       ]
     },
     "glm5next": {
-      "owner": "ggml-org#27754",
+      "owner": "unslothai#239",
       "checks": [
-        { "kind": "arch",       "arch": "glm5next" },
+        { "kind": "arch",       "arch": "glm5-next" },
         { "kind": "backend-op", "op": "LIGHTNING_INDEXER" }
       ]
     },
@@ -80,7 +80,7 @@
       ]
     },
     "qwen4exp-mtp": {
-      "owner": "unslothai#144",
+      "owner": "unslothai#240",
       "checks": [
         { "kind": "arch",       "arch": "qwen4exp" },
         { "kind": "backend-op", "op": "TOPK_QSA" }
@@ -95,10 +95,10 @@
   },
   "unchecked": {
     "unslothai#95": "sampling penalties indexed by token id; behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
-    "unslothai#137": "batched readahead for lazily read gather tables; a throughput change with no observable output difference",
     "unslothai#149": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 env parsing; needs a CUDA or HIP host, and no runner in the pipeline has one",
     "unslothai#152": "per-run mmap of a context's tensors; a memory-layout change with no observable output difference",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
-    "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host"
+    "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
+    "unslothai#241": "CUDA graph cache key, macOS row prefetch, F16 glm5-next indexer cache under a quantized -ctk and the glm5-next NextN draft graph; the first needs a CUDA host, the second has no observable output difference, the last two need a real GLM-5-Next NextN head with --spec-type draft-mtp"
   }
 }
