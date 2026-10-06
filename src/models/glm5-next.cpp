@@ -277,6 +277,12 @@ public:
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
 
+    // Views of the inputs above, built once per graph: the scheduler copies every view of a host input to
+    // the device on its own, so a per-layer reshape of the [n_kv, n_tokens] mask costs a copy per layer.
+    ggml_tensor * kq_mask_2d = nullptr;
+    ggml_tensor * gather_live = nullptr;
+    std::vector<ggml_tensor *> new_pool_idxs_chunks;
+
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
     uint32_t n_new = 0;
@@ -787,21 +793,38 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_kv = mctx_lid->get_n_kv();
 
     // Pool the entries completed by this ubatch. The last one is a dummy when the ubatch completes none.
-    ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
-    rows = ggml_reshape_3d(ctx0, rows, 2*n_embd_indexer, kpool, n_new);
+    // Chunked: re-pooling every pool (the full-context reserve, or a shared cache) would otherwise hold
+    // several f32 [head_dim, kpool] copies per pool at once, GiBs at long contexts.
+    const int64_t n_new_chunk = 16384;
+    ggml_tensor * pooled_new = nullptr;
+    if (inp_kpool->new_pool_idxs_chunks.empty()) {
+        for (int64_t i0 = 0; i0 < n_new; i0 += n_new_chunk) {
+            const int64_t nc = std::min(n_new_chunk, n_new - i0);
+            inp_kpool->new_pool_idxs_chunks.push_back(ggml_view_1d(ctx0, inp_kpool->new_pool_idxs, kpool*nc,
+                    i0*inp_kpool->new_pool_idxs->nb[1]));
+        }
+    }
+    for (int64_t i0 = 0, ic = 0; i0 < n_new; i0 += n_new_chunk, ++ic) {
+        const int64_t nc = std::min(n_new_chunk, n_new - i0);
 
-    ggml_tensor * pk = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, n_new, rows->nb[1], rows->nb[2], 0);
-    ggml_tensor * pg = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, n_new, rows->nb[1], rows->nb[2], ggml_row_size(rows->type, n_embd_indexer));
+        ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_idxs_chunks[ic]);
+        rows = ggml_reshape_3d(ctx0, rows, 2*n_embd_indexer, kpool, nc);
 
-    ggml_tensor * logits = ggml_add(ctx0, pg, layer.indexer_kpool_ape);
-    logits = ggml_cont(ctx0, ggml_permute(ctx0, logits, 1, 0, 2, 3)); // [kpool, head_dim, n_new]
-    // fold the pool axis into rows, soft_max maps ne[2] to CUDA gridDim.y which caps at 65535
-    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, logits, kpool, n_embd_indexer*n_new));
-    probs = ggml_reshape_3d(ctx0, probs, kpool, n_embd_indexer, n_new);
+        ggml_tensor * pk = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, nc, rows->nb[1], rows->nb[2], 0);
+        ggml_tensor * pg = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, nc, rows->nb[1], rows->nb[2], ggml_row_size(rows->type, n_embd_indexer));
 
-    pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
-    ggml_tensor * pooled_new = ggml_sum_rows(ctx0, ggml_mul(ctx0, probs, pk)); // [1, head_dim, n_new]
-    pooled_new = ggml_reshape_2d(ctx0, pooled_new, n_embd_indexer, n_new);
+        ggml_tensor * logits = ggml_add(ctx0, pg, layer.indexer_kpool_ape);
+        logits = ggml_cont(ctx0, ggml_permute(ctx0, logits, 1, 0, 2, 3)); // [kpool, head_dim, nc]
+        // fold the pool axis into rows, soft_max maps ne[2] to CUDA gridDim.y which caps at 65535
+        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, logits, kpool, n_embd_indexer*nc));
+        probs = ggml_reshape_3d(ctx0, probs, kpool, n_embd_indexer, nc);
+
+        pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
+        ggml_tensor * chunk = ggml_sum_rows(ctx0, ggml_mul(ctx0, probs, pk)); // [1, head_dim, nc]
+        chunk = ggml_reshape_2d(ctx0, chunk, n_embd_indexer, nc);
+
+        pooled_new = pooled_new ? ggml_concat(ctx0, pooled_new, chunk, 1) : chunk;
+    }
     cb(pooled_new, "indexer_pool_k_new", il);
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
@@ -874,7 +897,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     // Live slots (visible pools, real tail cells) address disjoint cells. Each dead slot writes its own dump row
     // n_kv + slot, so the scatter indices of a token are unique: idx = dump + live*(idx - dump), live = exp(mask).
     GGML_ASSERT(inp_kpool->sel_mask->ne[0] == n_sel && inp_kpool->sel_mask->ne[3] == n_tokens);
-    ggml_tensor * live  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
+    if (!inp_kpool->gather_live) {
+        inp_kpool->gather_live = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
+    }
+    ggml_tensor * live  = inp_kpool->gather_live;
     ggml_tensor * dump  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
@@ -885,7 +911,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
     // Fold causal visibility before shared-indexer reuse.
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
-    sel = ggml_add(ctx0, sel, ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens));
+    if (!inp_kpool->kq_mask_2d || inp_kpool->kq_mask_2d->src[0] != kq_mask) {
+        inp_kpool->kq_mask_2d = ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens);
+    }
+    sel = ggml_add(ctx0, sel, inp_kpool->kq_mask_2d);
     cb(sel, "indexer_sel", il);
 
     return sel;
