@@ -499,6 +499,27 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
+// src is only asked when its implementation differs: same-type backends share one implementation that already declined.
+static bool ggml_backend_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (backend_dst != NULL && backend_dst->iface.cpy_tensor_async != NULL) {
+        if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
+            return true;
+        }
+    }
+
+    // backend_dst must be a real backend before anything is delegated to the source. An
+    // implementation of the source role has to inspect the destination to decide whether it can
+    // help, so handing it a null destination pushes that dereference into every implementer.
+    // Guarding here keeps the invariant in one place instead of depending on all of them.
+    if (backend_src != NULL && backend_dst != NULL && backend_src->iface.cpy_tensor_from_async != NULL) {
+        if (backend_src->iface.cpy_tensor_from_async(backend_src, backend_dst, src, dst)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -507,10 +528,8 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     }
 
     GGML_ASSERT(backend_dst);
-    if (backend_dst->iface.cpy_tensor_async != NULL) {
-        if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
-            return;
-        }
+    if (ggml_backend_cpy_tensor_async_impl(backend_src, backend_dst, src, dst)) {
+        return;
     }
 
     // an async copy would normally happen after all the queued operations on both backends are completed
@@ -1728,7 +1747,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (!ggml_backend_cpy_tensor_async_impl(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);

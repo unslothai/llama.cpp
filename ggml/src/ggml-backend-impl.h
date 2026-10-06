@@ -8,7 +8,10 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    // 3: ggml_backend_i gained cpy_tensor_from_async. A dynamically loaded backend compiled
+    //    against version 2 supplies a struct one member short, so the version has to move with it
+    //    for the load-time check to reject that pairing instead of reading past the end.
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -138,6 +141,15 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) copy a tensor of this backend into another backend's tensor, driven from the
+        // source side. Kept separate from cpy_tensor_async because every existing implementation
+        // of that is written as a destination side handler: it casts backend_dst to its own
+        // context before deciding anything, so dispatching a source side call there would
+        // reinterpret a foreign backend_dst, or dereference a null one. Implement this only if
+        // the source role is genuinely supported. Appended last so backends that list the
+        // members positionally are unaffected.
+        bool (*cpy_tensor_from_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
     };
 
     struct ggml_backend {
