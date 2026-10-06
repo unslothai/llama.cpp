@@ -12,7 +12,7 @@
 	} from '@lucide/svelte';
 	import { ActionIcon, ModelId } from '$lib/components/app';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
-	import { ServerModelStatus } from '$lib/enums';
+	import { ModelCapability, ServerModelStatus } from '$lib/enums';
 	import { modelsStore } from '$lib/stores';
 	import type { ModelOption } from '$lib/types/models';
 	import { modelLoadFraction, modelLoadProgressText } from '$lib/utils';
@@ -58,6 +58,11 @@
 	let loadProgress = $derived(isLoading ? modelsStore.status.getLoadProgress(option.model) : null);
 	let loadPercent = $derived(Math.round(modelLoadFraction(loadProgress) * 100));
 	let loadTitle = $derived(modelLoadProgressText(loadProgress));
+	let modalities = $derived(option.modalities);
+	let capabilities = $derived.by(() => ({
+		reasoning: modelsStore.props.checkModelSupportsThinking(option.model),
+		tools: option.capabilities.includes(ModelCapability.TOOL_USE)
+	}));
 </script>
 
 <div
@@ -65,9 +70,11 @@
 	class={[
 		'group relative flex w-full items-center gap-2 rounded-sm p-2 text-left text-sm transition focus:outline-none',
 		'cursor-pointer',
-		isSelected && 'bg-accent/50 text-accent-foreground',
+		isSelected && !isHighlighted && 'bg-accent/50',
 		isHighlighted && 'bg-accent',
-		!isSelected && !isHighlighted && 'hover:bg-muted',
+		(isSelected || isHighlighted) && 'text-accent-foreground',
+		'hover:bg-accent',
+		'focus:bg-accent',
 		isLoaded ? 'text-popover-foreground' : 'text-muted-foreground'
 	]}
 	onclick={() => onSelect(option.id)}
@@ -81,7 +88,11 @@
 		aliases={option.aliases}
 		class="flex-1"
 		{hideOrgName}
+		{modalities}
 		modelId={option.model}
+		showRawTooltip
+		supportsThinking={capabilities.reasoning}
+		supportsToolUse={capabilities.tools}
 		tags={option.tags}
 	/>
 
