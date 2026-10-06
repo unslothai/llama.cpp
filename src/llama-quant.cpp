@@ -314,8 +314,19 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
 
-    // these are not too big so keep them as it is
-    quantize &= name.find("per_layer_model_proj") == std::string::npos;
+    // these are not too big so keep them as it is, unless an explicit --tensor-type names them
+    if (name.find("per_layer_model_proj") != std::string::npos) {
+        bool named = false;
+        if (params->tt_overrides) {
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+                if (std::regex_search(name, std::regex(p->pattern))) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        quantize &= named;
+    }
 
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
