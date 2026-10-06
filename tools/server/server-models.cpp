@@ -400,6 +400,8 @@ void server_model_meta::update_caps() {
     }
 }
 
+int server_get_pipeline_groups();
+
 //
 // server_models
 //
@@ -1026,6 +1028,19 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        // the router strips --pipeline-groups before base_preset is built, so it cannot ride
+        // the preset like other options; hand it over explicitly. base_env is a copy of our own
+        // environment, so an inherited LLAMA_ARG_PIPELINE_GROUPS would otherwise reach the child
+        // unchanged: appending cannot override it, because execve leaves duplicates in place and
+        // getenv() returns the first entry, and an explicit --pipeline-groups 1 would append
+        // nothing at all. Drop any inherited entry first, then always set the resolved value.
+        {
+            static const std::string pg_prefix = "LLAMA_ARG_PIPELINE_GROUPS=";
+            child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                                [](const std::string & e) { return e.rfind(pg_prefix, 0) == 0; }),
+                            child_env.end());
+            child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
