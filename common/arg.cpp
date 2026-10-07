@@ -2778,7 +2778,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU, or 'auto' to size it from the free VRAM after the fit (default: 0, disabled)",
+        "GPU cache size in MiB for the MoE experts kept in the CPU, or 'auto' to size it from the free VRAM after the fit\n"
+        "(the context is reduced to --fit-ctx first if needed, default: 0, disabled)",
         [](common_params & params, const std::string & value) {
             const bool is_auto = value == "auto" || value == "-1";
             const int  n       = is_auto ? 0 : std::stoi(value);

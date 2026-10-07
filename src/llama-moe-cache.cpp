@@ -144,6 +144,11 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
     return true;
 }
 
+// the NextN/MTP layers are only used by an MTP context
+static bool llama_moe_cache_skip_layer(const llama_model & model, size_t il, bool mtp) {
+    return !mtp && il >= model.hparams.n_layer();
+}
+
 static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
     return t->buffer != nullptr &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -211,7 +216,7 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size) :
+    impl(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size, bool mtp) :
             backend(backend), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         const auto dev_type = ggml_backend_dev_type(dev);
@@ -229,7 +234,7 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
-            if (experts.empty() || model.dev_layer(il) != dev ||
+            if (experts.empty() || model.dev_layer(il) != dev || llama_moe_cache_skip_layer(model, il, mtp) ||
                 !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }
@@ -514,8 +519,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size) :
-    pimpl(new impl(model, backend, buft, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size, bool mtp) :
+    pimpl(new impl(model, backend, buft, size, mtp)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -530,7 +535,7 @@ size_t llama_moe_cache::min_size(const llama_model & model, ggml_backend_dev_t d
     size_t host_bytes = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         auto experts = llama_moe_cache_layer_experts(model.layers[il]);
-        if (experts.empty() || model.dev_layer(il) != dev ||
+        if (experts.empty() || model.dev_layer(il) != dev || llama_moe_cache_skip_layer(model, il, false) ||
             !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
             continue;
         }

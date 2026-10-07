@@ -30,6 +30,7 @@ class common_params_fit_exception : public std::runtime_error {
 // expert layout of a model as loaded for a memory measurement
 struct common_fit_moe_layout {
     std::vector<size_t> layer_bytes;    // size of the expert tensors of each layer
+    uint32_t            n_layer;        // number of layers without the NextN/MTP layers
     size_t              cache_min_size; // smallest MoE cache that caches every layer with its experts in system memory
 };
 
@@ -152,7 +153,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_expert    = llama_model_n_expert(model);
 
     if (moe_layout) {
-        moe_layout->layer_bytes.resize(llama_model_n_layer(model) + llama_model_n_layer_nextn(model));
+        moe_layout->n_layer = llama_model_n_layer(model);
+        moe_layout->layer_bytes.resize(moe_layout->n_layer + llama_model_n_layer_nextn(model));
         for (size_t il = 0; il < moe_layout->layer_bytes.size(); il++) {
             moe_layout->layer_bytes[il] = llama_model_n_bytes_exps(model, il);
         }
@@ -677,6 +679,21 @@ static void common_params_fit_impl(
 
         const uint32_t n_layer = moe_layout.layer_bytes.size();
 
+        // on any error, do not load the model with a partially applied MoE cache
+        struct rollback_t {
+            llama_model_params               * mparams;
+            llama_context_params             * cparams;
+            llama_model_tensor_buft_override * tbo;
+            bool active = true;
+            ~rollback_t() {
+                if (active) {
+                    cparams->moe_cache_size = 0;
+                    tbo[0] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tbo;
+                }
+            }
+        } rollback = {mparams, cparams, tensor_buft_overrides};
+
         uint32_t il_host      = 0; // the experts of layers >= il_host are in system memory
         int64_t  static_bytes = 0;
         while (il_host < n_layer && static_bytes + int64_t(moe_layout.layer_bytes[il_host]) <= int64_t(moe_cache->static_frac*surplus)) {
@@ -684,29 +701,37 @@ static void common_params_fit_impl(
             il_host++;
         }
         uint32_t n_static = 0;
-        uint32_t n_host   = 0;
-        size_t   itbo     = 0;
-        for (uint32_t il = 0; il < n_layer; il++) {
-            if (moe_layout.layer_bytes[il] == 0) {
-                continue;
+        uint32_t n_host   = 0; // without NextN/MTP layers, the MoE cache of the main context does not use them
+        auto set_overrides = [&]() {
+            n_static = 0;
+            n_host   = 0;
+            size_t itbo = 0;
+            for (uint32_t il = 0; il < n_layer; il++) {
+                if (moe_layout.layer_bytes[il] == 0) {
+                    continue;
+                }
+                if (il < il_host) {
+                    n_static++;
+                    continue;
+                }
+                if (il < moe_layout.n_layer) {
+                    n_host++;
+                }
+                if (itbo + 1 >= ntbo) {
+                    tensor_buft_overrides[itbo] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tensor_buft_overrides;
+                    throw common_params_fit_exception("llama_max_tensor_buft_overrides() == "
+                        + std::to_string(ntbo) + " is insufficient for model");
+                }
+                tensor_buft_overrides[itbo++] = {get_overflow_pattern(il, LAYER_FRACTION_MOE), ggml_backend_cpu_buffer_type()};
             }
-            if (il < il_host) {
-                n_static++;
-                continue;
+            if (n_static == 0) {
+                itbo = 0;
+                tensor_buft_overrides[itbo++] = {pattern_moe_all.c_str(), ggml_backend_cpu_buffer_type()};
             }
-            n_host++;
-            if (itbo + 1 >= ntbo) {
-                throw common_params_fit_exception("llama_max_tensor_buft_overrides() == "
-                    + std::to_string(ntbo) + " is insufficient for model");
-            }
-            tensor_buft_overrides[itbo++] = {get_overflow_pattern(il, LAYER_FRACTION_MOE), ggml_backend_cpu_buffer_type()};
-        }
-        if (n_static == 0) {
-            itbo = 0;
-            tensor_buft_overrides[itbo++] = {pattern_moe_all.c_str(), ggml_backend_cpu_buffer_type()};
-        }
-        tensor_buft_overrides[itbo] = {nullptr, nullptr};
-        mparams->tensor_buft_overrides = tensor_buft_overrides;
+            tensor_buft_overrides[itbo] = {nullptr, nullptr};
+            mparams->tensor_buft_overrides = tensor_buft_overrides;
+        };
 
         // returns the memory that is left over on the device after the margin with the current parameters
         auto get_surplus = [&]() -> int64_t {
@@ -718,23 +743,41 @@ static void common_params_fit_impl(
 
         // the cache size in whole MiB, at most the surplus
         int64_t cache = surplus - static_bytes;
-        if (il_host > 0) {
+        set_overrides();
+        while (il_host > 0) {
             LOG_TRC("%s: getting device memory data with the experts of %" PRIu32 " layers in device memory:\n", __func__, n_static);
             cache = get_surplus();
+            if (cache > 0) {
+                break;
+            }
+            // the static layers overshoot, keep fewer of them in device memory
+            for (int64_t deficit = -cache; il_host > 0 && deficit >= 0;) {
+                il_host--;
+                deficit      -= moe_layout.layer_bytes[il_host];
+                static_bytes -= moe_layout.layer_bytes[il_host];
+            }
+            set_overrides();
+            cache = surplus - static_bytes;
         }
         cache -= cache % MiB;
-        const int64_t cache_min = moe_layout.cache_min_size;
-        for (int i = 0; i < 2 && cache >= cache_min && cache > 0; i++) {
+        if (n_host == 0) {
+            cache = 0;
+        }
+        // a cache with the slots for the experts of only one token thrashes and is slower than no cache
+        auto cache_min = [&]() { return 2*int64_t(moe_layout.cache_min_size); };
+        bool fits = false;
+        for (int i = 0; i < 4 && cache >= cache_min() && cache > 0; i++) {
             cparams->moe_cache_size = cache;
             LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
             const int64_t overshoot = -get_surplus();
             if (overshoot <= 0) {
+                fits = true;
                 break;
             }
             cache -= GGML_PAD(overshoot, MiB);
-            cparams->moe_cache_size = 0;
         }
-        if (cparams->moe_cache_size > 0 && cache >= cache_min) {
+        if (fits) {
+            rollback.active = false;
             LOG_INF("%s: moe cache auto: %" PRIu32 " layers static (%" PRId64 " MiB), %" PRIu32 " layers in host RAM, "
                 "cache %" PRId64 " MiB (S=%" PRId64 " MiB, margin %" PRId64 " MiB)\n",
                 __func__, n_static, static_bytes/MiB, n_host, cache/MiB, surplus/MiB, margins[0]/MiB);
@@ -742,10 +785,7 @@ static void common_params_fit_impl(
         }
 
         LOG_INF("%s: moe cache auto: cache of %" PRId64 " MiB does not fit or is below the minimum of %" PRId64 " MiB, not using a MoE cache\n",
-            __func__, cache/MiB, cache_min/MiB);
-        cparams->moe_cache_size = 0;
-        tensor_buft_overrides[0] = {nullptr, nullptr};
-        mparams->tensor_buft_overrides = tensor_buft_overrides;
+            __func__, std::max<int64_t>(cache, 0)/MiB, cache_min()/MiB);
     } else if (moe_cache) {
         LOG_INF("%s: moe cache auto: the dense weights do not fit, not using a MoE cache\n", __func__);
     }

@@ -11,10 +11,12 @@ struct llama_model;
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
-    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size);
+    // the NextN/MTP layers are only cached if mtp is true
+    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size, bool mtp);
     ~llama_moe_cache();
 
     // smallest size that gives every group of host-resident expert layers on dev the slots for the experts of one token
+    // in a context that is not an MTP context
     // returns 0 if no layer would be cached
     static size_t min_size(const llama_model & model, ggml_backend_dev_t dev);
 
