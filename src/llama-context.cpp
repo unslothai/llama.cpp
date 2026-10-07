@@ -471,7 +471,8 @@ llama_context::llama_context(
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
+                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size,
+                        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
                     break;
                 }
             }
