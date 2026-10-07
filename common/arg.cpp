@@ -2795,8 +2795,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("with --moe-cache-mib auto: fraction of the device memory for MoE experts used to keep the experts\n"
             "of whole layers in device memory, the rest is used for the MoE cache (default: %.1f)", (double) params.moe_cache_static),
         [](common_params & params, const std::string & value) {
-            params.moe_cache_static = std::stof(value);
-            if (params.moe_cache_static < 0.0f || params.moe_cache_static > 1.0f) {
+            size_t pos = 0;
+            params.moe_cache_static = std::stof(value, &pos);
+            if (pos != value.size() || !(params.moe_cache_static >= 0.0f && params.moe_cache_static <= 1.0f)) {
                 throw std::invalid_argument("invalid value");
             }
         }
