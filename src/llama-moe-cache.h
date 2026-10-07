@@ -14,6 +14,10 @@ public:
     llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size);
     ~llama_moe_cache();
 
+    // smallest size that gives every group of host-resident expert layers on dev the slots for the experts of one token
+    // returns 0 if no layer would be cached
+    static size_t min_size(const llama_model & model, ggml_backend_dev_t dev);
+
     ggml_backend_t backend() const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise

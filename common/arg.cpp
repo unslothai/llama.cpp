@@ -2778,14 +2778,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        "GPU cache size in MiB for the MoE experts kept in the CPU, or 'auto' to size it from the free VRAM after the fit (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            const bool is_auto = value == "auto" || value == "-1";
+            const int  n       = is_auto ? 0 : std::stoi(value);
+            if (n < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_auto = is_auto;
+            params.moe_cache_size = (size_t) n*1024*1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-static"}, "F",
+        string_format("with --moe-cache-mib auto: fraction of the device memory for MoE experts used to keep the experts\n"
+            "of whole layers in device memory, the rest is used for the MoE cache (default: %.1f)", (double) params.moe_cache_static),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_static = std::stof(value);
+            if (params.moe_cache_static < 0.0f || params.moe_cache_static > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_STATIC"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

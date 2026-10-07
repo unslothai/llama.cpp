@@ -1,11 +1,13 @@
 #include "llama-moe-cache.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -517,6 +519,61 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, ggml_backend_t backe
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+size_t llama_moe_cache::min_size(const llama_model & model, ggml_backend_dev_t dev) {
+    const int32_t n_expert_used = model.hparams.n_expert_used_max();
+    const size_t  alignment     = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev));
+
+    // same grouping as the constructor, the budget is split by the size of the experts
+    std::vector<std::vector<ggml_tensor *>> refs;
+    std::vector<size_t> group_bytes;
+    size_t host_bytes = 0;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+        if (experts.empty() || model.dev_layer(il) != dev ||
+            !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+            continue;
+        }
+        auto it = std::find_if(refs.begin(), refs.end(), [&](const std::vector<ggml_tensor *> & ref) { return llama_moe_cache_same_layout(ref, experts); });
+        if (it == refs.end()) {
+            refs.push_back(experts);
+            group_bytes.push_back(0);
+            it = refs.end() - 1;
+        }
+        for (const ggml_tensor * t : experts) {
+            group_bytes[it - refs.begin()] += ggml_nbytes(t);
+            host_bytes                     += ggml_nbytes(t);
+        }
+    }
+
+    size_t res = 0;
+    for (size_t ig = 0; ig < refs.size(); ++ig) {
+        size_t need = 0; // n_expert_used slots + the extra slot
+        for (const ggml_tensor * t : refs[ig]) {
+            need += GGML_PAD(t->nb[2]*(n_expert_used + 1), alignment);
+        }
+        res = std::max(res, (size_t) std::ceil((double) need*host_bytes/group_bytes[ig]) + 1);
+    }
+    return res;
+}
+
+size_t llama_model_n_bytes_exps(const llama_model * model, int32_t il) {
+    if (il < 0 || il >= (int32_t) model->layers.size()) {
+        return 0;
+    }
+    size_t res = 0;
+    for (const ggml_tensor * t : llama_moe_cache_layer_experts(model->layers[il])) {
+        res += ggml_nbytes(t);
+    }
+    return res;
+}
+
+size_t llama_model_moe_cache_min_size(const llama_model * model) {
+    if (model->hparams.n_expert == 0 || model->devices.size() != 1) {
+        return 0;
+    }
+    return llama_moe_cache::min_size(*model, model->devices[0].dev);
+}
 
 ggml_backend_t llama_moe_cache::backend() const {
     return pimpl->backend;
