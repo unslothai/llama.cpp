@@ -215,8 +215,19 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    dmds_t      dmds_extra;       // memory of the extra model, laid out on the devices of the main model
+    uint32_t    n_ctx_extra = 0;  // context that memory was measured at
+    std::string placement_extra;  // main model placement that memory was measured at, for a shared model
+
+    // a context that shares the main model runs on its weights wherever the fit puts them,
+    // so its memory follows the placement of the main model as well as the context size
+    auto placement_key = [&]() {
+        std::string key = std::to_string(mparams->n_gpu_layers);
+        for (const llama_model_tensor_buft_override * o = mparams->tensor_buft_overrides; o && o->pattern; o++) {
+            key += std::string("|") + o->pattern + "=" + (o->buft ? ggml_backend_buft_name(o->buft) : "");
+        }
+        return key;
+    };
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
@@ -225,7 +236,8 @@ static void common_params_fit_impl(
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        const std::string placement = extra->shares_model ? placement_key() : std::string();
+        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx || placement_extra != placement) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
@@ -239,12 +251,14 @@ static void common_params_fit_impl(
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, extra->shares_model ? mparams : extra->mparams, extra->cparams,
+                    devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
+                n_ctx_extra     = cparams->n_ctx;
+                placement_extra = placement;
                 return;
             }
 
@@ -266,7 +280,8 @@ static void common_params_fit_impl(
                 }
             }
 
-            n_ctx_extra = cparams->n_ctx;
+            n_ctx_extra     = cparams->n_ctx;
+            placement_extra = placement;
         }
 
         for (size_t id = 0; id < dmds.size(); id++) {
