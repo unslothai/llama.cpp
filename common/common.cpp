@@ -1258,13 +1258,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
+        const common_fit_moe_cache moe_cache = { params.moe_cache_static };
+
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
+            params.moe_cache_auto ? &moe_cache : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    } else if (params.moe_cache_auto) {
+        LOG_WRN("%s: --moe-cache-mib auto needs --fit on, not using a MoE cache\n", __func__);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
