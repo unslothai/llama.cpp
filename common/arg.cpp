@@ -2791,18 +2791,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
-        {"--moe-cache-static"}, "F",
-        string_format("with --moe-cache-mib auto: fraction of the device memory for MoE experts used to keep the experts\n"
-            "of whole layers in device memory, the rest is used for the MoE cache (default: %.1f)", (double) params.moe_cache_static),
-        [](common_params & params, const std::string & value) {
-            size_t pos = 0;
-            params.moe_cache_static = std::stof(value, &pos);
-            if (pos != value.size() || !(params.moe_cache_static >= 0.0f && params.moe_cache_static <= 1.0f)) {
-                throw std::invalid_argument("invalid value");
-            }
-        }
-    ).set_env("LLAMA_ARG_MOE_CACHE_STATIC"));
-    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

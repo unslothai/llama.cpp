@@ -21,11 +21,6 @@ struct common_fit_extra_model {
     bool shares_model;
 };
 
-// sizes the MoE cache for the experts that do not fit in device memory, see --moe-cache-mib auto
-struct common_fit_moe_cache {
-    float static_frac; // fraction of the device memory for experts that is used for whole layers of experts instead of the cache
-};
-
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state
@@ -40,7 +35,7 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-        const common_fit_moe_cache * moe_cache,              // sets llama_context_params::moe_cache_size, nullptr to keep it
+                               bool   moe_cache_auto,        // set llama_context_params::moe_cache_size from the free memory
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
 // print estimated memory to stdout

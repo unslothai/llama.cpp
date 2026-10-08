@@ -144,11 +144,6 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
     return true;
 }
 
-// the NextN/MTP layers are only used by an MTP context
-static bool llama_moe_cache_skip_layer(const llama_model & model, size_t il, bool mtp) {
-    return !mtp && il >= model.hparams.n_layer();
-}
-
 static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
     return t->buffer != nullptr &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -226,10 +221,6 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            impl(model, backends, bufts, size, false) {
-    }
-
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool mtp) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -252,9 +243,6 @@ struct llama_moe_cache::impl {
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
-            if (llama_moe_cache_skip_layer(model, il, mtp)) {
-                continue;
-            }
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }
@@ -617,13 +605,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
     pimpl(new impl(model, backends, bufts, size)) {
 }
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool mtp) :
-    pimpl(new impl(model, backends, bufts, size, mtp)) {
-}
-
 llama_moe_cache::~llama_moe_cache() = default;
 
-size_t llama_moe_cache::min_size(const llama_model & model, ggml_backend_dev_t dev) {
+// smallest budget that gives every group of host-resident expert layers on dev the slots for the experts of one token
+static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backend_dev_t dev) {
     const int32_t n_expert_used = model.hparams.n_expert_used_max();
     const size_t  alignment     = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev));
 
@@ -633,7 +618,7 @@ size_t llama_moe_cache::min_size(const llama_model & model, ggml_backend_dev_t d
     size_t host_bytes = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         auto experts = llama_moe_cache_layer_experts(model.layers[il]);
-        if (experts.empty() || model.dev_layer(il) != dev || llama_moe_cache_skip_layer(model, il, false) ||
+        if (experts.empty() || model.dev_layer(il) != dev ||
             !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
             continue;
         }
@@ -660,22 +645,11 @@ size_t llama_moe_cache::min_size(const llama_model & model, ggml_backend_dev_t d
     return res;
 }
 
-size_t llama_model_n_bytes_exps(const llama_model * model, int32_t il) {
-    if (il < 0 || il >= (int32_t) model->layers.size()) {
-        return 0;
-    }
-    size_t res = 0;
-    for (const ggml_tensor * t : llama_moe_cache_layer_experts(model->layers[il])) {
-        res += ggml_nbytes(t);
-    }
-    return res;
-}
-
 size_t llama_model_moe_cache_min_size(const llama_model * model) {
     if (model->hparams.n_expert == 0 || model->devices.size() != 1) {
         return 0;
     }
-    return llama_moe_cache::min_size(*model, model->devices[0].dev);
+    return llama_moe_cache_min_size_dev(*model, model->devices[0].dev);
 }
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {

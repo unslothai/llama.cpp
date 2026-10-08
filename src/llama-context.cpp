@@ -465,9 +465,7 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, true);
-        } else if (cparams.moe_cache_size > 0) {
+        if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 

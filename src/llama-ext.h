@@ -88,9 +88,6 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
-// size of the expert tensors of layer il in bytes, 0 for a layer without experts
-LLAMA_API size_t llama_model_n_bytes_exps(const struct llama_model * model, int32_t il);
-
 // smallest MoE cache size that caches every layer with all of its experts in host memory, 0 if no layer would be cached
 LLAMA_API size_t llama_model_moe_cache_min_size(const struct llama_model * model);
 

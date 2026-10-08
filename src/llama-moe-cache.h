@@ -14,14 +14,7 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
-    // the NextN/MTP layers are only cached if mtp is true
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool mtp);
     ~llama_moe_cache();
-
-    // smallest size that gives every group of host-resident expert layers on dev the slots for the experts of one token
-    // in a context that is not an MTP context
-    // returns 0 if no layer would be cached
-    static size_t min_size(const llama_model & model, ggml_backend_dev_t dev);
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
