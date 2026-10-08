@@ -1,5 +1,7 @@
 #include "server-decision.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_decision_order
+
 #include <algorithm>
 #include <cmath>
 #include <regex>
@@ -75,7 +77,7 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max   = labels.size();
         noul_true_first = true;
-    } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE) {
+    } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
         // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
         std::vector<std::string> codes;
         for (char a = 'A'; a <= 'Z'; a++) {
@@ -116,6 +118,10 @@ void server_decision_context::init(const llama_model * model) {
             throw std::runtime_error("decision model has no valid max_head_tokens");
         }
         n_options_max = 255;
+    } else if (model_type == COMMON_DECISION_TYPE_CLEF) {
+        n_options_max   = 255;
+        noul_true_first = true;
+        choice_sorted   = true;
     } else {
         throw std::runtime_error("unsupported decision model type: " + type_name);
     }
@@ -162,6 +168,11 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
             }
             for (const auto & [key, description] : criteria.items()) {
                 question.options.push_back({key, description});
+            }
+            if (choice_sorted) {
+                std::sort(question.options.begin(), question.options.end(), [](const auto & a, const auto & b) {
+                    return a.key < b.key;
+                });
             }
         } else if (type_name == "score") {
             question.type = SERVER_DECISION_QUESTION_SCORE;
@@ -212,6 +223,9 @@ static void decision_load_image(const json & url, std::vector<raw_buffer> & file
 }
 
 json server_decision_context::parse_state(const json & body, std::vector<raw_buffer> & files) const {
+    if (body.contains("videos") && !body.at("videos").is_null() && !body.at("videos").empty()) {
+        throw std::invalid_argument("\"videos\" is not supported");
+    }
     if (body.contains("images") && !body.at("images").is_null()) {
         if (!body.at("images").is_array()) {
             throw std::invalid_argument("\"images\" must be an array");
@@ -457,7 +471,7 @@ void server_decision_context::fill_task(
         server_task & task) const {
     const std::string prompt = render(state, questions, question, variant, files.size());
 
-    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE) {
+    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
         // lev reads the ratings of a noul question at its first labels, not at the digits
         task.decision.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
         if (!files.empty()) {
@@ -543,6 +557,125 @@ void server_decision_context::fill_task_laya(llama_tokens & tokens, const server
 }
 
 //
+// joint prompt (clef)
+//
+
+// given to the template: text between the pieces of the prompt, and at the start of the span of a question or of an option
+static const std::string CLEF_MARKER        = "<<clef:";
+static const std::string CLEF_SEP           = "<<clef:sep>>";
+static const std::string CLEF_MARK_QUESTION = "<<clef:question>>";
+static const std::string CLEF_MARK_OPTION   = "<<clef:option>>";
+
+void server_decision_context::fill_task_joint(
+        const json & state,
+        const std::vector<server_decision_question> & questions,
+        const std::vector<raw_buffer> & files,
+        mtmd_context * mctx,
+        const mtmd_helper_init_opt & init_opt,
+        server_task & task) const {
+    json inp_questions = json::array();
+    for (const auto & question : questions) {
+        json options = json::array();
+        for (const auto & opt : question.options) {
+            options.push_back(json{
+                {"key",         opt.key},
+                {"description", opt.description},
+            });
+        }
+        inp_questions.push_back(json{
+            {"id",           question.id},
+            {"type",         decision_question_type_name(question.type)},
+            {"instructions", question.instructions},
+            {"options",      options},
+        });
+    }
+
+    // the template is given raw JSON values with sorted keys, and no marker in the input
+    json inp = json{
+        {"state",     state},
+        {"questions", inp_questions},
+    };
+    inp = decision_replace_text(decision_sort_keys(inp), CLEF_MARKER, "<<clef ");
+
+    // the template puts one media marker per image
+    json images = json::array();
+    if (!files.empty()) {
+        inp = decision_replace_text(inp, get_media_marker(), " ");
+        for (size_t i = 0; i < files.size(); i++) {
+            images.push_back(get_media_marker());
+        }
+    }
+    inp["images"]        = images;
+    inp["sep"]           = CLEF_SEP;
+    inp["mark_question"] = CLEF_MARK_QUESTION;
+    inp["mark_option"]   = CLEF_MARK_OPTION;
+
+    jinja::context ctx(tmpl->source());
+    jinja::global_from_json(ctx, inp, false);
+    jinja::runtime runtime(ctx);
+    const jinja::value results = runtime.execute(tmpl->prog);
+    const std::string prompt   = jinja::runtime::gather_string_parts(results)->as_string().str();
+
+    const auto invalid = std::runtime_error("unexpected layout of the decision prompt");
+
+    // the model was trained with the pieces tokenized one by one
+    const std::vector<std::string> pieces = string_split(prompt, CLEF_SEP);
+    size_t i_piece = 0;
+
+    task.tokens = server_tokens(llama_tokens(), false);
+    if (!files.empty()) {
+        // the text before the images is tokenized with them, a vision token separates the pieces anyway
+        std::string head;
+        while (i_piece < pieces.size() && head.find(get_media_marker()) == std::string::npos) {
+            head += pieces[i_piece++];
+        }
+        if (head.find(get_media_marker()) == std::string::npos || head.find(CLEF_MARKER) != std::string::npos) {
+            throw invalid;
+        }
+        task.tokens = process_mtmd_prompt(mctx, head, files, init_opt);
+        task.decision.order.resize(task.tokens.size(), LLAMA_DECISION_ORDER_NONE);
+    }
+
+    size_t i_question = 0;
+    for (; i_piece < pieces.size(); i_piece++) {
+        std::string piece = pieces[i_piece];
+        int32_t order = LLAMA_DECISION_ORDER_NONE;
+        if (string_starts_with(piece, CLEF_MARK_QUESTION)) {
+            piece = piece.substr(CLEF_MARK_QUESTION.size());
+            if (i_question >= questions.size()) {
+                throw invalid;
+            }
+            switch (questions[i_question++].type) {
+                case SERVER_DECISION_QUESTION_NOUL:   order = LLAMA_DECISION_ORDER_QUESTION_NOUL;   break;
+                case SERVER_DECISION_QUESTION_CHOICE: order = LLAMA_DECISION_ORDER_QUESTION_CHOICE; break;
+                case SERVER_DECISION_QUESTION_SCORE:  order = LLAMA_DECISION_ORDER_QUESTION_SCORE;  break;
+            }
+        } else if (string_starts_with(piece, CLEF_MARK_OPTION)) {
+            piece = piece.substr(CLEF_MARK_OPTION.size());
+            order = LLAMA_DECISION_ORDER_OPTION;
+            task.decision.n_scores++;
+        }
+
+        const llama_tokens piece_tokens = common_tokenize(vocab, piece, false, true);
+        if (order != LLAMA_DECISION_ORDER_NONE && piece_tokens.empty()) {
+            throw std::invalid_argument("the instructions and the options of a question must not be empty");
+        }
+        for (const llama_token token : piece_tokens) {
+            task.tokens.push_back(token);
+        }
+        task.decision.order.resize(task.tokens.size(), order);
+    }
+
+    size_t n_options = 0;
+    for (const auto & question : questions) {
+        n_options += question.options.size();
+    }
+    if (i_question != questions.size() || (size_t) task.decision.n_scores != n_options) {
+        throw invalid;
+    }
+}
+
+//
 // answer
 //
 
@@ -608,6 +741,10 @@ json server_decision_context::format_answer(const server_decision_question & que
         const auto & s = scores[v];
         if (s.size() != n) {
             throw std::runtime_error("decision result does not match the number of options");
+        }
+        // a joint head returns NaN if it could not use the decision order
+        if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v); })) {
+            throw std::runtime_error("the model could not evaluate the decision");
         }
         const float score_max = *std::max_element(s.begin(), s.end());
         std::vector<double> p(n);
