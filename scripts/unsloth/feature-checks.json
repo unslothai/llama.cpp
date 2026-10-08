@@ -99,7 +99,7 @@
     "unslothai#152": "per-run mmap of a context's tensors; a memory-layout change with no observable output difference",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
     "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
-    "unslothai#241": "CUDA graph cache key, macOS row prefetch, F16 glm5-next indexer cache under a quantized -ctk and the glm5-next NextN draft graph; the first needs a CUDA host, the second has no observable output difference, the last two need a real GLM-5-Next NextN head with --spec-type draft-mtp",
+    "unslothai#253": "CUDA graph cache key without a count cap (#241 plus the cap removal), macOS row prefetch, F16 glm5-next indexer cache under a quantized -ctk and the glm5-next NextN draft graph; the first needs a CUDA host (the cap only shows with --split-mode tensor on two GPUs), the second has no observable output difference, the last two need a real GLM-5-Next NextN head with --spec-type draft-mtp",
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model"
   }
 }
