@@ -42,14 +42,22 @@ ARCHS_OK = """main: using seed 1234
 |     Model arch.|                         Device|Config|   NMSE vs. CPU|Roundtrip|
 |----------------|-------------------------------|------|---------------|---------|
 |         inkling|                    NVIDIA B200|   MoE|  OK (1.82e-11)|     SKIP|
-|         inkling|Intel(R) Xeon(R) Platinum 8559C|   MoE|  OK (0.00e+00)|     SKIP|"""
+|         inkling|Intel(R) Xeon(R) Platinum 8559C|   MoE|  OK (0.00e+00)|     SKIP|
+Summary: all 2 test(s) passed"""
 ARCHS_ALL_SKIP = """main: using seed 1234
 |     Model arch.|                         Device|Config|   NMSE vs. CPU|Roundtrip|
 |----------------|-------------------------------|------|---------------|---------|
-|         inkling|                    NVIDIA B200| Dense|SKIP           |     SKIP|"""
+|         inkling|                    NVIDIA B200| Dense|SKIP           |     SKIP|
+Summary: no tests executed"""
 ARCHS_ABSENT = """main: using seed 1234
 |     Model arch.|                         Device|Config|   NMSE vs. CPU|Roundtrip|
-|----------------|-------------------------------|------|---------------|---------|"""
+|----------------|-------------------------------|------|---------------|---------|
+Summary: no tests executed"""
+# The logger lost its queue at exit: the row stops after the config column.
+ARCHS_CUT = """main: using seed 1234
+|     Model arch.|                         Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|-------------------------------|------|---------------|---------|
+|         inkling|                    NVIDIA B200|   MoE|"""
 OPS_OK = """  FLASH_ATTN_EXT_BANDED(hsk=64): OK
   13/13 tests passed
   Backend CUDA0: OK"""
@@ -147,6 +155,22 @@ check("an mtmd run with zero assertions is a failure", rc == 1, out)
 d, m = build()
 rc, rep, out = run(d, m, "--gpu")
 check("knowingly unchecked pins are printed", "unslothai#95 has no runtime check" in out, out)
+
+# --- 10. the arch output was cut off at exit -------------------------------
+d, m = build(archs=ARCHS_CUT)
+rc, rep, out = run(d, m, "--gpu")
+check("output cut off on every run is a failure", rc == 1, out)
+check("and says it was cut off", "cut off before its Summary line" in out, out)
+
+d, m = build()
+real = d / "bin" / "test-llama-archs"
+real.rename(d / "bin" / "archs-full")
+fake(d / "bin", "archs-cut", ARCHS_CUT)
+real.write_text("#!/bin/sh\nif [ -e \"$0.ran\" ]; then exec \"$(dirname \"$0\")/archs-full\"; fi\n"
+                "touch \"$0.ran\"\nexec \"$(dirname \"$0\")/archs-cut\"\n")
+real.chmod(0o755)
+rc, rep, out = run(d, m, "--gpu")
+check("output cut off once is retried and passes", rc == 0 and rep["ok"], out)
 
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
