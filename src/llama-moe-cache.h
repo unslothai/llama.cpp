@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 
 struct llama_model;
 
@@ -11,8 +12,10 @@ struct llama_model;
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
+    // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     // the NextN/MTP layers are only cached if mtp is true
-    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size, bool mtp);
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool mtp);
     ~llama_moe_cache();
 
     // smallest size that gives every group of host-resident expert layers on dev the slots for the experts of one token
@@ -20,7 +23,8 @@ public:
     // returns 0 if no layer would be cached
     static size_t min_size(const llama_model & model, ggml_backend_dev_t dev);
 
-    ggml_backend_t backend() const;
+    // the device that caches layer il
+    ggml_backend_t backend(int32_t il) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
@@ -41,3 +45,5 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
