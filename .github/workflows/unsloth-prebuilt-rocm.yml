@@ -963,6 +963,96 @@ jobs:
 
         echo "Finished copying required ROCm libraries"
 
+    # rocm-systems 745ebf1 (TheRock 7.14 and later) sizes each queue's CWSR debug area from
+    # KFD topology (simd_per_cu * max_waves_per_simd waves per CU), while amdkfd keeps 32
+    # waves per CU below gfx1250 (kfd_queue.c get_num_waves). On a GPU whose firmware
+    # reports anything but 16 waves per SIMD the two sizes disagree; amdkfd then refuses
+    # the queue (always when the area is smaller, on the non-SVM path when it is larger)
+    # and llama.cpp aborts with "ROCm error: out of memory" at hipStreamCreateWithFlags
+    # (unslothai/unsloth#12205, ROCm/TheRock#7472). Rebuild only libhsa-runtime64 from the
+    # nightly's own rocm-systems pin with the ROCm/rocm-systems#11299 wave count. The patch
+    # check fails loudly once the pinned nightly carries a fix: delete this step then.
+    - name: Rebuild libhsa-runtime64 with the KFD CWSR wave count
+      run: |
+        set -euo pipefail
+        build_bin_path="llama.cpp/build/bin"
+        manifest=/opt/rocm/share/therock/therock_manifest.json
+        test -f "$manifest"
+        sha="$(jq -r '.submodules[] | select(.submodule_name == "rocm-systems") | .pin_sha' "$manifest")"
+        therock_sha="$(jq -r '.the_rock_commit // empty' "$manifest")"
+        test -n "$sha" && test "$sha" != null
+        echo "rocm-systems pin: $sha (TheRock ${therock_sha:-unknown})"
+
+        src="$RUNNER_TEMP/rocm-systems"
+        git init -q "$src"
+        git -C "$src" remote add origin https://github.com/ROCm/rocm-systems
+        git -C "$src" sparse-checkout set projects/rocr-runtime
+        git -C "$src" fetch -q --depth 1 --filter=blob:none origin "$sha"
+        git -C "$src" checkout -q FETCH_HEAD
+        # TheRock's own rocm-systems patches for this pin, so only the wave count differs.
+        if [ -n "$therock_sha" ]; then
+          jq -r '.submodules[] | select(.submodule_name == "rocm-systems") | .patches[]?' "$manifest" | while read -r p; do
+            [ -n "$p" ] || continue
+            echo "applying TheRock patch $p"
+            curl -fsSL --retry 5 "https://raw.githubusercontent.com/ROCm/TheRock/${therock_sha}/${p}" | git -C "$src" apply --include='projects/rocr-runtime/*' -
+          done
+        fi
+
+        python3 - "$src/projects/rocr-runtime/libhsakmt/src/queues.c" <<'PY'
+        import sys
+        path = sys.argv[1]
+        text = open(path, encoding = "utf-8").read()
+        old = ("\telse\n"
+               "\t\twave_num = cu_num * node->NumSIMDPerCU * node->MaxWavesPerSIMD;\n")
+        new = ("\telse if (gfxv < GFX_VERSION_GFX1250)\n"
+               "\t\twave_num = cu_num * 32;\n"
+               "\telse\n"
+               "\t\twave_num = cu_num * node->NumSIMDPerCU * node->MaxWavesPerSIMD;\n")
+        if new in text:
+            sys.exit("the pinned rocm-systems already carries the fix: delete this step")
+        if text.count(old) != 1:
+            sys.exit("get_num_waves() changed upstream: re-check it against kfd_queue.c")
+        open(path, "w", encoding = "utf-8").write(text.replace(old, new))
+        PY
+        git -C "$src" diff
+
+        # TheRock ships its own sysdeps headers and pkgconfig, so the rebuilt runtime links
+        # the bundle's librocm_sysdeps_* exactly like the shipped one.
+        export PKG_CONFIG_PATH="/opt/rocm/lib/rocm_sysdeps/lib/pkgconfig"
+        cmake -S "$src/projects/rocr-runtime" -B "$RUNNER_TEMP/rocr-build" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+          -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/lib/rocm_sysdeps" \
+          -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
+        cmake --build "$RUNNER_TEMP/rocr-build" --target hsa-runtime64
+
+        new_lib="$(find "$RUNNER_TEMP/rocr-build" -name 'libhsa-runtime64.so.1.*' -type f | head -1)"
+        old_lib="$(readlink -f "$build_bin_path/libhsa-runtime64.so.1")"
+        test -f "$new_lib" && test -f "$old_lib"
+
+        # Every ROCR_* symbol the shipped library exports, at the same version node.
+        exports() { objdump -T "$1" | awk 'NF > 2 && !/\*UND\*/ && $(NF-1) ~ /ROCR_/ {print $(NF-1), $NF}' | sort -u; }
+        missing="$(comm -23 <(exports "$old_lib") <(exports "$new_lib"))"
+        if [ -n "$missing" ]; then
+          echo "$missing"
+          echo "::error::the rebuilt libhsa-runtime64 lacks exports the shipped one has"
+          exit 1
+        fi
+        # The copy step above flattened the .so / .so.1 / .so.1.x symlinks into files:
+        # replace every one, so no unpatched copy ships beside the one the loader uses.
+        for f in "$build_bin_path"/libhsa-runtime64.so*; do
+          cp -v "$new_lib" "$f"
+        done
+
+        # HIP's ROCR imports resolve against the rebuilt runtime. Library-level
+        # completeness is checked for the whole bundle after RPATH is set.
+        unresolved="$(LD_LIBRARY_PATH="$build_bin_path" ldd -r "$build_bin_path/libamdhip64.so.7" 2>&1 | grep -E 'undefined symbol' || true)"
+        if [ -n "$unresolved" ]; then
+          echo "$unresolved"
+          echo "::error::libamdhip64 does not resolve against the rebuilt libhsa-runtime64"
+          exit 1
+        fi
+        echo "libhsa-runtime64 rebuilt from rocm-systems $sha with the KFD wave count"
+
     - name: Set RPATH for portable distribution
       run: |
         sudo apt-get install -y patchelf
