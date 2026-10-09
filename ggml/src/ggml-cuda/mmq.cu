@@ -64,13 +64,13 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ1_XS:
-            mul_mat_q_case<GGML_TYPE_IQ1_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ1_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ1_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ1_XXXS:
-            mul_mat_q_case<GGML_TYPE_IQ1_XXXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_XXXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
