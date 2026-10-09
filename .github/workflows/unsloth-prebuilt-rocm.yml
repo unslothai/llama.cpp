@@ -969,10 +969,14 @@ jobs:
     # reports anything but 16 waves per SIMD the two sizes disagree; amdkfd then refuses
     # the queue (always when the area is smaller, on the non-SVM path when it is larger)
     # and llama.cpp aborts with "ROCm error: out of memory" at hipStreamCreateWithFlags
-    # (unslothai/unsloth#12205, ROCm/TheRock#7472). Rebuild only libhsa-runtime64 from the
+    # (ROCm/TheRock#7472; enforced since Linux 6.12). Rebuild only libhsa-runtime64 from the
     # nightly's own rocm-systems pin with the ROCm/rocm-systems#11299 wave count. The patch
     # check fails loudly once the pinned nightly carries a fix: delete this step then.
+    # gfx103X only: the parts that disagree are gfx10.1 (40 waves per CU), which reach a
+    # Linux bundle through HSA_OVERRIDE_GFX_VERSION=10.3.0. Every other leg serves GPUs
+    # that report 32, so they keep TheRock's library unchanged.
     - name: Rebuild libhsa-runtime64 with the KFD CWSR wave count
+      if: matrix.gfx_target == 'gfx103X'
       run: |
         set -euo pipefail
         build_bin_path="llama.cpp/build/bin"
