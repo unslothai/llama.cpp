@@ -376,6 +376,8 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             const auto & t = chunk.at("timings");
             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+            timings.moe_cache_hits       = t.value("moe_cache_hits",       (uint64_t) 0);
+            timings.moe_cache_misses     = t.value("moe_cache_misses",     (uint64_t) 0);
         }
         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
             return;
@@ -653,10 +655,16 @@ int cli_context::run() {
         }
 
         if (params.show_timings) {
+            std::string moe;
+            const uint64_t n_moe = timings.moe_cache_hits + timings.moe_cache_misses;
+            if (n_moe > 0) {
+                moe = string_format(" | MoE cache hits: %.1f%%", 100.0*timings.moe_cache_hits/n_moe);
+            }
             ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s%s ]",
                 timings.prompt_per_second,
-                timings.predicted_per_second
+                timings.predicted_per_second,
+                moe.c_str()
             ));
         }
 

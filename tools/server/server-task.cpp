@@ -1573,6 +1573,18 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "moe_cache_hits_total",
+            "MoE cache: Total experts found in the cache",
+            (double) perf.n_moe_cache_hits
+        }, {
+            "moe_cache_misses_total",
+            "MoE cache: Total experts uploaded to the cache",
+            (double) perf.n_moe_cache_misses
+        }, {
+            "moe_cache_uploaded_bytes_total",
+            "MoE cache: Total bytes uploaded to the cache",
+            (double) perf.moe_cache_bytes
         },
     };
 

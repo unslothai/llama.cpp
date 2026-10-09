@@ -538,6 +538,8 @@ struct server_task_result_metrics : server_task_result {
 
     server_metrics metrics;
 
+    llama_perf_context_data perf = {};
+
     virtual json to_json() override;
 
     struct metric_item {
