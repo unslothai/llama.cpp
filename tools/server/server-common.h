@@ -401,6 +401,10 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // MoE cache lookups of the context while the request ran, other slots included
+    uint64_t n_moe_cache_hits   = 0;
+    uint64_t n_moe_cache_misses = 0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

@@ -364,12 +364,24 @@ struct server_slot {
 
     server_slot_stats stats;
 
+    llama_perf_context_data perf_start = {};
+
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+
+    server_slot_stats get_stats() const {
+        server_slot_stats res = stats;
+        if (res.is_set()) {
+            const auto perf = llama_perf_context(ctx_tgt);
+            res.n_moe_cache_hits   = perf.n_moe_cache_hits   - perf_start.n_moe_cache_hits;
+            res.n_moe_cache_misses = perf.n_moe_cache_misses - perf_start.n_moe_cache_misses;
+        }
+        return res;
+    }
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -2211,7 +2223,7 @@ private:
 
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
-            res->stats = slot.stats;
+            res->stats = slot.get_stats();
         }
 
         queue_results.send(std::move(res));
@@ -2238,7 +2250,7 @@ private:
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
         }
-        res->stats           = slot.stats;
+        res->stats           = slot.get_stats();
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
@@ -2857,6 +2869,7 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    res->perf                = llama_perf_context(ctx_tgt);
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3499,6 +3512,7 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        slot.perf_start = llama_perf_context(ctx_tgt);
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

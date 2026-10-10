@@ -1145,6 +1145,9 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_draft_tokens_total` | Counter | Total draft tokens generated (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
+| `llamacpp:moe_cache_hits_total` | Counter | Experts found in the MoE cache (0 when `--moe-cache-mib` is off). |
+| `llamacpp:moe_cache_misses_total` | Counter | Experts uploaded to the MoE cache (0 when `--moe-cache-mib` is off). |
+| `llamacpp:moe_cache_uploaded_bytes_total` | Counter | Bytes uploaded to the MoE cache (0 when `--moe-cache-mib` is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.

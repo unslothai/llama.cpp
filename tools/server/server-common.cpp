@@ -101,6 +101,11 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (n_moe_cache_hits + n_moe_cache_misses > 0) {
+        base["moe_cache_hits"]   = n_moe_cache_hits;
+        base["moe_cache_misses"] = n_moe_cache_misses;
+    }
+
     return base;
 }
 
