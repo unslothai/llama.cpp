@@ -18,6 +18,8 @@ server = ServerPreset.tinyllama2()
 
 _ASYNC_BANNER = "parking and resuming asynchronously"
 
+_scratch = []  # files a test wrote, removed after it
+
 _PROMPT_A = "Once upon a time there was a brave knight who"
 _PROMPT_B = "The quick brown fox jumps over the lazy dog and"
 _PROMPT_C = "In a small village by the sea there lived a fisherman who"
@@ -38,6 +40,10 @@ def create_server():
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
     yield
+    if _scratch:
+        server.stop()
+    while _scratch:
+        os.remove(_scratch.pop())
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
                  "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
@@ -1092,3 +1098,220 @@ def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     assert timings["prompt_n"] == n_prompt, timings
     assert timings["cache_n"] == 0, timings
     assert timings["predicted_n"] == n_predict, timings
+
+
+def _slot_view(slot_id: int) -> dict:
+    return next(s for s in server.make_request("GET", "/slots").body if s["id"] == slot_id)
+
+
+def _n_decoded(slot: dict) -> int:
+    return slot.get("next_token", [{}])[0].get("n_decoded", 0) if slot.get("is_processing") else 0
+
+
+def _raw_completion(n_predict: int, prompt, id_slot: int = -1, timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    return server.make_request("POST", "/completion", data={
+        "n_predict": n_predict, "prompt": prompt, "id_slot": id_slot, "cache_prompt": False,
+        "ignore_eos": True, "temperature": 0.0, "seed": 42,
+    }, timeout=timeout)
+
+
+def _serve_with_training_context(n_ctx_train: int):
+    """Serve a copy of the model that claims a longer training context, which caps the slot context: a generation that outlasts the 2 s a parked head waits needs more than 2048 tokens."""
+    _start(n_ctx=256)
+    path = server.make_request("GET", "/props").body["model_path"]
+    server.stop()
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    key = b"llama.context_length"
+    at = data.find(key) + len(key)
+    assert at > len(key) and struct.unpack_from("<I", data, at)[0] == 4, "not a uint32 llama.context_length"
+    struct.pack_into("<I", data, at + 4, n_ctx_train)
+    fd, out = tempfile.mkstemp(suffix=".gguf")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    _scratch.append(out)
+    server.model_file = out
+    server.model_hf_repo = server.model_hf_file = None
+
+
+def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
+    # a parked head of 6900 cells needs nearly the whole pool, and short requests that fit kept arriving and finishing, two queued per slot, so a resident was always there and the head waited for as long as the stream lasted. Once the head has waited its turn, a prompt that has never been resident waits for it.
+    # 1 MiB holds no short request's state, so none is rotated out for the head before PREEMPT_ROTATE_RECOMPUTE_US: what brings the head back early is the reservation alone
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    # parks the head while it generates; a short request never gets that far
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "48"
+    _serve_with_training_context(8192)
+    _start(n_ctx=8192, n_slots=4, n_batch=2048)
+
+    short_prompt = _prompt_of(1700, _PROMPT_B)
+    head_prompt = _prompt_of(6800, _PROMPT_A)
+    n_short, n_head = 32, 100
+    t_stream_max = 40.0
+
+    stop = threading.Event()
+    shorts = []
+    lock = threading.Lock()
+
+    def stream(id_slot):
+        while not stop.is_set():
+            res = _raw_completion(n_short, short_prompt, id_slot)
+            with lock:
+                shorts.append((time.time(), res))
+
+    workers = [threading.Thread(target=stream, args=(i % 3,), daemon=True) for i in range(6)]
+    for w in workers:
+        w.start()
+
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and len(shorts) < 6:
+            time.sleep(0.01)
+        t_head = time.time()
+        with ThreadPoolExecutor(1) as pool:
+            fut = pool.submit(_raw_completion, n_head, head_prompt, 3, 180)
+            while not fut.done() and time.time() - t_head < t_stream_max:
+                time.sleep(0.05)
+            stopped_early = not fut.done()
+            stop.set()
+            head = fut.result()
+    finally:
+        stop.set()
+        for w in workers:
+            w.join(120)
+
+    assert head.status_code == 200, head.body
+    assert head.body["timings"]["predicted_n"] == n_head
+    for _, res in shorts:
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_short
+
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    assert not stopped_early, f"the head was still waiting when the stream was stopped after {t_stream_max} s"
+    assert "prompt held:" in text, "no prompt was held back for the head"
+    # the head comes back once the residents in front of it have finished, about one quantum after each park
+    waits = [float(w) for w in re.findall(r"id +3 \| task \d+ \| resumed after ([\d.]+) s", text)]
+    assert waits, "the head was never parked and resumed"
+    assert max(waits) < 10.0, f"the head waited {waits} s behind requests that came after it"
+
+
+def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
+    # only a resident cycling through context shifts used to be rotated, so a long generation that fits the pool held it to the end, and the parked slot waited for all of it
+    _serve_with_training_context(16384)
+    _start(n_ctx=16384, n_slots=2, n_batch=2048)
+
+    done = {}
+
+    def run(name, n_predict, prompt, id_slot):
+        res = _raw_completion(n_predict, prompt, id_slot, timeout=900)
+        done[name] = (time.time(), res)
+
+    # A leads B by 564 cells throughout, so B is the one parked once the two fill the pool; A then has about 7600 tokens to go, far longer than the 2 s a parked head waits
+    a = threading.Thread(target=run, args=("a", 16000, _prompt_of(64, _PROMPT_A), 0))
+    a.start()
+    deadline = time.time() + 300
+    while time.time() < deadline and _n_decoded(_slot_view(0)) < 2000:
+        time.sleep(0.01)
+    b = threading.Thread(target=run, args=("b", 8000, _prompt_of(1500, _PROMPT_B), 1))
+    b.start()
+    a.join(900)
+    b.join(900)
+
+    for name in ("a", "b"):
+        assert done[name][1].status_code == 200, done[name][1].body
+    assert done["a"][1].body["timings"]["predicted_n"] == 16000
+    assert done["b"][1].body["timings"]["predicted_n"] == 8000
+
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    assert "slot context shift" not in text
+    assert "rotated out after 0 context shifts" in text, "the long resident was never rotated out"
+    assert done["b"][0] < done["a"][0], "the parked slot only came back once the long resident had finished"
+
+
+def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():
+    # the second chunk of a long prompt is short of about 600 cells: smallest first parked both 400-token residents, where the 1400-token one covers the shortfall alone
+    _serve_with_training_context(8192)
+    _start(n_ctx=4864, n_slots=4, n_batch=2048)
+
+    small = [_prompt_of(400, _PROMPT_A), _prompt_of(400, _PROMPT_B)]
+    medium = _prompt_of(1400, _PROMPT_C)
+    leader = _prompt_of(3267, _PROMPT_A)
+
+    with ThreadPoolExecutor(4) as pool:
+        residents = [pool.submit(_raw_completion, 300, p, i) for i, p in enumerate(small + [medium])]
+        # every resident is generating before the leader arrives, so the leader's second chunk is what the pool is short of
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            slots = server.make_request("GET", "/slots").body
+            if all(_n_decoded(s) > 0 for s in slots if s["id"] < 3):
+                break
+            time.sleep(0.002)
+        last = pool.submit(_raw_completion, 8, leader, 3)
+        results = [r.result() for r in residents] + [last.result()]
+
+    for res, n_predict in zip(results, (300, 300, 300, 8)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    first_resume = text.find("resumed after")
+    assert first_resume > 0, "nothing was parked"
+    parks = [int(n) for n in re.findall(r"preempted: (\d+) cells", text[:first_resume])]
+    assert len(parks) == 1, f"parked {parks} where one resident covered the shortfall"
+    assert parks[0] >= 1400, parks
+
+
+@pytest.mark.parametrize("ram", ["8192", "0", "unset"])
+def test_props_reports_the_preemption_setup(ram):
+    # a client deciding whether to rely on parking reads this instead of guessing from the version
+    if ram == "unset":
+        os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
+    else:
+        os.environ["LLAMA_ARG_PREEMPT_RAM"] = ram
+    _start(n_ctx=256)
+
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    preempt = res.body["preempt"]
+    assert sorted(preempt) == ["async", "enabled", "granularity", "notices", "ram_mib", "recurrent"]
+    assert preempt["enabled"] is (ram == "8192")
+    assert preempt["ram_mib"] == (8192 if ram == "8192" else 0)
+    assert preempt["async"] is False or ram == "8192"
+    assert isinstance(preempt["async"], bool)
+    assert preempt["notices"] == 2
+    assert preempt["recurrent"] is False
+    assert preempt["granularity"] == 1
+
+
+def test_props_reports_preemption_off_without_a_unified_cache():
+    _start(n_ctx=256, kv_unified=False)
+    preempt = server.make_request("GET", "/props").body["preempt"]
+    assert preempt["enabled"] is False
+    assert preempt["ram_mib"] == 8192
+    assert preempt["async"] is False
+
+
+def test_props_reports_the_planning_granularity():
+    os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
+    _start(n_ctx=1024)
+    preempt = server.make_request("GET", "/props").body["preempt"]
+    assert preempt["enabled"] is True
+    assert preempt["granularity"] == 64
+
+
+def test_a_growing_sequence_keeps_its_pinned_buffer_across_parks():
+    # the pinned buffer was sized to the exact state, so every park of a sequence that had grown since the last one unpinned it and pinned a new one, which costs about as long as the copy itself
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start_async(n_ctx=2048)
+
+    res = _complete(400, _prompt_of(1000, _PROMPT_A))
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["predicted_n"] == 400
+
+    text = _log()
+    parks = text.count("park completed after")
+    sizes = re.findall(r"pinned park buffer (?:allocated|grown)", text)
+    assert parks >= 40, parks
+    assert 1 <= len(sizes) <= 4, f"{len(sizes)} pinned allocations for {parks} parks"
