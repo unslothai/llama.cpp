@@ -4,14 +4,15 @@
 name: Unsloth prebuilt (full release)
 
 # Atomic daily build for unslothai/llama.cpp. One cron, one workflow run, one
-# release per upstream b#### tag. Splits the heavy build work into six reusable
+# release per upstream b#### tag. Splits the heavy build work into seven reusable
 # children:
-#   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)
-#   unsloth-prebuilt-cuda-windows.yml  -- CUDA Windows bundles (x64, matrix profiles)
-#   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Windows + Ubuntu, per gfx target)
-#   unsloth-prebuilt-macos.yml         -- macOS bundles (arm64 Metal + x64 CPU)
-#   unsloth-prebuilt-cpu.yml           -- CPU-only bundles (Linux + Windows, x64 + arm64)
-#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux x64/arm64 + Windows x64)
+#   unsloth-prebuilt-cuda.yml              -- Linux CUDA bundles (x64 + arm64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows.yml      -- CUDA Windows bundles (x64, matrix profiles)
+#   unsloth-prebuilt-cuda-windows-arm64.yml -- CUDA Windows bundle (arm64, cross-compiled)
+#   unsloth-prebuilt-rocm.yml              -- ROCm bundles (Windows + Ubuntu, per gfx target)
+#   unsloth-prebuilt-macos.yml             -- macOS bundles (arm64 Metal + x64 CPU)
+#   unsloth-prebuilt-cpu.yml               -- CPU-only bundles (Linux + Windows, x64 + arm64)
+#   unsloth-prebuilt-vulkan.yml            -- Vulkan bundles (Linux x64/arm64 + Windows x64)
 #
 # Atomicity: the `assemble` job depends on all children. GitHub's default
 # `needs` semantics require all needs to succeed -- if any matrix entry in
@@ -100,23 +101,23 @@ jobs:
     permissions:
       contents: read
     outputs:
-      tag: ${{ steps.r.outputs.tag }}
-      repo: ${{ steps.r.outputs.repo }}
-      base: ${{ steps.r.outputs.base }}
-      prs: ${{ steps.r.outputs.prs }}
-      source_artifact: ${{ steps.r.outputs.source_artifact }}
-      commit: ${{ steps.r.outputs.commit }}
-      ggml_tree: ${{ steps.r.outputs.ggml_tree }}
-      ggml_version: ${{ steps.r.outputs.ggml_version }}
-      exists: ${{ steps.r.outputs.exists }}
+      tag: ${{ steps.m.outputs.tag }}
+      repo: ${{ steps.m.outputs.repo }}
+      base: ${{ steps.m.outputs.base }}
+      prs: ${{ steps.m.outputs.prs }}
+      source_artifact: ${{ steps.m.outputs.source_artifact }}
+      commit: ${{ steps.m.outputs.commit }}
+      ggml_tree: ${{ steps.m.outputs.ggml_tree }}
+      ggml_version: ${{ steps.m.outputs.ggml_version }}
+      exists: ${{ steps.m.outputs.exists }}
       # The CUDA matrices pass through the `warm` step, which stamps `shards`.
       cuda_matrix: ${{ steps.warm.outputs.cuda_matrix }}
       win_cuda_matrix: ${{ steps.warm.outputs.win_cuda_matrix }}
       cuda_warm_matrix: ${{ steps.warm.outputs.cuda_warm_matrix }}
       win_cuda_warm_matrix: ${{ steps.warm.outputs.win_cuda_warm_matrix }}
-      rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
-      rocm_cutoff: ${{ steps.r.outputs.rocm_cutoff }}
-      macos_matrix: ${{ steps.r.outputs.macos_matrix }}
+      rocm_matrix: ${{ steps.m.outputs.rocm_matrix }}
+      rocm_cutoff: ${{ steps.m.outputs.rocm_cutoff }}
+      macos_matrix: ${{ steps.m.outputs.macos_matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -127,6 +128,31 @@ jobs:
       - id: r
         run: |
           set -euo pipefail
+
+          # This one step resolves the tag, fetches the base, merges every pinned
+          # PR and bakes build-info. 5 of the 12 failures in the 19 runs before
+          # 09-18 died somewhere inside it and could not be attributed afterwards,
+          # because GitHub serves 410 for run and job logs after a few days. PHASE
+          # names the section and the trap copies it, the line and the failing
+          # command into the run summary, which survives log expiry.
+          PHASE='startup'
+          on_err() {
+            local rc=$? line=$1
+            {
+              echo "### Resolve failed"
+              echo
+              echo "| field | value |"
+              echo "|---|---|"
+              echo "| phase | \`${PHASE}\` |"
+              echo "| line | ${line} |"
+              echo "| command | \`${BASH_COMMAND}\` |"
+              echo "| exit | ${rc} |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "resolve failed in phase '${PHASE}' at line ${line}: ${BASH_COMMAND} (exit ${rc})" >&2
+          }
+          trap 'on_err $LINENO' ERR
+
+          PHASE='read inputs'
           REQ='${{ github.event.inputs.tag || 'latest' }}'
           ONLY='${{ github.event.inputs.only_profile || 'all' }}'
           GFX_DEFAULT='gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
@@ -187,6 +213,7 @@ jobs:
                        and ((if .required == null then true else .required end) | type == "boolean")))' \
              scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
+          PHASE='parse pr-set.json'
           PRS='[]'
           URL_RE='^https://github\.com/(ggml-org|unslothai)/llama\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           while read -r url REQUIRED; do
@@ -261,6 +288,7 @@ jobs:
             TAG="${BASE}-mix-${SETHASH}"
             REPO="$GITHUB_REPOSITORY"
           fi
+          PHASE='check for an existing release'
           SRC_ARTIFACT="app-source-${TAG}"
           COMMIT=""
           GGML_TREE=""
@@ -284,6 +312,7 @@ jobs:
           # place. Nothing is pushed (GITHUB_TOKEN may never push commits touching
           # .github/workflows, which upstream history routinely does).
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PHASE='fetch base + merge pins'
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
             # The upstream checkout below takes scripts/unsloth/ away. Copy the
             # whole dir out, not file by file: see the note above the step.
@@ -327,6 +356,7 @@ jobs:
                     echo "::warning::${SRC}#${NUM} needed an additive merge; every conflict was a pure add/add and both sides were kept"
                   else
                     git merge --abort 2>/dev/null
+                    echo "- pin \`${SRC}#${NUM}\` (\`${SHA}\`) does not merge onto \`${BASE}\` + the pins before it" >> "$GITHUB_STEP_SUMMARY"
                     echo "${SRC}#${NUM} (${SHA}) does not merge cleanly onto ${BASE} + the PRs listed before it; reorder or drop it in scripts/unsloth/pr-set.json" >&2; exit 1
                   fi
                 fi
@@ -394,6 +424,24 @@ jobs:
           # cuda12 installs via Jimver; cuda13 is pinned to 13.3 (matching
           # upstream) which Jimver lacks, so those install via NVIDIA redist in
           # the build children -- on the same runners, so the glibc floor holds.
+          # The matrix construction below moved into its own step: this one was at 98% of
+          # GitHub's 21000-character limit per run string, and a step that exceeds it makes
+          # the whole workflow refuse to compile with no annotation anywhere. A step boundary
+          # resets the budget. These are the variables the second half reads.
+          for v in BASE COMMIT EXISTS GFX GGML_TREE GGML_VERSION ONLY PRS REPO REQ SRC_ARTIFACT TAG; do
+            printf "%s<<__UNSLOTH_EOF__\n%s\n__UNSLOTH_EOF__\n" "$v" "${!v}" >> "$GITHUB_ENV"
+          done
+
+      # Second half of resolve. Same script, same order, its own name so a failure
+      # here is attributable instead of being another anonymous line in one 300-line
+      # step. Reads the first half's variables from the environment.
+      - id: m
+        run: |
+          set -euo pipefail
+          PHASE='build the child matrices'
+          on_err() { local rc=$? line=$1; printf '### Resolve (matrices) failed\n\nphase `%s`, line %s, command `%s`, exit %s\n' "$PHASE" "$line" "$BASH_COMMAND" "$rc" >> "$GITHUB_STEP_SUMMARY"; }
+          trap 'on_err $LINENO' ERR
+
           ALL='[
             {"profile":"cuda12-legacy",  "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"legacy",  "rank":5, "cuda":"12.8.0","toolkit_line":"12.8","archs":"50-virtual 61-virtual","sms":"50 52 60 61"},
             {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "line":"cuda12","klass":"older",   "rank":10,"cuda":"12.8.0","toolkit_line":"12.8","archs":"70 75 80 86 89"},
@@ -455,8 +503,8 @@ jobs:
       - name: Warm shard matrix for the CUDA children
         id: warm
         env:
-          CUDA_MATRIX: ${{ steps.r.outputs.cuda_matrix }}
-          WIN_CUDA_MATRIX: ${{ steps.r.outputs.win_cuda_matrix }}
+          CUDA_MATRIX: ${{ steps.m.outputs.cuda_matrix }}
+          WIN_CUDA_MATRIX: ${{ steps.m.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
           # Warm shards are DISABLED (every profile 0); the caching fixes do not depend on them.
@@ -504,8 +552,8 @@ jobs:
         # titles, which are third-party text, and `${{ }}` pastes them into the
         # shell source before bash ever sees it.
         env:
-          PRS: ${{ steps.r.outputs.prs }}
-          BASE: ${{ steps.r.outputs.base }}
+          PRS: ${{ steps.m.outputs.prs }}
+          BASE: ${{ steps.m.outputs.base }}
         run: |
           set -euo pipefail
           if ! python3 "${RUNNER_TEMP}/us/pin_contract.py" --root . --base "$BASE" \
@@ -538,11 +586,11 @@ jobs:
       # produced when we build, so guard on the same condition as the build jobs
       # (resolve skips source prep on a scheduled no-op, leaving no tarball).
       - name: Upload source artifact
-        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ steps.m.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
-          name: ${{ steps.r.outputs.source_artifact }}
-          path: ${{ runner.temp }}/llama.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
+          name: ${{ steps.m.outputs.source_artifact }}
+          path: ${{ runner.temp }}/llama.cpp-source-${{ steps.m.outputs.tag }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -571,6 +619,28 @@ jobs:
       commit: ${{ needs.resolve.outputs.commit }}
       matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
       warm_matrix: ${{ needs.resolve.outputs.win_cuda_warm_matrix }}
+    secrets: inherit
+
+  # Windows on ARM CUDA. Separate child, not a row in the x64 matrix: it cross
+  # compiles on an x64 runner with the only toolkit that has ARM64 target
+  # libraries (13.4) and builds just the ggml-cuda backend, which it merges into
+  # the arm64 CPU bundle the `CPU` child builds in this same run. See that
+  # workflow's header.
+  build-windows-cuda-arm64:
+    name: CUDA Windows ARM64
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    # actions: read is for the step that waits on the CPU child's artifact; a
+    # called workflow cannot request more than the caller's job grants it.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/unsloth-prebuilt-cuda-windows-arm64.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      commit: ${{ needs.resolve.outputs.commit }}
     secrets: inherit
 
   # First of two ccache prunes (see scripts/unsloth/prune_ccache.sh): one generation per prefix
@@ -688,7 +758,7 @@ jobs:
           # job list as "<caller job name> / <called job name>", e.g.
           # "CUDA / x64/cuda12-legacy". One prefix per build child; every one of
           # them must be represented or we are not looking at a complete run.
-          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
+          PREFIXES=('CUDA / ' 'CUDA Windows / ' 'CUDA Windows ARM64 / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
           SELF='Assemble metadata + publish'
           ALERT='Report pipeline health'
           # Best-effort jobs that never gate a publish: the start-of-run ccache prune and the
@@ -752,7 +822,7 @@ jobs:
             fi
             if [ -n "$UNSCHEDULED" ]; then
               if [ "$(date +%s)" -gt "$DEADLINE" ]; then
-                echo "ERROR: timed out before the build legs of${UNSCHEDULED} were scheduled behind their warm shards" >&2
+                echo "PUBLISH_DEFERRED_WAITER_DEADLINE: timed out before the build legs of${UNSCHEDULED} were scheduled behind their warm shards" >&2
                 exit 1
               fi
               echo "warm shards still running, build legs not yet scheduled for:${UNSCHEDULED}"
@@ -786,13 +856,12 @@ jobs:
               break
             fi
             if [ "$(date +%s)" -gt "$DEADLINE" ]; then
-              echo "ERROR: timed out waiting for the build matrix; ${PENDING} of ${TOTAL} jobs still running" >&2
+              echo "PUBLISH_DEFERRED_WAITER_DEADLINE: timed out waiting for the build matrix; ${PENDING} of ${TOTAL} jobs still running" >&2
               exit 1
             fi
             echo "${PENDING} of ${TOTAL} build jobs still running; polling again in ${POLL}s"
             sleep "$POLL"
           done
-
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
@@ -1069,6 +1138,39 @@ jobs:
             echo "::warning::whisper.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
           fi
 
+      # audio.cpp vendors its own patched ggml, so a llama release changes
+      # nothing it ships. The event is only a wake-up: audio.cpp ignores the
+      # payload and re-resolves the newest aged upstream audio.cpp release, so
+      # a new upstream tag is published within hours instead of at its cron.
+      - name: Notify audio.cpp
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        # Never fail a published release because the notification did not land.
+        continue-on-error: true
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUDIO_CPP_DISPATCH_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          # No -x here: it would trace the token into the log.
+          set -eu
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::AUDIO_CPP_DISPATCH_TOKEN is not set; audio.cpp will only pick this up on its own schedule"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg t "$TAG" --arg r "$GITHUB_RUN_ID" \
+            '{event_type: "llama-published", client_payload: {llama_tag: $t, run_id: $r}}')"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/unslothai/audio.cpp/dispatches \
+            -d "$PAYLOAD")"
+          # 204 is "event accepted", not "audio.cpp published". Its dead-man
+          # check is what catches a dropped or ignored event.
+          if [ "$CODE" = "204" ]; then
+            echo "notified audio.cpp of ${TAG}"
+          else
+            echo "::warning::audio.cpp dispatch returned HTTP ${CODE}; it will fall back to its own schedule"
+          fi
+
   # Reclaim this run's Actions artifact storage once the release is canonical.
   #
   # Every prebuilt is stored TWICE: as an Actions artifact (billed against the
@@ -1114,7 +1216,7 @@ jobs:
     # Every build leg, not just assemble.
     # assemble needs only resolve, so one failing leg fails it immediately while slower legs are still building, and with always() this job then deleted the app-source-* artifact out from under them.
     # On 08-27 one arm64 CPU failure became ten: nine ROCm legs died on "Artifact not found" seconds later, which reads as a ROCm fault and is not.
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
+    needs: [resolve, build-cuda, build-windows-cuda, build-windows-cuda-arm64, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     # always(), so a run that publishes NOTHING still cleans up after itself.
     # Gating this on `published` leaked every non-publishing run's bundles: a
     # workflow_dispatch defaults to publish:false, and a cancelled run never
@@ -1288,7 +1390,7 @@ jobs:
   # Runs on publish-intent runs only, so subset test dispatches stay quiet.
   alert:
     name: Report pipeline health
-    needs: [resolve, build-cuda, build-windows-cuda, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
+    needs: [resolve, build-cuda, build-windows-cuda, build-windows-cuda-arm64, build-rocm, build-macos, build-cpu, build-vulkan, assemble]
     if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
     runs-on: ubuntu-24.04
     permissions:

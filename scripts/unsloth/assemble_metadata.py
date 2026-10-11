@@ -71,6 +71,7 @@ KIND_BY_CUDA = {
     ("linux",   "x64"):   {"manifest": "linux-cuda",       "sha": "linux-cuda-app"},
     ("linux",   "arm64"): {"manifest": "linux-arm64-cuda", "sha": "linux-arm64-cuda-app"},
     ("windows", "x64"):   {"manifest": "windows-cuda",     "sha": "windows-cuda-app"},
+    ("windows", "arm64"): {"manifest": "windows-arm64-cuda", "sha": "windows-arm64-cuda-app"},
 }
 
 KIND_BY_ROCM_PLATFORM = {
@@ -434,7 +435,11 @@ def main() -> int:
         assets = upstream_assets(tag, token)
         wanted: list[tuple[str, str]] = []  # (name, kind)
         for name in sorted(assets):
-            if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-x64\.zip", name):
+            # arm64 as well as x64: package_bundle.py deliberately leaves the CUDA
+            # runtime out of every bundle, so the Windows ARM64 CUDA bundle needs
+            # upstream's cudart-...-arm64.zip recorded here or the installer has no
+            # approved hash to pair it with.
+            if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-(?:x64|arm64)\.zip", name):
                 wanted.append((name, "windows-cuda-upstream"))
             # The win-cuda BINARY zips must be recorded under their own names too:
             # the installer resolves an attempt's hash by exact asset name first
@@ -442,7 +447,7 @@ def main() -> int:
             # entries every Windows CUDA binary gets paired with the cudart digest
             # and fails download verification.
             elif re.fullmatch(
-                rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-x64\.zip", name
+                rf"llama-{re.escape(tag)}-bin-win-cuda-\d+\.\d+-(?:x64|arm64)\.zip", name
             ):
                 wanted.append((name, "windows-cuda-upstream"))
         # x64 CPU and all current Vulkan targets are no longer passthroughs --

@@ -74,6 +74,8 @@ jobs:
       # in a way they do not elsewhere. Setting a launcher for a language this
       # build never enables is inert, so both are set unconditionally.
       - name: ccache
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
           key: macos-${{ matrix.build }}-${{ matrix.deploy_target }}-${{ inputs.tag }}
@@ -85,12 +87,27 @@ jobs:
           save: false
 
       - name: Configure ccache
-        # compiler_check=content: the toolchain is reinstalled every run, so mtime identity misses a
-        # byte-identical compiler. Sloppiness is the documented safe set; level 6 fits more under max-size.
+        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
+        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
+        # archive". A cache accelerator must never fail a release build. So verify ccache
+        # POSITIVELY here and, when it is missing or older than the options below require,
+        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
+        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
+        # would quietly change cache semantics rather than announce itself.
         run: |
-          ccache --set-config=compiler_check=content
-          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
-          ccache --set-config=compression_level=6
+          set -uo pipefail
+          need=4.10
+          have="$(ccache --version 2>/dev/null | head -1 | awk '{print $3}')"
+          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" = "$need" ]; then
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            echo "CCACHE_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "::warning::ccache unusable (found '${have:-none}', need >= $need); building without a cache"
+          echo "- ccache unusable (found \`${have:-none}\`); this leg built without a cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "CCACHE_LAUNCHER=" >> "$GITHUB_ENV"
 
       - name: Build (deployment target ${{ matrix.deploy_target }})
         working-directory: src
@@ -98,10 +115,10 @@ jobs:
           set -euo pipefail
           cmake -B build \
             ${{ matrix.defines }} \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_OBJC_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deploy_target }} \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
