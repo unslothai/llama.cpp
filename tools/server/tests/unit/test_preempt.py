@@ -19,6 +19,7 @@ server = ServerPreset.tinyllama2()
 _ASYNC_BANNER = "parking and resuming asynchronously"
 
 _scratch = []  # files a test wrote, removed after it
+_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")  # put back after a test that hides the GPUs
 
 _PROMPT_A = "Once upon a time there was a brave knight who"
 _PROMPT_B = "The quick brown fox jumps over the lazy dog and"
@@ -40,6 +41,10 @@ def create_server():
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
     yield
+    if _cuda_devices is None:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _cuda_devices
     if _scratch:
         server.stop()
     while _scratch:
@@ -1135,16 +1140,18 @@ def _serve_with_training_context(n_ctx_train: int):
 
 
 def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
-    # a parked head of 6900 cells needs nearly the whole pool, and short requests that fit kept arriving and finishing, two queued per slot, so a resident was always there and the head waited for as long as the stream lasted. Once the head has waited its turn, a prompt that has never been resident waits for it.
+    # a parked head of 7300 cells needs nearly the whole pool, and short requests that fit kept arriving and finishing, two queued per slot, so a resident was always there and the head waited for as long as the stream lasted. Once the head has waited its turn, a prompt that has never been resident waits for it.
     # 1 MiB holds no short request's state, so none is rotated out for the head before PREEMPT_ROTATE_RECOMPUTE_US: what brings the head back early is the reservation alone
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     # parks the head while it generates; a short request never gets that far
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "48"
+    # the scheduling under test is host code; on CUDA a prompt chunk across position 2048 of this context-extended model hangs llama_decode, the pin's base included, so the server runs on the CPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     _serve_with_training_context(8192)
-    _start(n_ctx=8192, n_slots=4, n_batch=2048)
+    _start(n_ctx=8192, n_slots=4, n_batch=1024)
 
     short_prompt = _prompt_of(1700, _PROMPT_B)
-    head_prompt = _prompt_of(6800, _PROMPT_A)
+    head_prompt = _prompt_of(7200, _PROMPT_A)
     n_short, n_head = 32, 100
     t_stream_max = 40.0
 
