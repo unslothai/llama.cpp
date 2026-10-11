@@ -29,7 +29,7 @@ class common_params_fit_exception : public std::runtime_error {
 
 // --moe-cache-mib auto keeps the layer split instead of a MoE cache when the split would hold at least this share of the
 // expert weights in device memory (calibrated in the measurements on the pull request)
-static constexpr double MOE_CACHE_AUTO_MAX_RESIDENT = 0.35;
+static constexpr double MOE_CACHE_AUTO_MAX_RESIDENT = 0.80;
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
