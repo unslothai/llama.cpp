@@ -495,7 +495,7 @@ struct server_slot {
             return need;
         }
 
-        const size_t step = 1u << 20;
+        const size_t step = 64u << 10;
 
         return ((std::max(need, held + held / 2) + step - 1) / step) * step;
     }
@@ -4467,11 +4467,12 @@ private:
     bool preempt_park(server_slot & slot, int64_t t_start, bool recompute = false) {
         slot.t_preempt_copy_us = t_start;
 
-        // [TAG_PREEMPT_ASYNC] reserve ahead only where the budget holds the larger capacity, which is what preempt_state_size() then charges
+        // [TAG_PREEMPT_ASYNC] reserve ahead only where the budget still holds another state of that size afterwards: preempt_state_size() charges the slack, which must not crowd out the next park
         if (!recompute && slot.preempt_is_async()) {
-            const size_t held = slot.preempt_state_size();
+            const size_t held  = slot.preempt_state_size();
+            const size_t grown = slot.preempt_state_grown();
 
-            slot.preempt_grow = preempt_ram_used() - held + slot.preempt_state_grown() <= preempt_ram_budget();
+            slot.preempt_grow = preempt_ram_used() - held + 2 * grown <= preempt_ram_budget();
         }
 
         // [TAG_PREEMPT] a budget check grants permission to allocate, not a successful allocation: preempt_save() unwinds and waits for whatever it issued, so the same victim can still be parked by dropping its cells
