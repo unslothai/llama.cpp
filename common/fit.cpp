@@ -27,6 +27,10 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// --moe-cache-mib auto keeps the layer split instead of a MoE cache when the split would hold at least this share of the
+// expert weights in device memory (calibrated in the measurements on the pull request)
+static constexpr double MOE_CACHE_AUTO_MAX_RESIDENT = 0.35;
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -675,8 +679,18 @@ static void common_params_fit_impl(
 
     // MoE cache: every routed expert stays in system memory and the device memory that is left over caches the used ones
     // all sizes are relative to the free memory measured at the start, as for the layers below
-    if (moe_cache_auto && global_surplus_cpu_moe > 0) {
-        const int64_t target = dmds_full[0].free - margins[0];
+    //
+    // the cache gets the same device memory the layer split below would spend on resident expert layers, so when that
+    // memory already holds most of the experts the split wins: its resident layers cost nothing per token, while the
+    // cache pays an upload for every miss
+    const int64_t target_moe     = dmds_full[0].free - margins[0];
+    const int64_t mem_experts    = int64_t(dmds_full[0].mb.total()) - mem_cpu_moe;
+    const double  frac_resident  = mem_experts > 0 ? double(target_moe - mem_cpu_moe) / double(mem_experts) : 1.0;
+    if (moe_cache_auto && global_surplus_cpu_moe > 0 && frac_resident >= MOE_CACHE_AUTO_MAX_RESIDENT) {
+        LOG_INF("%s: moe cache auto: the layer split keeps %.0f%% of the expert weights in device memory, not using a MoE cache\n",
+            __func__, 100.0*frac_resident);
+    } else if (moe_cache_auto && global_surplus_cpu_moe > 0) {
+        const int64_t target = target_moe;
 
         // on any error, do not load the model with a partially applied MoE cache
         struct rollback_t {
