@@ -943,6 +943,7 @@ struct ggml_backend_sched_split {
     // its weight copies are in staging slot pf_ordinal % depth
     int  pf_ordinal;
     // the copies are issued ahead on the copy queue, otherwise they are made by the regular path (copy callback) into the slot
+    // (after a callback changed since the graph was allocated)
     bool pf_async;
 };
 
@@ -2691,14 +2692,28 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_eval_user_data = user_data;
 }
 
+// the copies of the allocated graph were selected for prefetch with the previous callbacks: they are made by the regular path
+// (with the current callbacks) into their slots until the next allocation selects them again
+static void ggml_backend_sched_prefetch_invalidate(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        sched->splits[i].pf_async = false;
+    }
+}
+
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
     GGML_ASSERT(sched);
+    if (sched->callback_copy != callback || sched->callback_copy_user_data != user_data) {
+        ggml_backend_sched_prefetch_invalidate(sched);
+    }
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
 }
 
 void ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data) {
     GGML_ASSERT(sched);
+    if (sched->callback_prefetch != callback || sched->callback_prefetch_user_data != user_data) {
+        ggml_backend_sched_prefetch_invalidate(sched);
+    }
     sched->callback_prefetch = callback;
     sched->callback_prefetch_user_data = user_data;
 }
