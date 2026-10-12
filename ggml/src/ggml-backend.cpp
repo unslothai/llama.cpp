@@ -2138,7 +2138,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 async = false;
             }
         }
-        if (bytes == 0) {
+        // a split with a SYNC copy is not prefetched, its copies are allocated by the graph allocator as without prefetch,
+        // so the slots (and the copy queue) are only created for the splits whose copies are issued ahead
+        if (bytes == 0 || !async) {
             continue;
         }
 
