@@ -346,7 +346,7 @@ extern "C" {
     // How an input weight in a host buffer is copied to the backend of the split that uses it
     enum ggml_backend_sched_prefetch_mode {
         GGML_BACKEND_SCHED_PREFETCH_NONE  = 0, // copied when the split starts, the copy is allocated by the graph allocator (no prefetch)
-        GGML_BACKEND_SCHED_PREFETCH_SYNC  = 1, // copied when the split starts, into a staging slot (the copy needs results of earlier splits)
+        GGML_BACKEND_SCHED_PREFETCH_SYNC  = 1, // copied when the split starts (the copy needs results of earlier splits), the split is not prefetched
         GGML_BACKEND_SCHED_PREFETCH_ASYNC = 2, // copied into a staging slot on a separate copy queue, ahead of the split
     };
 
@@ -354,6 +354,8 @@ extern "C" {
     // ASYNC copies are made by the copy callback (if set) called with the copy queue backend, or whole if it returns false
     // such copies must not depend on the results of the graph computation (they may be issued before the previous splits are computed)
     // return NONE for host tensors whose contents change during the graph computation
+    // (user inputs, also through views, and weights written by the graph itself are never prefetched)
+    // a callback set after the graph is allocated applies from its next allocation, until then its copies use the regular path
     // when a copy callback is set and no prefetch callback is set, no weights are prefetched
     // prefetching is controlled with the env vars GGML_SCHED_PREFETCH (0 = off) and GGML_SCHED_PREFETCH_DEPTH
     typedef enum ggml_backend_sched_prefetch_mode (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, const struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
