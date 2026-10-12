@@ -2318,6 +2318,16 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// the computation stopped before all the prefetched splits were computed: wait for the copies issued ahead, so that they
+// cannot write a slot after it is reused or read host memory after the caller regains control
+static void ggml_backend_sched_prefetch_drain(ggml_backend_sched_t sched) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->pf[b].copy_backend != NULL) {
+            ggml_backend_synchronize(sched->pf[b].copy_backend);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2384,6 +2394,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_prefetch_drain(sched);
                 return ec;
             }
         } else {
@@ -2406,6 +2417,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_prefetch_drain(sched);
                     return ec;
                 }
 
