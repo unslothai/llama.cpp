@@ -129,6 +129,43 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// Rows shorter than a block: one thread per element over all rows, so that the threads of a block are not idle.
+// The element type T is the source type, or int4 for a vectorized copy of rows of the same type.
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_flat(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr, const uint32_t n,
+        const uint3 ne00_fdv, const uint3 ne10_fdv, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
+    for (uint32_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        const uint2 dm00 = fast_div_modulo(i,       ne00_fdv); // row, i00
+        const uint2 dm10 = fast_div_modulo(dm00.x,  ne10_fdv); // z, i10
+        const uint2 dm12 = fast_div_modulo(dm10.x,  ne12_fdv); // i11, i12
+        const int64_t i00 = dm00.y;
+        const int64_t i10 = dm10.y;
+        const int64_t i11 = dm12.x;
+        const int64_t i12 = dm12.y;
+
+        const int64_t i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const src0_t * src0_row = (const src0_t *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+        if constexpr (std::is_same<src0_t, dst_t>::value) {
+            dst[i10*s1 + i11*s2 + i12*s3 + i00] = src0_row[i00];
+        } else {
+            dst[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        }
+    }
+}
+
+// Most elements (or int4 vectors) per row for which k_get_rows_float_flat is used.
+#define GET_ROWS_FLAT_MAX_NE00 64
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -253,6 +290,46 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    // short rows: one thread per element over all rows instead of a block per row
+    {
+        const bool same_type = std::is_same<src0_t, dst_t>::value;
+        constexpr int VEC_FLAT = 16 / sizeof(dst_t);
+        const bool flat_vec = same_type && VEC_FLAT > 1 &&
+            (ne00 % VEC_FLAT == 0) &&
+            (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+            (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
+            (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
+        const int64_t ne00_flat = flat_vec ? ne00/VEC_FLAT : ne00;
+        const int64_t n_flat    = ne00_flat*ne10*ne11*ne12;
+        if (n_flat == 0) {
+            return;
+        }
+        if (ne00_flat <= GET_ROWS_FLAT_MAX_NE00 && n_flat <= int64_t(UINT32_MAX) - CUDA_GET_ROWS_BLOCK_SIZE) {
+            const int64_t nblocks = (n_flat + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+            const dim3 block_nums(MIN(nblocks, int64_t(INT32_MAX)), 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+            const uint3 ne00_fdv = init_fastdiv_values(ne00_flat);
+            const uint3 ne10_fdv = init_fastdiv_values(ne10);
+            if (flat_vec) {
+                const size_t sv = sizeof(int4) / sizeof(dst_t);
+                ggml_cuda_kernel_launch(k_get_rows_float_flat<int4, int4>, launch_params,
+                    (const int4 *) src0_d, src1_d, (int4 *) dst_d, (uint32_t) n_flat,
+                    ne00_fdv, ne10_fdv, ne12_fdv,
+                    s1/sv, s2/sv, s3/sv,
+                    nb01, nb02, nb03,
+                    s10, s11, s12);
+            } else {
+                ggml_cuda_kernel_launch(k_get_rows_float_flat<src0_t, dst_t>, launch_params,
+                    src0_d, src1_d, dst_d, (uint32_t) n_flat,
+                    ne00_fdv, ne10_fdv, ne12_fdv,
+                    s1, s2, s3,
+                    nb01, nb02, nb03,
+                    s10, s11, s12);
+            }
+            return;
+        }
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
