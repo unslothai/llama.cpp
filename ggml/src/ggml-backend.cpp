@@ -2367,6 +2367,38 @@ static void ggml_backend_sched_prefetch_drain(ggml_backend_sched_t sched) {
     }
 }
 
+// without pipeline parallelism (no events), a host-resident split input is queued as an async upload on the
+// split backend instead of a synchronous copy (2 host syncs per input); the caller synchronizes the split
+// backend once after queueing all of them, so the host data can be overwritten again as soon as
+// compute_splits moves on, as before
+static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced) {
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL || split_backend->iface.set_tensor_async == NULL) {
+        return false;
+    }
+    if (input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer)) {
+        return false;
+    }
+    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    if (input_cpy->buffer == NULL || ggml_backend_buffer_is_host(input_cpy->buffer)) {
+        return false;
+    }
+
+    if (!synced) {
+        // wait for the split backend to finish using its input copies before overwriting them
+        ggml_backend_synchronize(split_backend);
+        synced = true;
+    }
+    if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+        // produced by an earlier split
+        ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
+    }
+    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2406,10 +2438,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        bool upload_synced  = false;
+        bool upload_pending = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                if (ggml_backend_sched_upload_input_async(sched, split, split->inputs[input_id], upload_synced)) {
+                    upload_pending = true;
+                    continue;
+                }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
+        }
+        if (upload_pending) {
+            // queued before the wait on the prefetched copies of this split, so it never waits for the copy queue
+            ggml_backend_synchronize(split_backend);
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
