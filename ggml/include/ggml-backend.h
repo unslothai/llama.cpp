@@ -326,6 +326,13 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Callback deciding if an input weight in a host buffer may be prefetched
+    // a prefetched weight is copied whole into a staging slot on a separate copy queue ahead of its split, without calling the copy callback
+    // return false for host tensors whose contents change between graph computations
+    // when a copy callback is set and no prefetch callback is set, no weights are prefetched
+    // prefetching is controlled with the env vars GGML_SCHED_PREFETCH (0 = off), GGML_SCHED_PREFETCH_DEPTH and GGML_SCHED_PREFETCH_MIN_BATCH
+    typedef bool (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -366,6 +373,9 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Set a callback that selects the input weights in host buffers that may be prefetched
+    GGML_API void                 ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data);
 
     //
     // Meta backend

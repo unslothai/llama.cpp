@@ -617,6 +617,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
+bool llama_moe_cache::is_slot_map(const ggml_tensor * t) const {
+    return pimpl->layer_of.find(t) != pimpl->layer_of.end();
+}
+
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
 }

@@ -25,6 +25,9 @@ public:
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
 
+    // true if t is a slot map (host memory that changes between graph computations)
+    bool is_slot_map(const ggml_tensor * t) const;
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
