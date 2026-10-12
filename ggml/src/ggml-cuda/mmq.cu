@@ -227,12 +227,12 @@ void ggml_cuda_mul_mat_q(
         } else {
             pick_J(ne12, J_best, nthreads_best);
 
-            // NVIDIA: if the tile width for the average expert gets the compact MoE tiling (no column tiles per expert
-            // for the whole batch, see mmq_moe_compact_ntx), it wastes less of the tiles on experts with few tokens.
+            // If the tile width for the average expert gets the compact MoE tiling (no column tiles per expert for the
+            // whole batch, see mmq_moe_compact_ntx), it wastes less of the tiles on experts with few tokens.
             int J_expert        = 0;
             int nthreads_expert = 0;
             pick_J(ncols_expert, J_expert, nthreads_expert);
-            if (GGML_CUDA_CC_IS_NVIDIA(cc) && J_expert > 0 &&
+            if (J_expert > 0 &&
                     mmq_moe_compact_ntx(ne12*n_expert_used, ne12, ne02, J_expert) > 0) {
                 J_best        = J_expert;
                 nthreads_best = nthreads_expert;
