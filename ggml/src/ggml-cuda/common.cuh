@@ -1455,6 +1455,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // a graph was computed with this instance; an instance that only copies (e.g. the copy queue of the scheduler) is not
+    // a compute instance
+    bool computes = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

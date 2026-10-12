@@ -4640,6 +4640,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->computes = true;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6159,7 +6160,10 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         }
         void       * d = (char *) r.dst->data + r.dst_offset;
         const void * s = (const char *) r.src->data + r.src_offset;
-        if (src_dev && d2d_kernel) {
+        // the kernel only on compute instances: on a copy-only instance (the prefetch copy queue of the scheduler), whose
+        // copies overlap the compute of another stream, the copy engines are used; with the kernel there, generation after
+        // a prefetched prompt was ~5% slower (Qwen3.8-Flash-Next, MoE cache, B200), at the same prompt speed
+        if (src_dev && d2d_kernel && cuda_ctx->computes) {
             d2d_dsts.push_back(d);
             d2d_srcs.push_back(s);
             d2d_sizes.push_back(r.size);
