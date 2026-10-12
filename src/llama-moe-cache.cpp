@@ -188,6 +188,18 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// per-expert scales and biases of the experts kept in host memory, small enough to keep a copy on the device
+static std::vector<ggml_tensor *> llama_moe_cache_layer_small(const llama_layer & layer) {
+    std::vector<ggml_tensor *> res;
+    for (ggml_tensor * t : { layer.ffn_gate_exps_s, layer.ffn_up_exps_s, layer.ffn_down_exps_s,
+                             layer.ffn_gate_exps_b, layer.ffn_up_exps_b, layer.ffn_down_exps_b, layer.ffn_gate_up_exps_b }) {
+        if (t != nullptr && llama_moe_cache_is_host_weight(t) && ggml_nbytes(t) <= 1024*1024) {
+            res.push_back(t);
+        }
+    }
+    return res;
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -254,6 +266,7 @@ struct llama_moe_cache::impl {
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> resident; // small per-expert host tensors -> device copies
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
@@ -384,6 +397,9 @@ struct llama_moe_cache::impl {
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0);
+            for (int32_t il : g.layers) {
+                n_tensors[g.id] += llama_moe_cache_layer_small(model.layers[il]).size();
+            }
             n_tensors_host  += g.layers.size();
         }
         if (n_tensors_host == 0) {
@@ -434,6 +450,13 @@ struct llama_moe_cache::impl {
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                }
+                for (const ggml_tensor * t : llama_moe_cache_layer_small(model.layers[il])) {
+                    const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+                    ggml_tensor * copy = ggml_dup_tensor(ctx, t);
+                    ggml_format_name(copy, "moe_cache.%s", t->name);
+                    resident[t] = copy;
+                    devices[g.id].buf_size += GGML_PAD(ggml_nbytes(copy), alignment);
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
@@ -487,6 +510,10 @@ struct llama_moe_cache::impl {
                 throw std::runtime_error("failed to allocate the MoE cache buffers");
             }
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
+
+            for (const auto & [t, copy] : resident) {
+                ggml_backend_tensor_set(copy, t->data, 0, ggml_nbytes(t));
+            }
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
             for (group & g : groups) {
@@ -696,6 +723,11 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    ggml_tensor * get_resident(const ggml_tensor * t) const {
+        const auto it = t != nullptr ? resident.find(t) : resident.end();
+        return it != resident.end() ? it->second : nullptr;
+    }
+
     ggml_tensor * get_experts(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
@@ -857,6 +889,10 @@ ggml_tensor * llama_moe_cache::lookup(ggml_context * ctx, int32_t il, ggml_tenso
 
 void llama_moe_cache::prepare(int64_t n_tokens) {
     pimpl->prepare(n_tokens);
+}
+
+ggml_tensor * llama_moe_cache::get_resident(const ggml_tensor * t) const {
+    return pimpl->get_resident(t);
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {

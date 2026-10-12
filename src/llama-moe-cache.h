@@ -31,6 +31,10 @@ public:
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
+    // device copy of a small per-expert tensor (scale or bias) of a cached layer kept in host memory, nullptr if there is none
+    // with it the lookups of small batches do not need the host
+    ggml_tensor * get_resident(const ggml_tensor * t) const;
+
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
 

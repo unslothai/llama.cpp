@@ -2284,6 +2284,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    if (slots != nullptr) {
+        // the per-expert scales and biases are read from their device copies, so the layer does not go back to the host
+        for (ggml_tensor ** t : { &up_exps_s, &gate_exps_s, &down_exps_s, &up_exps_b, &gate_exps_b, &down_exps_b, &gate_up_exps_b }) {
+            if (ggml_tensor * dev = moe_cache->get_resident(*t)) {
+                *t = dev;
+            }
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
