@@ -1987,7 +1987,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
+        moe_cache_seed = moe_cache && ubatch.n_tokens > 32 && n_outputs > 0;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        moe_cache_seed = false;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2723,6 +2728,10 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+    if (moe_cache) {
+        moe_cache->seed_end();
+    }
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
@@ -2755,17 +2764,33 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
-        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
+    // the ubatch that seeds the MoE cache counts the experts used by the layers it caches
+    const bool seed = lctx->moe_cache_seed && lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr;
 
-        st.used.assign(n_expert, false);
-        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
-            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
-                st.used[id] = true;
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty())) {
+        if (!seed && ggml_nelements(ids) >= 8*n_expert) {
+            // nearly every expert is used, copying all of them avoids waiting for the ids
+            st.used.assign(n_expert, true);
+            st.counts.clear();
+        } else {
+            // the ids are computed by an earlier split, on the backend the scheduler assigned to them
+            ggml_backend_t backend_ids = ggml_backend_sched_get_tensor_backend(lctx->sched.get(), const_cast<ggml_tensor *>(ids));
+            if (backend_ids == nullptr) {
+                backend_ids = backend;
+            }
+            st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+            ggml_backend_tensor_get_async(backend_ids, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+            ggml_backend_synchronize(backend_ids);
+
+            st.used.assign(n_expert, false);
+            st.counts.assign(n_expert, 0);
+            for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+                for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                    const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                    GGML_ASSERT(id >= 0 && id < n_expert);
+                    st.used[id] = true;
+                    st.counts[id]++;
+                }
             }
         }
 
@@ -2793,6 +2818,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                lctx->moe_cache->count_upload(src, e - next, (e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -2804,9 +2830,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            if (lctx->moe_cache) {
+                lctx->moe_cache->count_upload(src, last + 1 - next, size);
+            }
         }
 
         first = last + 1;
+    }
+
+    if (seed && !st.counts.empty()) {
+        lctx->moe_cache->seed(backend, src, dst, st.counts);
     }
 
     return true;
