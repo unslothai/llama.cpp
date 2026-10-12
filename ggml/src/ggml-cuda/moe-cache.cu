@@ -19,6 +19,12 @@ static __device__ __forceinline__ unsigned moe_cache_ballot(const bool p) {
 #endif
 }
 
+// ids out of range (never produced by the router) are read as expert 0
+static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, const int i, const int n_expert) {
+    const int32_t e = ids[i];
+    return (uint32_t) e < (uint32_t) n_expert ? e : 0;
+}
+
 static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots) {
@@ -39,7 +45,14 @@ static __global__ void moe_cache_assign(
     int32_t * fill_e = dst + n_ids + ne0;
     int32_t * fill_s = fill_e + n_ids;
 
-    const uint32_t epoch = (uint32_t) state[1] + 1;
+    uint32_t epoch = (uint32_t) state[1] + 1;
+    if (epoch == 0) {
+        // wrapped around: no slot may look pinned by this lookup
+        for (int s = lane; s < n_slots; s += MOE_CACHE_LANES) {
+            pin[s] = 0;
+        }
+        epoch = 1;
+    }
     __syncthreads();
     if (lane == 0) {
         state[1] = (int32_t) epoch;
@@ -48,7 +61,7 @@ static __global__ void moe_cache_assign(
     // hits: set the reference bit and pin the slot for this lookup
     int n_hit = 0;
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
-        const int32_t s = row[ids[i]];
+        const int32_t s = row[moe_cache_id(ids, i, n_expert)];
         slots[i] = s;
         if (s >= 0) {
             ref[s] = 1;
@@ -63,7 +76,7 @@ static __global__ void moe_cache_assign(
     int n_miss = 0;
     for (int i0 = 0; i0 < n_ids; i0 += MOE_CACHE_LANES) {
         const int i = i0 + lane;
-        const int32_t e = i < n_ids && slots[i] < 0 ? ids[i] : -1;
+        const int32_t e = i < n_ids && slots[i] < 0 ? moe_cache_id(ids, i, n_expert) : -1;
         bool first = e >= 0;
         for (int k = 0; k < MOE_CACHE_LANES; ++k) {
             const int32_t ek = __shfl_sync(full, e, k, MOE_CACHE_LANES);
@@ -140,7 +153,7 @@ static __global__ void moe_cache_assign(
 
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
         if (slots[i] < 0) {
-            slots[i] = row[ids[i]];
+            slots[i] = row[moe_cache_id(ids, i, n_expert)];
         }
     }
 

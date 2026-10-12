@@ -5165,13 +5165,45 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 // maps host memory into the address space of the devices, so kernels can read it directly (zero-copy)
-// returns the device pointer of buffer, nullptr on failure; *registered is set if buffer was registered here
+// returns the device pointer of buffer, nullptr on failure; *registered is set if the caller holds a mapping reference and
+// must call ggml_backend_cuda_host_unmap(buffer) when done
+// buffers registered here are reference counted, so several users (e.g. contexts) can map the same buffer
 // pageable memory is never used through HMM/ATS even when the device could read it: that is an order of magnitude slower
+struct ggml_cuda_host_mapping {
+    size_t size;
+    void * dev_ptr;
+    int    refs;
+};
+
+static std::mutex & ggml_cuda_host_mappings_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+static std::unordered_map<void *, ggml_cuda_host_mapping> & ggml_cuda_host_mappings() {
+    static std::unordered_map<void *, ggml_cuda_host_mapping> m;
+    return m;
+}
+
 static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * registered) {
     *registered = false;
     void * dev_ptr = nullptr;
 
-    // already pinned, for example a CUDA host buffer (registering it again fails)
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    auto & mappings = ggml_cuda_host_mappings();
+
+    // registered here before: one more reference
+    auto it = mappings.find(buffer);
+    if (it != mappings.end()) {
+        if (size > it->second.size) {
+            return nullptr;
+        }
+        it->second.refs++;
+        *registered = true;
+        return it->second.dev_ptr;
+    }
+
+    // pinned by someone else, for example a CUDA host buffer (registering it again fails): not owned here
     cudaPointerAttributes attr;
     if (cudaPointerGetAttributes(&attr, buffer) == cudaSuccess && attr.type == cudaMemoryTypeHost) {
         if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) == cudaSuccess && dev_ptr != nullptr) {
@@ -5180,30 +5212,41 @@ static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * regi
     }
     (void)cudaGetLastError();
 
-#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
-    // read-only so that read-only mappings (mmap) can be registered where the platform supports it
-    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly;
-#else
+    // read-only registration also accepts read-only mappings (mmap), but not every device supports it
     const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+    bool read_only_ok = false;
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    read_only_ok = cudaHostRegister(buffer, size, flags | cudaHostRegisterReadOnly) == cudaSuccess;
+    if (!read_only_ok) {
+        (void)cudaGetLastError();
+    }
 #endif
-    cudaError_t err = cudaHostRegister(buffer, size, flags);
+    cudaError_t err = read_only_ok ? cudaSuccess : cudaHostRegister(buffer, size, flags);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         GGML_LOG_WARN("%s: failed to map %.2f MiB of host memory: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
-    *registered = true;
     if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
         (void)cudaGetLastError();
         cudaHostUnregister(buffer);
         (void)cudaGetLastError();
-        *registered = false;
         return nullptr;
     }
+    mappings[buffer] = { size, dev_ptr, 1 };
+    *registered = true;
     return dev_ptr;
 }
 
+// releases a reference taken by ggml_backend_cuda_host_map, the memory is unregistered with the last one
 static void ggml_backend_cuda_host_unmap(void * buffer) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    auto & mappings = ggml_cuda_host_mappings();
+    auto it = mappings.find(buffer);
+    if (it == mappings.end() || --it->second.refs > 0) {
+        return;
+    }
+    mappings.erase(it);
     if (cudaHostUnregister(buffer) != cudaSuccess) {
         (void)cudaGetLastError();
     }

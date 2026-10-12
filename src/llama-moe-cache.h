@@ -20,7 +20,8 @@ public:
     ggml_backend_t backend(int32_t il) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    // n_ubatch is the size of the ubatch (n_tokens the rows of the layer, fewer for an output-only last layer)
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const;
 
     // for small batches: the slots of the experts selected by ids [n_expert_used, n_tokens] in layer il, looked up on the device
     // the missing experts are copied from host memory by the device, so the selected experts are never read by the host

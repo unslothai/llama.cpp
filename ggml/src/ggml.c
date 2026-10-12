@@ -3448,6 +3448,8 @@ struct ggml_tensor * ggml_moe_cache_lookup(
 
     const int64_t n_slots = (ggml_nelements(state) - 8)/3;
     GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
+    // every distinct expert of the ids needs a slot, otherwise the eviction of the lookup cannot finish
+    GGML_ASSERT(MIN(ggml_nelements(ids), map->ne[0]) <= n_slots && "more distinct experts than slots");
     for (int i = 0; i < n_banks; ++i) {
         GGML_ASSERT(banks[i]->ne[2] == n_slots + 1 && banks[i]->ne[3] == 1);
         GGML_ASSERT(ggml_is_contiguous(banks[i]));

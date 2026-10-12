@@ -2533,7 +2533,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         }
     }
 
-    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
+    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], n_tokens);
     if (slot_map == nullptr) {
         return nullptr;
     }

@@ -36,6 +36,7 @@
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 #endif
 
 #if defined(_WIN32)
@@ -1692,6 +1693,33 @@ static uint64_t common_model_file_bytes(const std::string & path) {
     return res;
 }
 
+// system memory that can be used without swapping, 0 if unknown
+// (the CPU backend reports the total memory as free on Linux and macOS)
+static uint64_t common_available_memory() {
+#if defined(__linux__)
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    while (f >> key >> value) {
+        std::getline(f, unit);
+        if (key == "MemAvailable:") {
+            return value*1024;
+        }
+    }
+    return 0;
+#elif defined(__APPLE__) && defined(__MACH__)
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return ((uint64_t) vm.free_count + vm.inactive_count + vm.purgeable_count)*(uint64_t) vm_page_size;
+#else
+    return 0;
+#endif
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1713,8 +1741,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
             size_t mem_free  = 0;
             size_t mem_total = 0;
             ggml_backend_dev_memory(cpu, &mem_free, &mem_total);
+            uint64_t mem_avail = std::min(mem_free, mem_total);
+            const uint64_t mem_sys = common_available_memory();
+            if (mem_sys > 0) {
+                mem_avail = std::min(mem_avail, mem_sys);
+            }
             const uint64_t model_bytes = common_model_file_bytes(params.model.path);
-            if (model_bytes > 0 && model_bytes <= 0.8*std::min(mem_free, mem_total)) {
+            if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
                 mparams.load_mode = LLAMA_LOAD_MODE_NONE;
             }
         }
