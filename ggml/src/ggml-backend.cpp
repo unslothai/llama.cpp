@@ -976,6 +976,7 @@ struct ggml_backend_sched_prefetch {
     // progress during graph compute
     int issued;
     int consumed;
+    bool pending; // work was queued on the copy queue since it was last synchronized
 };
 
 struct ggml_backend_sched {
@@ -1953,13 +1954,21 @@ static enum ggml_backend_sched_prefetch_mode ggml_backend_sched_prefetch_candida
     return sched->callback_copy == NULL ? GGML_BACKEND_SCHED_PREFETCH_ASYNC : GGML_BACKEND_SCHED_PREFETCH_NONE;
 }
 
+// wait for the work queued on the copy queues (graphs without prefetched splits, e.g. generation, queue none)
+static void ggml_backend_sched_prefetch_drain(ggml_backend_sched_t sched) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->pf[b].copy_backend != NULL && sched->pf[b].pending) {
+            ggml_backend_synchronize(sched->pf[b].copy_backend);
+        }
+        sched->pf[b].pending = false;
+    }
+}
+
 static void ggml_backend_sched_prefetch_sync(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_synchronize(sched->backends[b]);
-        if (sched->pf[b].copy_backend != NULL) {
-            ggml_backend_synchronize(sched->pf[b].copy_backend);
-        }
     }
+    ggml_backend_sched_prefetch_drain(sched);
 }
 
 static void ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched, int backend_id) {
@@ -2309,6 +2318,7 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
                     }
                 }
                 ggml_backend_event_record(pf->ready[slot], pf->copy_backend);
+                pf->pending = true;
             }
             pf->issued++;
         }
@@ -2354,16 +2364,6 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
-    }
-}
-
-// the computation stopped before all the prefetched splits were computed: wait for the copies issued ahead, so that they
-// cannot write a slot after it is reused or read host memory after the caller regains control
-static void ggml_backend_sched_prefetch_drain(ggml_backend_sched_t sched) {
-    for (int b = 0; b < sched->n_backends; b++) {
-        if (sched->pf[b].copy_backend != NULL) {
-            ggml_backend_synchronize(sched->pf[b].copy_backend);
-        }
     }
 }
 
@@ -2414,6 +2414,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->pf_active && pf->n_bound > 0 && pf->start != NULL) {
             ggml_backend_event_record(pf->start, sched->backends[b]);
             ggml_backend_event_wait(pf->copy_backend, pf->start);
+            pf->pending = true;
         }
     }
 
@@ -2754,10 +2755,8 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
-        if (sched->pf[i].copy_backend != NULL) {
-            ggml_backend_synchronize(sched->pf[i].copy_backend);
-        }
     }
+    ggml_backend_sched_prefetch_drain(sched);
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,

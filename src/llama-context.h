@@ -373,6 +373,7 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
         std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
+        bool                 all = false; // used was set to every expert without reading the ids
 
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
         std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
@@ -382,6 +383,7 @@ private:
             ids_data.clear();
             used.clear();
             counts.clear();
+            all = false;
         }
     };
 
@@ -390,9 +392,13 @@ private:
     // the MoE cache admits the most used experts of this ubatch, set for the large ubatches with outputs (the end of a prompt)
     bool moe_cache_seed = false;
 
-    // MoE batches of at least this many tokens copy all of the experts of the host weights without reading the ids,
-    // ahead of the split on the copy queue of the scheduler [GGML_SCHED_PREFETCH_MIN_BATCH]
+    // ubatches of at least this many tokens prefetch the host weights on the copy queue of the scheduler, MoE experts whole
+    // without reading the ids; smaller ubatches (e.g. generation) use the regular path, where only the routed experts are
+    // copied (or the MoE cache serves them), so they do no staging or event work [GGML_SCHED_PREFETCH_MIN_BATCH]
     int64_t prefetch_min_batch = 256;
+
+    // tokens of the ubatch whose graph the scheduler is allocating, read by sched_prefetch_mode
+    int64_t prefetch_n_tokens = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
