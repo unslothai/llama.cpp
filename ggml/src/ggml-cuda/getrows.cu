@@ -129,6 +129,61 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// Vector width for the type-converting get_rows path. The load and the store have different
+// widths, so the widest of the two is what is capped at the 16 byte maximum access size:
+// f32 -> bf16 becomes a 16 byte load plus an 8 byte store per thread.
+template<typename src0_t, typename dst_t>
+struct get_rows_vec_width {
+    static constexpr size_t elem_max = sizeof(src0_t) > sizeof(dst_t) ? sizeof(src0_t) : sizeof(dst_t);
+    static constexpr int    value    = elem_max <= 16 ? int(16 / elem_max) : 1;
+};
+
+// Plain aligned array so the compiler emits a single wide load/store per object.
+// N and sizeof(T) are both powers of two, so the alignment is always legal.
+template<typename T, int N>
+struct __align__(sizeof(T) * N) get_rows_vec_t {
+    T v[N];
+};
+
+template<typename src0_t, typename dst_t, int VEC>
+static __global__ void k_get_rows_float_convert_vec(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t ne00v,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    typedef get_rows_vec_t<src0_t, VEC> src_vec_t;
+    typedef get_rows_vec_t<dst_t,  VEC> dst_vec_t;
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+
+        dst_vec_t       * GGML_CUDA_RESTRICT dst_row  = (dst_vec_t *)      (dst_ptr + i10*s1 + i11*s2 + i12*s3);
+        const src_vec_t * GGML_CUDA_RESTRICT src0_row = (const src_vec_t *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+
+        for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
+            const src_vec_t sv = src0_row[i];
+            dst_vec_t dv;
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                dv.v[j] = ggml_cuda_cast<dst_t>(sv.v[j]);
+            }
+            dst_row[i] = dv;
+        }
+    }
+}
+
+
 // Rows shorter than a block: one thread per element over all rows, so that the threads of a block are not idle.
 // The element type T is the source type, or int4 for a vectorized copy of rows of the same type.
 template<typename src0_t, typename dst_t>
@@ -348,6 +403,37 @@ static void get_rows_cuda_float(
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
+                ne00v, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    } else {
+        // Type-converting copy. The per-element operation is unchanged, only the number of
+        // elements handled per thread differs, so this stays numerically exact.
+        constexpr int    VEC           = get_rows_vec_width<src0_t, dst_t>::value;
+        constexpr size_t src_vec_bytes = VEC * sizeof(src0_t);
+        constexpr size_t dst_vec_bytes = VEC * sizeof(dst_t);
+
+        const int64_t ne00v = ne00 / VEC;
+        const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+        const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
+        // Both sides need their own alignment guarantees because the widths differ: the row
+        // base offsets (nb0x for the source, nb* for the destination) and the two base pointers
+        // must each be a multiple of the respective vector size.
+        const bool can_vec = VEC > 1 && enough_blocks &&
+            (ne00 % VEC == 0) &&
+            (nb01 % src_vec_bytes == 0) && (nb02 % src_vec_bytes == 0) && (nb03 % src_vec_bytes == 0) &&
+            (nb1  % dst_vec_bytes == 0) && (nb2  % dst_vec_bytes == 0) && (nb3  % dst_vec_bytes == 0) &&
+            (((uintptr_t) src0_d) % src_vec_bytes == 0) && (((uintptr_t) dst_d) % dst_vec_bytes == 0);
+
+        if (can_vec) {
+            const int block_num_y = vec_block_num_y;
+            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_float_convert_vec<src0_t, dst_t, VEC>, launch_params,
+                src0_d, src1_d, dst_d,
                 ne00v, ne11, ne12_fdv,
                 s1, s2, s3,
                 nb01, nb02, nb03,
