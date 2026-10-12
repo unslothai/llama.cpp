@@ -280,6 +280,7 @@ struct llama_moe_cache::impl {
         uint32_t done = 0; // expert tensors whose slots were filled
     } sd;
     std::vector<int32_t> seed_ids;
+    std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
 
     std::vector<device> devices;
@@ -1040,6 +1041,32 @@ struct llama_moe_cache::impl {
         sd.fills.clear();
     }
 
+    void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        seed_counts.resize(layers.size());
+        seed_counts[it->second.il] = counts;
+    }
+
+    const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const {
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || (size_t) it->second.il >= seed_counts.size()) {
+            return nullptr;
+        }
+        const auto & c = seed_counts[it->second.il];
+        return (int64_t) c.size() == w->ne[2] ? &c : nullptr;
+    }
+
+    void clear_seed_counts() {
+        seed_counts.clear();
+    }
+
+    bool has_seed_counts() const {
+        return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
+    }
+
     void log_stats() {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -1141,6 +1168,22 @@ void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const 
 
 void llama_moe_cache::seed_end() {
     pimpl->seed_end();
+}
+
+void llama_moe_cache::set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+    pimpl->set_seed_counts(w, counts);
+}
+
+const std::vector<int32_t> * llama_moe_cache::get_seed_counts(const ggml_tensor * w) const {
+    return pimpl->get_seed_counts(w);
+}
+
+void llama_moe_cache::clear_seed_counts() {
+    pimpl->clear_seed_counts();
+}
+
+bool llama_moe_cache::has_seed_counts() const {
+    return pimpl->has_seed_counts();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

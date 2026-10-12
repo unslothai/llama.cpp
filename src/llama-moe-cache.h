@@ -12,6 +12,9 @@ struct llama_model;
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
+    // the cache serves the ubatches of up to this many tokens, the larger ones (prompts) copy the experts they use
+    static constexpr int64_t n_small_max = 32;
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
@@ -65,6 +68,13 @@ public:
 
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
+
+    // the routing of an earlier large ubatch of the same prompt, for seed when the seeding ubatch copies all of the experts
+    // without reading its own ids: counts[e] is the number of tokens routed to expert e in the layer of w
+    void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
+    void clear_seed_counts();
+    bool has_seed_counts() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

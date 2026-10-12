@@ -389,8 +389,27 @@ private:
 
     copy_experts_info copy_experts;
 
-    // the MoE cache admits the most used experts of this ubatch, set for the large ubatches with outputs (the end of a prompt)
-    bool moe_cache_seed = false;
+    // the MoE cache admits the most used experts at the end of a prompt (see moe_cache_seed_begin):
+    // seed:      from the ids of this ubatch, read before its experts are copied
+    // seed_prev: from the routing of an earlier ubatch of the prompt, the copies of this ubatch do not wait for its ids
+    // record:    keep the routing outputs of this ubatch, for a later seed_prev
+    bool moe_cache_seed         = false;
+    bool moe_cache_seed_prev    = false;
+    bool moe_cache_record       = false;
+    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+
+    // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
+    bool moe_cache_seed_graph = false;
+
+    // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
+    std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> moe_cache_ids;
+
+    // the prompt the stored routing belongs to: its sequence and the position of its next token
+    llama_seq_id moe_cache_seq     = -1;
+    llama_pos    moe_cache_pos_next = -1;
+
+    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
+    void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
 
     // ubatches of at least this many tokens prefetch the host weights on the copy queue of the scheduler, MoE experts whole
     // without reading the ids; smaller ubatches (e.g. generation) use the regular path, where only the routed experts are

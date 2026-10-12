@@ -377,6 +377,10 @@ llama_context::llama_context(
         // smallest ubatch whose host weights the scheduler prefetches (see sched_prefetch_mode)
         const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
         const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
+        // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt
+        const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
+        moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
+
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
             prefetch_min_batch = INT64_MAX;
         } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
@@ -1517,11 +1521,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
+    // the routing outputs of the previous graph were read before, if needed (see moe_cache_seed_begin)
+    moe_cache_ids.clear();
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1558,7 +1566,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_active   = res;
+        moe_cache_seed_graph = moe_cache_seed;
     }
 
     // set the input data for the input tensors
@@ -2006,14 +2015,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
-        moe_cache_seed = moe_cache && ubatch.n_tokens > 32 && n_outputs > 0;
-        if (moe_cache && ubatch.n_tokens > 32) {
-            moe_cache->count_large_ubatch();
+        if (moe_cache) {
+            const bool large      = ubatch.n_tokens > llama_moe_cache::n_small_max;
+            const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
+            moe_cache_seed_begin(ubatch, last_large, n_outputs);
+            if (large) {
+                moe_cache->count_large_ubatch();
+            }
         }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
-        moe_cache_seed = false;
+        if (moe_cache) {
+            moe_cache_seed_end(ubatch, res ? n_outputs : -1);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2643,6 +2658,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+    moe_cache_ids.clear();
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {
@@ -2931,9 +2947,91 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     if (seed && !st.counts.empty()) {
         lctx->moe_cache->seed(backend, src, dst, st.counts);
+    } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
+        // all experts were copied: the routing of an earlier ubatch of the prompt, otherwise the ids of this one were read
+        const std::vector<int32_t> * counts = st.counts.empty() ? lctx->moe_cache->get_seed_counts(src) : &st.counts;
+        if (counts != nullptr) {
+            lctx->moe_cache->seed(backend, src, dst, *counts);
+        }
+    }
+
+    // the routing of a large ubatch is kept for a later seed, once per layer (the expert tensors of a layer share their ids)
+    if (lctx->moe_cache_record && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && lctx->moe_cache->get_experts(src) != nullptr &&
+            std::none_of(lctx->moe_cache_ids.begin(), lctx->moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
+        lctx->moe_cache_ids.emplace_back(src, ids);
     }
 
     return true;
+}
+
+void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
+    const bool large = ubatch.n_tokens > llama_moe_cache::n_small_max;
+    if (!moe_cache_seed_enabled) {
+        return;
+    }
+
+    // the stored routing is used only while the prompt continues: same single sequence, next position, no outputs since
+    const bool cont = ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == moe_cache_seq && ubatch.pos[0] == moe_cache_pos_next;
+    if (!cont) {
+        moe_cache->clear_seed_counts();
+    }
+
+    // the routing outputs of the previous large ubatch are read before the graph of this ubatch replaces them, unless this
+    // ubatch records newer ones without seeding or the prompt ends here
+    if (cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || last_large)) {
+        ggml_backend_sched_synchronize(sched.get());
+        std::vector<int32_t> ids_data;
+        std::vector<int32_t> counts;
+        for (const auto & [w, ids] : moe_cache_ids) {
+            GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->buffer != nullptr);
+            ids_data.resize(ggml_nelements(ids));
+            ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+            counts.assign(w->ne[2], 0);
+            for (const int32_t id : ids_data) {
+                GGML_ASSERT(id >= 0 && id < w->ne[2]);
+                counts[id]++;
+            }
+            moe_cache->set_seed_counts(w, counts);
+        }
+    }
+    moe_cache_ids.clear();
+
+    // the last large ubatch of the batch seeds the cache, with or without outputs: a caller may run the last tokens of the
+    // prompt as a separate small batch (e.g. the server saving a context checkpoint of a recurrent or SWA model first)
+    // with outputs (the prompt ends in this batch) or without an earlier routing of the prompt, it reads its own ids before
+    // copying the experts it uses; otherwise it seeds from the routing of the previous large ubatch of the prompt, and its
+    // copies of all of the experts do not wait for its ids (a prompt of several batches pays for at most one read)
+    moe_cache_record    = large;
+    moe_cache_seed      = false;
+    moe_cache_seed_prev = false;
+    if (last_large) {
+        if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
+            moe_cache_seed_prev = true;
+        } else {
+            moe_cache_seed = true;
+        }
+    }
+}
+
+void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub) {
+    moe_cache_seed      = false;
+    moe_cache_seed_prev = false;
+    moe_cache_record    = false;
+
+    // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
+    if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
+        moe_cache_seq      = -1;
+        moe_cache_pos_next = -1;
+        moe_cache_ids.clear();
+        moe_cache->clear_seed_counts();
+        return;
+    }
+    llama_pos pos_max = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        pos_max = std::max(pos_max, ubatch.pos[i]);
+    }
+    moe_cache_seq      = ubatch.seq_id_unq[0];
+    moe_cache_pos_next = pos_max + 1;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -3969,6 +4067,7 @@ void llama_context::opt_epoch_iter(
             gf_res_prev_active = nullptr;
             res->reset();
 
+            moe_cache_ids.clear();
             auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
