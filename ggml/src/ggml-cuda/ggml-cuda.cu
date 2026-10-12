@@ -5164,14 +5164,14 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
-// maps host memory into the address space of the CUDA devices, so kernels can read it directly
-// returns the device pointer of buffer, nullptr on failure; *registered is set if buffer had to be registered
+// maps host memory into the address space of the devices, so kernels can read it directly (zero-copy)
+// returns the device pointer of buffer, nullptr on failure; *registered is set if buffer was registered here
+// pageable memory is never used through HMM/ATS even when the device could read it: that is an order of magnitude slower
 static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * registered) {
     *registered = false;
     void * dev_ptr = nullptr;
-    // already pinned, for example a CUDA host buffer
-    // pageable memory is not used even if the device can access it (HMM), that is an order of magnitude slower
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+    // already pinned, for example a CUDA host buffer (registering it again fails)
     cudaPointerAttributes attr;
     if (cudaPointerGetAttributes(&attr, buffer) == cudaSuccess && attr.type == cudaMemoryTypeHost) {
         if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) == cudaSuccess && dev_ptr != nullptr) {
@@ -5179,17 +5179,21 @@ static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * regi
         }
     }
     (void)cudaGetLastError();
-#endif
 
-#if (CUDART_VERSION >= 11010 || defined(GGML_USE_HIP)) && !defined(GGML_USE_MUSA)
-    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    // read-only so that read-only mappings (mmap) can be registered where the platform supports it
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+#else
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+#endif
+    cudaError_t err = cudaHostRegister(buffer, size, flags);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         GGML_LOG_WARN("%s: failed to map %.2f MiB of host memory: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
     *registered = true;
-    if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess) {
+    if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
         (void)cudaGetLastError();
         cudaHostUnregister(buffer);
         (void)cudaGetLastError();
@@ -5197,10 +5201,6 @@ static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * regi
         return nullptr;
     }
     return dev_ptr;
-#else
-    GGML_UNUSED(size);
-    return nullptr;
-#endif
 }
 
 static void ggml_backend_cuda_host_unmap(void * buffer) {
@@ -6059,10 +6059,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
-    if (strcmp(name, "ggml_backend_cuda_host_map") == 0) {
+    if (strcmp(name, "ggml_backend_host_map") == 0) {
         return (void *)ggml_backend_cuda_host_map;
     }
-    if (strcmp(name, "ggml_backend_cuda_host_unmap") == 0) {
+    if (strcmp(name, "ggml_backend_host_unmap") == 0) {
         return (void *)ggml_backend_cuda_host_unmap;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {

@@ -1665,6 +1665,33 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// size of the model files, all the splits of a split model, 0 if unknown
+static uint64_t common_model_file_bytes(const std::string & path) {
+    std::vector<std::string> files = { path };
+    static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (std::regex_search(path, m, re_split)) {
+        const int n_split = std::stoi(m[2].str());
+        const std::string prefix = path.substr(0, m.position(0));
+        files.clear();
+        for (int i = 1; i <= n_split; ++i) {
+            char suffix[64];
+            snprintf(suffix, sizeof(suffix), "-%05d-of-%05d.gguf", i, n_split);
+            files.push_back(prefix + suffix);
+        }
+    }
+    uint64_t res = 0;
+    for (const auto & f : files) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(f, ec);
+        if (ec) {
+            return 0;
+        }
+        res += size;
+    }
+    return res;
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1678,10 +1705,18 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         // the MoE cache looks up and copies the experts on the device, which needs the experts in pinned host memory
-        // memory-mapped files usually cannot be pinned, so the model is loaded without mmap
+        // memory-mapped files usually cannot be pinned, so the model is loaded without mmap if it fits in system memory
+        // (a larger model keeps mmap, so it can still be paged from disk, and the cache falls back to host lookups)
         const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
-        if (env == nullptr || atoi(env) != 0) {
-            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if ((env == nullptr || atoi(env) != 0) && cpu != nullptr) {
+            size_t mem_free  = 0;
+            size_t mem_total = 0;
+            ggml_backend_dev_memory(cpu, &mem_free, &mem_total);
+            const uint64_t model_bytes = common_model_file_bytes(params.model.path);
+            if (model_bytes > 0 && model_bytes <= 0.8*std::min(mem_free, mem_total)) {
+                mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+            }
         }
     }
     mparams.lazy_mode = params.lazy_mode;
