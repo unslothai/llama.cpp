@@ -68,7 +68,12 @@
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
 #define cudaHostRegister musaHostRegister
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#define cudaHostRegisterMapped musaHostRegisterMapped
 #define cudaHostRegisterPortable musaHostRegisterPortable
+#define cudaPointerAttributes musaPointerAttributes
+#define cudaPointerGetAttributes musaPointerGetAttributes
+#define cudaMemoryTypeHost musaMemoryTypeHost
 #define cudaHostRegisterReadOnly musaHostRegisterReadOnly
 #define cudaHostUnregister musaHostUnregister
 #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel

@@ -62,6 +62,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2476,6 +2477,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_MOE_CACHE_LOOKUP:
+            ggml_cuda_op_moe_cache_lookup(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -5160,6 +5164,51 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// maps host memory into the address space of the devices, so kernels can read it directly (zero-copy)
+// returns the device pointer of buffer, nullptr on failure; *registered is set if buffer was registered here
+// pageable memory is never used through HMM/ATS even when the device could read it: that is an order of magnitude slower
+static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * registered) {
+    *registered = false;
+    void * dev_ptr = nullptr;
+
+    // already pinned, for example a CUDA host buffer (registering it again fails)
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, buffer) == cudaSuccess && attr.type == cudaMemoryTypeHost) {
+        if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) == cudaSuccess && dev_ptr != nullptr) {
+            return dev_ptr;
+        }
+    }
+    (void)cudaGetLastError();
+
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    // read-only so that read-only mappings (mmap) can be registered where the platform supports it
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+#else
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+#endif
+    cudaError_t err = cudaHostRegister(buffer, size, flags);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to map %.2f MiB of host memory: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    *registered = true;
+    if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
+        (void)cudaGetLastError();
+        cudaHostUnregister(buffer);
+        (void)cudaGetLastError();
+        *registered = false;
+        return nullptr;
+    }
+    return dev_ptr;
+}
+
+static void ggml_backend_cuda_host_unmap(void * buffer) {
+    if (cudaHostUnregister(buffer) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return;
@@ -5815,6 +5864,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_CACHE_LOOKUP:
+            return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
@@ -6071,6 +6122,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_host_map") == 0) {
+        return (void *)ggml_backend_cuda_host_map;
+    }
+    if (strcmp(name, "ggml_backend_host_unmap") == 0) {
+        return (void *)ggml_backend_cuda_host_unmap;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
