@@ -698,6 +698,111 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    // one Q2_0 block (64 values, 16 bytes of qs) pairs with two Q8_0 blocks;
+    // value j of the block is (qs[j/4] >> 2*(j%4)) & 3, mapped {0,1,2,3} -> {-1,0,1,2}
+#if defined(__AVX2__)
+    // Per Q8_0 block (8 bytes of qs): spread dword 0 over the low lane and dword 1 over the
+    // high lane, shift the 4 copies by 0/2/4/6 bits and keep 2 bits, then transpose each
+    // 4x4 byte tile so the values come out in Q8_0 order.
+    const __m256i perm_0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    const __m256i perm_1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+    const __m256i shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    const __m256i transpose = _mm256_setr_epi8(
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i mask_2 = _mm256_set1_epi8(3);
+    const __m256i ones_8 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 2];
+
+        const __m256i raw = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) x[ib].qs));
+
+        __m256i qx_0 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(raw, perm_0), shifts), mask_2);
+        __m256i qx_1 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_permutevar8x32_epi32(raw, perm_1), shifts), mask_2);
+        qx_0 = _mm256_sub_epi8(_mm256_shuffle_epi8(qx_0, transpose), ones_8);
+        qx_1 = _mm256_sub_epi8(_mm256_shuffle_epi8(qx_1, transpose), ones_8);
+
+        const __m256i qy_0 = _mm256_loadu_si256((const __m256i *) y_ptr[0].qs);
+        const __m256i qy_1 = _mm256_loadu_si256((const __m256i *) y_ptr[1].qs);
+
+        const __m256 p_0 = mul_sum_i8_pairs_float(qx_0, qy_0);
+        const __m256 p_1 = mul_sum_i8_pairs_float(qx_1, qy_1);
+
+        __m256 acc_block = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[0].d)), p_0);
+        acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[1].d)), p_1, acc_block);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#elif defined(__AVX__) || defined(__SSSE3__)
+    // Shift the 16 bytes of qs by 0/2/4/6 bits: byte b of v_k holds value 4*b + k.
+    // Interleaving bytes of (v_0, v_1) and (v_2, v_3), then 16-bit words of the two,
+    // restores the natural order, 16 values per register.
+    const __m128i mask_2 = _mm_set1_epi8(3);
+    const __m128i ones_8 = _mm_set1_epi8(1);
+    __m128 acc = _mm_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 2];
+
+        const __m128i raw = _mm_loadu_si128((const __m128i *) x[ib].qs);
+        const __m128i v_0 = _mm_sub_epi8(_mm_and_si128(raw, mask_2), ones_8);
+        const __m128i v_1 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw, 2), mask_2), ones_8);
+        const __m128i v_2 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw, 4), mask_2), ones_8);
+        const __m128i v_3 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw, 6), mask_2), ones_8);
+
+        const __m128i v_01_lo = _mm_unpacklo_epi8(v_0, v_1);
+        const __m128i v_01_hi = _mm_unpackhi_epi8(v_0, v_1);
+        const __m128i v_23_lo = _mm_unpacklo_epi8(v_2, v_3);
+        const __m128i v_23_hi = _mm_unpackhi_epi8(v_2, v_3);
+
+        const __m128i qx_0 = _mm_unpacklo_epi16(v_01_lo, v_23_lo); // values  0..15
+        const __m128i qx_1 = _mm_unpackhi_epi16(v_01_lo, v_23_lo); // values 16..31
+        const __m128i qx_2 = _mm_unpacklo_epi16(v_01_hi, v_23_hi); // values 32..47
+        const __m128i qx_3 = _mm_unpackhi_epi16(v_01_hi, v_23_hi); // values 48..63
+
+        const __m128i qy_0 = _mm_loadu_si128((const __m128i *) &y_ptr[0].qs[0]);
+        const __m128i qy_1 = _mm_loadu_si128((const __m128i *) &y_ptr[0].qs[16]);
+        const __m128i qy_2 = _mm_loadu_si128((const __m128i *) &y_ptr[1].qs[0]);
+        const __m128i qy_3 = _mm_loadu_si128((const __m128i *) &y_ptr[1].qs[16]);
+
+        const __m128i i32_0 = _mm_add_epi32(mul_sum_i8_pairs(qx_0, qy_0), mul_sum_i8_pairs(qx_1, qy_1));
+        const __m128i i32_1 = _mm_add_epi32(mul_sum_i8_pairs(qx_2, qy_2), mul_sum_i8_pairs(qx_3, qy_3));
+
+        __m128 acc_block = _mm_mul_ps(_mm_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[0].d)), _mm_cvtepi32_ps(i32_0));
+        acc_block = _mm_add_ps(acc_block, _mm_mul_ps(_mm_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[1].d)), _mm_cvtepi32_ps(i32_1)));
+        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_set1_ps(d0), acc_block));
+    }
+
+    acc = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+    acc = _mm_add_ss(acc, _mm_movehdup_ps(acc));
+    *s = _mm_cvtss_f32(acc);
+#else
+    UNUSED(nb);
+    UNUSED(x);
+    UNUSED(y);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
