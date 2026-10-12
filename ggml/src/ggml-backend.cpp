@@ -2210,6 +2210,41 @@ static bool ggml_backend_sched_prefetch_is_bound(ggml_backend_sched_t sched, con
     return input_cpy->buffer != NULL && input_cpy->buffer == sched->pf[split->backend_id].arena;
 }
 
+// the graph allocator failed while the staging arenas were allocated: unbind the copies, free the arenas and disable prefetch,
+// so that the allocation can be retried with the memory of the arenas, as without prefetch
+// returns false if nothing was freed
+static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
+    bool freed = false;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (ggml_backend_sched_prefetch_is_bound(sched, split, split->inputs[j])) {
+                struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+                input_cpy->data   = NULL;
+                input_cpy->buffer = NULL;
+            }
+        }
+        split->pf_ordinal = -1;
+        split->pf_async   = false;
+    }
+    sched->pf_active = false;
+
+    ggml_backend_sched_prefetch_sync(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        pf->n_bound = 0;
+        pf->n_async = 0;
+        pf->need    = 0;
+        if (pf->arena != NULL || pf->copy_backend != NULL) {
+            GGML_LOG_WARN("%s: %s: graph allocation failed, host weight prefetch disabled\n", __func__, ggml_backend_name(sched->backends[b]));
+            ggml_backend_sched_prefetch_release(sched, b);
+            pf->failed = true;
+            freed = true;
+        }
+    }
+    return freed;
+}
+
 // issue the copies of the next prefetched splits of every backend
 // `consumed` splits have been queued for compute, the copies run up to depth - 1 splits ahead of them, so a copy only waits for
 // computes queued before the last one: with depth = 2, the copy of split k + 1 overlaps the compute of split k (double buffering)
@@ -2565,7 +2600,11 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-        return false;
+        // retry without the staging memory
+        if (!ggml_backend_sched_prefetch_disable(sched) ||
+            !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            return false;
+        }
     }
 
     ggml_backend_sched_reset(sched);
@@ -2586,7 +2625,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
-        return false;
+        // retry without the staging memory
+        if (!ggml_backend_sched_prefetch_disable(sched) || !ggml_backend_sched_alloc_splits(sched)) {
+            return false;
+        }
     }
 
     sched->is_alloc = true;
