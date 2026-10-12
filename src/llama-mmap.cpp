@@ -513,6 +513,19 @@ struct llama_mmap::impl {
         if (prefetch > 0) {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+                // MAP_POPULATE is not used when the file has lazy ranges, so populate the page tables of the
+                // other ranges explicitly: otherwise the first access at run time (e.g. uploading the experts
+                // of a layer kept in host memory) takes a page fault for every page
+                if (!lazy_ranges.empty()) {
+                    const size_t page_size = sysconf(_SC_PAGESIZE);
+                    const size_t beg = range.first & ~(page_size - 1);
+                    const size_t end = std::min((range.second + page_size - 1) & ~(page_size - 1), file->size());
+                    if (beg < end && madvise((char *) addr + beg, end - beg, MADV_POPULATE_READ)) {
+                        LLAMA_LOG_DEBUG("%s: madvise(.., MADV_POPULATE_READ) failed: %s\n", __func__, strerror(errno));
+                    }
+                }
+#endif
             }
         }
         for (const auto & range : lazy_ranges) {
