@@ -117,6 +117,23 @@ extern "C" {
     // automatic fallback to sync copy if async is not supported
     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // a copy of `size` bytes from `src` at byte offset `src_offset` to `dst` at byte offset `dst_offset`
+    struct ggml_backend_copy_region {
+        const struct ggml_tensor * src;
+        size_t                     src_offset;
+        struct ggml_tensor *       dst;
+        size_t                     dst_offset;
+        size_t                     size;
+    };
+
+    // queue many copies on `backend` as one batch, in stream order with the work queued before and after it, the copies
+    // of the batch may run in any order (they must not overlap)
+    // the destinations must be device memory of the backend, the sources device memory of the same device or host memory
+    // the backend can read asynchronously (e.g. pinned)
+    // returns false if the backend cannot batch these copies, nothing is copied then
+    // with n_regions == 0, returns whether the backend supports batched copies at all
+    GGML_API bool ggml_backend_tensor_copy_regions_async(ggml_backend_t backend, const struct ggml_backend_copy_region * regions, size_t n_regions);
+
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 
     //

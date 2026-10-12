@@ -208,6 +208,7 @@ struct llama_moe_cache::impl {
     stats stats_copy;   // experts copied from the cache for large batches
     stats stats_upload; // experts uploaded for large batches
     stats stats_seed;   // experts admitted from large batches
+    size_t n_batches = 0; // batched copy calls (one per expert tensor) for large batches
 
     // the layer being seeded from a large batch
     struct seed_state {
@@ -217,6 +218,7 @@ struct llama_moe_cache::impl {
         uint32_t done = 0; // expert tensors whose slots were filled
     } sd;
     std::vector<int32_t> seed_ids;
+    std::vector<ggml_backend_copy_region> seed_regions;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -494,7 +496,7 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
-    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -516,12 +518,20 @@ struct llama_moe_cache::impl {
             n++;
         }
 
+        ggml_tensor * bank = g.banks[b.ip];
+
+        // batched: every cached run is copied, the copies are issued together with the uploads by the caller
+        if (regions != nullptr) {
+            GGML_ASSERT(bank->nb[2] == dst->nb[2]);
+            regions->push_back({ bank, (size_t) slots[e]*bank->nb[2], dst, (size_t) e*dst->nb[2], (size_t) n*bank->nb[2] });
+            return n;
+        }
+
         // a short run is uploaded with its neighbors: many small uploads are slower than the bytes they save
         if (n*w->nb[2] < min_copy_bytes) {
             return -n;
         }
 
-        ggml_tensor * bank = g.banks[b.ip];
         ggml_reset(ctx_views.get());
         ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
@@ -606,6 +616,24 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // statistics of a batch of copies of the experts of w issued by the caller: copies from the banks and uploads
+    void count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions) {
+        if (bindings.find(w) == bindings.end()) {
+            return;
+        }
+        n_batches++;
+        for (const auto & r : regions) {
+            stats & st = r.src == w ? stats_upload : stats_copy;
+            if (r.src == w) {
+                st.misses += r.size/w->nb[2];
+            } else {
+                st.hits   += r.size/w->nb[2];
+            }
+            st.bytes += r.size;
+            st.calls += 1;
+        }
+    }
+
     void count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes) {
         if (bindings.find(w) != bindings.end()) {
             stats_upload.misses += n_experts;
@@ -661,6 +689,25 @@ struct llama_moe_cache::impl {
         ggml_tensor * bank = g.banks[b.ip];
         ggml_tensor * src  = const_cast<ggml_tensor *>(dst);
         const auto & fills = sd.fills;
+
+        // batched: one call for the whole tensor
+        seed_regions.clear();
+        for (size_t i = 0; i < fills.size();) {
+            size_t n = 1;
+            while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                n++;
+            }
+            seed_regions.push_back({ src, (size_t) fills[i].expert*src->nb[2], bank, (size_t) fills[i].slot*bank->nb[2], n*src->nb[2] });
+            i += n;
+        }
+        if (!seed_regions.empty() && ggml_backend_tensor_copy_regions_async(backend, seed_regions.data(), seed_regions.size())) {
+            for (const auto & r : seed_regions) {
+                stats_seed.bytes += r.size;
+            }
+            sd.done |= 1u << b.ip;
+            return;
+        }
+
         for (size_t i = 0; i < fills.size();) {
             size_t n = 1;
             while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
@@ -715,8 +762,8 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts uploaded, %.2f MiB\n", stats_upload.misses, stats_upload.bytes/1024.0/1024.0);
         }
         if (n_large_ubatches > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu ubatches, copy calls per ubatch: %.1f from the cache, %.1f uploads\n",
-                n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches);
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu ubatches, copies per ubatch: %.1f from the cache, %.1f uploads, in %.1f batched calls\n",
+                n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches, (double) n_batches/n_large_ubatches);
         }
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts admitted to the cache, %.2f MiB\n", stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
@@ -750,8 +797,12 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
     return pimpl->copy(backend, src, dst, graph);
 }
 
-int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
-    return pimpl->copy_experts(backend, w, dst, e, last);
+int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
+    return pimpl->copy_experts(backend, w, dst, e, last, regions);
+}
+
+void llama_moe_cache::count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions) {
+    pimpl->count_batch(w, regions);
 }
 
 void llama_moe_cache::count_large_ubatch() {

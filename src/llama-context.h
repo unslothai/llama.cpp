@@ -375,6 +375,7 @@ private:
         std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
 
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
+        std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
 
         void reset() {
             ids = nullptr;

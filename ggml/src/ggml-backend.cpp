@@ -649,6 +649,19 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
+typedef bool (*ggml_backend_copy_regions_async_t)(ggml_backend_t backend, const struct ggml_backend_copy_region * regions, size_t n_regions);
+
+bool ggml_backend_tensor_copy_regions_async(ggml_backend_t backend, const struct ggml_backend_copy_region * regions, size_t n_regions) {
+    GGML_ASSERT(backend);
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    if (reg == NULL) {
+        return false;
+    }
+    auto fn = (ggml_backend_copy_regions_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_regions_async");
+    return fn != NULL && fn(backend, regions, n_regions);
+}
+
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 

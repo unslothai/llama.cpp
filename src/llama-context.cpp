@@ -2844,50 +2844,74 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
+    // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache, in one call with the uploads
+    // otherwise: only long cached runs are copied from the cache (many small copies are slower than the bytes they save),
     // the copies from the MoE cache are issued first, then the uploads
-    st.uploads.clear();
-    for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
-            first++;
-            continue;
-        }
-        int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
-            last++;
-        }
+    const bool batch = lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr && ggml_backend_tensor_copy_regions_async(backend, nullptr, 0);
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
-        int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n <= 0) {
-                e += n == 0 ? 1 : -n;
+    auto plan = [&](bool batched) {
+        st.uploads.clear();
+        st.regions.clear();
+        for (int64_t first = 0; first < n_expert; ) {
+            if (!st.used[first]) {
+                first++;
                 continue;
             }
-            if (next < e) {
-                st.uploads.push_back({ next*expert_size, (e - next)*expert_size });
-                lctx->moe_cache->count_upload(src, e - next, (e - next)*expert_size);
+            int64_t last = first;
+            while (last + 1 < n_expert && st.used[last + 1]) {
+                last++;
             }
-            e   += n;
-            next = e;
-        }
 
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            st.uploads.push_back({ offset, size });
-            if (lctx->moe_cache) {
-                lctx->moe_cache->count_upload(src, last + 1 - next, size);
+            // the experts in the MoE cache are copied from device memory, the others are uploaded
+            int64_t next = first;
+            for (int64_t e = first; e <= last && lctx->moe_cache; ) {
+                const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last, batched ? &st.regions : nullptr);
+                if (n <= 0) {
+                    e += n == 0 ? 1 : -n;
+                    continue;
+                }
+                if (next < e) {
+                    st.uploads.push_back({ next*expert_size, (e - next)*expert_size });
+                    if (!batched) {
+                        lctx->moe_cache->count_upload(src, e - next, (e - next)*expert_size);
+                    }
+                }
+                e   += n;
+                next = e;
             }
-        }
 
-        first = last + 1;
+            // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+            const size_t offset  = next*expert_size;
+            const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+            const size_t size    = (last + 1 - next)*expert_size + padding;
+            if (size > 0) {
+                st.uploads.push_back({ offset, size });
+                if (lctx->moe_cache && !batched) {
+                    lctx->moe_cache->count_upload(src, last + 1 - next, size);
+                }
+            }
+
+            first = last + 1;
+        }
+    };
+
+    bool done = false;
+    if (batch) {
+        plan(true);
+        for (const auto & [offset, size] : st.uploads) {
+            st.regions.push_back({ src, offset, dst, offset, size });
+        }
+        // fails (nothing copied) e.g. when the host weights are not pinned
+        if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+            lctx->moe_cache->count_batch(src, st.regions);
+            done = true;
+        }
     }
-
-    for (const auto & [offset, size] : st.uploads) {
-        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+    if (!done) {
+        plan(false);
+        for (const auto & [offset, size] : st.uploads) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        }
     }
 
     if (seed && !st.counts.empty()) {

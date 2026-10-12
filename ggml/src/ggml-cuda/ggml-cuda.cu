@@ -5994,8 +5994,72 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// many small copies as one cudaMemcpyBatchAsync (CUDA >= 12.8), GGML_CUDA_COPY_BATCH=0 disables it
+static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+    GGML_UNUSED(backend);
+    GGML_UNUSED(regions);
+    GGML_UNUSED(n_regions);
+    return false;
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_COPY_BATCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    if (n_regions == 0) {
+        return true;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    std::vector<void *>       dsts(n_regions);
+    std::vector<const void *> srcs(n_regions);
+    std::vector<size_t>       sizes(n_regions);
+    for (size_t i = 0; i < n_regions; i++) {
+        const ggml_backend_copy_region & r = regions[i];
+        ggml_backend_buffer_t buf_dst = r.dst->view_src ? r.dst->view_src->buffer : r.dst->buffer;
+        ggml_backend_buffer_t buf_src = r.src->view_src ? r.src->view_src->buffer : r.src->buffer;
+        if (buf_dst == nullptr || !ggml_backend_buffer_is_cuda(buf_dst) ||
+            ((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx->device) {
+            return false;
+        }
+        // device memory of the same device, or pinned host memory (pageable memory cannot be read in stream order)
+        const bool src_dev  = buf_src != nullptr && ggml_backend_buffer_is_cuda(buf_src) &&
+            ((ggml_backend_cuda_buffer_context *) buf_src->context)->device == cuda_ctx->device;
+        const bool src_host = buf_src != nullptr && ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src));
+        if (!src_dev && !src_host) {
+            return false;
+        }
+        GGML_ASSERT(r.dst_offset + r.size <= ggml_nbytes(r.dst) && r.src_offset + r.size <= ggml_nbytes(r.src));
+        dsts[i]  = (char *) r.dst->data + r.dst_offset;
+        srcs[i]  = (const char *) r.src->data + r.src_offset;
+        sizes[i] = r.size;
+    }
+
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attr_idx = 0;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+#if CUDART_VERSION >= 13000
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), n_regions, &attr, &attr_idx, 1, cuda_ctx->stream()));
+#else
+    size_t fail_idx = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), n_regions, &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
+#endif
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_regions_async;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

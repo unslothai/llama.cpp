@@ -33,7 +33,11 @@ public:
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
-    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+    // with regions != nullptr, every cached run is appended to regions instead of being copied (and is not counted)
+    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions = nullptr);
+
+    // for large batches: count the copies of a batch of the experts of w issued by the caller (copies from the cache and uploads)
+    void count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions);
 
     // for large batches: count a ubatch of more than 32 tokens (for the copy statistics)
     void count_large_ubatch();
