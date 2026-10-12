@@ -35,7 +35,10 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
-    // for large batches: count the experts of w uploaded from host memory
+    // for large batches: count a ubatch of more than 32 tokens (for the copy statistics)
+    void count_large_ubatch();
+
+    // for large batches: count the experts of w uploaded from host memory (one copy call)
     void count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes);
 
     // for large batches: admit the most used experts of the layer of w, counts[e] is the number of tokens routed to expert e

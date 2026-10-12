@@ -2002,6 +2002,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         moe_cache_seed = moe_cache && ubatch.n_tokens > 32 && n_outputs > 0;
+        if (moe_cache && ubatch.n_tokens > 32) {
+            moe_cache->count_large_ubatch();
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 

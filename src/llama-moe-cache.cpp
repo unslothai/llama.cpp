@@ -191,7 +191,10 @@ struct llama_moe_cache::impl {
         size_t hits   = 0;
         size_t misses = 0;
         size_t bytes  = 0;
+        size_t calls  = 0; // copy calls issued
     };
+
+    size_t n_large_ubatches = 0; // ubatches of more than max_batch tokens
 
     static constexpr int64_t max_batch = 32;
 
@@ -528,6 +531,7 @@ struct llama_moe_cache::impl {
 
         stats_copy.hits  += n;
         stats_copy.bytes += ggml_nbytes(src_view);
+        stats_copy.calls += 1;
 
         return n;
     }
@@ -606,6 +610,7 @@ struct llama_moe_cache::impl {
         if (bindings.find(w) != bindings.end()) {
             stats_upload.misses += n_experts;
             stats_upload.bytes  += bytes;
+            stats_upload.calls  += 1;
         }
     }
 
@@ -709,6 +714,10 @@ struct llama_moe_cache::impl {
         if (stats_upload.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts uploaded, %.2f MiB\n", stats_upload.misses, stats_upload.bytes/1024.0/1024.0);
         }
+        if (n_large_ubatches > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu ubatches, copy calls per ubatch: %.1f from the cache, %.1f uploads\n",
+                n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches);
+        }
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts admitted to the cache, %.2f MiB\n", stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
@@ -743,6 +752,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+void llama_moe_cache::count_large_ubatch() {
+    pimpl->n_large_ubatches++;
 }
 
 void llama_moe_cache::count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes) {
