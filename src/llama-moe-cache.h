@@ -35,6 +35,16 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // for large batches: count the experts of w uploaded from host memory
+    void count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes);
+
+    // for large batches: admit the most used experts of the layer of w, counts[e] is the number of tokens routed to expert e
+    // must be called for each expert tensor of the layer after dst is filled, the slots are filled from dst
+    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts);
+
+    // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
+    void seed_end();
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

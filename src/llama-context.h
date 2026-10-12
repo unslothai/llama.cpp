@@ -368,15 +368,20 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            counts.clear();
         }
     };
 
     copy_experts_info copy_experts;
+
+    // the MoE cache admits the most used experts of this ubatch, set for the large ubatches with outputs (the end of a prompt)
+    bool moe_cache_seed = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

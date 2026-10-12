@@ -199,7 +199,18 @@ struct llama_moe_cache::impl {
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
-    stats stats_copy;  // experts copied from the cache for large batches
+    stats stats_copy;   // experts copied from the cache for large batches
+    stats stats_upload; // experts uploaded for large batches
+    stats stats_seed;   // experts admitted from large batches
+
+    // the layer being seeded from a large batch
+    struct seed_state {
+        int32_t il = -1;
+        std::vector<int32_t> old_slots; // slot map before the seed, the copies of the other expert tensors of the layer read it
+        std::vector<moe_cache_lru::fill> fills;
+        uint32_t done = 0; // expert tensors whose slots were filled
+    } sd;
+    std::vector<int32_t> seed_ids;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -484,12 +495,13 @@ struct llama_moe_cache::impl {
         }
         const binding & b = it->second;
         const group & g = groups[layers[b.il].ig];
-        if (backend != devices[g.id].backend) {
+        if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
             return 0;
         }
 
         // large batches only read the cache, so the experts used in generation stay in it
-        const int32_t * slots = g.lru.slot_map[b.il];
+        // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
+        const int32_t * slots = b.il == sd.il ? sd.old_slots.data() : g.lru.slot_map[b.il];
         if (slots == nullptr || slots[e] < 0) {
             return 0;
         }
@@ -582,6 +594,96 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    void count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes) {
+        if (bindings.find(w) != bindings.end()) {
+            stats_upload.misses += n_experts;
+            stats_upload.bytes  += bytes;
+        }
+    }
+
+    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        const binding & b = it->second;
+        group & g = groups[layers[b.il].ig];
+        if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
+            return;
+        }
+
+        // the first expert tensor of the layer plans the slots of its most used experts, each layer gets an equal share
+        if (b.il != sd.il) {
+            seed_end();
+
+            const int32_t n_expert = g.lru.n_expert;
+            const size_t  n_seed   = g.n_slots / g.layers.size();
+            GGML_ASSERT((int32_t) counts.size() == n_expert);
+            seed_ids.clear();
+            for (int32_t e = 0; e < n_expert; ++e) {
+                if (counts[e] > 0) {
+                    seed_ids.push_back(e);
+                }
+            }
+            if (n_seed < seed_ids.size()) {
+                std::partial_sort(seed_ids.begin(), seed_ids.begin() + n_seed, seed_ids.end(), [&](int32_t a, int32_t c) {
+                    return counts[a] != counts[c] ? counts[a] > counts[c] : a < c;
+                });
+                seed_ids.resize(n_seed);
+            }
+            if (seed_ids.empty()) {
+                return;
+            }
+
+            const int32_t * slots = g.lru.slot_map[b.il];
+            sd.il = b.il;
+            sd.old_slots.assign(slots, slots + n_expert);
+            sd.done = 0;
+            size_t n_hit = 0;
+            const bool ok = g.lru.plan(b.il, seed_ids.data(), seed_ids.size(), sd.fills, n_hit);
+            GGML_ASSERT(ok);
+        }
+
+        // fill the new slots from the staged copy of the experts, after it was filled on the same backend
+        ggml_tensor * bank = g.banks[b.ip];
+        ggml_tensor * src  = const_cast<ggml_tensor *>(dst);
+        const auto & fills = sd.fills;
+        for (size_t i = 0; i < fills.size();) {
+            size_t n = 1;
+            while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                n++;
+            }
+            ggml_reset(ctx_views.get());
+            ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), src,  src->ne[0],  src->ne[1],  n, src->nb[1],  src->nb[2],  fills[i].expert*src->nb[2]);
+            ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], fills[i].slot*bank->nb[2]);
+            ggml_backend_view_init(src_view);
+            ggml_backend_view_init(dst_view);
+            ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+            stats_seed.bytes += ggml_nbytes(src_view);
+            i += n;
+        }
+        sd.done |= 1u << b.ip;
+    }
+
+    void seed_end() {
+        if (sd.il < 0) {
+            return;
+        }
+        const layer & l = layers[sd.il];
+        group & g = groups[l.ig];
+        if (sd.done == (1u << l.experts.size()) - 1) {
+            stats_seed.misses += sd.fills.size();
+        } else {
+            // some expert tensors were copied without filling their slots, drop the experts admitted to the layer
+            for (const auto & f : sd.fills) {
+                g.lru.slot_map[sd.il][f.expert] = -1;
+                g.lru.key_of[f.slot] = -1;
+            }
+        }
+        sd.il = -1;
+        sd.fills.clear();
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -595,6 +697,12 @@ struct llama_moe_cache::impl {
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+        }
+        if (stats_upload.misses > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts uploaded, %.2f MiB\n", stats_upload.misses, stats_upload.bytes/1024.0/1024.0);
+        }
+        if (stats_seed.misses > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts admitted to the cache, %.2f MiB\n", stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
     }
 };
@@ -627,6 +735,18 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+void llama_moe_cache::count_upload(const ggml_tensor * w, size_t n_experts, size_t bytes) {
+    pimpl->count_upload(w, n_experts, bytes);
+}
+
+void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts) {
+    pimpl->seed(backend, w, dst, counts);
+}
+
+void llama_moe_cache::seed_end() {
+    pimpl->seed_end();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
