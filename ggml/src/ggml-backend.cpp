@@ -1901,13 +1901,17 @@ static bool ggml_backend_sched_prefetch_backend_ok(ggml_backend_sched_t sched, i
         if (!props.caps.async || !props.caps.events) {
             return false;
         }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
         if (sched->pf_mode == 1) {
             // other backends have not been validated yet, they can be enabled with GGML_SCHED_PREFETCH=2
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-            const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
             if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
                 return false;
             }
+        }
+        // SYCL: weights in mmap'ed memory must be uploaded through the pinned staging of set_tensor, which the async copies skip
+        if (strcmp(reg_name, "SYCL") == 0) {
+            return false;
         }
         pf->eligible = true;
     }
@@ -2174,6 +2178,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             pf->n_async = 0;
             pf->need    = 0;
             continue;
+        }
+
+        // like the graph allocator, release the per-tensor state of the previous graph (e.g. tensor extras)
+        if (!dry) {
+            ggml_backend_buffer_reset(pf->arena);
         }
 
         const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
