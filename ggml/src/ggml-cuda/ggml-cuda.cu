@@ -63,6 +63,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-cuda/copy-regions.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -6088,7 +6089,19 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// many small copies as one cudaMemcpyBatchAsync (CUDA >= 12.8), GGML_CUDA_COPY_BATCH=0 disables it
+// host memory registered by ggml_backend_cuda_host_map (pinned)
+static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    for (const auto & [base, m] : ggml_cuda_host_mappings()) {
+        if ((const char *) ptr >= (const char *) base && (const char *) ptr + size <= (const char *) base + m.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// many small copies with two calls: the uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8) on the copy engines, the device
+// copies with one kernel (GGML_CUDA_COPY_REGIONS_KERNEL=0 puts them in the batch), GGML_CUDA_COPY_BATCH=0 disables both
 static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
     GGML_UNUSED(backend);
@@ -6109,9 +6122,20 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
-    std::vector<void *>       dsts(n_regions);
-    std::vector<const void *> srcs(n_regions);
-    std::vector<size_t>       sizes(n_regions);
+    static const bool d2d_kernel = [] {
+        const char * env = getenv("GGML_CUDA_COPY_REGIONS_KERNEL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    std::vector<void *>       dsts;
+    std::vector<const void *> srcs;
+    std::vector<size_t>       sizes;
+    std::vector<void *>       d2d_dsts;
+    std::vector<const void *> d2d_srcs;
+    std::vector<size_t>       d2d_sizes;
+    dsts.reserve(n_regions);
+    srcs.reserve(n_regions);
+    sizes.reserve(n_regions);
     for (size_t i = 0; i < n_regions; i++) {
         const ggml_backend_copy_region & r = regions[i];
         ggml_backend_buffer_t buf_dst = r.dst->view_src ? r.dst->view_src->buffer : r.dst->buffer;
@@ -6123,14 +6147,27 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         // device memory of the same device, or pinned host memory (pageable memory cannot be read in stream order)
         const bool src_dev  = buf_src != nullptr && ggml_backend_buffer_is_cuda(buf_src) &&
             ((ggml_backend_cuda_buffer_context *) buf_src->context)->device == cuda_ctx->device;
-        const bool src_host = buf_src != nullptr && ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src));
+        const bool src_host = buf_src != nullptr && !src_dev &&
+            (ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src)) ||
+             (ggml_backend_buffer_is_host(buf_src) && ggml_cuda_host_is_mapped((const char *) r.src->data + r.src_offset, r.size)));
         if (!src_dev && !src_host) {
             return false;
         }
         GGML_ASSERT(r.dst_offset + r.size <= ggml_nbytes(r.dst) && r.src_offset + r.size <= ggml_nbytes(r.src));
-        dsts[i]  = (char *) r.dst->data + r.dst_offset;
-        srcs[i]  = (const char *) r.src->data + r.src_offset;
-        sizes[i] = r.size;
+        if (r.size == 0) {
+            continue;
+        }
+        void       * d = (char *) r.dst->data + r.dst_offset;
+        const void * s = (const char *) r.src->data + r.src_offset;
+        if (src_dev && d2d_kernel) {
+            d2d_dsts.push_back(d);
+            d2d_srcs.push_back(s);
+            d2d_sizes.push_back(r.size);
+        } else {
+            dsts.push_back(d);
+            srcs.push_back(s);
+            sizes.push_back(r.size);
+        }
     }
 
     cudaMemcpyAttributes attr = {};
@@ -6139,12 +6176,18 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
     size_t attr_idx = 0;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    if (!d2d_dsts.empty()) {
+        ggml_cuda_copy_regions_d2d(cuda_ctx->stream(), ggml_cuda_info().devices[cuda_ctx->device].nsm,
+            d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
+    }
+    if (!dsts.empty()) {
 #if CUDART_VERSION >= 13000
-    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), n_regions, &attr, &attr_idx, 1, cuda_ctx->stream()));
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attr, &attr_idx, 1, cuda_ctx->stream()));
 #else
-    size_t fail_idx = 0;
-    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), n_regions, &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
+        size_t fail_idx = 0;
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), dsts.size(), &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
 #endif
+    }
     return true;
 #endif
 }
