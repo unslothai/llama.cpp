@@ -373,6 +373,17 @@ llama_context::llama_context(
         }
     }
 
+    {
+        // without the prefetch of the scheduler, the experts are copied after the ids are read, unless nearly all are used
+        const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
+        const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
+        if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
+            prefetch_min_batch = INT64_MAX;
+        } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
+            prefetch_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_MIN_BATCH));
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -732,7 +743,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_filter, this);
+    ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -773,7 +784,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_filter, this);
+                ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2739,11 +2750,32 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-bool llama_context::sched_prefetch_filter(const ggml_tensor * src, void * user_data) {
+ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache change between graph computations, they must go through the copy callback
-    return !(lctx->moe_cache && lctx->moe_cache->is_slot_map(src));
+    if (lctx->moe_cache && lctx->moe_cache->is_slot_map(src)) {
+        return GGML_BACKEND_SCHED_PREFETCH_NONE;
+    }
+
+    // experts: the copy callback can copy them ahead only if it does not need the ids, which are computed by an earlier split
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst && !lctx->sched_copy_all_experts(src, node->src[2])) {
+            return GGML_BACKEND_SCHED_PREFETCH_SYNC;
+        }
+    }
+
+    return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
+}
+
+bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const {
+    // the ubatch that seeds the MoE cache counts the experts used by the layers it caches
+    if (moe_cache_seed && moe_cache && moe_cache->get_experts(src) != nullptr) {
+        return false;
+    }
+    // nearly every expert is used, copying all of them avoids waiting for the ids
+    return ids->ne[1] >= prefetch_min_batch || ggml_nelements(ids) >= 8*src->ne[2];
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -2776,9 +2808,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the ubatch that seeds the MoE cache counts the experts used by the layers it caches
     const bool seed = lctx->moe_cache_seed && lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr;
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty())) {
-        if (!seed && ggml_nelements(ids) >= 8*n_expert) {
-            // nearly every expert is used, copying all of them avoids waiting for the ids
+    // must match sched_prefetch_mode: the copies of all experts may be issued on a copy queue before the ids are computed
+    const bool all = lctx->sched_copy_all_experts(src, ids);
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty()) || (all && !st.counts.empty())) {
+        if (all) {
             st.used.assign(n_expert, true);
             st.counts.clear();
         } else {

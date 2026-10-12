@@ -946,6 +946,7 @@ struct ggml_backend_sched_prefetch {
     size_t                slot_size;
     ggml_backend_event_t  ready [GGML_SCHED_MAX_PREFETCH_DEPTH];
     ggml_backend_event_t  retire[GGML_SCHED_MAX_PREFETCH_DEPTH];
+    ggml_backend_event_t  start; // recorded on the backend when a graph computation starts, the copy queue waits for it
 
     // prefetched splits of the current graph
     int * split_ids;
@@ -1011,7 +1012,6 @@ struct ggml_backend_sched {
     // host weight prefetch [GGML_SCHED_PREFETCH]
     int  pf_mode;      // 0 = off, 1 = CUDA-family backends, 2 = any backend with async copies and events
     int  pf_depth;     // number of staging slots per backend
-    int  pf_min_batch; // with a copy callback, MUL_MAT_ID weights of smaller batches keep the callback (routed experts only)
     bool pf_active;    // the current graph has prefetched splits
     struct ggml_backend_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
 
@@ -1900,15 +1900,16 @@ static bool ggml_backend_sched_prefetch_backend_ok(ggml_backend_sched_t sched, i
     return pf->eligible && !pf->failed;
 }
 
-static bool ggml_backend_sched_prefetch_candidate(ggml_backend_sched_t sched, struct ggml_tensor * input) {
+static enum ggml_backend_sched_prefetch_mode ggml_backend_sched_prefetch_candidate(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     if (!ggml_backend_sched_is_host_weight(input) || (input->flags & GGML_TENSOR_FLAG_INPUT)) {
-        return false;
+        return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
     if (sched->callback_prefetch != NULL) {
-        return sched->callback_prefetch(input, sched->callback_prefetch_user_data);
+        const struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+        return sched->callback_prefetch(input, input_cpy, &split->graph, sched->callback_prefetch_user_data);
     }
     // the copy callback may be required for some weights, so prefetch only if the user tells which ones
-    return sched->callback_copy == NULL;
+    return sched->callback_copy == NULL ? GGML_BACKEND_SCHED_PREFETCH_ASYNC : GGML_BACKEND_SCHED_PREFETCH_NONE;
 }
 
 static void ggml_backend_sched_prefetch_sync(ggml_backend_sched_t sched) {
@@ -1931,6 +1932,10 @@ static void ggml_backend_sched_prefetch_release(ggml_backend_sched_t sched, int 
             ggml_backend_event_free(pf->retire[s]);
             pf->retire[s] = NULL;
         }
+    }
+    if (pf->start != NULL) {
+        ggml_backend_event_free(pf->start);
+        pf->start = NULL;
     }
     if (pf->arena != NULL) {
         ggml_backend_buffer_free(pf->arena);
@@ -1962,6 +1967,10 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
             pf->copy_backend->iface.event_record     != NULL &&
             pf->copy_backend->iface.event_wait       != NULL &&
             ggml_backend_supports_buft(pf->copy_backend, sched->bufts[backend_id]);
+        if (ok) {
+            pf->start = ggml_backend_event_new(backend->device);
+            ok = pf->start != NULL;
+        }
         for (int s = 0; ok && s < sched->pf_depth; s++) {
             pf->ready[s]  = ggml_backend_event_new(backend->device);
             pf->retire[s] = ggml_backend_event_new(backend->device);
@@ -2018,8 +2027,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         return;
     }
 
-    // candidate copies and the split that copies them
+    // candidate copies, the split that copies them and how
     std::unordered_map<const ggml_tensor *, int> owner;
+    std::unordered_set<const ggml_tensor *> sync_copies;
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         if (!ggml_backend_sched_prefetch_backend_ok(sched, split->backend_id)) {
@@ -2027,8 +2037,13 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         }
         for (int j = 0; j < split->n_inputs; j++) {
             struct ggml_tensor * input = split->inputs[j];
-            if (ggml_backend_sched_prefetch_candidate(sched, input)) {
-                owner[tensor_copy(input, split->backend_id, sched->cur_copy)] = i;
+            const enum ggml_backend_sched_prefetch_mode mode = ggml_backend_sched_prefetch_candidate(sched, split, input);
+            if (mode != GGML_BACKEND_SCHED_PREFETCH_NONE) {
+                const ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+                owner[input_cpy] = i;
+                if (mode == GGML_BACKEND_SCHED_PREFETCH_SYNC) {
+                    sync_copies.insert(input_cpy);
+                }
             }
         }
     }
@@ -2070,14 +2085,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             }
             bytes += GGML_PAD(ggml_backend_buft_get_alloc_size(sched->bufts[b], input_cpy), align);
 
-            // small MoE batches read only a few experts: keep the copy callback, which uploads only the routed experts
-            if (sched->callback_copy != NULL) {
-                for (int n = 0; n < split->graph.n_nodes && async; n++) {
-                    const struct ggml_tensor * node = split->graph.nodes[n];
-                    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy && node->src[2]->ne[1] < sched->pf_min_batch) {
-                        async = false;
-                    }
-                }
+            // e.g. small MoE batches upload only the routed experts, which needs the ids computed by an earlier split
+            if (sync_copies.count(input_cpy) > 0) {
+                async = false;
             }
         }
         if (bytes == 0) {
@@ -2167,7 +2177,11 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
                     struct ggml_tensor * input = split->inputs[j];
                     if (ggml_backend_sched_prefetch_is_bound(sched, split, input)) {
                         struct ggml_tensor * input_cpy = tensor_copy(input, b, sched->cur_copy);
-                        ggml_backend_tensor_set_async(pf->copy_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        // the copy callback may copy parts of the weight from device memory (e.g. a cache of MoE experts)
+                        if (sched->callback_copy == NULL ||
+                            !sched->callback_copy(pf->copy_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+                            ggml_backend_tensor_set_async(pf->copy_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        }
                     }
                 }
                 ggml_backend_event_record(pf->ready[slot], pf->copy_backend);
@@ -2226,8 +2240,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
 
     for (int b = 0; b < sched->n_backends; b++) {
-        sched->pf[b].issued   = 0;
-        sched->pf[b].consumed = 0;
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        pf->issued   = 0;
+        pf->consumed = 0;
+        // the copies of this graph run after the work queued on the backend before it, e.g. writes of earlier graphs
+        // to device memory that a copy callback reads
+        if (sched->pf_active && pf->n_bound > 0 && pf->start != NULL) {
+            ggml_backend_event_record(pf->start, sched->backends[b]);
+            ggml_backend_event_wait(pf->copy_backend, pf->start);
+        }
     }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2402,10 +2423,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     {
         const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
         const char * GGML_SCHED_PREFETCH_DEPTH     = getenv("GGML_SCHED_PREFETCH_DEPTH");
-        const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
         sched->pf_mode      = GGML_SCHED_PREFETCH           ? atoi(GGML_SCHED_PREFETCH)           : 1;
         sched->pf_depth     = GGML_SCHED_PREFETCH_DEPTH     ? atoi(GGML_SCHED_PREFETCH_DEPTH)     : 2;
-        sched->pf_min_batch = GGML_SCHED_PREFETCH_MIN_BATCH ? atoi(GGML_SCHED_PREFETCH_MIN_BATCH) : 256;
         sched->pf_depth     = std::min(std::max(sched->pf_depth, 1), GGML_SCHED_MAX_PREFETCH_DEPTH);
     }
 

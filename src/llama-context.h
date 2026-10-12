@@ -275,7 +275,11 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
-    static bool sched_prefetch_filter(const ggml_tensor * src, void * user_data);
+    // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
+    static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
+    // true if the copy of the experts used by a MUL_MAT_ID with these ids may skip reading the ids (all experts are copied)
+    bool sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -382,6 +386,10 @@ private:
 
     // the MoE cache admits the most used experts of this ubatch, set for the large ubatches with outputs (the end of a prompt)
     bool moe_cache_seed = false;
+
+    // MoE batches of at least this many tokens copy all of the experts of the host weights without reading the ids,
+    // ahead of the split on the copy queue of the scheduler [GGML_SCHED_PREFETCH_MIN_BATCH]
+    int64_t prefetch_min_batch = 256;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
