@@ -32,7 +32,7 @@ public:
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
-    // returns the number of experts copied, 0 if expert e is not in the cache
+    // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     // for large batches: count the experts of w uploaded from host memory

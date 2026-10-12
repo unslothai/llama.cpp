@@ -195,6 +195,9 @@ struct llama_moe_cache::impl {
 
     static constexpr int64_t max_batch = 32;
 
+    // large batches copy runs of cached experts of at least this size from the cache
+    static constexpr size_t min_copy_bytes = 4u*1024*1024;
+
     int32_t n_expert_used;
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -508,6 +511,11 @@ struct llama_moe_cache::impl {
         int64_t n = 1;
         while (e + n <= last && slots[e + n] == slots[e] + n) {
             n++;
+        }
+
+        // a short run is uploaded with its neighbors: many small uploads are slower than the bytes they save
+        if (n*w->nb[2] < min_copy_bytes) {
+            return -n;
         }
 
         ggml_tensor * bank = g.banks[b.ip];

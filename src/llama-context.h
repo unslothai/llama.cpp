@@ -374,6 +374,8 @@ private:
         std::vector<bool>    used;
         std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
 
+        std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
+
         void reset() {
             ids = nullptr;
             ids_data.clear();
