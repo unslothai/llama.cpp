@@ -1419,6 +1419,15 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+// Number of column tiles of the compact MoE tiling (see mmq_moe_compact_tile) for ncols_y rows over nexperts experts
+// and batches of ncols_max tokens, or 0 if it is not used: it has to give fewer tiles than ceil(ncols_max/J) tiles per
+// expert, and fit the y dimension of a CUDA grid.
+static int mmq_moe_compact_ntx(const int64_t ncols_y, const int64_t ncols_max, const int64_t nexperts, const int J) {
+    const int64_t ntx_compact = ncols_y/J + nexperts;
+    const int64_t ntx_expert  = (ncols_max + J - 1)/J;
+    return ntx_compact < ntx_expert*nexperts && ntx_compact <= UINT16_MAX ? int(ntx_compact) : 0;
+}
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * y_scale;
@@ -1466,8 +1475,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // the per-expert grid is mostly empty tiles once an expert sees only a small part of the tokens.
     int nexperts_compact = 0;
     if (args.ids_dst != nullptr && channel_ratio == 1 && args.nsamples_y == 1) {
-        const int64_t ntx_compact = args.ncols_y / config.J + args.nchannels_y;
-        if (ntx_compact < int64_t(ntx) * args.nchannels_y && ntx_compact <= UINT16_MAX) {
+        const int ntx_compact = mmq_moe_compact_ntx(args.ncols_y, args.ncols_max, args.nchannels_y, config.J);
+        if (ntx_compact > 0) {
             ntx               = ntx_compact;
             nchannels_y_tiles = 1;
             nexperts_compact  = args.nchannels_y;

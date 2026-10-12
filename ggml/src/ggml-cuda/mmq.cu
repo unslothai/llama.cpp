@@ -187,21 +187,10 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
-    int J_best        = 0;
-    int nthreads_best = 0;
-    {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
-
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-            }
-        }
-
+    // the tile width with the fewest tiles for ncols_opt columns, the smallest such one
+    auto pick_J = [&](const int64_t ncols_opt, int & J_best, int & nthreads_best) {
+        J_best        = 0;
+        nthreads_best = 0;
         int ntiles_J_best = INT_MAX;
 
         for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
@@ -222,6 +211,35 @@ void ggml_cuda_mul_mat_q(
                 ntiles_J_best = ntiles_x;
             }
         }
+    };
+
+    int J_best        = 0;
+    int nthreads_best = 0;
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
+
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        const int64_t ncols_expert = (ne12*n_expert_used + ne02 - 1) / ne02;
+
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+            pick_J(ncols_expert, J_best, nthreads_best);
+        } else {
+            pick_J(ne12, J_best, nthreads_best);
+
+            // NVIDIA: if the tile width for the average expert gets the compact MoE tiling (no column tiles per expert
+            // for the whole batch, see mmq_moe_compact_ntx), it wastes less of the tiles on experts with few tokens.
+            int J_expert        = 0;
+            int nthreads_expert = 0;
+            pick_J(ncols_expert, J_expert, nthreads_expert);
+            if (GGML_CUDA_CC_IS_NVIDIA(cc) && J_expert > 0 &&
+                    mmq_moe_compact_ntx(ne12*n_expert_used, ne12, ne02, J_expert) > 0) {
+                J_best        = J_expert;
+                nthreads_best = nthreads_expert;
+            }
+        }
+    } else {
+        pick_J(ne11, J_best, nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
 
