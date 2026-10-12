@@ -9782,9 +9782,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
-        // src0 views with unaligned rows: not the vectorized copy
-        for (int n : {4, 8, 16, 64}) {
+        // src0 views with unaligned rows: not the vectorized copy (short rows: flat kernel, long rows: per-row kernels)
+        for (int n : {4, 8, 16, 64, 256}) {
             test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, false, true, 1));
+        }
+        // long rows, enough of them for the vectorized copy (n = 258 is not a multiple of the vector width)
+        for (int n : {256, 258}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, false));
         }
     }
 
