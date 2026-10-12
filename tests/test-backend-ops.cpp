@@ -9782,6 +9782,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // src0 views with unaligned rows: not the vectorized copy
+        for (int n : {4, 8, 16, 64}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, false, true, 1));
+        }
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
@@ -11058,6 +11062,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool b : {false, true}) {
             for (int m : {320, 512}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 6, b, m, 300, 256));
+            }
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS}) {
+        for (bool b : {false, true}) {
+            // more than 64 experts
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, b, 128, 512, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, b, 128, 300, 256));
+            // several k iterations per tile, tile count not a multiple of the SM count: stream-k fixup with empty tiles
+            for (int m : {128, 320}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, m, 256, 2048));
             }
         }
     }

@@ -360,7 +360,9 @@ static void get_rows_cuda_float(
         if (n_flat == 0) {
             return;
         }
-        if (ne00_flat <= GET_ROWS_FLAT_MAX_NE00 && n_flat <= int64_t(UINT32_MAX) - CUDA_GET_ROWS_BLOCK_SIZE) {
+        // The flat index has to stay below 2^31: fastdiv computes (umulhi(n, mp) + n) in 32 bits, which can overflow
+        // for n >= 2^31, and the grid-stride step i += gridDim.x*blockDim.x must not wrap around in 32 bits.
+        if (ne00_flat <= GET_ROWS_FLAT_MAX_NE00 && n_flat <= int64_t(INT32_MAX)) {
             const int64_t nblocks = (n_flat + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
             const dim3 block_nums(MIN(nblocks, int64_t(INT32_MAX)), 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
