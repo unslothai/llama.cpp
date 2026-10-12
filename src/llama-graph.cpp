@@ -2500,14 +2500,34 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         return nullptr;
     }
 
-    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
-    if (slot_map == nullptr) {
-        return nullptr;
-    }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
         if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
             return nullptr;
         }
+    }
+
+    // small batches: the slots are looked up on the device, which also copies the missing experts from host memory
+    {
+        ggml_tensor * ids = selected_experts;
+        if (!ggml_is_contiguous(ids)) {
+            ids = ggml_cont(ctx0, ids);
+        }
+        if (ggml_tensor * res = moe_cache->lookup(ctx0, il, ids, n_tokens)) {
+            ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
+            cb(res, "ffn_moe_lookup", il);
+
+            // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
+            ggml_build_forward_expand(gf, res);
+
+            ggml_tensor * slots = ggml_view_2d(ctx0, res, ids->ne[0], ids->ne[1], res->nb[1], 0); // [n_expert_used, n_tokens]
+            cb(slots, "ffn_moe_slots", il);
+            return slots;
+        }
+    }
+
+    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
+    if (slot_map == nullptr) {
+        return nullptr;
     }
 
     ggml_tensor * ids = selected_experts;

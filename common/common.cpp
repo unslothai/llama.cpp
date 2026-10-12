@@ -1676,6 +1676,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        // the MoE cache looks up and copies the experts on the device, which needs the experts in pinned host memory
+        // memory-mapped files usually cannot be pinned, so the model is loaded without mmap
+        const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
+        if (env == nullptr || atoi(env) != 0) {
+            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        }
+    }
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;

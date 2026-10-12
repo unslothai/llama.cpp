@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_CACHE_LOOKUP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_cache_lookup(ids, map, state, banks)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3421,6 +3425,51 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_moe_cache_lookup
+
+struct ggml_tensor * ggml_moe_cache_lookup(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * map,
+        struct ggml_tensor  * state,
+        struct ggml_tensor ** banks,
+        const void         ** host,
+        int                   n_banks,
+        int                   il) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state));
+    GGML_ASSERT(il >= 0 && il < map->ne[1]);
+    GGML_ASSERT(n_banks > 0 && n_banks <= 4 && 3 + n_banks <= GGML_MAX_SRC);
+
+    const int64_t n_slots = (ggml_nelements(state) - 8)/3;
+    GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
+    for (int i = 0; i < n_banks; ++i) {
+        GGML_ASSERT(banks[i]->ne[2] == n_slots + 1 && banks[i]->ne[3] == 1);
+        GGML_ASSERT(ggml_is_contiguous(banks[i]));
+    }
+
+    // slots [n_expert_used, n_tokens], then one row with the number of copied experts, then their experts and their slots
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 3*ids->ne[1] + 1);
+
+    int32_t params[2 + 2*4] = { il, n_banks };
+    for (int i = 0; i < n_banks; ++i) {
+        memcpy(&params[2 + 2*i], &host[i], sizeof(void *));
+    }
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "op params too large");
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = ids;
+    result->src[1] = map;
+    result->src[2] = state;
+    for (int i = 0; i < n_banks; ++i) {
+        result->src[3 + i] = banks[i];
+    }
 
     return result;
 }
