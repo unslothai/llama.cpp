@@ -253,10 +253,8 @@ struct server_batch {
 struct server_slot {
     int id;
 
-    // pipeline group that owns this slot, index into server_context_impl::groups
     int id_group = 0;
 
-    // sequence id of this slot inside ctx_tgt / ctx_dft, equal to id unless --pipeline-groups > 1
     int seq_id = 0;
 
     llama_context * ctx_tgt = nullptr;
@@ -790,7 +788,6 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        // note: parent and child slots are always in the same pipeline group, see get_free_slots()
         mem.seq_rm(other.seq_id,         -1, -1);
         mem.seq_cp(seq_id, other.seq_id, -1, -1);
 
@@ -990,23 +987,20 @@ struct server_group {
 
     llama_context * ctx = nullptr;
 
-    // groups after the first are made by llama_init_from_model(), which does not attach the
-    // pool common_init_from_params() builds for group 0. Without one the CPU backend makes a
-    // throwaway pool per graph and ignores --cpu-mask, --prio, --poll and --cpu-strict.
-    // Declared after ctx so it outlives the llama_free() above groups.clear().
+    // groups after the first are made by llama_init_from_model(), which does not attach the pool
+    // common_init_from_params() builds for group 0. Declared after ctx so it outlives the
+    // llama_free() above groups.clear().
     std::unique_ptr<common_threadpools> threadpools;
 
-    // common_speculative_init_result owns only the model and the context and never attaches a
-    // pool, so the draft context falls back to a throwaway pool per graph and ignores the draft
-    // --cpu-mask-draft, --prio, --poll and --cpu-strict settings. Declared before spec_init so
-    // it is destroyed after the draft context it is attached to.
+    // common_speculative_init_result never attaches a pool, so without this the draft context ignores
+    // --cpu-mask-draft, --prio, --poll and --cpu-strict. Declared before spec_init so it is destroyed
+    // after the draft context it is attached to.
     std::unique_ptr<common_threadpools> threadpools_dft;
 
     server_batch batch;
 
     std::vector<server_slot *> slots;
 
-    // note: bound to one target context, so each group owns its own set, indexed by slot.seq_id
     common_speculative_init_result_ptr spec_init;
 
     llama_model   * model_dft = nullptr;
@@ -1023,7 +1017,6 @@ struct server_group {
 
     int n_empty_consecutive = 0;
 
-    // note: per group on purpose - one group's host path runs while the other is on the GPU
     std::thread thread;
     std::mutex              mtx;  // guards this group's slots, batch and the two fields below
     std::condition_variable cv;
@@ -1137,7 +1130,6 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        // the draft / MTP context of a group refers to the group's context, so it goes first
         for (auto & grp : groups) {
             grp->spec.reset();
             grp->spec_init.reset();
@@ -1146,7 +1138,6 @@ private:
             grp->model_dft = nullptr;
         }
 
-        // groups[0]->ctx is owned by llama_init, the rest were created by llama_init_from_model()
         for (size_t g = 1; g < groups.size(); ++g) {
             if (groups[g]->ctx != nullptr) {
                 llama_free(groups[g]->ctx);
@@ -1325,7 +1316,6 @@ private:
 
         n_seq_per_group = params_base.n_parallel / n_groups;
 
-        // note: with a single group this reference IS params_base, so nothing changes
         common_params   params_grp = n_groups > 1 ? params_base : common_params{};
         common_params & params_ctx = n_groups > 1 ? params_grp  : params_base;
 
@@ -1337,31 +1327,13 @@ private:
                 params_ctx.n_ctx = std::min(params_ctx.n_ctx, n_seq_per_group * params_ctx.kv_unified_per_slot);
             }
 
-            // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked
-            // every request to be able to reach, and splitting the server into groups is an
-            // internal arrangement that should not quietly redefine it. Each group is built with
-            // the full n_ctx.
-            //
-            // What that means per slot differs by mode, because llama_context derives the
-            // per-request context differently. Unified KV sets n_ctx_seq = n_ctx, so every
-            // request can reach C, which is the point. Split KV sets n_ctx_seq = n_ctx /
-            // n_seq_max, and n_seq_max here is P/N, so a slot gets C*N/P: N times what it had when
-            // n_ctx was divided as well, not the same. That is more context per slot than before,
-            // never less, so nothing that used to fit stops fitting.
-            //
-            // The cost is aggregate KV of roughly N*C rather than C. That is real, and it is what
-            // reserve_extra_group_memory() below exists to account for: it measures each extra
-            // context and charges it to the fit margins, so a configuration that no longer fits
-            // comes back as an n_ctx the fitter lowered and reported rather than a silent
-            // shrinking of what was asked for.
+            // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked every
+            // request to be able to reach, and splitting the server into groups is an internal
+            // arrangement that should not quietly redefine it.
 
             // common_init_from_params fits ONE context and fixes the model placement from that
             // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
-            // can no longer change. Fitting the undivided n_ctx instead would not be enough:
-            // measured with common_get_device_memory_data on a 1.5B, KV tracks n_ctx (112, 224 and
-            // 448 MiB at 4k, 8k and 16k) but the compute buffer does not (536 MiB across the same
-            // range), so that would budget the KV and still miss n_groups - 1 compute buffers.
-            // Reserve what the fitter will not see in its per-device margin.
+            // can no longer change.
             if (params_ctx.fit_params) {
                 reserve_extra_group_memory(params_ctx, has_draft, spec_mtp);
             }
@@ -1373,7 +1345,6 @@ private:
         ctx_tgt   = llama_init->context();
 
         if (n_groups > 1) {
-            // pick up whatever the parameter fitting resolved, but keep the totals the user asked for
             const int n_parallel_total = params_base.n_parallel;
             const int n_ctx_total      = params_base.n_ctx;
 
@@ -1417,7 +1388,6 @@ private:
             for (int g = 1; g < n_groups; ++g) {
                 llama_context_params cparams = common_context_params_to_llama(params_ctx);
 
-                // make sure the extra contexts are identical to the one common_init_from_params made
                 cparams.n_ctx     = llama_n_ctx(ctx_tgt);
                 cparams.n_seq_max = llama_n_seq_max(ctx_tgt);
 
@@ -1449,7 +1419,6 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
-            // note: with --model-draft the draft model is loaded once per group
             for (int g = 0; g < n_groups; ++g) {
                 server_group & grp = *groups[g];
 
@@ -1473,8 +1442,8 @@ private:
                     return false;
                 }
 
-                // params_dft, not params_ctx: the draft has its own cpu params and this is the
-                // only place they can reach the draft context
+                // params_dft, not params_ctx: the draft has its own cpu params and this is the only
+                // place they can reach the draft context
                 grp.threadpools_dft = std::make_unique<common_threadpools>();
                 grp.threadpools_dft->init(grp.ctx_dft, params_dft);
 
@@ -1651,7 +1620,6 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
-            // slots are partitioned contiguously: group g owns slots [g*S, (g+1)*S)
             server_group & grp = *groups[i / n_seq_per_group];
 
             slot.id       = i;
@@ -1787,7 +1755,6 @@ private:
             return false;
         }
 
-        // mtmd_context is bound to one llama_context
         if (has_mmproj) {
             return refuse("multimodal (--mmproj)");
         }
@@ -1797,7 +1764,6 @@ private:
             return refuse("--control-vector");
         }
 
-        // entering / leaving it rebuilds the contexts under the running group threads
         if (params.sleep_idle_seconds >= 0) {
             return refuse("--sleep-idle");
         }
@@ -1818,7 +1784,6 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             if (n_groups > 1) {
-                // each pipeline group runs its own update loop on its own thread
                 return;
             }
             if (groups.empty()) {
@@ -1932,16 +1897,12 @@ private:
         return true;
     }
 
-    // Add what the extra pipeline groups will allocate to the fitter's per-device margin. Only the
-    // context and compute buffers for the target contexts, plus the draft contexts when speculation
-    // is on; the target weights are shared and already counted, and an MTP draft shares them too, so
-    // only a separate --model-draft adds weights per group.
+    // Add what the extra pipeline groups will allocate to the fitter's per-device margin.
     void reserve_extra_group_memory(common_params & params_ctx, bool has_draft, bool spec_mtp) const {
         const size_t n_extra = n_groups - 1;
 
         std::vector<size_t> added(params_ctx.fit_params_target.size(), 0);
 
-        // device order the margins are indexed by, taken from the target measurement below
         std::vector<ggml_backend_dev_t> devs_tgt;
 
         auto reserve = [&](common_params p, bool as_mtp, bool count_weights, bool is_target) {
@@ -1974,9 +1935,7 @@ private:
             };
 
             // mem holds one entry per device plus a host entry at the back, while fit_params_target
-            // is indexed by device alone (common/fit.cpp builds margins over the nd devices). With
-            // no device at all that single margin is the host one, so only then is the host entry
-            // charged; otherwise charging it would bill host memory to a device's margin.
+            // is indexed by device alone (common/fit.cpp builds margins over the nd devices).
             if (devs_tgt.empty()) {
                 if (!mem.empty()) {
                     charge(0, mem.back());
@@ -1985,10 +1944,8 @@ private:
             }
 
             for (size_t j = 0; j + 1 < mem.size() && j < devs.size(); ++j) {
-                // --device-draft may order the draft devices differently from the target, so match
-                // on device identity rather than position, the same way common_params_fit_impl maps
-                // its extra model. By position a draft allocation would be billed to another
-                // device's margin, approving a placement that then fails on the second context.
+                // by device identity, not position: --device-draft may order devices differently, and by
+                // position a draft allocation would be billed to another device's margin.
                 for (size_t id = 0; id < devs_tgt.size(); ++id) {
                     if (devs[j] == devs_tgt[id]) {
                         charge(id, mem[j]);
@@ -2012,8 +1969,8 @@ private:
         }
     }
 
-    // holds every group's lock, so the slot state is stable while the guard exists; a no-op with a
-    // single group. wait_for() then drops the other groups' locks and waits out one group's decode.
+    // holds every group's lock so slot state is stable; wait_for() then drops the others and
+    // waits out one group's decode. A no-op with a single group.
     struct engine_guard {
         server_context_impl * srv = nullptr;
         std::vector<std::unique_lock<std::mutex>> lks;
@@ -2997,10 +2954,10 @@ private:
 
         SRV_TRC("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
 
-        // to be called in case of failure to release all launched slots.
-        // only this group's slots: the parent and its children are guaranteed to share a group, and
-        // wait_for() released every other group's lock, so a global scan would read state and task
-        // while their workers write them
+        // to be called in case of failure to release all launched slots. only this group's slots:
+        // the parent and its children are guaranteed to share a group, and wait_for() released
+        // every other group's lock, so a global scan would read state and task while their workers
+        // write them
         auto release_slots = [this, id_parent, &parent_slot]() {
             for (auto * slot : groups[parent_slot.id_group]->slots) {
                 if (slot->is_processing() && (
@@ -3357,7 +3314,6 @@ private:
                         break;
                     }
 
-                    // the sampler of this slot is used by its group between decodes
                     guard.wait_for(slot->id_group);
 
                     if (task.params.control_action == "reasoning_end") {
@@ -3610,7 +3566,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
-                    // the adapters are applied to every context
                     guard.wait_for_all();
 
                     auto new_loras = construct_lora_list(task.set_lora);
@@ -3692,7 +3647,6 @@ private:
     };
 #endif
 
-    // one iteration of the decode loop of a single group, returns true if it had work to do
     bool update_slots(server_group & grp) {
         // shadow the single-context members - everything below operates on this group only
         auto * ctx_tgt = grp.ctx;
@@ -4788,8 +4742,7 @@ private:
 
         int ret = 0;
         if (n_groups > 1) {
-            // note: RAII, or a throwing decode leaves the group busy forever, or returns to the
-            //       caller's error handling without the engine lock held
+            // RAII: a throwing decode must not leave the group busy, or return without the engine lock.
             struct decode_window {
                 server_group * grp;
                 std::unique_lock<std::mutex> * lk;
@@ -4815,8 +4768,6 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         } else {
-            // yield to the queue, so we can still handle metrics tasks while decoding
-            // note: the sync is done here too, so that the wait is also covered by the yield
             queue_tasks.yield_to_queue([&]() {
                 {
                     server_trace_scope span("submit", grp.id, batch.view.size());

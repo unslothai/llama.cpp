@@ -29,7 +29,6 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
-// set from params right after parsing, read by server_models::spawn to pass the setting on
 static int g_pipeline_groups = 1;
 
 int server_get_pipeline_groups();

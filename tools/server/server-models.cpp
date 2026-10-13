@@ -1198,12 +1198,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
-        // the router strips --pipeline-groups before base_preset is built, so it cannot ride
-        // the preset like other options; hand it over explicitly. base_env is a copy of our own
+        // the router strips --pipeline-groups before base_preset is built, so it cannot ride the
+        // preset like other options; hand it over explicitly. base_env is a copy of our own
         // environment, so an inherited LLAMA_ARG_PIPELINE_GROUPS would otherwise reach the child
         // unchanged: appending cannot override it, because execve leaves duplicates in place and
         // getenv() returns the first entry, and an explicit --pipeline-groups 1 would append
-        // nothing at all. Drop any inherited entry first, then always set the resolved value.
+        // nothing at all.
         {
             static const std::string pg_prefix = "LLAMA_ARG_PIPELINE_GROUPS=";
             child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
