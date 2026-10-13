@@ -76,8 +76,7 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "%s : saved seq 1 state, %zu bytes\n", __func__, ncopy);
 
-    // A fragmented restore may stage a whole device tensor. Check every
-    // sequence byte-for-byte, including the neighbours that must be preserved.
+    // Staging rewrites whole tensors, so check every sequence is preserved byte-for-byte.
     std::vector<std::vector<uint8_t>> before(params.n_parallel);
     for (int s = 0; s < params.n_parallel; ++s) {
         before[s].resize(llama_state_seq_get_size(ctx, s));

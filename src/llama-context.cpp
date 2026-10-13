@@ -2759,10 +2759,7 @@ public:
             }
             const size_t tensor_bytes = ggml_nbytes(tensor);
             auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-            // A fragmented sequence can require thousands of synchronous device
-            // transfers per layer. For bounded tensors, stage the tensor once and
-            // preserve every byte belonging to other sequences. Bound scratch RAM
-            // and leave ordinary contiguous transfers on their original fast path.
+            // Stage a fragmented tensor once instead of thousands of small device writes.
             if (end - i >= 64 && tensor_bytes <= 64 * 1024 * 1024 &&
                     !ggml_backend_buffer_is_host(buffer)) {
                 std::vector<uint8_t> staging;
