@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
 
@@ -1229,6 +1230,12 @@ common_decision_type common_get_decision_type(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [TAG_EXACT_CONCURRENCY] set before any context exists, so none is created under an uncovered figure.
+    if (!model_only && !common_exact_concurrency_init(params)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
+        return;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1274,6 +1281,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->model.reset(model);
 
     if (model_only) {
+        return;
+    }
+
+    if (!common_exact_concurrency_model(params, model)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to create a context, see the error above\n");
         return;
     }
 
@@ -1366,6 +1378,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    if (!common_exact_concurrency_context(params, lctx)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to serve this context, see the error above\n");
+        pimpl->context.reset();
+        return;
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1394,6 +1412,147 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool common_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
+int common_exact_decode_width(const common_params & params) {
+    const int64_t n_slots = std::max(1, params.n_parallel);
+
+    const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
+
+    // The product is passed to a backend as an int, so overflow is reported.
+    const int64_t n_cols = n_slots*(1 + n_draft);
+
+    return n_cols > INT32_MAX ? -1 : (int) n_cols;
+}
+
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min) {
+    const int n_ub = std::min(n_batch, n_ubatch <= 0 ? n_batch : n_ubatch);
+
+    const int n_min = n_ub + std::max(0, n_decode_width);
+
+    if (n_batch_min) {
+        *n_batch_min = n_min;
+    }
+
+    return n_batch >= n_min;
+}
+
+// [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists.
+bool common_exact_concurrency_model(const common_params & params, const llama_model * model) {
+    if (!common_exact_concurrency() || params.mmproj.path.empty()) {
+        return true;
+    }
+
+    // M-RoPE gives every token of an image one position, which the paged pool cannot place.
+    const llama_rope_type rope_type = llama_model_rope_type(model);
+
+    if (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support M-RoPE together with a projector: the tokens of one image share a temporal position and the paged pool would give them one cell\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool common_exact_concurrency_init(const common_params & params) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    // DFlash and DSpark turn causal attention off on the draft context, which the paged attention needs.
+    for (const auto type : params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
+            return false;
+        }
+    }
+
+    const int n_cols = common_exact_decode_width(params);
+
+    if (n_cols < 0) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY: a decode step of %d slots with %d draft tokens each is too wide to report\n",
+                std::max(1, params.n_parallel), std::max(0, (int) common_speculative_n_max(&params.speculative)));
+        return false;
+    }
+
+    const char * bound = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+    if (bound) {
+        const int max_cols = atoi(bound);
+        if (max_cols > 0 && max_cols < n_cols) {
+            COM_ERR("GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at "
+                    "least %d to cover a decode step of %d slots, above which a matmul is left "
+                    "batched and its rows depend on the other rows in the ubatch. Raise it to %d, "
+                    "set it to 0 for no bound, or unset it to let it default to %d.\n",
+                    max_cols, n_cols, std::max(1, params.n_parallel), n_cols, n_cols);
+            return false;
+        }
+    }
+
+    // A prompt is added in whole ubatches, so the batch must hold one beside a decode step of every slot.
+    // A causal context clamps the batch to n_ctx; an unset -c is checked in common_exact_concurrency_context().
+    const int n_batch_eff = params.n_ctx > 0 ? std::min(params.n_ctx, params.n_batch) : params.n_batch;
+
+    int n_batch_min = 0;
+
+    if (!common_exact_batch_geometry(n_batch_eff, params.n_ubatch, n_cols, &n_batch_min)) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY needs a batch of at least %d tokens for a %d-token ubatch "
+                "and a decode step of %d slots (%d columns), but the batch is %d: a prefill beside "
+                "a running slot would be split into shorter ubatches than the same prompt gets alone. "
+                "Raise -b to %d (and -c to at least that), or lower -ub.\n",
+                n_batch_min, std::min(n_batch_eff, params.n_ubatch <= 0 ? n_batch_eff : params.n_ubatch),
+                std::max(1, params.n_parallel), n_cols, n_batch_eff, n_batch_min);
+        return false;
+    }
+
+    // Tell the batch splitter one sequence's decode width, also for callers that decode before creating a context.
+    if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
+        !llama_set_exact_decode_width((uint32_t) n_cols)) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool common_exact_concurrency_context(const common_params & params, const llama_context * ctx) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    const int n_cols = common_exact_decode_width(params);
+
+    if (n_cols < 0) {
+        return false;
+    }
+
+    // The geometry a prefill really gets after the context clamps the batch and ubatch.
+    const int n_batch  = (int) llama_n_batch(ctx);
+    const int n_ubatch = (int) llama_n_ubatch(ctx);
+
+    int n_batch_min = 0;
+
+    if (!common_exact_batch_geometry(n_batch, n_ubatch, n_cols, &n_batch_min)) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY needs a batch of at least %d tokens for a %d-token ubatch "
+                "and a decode step of %d slots (%d columns), but the context was created with a batch "
+                "of %d: a context of %d tokens clamps it, so a prefill beside a running slot would be "
+                "split into shorter ubatches than the same prompt gets alone. Raise -c to at least %d "
+                "(-fitc as well when the context was fitted to device memory), or lower -ub.\n",
+                n_batch_min, n_ubatch, std::max(1, params.n_parallel), n_cols, n_batch,
+                (int) llama_n_ctx(ctx), n_batch_min);
+        return false;
+    }
+
+    return true;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {

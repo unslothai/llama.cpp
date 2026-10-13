@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <atomic>
+#include <mutex>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <sstream>
@@ -201,4 +204,159 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
+}
+
+// [TAG_EXACT_CONCURRENCY]
+bool llama_exact_backend_name(const char * reg_name) {
+    return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
+}
+
+// [TAG_EXACT_CONCURRENCY] the scheduler moves a host weight's op to the GPU only for wide batches, so host buffers are refused.
+// The CPU matmul also picks SGEMM or vector dot by batch width.
+bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
+    if (!buft || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg));
+}
+
+bool llama_exact_concurrency() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_EXACT_CONCURRENCY");
+        return val && atoi(val) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h.
+static std::atomic<uint32_t> g_exact_decode_tokens{1};
+
+// One lock for all three, so a report cannot interleave with a change of figure.
+static std::recursive_mutex g_exact_mutex;
+
+static std::atomic<uint32_t> g_exact_max_n_seq{0};
+
+static bool llama_exact_width_within_explicit_bound(uint32_t n_cols);
+
+static bool llama_exact_width_of(uint32_t n_seq, uint32_t n_tokens, uint32_t & n_cols) {
+    const uint64_t w = (uint64_t) n_seq * (uint64_t) n_tokens;
+
+    if (w > (uint64_t) INT32_MAX) {
+        LLAMA_LOG_ERROR("%s: a decode step of %u sequences with %u tokens each is too wide to report\n", __func__, n_seq, n_tokens);
+        return false;
+    }
+
+    n_cols = (uint32_t) w;
+
+    return true;
+}
+
+bool llama_exact_check_n_seq(uint32_t n_seq) {
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
+
+    uint32_t n_cols = 0;
+
+    return llama_exact_width_of(n_seq_max, llama_exact_decode_tokens(), n_cols) && llama_exact_width_within_explicit_bound(n_cols);
+}
+
+bool llama_exact_report_n_seq(uint32_t n_seq) {
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    const uint32_t n_seq_max = std::max(n_seq, g_exact_max_n_seq.load(std::memory_order_relaxed));
+
+    uint32_t n_cols = 0;
+
+    if (!llama_exact_width_of(n_seq_max, llama_exact_decode_tokens(), n_cols) || !llama_set_exact_decode_width(n_cols)) {
+        return false;
+    }
+
+    uint32_t cur = g_exact_max_n_seq.load(std::memory_order_relaxed);
+
+    while (n_seq > cur && !g_exact_max_n_seq.compare_exchange_weak(cur, n_seq, std::memory_order_relaxed)) {
+    }
+
+    return true;
+}
+
+bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
+    n_tokens = n_tokens > 0 ? n_tokens : 1;
+
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    // Never lowered: a narrower later context would turn speculative verify steps into prompts.
+    if (n_tokens <= g_exact_decode_tokens.load(std::memory_order_relaxed)) {
+        return true;
+    }
+
+    // Report the width first; one the explicit bound cannot cover keeps the old figure.
+    const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
+
+    uint32_t n_cols = 0;
+
+    if (n_seq > 0 && (!llama_exact_width_of(n_seq, n_tokens, n_cols) || !llama_set_exact_decode_width(n_cols))) {
+        return false;
+    }
+
+    g_exact_decode_tokens.store(n_tokens, std::memory_order_relaxed);
+
+    return true;
+}
+
+uint32_t llama_exact_decode_tokens(void) {
+    return g_exact_decode_tokens.load(std::memory_order_relaxed);
+}
+
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h.
+static std::atomic<uint32_t> g_exact_decode_width{0};
+
+static bool llama_exact_width_within_explicit_bound(uint32_t n_cols) {
+    static const int explicit_cols = []() {
+        const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
+        return val ? atoi(val) : -1;
+    }();
+
+    if (explicit_cols > 0 && (uint32_t) explicit_cols < n_cols) {
+        LLAMA_LOG_ERROR("%s: GGML_CUDA_BATCH_INVARIANT_MAX_COLS is %d but LLAMA_EXACT_CONCURRENCY needs at least %u columns for the decode step just requested; raise it, set it to 0 for no bound, or unset it\n",
+                __func__, explicit_cols, n_cols);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_set_exact_decode_width(uint32_t n_cols) {
+    if (!llama_exact_width_within_explicit_bound(n_cols)) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    uint32_t cur = g_exact_decode_width.load(std::memory_order_relaxed);
+
+    while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
+    }
+
+    const uint32_t widest = g_exact_decode_width.load(std::memory_order_relaxed);
+
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+
+        auto * fn = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width");
+        if (fn) {
+            fn((int) widest);
+        }
+    }
+
+    return true;
+}
+
+uint32_t llama_exact_decode_width(void) {
+    return g_exact_decode_width.load(std::memory_order_relaxed);
 }

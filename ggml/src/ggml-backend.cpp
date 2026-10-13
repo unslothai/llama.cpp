@@ -324,6 +324,10 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+bool ggml_backend_buffer_supports_2d(ggml_backend_buffer_t buffer) {
+    return buffer->iface.set_tensor_2d != NULL && buffer->iface.get_tensor_2d != NULL;
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;
@@ -700,6 +704,29 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
+// (optional) non-blocking event completion test, published via the registry as "ggml_backend_dev_event_query" so ggml_backend_device_i stays as upstream has it.
+typedef bool (*ggml_backend_dev_event_query_t)(ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+static ggml_backend_dev_event_query_t ggml_backend_dev_get_event_query(ggml_backend_dev_t device) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    if (reg == NULL) {
+        return NULL;
+    }
+    return (ggml_backend_dev_event_query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_event_query");
+}
+
+bool ggml_backend_event_query(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+
+    ggml_backend_dev_event_query_t event_query = ggml_backend_dev_get_event_query(event->device);
+    if (event_query == NULL) {
+        ggml_backend_event_synchronize(event);
+        return true;
+    }
+
+    return event_query(event->device, event);
+}
+
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.event_wait != NULL);
@@ -774,6 +801,11 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     return device->iface.supports_op(device, op);
+}
+
+bool ggml_backend_dev_supports_event_query(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    return ggml_backend_dev_get_event_query(device) != NULL;
 }
 
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {

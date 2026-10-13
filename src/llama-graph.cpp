@@ -21,10 +21,24 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 // dedup helpers
+
+// [TAG_EXACT_CONCURRENCY] only llm_graph_input_attn_kv carries the page table, so a V-less layout is refused.
+static void llm_graph_reject_exact_concurrency(const char * layout) {
+    if (!llama_exact_concurrency()) {
+        return;
+    }
+
+    LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set, but this model uses the %s attention "
+            "layout, which carries no page table and would attend in physical cell order\n",
+            __func__, layout);
+
+    throw std::runtime_error("exact concurrency: unsupported attention layout");
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -500,6 +514,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (self_pages && self_pages->buffer) { mctx->set_input_pages(self_pages, ubatch); }
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->set_input_k_idxs(self_k_idxs, ubatch);
@@ -1124,6 +1139,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    if (inp_attn->self_pages) { mctx->get_attn()->set_input_pages(inp_attn->self_pages, ubatch); }
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
@@ -2698,7 +2714,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * pages) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2734,6 +2751,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cur->src[5] = pages;
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2926,6 +2944,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
+    inp->self_pages = mctx_cur->build_input_pages(ctx0, ubatch);
+    GGML_ASSERT(!inp->self_pages || (cparams.flash_attn && cparams.causal_attn));
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
@@ -2997,7 +3017,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, inp->self_pages);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3030,6 +3050,8 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     const llama_hparams & hparams,
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur) {
+
+    llm_graph_reject_exact_concurrency("V-less KV (attn_k)");
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
 
@@ -3415,6 +3437,8 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
     const llama_cparams & cparams,
     const llama_kv_cache_dsa_context * mctx_cur) {
 
+    llm_graph_reject_exact_concurrency("sparse V-less KV (attn_k_dsa)");
+
     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
 
     {
@@ -3531,6 +3555,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
 llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+
+    llm_graph_reject_exact_concurrency("V-less sliding window KV (attn_k_iswa)");
 
     auto inp = std::make_unique<llm_graph_input_attn_k_iswa>(hparams, cparams, mctx_cur);
 

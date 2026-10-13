@@ -140,6 +140,9 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // [TAG_PREEMPT] the request has several tasks, so index tells results and notices apart.
+    bool batched = false;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -371,6 +374,12 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
+    // [TAG_PREEMPT] how often the request was parked, and how many parks re-prefilled.
+    int32_t n_preempt   = 0;
+    int32_t n_recompute = 0;
+
+    json preempt_to_json() const;
+
     task_params generation_params;
 
     // response formatting
@@ -422,6 +431,19 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic();
 
     json to_json_anthropic_stream();
+};
+
+// [TAG_PREEMPT] SSE comment notice (": preempted", ": resumed") when a streaming task's slot is parked or restored.
+struct server_task_result_preempt_notice : server_task_result {
+    bool    parked     = false;
+    bool    recomputed = false;
+    int32_t n_preempt  = 0;
+    bool    batched    = false;
+
+    virtual bool is_stop() override {
+        return false;
+    }
+    virtual json to_json() override;
 };
 
 struct server_task_result_cmpl_partial : server_task_result {
@@ -534,7 +556,7 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
-    int n_preempted_slots = 0;        // [TAG_PREEMPT] processing slots currently parked
+    int n_preempted_slots = 0;        // [TAG_PREEMPT] processing slots currently parked or moving to or from host memory
     size_t preempt_ram_bytes = 0;     // [TAG_PREEMPT] host RAM their parked sequences hold
 
     server_metrics metrics;

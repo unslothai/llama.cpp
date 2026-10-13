@@ -133,6 +133,9 @@ public:
 
     bool get_can_shift() const override;
 
+    // [TAG_EXACT_CONCURRENCY] the page size under exact mode, 1 otherwise
+    uint32_t alloc_granularity() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -191,6 +194,8 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -265,6 +270,34 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+    static constexpr uint32_t exact_page_size = 256;
+    bool exact_pages = false;
+
+    // [TAG_EXACT_CONCURRENCY] (sequence, logical page) owning each physical page; seq < 0 means free.
+    struct exact_page {
+        llama_seq_id seq = -1;
+        llama_pos    lpg = -1;
+    };
+
+    mutable std::vector<exact_page> exact_page_owner;
+    mutable bool                    exact_page_owner_dirty = true;
+
+    // Live cells per page, so a removal can free an emptied page without a rescan.
+    mutable std::vector<uint32_t> exact_page_live;
+
+    void exact_pages_sync() const;
+
+    void exact_pages_rebuild() const;
+
+    void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
+
+    void exact_pages_release(uint32_t idx);
+
+    // Released cell count, so prepare() can tell whether a placement removed cells it will not restore.
+    uint64_t exact_page_n_release = 0;
+
+    mutable std::vector<exact_page> exact_page_owner_tmp;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -399,6 +432,8 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

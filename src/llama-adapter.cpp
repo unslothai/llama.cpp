@@ -354,6 +354,18 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
 
+        // [TAG_EXACT_CONCURRENCY] the adapter's mul_mat follows its weight, so a host-placed weight, token_embd included, is refused.
+        if (llama_exact_concurrency() && !llama_exact_buft_invariant(buft)) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but the lora for '%s' would sit in a %s "
+                    "buffer, which has no batch-invariant kernels: the adapted matmul's result would "
+                    "depend on how many sequences share the step (move the tensor to the device that "
+                    "holds the layers, for example --override-tensor %s=CUDA0, or serve this adapter "
+                    "without the mode)\n",
+                    __func__, model_tensor->name, ggml_backend_buft_name(buft), model_tensor->name);
+
+            throw std::runtime_error("exact concurrency: a lora weight is not on the CUDA backend");
+        }
+
         ggml_context * dev_ctx = ctx_for_buft(buft);
         // validate tensor shape
         if (is_token_embd) {

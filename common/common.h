@@ -636,7 +636,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t preempt_ram_mib     = 8192;  // host RAM for parked (preempted) sequences: -1 = no limit, 0 = disable preemption
+    int32_t preempt_ram_mib     = 0;     // host RAM for parked sequences: 0 = preemption off (default), -1 = no limit
+    bool    preempt_async       = true;
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -991,6 +992,23 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// [TAG_EXACT_CONCURRENCY] true when LLAMA_EXACT_CONCURRENCY is set for this process
+bool common_exact_concurrency();
+
+int common_exact_decode_width(const common_params & params);
+
+// [TAG_EXACT_CONCURRENCY] whether the batch holds a whole prompt ubatch beside a decode step of every slot; n_batch_min reports the size that would.
+bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min = nullptr);
+
+// Report that width to the CUDA backend; false if the configuration must not run.
+bool common_exact_concurrency_init(const common_params & params);
+
+// The same for what only the loaded model tells.
+bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
+
+// The same for the geometry the created context settled on.
+bool common_exact_concurrency_context(const common_params & params, const struct llama_context * ctx);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
