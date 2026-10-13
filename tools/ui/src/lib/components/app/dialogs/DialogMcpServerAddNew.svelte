@@ -10,7 +10,7 @@
 		RECOMMENDED_MCP_SERVERS
 	} from '$lib/constants';
 	import { BooleanString, HealthCheckStatus } from '$lib/enums';
-	import { conversationsStore, mcpStore } from '$lib/stores';
+	import { deviceStore, mcpStore } from '$lib/stores';
 	import { canonicalizeServerUrl, parseHeadersToArray, uuid } from '$lib/utils';
 
 	interface Props {
@@ -234,8 +234,6 @@
 			useProxy: newServerUseProxy
 		});
 
-		conversationsStore.preferences.setMcpServerOverride(newServerId, true);
-
 		handleOpenChange(false);
 	}
 
@@ -246,7 +244,10 @@
 </script>
 
 <Dialog.Root onOpenChange={handleOpenChange} {open}>
-	<Dialog.Content class="sm:max-w-2xl">
+	<Dialog.Content
+		class="max-w-2xl! p-4"
+		onOpenAutoFocus={(event) => deviceStore.isMobile && event.preventDefault()}
+	>
 		<Dialog.Header>
 			<Dialog.Title class="select-none">Add New MCP Server</Dialog.Title>
 		</Dialog.Header>
