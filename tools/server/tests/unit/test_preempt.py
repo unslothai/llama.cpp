@@ -1153,7 +1153,8 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     short_prompt = _prompt_of(1700, _PROMPT_B)
     head_prompt = _prompt_of(7200, _PROMPT_A)
     n_short, n_head = 32, 100
-    t_stream_max = 40.0
+    # a starved head waits for as long as the stream lasts, so any bound catches it; the head prefills its 7200 tokens three times (two parks, no room to keep them), which took 46 s on a CPU CI runner and 92 s on a Windows one
+    t_stream_max = 240.0
 
     stop = threading.Event()
     shorts = []
@@ -1175,7 +1176,7 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
             time.sleep(0.01)
         t_head = time.time()
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(_raw_completion, n_head, head_prompt, 3, 180)
+            fut = pool.submit(_raw_completion, n_head, head_prompt, 3, t_stream_max + 180)
             while not fut.done() and time.time() - t_head < t_stream_max:
                 time.sleep(0.05)
             stopped_early = not fut.done()
