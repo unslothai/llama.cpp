@@ -2064,7 +2064,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // shape; ask it what it can handle rather than duplicating either one's limits here. Fall back
     // to the host loop for that answer or for an ids layout the helper cannot address.
     const bool sort_on_device = ids->type == GGML_TYPE_I32 && ids->nb[0] == ggml_element_size(ids) &&
-        ggml_cuda_mm_ids_helper_supported(ne02, ne12);
+        ggml_cuda_mm_ids_helper_supported(ne02, ne12, n_expert_used);
 
     if (sort_on_device) {
         ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 1);

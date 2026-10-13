@@ -6,7 +6,7 @@
 // implementations behind it have different limits: the single-warp-per-expert kernel needs one
 // shared memory word per token, the counting sort needs one per expert. Callers that have a host
 // fallback should ask here rather than reimplementing either bound.
-bool ggml_cuda_mm_ids_helper_supported(int n_experts, int n_tokens);
+bool ggml_cuda_mm_ids_helper_supported(int n_experts, int n_tokens, int n_expert_used);
 
 void ggml_cuda_launch_mm_ids_helper(
         ggml_cuda_pool & pool,

@@ -497,10 +497,8 @@ void ggml_cuda_launch_mm_ids_invert(
     mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
 }
 
-bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens) {
-    // n_expert_used only bounds the legacy path's bit packing, and any value that fails it also
-    // fails the 2^10 assert there, so the counting sort is what decides support in that case.
-    return mm_ids_counting_sort_possible(n_experts) || mm_ids_legacy_possible(n_tokens, 1);
+bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
+    return mm_ids_counting_sort_possible(n_experts) || mm_ids_legacy_possible(n_tokens, n_expert_used);
 }
 
 #define MM_IDS_DISPATCH(neu)                                                                                                    \
