@@ -1785,7 +1785,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
-    if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO && (params.n_gpu_layers < 0 || params.n_gpu_layers > 1)) {
+    // the MoE cache only serves experts kept in host memory, which the placement does not do by itself:
+    // they get there through a tensor override to a host buffer (-ot, --cpu-moe, --n-cpu-moe) or when --fit moves them, otherwise keep mmap
+    bool host_experts = params.fit_params;
+    for (const auto & ovr : params.tensor_buft_overrides) {
+        host_experts = host_experts || (ovr.pattern != nullptr && ovr.buft != nullptr && ggml_backend_buft_is_host(ovr.buft));
+    }
+    if (params.moe_cache_size > 0 && host_experts && params.load_mode == LLAMA_LOAD_MODE_AUTO && (params.n_gpu_layers < 0 || params.n_gpu_layers > 1)) {
         // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory
         // and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
         bool dev_lookup = false;
