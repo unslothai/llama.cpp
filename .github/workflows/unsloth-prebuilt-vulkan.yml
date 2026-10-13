@@ -4,7 +4,7 @@
 name: "Unsloth prebuilt: Vulkan"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the Vulkan bundles for
-# Linux x64/arm64 + Windows x64. Each matrix entry uploads a single
+# Linux x64/arm64 + Windows x64/arm64. Each matrix entry uploads a single
 # app-*.{tar.gz|zip} artifact for the parent's assemble step to pick up.
 #
 # Mirrors oobabooga/llama-cpp-binaries' build-wheels-vulkan.yml build recipe
@@ -531,3 +531,187 @@ jobs:
         with:
           path: ${{ github.workspace }}\.ccache
           key: ccache-vulkan-windows-x64-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # Windows on ARM (Snapdragon X / Adreno). Its own job, not a row in the x64
+  # one: x64 builds with MSVC, while arm64 follows ggml-org's release.yml
+  # windows (vulkan, arm64) recipe, cross-compiling with clang on an x64 runner.
+  # No vcvarsall on purpose: it would put the ARM64-targeting cl.exe on PATH,
+  # and ggml-vulkan's host-compiler probe would then build vulkan-shaders-gen
+  # as an ARM64 binary that cannot run during the build. clang finds MSVC and
+  # the Windows SDK itself.
+  build-windows-arm64:
+    name: windows/arm64
+    runs-on: windows-2025
+    # Same signing gate as windows/x64 above.
+    environment: release-signing
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: vulkan-windows-arm64-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-windows-arm64
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - name: Configure ccache
+        # Same positive check as windows/x64: never fail a release on the cache.
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
+          $ok = $false
+          if ($have) { try { $ok = [version]($have -replace '[^0-9.].*$','') -ge [version]'4.10' } catch { $ok = $false } }
+          if ($ok) {
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            Write-Output "::warning::ccache unusable (found '$have', need >= 4.10); building without a cache"
+            "- ccache unusable (found ``$have``); this leg built without a cache" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            "CCACHE_LAUNCHER=" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      # The x64-hosted SDK plus its ARM64 component: the host glslc compiles the
+      # shaders, the component supplies the ARM64 vulkan-1.lib to link against.
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.arm64
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Configure
+        working-directory: src
+        run: |
+          # The windows/x64 recipe on the arm64 clang toolchain. No
+          # GGML_CPU_ALL_VARIANTS (an x86 microarch fan-out), and GGML_OPENMP=OFF
+          # as on x64 so no OpenMP runtime has to ship beside the binaries.
+          $env:CMAKE_PREFIX_PATH = $env:VULKAN_SDK
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_OPENMP=OFF `
+            -DGGML_RPC=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build --config Release
+
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          if (-not (Test-Path "examples/diffusion-gemma-server")) {
+            Write-Host "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          }
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
+            exit 0
+          }
+          cmake --build build --config Release `
+            --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          } else {
+            Write-Host "built DiffusionGemma binaries"
+          }
+          exit 0
+
+      # Cross-compiled binaries cannot run here, so at least prove the Vulkan
+      # backend module was built for ARM64 (IMAGE_FILE_MACHINE_ARM64 = 0xAA64)
+      # and is in the tree that ships.
+      - name: Check ARM64 Vulkan backend
+        run: |
+          $dll = "src/build/bin/Release/ggml-vulkan.dll"
+          if (-not (Test-Path $dll)) { Write-Error "$dll was not built"; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $dll))
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          Write-Host ("ggml-vulkan.dll machine: 0x{0:X4}" -f $machine)
+          if ($machine -ne 0xAA64) { Write-Error "ggml-vulkan.dll is not ARM64"; exit 1 }
+
+      - name: Fetch signing tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: signing-tooling
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Sign Windows binaries
+        id: sign_windows
+        uses: ./signing-tooling/.github/actions/sign-windows
+        with:
+          path: src/build/bin/Release
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package bundle (zip)
+        shell: bash
+        run: |
+          set -eux
+          ASSET="app-${{ inputs.tag }}-windows-arm64-vulkan.zip"
+          cp src/LICENSE src/build/bin/Release/
+          mkdir -p dist
+          (cd src/build/bin/Release && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -la dist
+
+      - name: Verify every binary in the bundle is signed
+        if: ${{ steps.sign_windows.outputs.signed == 'true' }}
+        shell: pwsh
+        run: signing-tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-arm64-vulkan.zip'
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-arm64-vulkan
+          path: dist/app-${{ inputs.tag }}-windows-arm64-vulkan.zip
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 7d
+
+      - name: Save ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-vulkan-windows-arm64-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
