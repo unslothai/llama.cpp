@@ -4075,6 +4075,9 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
 }
 
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    // [TAG_EXACT_CONCURRENCY] refused before the file is opened, so no session is left behind that the next load would reject
+    state_write_check();
+
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -4165,7 +4168,16 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+// [TAG_EXACT_CONCURRENCY] a whole-context state cannot be restored in this mode (see state_read_data), so it is not produced either
+void llama_context::state_write_check() const {
+    if (memory && memory->alloc_granularity() > 1) {
+        throw std::runtime_error("whole-context save is not supported with LLAMA_EXACT_CONCURRENCY, save per sequence");
+    }
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    state_write_check();
+
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
