@@ -685,6 +685,10 @@ struct llama_moe_cache::impl {
             auto host_map   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
             auto host_unmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
 
+            // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
+            const size_t n_mapped = mapped.size();
+            std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
+
             bool ok = true;
             std::vector<std::vector<const void *>> host_dev(g.layers.size());
             for (size_t i = 0; i < g.layers.size() && ok; ++i) {
@@ -696,6 +700,7 @@ struct llama_moe_cache::impl {
                         void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
                         if (registered) {
                             mapped.emplace_back(host_unmap, base);
+                            added.emplace_back(dev, t->buffer);
                         }
                         it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
                     }
@@ -707,6 +712,14 @@ struct llama_moe_cache::impl {
                 }
             }
             if (!ok) {
+                // release the mappings registered for this group only, so that the host experts do not stay page-locked until the cache is destroyed
+                for (size_t i = n_mapped; i < mapped.size(); ++i) {
+                    mapped[i].first(mapped[i].second);
+                }
+                mapped.resize(n_mapped);
+                for (const auto & key : added) {
+                    dev_base.erase(key);
+                }
                 LLAMA_LOG_WARN("%s: %s cannot map the host experts (pageable or memory-mapped), the MoE cache uses host lookups for %zu layers\n",
                     __func__, ggml_backend_name(backend), g.layers.size());
                 continue;
