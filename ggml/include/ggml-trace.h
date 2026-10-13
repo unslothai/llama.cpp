@@ -30,6 +30,8 @@ extern "C" {
 
     // names the tensor or graph the next RPC commands belong to; `name` must outlive the call
     GGML_API void ggml_trace_set_subject(const char * name, uint64_t uid);
+    // the subject this thread set last, NULL if none; `uid` may be NULL
+    GGML_API const char * ggml_trace_get_subject(uint64_t * uid);
 
     // t1 == t0 is an instant; `fields` may be NULL and is inlined verbatim into the JSON object
     GGML_API void ggml_trace_event(const char * phase, const char * name,

@@ -146,6 +146,13 @@ void ggml_trace_set_subject(const char * name, uint64_t uid) {
     tls_uid     = uid;
 }
 
+const char * ggml_trace_get_subject(uint64_t * uid) {
+    if (uid != nullptr) {
+        *uid = tls_uid;
+    }
+    return tls_subject;
+}
+
 const char * ggml_trace_escape(char * dst, size_t dst_size, const char * src) {
     if (dst == nullptr || dst_size == 0) {
         return dst;
