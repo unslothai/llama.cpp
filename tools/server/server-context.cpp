@@ -5489,6 +5489,9 @@ private:
                         }
 
                         if (slot.can_split()) {
+                            // the size of a decision is checked in slot_prompt_rejected, its first position bounds the reuse below
+                            const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+
                             const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
 
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
