@@ -13,6 +13,16 @@
 #include <unordered_map>
 #include <vector>
 
+bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr &&
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map")   != nullptr &&
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") != nullptr;
+}
+
 namespace {
 
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
@@ -632,9 +642,7 @@ struct llama_moe_cache::impl {
     // the device of the group can map host memory and run the lookup of the largest batch
     bool lookup_capable(const group & g) const {
         ggml_backend_t backend = devices[g.id].backend;
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        if (ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map") == nullptr ||
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") == nullptr) {
+        if (!llama_moe_cache_device_lookup_supported(ggml_backend_get_device(backend))) {
             return false;
         }
         ggml_init_params params = {

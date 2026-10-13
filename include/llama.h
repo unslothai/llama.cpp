@@ -572,6 +572,9 @@ extern "C" {
     LLAMA_API bool llama_supports_gpu_offload(void);
     LLAMA_API bool llama_supports_rpc        (void);
 
+    // the backend of the device can map host memory for the device lookup of the MoE cache (moe_cache_size) [EXPERIMENTAL]
+    LLAMA_API bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev);
+
     // NOTE: After creating a llama_context, it is recommended to query the actual values using these functions
     //       In some cases the requested values via llama_context_params may differ from the actual values used by the context
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
