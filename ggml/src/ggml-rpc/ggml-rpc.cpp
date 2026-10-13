@@ -107,6 +107,11 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
+        case RPC_CMD_SET_TENSOR_2D:     return "SET_TENSOR_2D";
+        case RPC_CMD_GET_TENSOR_2D:     return "GET_TENSOR_2D";
+        case RPC_CMD_COMM_INIT:         return "COMM_INIT";
+        case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+        case RPC_CMD_COMM_FREE:         return "COMM_FREE";
         case RPC_CMD_TRACE_SYNC:        return "TRACE_SYNC";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";

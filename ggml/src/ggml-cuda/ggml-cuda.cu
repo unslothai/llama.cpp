@@ -6031,9 +6031,10 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
     std::lock_guard<std::mutex> lock(st.mutex);
 
     ggml_cuda_trace_device & d = st.devs[cuda_ctx->device];
+    // events belong to the current device, which another backend may have switched
+    ggml_cuda_set_device(cuda_ctx->device);
 
     if (d.anchor == nullptr) {
-        ggml_cuda_set_device(cuda_ctx->device);
         if (cudaEventCreate(&d.anchor) != cudaSuccess) {
             d.anchor = nullptr;
             return;

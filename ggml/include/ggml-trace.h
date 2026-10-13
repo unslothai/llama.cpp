@@ -28,7 +28,7 @@ extern "C" {
     GGML_API void ggml_trace_set_group(int group);
     GGML_API int  ggml_trace_get_group(void);
 
-    // names the tensor or graph the next RPC commands belong to; `name` must outlive the call
+    // names the tensor or graph the next RPC commands belong to; `name` is copied (GGML_MAX_NAME)
     GGML_API void ggml_trace_set_subject(const char * name, uint64_t uid);
     GGML_API const char * ggml_trace_get_subject(uint64_t * uid);
 

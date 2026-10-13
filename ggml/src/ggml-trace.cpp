@@ -51,7 +51,8 @@ std::atomic<int> g_next_tid{0};
 
 thread_local int          tls_tid     = -1;
 thread_local int          tls_group   = -1;
-thread_local const char * tls_subject = nullptr;
+// owned copy: callers pass tensor and message names that die before the next event reads them
+thread_local char         tls_subject[GGML_MAX_NAME] = {};
 thread_local uint64_t     tls_uid     = 0;
 thread_local std::string  tls_line;
 
@@ -132,15 +133,15 @@ int ggml_trace_get_group(void) {
 }
 
 void ggml_trace_set_subject(const char * name, uint64_t uid) {
-    tls_subject = name;
-    tls_uid     = uid;
+    snprintf(tls_subject, sizeof(tls_subject), "%s", name != nullptr ? name : "");
+    tls_uid = uid;
 }
 
 const char * ggml_trace_get_subject(uint64_t * uid) {
     if (uid != nullptr) {
         *uid = tls_uid;
     }
-    return tls_subject;
+    return tls_subject[0] ? tls_subject : nullptr;
 }
 
 const char * ggml_trace_escape(char * dst, size_t dst_size, const char * src) {
@@ -172,7 +173,7 @@ int ggml_trace_open(const char * path, const char * role) {
     // before llama_backend_init(): on Windows ggml_time_us() divides by an uninitialized timer_freq
     ggml_time_init();
 
-    s.f = fopen(path, "wb");
+    s.f = ggml_fopen(path, "wb");
     if (s.f == nullptr) {
         GGML_LOG_ERROR("%s: cannot open trace file %s\n", __func__, path);
         return 0;
@@ -276,7 +277,7 @@ void ggml_trace_event(const char * phase, const char * name, int64_t t0, int64_t
         line += ",\"grp\":";
         append_i64(line, tls_group);
     }
-    if (tls_subject != nullptr) {
+    if (tls_subject[0]) {
         line += ",\"subj\":\"";
         append_escaped(line, tls_subject);
         line += "\"";
