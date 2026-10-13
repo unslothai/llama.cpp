@@ -568,7 +568,7 @@ struct server_task_result_metrics : server_task_result {
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
     int n_preempted_slots = 0;        // [TAG_PREEMPT] processing slots currently parked or moving to or from host memory
-    size_t preempt_ram_bytes = 0;     // [TAG_PREEMPT] host RAM their parked sequences hold
+    size_t preempt_ram_bytes = 0;     // [TAG_PREEMPT] host RAM held for parking, including buffers kept after a restore
 
     server_metrics metrics;
 

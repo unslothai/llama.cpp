@@ -1633,7 +1633,7 @@ std::string server_task_result_metrics::to_metrics() {
             (double) n_preempted_slots
         }, {
             "preempt_ram_bytes",
-            "Preemption: Host RAM held by parked sequences",
+            "Preemption: Host RAM held for parking: parked sequences plus the pinned buffers kept for reuse after a restore",
             (double) preempt_ram_bytes
         },
     };
