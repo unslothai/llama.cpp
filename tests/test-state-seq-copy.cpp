@@ -56,21 +56,18 @@ int main(int argc, char ** argv) {
     // are a comb rather than one block, which is what the transfer is built for
     std::vector<llama_token> tokens(60, 1);
 
-    llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); i++) {
         for (int s = 0; s < params.n_parallel; ++s) {
-            common_batch_add(batch, tokens[i], i, {s}, false);
+            batch.add(tokens[i], i, s, false);
         }
     }
-    batch.logits[batch.n_tokens - 1] = true;
+    batch.set_output(batch.size() - 1, true);
 
-    if (llama_decode(ctx, batch)) {
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         fprintf(stderr, "%s : failed to decode\n", __func__);
-        llama_batch_free(batch);
         return 1;
     }
-
-    llama_batch_free(batch);
 
     llama_state_seq_copy * cpy = llama_state_seq_copy_init(ctx);
 
