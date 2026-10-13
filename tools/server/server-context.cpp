@@ -135,19 +135,7 @@ enum slot_state {
     SLOT_STATE_PREEMPTED,  // [TAG_PREEMPT] cells released, everything needed to resume is in host RAM
 };
 
-// [TAG_PREEMPT] server-side request preemption
-//
-// With --kv-unified the cells are one pool shared by every slot, and each slot believes it
-// has all of them. When the pool fills, llama_decode returns 1, the retry ladder halves
-// n_batch down to 1, and the server ends EVERY conversation in flight with "Context size
-// has been exceeded" -- including the ones nowhere near their own limit. Upstream marks the
-// spot in decode(): "TODO: try to terminate only the largest active slot/sequence and
-// continue with the rest".
-//
-// Nothing is terminated here. The cells of one slot are taken back and given to it again
-// later: its sequence is copied to host RAM, its cells are released, and when the pool has
-// room the copy goes back and the slot carries on with the same sampler, the same generated
-// text and the same open stream. A streaming client sees a pause, not an error.
+// [TAG_PREEMPT] server-side request preemption: when the unified KV pool fills, park one slot's sequence in host RAM and restore it later, instead of failing every slot.
 constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the reservation
 constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a streaming slot is parked
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
@@ -392,11 +380,7 @@ struct server_slot {
         prompt.clear();
     }
 
-    // [TAG_PREEMPT] state of a slot whose cells were taken back
-    //
-    // Only the KV cells leave. The task, the sampler, the generated text and the position
-    // the stream has reached stay on the slot, so a resume is a memcpy and not a new
-    // request: no retokenisation, no replayed prompt, no seam in the output.
+    // [TAG_PREEMPT] only the KV cells leave; task, sampler and generated text stay on the slot.
     slot_state           state_before_preempt = SLOT_STATE_IDLE;
     std::vector<uint8_t> preempt_state_tgt;
     std::vector<uint8_t> preempt_state_dft;
@@ -417,13 +401,11 @@ struct server_slot {
         preempt_state_dft.shrink_to_fit();
     }
 
-    // bytes preempt_save() would need for this slot right now
     size_t preempt_state_required() const {
         return llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) +
                (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
     }
 
-    // copy the sequence out of the cache and release its cells
     bool preempt_save() {
         const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -451,10 +433,7 @@ struct server_slot {
             return false;
         }
 
-        // The draft is a prediction, not a result, so it goes with the cells. Preemption
-        // runs before the batch is built, so spec_i_batch is empty and prompt.tokens already
-        // holds exactly the tokens the state above covers -- including the rollback done by
-        // the checkpoint path when a draft was only partially accepted.
+        // Preemption runs before the batch is built, so prompt.tokens already matches the saved state.
         spec_draft.clear();
         spec_i_batch.clear();
         spec_ckpt.clear();
@@ -462,8 +441,7 @@ struct server_slot {
 
         i_batch = -1;
 
-        // note: prompt.tokens is deliberately kept. It is the mirror of the state just
-        //       copied out, and the resume needs it to know how many cells to ask for.
+        // prompt.tokens is kept: the resume needs it to size the request for cells.
         mem.seq_rm(id, -1, -1);
 
         state_before_preempt = state;
@@ -476,7 +454,6 @@ struct server_slot {
         return true;
     }
 
-    // put the sequence back; the slot then continues from the token it was about to decode
     bool preempt_restore() {
         const size_t size_tgt = preempt_state_tgt.size();
         const size_t size_dft = preempt_state_dft.size();
@@ -501,10 +478,6 @@ struct server_slot {
 
         state = state_before_preempt;
 
-        // same call the DONE_PROMPT -> GENERATING transition makes; for MTP it only checks
-        // that the draft context is where it should be, which the restore above ensures.
-        // A slot parked while still processing its prompt makes that transition itself
-        // once the prompt is done.
         if (state == SLOT_STATE_GENERATING && can_speculate()) {
             common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
         }
@@ -512,12 +485,7 @@ struct server_slot {
         return true;
     }
 
-    // [TAG_PREEMPT] bring prompt.tokens back to what the cache holds for this sequence.
-    // For a batch that is given up after it was built: the tokens added for this slot
-    // that were never decoded come off, the sampled token stays in `sampled` and goes into
-    // the next batch the way it went into this one, and a draft is a prediction that goes
-    // with them. A chunk that failed to decode left nothing in the cache, so the cache is
-    // the boundary.
+    // [TAG_PREEMPT] trim prompt.tokens to what the cache holds after a batch is given up.
     void rewind_to_cache() {
         const int32_t n_cached = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
 
@@ -525,8 +493,7 @@ struct server_slot {
             prompt.tokens.keep_first(n_cached);
         }
 
-        // a prompt whose last chunk was in the batch was marked done when the chunk was
-        // built; the chunk never ran, so the prompt is not done
+        // The chunk that marked the prompt done never ran.
         if (state == SLOT_STATE_DONE_PROMPT && task && prompt.n_tokens() < task->n_tokens()) {
             state = SLOT_STATE_PROCESSING_PROMPT;
         }
@@ -786,9 +753,7 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
-            // [TAG_PREEMPT] the cells are already gone (a cancelled or failed slot can be
-            // released while parked), so the mirror of them must not outlive them: the next
-            // task on this slot would otherwise take a prefix match against an empty cache
+            // [TAG_PREEMPT] drop the mirror so the next task does not prefix-match an empty cache.
             if (state == SLOT_STATE_PREEMPTED) {
                 preempt_state_free();
                 prompt_clear();
@@ -1674,8 +1639,6 @@ private:
         }
 
         {
-            // read on every load and kept on this context, so a reload after the variable
-            // changed, or another context loaded in the same process, has an order of its own
             preempt_resume_head = true;
 
             const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
@@ -1692,10 +1655,7 @@ private:
             const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
             preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
 
-            // LLAMA_SERVER_PREEMPT_POLICY: which non-leader the planner parks, for comparing
-            // policies against each other on the same workload. smallest (the default and the
-            // shipped one), largest, youngest (the most recent task, as vLLM's scheduler
-            // preempts), oldest. The leader is kept and the starvation guard applies under all.
+            // LLAMA_SERVER_PREEMPT_POLICY is a test knob: smallest (default), largest, youngest or oldest.
             const char * LLAMA_SERVER_PREEMPT_POLICY = getenv("LLAMA_SERVER_PREEMPT_POLICY");
             preempt_test_policy = LLAMA_SERVER_PREEMPT_POLICY ? LLAMA_SERVER_PREEMPT_POLICY : "smallest";
 
@@ -1715,8 +1675,7 @@ private:
                 SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_PLANNER = off (test knob: nothing is parked ahead of the decode, only as a last resort)\n");
             }
 
-            // assigned, not only set: the same context reloaded with an attention model after
-            // a recurrent one gets its preemption back
+            // Assigned, not only set, so a reload with an attention model re-enables preemption.
             preempt_recurrent = llama_model_is_recurrent(model_tgt);
 
             if (preempt_recurrent) {
@@ -3243,9 +3202,7 @@ private:
 
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
-            // [TAG_PREEMPT] a parked slot took no part in what failed: its sequence is in
-            // host RAM, not in the cache, and it comes back when there is room, the same as
-            // in the decode error sweep
+            // [TAG_PREEMPT] a parked slot took no part in the failure and resumes later.
             if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
@@ -3283,43 +3240,26 @@ private:
     };
 #endif
 
-    //
     // [TAG_PREEMPT] server-side request preemption
-    //
 
 
-    // LLAMA_SERVER_PREEMPT_EVERY=N preempts every generating slot every N generated tokens,
-    // whether or not the pool is under pressure. It exists to answer the only question that
-    // matters about a resume: with one request on an idle server the batch has the same
-    // shape at every step, so a preempted continuation that is not byte-identical to an
-    // uninterrupted one is the preemption's fault and nothing else's.
+    // LLAMA_SERVER_PREEMPT_EVERY=N forces a park every N tokens, for the determinism test.
     int32_t preempt_test_every = 0;
     std::string preempt_test_policy = "smallest"; // LLAMA_SERVER_PREEMPT_POLICY, see load_model
 
-    // env: LLAMA_SERVER_PREEMPT_PLANNER=off (test knob): no parking ahead of the decode, so
-    // the KV-full retry ladder and its last resort are the only thing between a full pool
-    // and the context error
     bool preempt_planner_off = false;
 
-    // LLAMA_SERVER_PREEMPT_RESUME: head (the default) puts parked slots back in the order they
-    // were parked and only the first until it fits; pass lets a smaller slot pass a head
-    // that does not fit. Read at load, per context.
     bool preempt_resume_head = true;
 
-    // a recurrent cache holds one state per sequence whatever its length: no cell pool,
-    // nothing to run out of, and the token count the planner measures says nothing about
-    // it. Preemption is off for those models; a hybrid keeps its attention cache and stays on.
+    // A recurrent cache has no cell pool to run out of, so preemption is off for it.
     bool preempt_recurrent = false;
 
-    // set by preempt_last_resort(): the batch being decoded was given up, stop the chunk loop
     bool preempt_batch_abandoned = false;
 
     int32_t preempt_n_spec_max() const {
         return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
     }
 
-    // draft tokens this slot's next step can actually carry: the configured maximum, cut to
-    // what its context and its prediction budget leave, the way get_n_draft_max() cuts it
     int32_t preempt_n_spec(const server_slot & slot) const {
         int32_t res = preempt_n_spec_max();
 
@@ -3336,7 +3276,6 @@ private:
         return std::max(0, res);
     }
 
-    // host RAM the parked sequences hold right now
     size_t preempt_ram_used() const {
         size_t res = 0;
 
@@ -3347,7 +3286,6 @@ private:
         return res;
     }
 
-    // whether parking this slot stays under --preempt-ram
     bool preempt_fits_budget(const server_slot & slot) const {
         if (params_base.preempt_ram_mib < 0) {
             return true;
@@ -3358,9 +3296,7 @@ private:
         return preempt_ram_used() + slot.preempt_state_required() <= budget;
     }
 
-    // cells of the mirrored prompt that a started slot's request keeps, by the rule the batch
-    // builder applies when it takes the slot: nothing when the request does not cache its
-    // prompt, otherwise the prefix the two share, cut short of an aLoRA invocation
+    // Mirrors the batch builder's rule for how much of a started slot's old prompt is kept.
     size_t preempt_n_keep(const server_slot & slot) const {
         if (!slot.task->params.cache_prompt) {
             return 0;
@@ -3375,10 +3311,7 @@ private:
         return n_keep;
     }
 
-    // cells of the slot's that its next step keeps: a slot just given a task still mirrors
-    // the previous request's prompt until the batch builder keeps what preempt_n_keep()
-    // says and drops the rest, so what it holds, and what it is about to ask for, both
-    // count from that
+    // A started slot still mirrors the previous prompt; count only what preempt_n_keep() keeps.
     int32_t preempt_n_retained(const server_slot & slot) const {
         if (slot.state == SLOT_STATE_STARTED && slot.task) {
             return (int32_t) preempt_n_keep(slot);
@@ -3387,7 +3320,6 @@ private:
         return slot.prompt.n_tokens();
     }
 
-    // cells the slot will ask for on its next step once it is back in the pool
     int32_t preempt_n_need(const server_slot & slot) const {
         int32_t res = preempt_n_retained(slot);
 
@@ -3402,16 +3334,11 @@ private:
         return res;
     }
 
-    // Cells the pool is holding right now. A released slot keeps its prompt in the cache
-    // for the next request to reuse as a prefix, so idle slots count too: the first version
-    // of this counted only the running ones, decided a pool holding 8185 cached cells was
-    // empty, and every resume failed against a cache that was actually full.
+    // Idle slots count too: their cached prompts still occupy the pool.
     int32_t preempt_kv_used() const {
         int32_t res = 0;
 
-        // n_cmpl > 1: the parent and its children share the prompt's cells through seq_cp, so
-        // the prompt is charged once per family, to whichever resident member comes first;
-        // the others are charged only what they generated on top of it
+        // n_cmpl > 1 families share the prompt via seq_cp, so it is charged once per family.
         std::vector<int> charged;
 
         for (const auto & slot : slots) {
@@ -3419,9 +3346,7 @@ private:
                 continue; // parked: its cells are in host RAM, not in the pool
             }
 
-            // a child waiting for its parent's prompt does not share anything yet: until
-            // copy_state_to() runs it still holds whatever the previous request left in its
-            // cells, so it is charged that on its own, outside the family
+            // A waiting child has not received its parent's prompt yet and still holds its old cells.
             if (slot.state == SLOT_STATE_WAIT_OTHER) {
                 res += slot.prompt.n_tokens();
                 continue;
@@ -3438,19 +3363,13 @@ private:
                 charged.push_back(family);
             }
 
-            // what the pool holds now, the previous request's prompt included for a slot just
-            // given a task: the batch builder trims that to the prefix the two share, but
-            // not until the slot is built into a batch, and with continuous batching off that
-            // can be a long time behind a running generation. Measured by the prefix, a
-            // restore was found to fit and attempted against cells still occupied. Under
-            // pressure the planner trims such slots itself, see preempt_normalize_started_all()
+            // Use the full mirror for started slots: counting only the prefix made restores fail against occupied cells.
             res += slot.prompt.n_tokens();
         }
 
         return res;
     }
 
-    // cells those slots are about to ask for on the next decode
     int32_t preempt_kv_reserve() const {
         const int32_t n_batch = llama_n_batch(ctx_tgt);
 
@@ -3467,9 +3386,7 @@ private:
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
                     {
-                        // from the prefix a started slot keeps, not from the prompt it still
-                        // mirrors: measured by the mirror, a request shorter than the last one
-                        // reserved one cell for a chunk of hundreds
+                        // Count from the kept prefix: counting from the mirror under-reserved.
                         const int32_t n_left = slot.task ? slot.task->n_tokens() - preempt_n_retained(slot) : 0;
 
                         res_pmt += std::max(1, std::min(n_batch, n_left));
@@ -3479,21 +3396,10 @@ private:
             }
         }
 
-        // one batch is all the prompt slots get between them, however many are waiting
         return res + std::min(res_pmt, n_batch);
     }
 
-    // Keep the slot that is furthest along -- it is the closest to finishing and to giving
-    // its cells back -- and among the rest prefer one that has not been preempted
-    // PREEMPT_N_STARVED times already, then the smallest.
-    // [TAG_PREEMPT] a slot just given a task still mirrors the previous request's prompt
-    // until the batch builder keeps the prefix the two share and drops the rest (see the
-    // SLOT_STATE_STARTED block of update_slots). Parked as it is, it would be copied out,
-    // charged and sized by the old prompt, and a short unrelated request could exceed the
-    // budget or stay parked for room it will never use. Keeping only the shared prefix now
-    // is what the batch builder does anyway; the chunk reuse it can add on top is given up
-    // for a slot the planner has to touch, which is rare.
-    // every started slot, when the pool is short: true when any of them gave cells up
+    // [TAG_PREEMPT] trim a started slot to the shared prefix now, as the batch builder would, so it is not sized by the old prompt.
     bool preempt_normalize_started_all() {
         bool res = false;
 
@@ -3527,10 +3433,7 @@ private:
             return;
         }
 
-        // a memory that cannot remove part of a sequence (a recurrent state without rollback
-        // room for the stale suffix) aborts on a partial removal; for it the whole stale
-        // sequence goes, and the prompt is processed from the start on resume, as it would be
-        // without a usable checkpoint
+        // A memory without partial removal aborts on seq_rm of a suffix, so drop the whole sequence.
         const bool partial_ok = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
                                 (!ctx_dft || ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
 
@@ -3548,10 +3451,7 @@ private:
         server_slot * leader    = nullptr;
         int32_t       n_running = 0;
 
-        // a slot just given a task is measured by the prefix it keeps, not by the previous
-        // request's prompt it still mirrors: measured by the mirror, a short request over a
-        // large stale cache would be the never-parked leader while the longest live
-        // conversation was parked in its place
+        // Without this, a short request over a large stale cache could become the never-parked leader.
         for (auto & slot : slots) {
             preempt_normalize_started(slot);
         }
@@ -3567,19 +3467,14 @@ private:
         }
 
         if (n_running < 2) {
-            // a single conversation that does not fit the pool on its own is a real context
-            // overflow and not a scheduling problem - leave it to the existing error path
+            // A single conversation that does not fit alone is a real overflow.
             return nullptr;
         }
 
         server_slot * victim = nullptr;
 
         for (auto & slot : slots) {
-            // Before the batch is built every one of these is at a token boundary: a
-            // generating slot between two sampled tokens, a prompt-processing slot between
-            // two chunks of its prompt, a started slot with only a cached prefix (or
-            // nothing) in the pool. A slot holding no cells is still worth parking - it
-            // is about to ask for a whole batch of them.
+            // Every slot is at a token boundary here; a slot holding no cells is still worth parking.
             if (slot.state != SLOT_STATE_GENERATING &&
                 slot.state != SLOT_STATE_PROCESSING_PROMPT &&
                 slot.state != SLOT_STATE_STARTED) {
@@ -3623,9 +3518,7 @@ private:
         return victim;
     }
 
-    // is a the better victim of the two? the smallest slot under the shipped policy: it
-    // gives up the least work and its restore is the cheapest (see the PR's simulation);
-    // the other choices exist for the comparison runs behind LLAMA_SERVER_PREEMPT_POLICY
+    // The smallest slot is the shipped policy; the others exist only for LLAMA_SERVER_PREEMPT_POLICY comparisons.
     bool preempt_better_victim(const server_slot & a, const server_slot & b) const {
         if (preempt_test_policy == "largest") {
             return a.prompt.n_tokens() > b.prompt.n_tokens();
@@ -3642,10 +3535,7 @@ private:
         return a.prompt.n_tokens() < b.prompt.n_tokens();
     }
 
-    // called once per update_slots(), before the batch is built: at that point every slot is
-    // at a token boundary, prompt.tokens is exactly what the cache holds for it, and no
-    // draft is in flight, so a slot can be removed from the picture without unpicking a
-    // half-decoded batch
+    // Must run before the batch is built, when every slot is at a token boundary and no draft is in flight.
     void update_preemption() {
         if (!params_base.kv_unified || slots.size() < 2) {
             return; // with a cache per slot, no slot can take another one's cells
@@ -3661,10 +3551,6 @@ private:
 
         const int32_t n_cells = n_ctx;
 
-        // Put back what fits, in the order preempt_resume_head describes: by default
-        // the slot parked longest, and only that one until it fits; under
-        // LLAMA_SERVER_PREEMPT_RESUME=pass the most-preempted slot first, then the one parked
-        // longest, and a smaller slot may pass a head that does not fit.
         const bool head_of_line = preempt_resume_head;
 
         for (;;) {
@@ -3694,12 +3580,7 @@ private:
 
             server_slot * best = nullptr;
 
-            // A parked slot whose sequence plus its next step would not fit an empty pool can
-            // never be restored, and would otherwise sit at the head of the line for ever
-            // without a restore ever being attempted: a prompt within n_ctx that was parked
-            // before it took any cells, but too close to n_ctx to leave room for its first
-            // batch. That is the single-conversation overflow the KV-full path reports, so
-            // report it the same way and rescan the line without it.
+            // A parked slot that cannot fit even an empty pool would block the line for ever, so fail it as an overflow.
             {
                 server_slot * impossible = nullptr;
 
@@ -3719,12 +3600,7 @@ private:
                 }
             }
 
-            // Room for the sequence AND for the next step of everything already running,
-            // so that a resume cannot immediately trigger the preemption of someone else.
-            // The margin is headroom for the others; with nothing resident there is nobody
-            // to keep it for, so a sequence that fits the pool exactly is let back in.
-            // A cached prompt on an idle slot is worth less than a conversation waiting to
-            // continue, so give those cells up first - same call the KV-full path makes.
+            // Leave room for everyone's next step so a resume cannot trigger another park; skip the margin when the pool is empty.
             for (;;) {
                 const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
                 const int32_t margin   = occupied == 0 ? 0 : PREEMPT_N_MARGIN;
@@ -3740,9 +3616,6 @@ private:
                     break;
                 }
 
-                // a slot just given a task still holds the previous request's prompt until
-                // the batch builder trims it; trimmed here instead, the cells it will not
-                // keep are counted out and a parked slot that fits without them comes back
                 if (preempt_normalize_started_all()) {
                     continue;
                 }
@@ -3752,20 +3625,12 @@ private:
                 }
             }
 
-            // Nothing fits. A resident that has reached the pool's limit and is cycling
-            // through context shifts holds the room for as long as it likes to generate,
-            // and the head behind it would wait for ever. After the head has waited its
-            // turn, that resident is parked in its place: it is at a token boundary like
-            // any other park, and when it comes back it is the one waiting, so the two
-            // take turns instead of one taking everything.
+            // A resident cycling through context shifts would hold the pool for ever, so after PREEMPT_ROTATE_US it is parked for the head.
             if (!best) {
                 server_slot * head = parked.front();
 
                 if (ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
-                    // the resident whose cells let the head in, the smallest of those; failing
-                    // one that does so alone, the largest, since it makes the most room. Taking
-                    // the first shifting resident in slot order could park one too small to
-                    // matter, spend the park budget on it, and leave the head waiting anyway.
+                    // Pick the smallest resident that alone frees enough room, else the largest.
                     const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
                     const int32_t need     = preempt_n_need(*head) + PREEMPT_N_MARGIN;
 
@@ -3782,11 +3647,7 @@ private:
                             continue;
                         }
 
-                        // The head's own bytes are not credited as leaving: the resident is
-                        // parked before the head is restored and freed, so both states are
-                        // held at once, and the cap is a cap on what is held. A budget that
-                        // holds one sequence but not two does not rotate, and the head waits
-                        // for a resident to finish, which is said once per park below.
+                        // The head's bytes are not credited: both states are held at once during a rotation.
                         if (!preempt_fits_budget(slot)) {
                             budget_refused = true;
                             continue;
@@ -3838,9 +3699,7 @@ private:
             const int64_t t_start = ggml_time_us();
 
             if (!best->preempt_restore()) {
-                // update_slots() runs in a tight loop while tasks are pending, so a counter
-                // alone burns its whole budget in a couple of milliseconds. Give up only on
-                // a slot that has been failing for a while, and keep the log quiet.
+                // This runs in a tight loop, so give up only after PREEMPT_FAIL_US and rate-limit the log.
                 if (best->n_preempt_fail % 64 == 1) {
                     SLT_WRN(*best, "resume failed (%d in a row, parked %.1f s), staying preempted\n",
                             best->n_preempt_fail, (ggml_time_us() - best->t_preempt_us) / 1e6);
@@ -3867,7 +3726,6 @@ private:
                     best->n_preempt);
         }
 
-        // forced preemption, for the determinism test only
         if (preempt_test_every > 0) {
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
@@ -3888,7 +3746,6 @@ private:
             return; // test knob: leave the pool to the retry ladder and its last resort
         }
 
-        // and take cells back until the next decode fits
         for (;;) {
             const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
 
@@ -3896,7 +3753,6 @@ private:
                 break;
             }
 
-            // a prompt cached on an idle slot is the cheapest thing in the pool to give up
             if (try_clear_idle_slots()) {
                 continue;
             }
@@ -4037,10 +3893,7 @@ private:
         }
 
         try {
-            // [TAG_PREEMPT] make the pool fit the step that is about to be built, measured
-            // after any context shift. Inside the guard with the rest of the step: a shift
-            // rebuilds a slot's tokens and a park allocates, and either can throw, which the
-            // slots are told about rather than the loop ending on an uncaught exception
+            // [TAG_PREEMPT] run after any context shift, inside the guard because both can throw.
             pre_decode_shift();
             update_preemption();
 
@@ -4090,8 +3943,7 @@ private:
 #endif
 
                 if (preempt_batch_abandoned) {
-                    // [TAG_PREEMPT] the rest of this batch was never decoded and the slots no
-                    // longer describe it; the next pass builds a new one
+                    // [TAG_PREEMPT] the rest of this batch was never decoded; the next pass rebuilds it.
                     preempt_batch_abandoned = false;
                     break;
                 }
@@ -4125,8 +3977,7 @@ private:
 
     // apply context-shift if needed
     // TODO: simplify and improve
-    // [TAG_PREEMPT] runs before update_preemption() so the pool is measured after the shift,
-    // not with the cells the shift is about to give back
+    // [TAG_PREEMPT] runs before update_preemption() so the pool is measured after the shift.
     void pre_decode_shift() {
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
@@ -4347,8 +4198,7 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                // [TAG_PREEMPT] a parked slot is processing but has nothing in the cache to
-                // batch; it takes no part in this pass until it is restored
+                // [TAG_PREEMPT] a parked slot has nothing in the cache to batch.
                 if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
                     return;
                 }
@@ -4894,14 +4744,7 @@ private:
         }
     }
 
-    // [TAG_PREEMPT] the retry ladder ran out: a single token found no cell. Upstream this is
-    // the context error for every slot in the batch. With a park budget the batch is given
-    // up instead: every resident slot is rewound to the token boundary the cache is at (a
-    // batch is applied one chunk at a time, and the chunk that failed left nothing behind),
-    // the smallest are parked until the planner's own bound holds again, and the next
-    // update_slots() rebuilds the batch from the survivors. The planner brings the parked
-    // ones back as cells free up. A multimodal prompt has no boundary the cache can name,
-    // so it keeps the old path.
+    // [TAG_PREEMPT] when the retry ladder runs out, rewind every slot to the cache boundary and park the smallest instead of failing all. Multimodal prompts keep the old path.
     bool preempt_last_resort_possible() const {
         return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
@@ -5097,11 +4940,7 @@ private:
             {
                 std::string err;
 
-                // [TAG_PREEMPT] with speculation on, a slot's sampled token and its draft have
-                // to stay in one view: a narrower view splits the group and the verify step
-                // throws for the slot whose tokens straddle it. Halving is no help there, so
-                // after the idle slots the ladder goes to its last resort straight away. With
-                // no budget to park into the ladder is what it always was.
+                // [TAG_PREEMPT] halving splits a slot's sampled token from its draft and breaks the verify step, so go straight to the last resort.
                 if (ret == 1 && n_batch > 1 && preempt_last_resort_possible() && batch_has_spec_groups()) {
                     if (try_clear_idle_slots()) {
                         SRV_WRN("%s", "failed to find free space in the KV cache, retrying after purging an idle slot\n");
@@ -5138,8 +4977,7 @@ private:
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
-                        // [TAG_PREEMPT] a parked slot has nothing in this batch and nothing in the
-                        // cache; it is not part of this failure and comes back when there is room
+                        // [TAG_PREEMPT] a parked slot is not part of this failure.
                         if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED) {
                             send_error(slot, err);
                             slot.release();
