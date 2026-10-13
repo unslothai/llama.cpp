@@ -13,9 +13,6 @@ static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 struct socket_t {
     ~socket_t();
 
-    // peer HELLO features (RPC_SRV_FLAG_* in ggml-rpc.cpp); zero for an older server
-    uint8_t srv_flags = 0;
-
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     // Must be called at every message boundary: the RDMA transport coalesces
@@ -27,6 +24,7 @@ struct socket_t {
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+    const char * transport_name() const;
 
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);
