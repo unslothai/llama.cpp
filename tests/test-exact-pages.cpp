@@ -12,24 +12,22 @@
 static const uint32_t PAGE = 256;
 
 static bool decode_range(llama_context * ctx, llama_seq_id seq, llama_pos first, llama_pos last) {
-    llama_batch batch = llama_batch_init(64, 0, 1);
+    common_batch batch(ctx);
 
     bool ok = true;
 
     for (llama_pos p = first; p <= last && ok; ) {
-        common_batch_clear(batch);
+        batch.clear();
 
         for (int i = 0; i < 64 && p <= last; ++i, ++p) {
-            common_batch_add(batch, 1, p, {seq}, false);
+            batch.add(1, p, seq, false);
         }
 
         // every decode asks for one set of logits, so none of them is a batch with no output
-        batch.logits[batch.n_tokens - 1] = true;
+        batch.set_output(batch.size() - 1, true);
 
-        ok = llama_decode(ctx, batch) == 0;
+        ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     }
-
-    llama_batch_free(batch);
 
     return ok;
 }
