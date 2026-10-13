@@ -5169,9 +5169,10 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 // maps host memory into the device address space so kernels read it directly (zero-copy), returns the device pointer or nullptr
 // mappings are reference counted: if *registered is set, call ggml_backend_cuda_host_unmap(buffer) when done
 // pageable memory is never read through HMM/ATS, it is an order of magnitude slower
+// the device pointer is taken per device: HIP maps registered memory into the address space of the current device
 struct ggml_cuda_host_mapping {
     size_t size;
-    void * dev_ptr;
+    void * dev_ptr[GGML_CUDA_MAX_DEVICES];
     int    refs;
 };
 
@@ -5185,22 +5186,31 @@ static std::unordered_map<void *, ggml_cuda_host_mapping> & ggml_cuda_host_mappi
     return m;
 }
 
-static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * registered) {
+static void * ggml_cuda_host_map(int device, void * buffer, size_t size, bool * registered) {
     *registered = false;
     void * dev_ptr = nullptr;
 
     std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
     auto & mappings = ggml_cuda_host_mappings();
 
-    // registered here before: one more reference
+    ggml_cuda_set_device(device);
+
+    // registered here before: one more reference, with the device pointer of this device
     auto it = mappings.find(buffer);
     if (it != mappings.end()) {
         if (size > it->second.size) {
             return nullptr;
         }
+        if (it->second.dev_ptr[device] == nullptr) {
+            if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
+                (void)cudaGetLastError();
+                return nullptr;
+            }
+            it->second.dev_ptr[device] = dev_ptr;
+        }
         it->second.refs++;
         *registered = true;
-        return it->second.dev_ptr;
+        return it->second.dev_ptr[device];
     }
 
     // pinned by someone else, for example a CUDA host buffer (registering it again fails): not owned here
@@ -5233,7 +5243,11 @@ static void * ggml_backend_cuda_host_map(void * buffer, size_t size, bool * regi
         (void)cudaGetLastError();
         return nullptr;
     }
-    mappings[buffer] = { size, dev_ptr, 1 };
+    ggml_cuda_host_mapping & m = mappings[buffer];
+    m = {};
+    m.size = size;
+    m.dev_ptr[device] = dev_ptr;
+    m.refs = 1;
     *registered = true;
     return dev_ptr;
 }
@@ -5274,6 +5288,12 @@ struct ggml_backend_cuda_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
+
+// maps host memory into the address space of the device dev (see ggml_cuda_host_map)
+static void * ggml_backend_cuda_host_map(ggml_backend_dev_t dev, void * buffer, size_t size, bool * registered) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    return ggml_cuda_host_map(ctx->device, buffer, size, registered);
+}
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;

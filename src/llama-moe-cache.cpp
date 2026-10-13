@@ -636,7 +636,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    using host_map_t   = void * (*)(void *, size_t, bool *);
+    using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
     using host_unmap_t = void (*)(void *);
 
     // the device of the group can map host memory and run the lookup of the largest batch
@@ -664,8 +664,8 @@ struct llama_moe_cache::impl {
     // the groups of devices without the lookup op or the host_map function (backend capability) keep the host lookups
     void init_device_lookup() {
 
-        // device pointer of each mapped host buffer, per mapping function (a buffer may be read by devices of different backends)
-        std::map<std::pair<host_map_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
+        // device pointer of each mapped host buffer, per device (the device address of a host buffer may differ between devices)
+        std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
@@ -673,7 +673,8 @@ struct llama_moe_cache::impl {
                 continue;
             }
             ggml_backend_t backend = devices[g.id].backend;
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
             if (!lookup_capable(g)) {
                 continue;
             }
@@ -684,15 +685,15 @@ struct llama_moe_cache::impl {
             std::vector<std::vector<const void *>> host_dev(g.layers.size());
             for (size_t i = 0; i < g.layers.size() && ok; ++i) {
                 for (const ggml_tensor * t : layers[g.layers[i]].experts) {
-                    auto it = dev_base.find({ host_map, t->buffer });
+                    auto it = dev_base.find({ dev, t->buffer });
                     if (it == dev_base.end()) {
                         void * base = ggml_backend_buffer_get_base(t->buffer);
                         bool registered = false;
-                        void * dev = host_map(base, ggml_backend_buffer_get_size(t->buffer), &registered);
+                        void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
                         if (registered) {
                             mapped.emplace_back(host_unmap, base);
                         }
-                        it = dev_base.emplace(std::make_pair(host_map, t->buffer), (uint8_t *) dev).first;
+                        it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
                     }
                     if (it->second == nullptr) {
                         ok = false;
