@@ -424,6 +424,17 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic_stream();
 };
 
+// [TAG_PREEMPT] Park/resume notice, sent only to streaming tasks as an SSE comment that existing clients ignore.
+struct server_task_result_preempt_notice : server_task_result {
+    bool    parked    = false; // true when the slot was just parked, false when restored
+    int32_t n_preempt = 0;     // how many times this task has been parked so far
+
+    virtual bool is_stop() override {
+        return false;
+    }
+    virtual json to_json() override;
+};
+
 struct server_task_result_cmpl_partial : server_task_result {
     std::string  content;
     llama_tokens tokens;

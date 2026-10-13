@@ -1023,6 +1023,13 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     }
 }
 
+json server_task_result_preempt_notice::to_json() {
+    return json {
+        {"preempted", parked},
+        {"n_preempt", n_preempt},
+    };
+}
+
 json server_task_result_cmpl_partial::to_json() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
     if (is_begin) {
