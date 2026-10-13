@@ -182,6 +182,47 @@ check("a reworded comment does not fail the pin", rc == 0, err)
 check("no symbol was harvested from the comment",
       "LLM_ARCH_MISTRAL" not in json.dumps(rep["pins"][0]["symbols"]), rep)
 
+# --- 8. an op-count assert rewritten by reconcile_op_count.py ---------------
+# Two pins each add an op and each take static_assert(GGML_OP_COUNT == 1) to 2;
+# the merged tree has 3 ops, so reconcile_op_count.py rewrites the asserts to 3
+# and neither pin's own "== 2" line survives. That must not fail the pin, and
+# every other line the pin adds is still held.
+d = Path(tempfile.mkdtemp(prefix="pc_"))
+git(d, "init", "-q", "-b", "main")
+(d / "ggml").mkdir()
+OPS_BASE = 'enum ggml_op {\n    GGML_OP_NONE,\n    GGML_OP_COUNT,\n};\nstatic_assert(GGML_OP_COUNT == 1, "GGML_OP_COUNT != 1");\n'
+(d / "ggml" / "ggml.c").write_text(OPS_BASE)
+git(d, "add", "-A"); git(d, "commit", "-qm", "base"); git(d, "tag", "b1")
+shas = []
+for op in ("GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
+    git(d, "checkout", "-qb", op, "b1")
+    (d / "ggml" / "ggml.c").write_text(
+        OPS_BASE.replace("    GGML_OP_COUNT,", f"    {op},\n    GGML_OP_COUNT,")
+        .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\""))
+    (d / "ggml" / f"{op.lower()}.c").write_text(f"int {op.lower()}_kernel_entry(void) {{ return 7; }}\n")
+    git(d, "add", "-A"); git(d, "commit", "-qm", op)
+    shas.append(git(d, "rev-parse", "HEAD").stdout.strip())
+git(d, "checkout", "-q", "main")
+for op in ("GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
+    r = git(d, "merge", "-q", "--no-ff", "--no-edit", "-m", f"merge {op}", op)
+    if r.returncode:                                 # both inserted above COUNT: keep both
+        (d / "ggml" / "ggml.c").write_text(
+            OPS_BASE.replace("    GGML_OP_COUNT,", "    GGML_OP_BANDED,\n    GGML_OP_MOE_CACHE,\n    GGML_OP_COUNT,")
+            .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\""))
+        git(d, "add", "-A"); git(d, "commit", "-qm", f"merge {op}")
+c = d / "ggml" / "ggml.c"
+c.write_text(c.read_text().replace("== 2, \"GGML_OP_COUNT != 2\"", "== 3, \"GGML_OP_COUNT != 3\""))
+ps8 = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
+ps8.write_text(json.dumps({"prs": [
+    f"https://github.com/unslothai/llama.cpp/pull/{i}/commits/{s}" for i, s in enumerate(shas, 1)]}))
+rc, rep, err = run(d, ps8)
+check("a reconciled op-count assert does not fail the pins", rc == 0, err)
+check("the pins still own their new op symbols",
+      all(any("GGML_OP_" in x for x in p["symbols"].get("ggml/ggml.c", [])) for p in rep["pins"]), rep)
+(d / "ggml" / "ggml_op_banded.c").write_text("int other(void) { return 0; }\n")
+rc, rep, err = run(d, ps8)
+check("any other lost line still fails", rc == 1 and "ggml_op_banded_kernel_entry" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
