@@ -91,29 +91,52 @@ static_assert(GGML_GLU_OP_COUNT == 2, "GGML_GLU_OP_COUNT != 2");
 
 
 RPC = """\
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_MAJOR_VERSION    {major}
+#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_PATCH_VERSION    {patch}
+// static_assert(GGML_OP_COUNT == {n}, "commented out, never rewritten");
 static_assert(GGML_OP_COUNT == {n}, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 """
 
 
-def make(ops, names, symbols, n_assert, rpc_n=None, **kw):
-    d = Path(tempfile.mkdtemp(prefix="roc_"))
-    (d / "ggml" / "include").mkdir(parents=True)
-    (d / "ggml" / "src").mkdir(parents=True)
+def git(d, *a):
+    subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                   check=True, capture_output=True)
+
+
+def write_tree(d, ops, names, symbols, n_assert, rpc_n, major, patch, **kw):
+    (d / "ggml" / "include").mkdir(parents=True, exist_ok=True)
+    (d / "ggml" / "src").mkdir(parents=True, exist_ok=True)
     (d / "ggml" / "include" / "ggml.h").write_text(header(ops, **{k: v for k, v in kw.items() if k in ("unary", "enum_extra")}))
     (d / "ggml" / "src" / "ggml.c").write_text(source(names, symbols, n_assert, **{k: v for k, v in kw.items() if k in ("unary", "u_assert")}))
-    (d / "ggml" / "include" / "ggml-rpc.h").write_text(RPC.format(n=n_assert if rpc_n is None else rpc_n))
+    (d / "ggml" / "include" / "ggml-rpc.h").write_text(RPC.format(n=n_assert if rpc_n is None else rpc_n, major=major, patch=patch))
+
+
+def make(ops, names, symbols, n_assert, rpc_n=None, major=8, patch=None, **kw):
+    """A git repo whose tag `base` is the plain 101-op tree at RPC 8.0.0, worked over to the given tree.
+
+    patch defaults to 0 when the tree has the base's op count, else 1: what each op-adding pin does.
+    """
+    d = Path(tempfile.mkdtemp(prefix="roc_"))
+    git(d, "init", "-q")
+    write_tree(d, BASE, NAMES, SYMS, 101, None, 8, 0)
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    git(d, "tag", "base")
+    if patch is None:
+        patch = 0 if len(ops) == len(BASE) else 1
+    write_tree(d, ops, names, symbols, n_assert, rpc_n, major, patch, **kw)
     return d
 
 
-def run(d, *extra):
-    r = subprocess.run([sys.executable, str(SCRIPT), "--root", str(d), *extra],
-                       capture_output=True, text=True)
+def run(d, *extra, base="base"):
+    cmd = [sys.executable, str(SCRIPT), "--root", str(d), *extra] + (["--base-ref", base] if base else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
 def snapshot(d):
-    return {p: p.read_text() for p in sorted(d.rglob("*")) if p.is_file()}
+    return {p: p.read_text() for p in sorted(d.rglob("*")) if p.is_file() and ".git" not in p.parts}
 
 
 # 101 ops (NONE + 100 more) in the base, so the base assert says 101.
@@ -140,8 +163,12 @@ check("both ggml.c asserts say 103",
 check("no 102 is left in ggml.c", "102" not in src, src)
 check("the rpc assert says 103 and keeps its message",
       'static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");' in rpc, rpc)
+check("two pins that each bumped PATCH 0 -> 1 merged to one bump: PATCH is raised to 0 + 2",
+      "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc and "RPC_PROTO_PATCH_VERSION 1 -> 2" in out, out + rpc)
+check("the commented-out rpc assert is untouched",
+      '// static_assert(GGML_OP_COUNT == 102, "commented out, never rewritten");' in rpc, rpc)
 check("the report names file and line of each rewrite",
-      "ggml/src/ggml.c:" in out and "ggml/include/ggml-rpc.h:2" in out and "102 -> 103" in out, out)
+      "ggml/src/ggml.c:" in out and "ggml/include/ggml-rpc.h:5" in out and "102 -> 103" in out, out)
 check("unrelated asserts are left alone",
       'static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");' in src
       and 'static_assert(GGML_UNARY_OP_COUNT == 2, "GGML_UNARY_OP_COUNT != 2");' in src, src)
@@ -210,11 +237,84 @@ check("commas in strings and comments are not entries", rc == 0 and "clean" in o
 # A number inside the message that is not the stale count is left alone.
 d = make(ops, NAMES + ["FLASH_ATTN_EXT_BANDED", "MOE_CACHE_LOOKUP"],
          SYMS + ["flash_attn_ext_banded(x)", "moe_cache_lookup(x)"], 102)
-p = d / "ggml" / "include" / "ggml-rpc.h"
+p = d / "ggml" / "src" / "extra.c"
 p.write_text('static_assert(GGML_OP_COUNT == 102, "102 ops, 1020 is not 102x");\n')
 rc, out = run(d)
 check("only the stale number is rewritten in a message",
       rc == 0 and p.read_text() == 'static_assert(GGML_OP_COUNT == 103, "103 ops, 1020 is not 103x");\n',
+      p.read_text())
+
+# The RPC assert guards the protocol version. Two ops added and RPC_PROTO_* left at 8.0.0: a pin
+# forgot the bump, and rewriting would hide it.
+TWO = (ops, NAMES + ["FLASH_ATTN_EXT_BANDED", "MOE_CACHE_LOOKUP"],
+       SYMS + ["flash_attn_ext_banded(x)", "moe_cache_lookup(x)"], 102)
+d = make(*TWO, patch=0)
+before = snapshot(d)
+rc, out = run(d)
+check("op count rose and the RPC version did not move: exit 1",
+      rc == 1 and "without bumping the RPC protocol" in out, out)
+check("and nothing is rewritten, not even ggml.c", snapshot(d) == before)
+
+# Without the base ref there is nothing to check the version against: refuse, do not rewrite.
+d = make(*TWO)
+before = snapshot(d)
+rc, out = run(d, base=None)
+check("a stale RPC assert without --base-ref exits 1", rc == 1 and "--base-ref" in out, out)
+check("and nothing is rewritten", snapshot(d) == before)
+
+d = make(*TWO)
+rc, out = run(d, base="no-such-tag")
+check("an unreadable --base-ref exits 1", rc == 1 and "cannot read" in out, out)
+
+# PATCH already moved by at least the op delta: assert rewritten, PATCH left alone.
+d = make(*TWO, patch=3)
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("PATCH that already covers the op delta is kept",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    3\n" in rpc and "GGML_OP_COUNT == 103" in rpc, out + rpc)
+
+# A MAJOR bump is a protocol break on its own: PATCH is not touched.
+d = make(*TWO, major=9, patch=0)
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("a MAJOR bump counts as moved",
+      rc == 0 and "#define RPC_PROTO_MAJOR_VERSION    9\n" in rpc
+      and "#define RPC_PROTO_PATCH_VERSION    0\n" in rpc and "GGML_OP_COUNT == 103" in rpc, out + rpc)
+
+# --dry-run reports the PATCH bump too and writes nothing.
+d = make(*TWO)
+before = snapshot(d)
+rc, out = run(d, "--dry-run")
+check("--dry-run reports the PATCH bump", rc == 0 and "RPC_PROTO_PATCH_VERSION 1 -> 2" in out, out)
+check("--dry-run leaves the version alone", snapshot(d) == before)
+
+# A ggml.c assert only needs the tables; it does not need --base-ref when the RPC one is right.
+d = make(*TWO, rpc_n=103, patch=2)
+rc, out = run(d, base=None)
+check("ggml.c asserts are rewritten without --base-ref when the RPC assert is already right",
+      rc == 0 and "GGML_OP_COUNT == 102 -> 103" in out and "rpc " not in out, out)
+
+# Commented-out and quoted asserts are text, not declarations: they stay as they are.
+d = make(*TWO)
+p = d / "ggml" / "src" / "ggml.c"
+noise = ('// static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");\n'
+         '/* static_assert(GGML_OP_COUNT == 102, "x");\n   static_assert(GGML_OP_COUNT == 7, "y"); */\n'
+         'static const char * doc = "static_assert(GGML_OP_COUNT == 102, \\"q\\");";\n')
+p.write_text(noise + p.read_text())
+rc, out = run(d)
+src = p.read_text()
+check("commented and quoted asserts are left untouched", rc == 0 and src.startswith(noise), src[:400])
+check("while the two real ones are rewritten",
+      src.count('static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");') == 2, out)
+check("and only real asserts are reported", out.count("fix  ggml/src/ggml.c") == 2, out)
+
+# Two asserts on one line: both rewritten, offsets stay right.
+d = make(*TWO)
+p = d / "ggml" / "src" / "extra.c"
+p.write_text('static_assert(GGML_OP_COUNT == 102, "a 102"); static_assert(GGML_OP_COUNT == 102, "b 102");\n')
+rc, out = run(d)
+check("two asserts on one line are both rewritten",
+      rc == 0 and p.read_text() == 'static_assert(GGML_OP_COUNT == 103, "a 103"); static_assert(GGML_OP_COUNT == 103, "b 103");\n',
       p.read_text())
 
 # A layout this does not understand must stop the run, not be guessed at.

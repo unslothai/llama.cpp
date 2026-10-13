@@ -87,7 +87,9 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 # The op-count asserts belong to reconcile_op_count.py, which runs first and rewrites them to the
 # counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
 # no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
-OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
+# It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
+OP_COUNT_ASSERT_RE = re.compile(r"^(?:static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*=="
+                                r"|#\s*define\s+RPC_PROTO_PATCH_VERSION\b)")
 
 # Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")

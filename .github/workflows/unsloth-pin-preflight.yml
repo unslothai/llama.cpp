@@ -187,8 +187,8 @@ jobs:
             # static_assert(GGML_OP_COUNT == N) to the same N+1, git merges the
             # identical edits silently and the tree does not compile. This rewrites
             # the asserts when every op table matches the enum and fails otherwise.
-            if ! python3 ../scripts/unsloth/reconcile_op_count.py --root . ; then
-              PROBLEMS="${PROBLEMS}- the pins add ggml ops and an op name table no longer matches its enum. See the run log for file and line.\n"
+            if ! python3 ../scripts/unsloth/reconcile_op_count.py --root . --base-ref "refs/tags/${BASE}" ; then
+              PROBLEMS="${PROBLEMS}- the pins add ggml ops and either an op name table no longer matches its enum or the op count changed without an RPC_PROTO version bump. See the run log for file and line.\n"
             fi
 
             # Merging cleanly is not the same as merging correctly. Two mistakes

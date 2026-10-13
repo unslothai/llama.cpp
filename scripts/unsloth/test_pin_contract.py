@@ -190,7 +190,8 @@ check("no symbol was harvested from the comment",
 d = Path(tempfile.mkdtemp(prefix="pc_"))
 git(d, "init", "-q", "-b", "main")
 (d / "ggml").mkdir()
-OPS_BASE = 'enum ggml_op {\n    GGML_OP_NONE,\n    GGML_OP_COUNT,\n};\nstatic_assert(GGML_OP_COUNT == 1, "GGML_OP_COUNT != 1");\n'
+OPS_BASE = ('#define RPC_PROTO_PATCH_VERSION    0\n'
+            'enum ggml_op {\n    GGML_OP_NONE,\n    GGML_OP_COUNT,\n};\nstatic_assert(GGML_OP_COUNT == 1, "GGML_OP_COUNT != 1");\n')
 (d / "ggml" / "ggml.c").write_text(OPS_BASE)
 git(d, "add", "-A"); git(d, "commit", "-qm", "base"); git(d, "tag", "b1")
 shas = []
@@ -198,7 +199,8 @@ for op in ("GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
     git(d, "checkout", "-qb", op, "b1")
     (d / "ggml" / "ggml.c").write_text(
         OPS_BASE.replace("    GGML_OP_COUNT,", f"    {op},\n    GGML_OP_COUNT,")
-        .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\""))
+        .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\"")
+        .replace("VERSION    0", "VERSION    1"))
     (d / "ggml" / f"{op.lower()}.c").write_text(f"int {op.lower()}_kernel_entry(void) {{ return 7; }}\n")
     git(d, "add", "-A"); git(d, "commit", "-qm", op)
     shas.append(git(d, "rev-parse", "HEAD").stdout.strip())
@@ -208,10 +210,12 @@ for op in ("GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
     if r.returncode:                                 # both inserted above COUNT: keep both
         (d / "ggml" / "ggml.c").write_text(
             OPS_BASE.replace("    GGML_OP_COUNT,", "    GGML_OP_BANDED,\n    GGML_OP_MOE_CACHE,\n    GGML_OP_COUNT,")
-            .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\""))
+            .replace("== 1, \"GGML_OP_COUNT != 1\"", "== 2, \"GGML_OP_COUNT != 2\"")
+        .replace("VERSION    0", "VERSION    1"))
         git(d, "add", "-A"); git(d, "commit", "-qm", f"merge {op}")
 c = d / "ggml" / "ggml.c"
-c.write_text(c.read_text().replace("== 2, \"GGML_OP_COUNT != 2\"", "== 3, \"GGML_OP_COUNT != 3\""))
+c.write_text(c.read_text().replace("== 2, \"GGML_OP_COUNT != 2\"", "== 3, \"GGML_OP_COUNT != 3\"")
+             .replace("VERSION    1", "VERSION    2"))   # and the PATCH bump that covers both ops
 ps8 = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
 ps8.write_text(json.dumps({"prs": [
     f"https://github.com/unslothai/llama.cpp/pull/{i}/commits/{s}" for i, s in enumerate(shas, 1)]}))

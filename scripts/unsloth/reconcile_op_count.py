@@ -28,25 +28,37 @@ which follow the same pattern. A family with no asserts in the tree is skipped; 
 asserts whose enum or tables cannot be found exits 2, since a changed layout upstream must
 be looked at rather than guessed.
 
-ggml-rpc.h's assert tells whoever adds an op to bump RPC_PROTO_PATCH_VERSION. Each op-adding
-pin already bumps it relative to the base, so the mix is never RPC-compatible with a plain
-upstream build of the same tag either way; that assert is rewritten like the others.
+ggml-rpc.h's assert is different: it exists to make whoever changes the op count bump
+RPC_PROTO_*_VERSION, so a client and server with different op tables refuse each other. It is
+only rewritten with --base-ref (the tag the pins were merged onto), against which:
 
-Nothing is committed: the tree is left modified, as the nightly already does for
-cmake/build-info.cmake before it tars the source. Run after the merge loop and before
-merge_checks.py, pin_contract.py and the build. Exits 0 when the tree is consistent (rewritten
-or already right), 1 on a table/enum mismatch, 2 when the layout cannot be parsed.
+  * the op count changed and RPC_PROTO_{MAJOR,MINOR,PATCH}_VERSION did not: a pin added an op
+    without bumping the protocol. Exit 1, rewrite nothing.
+  * the version moved, but MAJOR and MINOR are unchanged and PATCH moved by less than the op
+    count rose (two pins that each bumped PATCH by one merge to a single bump): PATCH is set to
+    base PATCH + the op count delta, and the output says so.
+  * otherwise the assert is rewritten like the others.
+
+Without --base-ref a stale RPC assert is a refusal (exit 1), never a silent rewrite.
+
+Nothing is committed: the tree is left modified, and the caller commits it if a tree id has to
+cover the rewrite. Run after the merge loop and before merge_checks.py, pin_contract.py and the
+build. Exits 0 when the tree is consistent (rewritten or already right), 1 on a table/enum
+mismatch or an RPC version that was not bumped, 2 when the layout cannot be parsed.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 HEADER = "ggml/include/ggml.h"
 SOURCE = "ggml/src/ggml.c"
+RPC_HEADER = "ggml/include/ggml-rpc.h"
+RPC_PARTS = ("MAJOR", "MINOR", "PATCH")
 # (count constant, enum name, tables in ggml.c that need one entry per enum value)
 FAMILIES = (
     ("GGML_OP_COUNT", "ggml_op", ("GGML_OP_NAME", "GGML_OP_SYMBOL")),
@@ -162,9 +174,12 @@ def table_count(text: str, clean: str, table: str) -> tuple[int, int]:
     return len(top_level_items(clean[start:end])), line_of(text, m.start())
 
 
-def find_asserts(root: Path, count: str) -> list[tuple[Path, int, int]]:
-    """Every `static_assert(<count> == N` under ggml/: (file, line number, N)."""
-    pat = re.compile(r"static_assert\s*\(\s*" + re.escape(count) + r"\s*==\s*(\d+)\s*,")
+def find_asserts(root: Path, count: str) -> list[tuple[Path, int, int, int, int]]:
+    """Every real `static_assert(<count> == N` under ggml/: (file, line, N, start, end of N).
+
+    Searched in the comment/string-blanked text, so a commented-out or quoted assert is ignored.
+    """
+    pat = re.compile(r"\bstatic_assert\s*\(\s*" + re.escape(count) + r"\s*==\s*(\d+)\s*,")
     hits = []
     for p in sorted((root / "ggml").rglob("*")):
         if p.suffix not in SCAN_SUFFIXES or not p.is_file():
@@ -172,27 +187,74 @@ def find_asserts(root: Path, count: str) -> list[tuple[Path, int, int]]:
         text = p.read_text(errors="replace")
         if count not in text:
             continue
-        for i, ln in enumerate(text.split("\n"), 1):
-            m = pat.search(ln)
-            if m:
-                hits.append((p, i, int(m.group(1))))
+        for m in pat.finditer(blank_comments_and_strings(text)):
+            hits.append((p, line_of(text, m.start()), int(m.group(1)), m.start(1), m.end(1)))
     return hits
 
 
-def rewrite_assert(line: str, count: str, old: int, new: int) -> str:
-    """The number after `<count> ==`, and the same number inside the assert's message string."""
-    m = re.search(r"(static_assert\s*\(\s*" + re.escape(count) + r"\s*==\s*)" + str(old) + r"\b", line)
-    line = line[:m.start()] + m.group(1) + str(new) + line[m.end():]
-    s = line.find('"', m.start())
-    e = line.find('"', s + 1) if s >= 0 else -1
-    if s >= 0 and e > s:
-        line = line[:s] + re.sub(r"(?<!\d)" + str(old) + r"(?!\d)", str(new), line[s:e]) + line[e:]
-    return line
+def rewrite_assert(text: str, start: int, end: int, old: int, new: int) -> str:
+    """The number at text[start:end], and the same number inside the assert's message string."""
+    clean = blank_comments_and_strings(text)
+    text = text[:start] + str(new) + text[end:]
+    clean = clean[:start] + str(new) + clean[end:]
+    comma = clean.find(",", start)
+    s = text.find('"', comma)
+    if comma >= 0 and s >= 0 and not text[comma + 1:s].strip():
+        e = s
+        while e < len(clean) and clean[e] == "S":
+            e += 1
+        text = text[:s] + re.sub(r"(?<!\d)" + str(old) + r"(?!\d)", str(new), text[s:e]) + text[e:]
+    return text
+
+
+def rpc_version(text: str) -> tuple[dict[str, int], dict[str, tuple[int, int]]]:
+    """RPC_PROTO_*_VERSION values and the (start, end) of each number."""
+    clean = blank_comments_and_strings(text)
+    vals, spans = {}, {}
+    for part in RPC_PARTS:
+        m = re.search(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + part + r"_VERSION[ \t]+(\d+)\b", clean, re.M)
+        if not m:
+            raise LayoutError(f"RPC_PROTO_{part}_VERSION not found in {RPC_HEADER}")
+        vals[part], spans[part] = int(m.group(1)), m.span(1)
+    return vals, spans
+
+
+def git_show(root: Path, ref: str, path: str) -> str:
+    r = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{path}"], capture_output=True, text=True)
+    if r.returncode:
+        raise LayoutError(f"cannot read {path} at {ref}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def check_rpc(root: Path, base_ref: str | None, n: int) -> tuple[str, int | None]:
+    """('ok' | 'refuse: why', PATCH to write or None) for a stale RPC op-count assert."""
+    if not base_ref:
+        return ("refuse: the RPC assert guards RPC_PROTO_*_VERSION and can only be rewritten "
+                "against the base tag; pass --base-ref", None)
+    try:
+        bh = git_show(root, base_ref, HEADER)
+        base_n, _ = enum_count(bh, blank_comments_and_strings(bh), "ggml_op", "GGML_OP_COUNT")
+        base_v, _ = rpc_version(git_show(root, base_ref, RPC_HEADER))
+        cur_v, _ = rpc_version((root / RPC_HEADER).read_text(errors="replace"))
+    except (LayoutError, OSError) as e:
+        return (f"refuse: {e}", None)
+    fmt = lambda v: ".".join(str(v[p]) for p in RPC_PARTS)  # noqa: E731
+    delta = n - base_n
+    print(f"rpc  GGML_OP_COUNT {base_n} at {base_ref} -> {n}; RPC_PROTO {fmt(base_v)} -> {fmt(cur_v)}")
+    if delta and cur_v == base_v:
+        return (f"refuse: GGML_OP_COUNT changed by {delta:+d} versus {base_ref} but RPC_PROTO_*_VERSION "
+                f"is still {fmt(base_v)}; a pin added or removed an op without bumping the RPC protocol", None)
+    same_mm = all(cur_v[p] == base_v[p] for p in ("MAJOR", "MINOR"))
+    if delta > 0 and same_mm and cur_v["PATCH"] - base_v["PATCH"] < delta:
+        return ("ok", base_v["PATCH"] + delta)
+    return ("ok", None)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=".", help="the merged llama.cpp tree")
+    ap.add_argument("--base-ref", help="git ref of the tag the pins were merged onto; required to "
+                    "rewrite the RPC op-count assert")
     ap.add_argument("--dry-run", action="store_true", help="report, change nothing")
     args = ap.parse_args()
     root = Path(args.root).resolve()
@@ -204,8 +266,10 @@ def main() -> int:
         print(f"reconcile_op_count: {e}", file=sys.stderr)
         return 2
     hclean, sclean = blank_comments_and_strings(htext), blank_comments_and_strings(stext)
+    rpc_path = root / RPC_HEADER
 
-    plan: dict[Path, list[tuple[int, str, int, int]]] = {}
+    # file -> [(start, end, old, new, is_assert)] spans to replace
+    plan: dict[Path, list[tuple[int, int, int, int, bool]]] = {}
     bad = layout = 0
     for count, enum, tables in FAMILIES:
         asserts = find_asserts(root, count)
@@ -226,27 +290,44 @@ def main() -> int:
                       f"({HEADER}:{eline}); a merge dropped or duplicated an entry", file=sys.stderr)
             bad += 1
             continue
-        stale = [(p, i, v) for p, i, v in asserts if v != n]
+        stale = [a for a in asserts if a[2] != n]
         if not stale:
             print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree, {len(asserts)} assert(s) already say {n}")
             continue
-        for p, i, v in stale:
-            plan.setdefault(p, []).append((i, count, v, n))
+        if any(p == rpc_path for p, *_ in stale):
+            verdict, patch = check_rpc(root, args.base_ref, n)
+            if verdict != "ok":
+                print(f"{RPC_HEADER}: {verdict[len('refuse: '):]}", file=sys.stderr)
+                bad += 1
+                continue
+            if patch is not None:
+                vals, spans = rpc_version(rpc_path.read_text(errors="replace"))
+                old = vals["PATCH"]
+                plan.setdefault(rpc_path, []).append((*spans["PATCH"], old, patch, False))
+                print(f"fix  {RPC_HEADER}: RPC_PROTO_PATCH_VERSION {old} -> {patch} (the op count rose by "
+                      f"more than PATCH moved: identical bumps from several pins merged into one)")
+        for p, i, v, st, en in stale:
+            plan.setdefault(p, []).append((st, en, v, n, True))
             print(f"fix  {p.relative_to(root)}:{i}: {count} == {v} -> {n}")
         print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree; {len(stale)} of {len(asserts)} "
               f"assert(s) {'would be ' if args.dry_run else ''}rewritten")
 
     if bad or layout:
-        print(f"\nreconcile_op_count: {bad} table/enum mismatch(es), {layout} unreadable layout(s); "
-              "nothing rewritten", file=sys.stderr)
+        print(f"\nreconcile_op_count: {bad} mismatch(es) or unbumped RPC version(s), {layout} unreadable "
+              "layout(s); nothing rewritten", file=sys.stderr)
         return 1 if bad else 2
     if not args.dry_run:
         for p, edits in plan.items():
-            lines = p.read_text().split("\n")
-            for i, count, old, new in edits:
-                lines[i - 1] = rewrite_assert(lines[i - 1], count, old, new)
-            p.write_text("\n".join(lines))
-    print(f"reconcile_op_count: {'clean' if not plan else 'rewrote ' + str(sum(map(len, plan.values()))) + ' assert(s)'}")
+            text = p.read_text()
+            # back to front, so earlier offsets stay valid
+            for st, en, old, new, is_assert in sorted(edits, reverse=True):
+                if is_assert:
+                    text = rewrite_assert(text, st, en, old, new)
+                else:
+                    text = text[:st] + str(new) + text[en:]
+            p.write_text(text)
+    nfix = sum(map(len, plan.values()))
+    print(f"reconcile_op_count: {'clean' if not plan else ('would rewrite ' if args.dry_run else 'rewrote ') + str(nfix) + ' line(s)'}")
     return 0
 
 

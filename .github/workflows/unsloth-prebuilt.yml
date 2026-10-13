@@ -367,7 +367,10 @@ jobs:
                 fi
               done < <(jq -r '.[] | "\(.repo) \(.number) \(.sha)"' <<<"$PRS")
               PHASE='reconcile ggml op counts'
-              python3 "${RUNNER_TEMP}/us/reconcile_op_count.py" --root .
+              python3 "${RUNNER_TEMP}/us/reconcile_op_count.py" --root . --base-ref "refs/tags/${BASE}"
+              # Commit the rewrite so HEAD:ggml below (the ABI key) is the tree that ships.
+              git diff --quiet || git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -qam "Reconcile ggml op counts"
               echo "MERGED_PINS=1" >> "$GITHUB_ENV"
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
