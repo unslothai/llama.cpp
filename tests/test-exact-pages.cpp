@@ -197,9 +197,17 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        // a whole-context restore is refused up front in this mode, through the same error return
+        std::vector<uint8_t> whole(llama_state_get_size(ctx));
+        whole.resize(llama_state_get_data(ctx, whole.data(), whole.size()));
+
+        if (whole.empty() || llama_state_set_data(ctx, whole.data(), whole.size()) != 0) {
+            fprintf(stderr, "%s : a whole-context state was %s\n", __func__, whole.empty() ? "not saved" : "restored");
+            return 1;
+        }
     }
 
-    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position was refused\n", __func__);
+    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position and a whole-context restore were refused\n", __func__);
 
     return 0;
 }
