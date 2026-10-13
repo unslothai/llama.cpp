@@ -1203,6 +1203,7 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     assert max(waits) < 10.0, f"the head waited {waits} s behind requests that came after it"
 
 
+@pytest.mark.slow
 def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
     # only a resident cycling through context shifts used to be rotated, so a long generation that fits the pool held it to the end, and the parked slot waited for all of it
     _serve_with_training_context(16384)
