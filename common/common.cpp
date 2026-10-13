@@ -1784,8 +1784,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU: the MoE cache then has no GPU layer to serve and disables itself, keep mmap
-    if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO && params.n_gpu_layers != 0) {
+    // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
+    if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO && (params.n_gpu_layers < 0 || params.n_gpu_layers > 1)) {
         // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory
         // and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
         bool dev_lookup = false;
