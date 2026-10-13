@@ -779,8 +779,8 @@ struct server_slot {
 
     // the other slot continues from the tokens processed so far
     void copy_prompt_to(server_slot & other) const {
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        mem.seq_rm(other.seq_id,         -1, -1);
+        mem.seq_cp(seq_id, other.seq_id, -1, -1);
 
         other.prompt = prompt.clone();
     }
