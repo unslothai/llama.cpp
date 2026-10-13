@@ -318,6 +318,55 @@ rc, out = run(d, base=None)
 check("without --base-ref a current RPC assert passes and says the version was not checked",
       rc == 0 and "RPC_PROTO_*_VERSION not checked" in out, out)
 
+# A pin that deletes or comments out the RPC assert must not switch the version check off.
+RPC_ASSERT = 'static_assert(GGML_OP_COUNT == {n}, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");'
+
+
+def drop_rpc_assert(d, n, how):
+    p = d / "ggml" / "include" / "ggml-rpc.h"
+    line = RPC_ASSERT.format(n=n)
+    p.write_text(p.read_text().replace(line, "" if how.startswith("delete") else "// " + line))
+
+
+for how in ("deleted", "commented out"):
+    d = make(*ONE, patch=0)
+    drop_rpc_assert(d, 102, how)
+    before = snapshot(d)
+    rc, out = run(d)
+    check(f"RPC assert {how} and the version not bumped: exit 1",
+          rc == 1 and "is gone from the merged tree" in out, out)
+    check(f"and nothing is rewritten ({how})", snapshot(d) == before)
+
+d = make(*ONE)
+drop_rpc_assert(d, 102, "delete")
+rc, out = run(d)
+check("RPC assert deleted with the version bumped still exits 1 (assert removed)",
+      rc == 1 and "is gone from the merged tree" in out, out)
+
+# Every GGML_OP_COUNT assert gone, ggml.c too: the RPC check still runs.
+d = make(*ONE)
+drop_rpc_assert(d, 102, "delete")
+p = d / "ggml" / "src" / "ggml.c"
+p.write_text(p.read_text().replace('static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");', ""))
+rc, out = run(d)
+check("no GGML_OP_COUNT assert left anywhere: the RPC check still runs and refuses",
+      rc == 1 and "is gone from the merged tree" in out and "skip GGML_OP_COUNT" not in out, out)
+
+# A base without the RPC assert: the version is still checked against the op count.
+d = make(BASE, NAMES, SYMS, 101)
+drop_rpc_assert(d, 101, "delete")
+git(d, "commit", "-qam", "no rpc assert")
+git(d, "tag", "base_noassert")
+write_tree(d, *ONE, None, 8, 0)
+drop_rpc_assert(d, 102, "delete")
+rc, out = run(d, base="base_noassert")
+check("base without the RPC assert, op added, version not bumped: exit 1",
+      rc == 1 and "without bumping the RPC protocol" in out, out)
+write_tree(d, *ONE, None, 8, 1)
+drop_rpc_assert(d, 102, "delete")
+rc, out = run(d, base="base_noassert")
+check("base without the RPC assert, op added, PATCH bumped: clean", rc == 0 and "RPC_PROTO 8.0.0 -> 8.0.1" in out, out)
+
 # Commented-out and quoted asserts are text, not declarations: they stay as they are.
 d = make(*TWO)
 p = d / "ggml" / "src" / "ggml.c"

@@ -39,9 +39,10 @@ only rewritten with --base-ref (the tag the pins were merged onto), against whic
     base PATCH + the op count delta, and the output says so.
   * otherwise the assert is rewritten like the others.
 
-With --base-ref the version is checked whenever the RPC assert is in the tree, also when the
-assert already says the merged count: a pin that added an op and updated the assert but not
-RPC_PROTO_*_VERSION is the same unbumped protocol. Without --base-ref a stale RPC assert is a
+With --base-ref the version is checked whenever ggml-rpc.h exists, also when the assert already
+says the merged count (a pin that added an op and updated the assert but not RPC_PROTO_*_VERSION
+is the same unbumped protocol) and when it is gone: an RPC assert the base had and the merged tree
+lacks (deleted or commented out) exits 1. Without --base-ref a stale RPC assert is a
 refusal (exit 1), never a silent rewrite; a current one passes, and the output says the version
 was not checked.
 
@@ -178,12 +179,16 @@ def table_count(text: str, clean: str, table: str) -> tuple[int, int]:
     return len(top_level_items(clean[start:end])), line_of(text, m.start())
 
 
+def assert_re(count: str) -> re.Pattern:
+    return re.compile(r"\bstatic_assert\s*\(\s*" + re.escape(count) + r"\s*==\s*(\d+)\s*,")
+
+
 def find_asserts(root: Path, count: str) -> list[tuple[Path, int, int, int, int]]:
     """Every real `static_assert(<count> == N` under ggml/: (file, line, N, start, end of N).
 
     Searched in the comment/string-blanked text, so a commented-out or quoted assert is ignored.
     """
-    pat = re.compile(r"\bstatic_assert\s*\(\s*" + re.escape(count) + r"\s*==\s*(\d+)\s*,")
+    pat = assert_re(count)
     hits = []
     for p in sorted((root / "ggml").rglob("*")):
         if p.suffix not in SCAN_SUFFIXES or not p.is_file():
@@ -230,18 +235,26 @@ def git_show(root: Path, ref: str, path: str) -> str:
     return r.stdout
 
 
-def check_rpc(root: Path, base_ref: str | None, n: int) -> tuple[str, int | None]:
-    """('ok' | 'refuse: why', PATCH to write or None) for the RPC op-count assert versus base_ref."""
+def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True) -> tuple[str, int | None]:
+    """('ok' | 'refuse: why', PATCH to write or None) for RPC_PROTO_*_VERSION versus base_ref.
+
+    has_assert: the merged tree still has a real GGML_OP_COUNT assert in ggml-rpc.h. One the base
+    had and the merge lost (deleted or commented out) is a refusal: it is what forces the bump.
+    """
     if not base_ref:
         return ("refuse: the RPC assert guards RPC_PROTO_*_VERSION and can only be rewritten "
                 "against the base tag; pass --base-ref", None)
     try:
         bh = git_show(root, base_ref, HEADER)
         base_n, _ = enum_count(bh, blank_comments_and_strings(bh), "ggml_op", "GGML_OP_COUNT")
-        base_v, _ = rpc_version(git_show(root, base_ref, RPC_HEADER))
+        base_rpc = git_show(root, base_ref, RPC_HEADER)
+        base_v, _ = rpc_version(base_rpc)
         cur_v, _ = rpc_version((root / RPC_HEADER).read_text(errors="replace"))
     except (LayoutError, OSError) as e:
         return (f"refuse: {e}", None)
+    if not has_assert and assert_re("GGML_OP_COUNT").search(blank_comments_and_strings(base_rpc)):
+        return (f"refuse: the GGML_OP_COUNT static_assert that {RPC_HEADER} has at {base_ref} is gone from the "
+                "merged tree (deleted or commented out); it is what makes an op change bump RPC_PROTO_*_VERSION", None)
     fmt = lambda v: ".".join(str(v[p]) for p in RPC_PARTS)  # noqa: E731
     delta = n - base_n
     print(f"rpc  GGML_OP_COUNT {base_n} at {base_ref} -> {n}; RPC_PROTO {fmt(base_v)} -> {fmt(cur_v)}")
@@ -277,7 +290,9 @@ def main() -> int:
     bad = layout = 0
     for count, enum, tables in FAMILIES:
         asserts = find_asserts(root, count)
-        if not asserts:
+        # with --base-ref the RPC version is checked even when no GGML_OP_COUNT assert is left
+        rpc_check = count == "GGML_OP_COUNT" and bool(args.base_ref) and rpc_path.is_file()
+        if not asserts and not rpc_check:
             print(f"skip {count}: no static_assert in the tree")
             continue
         try:
@@ -295,13 +310,15 @@ def main() -> int:
             bad += 1
             continue
         stale = [a for a in asserts if a[2] != n]
-        # the RPC assert guards RPC_PROTO_*_VERSION: with --base-ref the version is checked even
-        # when the assert is current (a pin may have updated it and not bumped the protocol)
+        # the RPC assert guards RPC_PROTO_*_VERSION: with --base-ref the version is checked whenever
+        # ggml-rpc.h exists, also when the assert is current (a pin may have updated it and not bumped
+        # the protocol) or gone (a pin may have deleted or commented it out)
+        rpc_assert = any(p == rpc_path for p, *_ in asserts)
         rpc_stale = any(p == rpc_path for p, *_ in stale)
-        if any(p == rpc_path for p, *_ in asserts) and not args.base_ref and not rpc_stale:
+        if rpc_assert and not args.base_ref and not rpc_stale:
             print(f"note {RPC_HEADER}: RPC_PROTO_*_VERSION not checked (no --base-ref); the assert already says {n}")
-        elif any(p == rpc_path for p, *_ in asserts):
-            verdict, patch = check_rpc(root, args.base_ref, n)
+        elif rpc_assert or rpc_check:
+            verdict, patch = check_rpc(root, args.base_ref, n, rpc_assert)
             if verdict != "ok":
                 print(f"{RPC_HEADER}: {verdict[len('refuse: '):]}", file=sys.stderr)
                 bad += 1
