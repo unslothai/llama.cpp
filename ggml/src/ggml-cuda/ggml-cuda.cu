@@ -5793,9 +5793,7 @@ static bool ggml_backend_cuda_device_event_query(ggml_backend_dev_t dev, ggml_ba
 
     const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
 
-    // not an error, and nothing to clear: cudaEventQuery() returns cudaErrorNotReady
-    // without recording it as the thread's last error, so collecting one here would only
-    // consume somebody else's, and a real launch failure would be swallowed
+    // cudaErrorNotReady is not recorded as the last error, so do not clear one here.
     if (err == cudaErrorNotReady) {
         return false;
     }
@@ -5913,7 +5911,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
-    // reached through the registry rather than ggml_backend_device_i, so the interface keeps its layout
     if (strcmp(name, "ggml_backend_dev_event_query") == 0) {
         return (void *)ggml_backend_cuda_device_event_query;
     }
