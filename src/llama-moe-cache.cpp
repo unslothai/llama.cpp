@@ -282,6 +282,20 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> seed_ids;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
+    size_t seed_unstaged = 0; // seeds of a layer dropped because a planned expert was not staged in the copy of an expert tensor
+
+    // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
+    struct seed_rec {
+        const ggml_tensor * w;
+        const ggml_tensor * bank;
+        int32_t expert;
+        int32_t slot;
+    };
+    bool seed_check = false;
+    std::vector<seed_rec> seed_pending;   // the layer being seeded
+    std::vector<seed_rec> seed_committed; // seeded layers, not yet checked
+    size_t seed_checked    = 0;
+    size_t seed_mismatches = 0;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -329,6 +343,10 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
             device_lookup = env == nullptr || atoi(env) != 0;
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
+            seed_check = env != nullptr && atoi(env) != 0;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -938,7 +956,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts) {
+    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return;
@@ -955,10 +973,10 @@ struct llama_moe_cache::impl {
 
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_seed   = g.n_slots / g.layers.size();
-            GGML_ASSERT((int32_t) counts.size() == n_expert);
+            GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
             for (int32_t e = 0; e < n_expert; ++e) {
-                if (counts[e] > 0) {
+                if (counts[e] > 0 && staged[e]) {
                     seed_ids.push_back(e);
                 }
             }
@@ -985,6 +1003,21 @@ struct llama_moe_cache::impl {
         ggml_tensor * bank = g.banks[b.ip];
         ggml_tensor * src  = const_cast<ggml_tensor *>(dst);
         const auto & fills = sd.fills;
+
+        // the slots are planned by the first expert tensor of the layer: an expert tensor whose copy does not hold every
+        // planned expert (e.g. only its routed experts were uploaded) must not fill them, seed_end then drops the layer
+        GGML_ASSERT(staged.size() == (size_t) w->ne[2]);
+        for (const auto & f : fills) {
+            if (!staged[f.expert]) {
+                seed_unstaged++;
+                return;
+            }
+        }
+        if (seed_check) {
+            for (const auto & f : fills) {
+                seed_pending.push_back({ w, bank, f.expert, f.slot });
+            }
+        }
 
         // batched: one call for the whole tensor
         seed_regions.clear();
@@ -1029,6 +1062,7 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
         if (sd.done == (1u << l.experts.size()) - 1) {
             stats_seed.misses += sd.fills.size();
+            seed_committed.insert(seed_committed.end(), seed_pending.begin(), seed_pending.end());
         } else {
             // some expert tensors were copied without filling their slots, drop the experts admitted to the layer
             for (const auto & f : sd.fills) {
@@ -1039,6 +1073,29 @@ struct llama_moe_cache::impl {
         }
         sd.il = -1;
         sd.fills.clear();
+        seed_pending.clear();
+    }
+
+    // LLAMA_MOE_CACHE_SEED_CHECK: the device work of the seeding ubatch must be complete
+    void seed_verify() {
+        if (seed_committed.empty()) {
+            return;
+        }
+        std::vector<uint8_t> buf;
+        size_t n_bad = 0;
+        for (const auto & r : seed_committed) {
+            const size_t size = r.w->nb[2];
+            GGML_ASSERT(r.bank->nb[2] == size && r.w->data != nullptr);
+            buf.resize(size);
+            ggml_backend_tensor_get(r.bank, buf.data(), (size_t) r.slot*r.bank->nb[2], size);
+            if (memcmp(buf.data(), (const uint8_t *) r.w->data + (size_t) r.expert*size, size) != 0) {
+                n_bad++;
+            }
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: seed check: %zu expert copies verified, %zu mismatches\n", seed_committed.size(), n_bad);
+        seed_checked    += seed_committed.size();
+        seed_mismatches += n_bad;
+        seed_committed.clear();
     }
 
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
@@ -1105,6 +1162,12 @@ struct llama_moe_cache::impl {
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts admitted to the cache, %.2f MiB\n", stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
+        if (seed_unstaged > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", seed_unstaged);
+        }
+        if (seed_check) {
+            LLAMA_LOG_INFO("llama_moe_cache: seed check total: %zu expert copies verified, %zu mismatches\n", seed_checked, seed_mismatches);
+        }
     }
 };
 
@@ -1162,8 +1225,16 @@ void llama_moe_cache::count_upload(const ggml_tensor * w, size_t n_experts, size
     pimpl->count_upload(w, n_experts, bytes);
 }
 
-void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts) {
-    pimpl->seed(backend, w, dst, counts);
+void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
+    pimpl->seed(backend, w, dst, counts, staged);
+}
+
+bool llama_moe_cache::seed_check() const {
+    return pimpl->seed_check;
+}
+
+void llama_moe_cache::seed_verify() {
+    pimpl->seed_verify();
 }
 
 void llama_moe_cache::seed_end() {

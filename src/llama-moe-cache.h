@@ -64,10 +64,16 @@ public:
 
     // for large batches: admit the most used experts of the layer of w, counts[e] is the number of tokens routed to expert e
     // must be called for each expert tensor of the layer after dst is filled, the slots are filled from dst
-    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts);
+    // staged[e]: expert e was copied to dst for this ubatch (only those can fill a slot)
+    void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged);
 
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
+
+    // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is computed and synchronized, compare the seeded slots
+    // with the host experts and log the mismatches
+    bool seed_check() const;
+    void seed_verify();
 
     // the routing of an earlier large ubatch of the same prompt, for seed when the seeding ubatch copies all of the experts
     // without reading its own ids: counts[e] is the number of tokens routed to expert e in the layer of w
