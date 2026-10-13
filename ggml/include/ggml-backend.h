@@ -343,6 +343,14 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+    // it happens on the graph allocation path and costs a synchronization of the backends
+    // `sched` is the scheduler
+    // `graph` is the compute graph being allocated
+    // `backend_ids_changed` is true if the backend assignment of the graph nodes changed since the last allocation
+    // `graph_size_changed` is true if the graph size changed since the last allocation
+    typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
     // How an input weight in a host buffer is copied to the backend of the split that uses it
     enum ggml_backend_sched_prefetch_mode {
         GGML_BACKEND_SCHED_PREFETCH_NONE  = 0, // copied when the split starts, the copy is allocated by the graph allocator (no prefetch)
@@ -398,6 +406,9 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Set a callback to be called when the compute buffers of a graph are being reallocated
+    GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
     // Set a callback that selects how the input weights in host buffers are prefetched
     GGML_API void                 ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data);
