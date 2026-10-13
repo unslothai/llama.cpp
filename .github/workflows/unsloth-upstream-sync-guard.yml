@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth: upstream sync guard"
+
+# Holds the two properties that make a fork sync cheap, and that silently broke once.
+#
+# The 08-07 sync (PR #80) was squash-merged, so upstream 82bb48500 never became an ancestor of
+# master. The files arrived; the ancestry did not. For three weeks every merge involving a
+# master-derived branch three-way merged against a 2026-06-10 base and manufactured conflicts
+# in files nobody had touched -- 539 of them, against 21 with the correct base. Nothing was red
+# while that was true, which is the whole reason this exists.
+#
+# Uses the compare API rather than a checkout: the ancestry question is one request, and a
+# full-history checkout of this repository is neither fast nor free.
+
+on:
+  push:
+    branches: [master]
+  # Unfiltered, deliberately. The trigger check below has to be able to BLOCK a sync, and
+  # a push-only host first runs after the merge, by which point a reintroduced
+  # `pull_request_target` workflow is already active on master. No `paths:` here either,
+  # because GitHub evaluates a paths filter against only the first 300 changed files and
+  # a sync is routinely larger than that, which is the whole reason this second host
+  # exists.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Upstream sync invariants
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { fetch-depth: 1 }
+
+      - name: Check the recorded sync point is still an ancestor of master
+        # Asks about master's own history, so it is meaningless on a pull request head.
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          FILE=scripts/unsloth/upstream-sync.json
+          SHA="$(jq -r .commit "$FILE")"
+          TAG="$(jq -r .tag "$FILE")"
+          case "$SHA" in
+            [0-9a-f]*) [ "${#SHA}" -eq 40 ] || { echo "::error file=$FILE::commit must be a 40-hex sha"; exit 1; } ;;
+            *) echo "::error file=$FILE::commit must be a 40-hex sha"; exit 1 ;;
+          esac
+
+          # compare(base...head): 'ahead' or 'identical' means base is an ancestor of head.
+          # 'diverged' or 'behind' means it is not, which is what a squash-merged sync looks like.
+          STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master" --jq .status)"
+          echo "compare ${SHA:0:10} (${TAG}) ...master -> ${STATUS}"
+          case "$STATUS" in
+            ahead|identical) echo "ancestry OK" ;;
+            *)
+              echo "::error file=$FILE::upstream ${TAG} (${SHA:0:10}) is NOT an ancestor of master (compare says '${STATUS}')."
+              echo "::error::A sync PR was almost certainly squash- or rebase-merged. Squashing drops the upstream parent, so the merge base stays stale and every later merge invents hundreds of conflicts. Re-land the sync with a merge commit."
+              exit 1 ;;
+          esac
+
+      - name: Check the fork still owns only CI
+        # Asks about master's own history, so it is meaningless on a pull request head.
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          FILE=scripts/unsloth/upstream-sync.json
+          SHA="$(jq -r .commit "$FILE")"
+
+          # The compare API caps its file list. Say so rather than pass on a truncated answer.
+          RESP="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master")"
+          TOTAL="$(jq -r '.files | length' <<<"$RESP")"
+          if [ "$TOTAL" -ge 300 ]; then
+            echo "::error file=$FILE::compare returned ${TOTAL} files, at or over the API cap, so this check cannot be trusted. The fork delta should be well under 100 paths; if it is genuinely this large the invariant has already broken."
+            exit 1
+          fi
+
+          STRAY="$(jq -r '.files[].filename' <<<"$RESP" | grep -vE '^(\.github/|scripts/unsloth/)' || true)"
+          if [ -n "$STRAY" ]; then
+            echo "::error file=$FILE::the fork now diverges from upstream outside .github/ and scripts/unsloth/:"
+            echo "$STRAY" | sed 's/^/  /'
+            echo "::error::Syncs are provably additive only while this fork owns no llama.cpp source. Land source changes upstream, or pin them through scripts/unsloth/pr-set.json, rather than carrying them on master."
+            exit 1
+          fi
+          echo "fork delta is ${TOTAL} path(s), all under .github/ or scripts/unsloth/"
+
+      # The trigger check has a second home here, and this is the one that matters for
+      # the case it was written for. It runs on BOTH events, so it can block a sync pull
+      # request rather than only reporting after the merge.
+      #
+      # Its usual host, unsloth-pr-set-lint.yml, filters on `paths`, and GitHub evaluates
+      # a `paths` filter against only the FIRST 300 changed files. An upstream sync is
+      # routinely far larger than that, so a sync that reintroduces upstream's
+      # `bench.yml` under its active name could land without the host ever starting --
+      # precisely the scenario the check exists for, skipped precisely when it applies.
+      #
+      # This workflow has no `paths` filter at all and runs on every pull request as well
+      # as every push to master, so hosting it here removes that dependency and can still
+      # BLOCK a sync. A push-only placement would have reported the problem only after
+      # the merge, with the reintroduced workflow already active, which is a notification
+      # rather than a guard. Keeping it in both places is deliberate: the lint host gives
+      # fast feedback on an ordinary pull request, this one gives the guarantee.
+      - name: No workflow may subscribe to pull_request_target
+        run: python3 scripts/unsloth/check_workflow_triggers.py

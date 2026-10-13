@@ -1,0 +1,430 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth prebuilt: CUDA Windows"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA Windows
+# bundles the parent's `resolve` job filtered into `matrix`. Each entry uploads
+# a single app-*.zip artifact for the parent's assemble step to pick up.
+#
+# Mirrors unsloth-prebuilt-cuda.yml (Linux), adapted for Windows: MSVC + Ninja
+# toolchain, BoringSSL instead of system OpenSSL, no RPATH (Windows resolves
+# DLLs from the executable's directory), and a .zip archive. CUDA compiles
+# entirely in software here -- no GPU is present on the runner.
+#
+# Same two-job shape as the Linux child; see its header and .github/actions/unsloth-cuda-windows-setup.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      commit:
+        description: 'Upstream commit SHA for that tag, resolved by parent'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name): ggml-org/llama.cpp for plain builds, or this repo for mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact (app-source-*) holding the stamped source tree; set by resolve for every build'
+        required: false
+        default: ''
+        type: string
+      matrix:
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job; each row carries `shards`'
+        required: true
+        type: string
+      warm_matrix:
+        description: 'Matrix JSON {include:[...]} of (profile row x shard) for the warm job, or empty to skip warming'
+        required: false
+        default: ''
+        type: string
+
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'Azure Trusted Signing client id; empty on forks, which then build unsigned'
+        required: false
+      AZURE_CLIENT_SECRET:
+        description: 'Azure Trusted Signing client secret'
+        required: false
+      AZURE_TENANT_ID:
+        description: 'Azure Trusted Signing tenant id'
+        required: false
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:
+        description: 'Azure Trusted Signing account name'
+        required: false
+      AZURE_CERTIFICATE_PROFILE_NAME:
+        description: 'Azure Trusted Signing certificate profile name'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: warm x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    if: ${{ inputs.warm_matrix != '' }}
+    runs-on: ${{ matrix.runner }}
+    # Best effort; no signing environment, shards ship nothing.
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.warm_matrix) }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-windows-setup
+        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
+          cuda: ${{ matrix.cuda }}
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          if (Test-Path shards) {
+            Get-ChildItem -Directory shards | ForEach-Object {
+              "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+              robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+            }
+            Remove-Item -Recurse -Force shards
+          }
+          ccache -z
+          exit 0
+
+      - name: Snapshot the restored cache
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $snap = @{}
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+          "$($snap.Count) files snapshotted"
+
+      - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build -t targets all \
+            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.obj:' | cut -d: -f1 | sort \
+            | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
+          echo "$(wc -l < shard.txt) CUDA objects in this shard"
+          xargs -a shard.txt ninja -C build -j 3
+
+      - name: ccache stats
+        if: ${{ always() }}
+        run: ccache -s -v
+
+      - name: Export the shard delta
+        if: ${{ always() }}
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $dst = "${{ github.workspace }}\shards\${{ matrix.shard }}"
+          $before = @{}
+          (Get-Content -LiteralPath "${{ github.workspace }}\shard.before.json" -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $before[$_.Name] = $_.Value }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $n = 0; $bytes = 0
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $now = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+            if ($before.ContainsKey($rel) -and $before[$rel] -eq $now) { return }
+            $to = Join-Path $dst $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $to
+            $n++; $bytes += $_.Length
+          }
+          "{0} files, {1:N0} MB" -f $n, ($bytes / 1MB)
+
+      - name: Save shard ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/${{ matrix.shard }}
+          key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  build:
+    name: x64/${{ matrix.profile }}
+    needs: warm
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.runner }}
+    # Every Azure Trusted Signing secret in this workflow is read by this job
+    # and no other. Naming an environment is what makes them gateable: without
+    # it there is no place to hang a required reviewer, so anyone who can
+    # dispatch the parent workflow can sign under our identity.
+    #
+    # Inert until protection rules exist. GitHub creates a referenced-but-absent
+    # environment on first run with no rules and no branch policy, and
+    # repository secrets keep resolving inside a job that names an environment,
+    # so this line alone changes nothing about how a build runs. Same shape as
+    # release-desktop.yml in unslothai/unsloth.
+    environment: release-signing
+    # Hang guard only. Without it the job inherits GitHub's 360-minute default,
+    # which is above both assemble's `timeout-minutes: 350` and, more to the
+    # point, the "Wait for the build matrix" step's own 330-minute deadline in
+    # unsloth-prebuilt.yml -- so a wedged leg burns a runner for an hour after
+    # the publish it was feeding has already given up.
+    #
+    # 345, not something tighter: x64/cuda12-portable legitimately reaches the
+    # low 300s on a cold ccache. Run 27347317849 took 305.1 minutes and
+    # SUCCEEDED (286.9 of it genuine compile). Across 62 historical runs of this
+    # leg the max is 305.1 and nothing falls between 215 and 305, so a tighter
+    # cap buys no hang detection and would have destroyed that publish -- one
+    # killed leg fails the bundle-coverage gate and the whole night ships
+    # nothing. Shards should make that history; the cap stays until cold nights show the new ceiling.
+    #
+    # Note this cannot by itself rescue a slow run: the waiter's 330-minute
+    # deadline is wall-clock from assemble start and INCLUDES the child's queue
+    # wait, while timeout-minutes starts at job start and excludes it. Raising
+    # the waiter deadline is the separate change that would actually save runs.
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-windows-setup
+        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
+          cuda: ${{ matrix.cuda }}
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          if (Test-Path shards) {
+            Get-ChildItem -Directory shards | ForEach-Object {
+              "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+              robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+            }
+            Remove-Item -Recurse -Force shards
+          }
+          ccache -z
+          exit 0
+
+      - name: Build
+        working-directory: src
+        run: |
+          # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
+          # 4 vCPU / 16 GB GitHub-hosted runners (measured over a 1s sampler),
+          # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
+          # is ~2 physical cores + HT), so 3 is the sweet spot.
+          cmake --build build --config Release -j 3
+
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the Linux CUDA child for
+      # the rationale. package_bundle.py ships the .exe only if it was produced.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          if (-not (Test-Path "examples/diffusion-gemma-server")) {
+            Write-Host "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          }
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
+            exit 0
+          }
+          cmake --build build --config Release -j 3 `
+            --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          } else {
+            Write-Host "built DiffusionGemma binaries"
+          }
+          exit 0
+
+      - name: ccache stats
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          ccache -s -v
+          {
+            echo "### ccache windows x64/${{ matrix.profile }}"
+            echo ""
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Authenticode-sign before packaging. The Studio installer downloads these
+      # zips after its own signed installer has run, so nothing downstream signs
+      # them. Smart App Control evaluates every binary as it loads and refuses
+      # unknown unsigned code, naming whichever dependent DLL it blocked in a Bad
+      # Image dialog (status 0xc0e90002), so the whole tree is signed, not just
+      # the launcher executables.
+      - name: Sign Windows binaries
+        id: sign_windows
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: src/build/bin
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package bundle
+        env:
+          PLATFORM: windows
+          ARCH: x64
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+          SOURCE_REF_KIND: ${{ inputs.repo == 'ggml-org/llama.cpp' && 'tag' || 'mix' }}
+          PROFILE: ${{ matrix.profile }}
+          LINE: ${{ matrix.line }}
+          KLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          # Provenance label kept byte for byte as under the Jimver install: bundles must stay
+          # identical, metadata included, and the compiler behind the label is the same nvcc.
+          DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
+          ARCHS: ${{ matrix.archs }}
+          SMS: ${{ matrix.sms }}
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      # Verify the finished zip, not the build tree: packaging copies extra
+      # runtimes in afterwards, and only the archive shows what actually ships.
+      # Skipped on forks, which have no signing credentials and build unsigned.
+      - name: Verify every binary in the bundle is signed
+        if: ${{ steps.sign_windows.outputs.signed == 'true' }}
+        shell: pwsh
+        run: tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip'
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
+          path: dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 7d
+
+      - name: Save ccache
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+name: Unsloth CUDA build setup (Windows)
+description: >-
+  Source tree, MSVC + Ninja, CUDA toolkit, ccache and the CMake configure
+  that the CUDA Windows legs of unsloth-prebuilt-cuda-windows.yml share. Both
+  the `warm` shards and the `build` job of a profile run exactly this, so
+  every object they compile hashes the same and the shards' ccache entries
+  are hits for the build. Mirrors unsloth-cuda-linux-setup.
+
+inputs:
+  tag:
+    description: Upstream llama.cpp release tag (b#### or b####-mix-<hash>), resolved by the parent.
+    required: true
+  source_artifact:
+    description: Workflow artifact (app-source-*) holding the stamped source tree.
+    required: true
+  cuda:
+    description: CUDA toolkit version (12.8.0 or 13.3), installed from the NVIDIA redist CDN.
+    required: true
+  archs:
+    description: Space-separated CMAKE_CUDA_ARCHITECTURES list for this profile.
+    required: true
+  profile:
+    description: Profile name (cuda12-portable ...), part of the ccache key.
+    required: true
+  max-size:
+    description: ccache max_size for this profile (portable holds the most objects).
+    required: false
+    default: 4G
+
+runs:
+  using: composite
+  steps:
+    # No cleanup step: D: starts 147 GB free, C: 84 GB with a 4.8 GB toolkit; the 87-minute
+    # runner-loss failure was not disk exhaustion (unsloth-prebuilt-retry.yml covers it).
+    - name: Report disk space
+      shell: pwsh
+      run: |
+        "workspace: $env:GITHUB_WORKSPACE"
+        Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+          "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+        }
+
+    # No Defender exclusion: A/B on windows-2022 showed no gain (1675 s scan on vs 1764 s excluded).
+
+    # Source tree is resolve's app-source artifact, build number and fingerprint already baked in.
+    - name: Download source @ ${{ inputs.tag }}
+      uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+      with:
+        name: ${{ inputs.source_artifact }}
+        path: srcpkg
+    - name: Extract source
+      shell: bash
+      run: |
+        set -eux
+        mkdir -p src
+        tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      with:
+        python-version: "3.11"
+
+    # Ninja is on the image; choco was a network round trip for the same binary.
+    - name: Check Ninja
+      shell: pwsh
+      run: |
+        (Get-Command ninja.exe -ErrorAction Stop).Source
+        ninja --version
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+
+    # Toolkit from NVIDIA's redist CDN: about 1 min per job against 7 to 8 for Jimver. The 12.8.0
+    # archives are the same nvcc V12.8.61 and libcublas 12.8.3.14 Jimver installed, so shipped bits are unchanged.
+    - name: Install CUDA toolkit ${{ inputs.cuda }} (NVIDIA redist)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        switch ("${{ inputs.cuda }}") {
+          '12.8.0' { $components = @('cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_nvrtc:12.8.61', 'libcublas:12.8.3.14', 'cuda_nvtx:12.8.55', 'cuda_profiler_api:12.8.55', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55') }
+          '13.3'   { $components = @('cuda_crt:13.3.33', 'cuda_cudart:13.3.29', 'cuda_nvcc:13.3.33', 'cuda_nvrtc:13.3.33', 'libcublas:13.5.1.27', 'libnvvm:13.3.33', 'cuda_nvtx:13.3.29', 'cuda_profiler_api:13.3.27', 'cccl:13.3.3.3.1', 'visual_studio_integration:13.3.27') }
+          default  { throw "no redist component table for CUDA ${{ inputs.cuda }}" }
+        }
+        $line = "${{ inputs.cuda }}" -replace '^(\d+\.\d+).*$', '$1'
+        $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$line"
+        $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+        New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+        foreach ($cv in $components) {
+          $comp, $ver = $cv.Split(':')
+          $name = "$comp-windows-x86_64-$ver-archive"
+          $zip = Join-Path $stage "$name.zip"
+          curl.exe -fsSL --retry 3 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
+          if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
+          tar.exe -xf $zip -C $stage
+          if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }
+          robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "copy failed: $name ($LASTEXITCODE)" }
+          Remove-Item -Recurse -Force $zip, (Join-Path $stage $name)
+        }
+        "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CUDA_HOME=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CUDA_PATH_V$($line.Replace('.', '_'))=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        exit 0
+
+    - name: Verify CUDA
+      shell: pwsh
+      run: nvcc --version
+
+    - name: Report disk space before build
+      shell: pwsh
+      run: |
+        "workspace: $env:GITHUB_WORKSPACE"
+        Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | Sort-Object DeviceID | ForEach-Object {
+          "{0} {1:N1} GB free of {2:N1} GB" -f $_.DeviceID, ($_.FreeSpace / 1GB), ($_.Size / 1GB)
+        }
+
+    # See unsloth-cuda-linux-setup for the ccache setup and why not sccache.
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+      with:
+        key: cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}-${{ inputs.tag }}
+        restore-keys: |
+          cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}
+        append-timestamp: false
+        variant: ccache
+        max-size: ${{ inputs.max-size }}
+        save: false
+
+    - name: Configure ccache
+      shell: pwsh
+      run: |
+        ccache --set-config=compiler_check=content
+        ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+        ccache --set-config=compression_level=6
+        ccache -p | Select-String -Pattern "compiler_check|sloppiness|compression|max_size|cache_dir"
+        ccache -z
+
+    - name: Configure
+      shell: pwsh
+      working-directory: src
+      run: |
+        # Launchers cache nvcc and cl.exe; no RPATH knobs, Windows loads sibling DLLs from the binary's dir.
+        $archs = "${{ inputs.archs }}".Replace(' ', ';')
+        cmake -S . -B build -G Ninja `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DGGML_NATIVE=OFF `
+          -DGGML_BACKEND_DL=ON `
+          -DGGML_CPU_ALL_VARIANTS=ON `
+          -DGGML_RPC=ON `
+          -DGGML_CUDA=ON `
+          -DGGML_CUDA_CUB_3DOT2=ON `
+          -DLLAMA_BUILD_TESTS=OFF `
+          -DLLAMA_BUILD_EXAMPLES=OFF `
+          -DLLAMA_BUILD_TOOLS=ON `
+          -DLLAMA_BUILD_SERVER=ON `
+          -DLLAMA_BUILD_BORINGSSL=ON `
+          -DCMAKE_CUDA_ARCHITECTURES="$archs" `
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
