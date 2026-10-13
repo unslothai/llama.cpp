@@ -6577,6 +6577,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 for (size_t i = 1; i < arr.size(); i++) {
                     choices.push_back(std::move(arr[i]["choices"][0]));
                 }
+                // [TAG_PREEMPT] one response stands for every prompt (or choice), so its counters are the sum of each result's: a park of any member is the request's
+                if (arr[0].contains("preempt")) {
+                    int64_t n_parks      = 0;
+                    int64_t n_recomputes = 0;
+                    for (const auto & r : arr) {
+                        if (r.contains("preempt")) {
+                            n_parks      += json_value(r.at("preempt"), "parks",      (int64_t) 0);
+                            n_recomputes += json_value(r.at("preempt"), "recomputes", (int64_t) 0);
+                        }
+                    }
+                    arr[0]["preempt"] = json {
+                        {"parks",      n_parks},
+                        {"recomputes", n_recomputes},
+                    };
+                }
                 res->ok(arr[0]);
             } else {
                 // multi-results, non-OAI compat
