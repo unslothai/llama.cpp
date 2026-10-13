@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+name: Sign Windows binaries
+description: >-
+  Authenticode-sign every PE in a built Windows tree with Azure Trusted Signing,
+  so the bundles the Unsloth Studio installer downloads are not blocked by Smart
+  App Control when they load on a user machine.
+
+inputs:
+  path:
+    description: Directory to sign, searched recursively.
+    required: true
+  azure-client-id:
+    description: AZURE_CLIENT_ID from the release-signing environment.
+    required: false
+    default: ''
+  azure-client-secret:
+    description: AZURE_CLIENT_SECRET from the release-signing environment.
+    required: false
+    default: ''
+  azure-tenant-id:
+    description: AZURE_TENANT_ID from the release-signing environment.
+    required: false
+    default: ''
+  azure-account:
+    description: AZURE_TRUSTED_SIGNING_ACCOUNT_NAME from the release-signing environment.
+    required: false
+    default: ''
+  azure-certificate-profile:
+    description: AZURE_CERTIFICATE_PROFILE_NAME from the release-signing environment.
+    required: false
+    default: ''
+  endpoint:
+    description: Azure Trusted Signing endpoint for the account's region.
+    required: false
+    default: https://eus.codesigning.azure.net
+
+outputs:
+  signed:
+    description: '"true" when the tree was signed, "false" when signing was skipped on a fork.'
+    value: ${{ steps.gate.outputs.signed }}
+
+runs:
+  using: composite
+  steps:
+    # Forks cannot read the signing secrets, so their builds are allowed through
+    # unsigned rather than failing on something a contributor cannot fix. On the
+    # canonical repo the same missing secret is a hard error: silently shipping
+    # an unsigned release is the exact failure this action exists to prevent,
+    # and a skip that looks like a pass is how the Defender scan in
+    # unslothai/unsloth#8358 went missing for five releases.
+    - name: Decide whether signing runs
+      id: gate
+      shell: pwsh
+      env:
+        AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+      run: |
+        $ErrorActionPreference = 'Continue'
+        $haveSecrets = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)
+        $canonical = ($env:GITHUB_REPOSITORY -eq 'unslothai/llama.cpp')
+        if ($haveSecrets) {
+          Add-Content -Path $env:GITHUB_OUTPUT -Value 'signed=true'
+          Write-Host 'Azure Trusted Signing credentials present; signing.'
+        } elseif ($canonical) {
+          Write-Host '::error::Azure Trusted Signing secrets are missing on unslothai/llama.cpp.'
+          Write-Host 'Add AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID,'
+          Write-Host 'AZURE_TRUSTED_SIGNING_ACCOUNT_NAME and AZURE_CERTIFICATE_PROFILE_NAME'
+          Write-Host 'to the release-signing environment. Refusing to publish unsigned binaries.'
+          exit 1
+        } else {
+          Add-Content -Path $env:GITHUB_OUTPUT -Value 'signed=false'
+          Write-Host "::warning::No signing secrets on $env:GITHUB_REPOSITORY; leaving binaries unsigned."
+        }
+
+    # Pinned by digest. This binary runs in the step that holds the signing
+    # credentials, so where it comes from is itself a key-handling question.
+    - name: Install trusted-signing-cli
+      if: ${{ steps.gate.outputs.signed == 'true' }}
+      shell: pwsh
+      env:
+        TRUSTED_SIGNING_CLI_URL: https://github.com/Levminer/artifact-signing-cli/releases/download/0.10.0/trusted-signing-cli.exe
+        TRUSTED_SIGNING_CLI_SHA256: 8c9d750ca582891a7433925dcf302d5d3761fbed757b46c4bf5b417562dccb0e
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $dir = Join-Path $env:RUNNER_TEMP 'trusted-signing-cli'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $dest = Join-Path $dir 'trusted-signing-cli.exe'
+        Invoke-WebRequest -Uri $env:TRUSTED_SIGNING_CLI_URL -OutFile $dest -MaximumRetryCount 3 -RetryIntervalSec 5
+        $actual = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+        $expected = $env:TRUSTED_SIGNING_CLI_SHA256.ToLower()
+        if ($actual -ne $expected) {
+          Write-Host "::error::trusted-signing-cli digest mismatch, refusing to sign with an unverified binary. Expected $expected, got $actual."
+          exit 1
+        }
+        Write-Host "verified trusted-signing-cli sha256=$actual"
+        Add-Content -Path $env:GITHUB_PATH -Value $dir
+
+    # Fails closed, matching the desktop release workflow. Without this a
+    # missing or broken binary only surfaces later as a signing error with no
+    # obvious cause.
+    - name: Verify trusted-signing-cli
+      if: ${{ steps.gate.outputs.signed == 'true' }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $cli = Get-Command trusted-signing-cli -ErrorAction SilentlyContinue
+        if (-not $cli) {
+          Write-Output "::error::trusted-signing-cli is not on PATH. Check the install step above."
+          exit 1
+        }
+        # sign-windows-tree.ps1 invokes this by bare name, so whatever PATH
+        # resolves is what signs. Only the digest-verified copy may do that;
+        # anything else under the same name is unverified by definition.
+        $verified = [IO.Path]::GetFullPath((Join-Path (Join-Path $env:RUNNER_TEMP 'trusted-signing-cli') 'trusted-signing-cli.exe'))
+        if ([IO.Path]::GetFullPath($cli.Source) -ne $verified) {
+          Write-Output "::error::trusted-signing-cli resolved to $($cli.Source), not the verified $verified. Refusing to sign with a binary that was never digest checked."
+          exit 1
+        }
+        # Two distinct failure modes, neither covering the other: a truncated
+        # download cannot start at all, which raises under Stop and must be
+        # caught; a binary that starts and exits non-zero does not raise, so
+        # $LASTEXITCODE has to be read.
+        try {
+          & $cli.Source --version
+        } catch {
+          $detail = ($_.Exception.Message -replace '\s+', ' ').Trim()
+          Write-Output "::error::trusted-signing-cli could not be started. Re-run to fetch it again; if it persists the pinned asset is bad. Underlying error: $detail"
+          exit 1
+        }
+        if ($LASTEXITCODE -ne 0) {
+          Write-Output "::error::trusted-signing-cli is on PATH but exited $LASTEXITCODE."
+          exit 1
+        }
+
+    - name: Sign every PE in the build tree
+      if: ${{ steps.gate.outputs.signed == 'true' }}
+      shell: pwsh
+      env:
+        AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+        AZURE_CLIENT_SECRET: ${{ inputs.azure-client-secret }}
+        AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+        AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ inputs.azure-account }}
+        AZURE_CERTIFICATE_PROFILE_NAME: ${{ inputs.azure-certificate-profile }}
+      run: |
+        $ErrorActionPreference = 'Continue'
+        & "$env:GITHUB_ACTION_PATH/../../scripts/sign-windows-tree.ps1" -Path "${{ inputs.path }}" -Endpoint "${{ inputs.endpoint }}"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
