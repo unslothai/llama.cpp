@@ -699,7 +699,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
-            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a prompt and gets a ubatch of its own; grouped sets need equal tokens left, or the expansion below changes their sum order
+            // [TAG_EXACT_CONCURRENCY] A set with more tokens left than a decode step is a prompt and gets its own ubatch; grouped sets need equal tokens left, or the sum order changes.
             if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 

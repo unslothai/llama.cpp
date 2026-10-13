@@ -977,7 +977,7 @@ extern "C" {
     LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
     LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
 
-    // size the transfer's host buffer, keeping no contents; NULL on failure. Grow-only: page-locking is far too slow to redo per transfer, so only llama_state_seq_copy_buf_free() frees it.
+    // Size the transfer's host buffer, keeping no contents; NULL on failure. Grow-only, since page-locking is too slow to redo; only llama_state_seq_copy_buf_free() frees it.
     LLAMA_API uint8_t * llama_state_seq_copy_buf_resize  (struct llama_state_seq_copy * cpy, size_t size);
     LLAMA_API uint8_t * llama_state_seq_copy_buf         (struct llama_state_seq_copy * cpy);
     LLAMA_API size_t    llama_state_seq_copy_buf_size    (struct llama_state_seq_copy * cpy);
@@ -989,7 +989,7 @@ extern "C" {
 
     LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
 
-    // issue the copies; the bytes covered, 0 on failure. size must be within llama_state_seq_copy_buf_size(), and LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused.
+    // Issue the copies; returns bytes covered, 0 on failure. size must fit llama_state_seq_copy_buf_size(); LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused.
     LLAMA_API size_t llama_state_seq_copy_get(
             struct llama_state_seq_copy * cpy,
                            size_t   size,

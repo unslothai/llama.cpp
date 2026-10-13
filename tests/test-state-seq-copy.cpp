@@ -1,4 +1,4 @@
-// [TAG_STATE_ASYNC] guards on the asynchronous state transfer: the buffer belongs to the transfer, so an oversized size is refused, and ON_DEVICE is refused as these go via the host
+// [TAG_STATE_ASYNC] Async state transfer guards: an oversized size is refused since the transfer owns the buffer, and ON_DEVICE is refused since copies go via host.
 
 #include "arg.h"
 #include "common.h"

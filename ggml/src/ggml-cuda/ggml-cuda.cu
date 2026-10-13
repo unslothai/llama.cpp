@@ -1795,7 +1795,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
-    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single destination column only, so leaving it on would give a solo request a different code path from a batched one
+    // [TAG_BATCH_INVARIANT] mul_mat+GLU fuses only for one destination column, so a solo request would take a different path from a batched one.
     if (ggml_cuda_batch_invariant()) {
         return false;
     }
@@ -2031,7 +2031,7 @@ static ggml_cuda_mm_path ggml_cuda_mul_mat_path(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT] the widest slice of columns that can be recomputed in one launch while every column still sums as a batch of one; always below ncols_dst, so the recursion ends
+// [TAG_BATCH_INVARIANT] The widest column slice one launch can compute with batch-of-one sums; always below ncols_dst, so the recursion ends.
 static int64_t ggml_cuda_mul_mat_invariant_width(
         int cc, int warp_size, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
         ggml_cuda_mm_path path_one, int64_t ncols_dst) {
@@ -2086,9 +2086,9 @@ static bool ggml_cuda_mul_mat_split_columns(
         return false;
     }
 
-    // mode 1 recomputes one column at a time; mode 2, which exact concurrency runs under, uses the widest slices that keep the batch-of-one arithmetic
+    // Mode 1 recomputes one column at a time; mode 2 (used by exact concurrency) uses the widest slices that keep batch-of-one arithmetic.
     int64_t width = 1;
-    // F32 weights go one column at a time: the predictor cannot see precision rules another pin adds to the dispatch for them
+    // F32 weights go one column at a time: the predictor cannot see precision rules other pins add for them.
     if (ggml_cuda_batch_invariant() >= 2 && src0->type != GGML_TYPE_F32) {
         const ggml_cuda_mm_path path_one     = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, 1);
         const ggml_cuda_mm_path path_batched = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, ncols_dst);
@@ -2136,7 +2136,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    // [TAG_BATCH_INVARIANT] ahead of the dispatch below, which is left as upstream wrote it so other pins that edit it still merge
+    // [TAG_BATCH_INVARIANT] Placed before the upstream dispatch, left unchanged so other pins still merge.
     if (ggml_cuda_batch_invariant() &&
             ggml_cuda_mul_mat_split_columns(ctx, ggml_cuda_info().devices[ctx.device].cc,
                                             ggml_cuda_info().devices[ctx.device].warp_size, src0, src1, dst)) {
@@ -2217,7 +2217,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    // [TAG_BATCH_INVARIANT] a split node runs as ntokens single-token calls, so the path that decides whether the stream is synchronized is the single-token one
+    // [TAG_BATCH_INVARIANT] A split node runs as single-token calls, so the single-token path decides stream synchronization.
     const int64_t ntokens = ggml_cuda_mul_mat_id_splits_tokens(dst) ? 1 : dst->ne[2];
 
     if (ntokens <= MMVQ_MAX_BATCH_SIZE) {
@@ -2247,7 +2247,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT] recompute dst one token at a time: every implementation below groups the ubatch's tokens by the expert they routed to, so shapes depend on the other tokens
+// [TAG_BATCH_INVARIANT] Recompute dst one token at a time: every implementation below groups tokens by expert, so shapes depend on the other tokens.
 static void ggml_cuda_mul_mat_id_split_tokens(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2294,7 +2294,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_BATCH_INVARIANT]
     if (ggml_cuda_mul_mat_id_splits_tokens(dst)) {
         GGML_ASSERT(ne3 == 1 && src1->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
-        // a quantized expert matrix takes the single-token MMVQ path at every token count and can put the tokens on its sample axis in one launch; anything else goes token by token
+        // Quantized experts use single-token MMVQ with tokens on the sample axis in one launch; anything else goes token by token.
         if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
             return;
@@ -3977,7 +3977,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     //topk-moe
-    // [TAG_BATCH_INVARIANT] the routing fusion passes its memory-range check only for a one-token ubatch, so a solo request takes the fused top-k kernel and a batched one the long chain
+    // [TAG_BATCH_INVARIANT] The routing fusion only passes its range check for one-token ubatches, so solo and batched runs would take different kernels.
     if (!ggml_cuda_batch_invariant() &&
             (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
@@ -6208,7 +6208,7 @@ static bool ggml_backend_cuda_device_event_query(ggml_backend_dev_t dev, ggml_ba
 
     const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
 
-    // not an error, and nothing to clear: cudaEventQuery() returns cudaErrorNotReady without recording it, so collecting one here would consume somebody else's
+    // cudaEventQuery() returns cudaErrorNotReady without recording it, so do not collect an error here or it would consume someone else's.
     if (err == cudaErrorNotReady) {
         return false;
     }

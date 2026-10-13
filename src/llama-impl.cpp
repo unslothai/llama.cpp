@@ -211,7 +211,7 @@ bool llama_exact_backend_name(const char * reg_name) {
     return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
 }
 
-// [TAG_EXACT_CONCURRENCY] a host buffer is the case that matters: the scheduler runs an op on the backend that holds its weight, and moves a host weight's op to the GPU only once the batch is wide enough (ggml_backend_cuda_device_offload_op).
+// [TAG_EXACT_CONCURRENCY] Host buffers matter: an op runs where its weight lives, and a host weight's op moves to the GPU only for wide batches (ggml_backend_cuda_device_offload_op).
 // The CPU matmul picks between its SGEMM and its vector dot by the batch width too.
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
     if (!buft || ggml_backend_buft_is_host(buft)) {
@@ -236,7 +236,7 @@ bool llama_exact_concurrency() {
 // [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
 static std::atomic<uint32_t> g_exact_decode_tokens{1};
 
-// one lock for the token figure, the sequence count and the width: a report interleaved with a change of figure could leave the backend with a width that covers neither
+// One lock for token figure, sequence count and width, so an interleaved report cannot leave a width that covers neither.
 static std::recursive_mutex g_exact_mutex;
 
 // the most sequences any context was created with; the tokens figure is process wide, so raising it re-reports every context's width

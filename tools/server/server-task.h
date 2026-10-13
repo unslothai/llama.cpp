@@ -444,7 +444,7 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic_stream();
 };
 
-// [TAG_PREEMPT] out-of-band notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") every existing client ignores
+// [TAG_PREEMPT] Notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") that clients ignore.
 struct server_task_result_preempt_notice : server_task_result {
     bool    parked     = false; // true when the slot was just parked, false when restored
     bool    recomputed = false; // this resume re-prefilled its tokens instead of restoring saved bytes

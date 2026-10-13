@@ -274,7 +274,7 @@ private:
     static constexpr uint32_t exact_page_size = 256;
     bool exact_pages = false;
 
-    // [TAG_EXACT_CONCURRENCY] which (sequence, logical page) owns each physical page; seq < 0 means free, and it is kept current as cells are placed and dirtied by removals
+    // [TAG_EXACT_CONCURRENCY] The (sequence, logical page) owning each physical page; seq < 0 is free. Kept current on placement and removal.
     struct exact_page {
         llama_seq_id seq = -1;
         llama_pos    lpg = -1;

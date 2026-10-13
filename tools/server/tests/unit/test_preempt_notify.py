@@ -8,7 +8,7 @@ import pytest
 import requests
 from utils import *
 
-# [TAG_PREEMPT] a streaming client is told when its slot is parked and restored, as SSE comments every existing client ignores; a keepalive every 2 s keeps proxies from giving up
+# [TAG_PREEMPT] Streaming clients get SSE comment notices on park and restore, and a 2 s keepalive keeps proxies from giving up.
 
 server = ServerPreset.tinyllama2()
 
@@ -172,7 +172,7 @@ def _prefill_payload(path: str, prompt: str, n_predict: int) -> dict:
 
 @pytest.mark.parametrize("path", ["/completion", "/v1/chat/completions", "/v1/responses", "/v1/messages"])
 def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
-    # a park before the first token is the case a client cannot tell from a stall, so the notice goes out with the response headers rather than waiting for a chunk that is not coming
+    # A park before the first token looks like a stall, so its notice goes out with the response headers.
     server.server_slots = True
     _start(n_ctx=2048, n_batch=256)
 
@@ -184,7 +184,7 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     t = threading.Thread(target=_resident, daemon=True)
     t.start()
 
-    # the pool has to be nearly full before the second prompt starts, so that its prefill is what runs out of cells
+    # The pool must be nearly full before the second prompt starts, so its prefill runs out of cells.
     # the resident grows by decoding: 1400 tokens took over 12 s on a loaded CI runner
     deadline = time.time() + 90
     while t.is_alive() and time.time() < deadline:
@@ -235,7 +235,7 @@ def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
 
 
 def test_an_oversized_prompt_is_errored_instead_of_parked():
-    # a slot just given a task has not passed the prompt checks yet, and a notice opens the stream, so parking it would turn a plain error response into 200 plus an in-stream one
+    # A newly assigned slot has not passed prompt checks, and a notice opens the stream, so parking it would turn an error response into 200 plus an in-stream error.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512, n_batch=512)
 
@@ -246,7 +246,7 @@ def test_an_oversized_prompt_is_errored_instead_of_parked():
 
 
 def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept_alive():
-    # --preempt-ram 2 MiB holds one parked state but not a resident's and the head's at once, so that rotation is refused and the head waits parked for longer than the 2 s keepalive
+    # 2 MiB holds one parked state but not two, so rotation is refused and the head stays parked past the 2 s keepalive.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
     _start(n_slots=3, n_ctx=2048, enable_ctx_shift=True)
 
@@ -271,7 +271,7 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
 
 
 def test_every_notice_of_a_multi_prompt_stream_names_the_prompt_it_is_about():
-    # one request, two prompts: a client reading the shared stream can only tell the notices apart by their index, so index 0 has to be spelled out like any other
+    # Clients sharing a stream tell notices apart by index, so index 0 must be explicit too.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512)
 
@@ -285,7 +285,7 @@ def test_every_notice_of_a_multi_prompt_stream_names_the_prompt_it_is_about():
 
 
 def test_an_oversized_sibling_prompt_is_errored_before_a_valid_one_is_parked():
-    # a request can carry several prompts; a valid one can be parked and its notice opens the stream, so the sibling that does not fit has to be found before any of them is queued
+    # A valid prompt's park notice opens the stream, so a sibling that does not fit must be rejected before any is queued.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     _start(n_ctx=256, n_slots=3, n_batch=512)
 

@@ -1,4 +1,4 @@
-// [TAG_EXACT_CONCURRENCY] the context refuses a weight outside the per-layer blocks (here output_norm) that an override keeps on the host, and still accepts the same model fully offloaded.
+// [TAG_EXACT_CONCURRENCY] The context refuses a non-layer weight (output_norm) kept on host by an override, and accepts the same model fully offloaded.
 // Needs a batch-invariant GPU backend; without one the test reports what it skipped and passes.
 
 #include "llama.h"

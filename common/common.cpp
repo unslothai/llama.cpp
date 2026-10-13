@@ -1239,7 +1239,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure the explicit bound does not cover
+    // [TAG_EXACT_CONCURRENCY] Checked before any context exists, so none is created outside the explicit bound.
     if (!model_only && !common_exact_concurrency_init(params)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
         return;
@@ -1472,7 +1472,7 @@ bool common_exact_concurrency_model(const common_params & params, const llama_mo
         return true;
     }
 
-    // the paged pool places a cell from the sequence and the position alone, and M-RoPE gives every token of one image the same temporal position, so the second of them lands on the first one's cell and the batch is refused at the first image
+    // The paged pool places a cell by sequence and position, and M-RoPE gives all tokens of an image one temporal position, so such batches are refused.
     const llama_rope_type rope_type = llama_model_rope_type(model);
 
     if (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) {
@@ -1488,7 +1488,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         return true;
     }
 
-    // DFlash drafting turns causal attention off on its draft context, which the paged attention needs; say so instead of asserting in the graph. DSpark is the same.
+    // DFlash and DSpark turn causal attention off on the draft context, which paged attention needs; refuse here instead of asserting in the graph.
     for (const auto type : params.speculative.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
             COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
@@ -1533,7 +1533,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         return false;
     }
 
-    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is; this also covers a caller that decodes before creating a context
+    // Tell the batch splitter the width of one sequence's decode step; this also covers callers that decode before creating a context.
     if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
         !llama_set_exact_decode_width((uint32_t) n_cols)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
@@ -1554,7 +1554,7 @@ bool common_exact_concurrency_context(const common_params & params, const llama_
         return false; // already reported by common_exact_concurrency_init()
     }
 
-    // the context clamps the batch to the context size and the ubatch to the batch, and an unset -c takes its size from the model or from the fit to device memory, so this is the geometry a prefill really gets
+    // The context clamps the batch to n_ctx and the ubatch to the batch, and an unset -c comes from the model or the memory fit, so this is the real prefill geometry.
     const int n_batch  = (int) llama_n_batch(ctx);
     const int n_ubatch = (int) llama_n_ubatch(ctx);
 

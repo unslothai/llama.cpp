@@ -411,7 +411,7 @@ private:
     // [TAG_STATE_ASYNC] one event per device that copies asynchronously, recorded on the compute stream at the end of every decode; see state_seq_copy_fence()
     std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
 
-    // transfers alive on this context; the fences go when the last one does, and a context freed with transfers still alive drains them and lets them go first
+    // Live transfers; the fences go with the last one, and freeing the context drains live transfers first.
     std::set<llama_state_seq_copy *> state_copies;
 
     // training

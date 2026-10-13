@@ -645,7 +645,7 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    // a transfer still alive is drained first: synchronize() covers the graph backends, not the copy backend a transfer owns, and its KV buffers are about to go
+    // Drain live transfers first: synchronize() does not cover their copy backends, and the KV buffers are about to go.
     state_seq_copies_drain();
 
     for (auto & it : state_copy_fences) {
@@ -2991,7 +2991,7 @@ private:
     size_t size_written = 0;
 };
 
-// [TAG_STATE_COALESCE] one transfer per run of cells, not one per cell; the restore side asks for one per cell, and the transposed V layout repeats every run once per row
+// [TAG_STATE_COALESCE] One transfer per run of cells, not per cell; the transposed V layout repeats every run once per row.
 template <typename info_t>
 static size_t llama_io_run_end(const std::vector<info_t> & infos, size_t i) {
     size_t end = i + 1;
@@ -3017,7 +3017,7 @@ static size_t llama_io_run_size(const std::vector<info_t> & infos, size_t i, siz
     return size;
 }
 
-// [TAG_STATE_COALESCE] a comb of equal runs at a constant stride is one strided copy: sequences sharing a unified cache take their cells in turn
+// [TAG_STATE_COALESCE] Equal runs at a constant stride (sequences interleaved in a unified cache) are one strided copy.
 template <typename info_t, typename emit_t>
 static void llama_io_emit(const std::vector<info_t> & infos, size_t first, size_t last, emit_t emit) {
     std::vector<std::pair<size_t, size_t>> runs;
@@ -3180,7 +3180,7 @@ public:
             while (end < rinfos.size() && rinfos[end].tensor == tensor) {
                 end++;
             }
-            // [TAG_STATE_COALESCE] the restore emits one fragment per cell, but the cost is the number of runs of adjacent cells, so count runs before falling back to staging
+            // [TAG_STATE_COALESCE] The cost is the number of runs of adjacent cells, not fragments, so count runs before falling back to staging.
             const size_t tensor_bytes = ggml_nbytes(tensor);
             auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -3657,7 +3657,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-// [TAG_STATE_ASYNC] a sequence state transfer that runs beside the decode instead of in it: the host buffer, one backend per device, each with its own stream, and one event per device
+// [TAG_STATE_ASYNC] A sequence state transfer that runs beside the decode: a host buffer, plus one backend, stream and event per device.
 struct llama_state_seq_copy {
     llama_context * ctx = nullptr;
 
@@ -3696,7 +3696,7 @@ struct llama_state_seq_copy {
         }
     }
 
-    // the stream this tensor is copied on, or null when it needs none: a host tensor is a memcpy, and a split buffer fails every backend's async copy assert
+    // The copy stream for this tensor, or null: a host tensor is a memcpy, and a split buffer fails every backend's async copy assert.
     ggml_backend_t backend_for(const ggml_tensor * t) {
         ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
 
@@ -3732,7 +3732,7 @@ struct llama_state_seq_copy {
         }
     }
 
-    // order the copies behind the compute already queued on each device: the copy stream waits for the context's fence, recorded at the end of every decode
+    // Order the copies after compute already queued: the copy stream waits for the fence recorded at the end of every decode.
     void order_after(const std::map<ggml_backend_dev_t, ggml_backend_event_t> & fences) {
         for (auto & it : devs) {
             const auto fence = fences.find(it.first);
@@ -3743,7 +3743,7 @@ struct llama_state_seq_copy {
         }
     }
 
-    // order the context's compute behind the copies just recorded, for a restore only: its copies write KV cells while other sequences read every cell up to n_kv
+    // For restores, order compute after the copies: they write KV cells while other sequences read every cell up to n_kv.
     void order_before(const std::vector<ggml_backend_ptr> & compute) {
         for (auto & it : devs) {
             if (!it.second.pending) {
@@ -3788,7 +3788,7 @@ struct llama_state_seq_copy {
         }
     }
 
-    // grow-only: pinning host memory costs about as long as the copy it is for, and a caller parking the same sequence asks for a slightly different size each time
+    // Grow-only: pinning costs about as much as the copy, and re-parks ask for slightly different sizes.
     uint8_t * buf_resize(size_t size_new) {
         if (size_new <= capacity) {
             size = size_new;
@@ -3826,7 +3826,7 @@ struct llama_state_seq_copy {
         data     = base;
         size     = size_new;
         capacity = size_new;
-        // a host buffer type may quietly hand back ordinary memory when pinning is off, so believe the buffer that came back rather than the type
+        // A host buffer type may return ordinary memory when pinning is off, so trust the returned buffer, not the type.
         pinned   = can_pin && ggml_backend_buffer_get_type(buf) == host_buft;
 
         return data;
@@ -3862,7 +3862,7 @@ public:
     llama_io_write_host_async(uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
         llama_io_write_host(p, len, true), cpy(cpy) {}
 
-    // posted from the destructor, and only once serialisation reached the end: a caller told of a partial failure by a zero return is free to reuse the buffer at once
+    // Posted from the destructor, only if serialisation completed: after a zero return the caller may reuse the buffer at once.
     void commit() {
         committed = true;
     }
@@ -3890,13 +3890,13 @@ private:
     bool committed = false;
 };
 
-// [TAG_STATE_ASYNC] the read half of the same, without llama_io_read_host's whole-tensor staging: a write-back would undo whatever the sequences sharing the tensor wrote while these copies ran
+// [TAG_STATE_ASYNC] Read side, without llama_io_read_host's whole-tensor staging: a write-back would undo writes by sequences sharing the tensor.
 class llama_io_read_host_async : public llama_io_read_host {
 public:
     llama_io_read_host_async(const uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
         llama_io_read_host(p, len, true), cpy(cpy) {}
 
-    // see llama_io_write_host_async::commit(): a restore that failed part way has dropped the sequence, and copies posted for it would write cells that are no longer its own
+    // See llama_io_write_host_async::commit(): a failed restore dropped the sequence, so its copies would write cells it no longer owns.
     void commit() {
         committed = true;
     }
@@ -4033,7 +4033,7 @@ void llama_context::state_seq_copy_fence() {
 }
 
 llama_state_seq_copy * llama_context::state_seq_copy_init() {
-    // [TAG_STATE_ASYNC] a recurrent state keeps no fixed row: find_slot() gathers the live rows together, so a decode beside a transfer moves or overwrites the row the transfer reads. A hybrid carries that half too
+    // [TAG_STATE_ASYNC] Recurrent states have no fixed row: find_slot() compacts live rows, so a decode beside a transfer can move the row being read. Hybrids too.
     if (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch)) {
         LLAMA_LOG_INFO("%s: this model moves sequence states between rows, so they are copied synchronously\n", __func__);
         return nullptr;
@@ -4057,7 +4057,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
-        // a device that advertises events but does not implement event_query makes the first poll wait for the whole copy, so leave it out and let state_seq_copy_init() return NULL
+        // A device with events but no event_query would make the first poll block on the whole copy, so skip it and let state_seq_copy_init() return NULL.
         if (!ggml_backend_dev_supports_event_query(dev)) {
             static std::atomic<bool> warned(false);
 
@@ -4069,7 +4069,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
             continue;
         }
 
-        // a backend of its own, not the one the graphs are computed on: that one moves its copies to whichever stream it is using, so a transfer could end up ordered behind a graph
+        // A separate backend: the graph backend moves copies to whichever stream it uses, which could order a transfer behind a graph.
         ggml_backend_t backend_cpy = ggml_backend_dev_init(dev, nullptr);
 
         if (!backend_cpy) {
@@ -4093,7 +4093,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
         return nullptr;
     }
 
-    // the devices above are the ones the graphs run on, not the ones the state lives on: with most layers on the CPU every copy takes the synchronous branch of backend_for()
+    // These are the graph devices, not where the state lives: with most layers on the CPU every copy takes the synchronous branch of backend_for().
     if (memory) {
         bool on_device = false;
 
@@ -4121,7 +4121,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
 
     cpy->can_pin = cpy->host_buffer_type() != ggml_backend_cpu_buffer_type();
 
-    // one fence per device, shared by every transfer and recorded after every decode; installed only after the checks above, so a refused transfer leaves nothing behind
+    // One fence per device, shared by all transfers and recorded after every decode; installed after the checks so a refused transfer leaves nothing.
     std::vector<ggml_backend_dev_t> fences_new;
 
     for (const auto & it : cpy->devs) {
@@ -4153,13 +4153,13 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
 }
 
 size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // the library owns this buffer, so the extent can be checked instead of believed: every bounds check validates against it, so an oversized one agrees and the copy overruns
+    // The library owns this buffer, so check the extent against it; trusting an oversized value would pass every bounds check and overrun.
     if (!cpy.data || size == 0 || size > cpy.size) {
         LLAMA_LOG_ERROR("%s: cannot cover %zu bytes, the transfer's buffer holds %zu\n", __func__, size, cpy.size);
         return 0;
     }
 
-    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE has nowhere to leave the data here, and get_size_ext() with that flag reports a metadata-sized state, so the two cannot be paired
+    // ON_DEVICE has nowhere to put the data here, and get_size_ext() reports a metadata-only size with it, so they cannot be paired.
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported here, the copies go through host memory\n", __func__);
         return 0;
@@ -4199,7 +4199,7 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
         return 0;
     }
 
-    // the cells this restore was given may still be read, masked, by a graph in flight, so the copy stream waits for the compute stream on the device, see order_after()
+    // A graph in flight may still read these cells (masked), so the copy stream waits for compute, see order_after().
     const int64_t t_sync = ggml_time_us();
     cpy.order_after(state_copy_fences);
     cpy.t_sync_us = ggml_time_us() - t_sync;
@@ -4402,7 +4402,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
-    // [TAG_EXACT_CONCURRENCY] a whole-context restore writes cells at their recorded physical index, which the paged pool owns; refused before anything is parsed
+    // [TAG_EXACT_CONCURRENCY] A whole-context restore writes cells at recorded physical indices, which the paged pool owns; refused before parsing.
     if (memory && memory->alloc_granularity() > 1) {
         throw std::runtime_error("whole-context restore is not supported with LLAMA_EXACT_CONCURRENCY, restore per sequence");
     }

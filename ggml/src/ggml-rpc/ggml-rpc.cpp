@@ -2146,7 +2146,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
             return false;
         }
-        // [TAG_EXACT_CONCURRENCY] supports_op never offers a page table to RPC, so a graph carrying one is not from a ggml scheduler, and the backend would trust its page ids and counts
+        // [TAG_EXACT_CONCURRENCY] supports_op never offers RPC a page table, so a graph with one is not from a scheduler and its page ids cannot be trusted.
         if (graph->nodes[i] != nullptr && graph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT && graph->nodes[i]->src[5] != nullptr) {
             LOG_ERROR("[%s] graph node %d (id=%" PRId64 ") is a paged FLASH_ATTN_EXT, which RPC does not support\n", __func__, i, id);
             return false;

@@ -12,14 +12,14 @@ import pytest
 import requests
 from utils import *
 
-# Preemption on a unified KV pool: one slot is parked, its sequence copied to host RAM and its cells released, instead of every slot being terminated. Needs --kv-unified.
+# Preemption on a unified KV pool: one slot is parked in host RAM instead of every slot being terminated. Needs --kv-unified.
 
 server = ServerPreset.tinyllama2()
 
 _ASYNC_BANNER = "parking and resuming asynchronously"
 
 _scratch = []  # files a test wrote, removed after it
-_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")  # put back after a test that hides the GPUs
+_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")  # restored after a test that hides the GPUs
 
 _PROMPT_A = "Once upon a time there was a brave knight who"
 _PROMPT_B = "The quick brown fox jumps over the lazy dog and"
@@ -32,7 +32,7 @@ def create_server():
     server = ServerPreset.tinyllama2()
     server.n_slots = 2
     server.kv_unified = True
-    # the server parks only when asked: --preempt-ram defaults to 0, and this suite is about parking
+    # --preempt-ram defaults to 0, so parking must be enabled.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     server.server_slots = True
     server.server_metrics = True
@@ -93,7 +93,7 @@ def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay:
               timeout: float = DEFAULT_REQUEST_TIMEOUT):
     time.sleep(delay)
     if after_slot_busy is not None:
-        # sent once that slot is processing, so the request queues behind it whatever the host's speed
+        # Sent once that slot is processing, so the request queues behind it regardless of host speed.
         for _ in range(200):
             slots = server.make_request("GET", "/slots").body
             if any(s["id"] == after_slot_busy and s["is_processing"] for s in slots):
@@ -159,7 +159,7 @@ _PARK_MARKERS = ("preempted:", "preempted as a last resort", "preempted on reque
 
 
 def _assert_nothing_parked(text: str):
-    # the park log lines, not the bare word: a verbose log prints every slot's "is_preempted"
+    # Match park log lines, not the bare word: verbose logs print every slot's "is_preempted".
     assert not any(m in text for m in _PARK_MARKERS), "nothing could be parked here"
 
 
@@ -213,9 +213,9 @@ def test_forced_parks_do_not_change_the_output(mode):
 
 @pytest.mark.parametrize("knob", ["planner", "pages", "async", "last-resort", "last-resort-unlimited"])
 def test_two_generations_that_do_not_fit_together_both_finish(knob):
-    # each request fits the pool alone (960 and 600 of 1024 cells) but not together; without preemption both end with "Context size has been exceeded"
+    # Each request fits the pool alone (960 and 600 of 1024 cells) but not together.
     if knob == "pages":
-        # a block allocator gives a whole block to one sequence, so the planner has to count cells: counting tokens it sees room the allocator cannot find
+        # A block allocator gives each block to one sequence, so the planner must count cells, not tokens.
         os.environ["LLAMA_SERVER_PREEMPT_GRANULARITY"] = "64"
     if knob.startswith("last-resort"):
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
@@ -224,8 +224,7 @@ def test_two_generations_that_do_not_fit_together_both_finish(knob):
     n_ctx = 1024
     (_start_async if knob == "async" else _start)(n_ctx=n_ctx)
 
-    # the lengths, not the client's speed, decide the overlap: two equal requests fired together did not overlap on a Windows runner, the first finished before the second arrived, and the last resort never saw the two residents it needs.
-    # the follower is sent once the leader is seen processing, so it holds its cells while the leader grows into the rest of the pool
+    # Lengths, not client speed, must force the overlap: equal requests fired together did not overlap on a Windows runner.
     n_predict = (460, 400)
     results = _complete_overlapping(n_predict, (500, 200))
 
@@ -258,12 +257,12 @@ def test_a_request_that_cannot_be_helped_gets_the_context_error_and_the_server_l
     if knob == "ram-0":
         os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
     else:
-        # a family member is not a victim for the other, so a two-completion request gets the error it would get alone
+        # Family members are not victims for each other, so a two-completion request gets the same error as alone.
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
     _start(n_ctx=256)
 
     if knob == "ram-0":
-        # the overflow has to be a matter of lengths: two equal requests fired together did not overlap on a Windows runner, and each one fits the pool alone
+        # The overflow must come from lengths, since equal concurrent requests did not overlap on a Windows runner.
         assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
     else:
         res = server.make_request("POST", "/completion", data={
@@ -291,7 +290,6 @@ def test_a_server_that_never_asked_for_parking_behaves_as_upstream():
     assert "preemption:" not in text, "a server that did not ask for parking announced it"
     assert _ASYNC_BANNER not in text, "the async park path was set up without being asked for"
 
-    # as above, the two have to be resident together for the pool to overflow at all
     assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
 
     text = _log()
@@ -330,17 +328,17 @@ def test_a_late_prompt_and_a_generating_slot_both_finish(planner):
     for res, n_predict in zip(results, (n_predict_a, n_predict_b)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
-    # the chunk in the batch given up is processed once after the rewind, never twice
+    # The chunk in the abandoned batch is processed once after the rewind, never twice.
     assert results[1].body["timings"]["prompt_n"] == n_b
 
 
 def test_a_prompt_parked_before_its_first_token_is_issued_whole():
-    # both prompts are too close to n_ctx to leave the usual margin, so the second is parked before it takes a cell and has to come back once the first has finished
+    # Both prompts are too close to n_ctx for the usual margin, so the second is parked before taking a cell and resumes after the first finishes.
     _start(n_ctx=256, n_batch=256)
 
     n_prompt = 240
     n_predict = 4
-    # two different prompts: with the same one, the second can be served from the first one's cached cells after it finishes, and prompt_n is then 1
+    # Different prompts: with the same one the second could reuse the first's cached cells and prompt_n would be 1.
     together = _complete_all(n_predict, [_prompt_of(n_prompt, _PROMPT_A), _prompt_of(n_prompt, _PROMPT_B)])
 
     assert "cannot fit the pool" not in _log()
@@ -350,10 +348,10 @@ def test_a_prompt_parked_before_its_first_token_is_issued_whole():
 
 
 def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_head():
-    # with context shift on a resident would hold its cells for as long as it generates, so once the head has waited its turn the resident is parked and the two take turns
+    # With context shift a resident never frees its cells, so once the head has waited it is parked and the two take turns.
     _start(n_slots=3, n_ctx=384, enable_ctx_shift=True)
 
-    # the rotation waits on a clock, not on a token count, so the generation has to be long enough on a fast host; that is a lot of tokens for a slow one, and it takes turns with two others, so it is given more than the usual wait
+    # Rotation is clock-based, so a fast host needs a long generation, and a slow host then needs a longer wait.
     n_predict = 9000
     _assert_completed(_complete_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C), timeout=1800), n_predict)
 
@@ -363,11 +361,11 @@ def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_h
 
 
 def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
-    # the budget grants permission to allocate, not a successful allocation: a failed save used to stop the planner and leave the pool to overflow, although the same victim could be parked by dropping its cells
+    # A failed save used to stop the planner and let the pool overflow, though the victim could still be parked by dropping its cells.
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
     _start(n_ctx=1024, n_slots=2)
 
-    # lengths decide the overlap, not the host's speed: two 171-cell requests fired together did not overlap on a Windows runner, so nothing was parked. The leader ends at 960 of 1024 cells, so the second is parked whatever the client's lag
+    # The leader ends at 960 of 1024 cells, so the second is parked regardless of client lag.
     leader = _prompt_of(500, _PROMPT_A)
     other = _prompt_of(200, _PROMPT_B)
     with ThreadPoolExecutor(1) as pool:
@@ -386,18 +384,18 @@ def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
 
 
 def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
-    # 1 MiB holds no snapshot, so rotation refused every resident and only logged that the head waits: a resident that keeps context-shifting need never finish, and the head waited behind it for good
+    # 1 MiB holds no snapshot, so rotation used to refuse every resident and the head waited forever behind a context-shifting one.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     _start(n_ctx=2048, n_slots=2, n_batch=2048, enable_ctx_shift=True)
 
-    # a small n_discard keeps the resident near the end of the pool, so its state never fits the budget
+    # A small n_discard keeps the resident near the end of the pool, so its state never fits the budget.
     def unending_request():
         return server.make_request("POST", "/completion", data={
             "n_predict": 100000, "prompt": _PROMPT_A, "n_keep": 1, "n_discard": 64,
             "ignore_eos": True, "temperature": 0.0, "seed": 42,
         }, timeout=600)
 
-    # the server is stopped below with this request still in flight, so the disconnect it then sees is expected and must not surface as an unhandled thread exception
+    # The server is stopped with this request in flight, so the disconnect is expected.
     unending = []
 
     def run_unending():
@@ -410,7 +408,7 @@ def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
     t.start()
 
     try:
-        # the resident has to be at the pool's limit and cycling before a second prompt cannot fit beside it
+        # The resident must be at the pool's limit and cycling before a second prompt cannot fit.
         for _ in range(3000):
             if "slot context shift" in _log():
                 break
@@ -437,7 +435,7 @@ def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
 
 
 def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
-    # a cancelled request can reach release() with a park or a resume still running, where the host buffer is freed and the cells handed on, so both have to wait for the copy
+    # A cancelled request can reach release() with a copy running, so release must wait for it.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start_async(n_ctx=512)
 
@@ -447,7 +445,7 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
                 "n_predict": 96, "prompt": _PROMPT_A, "ignore_eos": True, "temperature": 0.0, "seed": 42,
             }, timeout=0.05 + 0.1 * i)
         except Exception:
-            pass  # the point is the drop, not the response
+            pass
 
     for _ in range(600):
         res = server.make_request("GET", "/slots")
@@ -468,16 +466,16 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 
 
 def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_keeps():
-    # the last request waits for slot 0 and is started on it holding the first request's cells; counted by the prompt it keeps instead, the pool looks free and a parked slot is restored into cells that are still taken
+    # The last request starts on slot 0 holding the first request's cells; counting only its kept prompt made the pool look free and a restore landed on taken cells.
     _start(n_ctx=1024, n_slots=3)
 
-    # the lengths, not the host's speed, decide who is parked: the three prompts (500 + 200 + 200) fit the 1024 cells, so both of the others are parked holding at least their whole prompt once slot 0 grows into the rest, and slot 0 is the largest slot throughout, which the planner never picks as a victim. Slot 0 ends holding 960 of the 1024 cells, too few left for either parked slot to come back
+    # 500 + 200 + 200 fit 1024 cells, so both small slots are parked with their whole prompt once slot 0 grows; slot 0 stays largest and ends at 960 cells, too few for either to return.
     ids = _prompt_of(500, _PROMPT_C)
 
     with ThreadPoolExecutor(4) as pool:
         first = pool.submit(_complete, 460, ids, 0)
         _wait_processing([0])
-        # queued behind slot 0 whatever the host's speed, and a real prefix of what slot 0 holds: it starts on 960 cells while keeping 8 of them
+        # Queued behind slot 0 and a real prefix of what it holds: it starts on 960 cells keeping 8.
         follower = pool.submit(_complete, 8, ids[:8], 0)
         long_ones = [pool.submit(_complete, 400, _prompt_of(200, _PROMPT_A), 1),
                      pool.submit(_complete, 400, _prompt_of(200, _PROMPT_B), 2)]
@@ -506,7 +504,7 @@ def test_a_recurrent_model_is_served_without_preemption():
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     server.start(timeout_seconds=300)
 
-    # not "Once upon a time": what this Q2_K model decodes from it on CUDA carries bytes the content parser refuses, master included, which is not what this test measures
+    # Not "Once upon a time": on CUDA this Q2_K model decodes bytes the content parser refuses, also on master.
     results = _complete_all(64, ["The quick brown fox", "Hello world"])
     _assert_completed(results, 64)
 
@@ -536,11 +534,11 @@ def _stream_completion(n_predict: int, prompt: str | list[int]) -> tuple[list[st
 
 @pytest.mark.parametrize("planner", ["on", "off"])
 def test_a_budget_that_holds_no_sequence_parks_by_dropping_the_cells(planner):
-    # 1 MiB holds neither sequence, so no victim fits the budget: the park drops the cells and the resume re-prefills the tokens, instead of the pool overflowing and ending both; the last resort falls back the same way
+    # 1 MiB fits neither sequence, so the park drops the cells and the resume re-prefills; the last resort falls back the same way.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     if planner == "off":
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
-    # one batch for the re-prefill: a prompt of this length in 32-token batches hangs the CUDA build with graphs on, master included, so that is not what this test measures
+    # One batch for the re-prefill: this prompt in 32-token batches hangs the CUDA build with graphs on, also on master.
     _start(n_ctx=3840, n_batch=2048)
 
     n_predict = 2000
@@ -565,7 +563,7 @@ _IMG_URL = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11
 
 
 def test_a_media_chunk_is_reserved_whole_before_it_is_decoded():
-    # a chunk is decoded whole inside one iteration, through decodes the kv-full retry does not cover: unless the planner reserves every cell it takes, the second of two image requests that each fit alone fails part way through its chunk
+    # A media chunk decodes whole outside the kv-full retry, so unless the planner reserves all its cells the second of two image requests fails mid-chunk.
     os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
     server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
     server.model_hf_file = None
@@ -589,15 +587,15 @@ def test_a_media_chunk_is_reserved_whole_before_it_is_decoded():
 
 
 def test_an_mtp_draft_stays_inside_the_reservation_it_was_priced_for():
-    # near the end of the pool the planner prices one draft token and one sampled token, but the draft loop stopped against the configured window and could attempt positions past the reservation
+    # Near the end of the pool the draft loop could attempt positions past the planner's reservation.
     path = os.environ.get("LLAMA_SERVER_TEST_MTP_MODEL")
     if not path:
         pytest.skip("set LLAMA_SERVER_TEST_MTP_MODEL to a gguf carrying an MTP head")  # ty: ignore[too-many-positional-arguments]
     server.model_file = path
     server.model_hf_repo = server.model_hf_file = None
     server.spec_type = "draft-mtp"
-    os.environ["LLAMA_ARG_SPEC_DRAFT_P_MIN"] = "0.0"   # nothing but the bounds stops the draft loop
-    os.environ["LLAMA_ARG_LOG_VERBOSITY"] = "5"        # the wrapper says so when it truncates what an implementation returned
+    os.environ["LLAMA_ARG_SPEC_DRAFT_P_MIN"] = "0.0"  # only the bounds stop the draft loop
+    os.environ["LLAMA_ARG_LOG_VERBOSITY"] = "5"  # logs when the wrapper truncates a draft
     _start(n_ctx=2048, n_slots=2, n_batch=2048, n_gpu_layer=99, spec_draft_n_max=128, spec_draft_n_min=1)
 
     n_prompt = 2045
@@ -617,7 +615,7 @@ def test_an_mtp_draft_stays_inside_the_reservation_it_was_priced_for():
 
 
 def test_a_hybrid_model_parks_synchronously():
-    # the recurrent half of a hybrid gathers the active sequences into contiguous rows on every batch, so a copy running beside the decode could read a row another sequence has been moved into
+    # A hybrid's recurrent half compacts active sequences each batch, so a concurrent copy could read a moved row.
     path = os.environ.get("LLAMA_SERVER_TEST_HYBRID_MODEL")
     if not path:
         pytest.skip("set LLAMA_SERVER_TEST_HYBRID_MODEL to a hybrid attention/recurrent gguf")  # ty: ignore[too-many-positional-arguments]
@@ -638,7 +636,7 @@ def test_a_hybrid_model_parks_synchronously():
     _assert_recovered(text, "preempted on request")
 
 
-# [TAG_EXACT_CONCURRENCY] the paged pool places a cell from the sequence and the position alone, so a layout that gives several tokens one position cannot be served
+# [TAG_EXACT_CONCURRENCY] The paged pool places a cell by sequence and position, so layouts with shared positions cannot be served.
 
 def _mrope_model() -> str:
     path = os.environ.get("LLAMA_SERVER_TEST_MROPE_MODEL")
@@ -648,12 +646,12 @@ def _mrope_model() -> str:
 
 
 def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
-    # every token of one image shares a temporal position under M-RoPE, so the pool would give the second one the first one's cell
+    # Under M-RoPE all tokens of one image share a temporal position.
     path = _mrope_model()
     with tempfile.TemporaryDirectory() as tmp:
         mmproj = os.path.join(tmp, "mmproj.gguf")
         with open(mmproj, "wb") as f:
-            f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))  # header only: never read, the refusal comes first
+            f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))  # header only: the refusal comes first
         proc = subprocess.run([
             os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server"),
             "--model", path, "--mmproj", mmproj, "--host", "127.0.0.1", "--port", str(server.server_port),
@@ -665,7 +663,7 @@ def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
 
 
 def test_exact_concurrency_refuses_a_batch_that_cannot_hold_a_whole_ubatch():
-    # a prompt is added in whole ubatches, so -b 512 -ub 512 -np 2 would leave a prefill 511 tokens beside one decoder: the geometry is refused at startup rather than reported as exact and served short
+    # -b 512 -ub 512 -np 2 would leave a 511-token prefill beside one decoder, so startup refuses the geometry.
     path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
     if not path:
         pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")  # ty: ignore[too-many-positional-arguments]
@@ -682,11 +680,11 @@ def test_exact_concurrency_refuses_a_batch_that_cannot_hold_a_whole_ubatch():
 
 
 def test_exact_concurrency_serves_an_mrope_model_without_a_projector():
-    # the refusal is about images, not the rope layout: a text prompt gives every token its own position
+    # The refusal is about images: a text prompt gives every token its own position.
     server.model_file = _mrope_model()
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
-    # the mode needs a batch that holds a whole ubatch beside a decode step of every slot
+    # The mode needs a batch holding a whole ubatch beside a decode step of every slot.
     _start(n_ctx=512, n_slots=2, n_batch=512, n_ubatch=128, fa="on", n_gpu_layer=99)
 
     res = _complete(16, "Once upon a time")
@@ -712,8 +710,8 @@ def _ubatch_widths(text: str) -> list:
 
 
 def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone():
-    # generated tokens enter the batch first and a prompt took what was left, so its ubatches were 512,512,512,509 beside three decoders and 512,512,512,512 alone: isolating the sequences does not make the shapes equal by itself
-    # geometry: -b 2048 -ub 512 -np 4, so the batch holds a whole ubatch beside a decode step of every slot (516 tokens), which is what common_exact_batch_geometry() requires of a start
+    # Generated tokens enter the batch first, so a prompt got ubatches 512,512,512,509 beside three decoders and 512,512,512,512 alone.
+    # -b 2048 -ub 512 -np 4: the batch holds a whole ubatch plus one decode per slot (516 tokens), as common_exact_batch_geometry() requires.
     path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
     if not path:
         pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")  # ty: ignore[too-many-positional-arguments]
@@ -734,7 +732,7 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
         assert res.status_code == 200, res.body
         assert res.body["timings"]["prompt_n"] == 3500
         text = _log()[mark:]
-        # a decode step is one token per slot, so the prompt's own ubatches are the wide ones
+        # Decode steps are one token per slot, so the wide ubatches are the prompt's.
         return [w for w in _ubatch_widths(text) if w > 3]
 
     alone = prefill(1000)
@@ -770,7 +768,7 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
 
 
 def test_slots_reports_a_transferring_slot_apart_from_a_parked_one():
-    # a copy out still owns its cells and a restore has already taken them back, so a reader counting residency has to keep counting both; only a fully parked slot holds nothing
+    # Slots copying out or restoring still hold cells; only a fully parked slot holds nothing.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "1"
     _start_async(n_ctx=256)
 
@@ -809,7 +807,7 @@ def _shift_completion(n_predict: int):
 
 
 def test_a_park_right_after_a_context_shift_does_not_change_the_output():
-    # the shift moves the positions and leaves the K transformation for the next decode, so a park in between used to save the new positions with the old K
+    # A shift defers the K transform to the next decode, so a park in between used to save new positions with old K.
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "0"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "0"
     _start(n_ctx=256, n_batch=32, n_ubatch=32, enable_ctx_shift=True, cache_ram=0)
@@ -821,7 +819,7 @@ def test_a_park_right_after_a_context_shift_does_not_change_the_output():
     n_prompt = reference.body["timings"]["prompt_n"]
     server.stop()
 
-    # park on the step the shift lands on: the pool holds n_ctx cells, so the first shift is that many tokens in
+    # The pool holds n_ctx cells, so the first shift is that many tokens in.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = str(256 - n_prompt)
     _start()
@@ -838,7 +836,7 @@ def test_a_park_right_after_a_context_shift_does_not_change_the_output():
 
 
 def test_a_sibling_prompt_with_an_invalid_token_is_refused_before_anything_streams():
-    # validated with the others ahead of posting: parked behind a running sibling, it used to fail inside a stream that had already opened 200
+    # Validated before posting: parked behind a running sibling, it used to fail inside an already opened 200 stream.
     _start(n_ctx=256, n_slots=2, n_batch=256)
 
     res = server.make_request("POST", "/completion", data={
@@ -852,7 +850,7 @@ def test_a_sibling_prompt_with_an_invalid_token_is_refused_before_anything_strea
 
 
 def test_a_recompute_park_bounds_its_draft_by_the_tokens_it_comes_back_with():
-    # a recompute park moves the prompt out of the slot, and the draft was bounded by the empty prompt: 2000 tokens and a whole draft could not fit a 2048-cell pool "even alone", failing a request that fits
+    # A recompute park empties the prompt, and bounding the draft by it failed a 2000-token request in a 2048-cell pool as impossible.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "1"
     server.spec_type = "ngram-mod"
@@ -873,7 +871,7 @@ def test_a_recompute_park_bounds_its_draft_by_the_tokens_it_comes_back_with():
 
 
 def test_props_says_whether_exact_concurrency_is_running():
-    # a client that asked for the mode reads the answer here: a build that ignores the variable starts all the same
+    # A build ignoring the variable still starts, so clients read the answer here.
     _start(n_ctx=256)
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
@@ -891,7 +889,7 @@ def test_props_reports_exact_concurrency_on():
 
 
 def test_a_recompute_park_under_exact_concurrency_says_it_is_not_byte_identical():
-    # a state that comes back from host memory is the state that left; one rebuilt by re-prefilling differs in the last bits on CUDA, so the mode says so the first time it happens
+    # A re-prefilled state differs in the last bits on CUDA, so the mode reports it the first time.
     server.model_file = _mrope_model()
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
@@ -907,10 +905,10 @@ def test_a_recompute_park_under_exact_concurrency_says_it_is_not_byte_identical(
 
 
 def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
-    # a recompute resume re-prefills instead of restoring the saved bytes, so it is not the continuation the parked state would have given: the request, /slots and /metrics all say how often that happened
+    # A recompute resume is not bit-identical to the saved state; the request, /slots and /metrics report how often it happened.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
-    # a sequence this long holds more than the 1 MiB budget, so every park drops its cells
+    # This sequence exceeds the 1 MiB budget, so every park drops its cells.
     _start(n_ctx=2048, n_batch=2048)
 
     n_predict = 24
@@ -922,7 +920,6 @@ def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
     assert final["preempt"]["parks"] >= 2, final["preempt"]
     assert final["preempt"]["recomputes"] == final["preempt"]["parks"], final["preempt"]
 
-    # the notice comes right after the resume it belongs to
     resumed = [i for i, c in enumerate(comments) if c.startswith(": resumed")]
     assert len(resumed) == final["preempt"]["recomputes"], comments
     for i in resumed:
@@ -932,7 +929,6 @@ def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
     assert metrics["preempt_recompute_total"] == final["preempt"]["recomputes"]
     assert metrics["preempt_recompute_total"] == metrics["n_preempt_total"]
 
-    # a request that is never parked says so
     plain = server.make_request("POST", "/completion", data={
         "n_predict": 4, "prompt": _PROMPT_B, "temperature": 0.0, "seed": 42,
     })
@@ -941,7 +937,7 @@ def test_a_recompute_park_is_reported_to_the_client_and_to_metrics():
 
 
 def test_a_recompute_restore_does_not_count_its_replay_as_prompt():
-    # the re-prefill puts back what the park dropped: counted as prompt it would move the prompt/generation boundary, and since n_gen carries across the park the generation time would then cover only the tokens after the last re-prefill
+    # Counting the re-prefill as prompt would move the prompt/generation boundary, and the generation time would cover only tokens after the last re-prefill.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=2048, n_batch=2048)
@@ -956,12 +952,11 @@ def test_a_recompute_restore_does_not_count_its_replay_as_prompt():
     timings = res.body["timings"]
     assert timings["prompt_n"] == n_prompt, timings
     assert timings["predicted_n"] == n_predict, timings
-    # every re-prefill happens inside the generation, so the generation holds the longer time of the two
+    # Every re-prefill happens during generation, so the generation time is the longer.
     assert timings["predicted_ms"] > timings["prompt_ms"], timings
 
 
 def test_slots_reports_the_recomputes_of_the_current_task():
-    # a reader watching the slots sees the same count the request is given at the end
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=2048, n_batch=2048)
@@ -990,7 +985,7 @@ def test_slots_reports_the_recomputes_of_the_current_task():
 
 
 def test_a_swap_park_is_not_reported_as_a_recompute():
-    # the same park with room for its bytes keeps the sequence it saved, and the client is told so
+    # With room for its bytes the park keeps the saved sequence, and the client is told so.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512)
 
@@ -1022,7 +1017,7 @@ def _stream_responses(n_predict: int, prompt: str) -> dict:
 
 
 def test_a_streamed_response_carries_the_preempt_record_where_a_plain_one_does():
-    # what a client keeps from a streamed /v1/responses is data["response"], so the record has to be in that object, the same place the non-streamed body carries it
+    # Clients keep data["response"] from a streamed /v1/responses, so the record must be there, as in the non-streamed body.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512)
 
@@ -1039,7 +1034,7 @@ def test_a_streamed_response_carries_the_preempt_record_where_a_plain_one_does()
 
 
 def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
-    # a media chunk could not be parked by recompute, so with the host budget spent nothing could be parked at all and the pool overflowing ended both chats. The chunk comes back the way it went in: re-encoded off the task, its cells reserved whole
+    # Media chunks could not be recompute-parked, so with no budget the pool overflowed and ended both chats. Now the chunk is re-encoded from the task with its cells reserved whole.
     os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
@@ -1066,8 +1061,8 @@ def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
 
 
 def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
-    # a park with no budget for the state drops the cells of a prompt that is still being processed, and the resume starts that prefill again from nothing: what it had counted before the park has to go with the cells, or the request reports more prompt tokens than it has
-    # the park is made to fail its host allocation, so it drops the cells instead: the state of a half processed prompt is small enough to fit any budget
+    # A recompute park mid-prefill restarts the prefill, so the prompt count before the park must be dropped too.
+    # The park's host allocation is forced to fail, so it drops the cells instead.
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
     _start(n_ctx=2048, n_batch=256)
 
@@ -1075,7 +1070,7 @@ def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     t = threading.Thread(target=lambda: resident.append(_complete(1900, _PROMPT_A)), daemon=True)
     t.start()
 
-    # the pool has to be nearly full before the second prompt starts, so that it is that prefill which runs out of cells
+    # The pool must be nearly full before the second prompt starts, so its prefill runs out of cells.
     deadline = time.time() + 90
     while t.is_alive() and time.time() < deadline:
         slots = server.make_request("GET", "/slots").body
@@ -1094,7 +1089,7 @@ def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     assert "error" not in final, final
     assert comments and comments[0] == ": preempted", comments
 
-    # a park that dropped fewer cells than the resume has tokens to put back is a park taken mid-prefill, which is the case this test is about
+    # A park that dropped fewer cells than the resume puts back was taken mid-prefill, the case under test.
     parks = [(int(cells), int(again)) for cells, again in re.findall(
         r"preempted: (\d+) cells dropped .*? (\d+) tokens to re-prefill", _log())]
     assert any(0 < cells < again for cells, again in parks), parks
@@ -1140,12 +1135,12 @@ def _serve_with_training_context(n_ctx_train: int):
 
 
 def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
-    # a parked head of 7300 cells needs nearly the whole pool, and short requests that fit kept arriving and finishing, two queued per slot, so a resident was always there and the head waited for as long as the stream lasted. Once the head has waited its turn, a prompt that has never been resident waits for it.
-    # 1 MiB holds no short request's state, so none is rotated out for the head before PREEMPT_ROTATE_RECOMPUTE_US: what brings the head back early is the reservation alone
+    # A 7300-cell parked head used to wait forever while short requests kept a resident present. Once the head has waited its turn, never-resident prompts wait for it.
+    # 1 MiB holds no short request's state, so only the reservation brings the head back before PREEMPT_ROTATE_RECOMPUTE_US.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
-    # parks the head while it generates; a short request never gets that far
+    # Parks the head while it generates.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "48"
-    # the scheduling under test is host code; on CUDA a prompt chunk across position 2048 of this context-extended model hangs llama_decode, the pin's base included, so the server runs on the CPU
+    # On CUDA a prompt chunk across position 2048 of this model hangs llama_decode (also on base), so run on CPU; the code under test is host-side.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     _serve_with_training_context(8192)
     _start(n_ctx=8192, n_slots=4, n_batch=1024)
@@ -1153,7 +1148,7 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     short_prompt = _prompt_of(1700, _PROMPT_B)
     head_prompt = _prompt_of(7200, _PROMPT_A)
     n_short, n_head = 32, 100
-    # a starved head waits for as long as the stream lasts, so any bound catches it; the head prefills its 7200 tokens three times (two parks, no room to keep them), which took 46 s on a CPU CI runner and 92 s on a Windows one
+    # A starved head waits forever, so any bound catches it; the head prefills 7200 tokens three times, 46 s on a CPU runner and 92 s on Windows.
     t_stream_max = 240.0
 
     stop = threading.Event()
@@ -1197,7 +1192,7 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     assert "Context size has been exceeded" not in text
     assert not stopped_early, f"the head was still waiting when the stream was stopped after {t_stream_max} s"
     assert "prompt held:" in text, "no prompt was held back for the head"
-    # the head comes back once the residents in front of it have finished, about one quantum after each park
+    # The head returns once the residents ahead of it finish, about one quantum after each park.
     waits = [float(w) for w in re.findall(r"id +3 \| task \d+ \| resumed after ([\d.]+) s", text)]
     assert waits, "the head was never parked and resumed"
     assert max(waits) < 10.0, f"the head waited {waits} s behind requests that came after it"
@@ -1205,7 +1200,7 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
 
 @pytest.mark.slow
 def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
-    # only a resident cycling through context shifts used to be rotated, so a long generation that fits the pool held it to the end, and the parked slot waited for all of it
+    # Only context-shifting residents used to be rotated, so a long generation that fit held the pool and the parked slot waited for all of it.
     _serve_with_training_context(16384)
     _start(n_ctx=16384, n_slots=2, n_batch=2048)
 
@@ -1215,7 +1210,7 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
         res = _raw_completion(n_predict, prompt, id_slot, timeout=900)
         done[name] = (time.time(), res)
 
-    # A leads B by 564 cells throughout, so B is the one parked once the two fill the pool; A then has about 7600 tokens to go, far longer than the 2 s a parked head waits
+    # A leads B by 564 cells, so B is parked once the pool fills, and A then runs far longer than the 2 s a parked head waits.
     a = threading.Thread(target=run, args=("a", 16000, _prompt_of(64, _PROMPT_A), 0))
     a.start()
     deadline = time.time() + 300
@@ -1239,7 +1234,7 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
 
 
 def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():
-    # the second chunk of a long prompt is short of about 600 cells: smallest first parked both 400-token residents, where the 1400-token one covers the shortfall alone
+    # The second chunk is about 600 cells short: smallest-first parked both 400-token residents, where the 1400-token one alone covers it.
     _serve_with_training_context(8192)
     _start(n_ctx=4864, n_slots=4, n_batch=2048)
 
@@ -1249,7 +1244,7 @@ def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small
 
     with ThreadPoolExecutor(4) as pool:
         residents = [pool.submit(_raw_completion, 300, p, i) for i, p in enumerate(small + [medium])]
-        # every resident is generating before the leader arrives, so the leader's second chunk is what the pool is short of
+        # Every resident is generating before the leader arrives, so the leader's second chunk is the shortfall.
         deadline = time.time() + 60
         while time.time() < deadline:
             slots = server.make_request("GET", "/slots").body
@@ -1274,7 +1269,7 @@ def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small
 
 @pytest.mark.parametrize("ram", ["8192", "0", "unset"])
 def test_props_reports_the_preemption_setup(ram):
-    # a client deciding whether to rely on parking reads this instead of guessing from the version
+    # Clients read this instead of guessing from the version.
     if ram == "unset":
         os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
     else:
@@ -1311,7 +1306,7 @@ def test_props_reports_the_planning_granularity():
 
 
 def test_a_growing_sequence_keeps_its_pinned_buffer_across_parks():
-    # the pinned buffer was sized to the exact state, so every park of a sequence that had grown since the last one unpinned it and pinned a new one, which costs about as long as the copy itself
+    # Pinned buffers sized exactly were re-pinned on every park of a grown sequence, costing about as much as the copy.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start_async(n_ctx=2048)
 
@@ -1327,7 +1322,7 @@ def test_a_growing_sequence_keeps_its_pinned_buffer_across_parks():
 
 
 def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():
-    # an array prompt is one ordinary task per prompt, each parked on its own; the OAI response merges them into one object, so its counters are the sum, as /completion reports them per prompt
+    # An array prompt is one task per prompt, each parked separately; the OAI response merges them, so its counters are the sum.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start()
 
