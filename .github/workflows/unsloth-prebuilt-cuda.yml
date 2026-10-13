@@ -6,6 +6,13 @@ name: "Unsloth prebuilt: CUDA"
 # Reusable child of unsloth-prebuilt.yml. Builds the per-profile CUDA bundles
 # the parent's `resolve` job filtered into `matrix`. Each entry uploads a
 # single app-*.tar.gz artifact for the parent's assemble step to pick up.
+#
+# Two jobs per profile since 2026-09. `warm` shards (N per profile from the parent, 0 = skipped)
+# each restore the newest ccache generation, compile a 1/N slice of the ggml-cuda objects and save
+# only what the compile added or rewrote; `build` merges the deltas over the generation
+# newest-file-wins (slices are disjoint) and runs the full build. Shards are best effort: a dead
+# one costs compile time, never a release. A base bump touching ggml-cuda/common.cuh invalidates
+# every CUDA object; parallel shards are the only lever without larger runners.
 
 on:
   workflow_call:
@@ -29,16 +36,160 @@ on:
         default: ''
         type: string
       matrix:
-        description: 'Matrix JSON {include:[...]} produced by the parent resolve job'
+        description: 'Matrix JSON {include:[...]} produced by the parent resolve job; each row carries `shards`'
         required: true
+        type: string
+      warm_matrix:
+        description: 'Matrix JSON {include:[...]} of (profile row x shard) for the warm job, or empty to skip warming'
+        required: false
+        default: ''
         type: string
 
 permissions:
   contents: read
 
 jobs:
+  warm:
+    name: warm ${{ matrix.arch }}/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    # An empty string, not an empty include list: with the `if` false the strategy is never
+    # evaluated, while fromJSON('{"include":[]}') fails the job instead of skipping it.
+    if: ${{ inputs.warm_matrix != '' }}
+    runs-on: ${{ matrix.runner }}
+    # Best effort (see header); the parent's waiter excludes ` / warm ` jobs.
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.warm_matrix) }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          path: tooling
+
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-linux-setup
+        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
+          cuda: ${{ matrix.cuda }}
+          arch: ${{ matrix.arch }}
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+
+      # Previous deltas are restored too (tagless fallback), so a retry compiles only what changed since them.
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
+        run: |
+          set -euo pipefail
+          for d in shards/*/; do
+            [ -d "$d" ] || continue
+            echo "merging $d ($(find "$d" -type f | wc -l) files, $(du -sh "$d" | cut -f1))"
+            cp -au "$d." "${{ github.workspace }}/.ccache/"
+          done
+          rm -rf shards
+          ccache -z
+
+      # Path + size, manifests by hash (the one file ccache rewrites in place). Not mtimes:
+      # ccache touches every hit, so on a warm night everything looks newer.
+      - name: Snapshot the restored cache
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
+
+      - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Stable order, dealt round-robin; the build compiles whatever a shard did not reach.
+          ninja -C build -t targets all \
+            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.o:' | cut -d: -f1 | sort \
+            | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
+          echo "$(wc -l < shard.txt) CUDA objects in this shard"
+          xargs -a shard.txt ninja -C build -j 3
+
+      - name: ccache stats
+        if: ${{ always() }}
+        run: ccache -s -v
+
+      # Only what this job added or rewrote, tree layout preserved: never a 4 GB copy of the generation.
+      - name: Export the shard delta
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          W="${{ github.workspace }}"
+          mkdir -p "$W/shards/${{ matrix.shard }}"
+          cd "$W/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "$W/shard.after"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "$W/shard.after.m"
+          { comm -13 "$W/shard.before" "$W/shard.after" | cut -f1
+            comm -13 "$W/shard.before.m" "$W/shard.after.m" | awk '{ print $2 }'; } | sort -u > "$W/shard.changed"
+          xargs -a "$W/shard.changed" -d '\n' -r cp --parents -a -t "$W/shards/${{ matrix.shard }}/"
+          echo "$(find "$W/shards/${{ matrix.shard }}" -type f | wc -l) files, $(du -sh "$W/shards/${{ matrix.shard }}" | cut -f1)"
+
+      - name: Save shard ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/${{ matrix.shard }}
+          # Shard index ahead of the profile so the generation prefix restore never picks a shard.
+          key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
   build:
     name: ${{ matrix.arch }}/${{ matrix.profile }}
+    # Runs whatever the shards did (fewer hits at worst); only a cancelled run stops here.
+    needs: warm
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -59,144 +210,66 @@ jobs:
         with:
           path: tooling
 
-      # The parent's resolve job built the source tree (upstream base + any mix
-      # PRs, with the build number/commit and Unsloth fingerprint baked
-      # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
-      # instead of cloning -- no .git needed, the build number is already baked.
-      - name: Download source @ ${{ inputs.tag }}
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+      - name: Source, toolkit, ccache, configure
+        uses: ./tooling/.github/actions/unsloth-cuda-linux-setup
         with:
-          name: ${{ inputs.source_artifact }}
-          path: srcpkg
-      - name: Extract source
-        shell: bash
-        run: |
-          set -eux
-          mkdir -p src
-          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
-
-      - name: Install build dependencies
-        run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev
-
-      - name: Install ARM64 host compiler (gcc-14)
-        if: matrix.arch == 'arm64'
-        run: |
-          set -eux
-          sudo apt-get install -y gcc-14 g++-14
-          {
-            echo "CC=gcc-14"
-            echo "CXX=g++-14"
-            echo "CUDAHOSTCXX=g++-14"
-          } >> "$GITHUB_ENV"
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
-        with:
-          key: cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}
-          restore-keys: |
-            cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}
-          append-timestamp: false
-          variant: ccache
-          max-size: 2G
-          save: false
-
-      # Jimver has no mapping for CUDA 13.3 yet, so for that version we pull the
-      # toolkit components straight from NVIDIA's redist CDN (same source Jimver
-      # and ggml-org use) and assemble a prefix by hand. Component versions are
-      # from NVIDIA's redistrib_13.3.0.json. Runs on the same ubuntu runner, so
-      # the glibc floor is unchanged. Any other version uses Jimver.
-      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
-        if: matrix.cuda == '13.3'
-        run: |
-          set -eux
-          case "${{ matrix.arch }}" in
-            x64)   PLAT=linux-x86_64 ;;
-            arm64) PLAT=linux-sbsa ;;
-            *) echo "unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
-          esac
-          PREFIX="$HOME/cuda-13.3"
-          mkdir -p "$PREFIX"
-          BASE="https://developer.download.nvidia.com/compute/cuda/redist"
-          for cv in \
-            cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 \
-            cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 \
-            cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1; do
-            comp="${cv%:*}"; ver="${cv#*:}"
-            name="${comp}-${PLAT}-${ver}-archive"
-            curl -fsSL -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
-            tar -xf comp.tar.xz
-            cp -a "${name}/." "$PREFIX"/
-            rm -rf comp.tar.xz "${name}"
-          done
-          # Redist ships libs under lib/; some CMake CUDA discovery expects lib64.
-          ln -sfn lib "$PREFIX/lib64"
-          {
-            echo "CUDA_PATH=$PREFIX"
-            echo "CUDA_HOME=$PREFIX"
-            echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"
-          } >> "$GITHUB_ENV"
-          echo "$PREFIX/bin" >> "$GITHUB_PATH"
-
-      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
-        if: matrix.cuda != '13.3'
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76  # v0.2.35
-        id: cuda-toolkit
-        with:
+          tag: ${{ inputs.tag }}
+          source_artifact: ${{ inputs.source_artifact }}
           cuda: ${{ matrix.cuda }}
-          method: 'network'
+          arch: ${{ matrix.arch }}
+          archs: ${{ matrix.archs }}
+          profile: ${{ matrix.profile }}
+          max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      - name: Set up CUDA environment (Jimver)
-        if: matrix.cuda != '13.3'
+      # One restore per possible shard (max four); a shard that never saved is just a miss.
+      - name: Restore warm shard 0
+        if: ${{ matrix.shards >= 1 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/0
+          key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 1
+        if: ${{ matrix.shards >= 2 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/1
+          key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 2
+        if: ${{ matrix.shards >= 3 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/2
+          key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Restore warm shard 3
+        if: ${{ matrix.shards >= 4 }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: shards/3
+          key: ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          restore-keys: |
+            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+
+      - name: Merge warm shards into the ccache
+        if: ${{ matrix.shards >= 1 }}
         run: |
-          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-
-      - name: Verify CUDA
-        run: nvcc --version
-
-      - name: Configure
-        working-directory: src
-        run: |
-          set -eux
-          # Three non-obvious flags:
-          #  - CMAKE_INSTALL_RPATH=$ORIGIN + RPATH knobs: the tar.gz layout
-          #    ships sibling .so files in the same directory as the binaries.
-          #  - CMAKE_CUDA_ARCHITECTURES: explicit per-profile arch list, the
-          #    whole point of the matrix.
-          #  - CMAKE_*_COMPILER_LAUNCHER=ccache: Jimver installs nvcc outside
-          #    /usr/local/bin, so PATH-symlinked ccache misses CUDA TUs --
-          #    setting the launcher explicitly caches nvcc too.
-          # No LLAMA_FATAL_WARNINGS on this leg, unlike cpu/vulkan/macos. Here it also
-          # sets nvcc -Werror all-warnings, and the host warnings arrive through an
-          # -Xcompiler list llama.cpp composes itself, which CMAKE_CXX_FLAGS does not
-          # reach -- verified on 08-27, where the suppression added that morning was
-          # absent from the actual nvcc command line. So the warning set here is
-          # all-or-nothing, and 'all' means every libstdc++ false positive fails a
-          # release: cuda13-newer and cuda13-portable both died on a GCC 11
-          # -Wstringop-overflow inside std::copy, from ggml_cuda_try_fuse.
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=OFF \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DGGML_RPC=ON \
-            -DGGML_CUDA=ON \
-            -DGGML_CUDA_CUB_3DOT2=ON \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_TOOLS=ON \
-            -DLLAMA_BUILD_SERVER=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          set -euo pipefail
+          for d in shards/*/; do
+            [ -d "$d" ] || continue
+            echo "merging $d ($(find "$d" -type f | wc -l) files, $(du -sh "$d" | cut -f1))"
+            cp -au "$d." "${{ github.workspace }}/.ccache/"
+          done
+          rm -rf shards
+          ccache -z
 
       - name: Build
         working-directory: src
@@ -207,7 +280,8 @@ jobs:
           # -j 3: this multi-arch nvcc build peaks at ~3 GB host RSS on the
           # 4 vCPU / 16 GB GitHub-hosted runners (x64 and arm64 alike, measured
           # over a 1s sampler), so 3 parallel TUs leave ~13 GB free. -j 4 adds
-          # no speed (the runner is ~2 physical cores + HT), so 3 is the sweet spot.
+          # no speed (the runner is ~2 physical cores + HT), so 3 is the sweet spot;
+          # -j 2 with nvcc --threads 2 measured within 5%, not worth the flag.
           cmake --build build --config Release -j 3
           strip build/bin/llama-* || true
 
@@ -235,6 +309,19 @@ jobs:
           fi
           exit 0
 
+      # Misses on every CUDA TU with C++ hitting is a base bump that touched a shared CUDA header.
+      - name: ccache stats
+        if: ${{ always() }}
+        run: |
+          ccache -s -v
+          {
+            echo "### ccache ${{ matrix.arch }}/${{ matrix.profile }}"
+            echo ""
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Package bundle
         env:
           PLATFORM: linux
@@ -251,6 +338,8 @@ jobs:
           KLASS: ${{ matrix.klass }}
           RANK: ${{ matrix.rank }}
           TOOLKIT_LINE: ${{ matrix.toolkit_line }}
+          # Provenance label kept byte for byte as under the Jimver install: bundles must stay
+          # identical, metadata included, and the compiler behind the label is the same nvcc.
           DOCKER_IMAGE: github-hosted ${{ matrix.runner }}, CUDA ${{ matrix.cuda }} ${{ matrix.cuda == '13.3' && '(NVIDIA redist)' || '(Jimver)' }}
           ARCHS: ${{ matrix.archs }}
           SMS: ${{ matrix.sms }}
@@ -268,10 +357,11 @@ jobs:
         # single ~5 minute teardown window (measured ~4m50s after process
         # kill), shared by every remaining step and not replenished. Evicting
         # spends that window on housekeeping; the save is what actually needs
-        # it, and a 2 GB cache is not quick to write.
+        # it, and a multi-GB cache is not quick to write. 7 days: with a daily base bump an
+        # object idle for a week is dead, and the smaller dir keeps restore and save near a minute.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: ccache --evict-older-than 14d
+        run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Save even when the build failed: the objects compiled before the
@@ -283,8 +373,11 @@ jobs:
         # the CANCELLATION path, not the failure path, so !cancelled() would
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
+        #
+        # Run id and attempt on the key: entries are immutable, so a same-tag retry could
+        # otherwise never replace a partial save. The restore prefix ignores the suffix.
         if: ${{ always() }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
