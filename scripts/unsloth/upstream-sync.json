@@ -20,7 +20,7 @@
     "merge-base(--fork, --upstream). Pass a --fork ref whose ancestry is already correct, or it",
     "measures the stale set and reports failures that are artefacts of the bad base."
   ],
-  "tag": "b10632",
-  "commit": "11cd98842874cc1b87ac274bd2d5cceb38102bb2",
-  "synced_at": "2026-08-26"
+  "tag": "b11436",
+  "commit": "b9a5a00b86fd285a445916086a0b1dc35bee6d66",
+  "synced_at": "2026-10-06"
 }
