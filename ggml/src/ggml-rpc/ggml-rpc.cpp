@@ -537,7 +537,7 @@ private:
     rpc_msg_queue    queue;
     socket_ptr       sock;
     std::atomic_uint busy_spin_users = 0;
-    std::atomic_bool running;
+    std::atomic_bool running{false};
     std::thread      thread;
 };
 
