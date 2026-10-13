@@ -37,6 +37,11 @@
 #include <windows.h>
 #endif
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -138,7 +143,8 @@ struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
     struct token {
-        int32_t id_slot;
+        int32_t id_slot; // global slot id, used to attribute stats
+        int32_t seq_id;  // sequence id inside the context of the slot's pipeline group
         llama_token token;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos; // only pos[0] is used for text tokens
         bool output;
@@ -166,20 +172,20 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, int32_t seq_id, llama_token token, llama_pos pos, bool output, bool is_prompt) {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, { pos, 0, 0, 0 }, output, is_prompt });
+        tokens.push_back({ id_slot, seq_id, token, { pos, 0, 0, 0 }, output, is_prompt });
         return true;
     }
 
     // embd_in has n_embd values, pos has GGML_MROPE_SECTIONS values
-    bool add_embd(int32_t id_slot, const float * embd_in, const llama_pos * pos, bool output, bool is_prompt) {
+    bool add_embd(int32_t id_slot, int32_t seq_id, const float * embd_in, const llama_pos * pos, bool output, bool is_prompt) {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, { pos[0], pos[1], pos[2], pos[3] }, output, is_prompt });
+        tokens.push_back({ id_slot, seq_id, LLAMA_TOKEN_NULL, { pos[0], pos[1], pos[2], pos[3] }, output, is_prompt });
         tokens.back().i_embd = (int32_t) (embd.size() / n_embd);
         embd.insert(embd.end(), embd_in, embd_in + n_embd);
         return true;
@@ -233,9 +239,9 @@ struct server_batch {
         for (int32_t i = off; i < off + n_tokens; i++) {
             const auto & t = tokens[i];
             if (t.i_embd >= 0) {
-                view.add_embd({ embd.data() + (size_t) t.i_embd * n_embd, 1, (size_t) n_embd }, t.pos.data(), t.id_slot, t.output);
+                view.add_embd({ embd.data() + (size_t) t.i_embd * n_embd, 1, (size_t) n_embd }, t.pos.data(), t.seq_id, t.output);
             } else {
-                view.add(t.token, t.pos[0], t.id_slot, t.output);
+                view.add(t.token, t.pos[0], t.seq_id, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
         }
@@ -244,6 +250,10 @@ struct server_batch {
 
 struct server_slot {
     int id;
+
+    int id_group = 0;
+
+    int seq_id = 0;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -310,8 +320,8 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -323,16 +333,16 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, seq_id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -343,7 +353,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        mem.seq_rm(seq_id, -1, -1);
 
         prompt.clear();
     }
@@ -406,7 +416,7 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        llama_set_sampler(ctx_tgt, seq_id, nullptr);
 
         // clear alora start
         alora_invocation_start = -1;
@@ -551,9 +561,9 @@ struct server_slot {
                 const llama_pos p = prompt.tokens.pos_next();
                 const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
                 GGML_ASSERT((int32_t) inp_embd.size() == batch.n_embd);
-                add_ok &= batch.add_embd(id, inp_embd.data(), pos, true, false);
+                add_ok &= batch.add_embd(id, seq_id, inp_embd.data(), pos, true, false);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, seq_id, sampled, prompt.tokens.pos_next(), true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -571,9 +581,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            add_ok &= batch.add(id, seq_id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(this->id, seq_id, token, pos0++, true, false);
             }
         }
 
@@ -767,8 +777,8 @@ struct server_slot {
 
     // the other slot continues from the tokens processed so far
     void copy_prompt_to(server_slot & other) const {
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        mem.seq_rm(other.seq_id,         -1, -1);
+        mem.seq_cp(seq_id, other.seq_id, -1, -1);
 
         other.prompt = prompt.clone();
     }
@@ -776,8 +786,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        mem.seq_rm(other.seq_id,         -1, -1);
+        mem.seq_cp(seq_id, other.seq_id, -1, -1);
 
         other.i_batch = i_batch;
 
@@ -869,7 +879,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     chunk.get(),
                     embd,
                     slot.prompt.tokens.pos_next(),
-                    slot.id,
+                    slot.seq_id,
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
                     cb,
@@ -926,12 +936,54 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
             pos[2] = rel.x;
             pos[3] = rel.z;
         }
-        if (!batch.add_embd(slot.id, embd + i * n_embd, pos, slot.need_embd(), /* is_prompt */ true)) {
+        if (!batch.add_embd(slot.id, slot.seq_id, embd + i * n_embd, pos, slot.need_embd(), /* is_prompt */ true)) {
             return false;
         }
     }
     return true;
 }
+
+struct server_group {
+    int id = 0;
+
+    llama_context * ctx = nullptr;
+
+    // groups after the first are made by llama_init_from_model(), which does not attach the pool
+    // common_init_from_params() builds for group 0. Declared after ctx so it outlives the
+    // llama_free() above groups.clear().
+    std::unique_ptr<common_threadpools> threadpools;
+
+    // common_speculative_init_result never attaches a pool, so without this the draft context ignores
+    // --cpu-mask-draft, --prio, --poll and --cpu-strict. Declared before spec_init so it is destroyed
+    // after the draft context it is attached to.
+    std::unique_ptr<common_threadpools> threadpools_dft;
+
+    server_batch batch;
+
+    std::vector<server_slot *> slots;
+
+    common_speculative_init_result_ptr spec_init;
+
+    llama_model   * model_dft = nullptr;
+    llama_context * ctx_dft   = nullptr;
+
+    common_speculative_ptr spec;
+
+    common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // note: async, so only valid after a sync; kept out of server_metrics, which is copied as-is
+    int64_t  t_decode_start  = 0; // start of the last submitted decode of this group
+    int64_t  t_prompt_start  = 0; // start of the oldest queued prompt decode of this group
+    uint64_t n_prompt_queued = 0;
+
+    int n_empty_consecutive = 0;
+
+    std::thread thread;
+    std::mutex              mtx;  // guards this group's slots, batch and the two fields below
+    std::condition_variable cv;
+    bool busy        = false; // a decode is in flight, no one may touch ctx
+    int  n_pause_req = 0;     // someone wants this group stopped, do not start a new iteration
+};
 
 //
 // server_context_impl (private implementation)
@@ -960,6 +1012,8 @@ public:
     server_chat_params chat_params;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
+
+    int n_pipeline_groups_req = 1;
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
@@ -992,17 +1046,17 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
-    server_batch batch;
+    int n_groups = 1;
+    std::vector<std::unique_ptr<server_group>> groups;
 
-    llama_model   * model_dft = nullptr;
-    llama_context * ctx_dft   = nullptr;
+    int n_seq_per_group = 1;
 
-    common_speculative_init_result_ptr spec_init;
+    std::atomic<bool> groups_stop { false };
+
+    std::mutex mtx_metrics;
+    std::mutex mtx_prompt_cache;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-    common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-
-    common_speculative_ptr spec;
 
     bool add_bos_token = true;
 
@@ -1019,17 +1073,9 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
-    int n_empty_consecutive = 0;
-
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
-
-    // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-    // note: kept out of server_metrics, which is copied as-is into the task result
-    int64_t  t_decode_start  = 0; // start of the last submitted decode
-    int64_t  t_prompt_start  = 0; // start of the oldest queued prompt decode
-    uint64_t n_prompt_queued = 0;
 
     json json_ui_settings = json::object();
 
@@ -1045,11 +1091,21 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        spec.reset();
-        spec_init.reset();
+        for (auto & grp : groups) {
+            grp->spec.reset();
+            grp->spec_init.reset();
 
-        ctx_dft   = nullptr;
-        model_dft = nullptr;
+            grp->ctx_dft   = nullptr;
+            grp->model_dft = nullptr;
+        }
+
+        for (size_t g = 1; g < groups.size(); ++g) {
+            if (groups[g]->ctx != nullptr) {
+                llama_free(groups[g]->ctx);
+                groups[g]->ctx = nullptr;
+            }
+        }
+        groups.clear();
 
         llama_init.reset();
 
@@ -1213,10 +1269,51 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        n_groups = std::max(1, n_pipeline_groups_req);
+
+        if (n_groups > 1 && !validate_pipeline_groups(params_base, has_mmproj)) {
+            return false;
+        }
+
+        n_seq_per_group = params_base.n_parallel / n_groups;
+
+        common_params   params_grp = n_groups > 1 ? params_base : common_params{};
+        common_params & params_ctx = n_groups > 1 ? params_grp  : params_base;
+
+        if (n_groups > 1) {
+            params_ctx.n_parallel = n_seq_per_group;
+
+            // a per-slot cap bounds what one group's P/N slots can use, the rest of the pool is never reached
+            if (params_ctx.kv_unified_per_slot > 0) {
+                params_ctx.n_ctx = std::min(params_ctx.n_ctx, n_seq_per_group * params_ctx.kv_unified_per_slot);
+            }
+
+            // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked every
+            // request to be able to reach, and splitting the server into groups is an internal
+            // arrangement that should not quietly redefine it.
+
+            // common_init_from_params fits ONE context and fixes the model placement from that
+            // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
+            // can no longer change.
+            if (params_ctx.fit_params) {
+                reserve_extra_group_memory(params_ctx, has_draft, spec_mtp);
+            }
+        }
+
+        llama_init = common_init_from_params(params_ctx);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        if (n_groups > 1) {
+            const int n_parallel_total = params_base.n_parallel;
+            const int n_ctx_total      = params_base.n_ctx;
+
+            params_base = params_ctx;
+
+            params_base.n_parallel = n_parallel_total;
+            params_base.n_ctx      = n_ctx_total;
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -1237,7 +1334,44 @@ private:
             return false;
         }
 
-        n_ctx = llama_n_ctx(ctx_tgt);
+
+        {
+            groups.clear();
+            groups.reserve(n_groups);
+
+            for (int g = 0; g < n_groups; ++g) {
+                groups.emplace_back(new server_group());
+                groups[g]->id = g;
+            }
+
+            groups[0]->ctx = ctx_tgt;
+
+            for (int g = 1; g < n_groups; ++g) {
+                llama_context_params cparams = common_context_params_to_llama(params_ctx);
+
+                cparams.n_ctx     = llama_n_ctx(ctx_tgt);
+                cparams.n_seq_max = llama_n_seq_max(ctx_tgt);
+
+                groups[g]->ctx = llama_init_from_model(model_tgt, cparams);
+                if (groups[g]->ctx == nullptr) {
+                    SRV_ERR("failed to create llama_context for pipeline group %d\n", g);
+                    for (int j = 1; j < g; ++j) {
+                        llama_free(groups[j]->ctx);
+                        groups[j]->ctx = nullptr;
+                    }
+                    groups.clear();
+                    return false;
+                }
+
+                groups[g]->threadpools = std::make_unique<common_threadpools>();
+                groups[g]->threadpools->init(groups[g]->ctx, params_ctx);
+
+                SRV_INF("created llama_context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
+                        g, (int) llama_n_ctx(groups[g]->ctx), (int) llama_n_seq_max(groups[g]->ctx));
+            }
+        }
+
+        n_ctx = llama_n_ctx(ctx_tgt) * n_groups;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1246,30 +1380,42 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
-            {
-                common_params params_dft = common_base_params_to_speculative(params_base);
+            for (int g = 0; g < n_groups; ++g) {
+                server_group & grp = *groups[g];
+
+                common_params params_dft = common_base_params_to_speculative(params_ctx);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
-                model_dft = spec_init->model();
-                ctx_dft   = spec_init->context();
+                grp.spec_init = common_speculative_init_from_params(params_dft, model_tgt, grp.ctx);
+                grp.model_dft = grp.spec_init->model();
+                grp.ctx_dft   = grp.spec_init->context();
 
-                if (has_draft && model_dft == nullptr) {
+                if (has_draft && grp.model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (grp.ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
 
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+                // params_dft, not params_ctx: the draft has its own cpu params and this is the only
+                // place they can reach the draft context
+                grp.threadpools_dft = std::make_unique<common_threadpools>();
+                grp.threadpools_dft->init(grp.ctx_dft, params_dft);
+
+                if (n_groups > 1) {
+                    SRV_INF("created draft context for pipeline group %d, n_ctx = %d, n_seq_max = %d\n",
+                            g, (int) llama_n_ctx(grp.ctx_dft), (int) llama_n_seq_max(grp.ctx_dft));
+                }
             }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = groups[0]->ctx_dft;
 
             load_progress_callback(1.0f, &load_progress_spec);
         }
@@ -1397,30 +1543,37 @@ private:
         }
 
         // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-            try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-            } catch (const std::exception & e) {
-                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-                if (params_base.speculative.has_synth()) {
-                    return false;
+        for (auto & grp : groups) {
+            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                common_params_speculative params_spec = params_base.speculative;
+
+                params_spec.draft.ctx_tgt = grp->ctx;
+                params_spec.draft.ctx_dft = grp->ctx_dft;
+
+                try {
+                    grp->spec.reset(common_speculative_init(params_spec, n_seq_per_group));
+                } catch (const std::exception & e) {
+                    SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                    if (params_base.speculative.has_synth()) {
+                        return false;
+                    }
                 }
+            }
+
+            if (grp->ctx_dft) {
+                grp->ctx_dft_seq_rm_type = common_context_can_seq_rm(grp->ctx_dft);
+            }
+
+            if (grp->spec) {
+                SRV_TRC("%s", "speculative decoding context initialized\n");
+            } else {
+                grp->spec_init.reset();
+                grp->ctx_dft   = nullptr;
+                grp->model_dft = nullptr;
             }
         }
 
-        if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
-        }
-
-        if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
-        } else {
-            spec_init.reset();
-            ctx_dft   = nullptr;
-            model_dft = nullptr;
-        }
-
-        if (!spec && params_base.speculative.has_synth()) {
+        if (!groups[0]->spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
         }
@@ -1428,11 +1581,17 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
-            slot.id      = i;
-            slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
-            slot.spec    = spec.get();
+            server_group & grp = *groups[i / n_seq_per_group];
+
+            slot.id       = i;
+            slot.id_group = grp.id;
+            slot.seq_id   = i % n_seq_per_group;
+            slot.ctx_tgt  = grp.ctx;
+            slot.ctx_dft  = grp.ctx_dft;
+            slot.mem.init(grp.ctx, grp.ctx_dft);
+
+            grp.slots.push_back(&slot);
+            slot.spec    = grp.spec.get();
             slot.n_ctx   = n_ctx_slot();
 
             slot.mctx                   = mctx;
@@ -1486,7 +1645,9 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
+            for (auto & grp : groups) {
+                grp->batch.init(grp->ctx, std::max(n_batch, n_seq_per_group), n_embd);
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -1538,6 +1699,39 @@ private:
         return true;
     }
 
+    bool validate_pipeline_groups(const common_params & params, bool has_mmproj) const {
+        auto refuse = [](const char * what) {
+            SRV_ERR("--pipeline-groups > 1 is not supported together with %s\n", what);
+            return false;
+        };
+
+        if (params.n_parallel < n_groups || params.n_parallel % n_groups != 0) {
+            SRV_ERR("--parallel (%d) must be a positive multiple of --pipeline-groups (%d)\n",
+                    params.n_parallel, n_groups);
+            return false;
+        }
+
+        if (params.n_ctx <= 0) {
+            SRV_ERR("%s", "--pipeline-groups > 1 requires an explicit context size, pass -c N\n");
+            return false;
+        }
+
+        if (has_mmproj) {
+            return refuse("multimodal (--mmproj)");
+        }
+
+        // common_init_from_params() applies it only to the context it creates
+        if (!params.control_vectors.empty()) {
+            return refuse("--control-vector");
+        }
+
+        if (params.sleep_idle_seconds >= 0) {
+            return refuse("--sleep-idle");
+        }
+
+        return true;
+    }
+
     // unlike load_model(), this is only called once during initialization
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
@@ -1550,7 +1744,13 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
-            update_slots();
+            if (n_groups > 1) {
+                return;
+            }
+            if (groups.empty()) {
+                return; // no model loaded
+            }
+            update_slots(*groups[0]);
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -1658,6 +1858,214 @@ private:
         return true;
     }
 
+    // Add what the extra pipeline groups will allocate to the fitter's per-device margin.
+    void reserve_extra_group_memory(common_params & params_ctx, bool has_draft, bool spec_mtp) const {
+        const size_t n_extra = n_groups - 1;
+
+        std::vector<size_t> added(params_ctx.fit_params_target.size(), 0);
+
+        std::vector<ggml_backend_dev_t> devs_tgt;
+
+        auto reserve = [&](common_params p, bool as_mtp, bool count_weights, bool is_target) {
+            auto mparams = common_model_params_to_llama(p);
+            auto cparams = common_context_params_to_llama(p);
+            if (as_mtp) {
+                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, n_ctx_train = 0, n_expert = 0;
+
+            const auto mem = common_get_device_memory_data(p.model.path.c_str(), &mparams, &cparams,
+                                 devs, ngl, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+
+            if (is_target) {
+                devs_tgt = devs;
+            }
+
+            auto charge = [&](size_t id, const common_device_memory_data & md) {
+                if (id >= params_ctx.fit_params_target.size()) {
+                    return;
+                }
+                size_t per_group = md.context + md.compute;
+                if (count_weights) {
+                    per_group += md.model;
+                }
+                params_ctx.fit_params_target[id] += n_extra * per_group;
+                added[id]                        += n_extra * per_group;
+            };
+
+            // mem holds one entry per device plus a host entry at the back, while fit_params_target
+            // is indexed by device alone (common/fit.cpp builds margins over the nd devices).
+            if (devs_tgt.empty()) {
+                if (!mem.empty()) {
+                    charge(0, mem.back());
+                }
+                return;
+            }
+
+            for (size_t j = 0; j + 1 < mem.size() && j < devs.size(); ++j) {
+                // by device identity, not position: --device-draft may order devices differently, and by
+                // position a draft allocation would be billed to another device's margin.
+                for (size_t id = 0; id < devs_tgt.size(); ++id) {
+                    if (devs[j] == devs_tgt[id]) {
+                        charge(id, mem[j]);
+                        break;
+                    }
+                }
+            }
+        };
+
+        reserve(params_ctx, false, false, true);
+
+        if (has_draft || spec_mtp) {
+            reserve(common_base_params_to_speculative(params_ctx), spec_mtp, has_draft, false);
+        }
+
+        for (size_t i = 0; i < added.size(); ++i) {
+            if (added[i] > 0) {
+                SRV_INF("pipeline groups: reserved %.0f MiB on device %zu for %zu extra context(s)\n",
+                        added[i] / 1048576.0, i, n_extra);
+            }
+        }
+    }
+
+    // holds every group's lock so slot state is stable; wait_for() then drops the others and
+    // waits out one group's decode. A no-op with a single group.
+    struct engine_guard {
+        server_context_impl * srv = nullptr;
+        std::vector<std::unique_lock<std::mutex>> lks;
+
+        explicit engine_guard(server_context_impl * srv_) {
+            if (srv_->n_groups <= 1) {
+                return;
+            }
+
+            srv = srv_;
+
+            // always in group order, so two guards cannot deadlock against each other
+            lks.resize(srv->groups.size());
+
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                lks[g] = std::unique_lock<std::mutex>(srv->groups[g]->mtx);
+                srv->groups[g]->n_pause_req++;
+            }
+        }
+
+        void wait_for(int id_group) {
+            if (srv == nullptr) {
+                return;
+            }
+
+            GGML_ASSERT(id_group >= 0 && id_group < (int) srv->groups.size());
+
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                if ((int) g != id_group) {
+                    release(g);
+                }
+            }
+
+            server_group * grp = srv->groups[id_group].get();
+            grp->cv.wait(lks[id_group], [&] { return !grp->busy; });
+        }
+
+        void wait_for_all() {
+            if (srv == nullptr) {
+                return;
+            }
+
+            // a preceding wait_for() released every other group, and waiting on an unowned
+            // unique_lock is undefined. drop what is left and retake all of them in group order,
+            // the same order the constructor uses, so two guards still cannot deadlock.
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                release(g);
+            }
+
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                lks[g].lock();
+                srv->groups[g]->n_pause_req++;
+            }
+
+            // a group cannot set busy without its own lock, so one already waited out stays idle
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                server_group * grp = srv->groups[g].get();
+                grp->cv.wait(lks[g], [&] { return !grp->busy; });
+            }
+        }
+
+        ~engine_guard() {
+            if (srv == nullptr) {
+                return;
+            }
+
+            for (size_t g = 0; g < srv->groups.size(); ++g) {
+                release(g);
+            }
+        }
+
+        engine_guard(const engine_guard &) = delete;
+        engine_guard & operator=(const engine_guard &) = delete;
+
+    private:
+        void release(size_t g) {
+            if (!lks[g].owns_lock()) {
+                return;
+            }
+            srv->groups[g]->n_pause_req--;
+            lks[g].unlock();
+            srv->groups[g]->cv.notify_all();
+        }
+    };
+
+    void group_loop(server_group & grp) {
+        while (true) {
+            if (groups_stop.load(std::memory_order_relaxed)) {
+                return;
+            }
+
+            if (update_slots(grp)) {
+                continue;
+            }
+
+            std::unique_lock<std::mutex> lk(grp.mtx);
+            grp.cv.wait_for(lk, std::chrono::milliseconds(5),
+                    [&] { return groups_stop.load(std::memory_order_relaxed); });
+        }
+    }
+
+    void start_groups() {
+        if (n_groups <= 1) {
+            return;
+        }
+
+        groups_stop.store(false);
+
+        for (auto & grp : groups) {
+            server_group * g = grp.get();
+            g->thread = std::thread([this, g]() { group_loop(*g); });
+        }
+
+        SRV_INF("started %d pipeline group decode threads\n", n_groups);
+    }
+
+    void stop_groups() {
+        if (n_groups <= 1) {
+            return;
+        }
+
+        for (auto & grp : groups) {
+            std::unique_lock<std::mutex> lk(grp->mtx);
+            groups_stop.store(true);
+            grp->cv.notify_all();
+        }
+
+        for (auto & grp : groups) {
+            if (grp->thread.joinable()) {
+                grp->thread.join();
+            }
+        }
+    }
+
     server_slot * get_slot_by_id(int id_slot) {
         // note: allow id_slot to be out of bounds (wrap around)
         id_slot = id_slot % slots.size();
@@ -1685,7 +2093,7 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(const server_task & task, bool & need_cache_update) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1784,25 +2192,30 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
-                SRV_TRC("%s", "updating prompt cache\n");
-
-                const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
-                }
-
-                prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-            }
+        } else {
+            update_cache = false;
         }
 
+        need_cache_update = update_cache;
+
         return ret;
+    }
+
+    // reads and writes the slot's sequence KV, so the owning group must be out of llama_decode
+    void update_prompt_cache(server_slot & slot, const server_task & task) {
+        SRV_TRC("%s", "updating prompt cache\n");
+
+        const int64_t t_start = ggml_time_us();
+
+        slot.prompt_save(*prompt_cache);
+
+        if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+            slot.prompt_clear();
+        }
+
+        prompt_cache->update();
+
+        SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
     }
 
     // return true if at least one slot has been cleared
@@ -1810,14 +2223,16 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(server_group & grp) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
         }
 
-        for (auto & slot : slots) {
+        for (auto * slot_ptr : grp.slots) {
+            auto & slot = *slot_ptr;
+
             if (slot.is_processing()) {
                 continue;
             }
@@ -1942,15 +2357,15 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_set_sampler(slot.ctx_tgt, slot.seq_id, common_sampler_get(slot.smpl.get()));
             } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                llama_set_sampler(slot.ctx_tgt, slot.seq_id, nullptr);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
-            if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
+            if (slot.spec && !common_speculative_get_synth_probs(slot.spec).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
                     : task.params.sampling.seed;
@@ -1970,7 +2385,7 @@ private:
             : SLOT_STATE_STARTED;
 
         // reset server kill-switch counter
-        n_empty_consecutive = 0;
+        groups[slot.id_group]->n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
@@ -2132,12 +2547,12 @@ private:
 
                 result.probs.push_back({
                     cur_p->data[i].id,
-                    common_token_to_piece(ctx_tgt, cur_p->data[i].id, special),
+                    common_token_to_piece(slot.ctx_tgt, cur_p->data[i].id, special),
                     cur_p->data[i].p
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = get_token_probabilities(slot.ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2155,7 +2570,7 @@ private:
             for (size_t i = 0; i < n_probs; i++) {
                 result.probs.push_back({
                     cur[i].id,
-                    common_token_to_piece(ctx_tgt, cur[i].id, special),
+                    common_token_to_piece(slot.ctx_tgt, cur[i].id, special),
                     cur[i].p
                 });
             }
@@ -2252,7 +2667,7 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+        res->prompt          = slot.task->tokens.detokenize(slot.ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
@@ -2275,7 +2690,7 @@ private:
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
-                const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+                const llama_tokens stop_word_toks = common_tokenize(slot.ctx_tgt, slot.stopping_word, false);
 
                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
                 res->probs_output = std::vector<completion_token_output>(
@@ -2305,7 +2720,7 @@ private:
         std::vector<float> embd_res(n_embd_out, 0.0f);
 
         for (int i = 0; i < batch.size(); ++i) {
-            if (!batch.tokens[i].output || batch.tokens[i].seq_id != slot.id) {
+            if (!batch.tokens[i].output || batch.tokens[i].seq_id != slot.seq_id) {
                 continue;
             }
 
@@ -2371,7 +2786,7 @@ private:
             // the outputs of this slot in this batch are the last tokens of the prompt
             std::vector<int32_t> idx;
             for (int i = 0; i < batch.size(); ++i) {
-                if (batch.tokens[i].output && batch.tokens[i].seq_id == slot.id) {
+                if (batch.tokens[i].output && batch.tokens[i].seq_id == slot.seq_id) {
                     idx.push_back(i);
                 }
             }
@@ -2426,13 +2841,13 @@ private:
         res->n_tokens = slot.task->n_tokens();
 
         for (int i = 0; i < batch.size(); ++i) {
-            if (!batch.tokens[i].output || batch.tokens[i].seq_id != slot.id) {
+            if (!batch.tokens[i].output || batch.tokens[i].seq_id != slot.seq_id) {
                 continue;
             }
 
-            const float * embd = llama_get_embeddings_seq(ctx_tgt, batch.tokens[i].seq_id);
+            const float * embd = llama_get_embeddings_seq(slot.ctx_tgt, batch.tokens[i].seq_id);
             if (embd == NULL) {
-                embd = llama_get_embeddings_ith(ctx_tgt, i);
+                embd = llama_get_embeddings_ith(slot.ctx_tgt, i);
             }
 
             if (embd == NULL) {
@@ -2472,9 +2887,12 @@ private:
         return true;
     }
 
-    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
+    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot, int id_group) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
+            if (slot.id_group != id_group) {
+                continue;
+            }
             if (!slot.is_processing() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
@@ -2495,14 +2913,17 @@ private:
 
         SRV_TRC("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
 
-        // to be called in case of failure to release all launched slots
-        auto release_slots = [this, id_parent]() {
-            for (auto & slot : slots) {
-                if (slot.is_processing() && (
-                        slot.task->id == id_parent ||
-                        slot.task->id_parent == id_parent
+        // to be called in case of failure to release all launched slots. only this group's slots:
+        // the parent and its children are guaranteed to share a group, and wait_for() released
+        // every other group's lock, so a global scan would read state and task while their workers
+        // write them
+        auto release_slots = [this, id_parent, &parent_slot]() {
+            for (auto * slot : groups[parent_slot.id_group]->slots) {
+                if (slot->is_processing() && (
+                        slot->task->id == id_parent ||
+                        slot->task->id_parent == id_parent
                 )) {
-                    slot.release();
+                    slot->release();
                 }
             }
         };
@@ -2585,10 +3006,10 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        common_speculative_get_state(slot.spec, slot.seq_id, cur.data_spec);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2711,9 +3132,9 @@ private:
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
-        if (ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back().data_dft.empty()) {
-            const bool ok = checkpoints.back().load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+        if (slot.ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back().data_dft.empty()) {
+            const bool ok = checkpoints.back().load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.seq_id, -1, -1);
             if (!ok) {
                 SLT_WRN(slot, "draft context checkpoint data in '%s' does not match the draft context - dropped\n", filepath.c_str());
                 for (auto & cur : checkpoints) {
@@ -2734,6 +3155,8 @@ private:
             return false;
         }
 
+        engine_guard guard(this);
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -2751,7 +3174,8 @@ private:
 
                     const int id_task = task.id;
 
-                    server_slot * slot = get_available_slot(task);
+                    bool need_cache_update = false;
+                    server_slot * slot = get_available_slot(task, need_cache_update);
 
                     //
                     // slot scheduling logic
@@ -2771,10 +3195,24 @@ private:
                         break;
                     }
 
+                    // from here the slot's context is touched, so its group must finish its decode
+                    guard.wait_for(slot->id_group);
+
+                    if (need_cache_update) {
+                        update_prompt_cache(*slot, task);
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        // the children take their KV from the parent, so they must fit its group
+                        if ((int) n_child_tasks + 1 > n_seq_per_group) {
+                            send_error(task, string_format(
+                                "n_cmpl must not exceed the number of slots per pipeline group (%d)", n_seq_per_group),
+                                ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id, slot->id_group);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
@@ -2790,6 +3228,8 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        guard.wait_for_all();
+
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -2812,6 +3252,7 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            guard.wait_for(slot.id_group);
                             slot.release();
                             break;
                         }
@@ -2831,6 +3272,8 @@ private:
                         queue_results.send(std::move(res));
                         break;
                     }
+
+                    guard.wait_for(slot->id_group);
 
                     if (task.params.control_action == "reasoning_end") {
                         // the budget sampler only exists when reasoning control was armed
@@ -2913,6 +3356,8 @@ private:
                         break;
                     }
 
+                    guard.wait_for(slot->id_group);
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2928,7 +3373,7 @@ private:
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
                     const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
+                        slot->ctx_tgt, filepath.c_str(), slot->seq_id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
@@ -2969,6 +3414,8 @@ private:
                         break;
                     }
 
+                    guard.wait_for(slot->id_group);
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2978,10 +3425,10 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        nread = llama_state_seq_load_file(slot->ctx_tgt, filepath.c_str(), slot->seq_id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            nread = llama_state_seq_load_file(slot->ctx_tgt, filepath.c_str(), slot->seq_id, packed.data(), packed.size(), &n_packed);
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
@@ -2994,7 +3441,7 @@ private:
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
                         }
 
-                        if (!restored.validate(ctx_tgt)) {
+                        if (!restored.validate(slot->ctx_tgt)) {
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
@@ -3037,6 +3484,8 @@ private:
                         break;
                     }
 
+                    guard.wait_for(slot->id_group);
+
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
@@ -3076,6 +3525,8 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
+                    guard.wait_for_all();
+
                     auto new_loras = construct_lora_list(task.set_lora);
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
@@ -3116,11 +3567,11 @@ private:
         }
     }
 
-    void abort_all_slots(const std::string & reason) {
-        for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                send_error(slot, reason, ERROR_TYPE_SERVER);
-                slot.release();
+    void abort_all_slots(server_group & grp, const std::string & reason) {
+        for (auto * slot : grp.slots) {
+            if (slot->is_processing()) {
+                send_error(*slot, reason, ERROR_TYPE_SERVER);
+                slot->release();
             }
         }
     }
@@ -3155,7 +3606,21 @@ private:
     };
 #endif
 
-    void update_slots() {
+    bool update_slots(server_group & grp) {
+        // shadow the single-context members - everything below operates on this group only
+        auto * ctx_tgt = grp.ctx;
+        auto & batch   = grp.batch;
+        auto & slots   = grp.slots;
+
+        std::unique_lock<std::mutex> lk;
+        if (n_groups > 1) {
+            lk = std::unique_lock<std::mutex>(grp.mtx);
+            grp.cv.wait(lk, [&]{ return groups_stop.load(std::memory_order_relaxed) || grp.n_pause_req == 0; });
+            if (groups_stop.load(std::memory_order_relaxed)) {
+                return false;
+            }
+        }
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3173,8 +3638,8 @@ private:
         {
             bool all_idle = true;
 
-            for (auto & slot : slots) {
-                if (slot.is_processing()) {
+            for (auto * slot : slots) {
+                if (slot->is_processing()) {
                     all_idle = false;
                     break;
                 }
@@ -3183,28 +3648,29 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
-                metrics_flush_idle();
+                metrics_flush_idle(grp);
 
-                return; // skip further processing
+                return false; // skip further processing
 
-            } else {
+            } else if (n_groups == 1) {
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+            // note: each group drives its own loop, so the shared task loop need not keep spinning
         }
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
-            pre_decode();
+            pre_decode(grp);
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
-            abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+            abort_all_slots(grp, "pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB
-            return;
+            return true;
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -3237,7 +3703,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off);
+                bool ok = decode(grp, lk, n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3254,22 +3720,32 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
-                abort_all_slots("decode() failed: " + std::string(e.what()));
+                abort_all_slots(grp, "decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off);
+                post_decode(grp, n_tokens, off);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
-                abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                abort_all_slots(grp, "post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+
+        return true;
     }
 
-    void pre_decode() {
+    void pre_decode(server_group & grp) {
+        auto * ctx_tgt = grp.ctx;
+        auto & batch   = grp.batch;
+        auto & slots   = grp.slots;
+        (void) ctx_tgt;
+
+        auto & spec    = grp.spec;
+        auto * ctx_dft = grp.ctx_dft;
+        const auto ctx_dft_seq_rm_type = grp.ctx_dft_seq_rm_type;
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3311,8 +3787,8 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                slot.mem.seq_rm (slot.seq_id, n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.seq_id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3359,7 +3835,7 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                common_speculative_get_draft_params(spec.get(), slot.seq_id).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3382,18 +3858,18 @@ private:
 
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+                                llama_memory_seq_pos_min(llama_get_memory(slot.ctx_tgt), slot.seq_id),
+                                llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.seq_id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         const bool spec_reject = slot.use_spec_rejection();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        common_speculative_get_draft_params(spec.get(), slot.seq_id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
@@ -3412,10 +3888,15 @@ private:
         });
 
         // generate the actual drafts (if any)
+        // note: only the main thread may yield to the task queue
         if (!drafting.empty()) {
-            queue_tasks.yield_to_queue([&]() {
+            if (n_groups > 1) {
                 common_speculative_draft(spec.get());
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    common_speculative_draft(spec.get());
+                });
+            }
         }
 
         // make checkpoints if needed
@@ -3430,11 +3911,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                    GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.seq_id, ckpt.pos_max + 1, -1)) {
+                    GGML_ABORT("failed to remove sequence %d\n", slot.seq_id);
                 }
             }
 
@@ -3449,7 +3930,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3461,7 +3942,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -3661,8 +4142,8 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            slot.mem.seq_rm (slot.seq_id, head_p, head_c);
+                                            slot.mem.seq_add(slot.seq_id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -3692,9 +4173,9 @@ private:
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
-                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(slot.ctx_tgt), slot.seq_id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.seq_id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
@@ -3761,8 +4242,8 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-                                            !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                        if (!it->load_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                                            !it->load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                             if (it->id_task != -1) {
                                                 GGML_ABORT("failed to restore context checkpoint\n");
                                             }
@@ -3774,7 +4255,7 @@ private:
 
                                     if (!do_reset) {
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_state(spec.get(), slot.seq_id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -3814,7 +4295,10 @@ private:
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
-                        metrics.add_prompt_cached(n_past);
+                        {
+                            std::lock_guard<std::mutex> lk(mtx_metrics);
+                            metrics.add_prompt_cached(n_past);
+                        }
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -3846,13 +4330,14 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.mem.seq_rm(slot.seq_id, p0, -1);
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {
                         const bool is_shared_done = slot.prompt.n_tokens() == slot.task->n_tokens_shared;
-                        for (auto & other : slots) {
+                        for (auto * other_ptr : slots) {
+                            auto & other = *other_ptr;
                             if (other.state != SLOT_STATE_WAIT_OTHER || other.task->id_parent != slot.task->id) {
                                 continue;
                             }
@@ -3917,7 +4402,7 @@ private:
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
-                        metrics_pre_decode();
+                        metrics_pre_decode(grp);
 
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
@@ -3933,7 +4418,7 @@ private:
                             return; // the slot is done, skip it entirely
                         }
 
-                        metrics_queue_prompt(n_tokens_out);
+                        metrics_queue_prompt(grp, n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
 
@@ -3981,7 +4466,7 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        add_ok &= batch.add(slot.id, slot.seq_id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
@@ -4054,8 +4539,8 @@ private:
                         }
                     }
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(slot.ctx_tgt), slot.seq_id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.seq_id);
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
@@ -4097,6 +4582,8 @@ private:
     // the caller makes sure that it fits in the batch
     // returns false on error, the slot is then released
     bool add_prompt_mixed(server_slot & slot) {
+        auto & batch = groups[slot.id_group]->batch;
+
         const auto & input_tokens = slot.task->tokens;
         const auto n_tokens_prev = batch.size();
 
@@ -4105,7 +4592,7 @@ private:
             const llama_token cur_tok = input_tokens[cur_token_idx];
 
             if (cur_tok != LLAMA_TOKEN_NULL) {
-                const bool add_ok = batch.add(slot.id,
+                const bool add_ok = batch.add(slot.id, slot.seq_id,
                     cur_tok,
                     /* pos       = */ slot.prompt.tokens.pos_next(),
                     /* output    = */ slot.need_embd(),
@@ -4147,21 +4634,28 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off) {
+    bool decode(server_group & grp, std::unique_lock<std::mutex> & lk, int32_t & n_batch, int32_t off) {
+        auto * ctx_tgt = grp.ctx;
+        auto & batch   = grp.batch;
+        auto & slots   = grp.slots;
+
+        auto & spec      = grp.spec;
+        auto * model_dft = grp.model_dft;
+
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
-        metrics_pre_decode();
+        metrics_pre_decode(grp);
 
         if (batch.size() == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
 
-            if (++n_empty_consecutive > 3) {
+            if (++grp.n_empty_consecutive > 3) {
                 GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
             }
 
             return true; // nothing to decode
         } else {
-            n_empty_consecutive = 0;
+            grp.n_empty_consecutive = 0;
         }
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
@@ -4178,15 +4672,37 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
-        // yield to the queue, so we can still handle metrics tasks while decoding
-        // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
+        if (n_groups > 1) {
+            // RAII: a throwing decode must not leave the group busy, or return without the engine lock.
+            struct decode_window {
+                server_group * grp;
+                std::unique_lock<std::mutex> * lk;
+                decode_window(server_group * grp, std::unique_lock<std::mutex> * lk) : grp(grp), lk(lk) {
+                    grp->busy = true;
+                    lk->unlock();
+                }
+                ~decode_window() {
+                    lk->lock();
+                    grp->busy = false;
+                    grp->cv.notify_all();
+                }
+            } window(&grp, &lk);
+
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
+            // sync even with no output to read: ~decode_window clears busy, and a task thread that
+            // takes the guard must not touch ctx while the decode is still in flight
+            if (ret == 0) {
                 llama_synchronize(ctx_tgt);
             }
-        });
+        } else {
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {
@@ -4212,14 +4728,14 @@ private:
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            send_error(slot, err);
-                            slot.release();
+                    for (auto * slot : slots) {
+                        if (slot->is_processing()) {
+                            send_error(*slot, err);
+                            slot->release();
 
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
+                            slot->prompt_clear();
                         }
                     }
 
@@ -4229,7 +4745,7 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (!try_clear_idle_slots(grp)) {
                 n_batch /= 2;
             }
 
@@ -4238,7 +4754,7 @@ private:
             return false; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
-            metrics_post_decode(off, batch.view.size(), has_output);
+            metrics_post_decode(grp, off, batch.view.size(), has_output);
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -4246,9 +4762,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
+            if (n_groups > 1) {
                 ok = common_speculative_process(spec.get(), batch.view);
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4259,12 +4779,13 @@ private:
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
-        for (auto & slot : slots) {
+        for (auto * slot_ptr : slots) {
+            auto & slot = *slot_ptr;
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
                 std::vector<server_slot *> children;
-                for (auto & other : slots) {
-                    if (other.state == SLOT_STATE_WAIT_OTHER && slot.task->id == other.task->id_parent) {
-                        children.push_back(&other);
+                for (auto * other : slots) {
+                    if (other->state == SLOT_STATE_WAIT_OTHER && slot.task->id == other->task->id_parent) {
+                        children.push_back(other);
                     }
                 }
 
@@ -4286,7 +4807,13 @@ private:
         return true;
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off) {
+    void post_decode(server_group & grp, int32_t n_batch_tokens, int32_t off) {
+        auto * ctx_tgt = grp.ctx;
+        auto & batch   = grp.batch;
+        auto & slots   = grp.slots;
+        auto & spec    = grp.spec;
+        (void) ctx_tgt;
+
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4349,7 +4876,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    common_speculative_begin(spec.get(), slot.seq_id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4467,13 +4994,13 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                         if (slot.ctx_dft) {
-                            GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                            GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        slot.mem.seq_rm(slot.seq_id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4486,7 +5013,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.seq_id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -4520,7 +5047,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            slot.mem.seq_rm(slot.seq_id, slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4568,38 +5095,48 @@ private:
     //
 
     // call before submitting a decode, so that the queued prompt stats can be timed
-    void metrics_pre_decode() {
-        t_decode_start = ggml_time_us();
+    void metrics_pre_decode(server_group & grp) {
+        grp.t_decode_start = ggml_time_us();
     }
 
     // the batch is submitted, but its compute may not be done yet
-    void metrics_queue_prompt(uint64_t n_tokens) {
+    void metrics_queue_prompt(server_group & grp, uint64_t n_tokens) {
         if (n_tokens == 0) {
             return;
         }
-        if (n_prompt_queued == 0) {
-            t_prompt_start = t_decode_start;
+        if (grp.n_prompt_queued == 0) {
+            grp.t_prompt_start = grp.t_decode_start;
         }
-        n_prompt_queued += n_tokens;
+        grp.n_prompt_queued += n_tokens;
     }
 
     // call only after the context is synchronized, otherwise the time is meaningless
-    void metrics_flush_prompt() {
-        if (n_prompt_queued == 0) {
+    void metrics_flush_prompt(server_group & grp) {
+        if (grp.n_prompt_queued == 0) {
             return;
         }
-        metrics.add_prompt(n_prompt_queued, ggml_time_us() - t_prompt_start);
-        n_prompt_queued = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_metrics);
+            metrics.add_prompt(grp.n_prompt_queued, ggml_time_us() - grp.t_prompt_start);
+        }
+        grp.n_prompt_queued = 0;
     }
 
     // has_output is computed by the caller, which also already synchronized the context if it is set
-    void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
-        metrics.n_decode++;
-        for (const auto & slot : slots) {
-            if (slot.is_processing()) {
-                metrics.n_busy_slots++;
+    void metrics_post_decode(server_group & grp, int32_t off, int32_t n_tokens, bool has_output) {
+        auto & batch = grp.batch;
+
+        {
+            // note: only this group's slots - another group's slot state may not be read here
+            std::lock_guard<std::mutex> lk(mtx_metrics);
+
+            metrics.n_decode++;
+            for (const auto * slot : grp.slots) {
+                if (slot->is_processing()) {
+                    metrics.n_busy_slots++;
+                }
+                metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot->prompt.n_tokens());
             }
-            metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
         }
 
         // apply enqueued prompt tokens stats
@@ -4622,11 +5159,11 @@ private:
             }
         }
 
-        metrics_queue_prompt(n_prompt_tokens);
+        metrics_queue_prompt(grp, n_prompt_tokens);
 
         if (has_output) {
             // the context is already synchronized, so the timings are correct
-            metrics_flush_prompt();
+            metrics_flush_prompt(grp);
         }
 
         // advance the prompt timing of the slots that had tokens in this batch
@@ -4642,19 +5179,21 @@ private:
     }
 
     // flush any queued prompt metrics if all slots are now idle
-    void metrics_flush_idle() {
-        if (n_prompt_queued == 0) {
+    void metrics_flush_idle(server_group & grp) {
+        if (grp.n_prompt_queued == 0) {
             return;
         }
 
-        llama_synchronize(ctx_tgt);
-        metrics_flush_prompt();
+        llama_synchronize(grp.ctx);
+        metrics_flush_prompt(grp);
     }
 
     void metrics_on_prediction(const server_slot & slot) {
         const uint64_t t_us    = slot.stats.t_gen_us();
         const uint64_t n       = slot.stats.n_gen;
         const uint64_t n_steps = slot.stats.n_gen_steps();
+
+        std::lock_guard<std::mutex> lk(mtx_metrics);
 
         metrics.predict       .add(n, n_steps, t_us);
         metrics.predict_bucket.add(n, n_steps, t_us);
@@ -4688,7 +5227,16 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
+
+    impl->start_groups();
+
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    impl->stop_groups();
+}
+
+void server_context::set_pipeline_groups(int n_groups) {
+    impl->n_pipeline_groups_req = n_groups;
 }
 
 void server_context::terminate() {

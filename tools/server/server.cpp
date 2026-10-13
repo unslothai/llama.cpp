@@ -14,8 +14,11 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <signal.h>
+#include <string>
 #include <thread> // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
@@ -24,6 +27,11 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+static int g_pipeline_groups = 1;
+
+int server_get_pipeline_groups();
+int server_get_pipeline_groups() { return g_pipeline_groups; }
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -113,6 +121,8 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
+    g_pipeline_groups = params.n_pipeline_groups;
+
     SRV_INF("%s", "initializing ...\n");
 
     llama_backend_init();
@@ -196,6 +206,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
     // struct that contains llama context and inference
     server_context ctx_server;
+    ctx_server.set_pipeline_groups(params.n_pipeline_groups);
 
     //
     // Router
