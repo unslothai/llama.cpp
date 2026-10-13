@@ -75,7 +75,17 @@ def run(cmd: list[str], cwd: Path, gpu: bool) -> tuple[int, str]:
 def probe_arch(check: dict, b: Path, gpu: bool) -> str:
     """A synthetic model of this architecture decodes, and matches CPU."""
     arch = check["arch"]
-    rc, out = run([str(b / "test-llama-archs"), "-a", arch, "-s", "1234"], b, gpu)
+    # test-llama-archs prints through common_log, whose worker thread is leaked
+    # at exit (common/log.cpp), so lines still queued when main returns are lost.
+    # On a busy runner that cut a row off right after its config column. A run
+    # without its "Summary:" line is retried; on one loaded core 5 of 60 runs
+    # were cut off.
+    for _ in range(4):
+        rc, out = run([str(b / "test-llama-archs"), "-a", arch, "-s", "1234"], b, gpu)
+        if rc != 0 or "Summary:" in out:
+            break
+    else:
+        raise Unproven(f"test-llama-archs -a {arch} output was cut off before its Summary line on 4 runs")
     if rc != 0:
         raise Unproven(f"test-llama-archs -a {arch} exited {rc}")
     # The arch's own rows, not the header and not another arch's.

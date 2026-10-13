@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+name: Unsloth CUDA build setup (Linux)
+description: >-
+  Source tree, CUDA toolkit, ccache and the CMake configure that the Linux
+  CUDA legs of unsloth-prebuilt-cuda.yml share. Both the `warm` shards and
+  the `build` job of a profile run exactly this, so every object they compile
+  hashes the same and the shards' ccache entries are hits for the build.
+
+inputs:
+  tag:
+    description: Upstream llama.cpp release tag (b#### or b####-mix-<hash>), resolved by the parent.
+    required: true
+  source_artifact:
+    description: Workflow artifact (app-source-*) holding the stamped source tree.
+    required: true
+  cuda:
+    description: CUDA toolkit version (12.8.0 or 13.3), installed from the NVIDIA redist CDN.
+    required: true
+  arch:
+    description: x64 or arm64.
+    required: true
+  archs:
+    description: Space-separated CMAKE_CUDA_ARCHITECTURES list for this profile.
+    required: true
+  profile:
+    description: Profile name (cuda12-portable ...), part of the ccache key.
+    required: true
+  max-size:
+    description: ccache max_size for this profile (portable holds the most objects).
+    required: false
+    default: 4G
+
+runs:
+  using: composite
+  steps:
+    # Source tree is resolve's app-source artifact, build number and fingerprint already baked in.
+    - name: Download source @ ${{ inputs.tag }}
+      uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+      with:
+        name: ${{ inputs.source_artifact }}
+        path: srcpkg
+    - name: Extract source
+      shell: bash
+      run: |
+        set -eux
+        mkdir -p src
+        tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y build-essential libssl-dev
+
+    - name: Install ARM64 host compiler (gcc-14)
+      if: inputs.arch == 'arm64'
+      shell: bash
+      run: |
+        set -eux
+        sudo apt-get install -y gcc-14 g++-14
+        {
+          echo "CC=gcc-14"
+          echo "CXX=g++-14"
+          echo "CUDAHOSTCXX=g++-14"
+        } >> "$GITHUB_ENV"
+
+    # Toolkit from NVIDIA's redist CDN (the 13.3 path, generalised): about 1 min per job against
+    # 4 to 5 for Jimver apt. Component versions match what Jimver produced, so ccache entries carry over.
+    - name: Install CUDA toolkit ${{ inputs.cuda }} (NVIDIA redist)
+      shell: bash
+      run: |
+        set -eux
+        case "${{ inputs.arch }}" in
+          x64)   PLAT=linux-x86_64 ;;
+          arm64) PLAT=linux-sbsa ;;
+          *) echo "unsupported arch ${{ inputs.arch }}" >&2; exit 1 ;;
+        esac
+        # 12.8.0 maps to the 12.8.1 archives on purpose: Jimver's apt metapackage served the
+        # newest patch, so every Linux CUDA 12 bundle was built by nvcc V12.8.93 with libcublas
+        # 12.8.4.1 (run 34168016006). Shipped bits must not change with the install method.
+        case "${{ inputs.cuda }}" in
+          12.8.0) COMPONENTS="cuda_cudart:12.8.90 cuda_nvcc:12.8.93 cuda_nvrtc:12.8.93 libcublas:12.8.4.1 cuda_nvtx:12.8.90 cuda_profiler_api:12.8.90 cuda_cccl:12.8.90" ;;
+          13.3)   COMPONENTS="cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1" ;;
+          *) echo "no redist component table for CUDA ${{ inputs.cuda }}" >&2; exit 1 ;;
+        esac
+        PREFIX="$HOME/cuda-${{ inputs.cuda }}"
+        mkdir -p "$PREFIX"
+        BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+        for cv in $COMPONENTS; do
+          comp="${cv%:*}"; ver="${cv#*:}"
+          name="${comp}-${PLAT}-${ver}-archive"
+          curl -fsSL --retry 3 -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
+          tar -xf comp.tar.xz
+          cp -a "${name}/." "$PREFIX"/
+          rm -rf comp.tar.xz "${name}"
+        done
+        # Redist ships libs under lib/; some CMake CUDA discovery expects lib64.
+        ln -sfn lib "$PREFIX/lib64"
+        {
+          echo "CUDA_PATH=$PREFIX"
+          echo "CUDA_HOME=$PREFIX"
+          echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"
+        } >> "$GITHUB_ENV"
+        echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+    - name: Verify CUDA
+      shell: bash
+      run: nvcc --version
+
+    # ccache 4.13 from the action's binary (apt ships 4.5.1); save: false because the calling job
+    # saves under its own key. Not sccache: measured 2026-09-08, no faster on the churn rebuild,
+    # 111 s vs 1 s warm, and 0% per-arch sharing (nvcc passes __CUDA_ARCH_LIST__ into every preprocess).
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+      with:
+        key: cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
+        restore-keys: |
+          cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
+        append-timestamp: false
+        variant: ccache
+        install: binary
+        max-size: ${{ inputs.max-size }}
+        save: false
+
+    - name: Configure ccache
+      shell: bash
+      # compiler_check=content: the toolkit is re-extracted every run, so mtime identity misses a
+      # byte-identical nvcc. Sloppiness is the documented safe set; level 6 fits more under max_size.
+      run: |
+        ccache --set-config=compiler_check=content
+        ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+        ccache --set-config=compression_level=6
+        ccache -p | grep -E "compiler_check|sloppiness|compression|max_size|cache_dir"
+        ccache -z
+
+    - name: Configure
+      shell: bash
+      working-directory: src
+      run: |
+        set -eux
+        # RPATH=$ORIGIN: sibling .so files ship next to the binaries. COMPILER_LAUNCHER set
+        # explicitly: nvcc lives in the redist prefix, so a PATH-symlinked ccache misses CUDA TUs.
+        # No LLAMA_FATAL_WARNINGS: it also sets nvcc -Werror all-warnings via an -Xcompiler list
+        # CMAKE_CXX_FLAGS cannot reach, so any libstdc++ false positive fails a release
+        # (cuda13-newer/portable died on GCC 11 -Wstringop-overflow in ggml_cuda_try_fuse).
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DGGML_NATIVE=OFF \
+          -DGGML_BACKEND_DL=ON \
+          -DGGML_CPU_ALL_VARIANTS=ON \
+          -DGGML_RPC=ON \
+          -DGGML_CUDA=ON \
+          -DGGML_CUDA_CUB_3DOT2=ON \
+          -DLLAMA_BUILD_TESTS=OFF \
+          -DLLAMA_BUILD_EXAMPLES=OFF \
+          -DLLAMA_BUILD_TOOLS=ON \
+          -DLLAMA_BUILD_SERVER=ON \
+          -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ inputs.archs }}' | tr ' ' ';')" \
+          -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+          -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+          -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
