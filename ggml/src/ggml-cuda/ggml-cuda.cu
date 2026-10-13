@@ -6101,6 +6101,32 @@ static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
     return false;
 }
 
+// the device copies of a copy-only instance (the prefetch copy queue of the scheduler, whose copies overlap the compute of
+// another stream): the copy engines on HBM devices, the kernel otherwise. Measured with Qwen3.8-Flash-Next and the MoE cache:
+// B200 (HBM): with the kernel, generation after a prefetched prompt was ~5% slower, at the same prompt speed;
+// RTX PRO 6000 (GDDR7): with the copy engines, a prefetched 8k prompt was 9-16% slower, at the same generation speed.
+// GGML_CUDA_COPY_QUEUE_KERNEL=1 (kernel) / 0 (copy engines) overrides the choice
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+static bool ggml_cuda_copy_queue_kernel(int device) {
+    static const std::vector<bool> kernel = [] {
+        const char * env = getenv("GGML_CUDA_COPY_QUEUE_KERNEL");
+        std::vector<bool> res(ggml_cuda_info().device_count, true);
+        for (int id = 0; id < (int) res.size(); id++) {
+            int bus_width = 0;
+            if (cudaDeviceGetAttribute(&bus_width, cudaDevAttrGlobalMemoryBusWidth, id) != cudaSuccess) {
+                (void) cudaGetLastError();
+                bus_width = 0;
+            }
+            res[id] = env != nullptr ? atoi(env) != 0 : bus_width < 2048;
+            GGML_LOG_INFO("ggml_cuda_copy_queue_kernel: device %d: memory bus %d bits, device copies of a copy queue with the %s\n", id, bus_width,
+                res[id] ? "kernel" : "copy engines");
+        }
+        return res;
+    }();
+    return device >= 0 && device < (int) kernel.size() ? kernel[device] : true;
+}
+#endif
+
 // many small copies with two calls: the uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8) on the copy engines, the device
 // copies with one kernel (GGML_CUDA_COPY_REGIONS_KERNEL=0 puts them in the batch), GGML_CUDA_COPY_BATCH=0 disables both
 static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
@@ -6160,10 +6186,8 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         }
         void       * d = (char *) r.dst->data + r.dst_offset;
         const void * s = (const char *) r.src->data + r.src_offset;
-        // the kernel only on compute instances: on a copy-only instance (the prefetch copy queue of the scheduler), whose
-        // copies overlap the compute of another stream, the copy engines are used; with the kernel there, generation after
-        // a prefetched prompt was ~5% slower (Qwen3.8-Flash-Next, MoE cache, B200), at the same prompt speed
-        if (src_dev && d2d_kernel && cuda_ctx->computes) {
+        // a copy-only instance uses the kernel only where the copy engines are slow for device copies (see above)
+        if (src_dev && d2d_kernel && (cuda_ctx->computes || ggml_cuda_copy_queue_kernel(cuda_ctx->device))) {
             d2d_dsts.push_back(d);
             d2d_srcs.push_back(s);
             d2d_sizes.push_back(r.size);
