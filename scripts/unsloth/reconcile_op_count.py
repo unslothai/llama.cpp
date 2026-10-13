@@ -20,12 +20,18 @@ silently shifts every later name). So this checks that, and only then moves the 
      (GGML_OP_NAME and GGML_OP_SYMBOL);
   3. a table that does not match the enum is a real merge bug: report file:line, exit 1,
      rewrite nothing;
-  4. every table matches: rewrite each `static_assert(<COUNT> == M` under ggml/ with M != the
+  4. equal counts do not prove order (the tables are indexed by enum value), so GGML_OP_NAME
+     must be the enum names in enum order with GGML_OP_ stripped (upstream holds to this for
+     every entry); GGML_OP_SYMBOL is free text, so with --base-ref every op the base had must
+     keep the base's symbol, and the symbols of new ops are only counted. A break is exit 1;
+  5. all match: rewrite each `static_assert(<COUNT> == M` under ggml/ with M != the
      count (the number, and the same number in that assert's message) and exit 0.
 
 The same for GGML_UNARY_OP_COUNT (GGML_UNARY_OP_NAME) and GGML_GLU_OP_COUNT (GGML_GLU_OP_NAME),
-which follow the same pattern. A family with no asserts in the tree is skipped; one with
-asserts whose enum or tables cannot be found exits 2, since a changed layout upstream must
+which follow the same pattern. The enum and tables of every family are checked whether or not an
+assert is left; with --base-ref a family whose base had an assert and whose merged tree has none
+(deleted or commented out) exits 1. A family with no asserts and no enum or table is skipped; one
+with asserts whose enum or tables cannot be found exits 2, since a changed layout upstream must
 be looked at rather than guessed.
 
 ggml-rpc.h's assert is different: it exists to make whoever changes the op count bump
@@ -35,8 +41,8 @@ only rewritten with --base-ref (the tag the pins were merged onto), against whic
   * the op count changed and RPC_PROTO_{MAJOR,MINOR,PATCH}_VERSION did not: a pin added an op
     without bumping the protocol. Exit 1, rewrite nothing.
   * the version moved, but MAJOR and MINOR are unchanged and PATCH moved by less than the op
-    count rose (two pins that each bumped PATCH by one merge to a single bump): PATCH is set to
-    base PATCH + the op count delta, and the output says so.
+    count changed, up or down (two pins that each bumped PATCH by one merge to a single bump):
+    PATCH is set to base PATCH + |op count delta|, and the output says so.
   * otherwise the assert is rewritten like the others.
 
 With --base-ref the version is checked whenever ggml-rpc.h exists, also when the assert already
@@ -131,25 +137,34 @@ def braced_body(clean: str, open_pos: int) -> tuple[int, int]:
     raise LayoutError("unbalanced braces")
 
 
-def top_level_items(body: str) -> list[str]:
-    """Comma-separated items at brace/paren depth 0, empty ones (a trailing comma) dropped."""
-    items, depth, cur = [], 0, []
-    for c in body:
+def item_spans(body: str) -> list[tuple[int, int]]:
+    """(start, end) in body of each comma-separated item at brace/paren depth 0, empty ones dropped."""
+    spans, depth, st = [], 0, 0
+    for i, c in enumerate(body + ","):
         if c in "({[":
             depth += 1
         elif c in ")}]":
             depth -= 1
-        if c == "," and depth == 0:
-            items.append("".join(cur))
-            cur = []
-        else:
-            cur.append(c)
-    items.append("".join(cur))
-    return [x.strip() for x in items if x.strip()]
+        elif c == "," and depth == 0:
+            if body[st:i].strip():
+                spans.append((st, i))
+            st = i + 1
+    return spans
+
+
+def top_level_items(body: str) -> list[str]:
+    """Comma-separated items at brace/paren depth 0, empty ones (a trailing comma) dropped."""
+    return [body[a:b].strip() for a, b in item_spans(body)]
 
 
 def enum_count(text: str, clean: str, enum: str, count: str) -> tuple[int, int]:
     """(value of `count` in `enum <enum> {`, line of the enum)."""
+    n, line, _ = enum_entries(text, clean, enum, count)
+    return n, line
+
+
+def enum_entries(text: str, clean: str, enum: str, count: str) -> tuple[int, int, list[str]]:
+    """(value of `count`, line of the enum, names of the entries before `count`)."""
     m = re.search(r"\benum\s+" + re.escape(enum) + r"\s*\{", clean)
     if not m:
         raise LayoutError(f"enum {enum} not found in {HEADER}")
@@ -157,7 +172,7 @@ def enum_count(text: str, clean: str, enum: str, count: str) -> tuple[int, int]:
     # preprocessor lines inside an enum would make the count depend on the build; refuse them
     if re.search(r"^\s*#", clean[start:end], re.M):
         raise LayoutError(f"enum {enum} ({HEADER}:{line_of(text, m.start())}) has preprocessor lines")
-    value = 0
+    value, names = 0, []
     for item in top_level_items(clean[start:end]):
         name, _, init = (x.strip() for x in item.partition("="))
         if init:
@@ -165,18 +180,77 @@ def enum_count(text: str, clean: str, enum: str, count: str) -> tuple[int, int]:
                 raise LayoutError(f"enum {enum}: {name} = {init} is not a plain integer")
             value = int(init)
         if name == count:
-            return value, line_of(text, m.start())
+            return value, line_of(text, m.start()), names
+        names.append(name)
         value += 1
     raise LayoutError(f"{count} is not in enum {enum} ({HEADER}:{line_of(text, m.start())})")
 
 
 def table_count(text: str, clean: str, table: str) -> tuple[int, int]:
     """(number of initializers of `static const char * <table>[...] = {`, line of the table)."""
+    items, line = table_entries(text, clean, table)
+    return len(items), line
+
+
+def table_entries(text: str, clean: str, table: str) -> tuple[list[tuple[str, int]], int]:
+    """([(initializer with comments dropped, its line)], line of the table)."""
     m = re.search(r"\bstatic\s+const\s+char\s*\*\s*" + re.escape(table) + r"\s*\[[^\]]*\]\s*=\s*\{", clean)
     if not m:
         raise LayoutError(f"table {table} not found in {SOURCE}")
     start, end = braced_body(clean, m.end() - 1)
-    return len(top_level_items(clean[start:end])), line_of(text, m.start())
+    items = []
+    for a, b in item_spans(clean[start:end]):
+        a, b = start + a, start + b
+        # keep string literals (S in clean) and code; drop comment characters (blank in clean only)
+        raw = "".join(t for t, c in zip(text[a:b], clean[a:b]) if c == t or c == "S")
+        items.append((" ".join(raw.split()), line_of(text, a + len(clean[a:b]) - len(clean[a:b].lstrip()))))
+    return items, line_of(text, m.start())
+
+
+def check_order(names: list[str], prefix: str, table: str, entries: list[tuple[str, int]]) -> list[str]:
+    """Problems with a NAME table that is not the enum names, in enum order, prefix stripped.
+
+    The tables are indexed by enum value, so equal counts are not enough: two entries in the wrong
+    order compile and name the wrong op. Upstream follows this rule for every entry of GGML_OP_NAME,
+    GGML_UNARY_OP_NAME and GGML_GLU_OP_NAME (checked on b11580), so any break of it is refused.
+    """
+    bad = []
+    for i, (name, (entry, eline)) in enumerate(zip(names, entries)):
+        want = '"' + (name[len(prefix):] if name.startswith(prefix) else name) + '"'
+        if entry != want:
+            bad.append(f"{SOURCE}:{eline}: {table}[{i}] is {entry}, enum entry {i} is {name} (expected {want})")
+    return bad
+
+
+def git_lines(root: Path, *args: str) -> list[str]:
+    r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def base_has_assert(root: Path, ref: str, count: str) -> bool:
+    """Whether the tree at ref has a real (not commented out) `static_assert(<count> ==` under ggml/."""
+    pat = assert_re(count)
+    for path in git_lines(root, "grep", "-l", "-F", count, ref, "--", "ggml"):
+        path = path.split(":", 1)[1] if path.startswith(ref + ":") else path
+        if Path(path).suffix in SCAN_SUFFIXES and pat.search(blank_comments_and_strings(git_show(root, ref, path))):
+            return True
+    return False
+
+
+def check_symbols(root: Path, ref: str, names: list[str], entries: list[tuple[str, int]]) -> list[str]:
+    """GGML_OP_SYMBOL is free text, so its order cannot be derived from the enum. What can be checked:
+    every op the base already had keeps the base's symbol at its (possibly moved) index, so a symbol
+    shifted by a dropped or misplaced line is caught. The symbols of new ops are only counted."""
+    bh, bs = git_show(root, ref, HEADER), git_show(root, ref, SOURCE)
+    _, _, bnames = enum_entries(bh, blank_comments_and_strings(bh), "ggml_op", "GGML_OP_COUNT")
+    bentries, _ = table_entries(bs, blank_comments_and_strings(bs), "GGML_OP_SYMBOL")
+    if len(bnames) != len(bentries):
+        raise LayoutError(f"GGML_OP_SYMBOL at {ref} has {len(bentries)} entries for {len(bnames)} ops")
+    base = dict(zip(bnames, (e for e, _ in bentries)))
+    return [f"{SOURCE}:{eline}: GGML_OP_SYMBOL[{i}] is {entry}, but {name} has {base[name]} at {ref}; "
+            "a symbol line is out of place"
+            for i, (name, (entry, eline)) in enumerate(zip(names, entries))
+            if name in base and entry != base[name]]
 
 
 def assert_re(count: str) -> re.Pattern:
@@ -262,8 +336,10 @@ def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True)
         return (f"refuse: GGML_OP_COUNT changed by {delta:+d} versus {base_ref} but RPC_PROTO_*_VERSION "
                 f"is still {fmt(base_v)}; a pin added or removed an op without bumping the RPC protocol", None)
     same_mm = all(cur_v[p] == base_v[p] for p in ("MAJOR", "MINOR"))
-    if delta > 0 and same_mm and cur_v["PATCH"] - base_v["PATCH"] < delta:
-        return ("ok", base_v["PATCH"] + delta)
+    # removed ops are handled like added ones: every pin bumps PATCH by one per op it changes, and
+    # identical bumps merge to one in either direction
+    if delta and same_mm and cur_v["PATCH"] - base_v["PATCH"] < abs(delta):
+        return ("ok", base_v["PATCH"] + abs(delta))
     return ("ok", None)
 
 
@@ -292,22 +368,52 @@ def main() -> int:
         asserts = find_asserts(root, count)
         # with --base-ref the RPC version is checked even when no GGML_OP_COUNT assert is left
         rpc_check = count == "GGML_OP_COUNT" and bool(args.base_ref) and rpc_path.is_file()
-        if not asserts and not rpc_check:
-            print(f"skip {count}: no static_assert in the tree")
-            continue
         try:
-            n, eline = enum_count(htext, hclean, enum, count)
-            sizes = {t: table_count(stext, sclean, t) for t in tables}
+            n, eline, names = enum_entries(htext, hclean, enum, count)
+            entries = {t: table_entries(stext, sclean, t) for t in tables}
         except LayoutError as e:
+            if not asserts and not rpc_check:
+                print(f"skip {count}: no static_assert in the tree and {e}")
+                continue
             print(f"ERROR {count}: {e}", file=sys.stderr)
             layout += 1
             continue
-        wrong = {t: v for t, v in sizes.items() if v[0] != n}
+        # the enum and tables are checked whether or not any assert is left: a merge that deleted the
+        # last assert must not also switch off the check that it existed for
+        if not asserts and args.base_ref:
+            try:
+                had = base_has_assert(root, args.base_ref, count)
+            except LayoutError as e:
+                print(f"ERROR {count}: {e}", file=sys.stderr)
+                bad += 1
+                continue
+            if had:
+                print(f"{count}: {args.base_ref} has a static_assert({count} == ...) under ggml/ and the merged "
+                      "tree has none (deleted or commented out); restore it", file=sys.stderr)
+                bad += 1
+                continue
+        wrong = {t: (len(v[0]), v[1]) for t, v in entries.items() if len(v[0]) != n}
         if wrong:
             for t, (k, tline) in wrong.items():
                 print(f"{SOURCE}:{tline}: {t} has {k} entries, enum {enum} has {n} before {count} "
                       f"({HEADER}:{eline}); a merge dropped or duplicated an entry", file=sys.stderr)
             bad += 1
+            continue
+        order = check_order(names, count[:-len("COUNT")], tables[0], entries[tables[0]][0])
+        if count == "GGML_OP_COUNT" and args.base_ref:
+            try:
+                order += check_symbols(root, args.base_ref, names, entries["GGML_OP_SYMBOL"][0])
+            except LayoutError as e:
+                order.append(f"cannot check GGML_OP_SYMBOL order: {e}")
+        if order:
+            for x in order[:10]:
+                print(x, file=sys.stderr)
+            print(f"{count}: {len(order)} table entr{'y is' if len(order) == 1 else 'ies are'} out of enum order",
+                  file=sys.stderr)
+            bad += 1
+            continue
+        if not asserts and not rpc_check:
+            print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree; no static_assert in the tree")
             continue
         stale = [a for a in asserts if a[2] != n]
         # the RPC assert guards RPC_PROTO_*_VERSION: with --base-ref the version is checked whenever
@@ -327,7 +433,7 @@ def main() -> int:
                 vals, spans = rpc_version(rpc_path.read_text(errors="replace"))
                 old = vals["PATCH"]
                 plan.setdefault(rpc_path, []).append((*spans["PATCH"], old, patch, False))
-                print(f"fix  {RPC_HEADER}: RPC_PROTO_PATCH_VERSION {old} -> {patch} (the op count rose by "
+                print(f"fix  {RPC_HEADER}: RPC_PROTO_PATCH_VERSION {old} -> {patch} (the op count changed by "
                       f"more than PATCH moved: identical bumps from several pins merged into one)")
         if not stale:
             print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree, {len(asserts)} assert(s) already say {n}")

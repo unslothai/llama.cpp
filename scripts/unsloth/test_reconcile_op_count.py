@@ -231,7 +231,7 @@ src = src.replace('    "none",', '    "f(x,y)",')
 h = (d / "ggml" / "include" / "ggml.h").read_text()
 h = h.replace("        GGML_OP_NONE = 0,", "        GGML_OP_NONE = 0, // none, really\n        /* GGML_OP_GONE, */")
 (d / "ggml" / "include" / "ggml.h").write_text(h)
-rc, out = run(d)
+rc, out = run(d, base=None)    # "none" -> "f(x,y)" changes a base symbol, which --base-ref would refuse
 check("commas in strings and comments are not entries", rc == 0 and "clean" in out, out)
 
 # A number inside the message that is not the stale count is left alone.
@@ -349,8 +349,8 @@ drop_rpc_assert(d, 102, "delete")
 p = d / "ggml" / "src" / "ggml.c"
 p.write_text(p.read_text().replace('static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");', ""))
 rc, out = run(d)
-check("no GGML_OP_COUNT assert left anywhere: the RPC check still runs and refuses",
-      rc == 1 and "is gone from the merged tree" in out and "skip GGML_OP_COUNT" not in out, out)
+check("no GGML_OP_COUNT assert left anywhere: the family is still checked and refuses",
+      rc == 1 and "base has a static_assert(GGML_OP_COUNT" in out and "skip GGML_OP_COUNT" not in out, out)
 
 # A base without the RPC assert: the version is still checked against the op count.
 d = make(BASE, NAMES, SYMS, 101)
@@ -401,12 +401,87 @@ d = make(BASE, NAMES, SYMS, 101, enum_extra="#ifdef GGML_EXTRA\n        GGML_OP_
 rc, out = run(d)
 check("a preprocessor line inside the enum exits 2", rc == 2 and "preprocessor" in out, out)
 
-# A family with no asserts at all has nothing to reconcile.
+# A family whose last assert the merge deleted: the base had one, so that is refused with --base-ref.
+GLU_ASSERT = 'static_assert(GGML_GLU_OP_COUNT == 2, "GGML_GLU_OP_COUNT != 2");'
 d = make(BASE, NAMES, SYMS, 101)
 src = d / "ggml" / "src" / "ggml.c"
-src.write_text(src.read_text().replace('static_assert(GGML_GLU_OP_COUNT == 2, "GGML_GLU_OP_COUNT != 2");', ""))
+src.write_text(src.read_text().replace(GLU_ASSERT, ""))
+before = snapshot(d)
 rc, out = run(d)
-check("a family without asserts is skipped", rc == 0 and "skip GGML_GLU_OP_COUNT" in out, out)
+check("the last GLU assert deleted, base had one: exit 1",
+      rc == 1 and "base has a static_assert(GGML_GLU_OP_COUNT" in out, out)
+check("and nothing is rewritten", snapshot(d) == before)
+src.write_text(src.read_text().replace('"REGLU",', '"REGLU", // ' + GLU_ASSERT))
+rc, out = run(d)
+check("a commented-out assert counts as deleted", rc == 1 and "base has a static_assert(GGML_GLU_OP_COUNT" in out, out)
+
+# Without --base-ref there is no base to compare with, but the enum and table are still checked.
+rc, out = run(d, base=None)
+check("no assert and no --base-ref: the family is still validated",
+      rc == 0 and "ok   GGML_GLU_OP_COUNT = 2: enum and GGML_GLU_OP_NAME agree; no static_assert" in out, out)
+d = make(BASE, NAMES, SYMS, 101)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace(GLU_ASSERT, "").replace('    "GEGLU",\n', ""))
+rc, out = run(d, base=None)
+check("no assert left and a dropped GLU table entry: exit 1",
+      rc == 1 and "GGML_GLU_OP_NAME has 1 entries" in out, out)
+
+# A family that never had asserts, and whose enum is not there either, is skipped.
+d = make(BASE, NAMES, SYMS, 101)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace(GLU_ASSERT, ""))
+h = d / "ggml" / "include" / "ggml.h"
+h.write_text(h.read_text().replace("enum ggml_glu_op {", "enum ggml_glu_op_other {"))
+git(d, "commit", "-qam", "no glu")
+git(d, "tag", "base_noglu")
+rc, out = run(d, base="base_noglu")
+check("a family with no assert and no enum, in base and merge: skipped",
+      rc == 0 and "skip GGML_GLU_OP_COUNT" in out, out)
+
+# Equal counts do not prove order: the tables are indexed by enum value.
+NEW2 = ["FLASH_ATTN_EXT_BANDED", "MOE_CACHE_LOOKUP"]
+d = make(*TWO[:1], NAMES + NEW2[::-1], TWO[2], 102)
+before = snapshot(d)
+rc, out = run(d)
+check("two new GGML_OP_NAME entries swapped: exit 1",
+      rc == 1 and 'GGML_OP_NAME[101] is "MOE_CACHE_LOOKUP", enum entry 101 is GGML_OP_FLASH_ATTN_EXT_BANDED' in out
+      and "ggml/src/ggml.c:" in out, out)
+check("and nothing is rewritten", snapshot(d) == before)
+rc, out = run(d, base=None)
+check("the name order is checked without --base-ref too", rc == 1 and "out of enum order" in out, out)
+
+d = make(BASE, NAMES, SYMS, 101, unary=("ABS", "SGN", "NEW"), u_assert=2)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace('    "ABS",\n    "SGN",', '    "SGN",\n    "ABS",'))
+rc, out = run(d)
+check("swapped unary names: exit 1", rc == 1 and "GGML_UNARY_OP_NAME[0] is \"SGN\"" in out, out)
+d = make(BASE, NAMES, SYMS, 101)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace('    "REGLU",\n    "GEGLU",', '    "GEGLU",\n    "REGLU",'))
+rc, out = run(d)
+check("swapped GLU names: exit 1", rc == 1 and "GGML_GLU_OP_NAME[0] is \"GEGLU\"" in out, out)
+
+# GGML_OP_SYMBOL is free text: a new op's symbol inserted before an existing op's (count right,
+# names right) shifts that op's symbol, which the base mapping catches.
+d = make(*TWO[:2], SYMS[:50] + ["flash_attn_ext_banded(x)"] + SYMS[50:] + ["moe_cache_lookup(x)"], 102)
+rc, out = run(d)
+check("a symbol line out of place: exit 1",
+      rc == 1 and "GGML_OP_SYMBOL[50] is \"flash_attn_ext_banded(x)\"" in out, out)
+d = make(*TWO[:2], SYMS + ["moe_cache_lookup(x)", "flash_attn_ext_banded(x)"], 102)
+rc, out = run(d)
+check("two new symbols swapped are not detectable (only counted): passes", rc == 0, out)
+
+# Two pins that each remove an op and each bump PATCH 0 -> 1: PATCH goes to 0 + 2, as for adds.
+d = make(BASE[:-2], NAMES[:-2], SYMS[:-2], 100)
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("op count fell by 2 with PATCH moved by 1: PATCH raised to 2",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc and "RPC_PROTO_PATCH_VERSION 1 -> 2" in out
+      and "GGML_OP_COUNT == 99" in rpc, out + rpc)
+d = make(BASE[:-2], NAMES[:-2], SYMS[:-2], 100, patch=0)
+rc, out = run(d)
+check("op count fell and the version did not move: exit 1",
+      rc == 1 and "without bumping the RPC protocol" in out, out)
 
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
