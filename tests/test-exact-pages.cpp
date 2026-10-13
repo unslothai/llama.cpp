@@ -1,4 +1,4 @@
-// [TAG_EXACT_CONCURRENCY] drives the removal paths of the paged KV pool - a removal that empties nothing, one that leaves holes, the pages those holes keep reserved, and a restore whose position has no page - while LLAMA_KV_CACHE_DEBUG=1 makes the pool cross-check page ownership against the live cells every ubatch.
+// [TAG_EXACT_CONCURRENCY] tests the paged KV pool removal and restore paths, with LLAMA_KV_CACHE_DEBUG=1 cross-checking page ownership every ubatch.
 // Needs a CUDA build with 256-wide heads and a fully offloaded F16 cache; without one the test reports what it skipped and passes.
 
 #include "arg.h"
@@ -90,8 +90,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // a page belongs to one sequence, so a cross-sequence copy is refused whole rather than half
-    // applied: the pool logs the refusal and leaves the destination empty and the source as it was
+    // a page belongs to one sequence, so a cross-sequence copy is refused whole and both sequences stay as they were.
     llama_memory_seq_cp(mem, 0, 1, -1, -1);
 
     if (llama_memory_seq_pos_max(mem, 1) != -1 || llama_memory_seq_pos_max(mem, 0) != 599) {
@@ -100,8 +99,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // the removal every accepted speculative step makes: a rejected tail that is not there. It
-    // must leave the pool alone, ownership included
+    // removing a rejected speculative tail that is not there must leave the pool and its ownership alone.
     if (!llama_memory_seq_rm(mem, 0, 600, -1) || llama_memory_seq_pos_max(mem, 0) != 599) {
         fprintf(stderr, "%s : a removal past the tail changed the sequence, its end is %d\n",
                 __func__, llama_memory_seq_pos_max(mem, 0));
@@ -113,9 +111,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // holes: positions 1 to 510 go, 0 and 511 to 655 stay, so the first two pages each keep a live
-    // cell and neither is free for another sequence. A hybrid memory refuses to remove the middle
-    // of a sequence, and then there is nothing to check here
+    // holes: positions 1 to 510 go and 0, 511 to 655 stay, so the first two pages each keep a live cell and stay reserved.
+    // A hybrid memory refuses to remove the middle of a sequence, so there is nothing to check then.
     const bool holes = llama_memory_seq_rm(mem, 0, 1, 511);
 
     if (holes && llama_memory_seq_pos_max(mem, 0) != 655) {
@@ -126,15 +123,13 @@ int main(int argc, char ** argv) {
 
     printf("%s : interior removal %s\n", __func__, holes ? "left holes" : "was refused, skipping the hole case");
 
-    // sequence 1 fills what is left of the pool. The pool holds 8 pages and sequence 0 holds 3 of
-    // them, holes and a part full tail page included, so 5 remain
+    // sequence 1 fills the 5 pages left of 8, since sequence 0 holds 3 including holes and a partial tail page.
     if (!decode_range(ctx, 1, 0, 5*PAGE - 1)) {
         fprintf(stderr, "%s : failed to fill the pages sequence 0 does not hold\n", __func__);
         return 1;
     }
 
-    // one page more than the pool has left: it has to refuse rather than take a page that still
-    // has a live cell in it
+    // one page more than is left must be refused, not taken from a page that still has a live cell.
     if (decode_range(ctx, 1, 5*PAGE, 5*PAGE)) {
         fprintf(stderr, "%s : the pool allocated a page that sequence 0 still holds\n", __func__);
         return 1;
@@ -157,9 +152,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // a restored cell with a negative position has no page: the restore fails as a bad state does,
-    // and the same state unpatched still restores. After the magic and the sequence id, the
-    // attention cache comes first, as n_stream, cell_count, then the first cell's position
+    // a restored cell with a negative position has no page, so the restore fails while the unpatched state still restores.
+    // Layout after the magic and sequence id: n_stream, cell_count, then the first cell's position.
     {
         std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 1));
         state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 1));
@@ -195,8 +189,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // a whole-context state cannot be restored in this mode, so it is not saved either: the size,
-        // the copy and the session file all fail, and no file is left behind to fail at the next load
+        // a whole-context state cannot be restored in this mode, so size, copy and session save all fail and leave no file.
         std::vector<uint8_t> whole(state.size() + 4096);
 
         if (llama_state_get_size(ctx) != 0 || llama_state_get_data(ctx, whole.data(), whole.size()) != 0) {

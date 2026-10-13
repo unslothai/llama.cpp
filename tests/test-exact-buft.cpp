@@ -1,8 +1,5 @@
-// [TAG_EXACT_CONCURRENCY] which buffer types the mode accepts a weight in. A host buffer is not one
-// of them: the scheduler runs an operation on the backend holding its weight, and moves a host
-// weight's operation to the GPU only once the batch is wide enough, so its result would depend on
-// how many sequences share the step. This is the predicate behind both the context's weight check
-// and the refusal of a lora that would inherit such a buffer.
+// [TAG_EXACT_CONCURRENCY] which buffer types the mode accepts a weight in, as used by the context weight check and the lora refusal.
+// A host buffer is refused: its ops move to the GPU only once the batch is wide enough, so results depend on the step width.
 
 #include "ggml-backend.h"
 

@@ -296,8 +296,7 @@ private:
     // record that the cell at physical index idx has just become empty
     void exact_pages_release(uint32_t idx);
 
-    // how many cells have been released, so prepare() can tell whether a placement removed cells
-    // it is not going to restore
+    // released cell count, so prepare() can tell whether a placement removed cells it does not restore.
     uint64_t exact_page_n_release = 0;
 
     // scratch for find_slot(), which must not touch the ownership it reads

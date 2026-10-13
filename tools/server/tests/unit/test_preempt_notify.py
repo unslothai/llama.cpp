@@ -251,9 +251,7 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
     _start(n_slots=3, n_ctx=2048, enable_ctx_shift=True)
 
     n_predict = 12000
-    # the default parked keepalive is 2 s, which is also when a resident is rotated out for the head:
-    # a park that ends with that rotation could beat its own keepalive. Ask for a 1 s ping instead, so
-    # any park that outlasts one rotation window is still required to say so
+    # the default 2 s keepalive equals the rotation window, so a park could end before its ping; ask for 1 s instead.
     results = _stream_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C), sse_ping_interval=1)
     n_parked = n_keepalive = 0
     for comments, datas in results:

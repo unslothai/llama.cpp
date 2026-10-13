@@ -1,6 +1,4 @@
-// [TAG_PREEMPT] the server converts between a KV position and a token count when it rewinds a slot to
-// what the cache holds. With M-RoPE media the two differ, so the conversion is exercised here on a
-// hand-built image chunk, without a model.
+// [TAG_PREEMPT] KV position and token count differ with M-RoPE media, so test the rewind conversion on a hand-built image chunk.
 
 #include "server-common.h"
 
@@ -16,8 +14,7 @@
 #undef NDEBUG
 #include <cassert>
 
-// the wire format of mtmd_input_chunk_save(), which needs a context to produce a chunk; written here so
-// that a chunk of a known shape can be loaded without one
+// the mtmd_input_chunk_save() wire format, written by hand so a chunk loads without a context.
 struct chunk_writer {
     std::vector<char> buf;
 

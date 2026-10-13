@@ -574,10 +574,8 @@ void llama_kv_cache::exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos
     ++exact_page_live[idx/exact_page_size];
 }
 
-// [TAG_EXACT_CONCURRENCY] a page stays with its sequence for as long as one of its cells is live,
-// so a removal frees it only when it takes the last one. Counting per page is what keeps a removal
-// that empties nothing, such as the rejected tail of every accepted speculative step, from costing
-// a rescan of the pool.
+// [TAG_EXACT_CONCURRENCY] a page stays with its sequence while one of its cells is live, so a removal frees it only when it takes the last one.
+// Per-page counts keep a removal that empties nothing (a rejected speculative tail) from rescanning the pool.
 void llama_kv_cache::exact_pages_release(uint32_t idx) {
     ++exact_page_n_release;
 
@@ -1045,8 +1043,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
-    // [TAG_EXACT_CONCURRENCY] a placement can purge positions outside the cells it restores below,
-    // and those are not undone; count removals to notice
+    // [TAG_EXACT_CONCURRENCY] a placement can purge cells it does not restore below, so count removals to notice.
     const uint64_t n_release_before = exact_page_n_release;
 
     bool success = true;
@@ -1081,8 +1078,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     GGML_ASSERT(!states.empty() || !success);
 
-    // [TAG_EXACT_CONCURRENCY] what the allocator knew is the answer unless the placement also
-    // removed cells, in which case only the cells can say what is left
+    // [TAG_EXACT_CONCURRENCY] trust the allocator unless the placement also removed cells; then only the cells say what is left.
     const bool exact_rebuild = exact_page_owner_dirty || exact_page_n_release != n_release_before;
 
     // iterate backwards and restore the cells to their original state

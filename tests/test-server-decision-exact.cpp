@@ -1,6 +1,5 @@
-// [TAG_EXACT_CONCURRENCY] a decision request whose questions share a prompt prefix is grouped so the
-// children continue from the parent's cells through seq_cp. Exact mode gives a page to one sequence
-// and refuses that copy, so the grouping must not happen there: every task keeps its whole prompt.
+// [TAG_EXACT_CONCURRENCY] decision questions with a shared prefix are grouped through seq_cp, which exact mode refuses.
+// So in exact mode no grouping happens and every task keeps its whole prompt.
 
 #include "server-decision.h"
 

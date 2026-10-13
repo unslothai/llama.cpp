@@ -10,8 +10,7 @@
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 
-// [TAG_EXACT_CONCURRENCY] the page table of the paged path, which only the ordinary flash
-// attention op carries: another op is free to keep a tensor of its own in the same slot
+// [TAG_EXACT_CONCURRENCY] page table of the paged path; only the plain flash attention op carries it in this slot.
 static __forceinline__ const ggml_tensor * ggml_cuda_fattn_pages(const ggml_tensor * dst) {
     return dst->op == GGML_OP_FLASH_ATTN_EXT ? dst->src[5] : nullptr;
 }

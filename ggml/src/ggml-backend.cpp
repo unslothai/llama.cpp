@@ -704,9 +704,8 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
-// (optional) non-blocking completion test for an event, published by the backend's registry as
-// "ggml_backend_dev_event_query" so that ggml_backend_device_i, and with it the backend API version,
-// stays as upstream has it. A backend that does not publish it gets the blocking fallback.
+// (optional) non-blocking event test, published as "ggml_backend_dev_event_query" so ggml_backend_device_i stays unchanged.
+// A backend that does not publish it gets the blocking fallback.
 typedef bool (*ggml_backend_dev_event_query_t)(ggml_backend_dev_t dev, ggml_backend_event_t event);
 
 static ggml_backend_dev_event_query_t ggml_backend_dev_get_event_query(ggml_backend_dev_t device) {

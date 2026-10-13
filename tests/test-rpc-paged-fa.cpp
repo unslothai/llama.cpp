@@ -1,7 +1,5 @@
-// [TAG_EXACT_CONCURRENCY] an RPC server refuses a FLASH_ATTN_EXT that carries a page table (src[5]).
-// supports_op keeps the scheduler from sending one, but a client can submit any graph, and a paged
-// backend would trust the page ids it was given. The server runs on the CPU in a child process and
-// each graph is sent from a child of its own, so a refused graph only costs that client its connection.
+// [TAG_EXACT_CONCURRENCY] an RPC server must refuse a FLASH_ATTN_EXT with a page table (src[5]), since a client can send any graph.
+// The server and each client run in child processes, so a refused graph only drops that client.
 
 #include "ggml.h"
 #include "ggml-alloc.h"

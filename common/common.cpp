@@ -1517,8 +1517,8 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // a prompt is added to a batch in whole ubatches, so a batch that cannot hold one beside a decode step of every slot would leave a prefill shorter ubatches than it gets alone, and the mode would report itself as on while a shared step changed the prompt's arithmetic
-    // a causal context clamps the batch to the context size, so that is the batch a prefill really gets; an unset -c is only known once the context exists, which common_exact_concurrency_context() checks
+    // the batch must hold one whole ubatch beside a decode step of every slot, else a shared step changes a prompt's ubatches.
+    // a causal context clamps the batch to n_ctx; an unset -c is checked later by common_exact_concurrency_context().
     const int n_batch_eff = params.n_ctx > 0 ? std::min(params.n_ctx, params.n_batch) : params.n_batch;
 
     int n_batch_min = 0;
