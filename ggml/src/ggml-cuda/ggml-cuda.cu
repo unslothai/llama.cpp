@@ -6099,21 +6099,16 @@ static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
     return false;
 }
 
-// device copies of a copy-only instance (the scheduler copy queue, overlapping compute): copy engines on HBM devices (the kernel slows the compute), the kernel otherwise (copy engines are slow there)
-// GGML_CUDA_COPY_QUEUE_KERNEL=1 forces the kernel, 0 the copy engines
+// device copies of a copy-only instance (the scheduler copy queue): the kernel, except copy engines on compute capability 10.x where they measured faster (GGML_CUDA_COPY_QUEUE_KERNEL=0/1 overrides)
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
 static bool ggml_cuda_copy_queue_kernel(int device) {
     static const std::vector<bool> kernel = [] {
         const char * env = getenv("GGML_CUDA_COPY_QUEUE_KERNEL");
         std::vector<bool> res(ggml_cuda_info().device_count, true);
         for (int id = 0; id < (int) res.size(); id++) {
-            int bus_width = 0;
-            if (cudaDeviceGetAttribute(&bus_width, cudaDevAttrGlobalMemoryBusWidth, id) != cudaSuccess) {
-                (void) cudaGetLastError();
-                bus_width = 0;
-            }
-            res[id] = env != nullptr ? atoi(env) != 0 : bus_width < 2048;
-            GGML_LOG_INFO("ggml_cuda_copy_queue_kernel: device %d: memory bus %d bits, device copies of a copy queue with the %s\n", id, bus_width,
+            const int cc = ggml_cuda_info().devices[id].cc;
+            res[id] = env != nullptr ? atoi(env) != 0 : !(cc >= 1000 && cc < 1100);
+            GGML_LOG_INFO("ggml_cuda_copy_queue_kernel: device %d: compute capability %d.%d, device copies of a copy queue with the %s\n", id, cc/100, (cc%100)/10,
                 res[id] ? "kernel" : "copy engines");
         }
         return res;
