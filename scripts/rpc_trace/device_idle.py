@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Splits one device's idle time into idle while the other computes (a scheduling problem) and
-idle while neither computes (a host problem), per phase: device_idle.py client.jsonl peer.jsonl
-"""
+"""Splits one device's idle time into idle while the other computes (a scheduling problem) and idle
+while neither computes (a host problem), per phase: device_idle.py client.jsonl peer.jsonl"""
 
 import argparse
 import sys
@@ -19,23 +18,9 @@ def inside(outer, e):
 def phase_windows(client):
     """(prefill, decode) iteration windows per group; groups do not enter decode together.
 
-    An iteration is classified by, in order of preference:
-
-    0. `prompt` and `decode`, the token counts of the batch that was actually submitted. An
-       iteration carrying both is genuinely mixed: continuous batching puts one slot's prompt
-       alongside other slots' generation. Charging the whole iteration to prefill would drag the
-       end of the prefill phase forward every time a request arrives late, so a mixed iteration
-       counts as decode once any generation is present, and only a batch that is entirely prompt
-       tokens is prefill. An iteration that submitted nothing at all is neither;
-    1. `prompt` alone, for traces written before `decode` was emitted alongside it;
-    2. drafting. With speculative decoding a generation step submits one sampled plus n_draft
-       drafted tokens per slot, which the token count alone cannot tell from a prompt chunk.
-       common_speculative_draft() runs the draft model inside pre_decode, so a nested one-token
-       llama/decode inside batch_build means the step is drafting, hence generating. The token
-       count is required so that a multimodal prompt chunk, which also decodes inside pre_decode
-       but a whole image at a time, is not mistaken for a draft;
-    3. tokens per processing slot, once the draft width seen in 2 is allowed for. With nothing
-       drafting anywhere the width is 1 and this is the plain "more tokens than slots" rule.
+    Classified by the submitted batch's `prompt`/`decode` counts (mixed = decode), else `prompt`
+    alone (older traces), else a nested one-token draft decode (speculative decode looks like a
+    prompt chunk by count), else tokens per processing slot.
     """
     subs = defaultdict(list)
     builds = defaultdict(list)

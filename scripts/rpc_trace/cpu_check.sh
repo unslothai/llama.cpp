@@ -1,12 +1,11 @@
 #!/bin/bash
 # CPU-only smoke test: layers split over two rpc-servers, run with the trace off and on, checking
 # the text is identical and that merge.py accepts the result.
-#
 # pipefail matters here: the completions run as `curl | parser`, and without it the status of a
-# failed request is thrown away and two empty output files compare equal, so the test would
-# report PASS without ever generating a token. errexit is deliberately not set, because the
-# teardown deals in `kill` and `grep -q` calls that are expected to fail; every step that can
-# fail is checked by hand instead.
+# failed request is thrown away and two empty output files compare equal, so the test would report
+# PASS without ever generating a token. errexit is deliberately not set, because the teardown deals
+# in `kill` and `grep -q` calls that are expected to fail; every step that can fail is checked by
+# hand instead.
 set -u
 set -o pipefail
 
@@ -30,7 +29,6 @@ trap cleanup EXIT
 
 PROMPTS=("the capital of France is" "two plus two equals" "the colour of the sky is")
 
-# complete <tag> <prompt> -- one completion appended to $OUT/$tag.out.txt, non-zero on any failure
 complete() {
   local tag=$1 prompt=$2
   local body="$OUT/$tag.resp.json" code rc
@@ -71,7 +69,6 @@ sys.stdout.write("=== %s\n%s\n" % (sys.argv[2], d["content"]))
   return 0
 }
 
-# cell <tag>   (PEER_TRACE is the prefix of the peer trace files)
 cell() {
   local tag=$1; shift
   rm -f "$OUT/$tag.out.txt"
@@ -95,8 +92,8 @@ cell() {
   for p in "${PROMPTS[@]}"; do
     if complete "$tag" "$p"; then ok=$((ok + 1)); else rc=1; fi
   done
-  # the point of the test is comparing generated text, so a missing response is a failure and
-  # must not be allowed to leave an empty file that would compare equal to another empty file
+  # the point of the test is comparing generated text, so a missing response is a failure and must
+  # not be allowed to leave an empty file that would compare equal to another empty file
   if [ $ok -ne ${#PROMPTS[@]} ]; then
     echo "$tag: only $ok of ${#PROMPTS[@]} completions were recorded" >&2
     rc=1

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Merge the event traces of an RPC layer split onto the client's time line, into a Chrome trace
-and a per decode step summary: merge.py client.jsonl peer.jsonl --chrome t.json --summary s.txt
-"""
+"""Merge the event traces of an RPC layer split onto the client's time line, into a Chrome trace and a
+per decode step summary: merge.py client.jsonl peer.jsonl --chrome t.json --summary s.txt"""
 
 import argparse
 import bisect
@@ -27,7 +26,6 @@ class TraceFile:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    # a killed process can leave a partial last line
                     continue
                 if "header" in rec:
                     self.header = rec
@@ -69,12 +67,7 @@ def endpoint_host(endpoint):
 
 
 def served_the_sync(f, rec):
-    """did peer `f` answer this clock exchange?
-
-    The client stores the peer's own t2 (reply built) and t3 (reply sent) inside the record, and
-    the peer traced the very same TRACE_SYNC command on that same clock, so the record belongs to
-    the peer whose TRACE_SYNC span brackets [t2, t3]. No host name is involved.
-    """
+    """did peer `f` answer this clock exchange?"""
     t2, t3 = rec.get("t2"), rec.get("t3")
     if t2 is None or t3 is None:
         return False
@@ -88,13 +81,12 @@ def load(paths):
     servers = [f for f in files if f.role == "rpc-server"]
 
     if not clients:
-        # the peer alone is still useful, it just has no common time line
         return files, None
 
     client = clients[0]
 
-    # keyed by the whole endpoint: two peers on one host differ only in the port, and a host name
-    # is not an identity at all once the peers are addressed by IP or by a DNS alias
+    # keyed by the whole endpoint: two peers on one host differ only in the port, and a host name is
+    # not an identity at all once the peers are addressed by IP or by a DNS alias
     by_ep = defaultdict(list)
     for rec in client.offsets:
         by_ep[rec.get("peer", "")].append(rec)
@@ -102,7 +94,7 @@ def load(paths):
     taken = {}                 # id(file) -> offset samples
     left = dict(by_ep)
 
-    # 1. the peer's own record of the clock exchange, which is unambiguous when it is there
+    # 1. the peer's own record of the clock exchange, unambiguous when present
     for ep, recs in list(left.items()):
         owners = [f for f in servers if any(served_the_sync(f, r) for r in recs)]
         if len(owners) == 1:
@@ -110,7 +102,7 @@ def load(paths):
             del left[ep]
 
     # 2. host name, only when the header carries one and it picks out a single endpoint. An empty
-    #    host (Windows, where the tracer writes no host at all) must never prefix-match.
+    #    host (Windows writes none) must never prefix-match.
     for f in servers:
         if id(f) in taken or not f.host:
             continue
@@ -217,7 +209,6 @@ def chrome_trace(files, client):
             tid = e.get("tid", 0)
 
             if cat == "gpu":
-                # one row per device, away from the host thread ids
                 key = e.get("n", "gpu")
                 if key not in gpu_rows:
                     gpu_rows[key] = 10000 + len(gpu_rows)
@@ -272,16 +263,12 @@ def sub_phases(e):
 # only used for traces from a build that did not record the tensor name yet
 LOGITS_MIN_BYTES = 64 * 1024
 
-# the graph outputs llama.cpp reads back with GET_TENSOR: logits, embeddings and the norm the
-# pooled embedding is taken from. Anything else a layer split copies back (a staged hidden state,
-# a KV entry) also runs past 64 KiB, so the size alone says nothing about what the bytes were.
 OUTPUT_PREFIX = "result_"
 
 
 def is_output_tensor(subj):
     if not subj:
         return False
-    # the scheduler names a staging copy "<backend>#<tensor>#<n>"
     return any(part.startswith(OUTPUT_PREFIX) for part in subj.split("#"))
 
 
@@ -453,7 +440,6 @@ def summarize(files, client, out):
         out.write("group %d: %.1f kB out and %.1f kB in per step over RPC; "
                   "biggest idle gap %.1f ms in %s\n"
                   % (grp, wo / n / 1024.0, wi / n / 1024.0, worst[0] / 1000.0, worst[1]))
-        # now that a gap is split over every phase it touches there are more names to show
         top = sorted(idle_by.items(), key=lambda kv: -kv[1])[:6]
         out.write("         idle with neither GPU busy, per step: %s\n"
                   % ", ".join("%s %.1f ms" % (k, v / n / 1000.0) for k, v in top if v > 0))
@@ -474,15 +460,7 @@ def summarize(files, client, out):
 def attribute_gap(indexes, g0, g1):
     """what the host was doing during a stretch in which no GPU was busy
 
-    Returns {"ph/name": microseconds} for every traced phase that covers part of the gap, so a
-    gap that runs batch_build -> submit -> synchronize back to back is fully accounted for
-    instead of being credited to whichever single phase happened to be the longest.
-
-    Phases nest (a sched/split inside a server/submit) and can straddle each other (an
-    llama/graph_compute reaching from a submit into the following synchronize), so a point in
-    the gap is charged to exactly one phase: the innermost scope covering it, that is the
-    shortest one, ties broken by the later start and then by the name so the split is stable.
-    Every microsecond is therefore counted at most once and the total can never exceed g1 - g0.
+    Each point is charged to the innermost covering phase only, so the total never exceeds g1 - g0.
     """
     spans = []
     for ix in indexes:

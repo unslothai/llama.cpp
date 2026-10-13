@@ -950,16 +950,8 @@ struct server_trace_scope {
     int64_t      t0;
     int          n0;
     int          n1;
-    // -1 leaves both fields out entirely. Otherwise these are the prompt and decode token counts
-    // of the batch that was actually submitted, which states the phase rather than leaving the
-    // reader to guess it. A reader cannot infer the phase from tokens per slot, because under
-    // speculative decoding an ordinary decode submits several drafted tokens per slot and looks
-    // exactly like a small prefill.
-    //
-    // Two counts rather than one flag, because continuous batching genuinely produces iterations
-    // that are both: a slot still working through its prompt alongside slots already generating.
-    // Collapsing that to "this iteration is prompt" would charge the generation work in it to
-    // prefill and drag the end of the prefill phase forward every time a request arrives late.
+    // -1 leaves both fields out. Two counts, not a phase flag: continuous batching mixes one slot's
+    // prompt with other slots' generation, and speculative decode looks like a small prefill.
     int          n_prompt = -1;
     int          n_decode = -1;
 
@@ -3729,10 +3721,7 @@ private:
 
         if (ggml_trace_flag) {
             // Counted from the batch that was actually built, not from slot states before
-            // pre_decode(). A slot can be in a prompt state and contribute nothing this iteration,
-            // because the batch filled up before it was admitted, and continuous batching routinely
-            // mixes one slot's prompt with other slots' generation in a single batch. Both cases
-            // are invisible to any pre-decode reading of the states.
+            // pre_decode(): a slot in a prompt state may not have been admitted to this batch.
             int n_prompt = 0;
             for (const auto & tok : batch.tokens) {
                 n_prompt += tok.is_prompt ? 1 : 0;

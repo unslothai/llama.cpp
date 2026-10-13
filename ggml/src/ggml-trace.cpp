@@ -57,19 +57,9 @@ thread_local std::string  tls_line;
 
 // A traced process is usually killed with a signal, and neither ggml-rpc-server nor the capture
 // scripts install a handler, so nothing runs ggml_trace_close() or the static destructors: whatever
-// is still in the stdio buffer is lost. Counting records alone is not enough of a bound, because a
-// tail shorter than the count is dropped no matter how long the run was, and a capture short enough
-// to never reach the count keeps only its explicitly flushed header.
-//
-// So the flush is bounded in time as well as in records. The loss window becomes the interval below
-// rather than "however many events were left over", for any signal including SIGKILL, which no
-// shutdown path could catch anyway.
-//
-// A handler that closed the trace was the other option and is deliberately not used: fflush and
-// fclose are not async-signal-safe, and a signal arriving while emit() holds this mutex would
-// deadlock the handler against the thread it interrupted. Ten flushes a second cannot perturb what
-// this tracer measures, whereas flushing on every record would put a write syscall inside the
-// intervals being timed, and non-perturbation is a property this tooling is supposed to have.
+// is still in the stdio buffer is lost. So the flush is bounded in time as well as in records.
+// A signal handler that closed the trace is WRONG: fflush/fclose are not async-signal-safe and a
+// signal arriving while emit() holds this mutex would deadlock.
 const int64_t TRACE_FLUSH_EVERY    = 128;
 const int64_t TRACE_FLUSH_EVERY_US = 100 * 1000;
 
@@ -179,10 +169,7 @@ int ggml_trace_open(const char * path, const char * role) {
         return 0;
     }
 
-    // llama_server() and rpc-server both open the trace before llama_backend_init(), which is what
-    // normally initializes ggml's timer. On Windows ggml_time_us() divides by timer_freq, so
-    // reaching it first is a division by zero during startup rather than a traced server. This is
-    // idempotent, so calling it here costs nothing when the backend has already been initialized.
+    // before llama_backend_init(): on Windows ggml_time_us() divides by an uninitialized timer_freq
     ggml_time_init();
 
     s.f = fopen(path, "wb");
@@ -209,7 +196,6 @@ int ggml_trace_open(const char * path, const char * role) {
     line += ",\"t_open_us\":";
     append_i64(line, s.t_open);
     line += ",\"wall_us\":";
-    // CLOCK_REALTIME at the same instant, a sanity check for the merge tool
     {
         struct timespec ts;
         timespec_get(&ts, TIME_UTC);
@@ -242,7 +228,6 @@ void ggml_trace_clock_offset(const char * peer, int64_t t1, int64_t t2, int64_t 
     if (!ggml_trace_flag) {
         return;
     }
-    // NTP style: the peer clock is ahead of ours by offset, the round trip is delay
     const int64_t offset = ((t2 - t1) + (t3 - t4)) / 2;
     const int64_t delay  = (t4 - t1) - (t3 - t2);
 
@@ -315,8 +300,7 @@ void ggml_trace_eventf(const char * phase, const char * name, int64_t t0, int64_
     ggml_trace_event(phase, name, t0, t1, fields);
 }
 
-// GPU spans. The timing hooks come from the backend registry, so ggml-base links no GPU runtime.
-
+// GPU spans: hooks come from the backend registry, so ggml-base links no GPU runtime.
 typedef void (*ggml_trace_gpu_mark_t)(ggml_backend_t backend, uint64_t tag, int kind);
 typedef int  (*ggml_trace_gpu_poll_t)(uint64_t * tags, int * kinds, int64_t * t_us, int max);
 

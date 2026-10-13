@@ -1216,9 +1216,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         // copy of our own environment, so without this every child would open the router's exact
         // path: loading a model truncates the router's trace, and two children running at once
         // interleave through independent file offsets, so the file is unusable and the damage is
-        // silent. Give each child its own path instead, derived from the base name so the set is
-        // still recognisable, and keyed by port because a port is unique among live children while
-        // a model name is not guaranteed to be filesystem-safe on its own.
+        // silent. Each child gets its own path keyed by port (unique among live children).
         {
             static const std::string tr_prefix = "GGML_RPC_TRACE=";
 
@@ -1242,8 +1240,6 @@ void server_models::load(const std::string & name, const load_options & opts) {
                     ext  = base_trace.substr(dot);
                 }
 
-                // a model name can carry '/' and ':' from an HF repo spec, neither of which can go
-                // into a filename on every platform we build for
                 std::string safe_name;
                 for (const char c : name) {
                     safe_name += (std::isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';

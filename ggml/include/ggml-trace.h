@@ -13,7 +13,6 @@
 extern "C" {
 #endif
 
-    // 1 while a trace file is open; read it at the call sites so a disabled tracer is one branch
     GGML_API int ggml_trace_flag;
 
     // `path` NULL means GGML_RPC_TRACE; the first call with a usable path wins
@@ -24,16 +23,13 @@ extern "C" {
 
     GGML_API int ggml_trace_tid(void);
 
-    // tags every event this thread raises with a pipeline group, -1 means no group
     GGML_API void ggml_trace_set_group(int group);
     GGML_API int  ggml_trace_get_group(void);
 
     // names the tensor or graph the next RPC commands belong to; `name` must outlive the call
     GGML_API void ggml_trace_set_subject(const char * name, uint64_t uid);
-    // the subject this thread set last, NULL if none; `uid` may be NULL
     GGML_API const char * ggml_trace_get_subject(uint64_t * uid);
 
-    // t1 == t0 is an instant; `fields` may be NULL and is inlined verbatim into the JSON object
     GGML_API void ggml_trace_event(const char * phase, const char * name,
                                    int64_t t0, int64_t t1, const char * fields);
 
