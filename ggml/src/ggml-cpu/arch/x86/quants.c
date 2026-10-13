@@ -712,12 +712,9 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q2_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-    // one Q2_0 block (64 values, 16 bytes of qs) pairs with two Q8_0 blocks;
-    // value j of the block is (qs[j/4] >> 2*(j%4)) & 3, mapped {0,1,2,3} -> {-1,0,1,2}
+    // one Q2_0 block pairs with two Q8_0 blocks; value j is ((qs[j/4] >> 2*(j%4)) & 3) - 1
 #if defined(__AVX2__)
-    // Per Q8_0 block (8 bytes of qs): spread dword 0 over the low lane and dword 1 over the
-    // high lane, shift the 4 copies by 0/2/4/6 bits and keep 2 bits, then transpose each
-    // 4x4 byte tile so the values come out in Q8_0 order.
+    // per Q8_0 block: spread 2 dwords over the lanes, shift by 0/2/4/6, mask, then transpose 4x4 byte tiles to Q8_0 order
     const __m256i perm_0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
     const __m256i perm_1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
     const __m256i shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
@@ -752,9 +749,7 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     *s = hsum_float_8(acc);
 #elif defined(__AVX__) || defined(__SSSE3__)
-    // Shift the 16 bytes of qs by 0/2/4/6 bits: byte b of v_k holds value 4*b + k.
-    // Interleaving bytes of (v_0, v_1) and (v_2, v_3), then 16-bit words of the two,
-    // restores the natural order, 16 values per register.
+    // byte b of v_k (qs >> 2k) holds value 4*b + k; byte then word unpacks restore the natural order
     const __m128i mask_2 = _mm_set1_epi8(3);
     const __m128i ones_8 = _mm_set1_epi8(1);
     __m128 acc = _mm_setzero_ps();
