@@ -1782,6 +1782,49 @@ static uint64_t common_available_memory() {
 #endif
 }
 
+// the devices llama_model_load picks when none are given (src/llama.cpp): RPC servers, GPUs without a duplicate device id, integrated GPUs only without a discrete one
+static std::vector<ggml_backend_dev_t> common_default_model_devices() {
+    std::vector<ggml_backend_dev_t> rpc;
+    std::vector<ggml_backend_dev_t> gpus;
+    std::vector<ggml_backend_dev_t> igpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                if (ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC")) {
+                    rpc.push_back(dev);
+                    break;
+                }
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                bool dup = false;
+                for (ggml_backend_dev_t g : gpus) {
+                    ggml_backend_dev_props g_props;
+                    ggml_backend_dev_get_props(g, &g_props);
+                    dup = dup || (props.device_id && g_props.device_id && strcmp(props.device_id, g_props.device_id) == 0);
+                }
+                if (!dup) {
+                    gpus.push_back(dev);
+                }
+                break;
+            }
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back())) {
+                    igpus.push_back(dev);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    std::vector<ggml_backend_dev_t> devs = rpc;
+    devs.insert(devs.end(), gpus.begin(), gpus.end());
+    if (gpus.empty()) {
+        devs.insert(devs.end(), igpus.begin(), igpus.end());
+    }
+    return devs;
+}
+
 // number of repeating layers of the model (the <arch>.block_count key the loader reads into n_layer_all), -1 if unknown
 // for a split model the metadata is read from the first split
 static int64_t common_model_n_layer(const std::string & path) {
@@ -1890,19 +1933,22 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
         return load_mode;
     }
     // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
-    bool dev_lookup = false;
-    if (!params.devices.empty()) {
-        for (ggml_backend_dev_t dev : params.devices) {
-            dev_lookup = dev_lookup || (dev != nullptr && llama_moe_cache_device_lookup_supported(dev));
+    // every device that gets layers must do the lookup: which device serves the host-expert layers is only known after placement, and a device without it keeps the host lookup that mmap serves as well
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
         }
-    } else {
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                dev_lookup = dev_lookup || llama_moe_cache_device_lookup_supported(dev);
-            }
-        }
+    }
+    if (devs.empty()) {
+        devs = common_default_model_devices();
+    }
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !devs.empty()) {
+        devs = params.main_gpu >= 0 && params.main_gpu < (int) devs.size() ? std::vector<ggml_backend_dev_t>{ devs[params.main_gpu] } : std::vector<ggml_backend_dev_t>{};
+    }
+    bool dev_lookup = !devs.empty();
+    for (ggml_backend_dev_t dev : devs) {
+        dev_lookup = dev_lookup && llama_moe_cache_device_lookup_supported(dev);
     }
     const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
