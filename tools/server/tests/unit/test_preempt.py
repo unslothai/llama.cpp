@@ -340,8 +340,8 @@ def test_a_prompt_parked_before_its_first_token_is_issued_whole():
 
     n_prompt = 240
     n_predict = 4
-    long_prompt = _prompt_of(n_prompt, "Once upon a time there was a little girl")
-    together = _complete_all(n_predict, [long_prompt, long_prompt])
+    # two different prompts: with the same one, the second can be served from the first one's cached cells after it finishes, and prompt_n is then 1
+    together = _complete_all(n_predict, [_prompt_of(n_prompt, _PROMPT_A), _prompt_of(n_prompt, _PROMPT_B)])
 
     assert "cannot fit the pool" not in _log()
     _assert_completed(together, n_predict)
