@@ -74,7 +74,7 @@ def _log() -> str:
 
 def _require_async(text: str):
     if _ASYNC_BANNER not in text:
-        pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")
+        pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")  # ty: ignore[too-many-positional-arguments]
 
 
 def _complete(n_predict: int, prompt="Hi how are you", id_slot: int = -1, delay: float = 0.0, after_slot_busy=None,
@@ -104,7 +104,7 @@ def _wait_processing(slot_ids, timeout: float = 30.0):
         if all(any(s["id"] == i and s["is_processing"] for s in slots) for i in slot_ids):
             return
         time.sleep(0.005)
-    pytest.fail(f"slots {slot_ids} never showed as processing")
+    pytest.fail(f"slots {slot_ids} never showed as processing")  # ty: ignore[invalid-argument-type]
 
 
 def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_TIMEOUT):
@@ -389,7 +389,7 @@ def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
                 break
             time.sleep(0.05)
         else:
-            pytest.fail("the resident never reached the end of the pool")
+            pytest.fail("the resident never reached the end of the pool")  # ty: ignore[invalid-argument-type]
 
         waiting = server.make_request("POST", "/completion", data={
             "n_predict": 8, "prompt": _prompt_of(1800, _PROMPT_C),
@@ -429,7 +429,7 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
             break
         time.sleep(0.2)
     else:
-        pytest.fail("a slot never came back after a cancel during a copy")
+        pytest.fail("a slot never came back after a cancel during a copy")  # ty: ignore[invalid-argument-type]
     for slot in res.body:
         assert slot["is_preempted"] is False
         assert slot["is_transferring"] is False
@@ -487,7 +487,7 @@ def test_a_recurrent_model_is_served_without_preemption():
     assert "Context size has been exceeded" not in text
 
 
-def _stream_completion(n_predict: int, prompt: str) -> tuple[list[str], dict]:
+def _stream_completion(n_predict: int, prompt: str | list[int]) -> tuple[list[str], dict]:
     """One streaming completion: its SSE comment lines and the last response object."""
     url = f"http://{server.server_host}:{server.server_port}/completion"
     res = requests.post(url, json={
@@ -560,7 +560,7 @@ def test_a_media_chunk_is_reserved_whole_before_it_is_decoded():
 def test_an_mtp_draft_stays_inside_the_reservation_it_was_priced_for():
     path = os.environ.get("LLAMA_SERVER_TEST_MTP_MODEL")
     if not path:
-        pytest.skip("set LLAMA_SERVER_TEST_MTP_MODEL to a gguf carrying an MTP head")
+        pytest.skip("set LLAMA_SERVER_TEST_MTP_MODEL to a gguf carrying an MTP head")  # ty: ignore[too-many-positional-arguments]
     server.model_file = path
     server.model_hf_repo = server.model_hf_file = None
     server.spec_type = "draft-mtp"
@@ -587,7 +587,7 @@ def test_an_mtp_draft_stays_inside_the_reservation_it_was_priced_for():
 def test_a_hybrid_model_parks_synchronously():
     path = os.environ.get("LLAMA_SERVER_TEST_HYBRID_MODEL")
     if not path:
-        pytest.skip("set LLAMA_SERVER_TEST_HYBRID_MODEL to a hybrid attention/recurrent gguf")
+        pytest.skip("set LLAMA_SERVER_TEST_HYBRID_MODEL to a hybrid attention/recurrent gguf")  # ty: ignore[too-many-positional-arguments]
     server.model_file = path
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1"
@@ -610,7 +610,7 @@ def test_a_hybrid_model_parks_synchronously():
 def _mrope_model() -> str:
     path = os.environ.get("LLAMA_SERVER_TEST_MROPE_MODEL")
     if not path:
-        pytest.skip("set LLAMA_SERVER_TEST_MROPE_MODEL to an M-RoPE gguf")
+        pytest.skip("set LLAMA_SERVER_TEST_MROPE_MODEL to an M-RoPE gguf")  # ty: ignore[too-many-positional-arguments]
     return path
 
 
@@ -633,7 +633,7 @@ def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
 def test_exact_concurrency_refuses_a_batch_that_cannot_hold_a_whole_ubatch():
     path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
     if not path:
-        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")
+        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")  # ty: ignore[too-many-positional-arguments]
     proc = subprocess.run([
         os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server"),
         "--model", path, "--host", "127.0.0.1", "--port", str(server.server_port),
@@ -677,7 +677,7 @@ def _ubatch_widths(text: str) -> list:
 def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone():
     path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
     if not path:
-        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")
+        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")  # ty: ignore[too-many-positional-arguments]
     server.model_file = path
     server.model_hf_repo = server.model_hf_file = None
     os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
@@ -717,7 +717,7 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
                 break
             time.sleep(0.1)
         else:
-            pytest.fail("the decoders never started")
+            pytest.fail("the decoders never started")  # ty: ignore[invalid-argument-type]
         time.sleep(1.0)
 
         beside = prefill(50000)
@@ -1028,7 +1028,7 @@ def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
             break
         time.sleep(0.005)
     else:
-        pytest.fail("the resident never grew into the pool")
+        pytest.fail("the resident never grew into the pool")  # ty: ignore[invalid-argument-type]
 
     n_prompt = 500
     n_predict = 8
