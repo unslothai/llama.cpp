@@ -88,8 +88,10 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 # counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
 # no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
 # It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
-OP_COUNT_ASSERT_RE = re.compile(r"^(?:static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*=="
-                                r"|#\s*define\s+RPC_PROTO_PATCH_VERSION\b)")
+# Both are exempt only for a pin whose own diff moves an op count (it adds an op-count assert): a
+# pin that bumps PATCH for any other RPC change keeps that line in its contract.
+OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
+RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
 
 # Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")
@@ -162,6 +164,7 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
 
     symbols: dict[str, set[str]] = defaultdict(set)
     lines: dict[str, list[str]] = defaultdict(list)
+    added: list[tuple[str, str]] = []
     cur = None
     for ln in diff.split("\n"):
         if ln.startswith("+++ b/"):
@@ -169,14 +172,17 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
         elif ln.startswith("+++ "):
             cur = None                       # /dev/null: a deletion
         elif cur and ln.startswith("+") and not ln.startswith("+++"):
-            text = ln[1:]
-            stripped = text.strip()
-            if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
-                    and not OP_COUNT_ASSERT_RE.match(stripped)):
-                lines[cur].append(stripped)
-            code = COMMENT_RE.sub("", text).strip()
-            if code:
-                symbols[cur].update(SYMBOL_RE.findall(code))
+            added.append((cur, ln[1:]))
+    op_count_pin = any(OP_COUNT_ASSERT_RE.match(text.strip()) for _, text in added)
+    for cur, text in added:
+        stripped = text.strip()
+        if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
+                and not (op_count_pin and (OP_COUNT_ASSERT_RE.match(stripped)
+                                           or RPC_PATCH_RE.match(stripped)))):
+            lines[cur].append(stripped)
+        code = COMMENT_RE.sub("", text).strip()
+        if code:
+            symbols[cur].update(SYMBOL_RE.findall(code))
 
     # Only symbols the base does not ALREADY have in that file are evidence of
     # this pin. Upstream naming an arch in a file the pin also touches is not

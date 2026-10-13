@@ -227,6 +227,31 @@ check("the pins still own their new op symbols",
 rc, rep, err = run(d, ps8)
 check("any other lost line still fails", rc == 1 and "ggml_op_banded_kernel_entry" in err, err)
 
+# --- 9. a PATCH bump that is not an op-count change keeps its contract ------
+# A pin that bumps RPC_PROTO_PATCH_VERSION for a non-op RPC change is not
+# reconcile_op_count.py's to rewrite, so losing that line must fail the pin.
+d = Path(tempfile.mkdtemp(prefix="pc_"))
+git(d, "init", "-q", "-b", "main")
+(d / "ggml").mkdir()
+(d / "ggml" / "ggml.c").write_text(OPS_BASE)
+git(d, "add", "-A"); git(d, "commit", "-qm", "base"); git(d, "tag", "b1")
+git(d, "checkout", "-qb", "rpc", "b1")
+(d / "ggml" / "ggml.c").write_text(OPS_BASE.replace("VERSION    0", "VERSION    1")
+                                   + "int rpc_new_command_handler(void) { return 3; }\n")
+git(d, "add", "-A"); git(d, "commit", "-qm", "rpc change")
+sha9 = git(d, "rev-parse", "HEAD").stdout.strip()
+git(d, "checkout", "-q", "main")
+git(d, "merge", "-q", "--no-ff", "--no-edit", "-m", "merge rpc", "rpc")
+ps9 = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
+ps9.write_text(json.dumps({"prs": [f"https://github.com/unslothai/llama.cpp/pull/9/commits/{sha9}"]}))
+rc, rep, err = run(d, ps9)
+check("a non-op PATCH bump that survived passes", rc == 0, err)
+c = d / "ggml" / "ggml.c"
+c.write_text(c.read_text().replace("VERSION    1", "VERSION    0"))
+rc, rep, err = run(d, ps9)
+check("a non-op PATCH bump that was lost fails the pin",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
