@@ -704,16 +704,30 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
+// (optional) non-blocking completion test for an event, published by the backend's registry as
+// "ggml_backend_dev_event_query" so that ggml_backend_device_i, and with it the backend API version,
+// stays as upstream has it. A backend that does not publish it gets the blocking fallback.
+typedef bool (*ggml_backend_dev_event_query_t)(ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+static ggml_backend_dev_event_query_t ggml_backend_dev_get_event_query(ggml_backend_dev_t device) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    if (reg == NULL) {
+        return NULL;
+    }
+    return (ggml_backend_dev_event_query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_event_query");
+}
+
 bool ggml_backend_event_query(ggml_backend_event_t event) {
     GGML_ASSERT(event);
 
-    if (event->device->iface.event_query == NULL) {
+    ggml_backend_dev_event_query_t event_query = ggml_backend_dev_get_event_query(event->device);
+    if (event_query == NULL) {
         // no way to ask: the honest answer is to wait for it and then say yes
         ggml_backend_event_synchronize(event);
         return true;
     }
 
-    return event->device->iface.event_query(event->device, event);
+    return event_query(event->device, event);
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -794,7 +808,7 @@ bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_t
 
 bool ggml_backend_dev_supports_event_query(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    return device->iface.event_query != NULL;
+    return ggml_backend_dev_get_event_query(device) != NULL;
 }
 
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
