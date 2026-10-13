@@ -495,6 +495,8 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    // teardown-only commands: a lost peer is reported, not aborted on
+    bool try_send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -505,7 +507,7 @@ public:
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
 
-    void start(const std::string & endpoint);
+    bool start(const std::string & endpoint);
     void work();
 
     ~rpc_dispatcher();
@@ -518,6 +520,8 @@ private:
         void                        * output;
         size_t                        output_size;
         std::promise<void>            completion;
+        bool                          tolerant = false;
+        bool                          ok       = true;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -583,6 +587,19 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     GGML_ASSERT(queue.push(msg));
 }
 
+bool rpc_dispatcher::try_send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    msg->tolerant = true;
+    GGML_ASSERT(queue.push(msg));
+    msg->completion.get_future().wait();
+    return msg->ok;
+}
+
 ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
     rpc_event * ev = new rpc_event;
     ev->msg = std::make_shared<rpc_msg>();
@@ -630,7 +647,7 @@ void rpc_dispatcher::busy_spin_release() {
     GGML_ASSERT(previous > 0);
 }
 
-void rpc_dispatcher::start(const std::string & endpoint) {
+bool rpc_dispatcher::start(const std::string & endpoint) {
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -642,7 +659,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
 
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
-        GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+        return false;
     }
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
@@ -650,6 +667,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
+    return true;
 }
 
 void rpc_dispatcher::work() {
@@ -673,11 +691,12 @@ void rpc_dispatcher::work() {
             const auto t0 = std::chrono::steady_clock::now();
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
-                RPC_STATUS_ASSERT(status);
+                msg_ptr->ok = status;
             } else {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
-                RPC_STATUS_ASSERT(status);
+                msg_ptr->ok = status;
             }
+            RPC_STATUS_ASSERT(msg_ptr->ok || msg_ptr->tolerant);
             if (trace) {
                 const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - t0;
                 LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
@@ -699,7 +718,7 @@ rpc_dispatcher::~rpc_dispatcher() {
     }
 }
 
-static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
+static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint, bool abort_on_failure = true) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<rpc_dispatcher>> dispatchers;
@@ -712,7 +731,12 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
-    dispatcher->start(endpoint);
+    if (!dispatcher->start(endpoint)) {
+        if (abort_on_failure) {
+            GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+        }
+        return nullptr;
+    }
     dispatchers[endpoint] = dispatcher;
     return dispatcher;
 }
@@ -722,7 +746,9 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto request = std::make_shared<rpc_msg_free_buffer_req>();
     request->remote_ptr = ctx->remote_ptr;
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+    if (!ctx->dispatcher->try_send(RPC_CMD_FREE_BUFFER, request, sizeof(*request), nullptr, 0)) {
+        GGML_LOG_ERROR("%s: failed to free the remote buffer, the connection is gone\n", __func__);
+    }
     delete ctx;
 }
 
@@ -1350,11 +1376,17 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
 }
 
 void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
-    auto dispatcher = get_dispatcher(endpoint);
+    *free = 0;
+    *total = 0;
     auto request = std::make_shared<rpc_msg_get_device_memory_req>();
     request->device = device;
     rpc_msg_get_device_memory_rsp response;
-    dispatcher->send(RPC_CMD_GET_DEVICE_MEMORY, request, sizeof(*request), &response, sizeof(response));
+    // informational, also queried at teardown when the peer may be gone: report 0 instead of aborting
+    auto dispatcher = get_dispatcher(endpoint, false);
+    if (dispatcher == nullptr || !dispatcher->try_send(RPC_CMD_GET_DEVICE_MEMORY, request, sizeof(*request), &response, sizeof(response))) {
+        GGML_LOG_ERROR("%s: failed to query device memory of %s, reporting 0\n", __func__, endpoint);
+        return;
+    }
     LOG_DBG2("[%s] device: %u, free: %" PRIu64 ", total: %" PRIu64 "\n", __func__, device, response.free_mem, response.total_mem);
     *free = response.free_mem;
     *total = response.total_mem;
