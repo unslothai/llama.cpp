@@ -536,6 +536,7 @@ struct server_slot {
     // [TAG_PREEMPT] a park with no room left under --preempt-ram: the cells are dropped instead of copied out, and the resume re-prefills the tokens
     bool                 preempt_recompute = false; // parked by dropping its cells
     bool                 preempt_reprefill = false; // putting back, as a prompt, what such a park dropped
+    bool                 backend_sampler   = false; // the task's sampler chain runs on the backend, see the re-prefill's last token in update_slots
     server_tokens        preempt_tokens;            // what the re-prefill decodes: the prompt and everything generated so far
 
     size_t preempt_state_size() const {
@@ -934,6 +935,7 @@ struct server_slot {
         preempt_hold_logged  = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        backend_sampler = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -2635,9 +2637,10 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.backend_sampler = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -5974,7 +5977,10 @@ private:
                         GGML_ASSERT(batch.size() > 0);
 
                         // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        // [TAG_PREEMPT] except a re-prefill's under a backend sampler: that token was sampled before the park and post_decode throws the output away, but the sampler runs on every output of its sequence and, at one output per sequence, draws its uniform from the stream's own RNG, which would come back a draw ahead
+                        if (!(slot.preempt_reprefill && slot.backend_sampler && !slot.can_speculate())) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
 
                         slot.i_batch = batch.size() - 1;
 
