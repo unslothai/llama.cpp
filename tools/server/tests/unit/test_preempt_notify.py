@@ -193,7 +193,7 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
             break
         time.sleep(0.02)
     else:
-        pytest.fail("the resident never grew into the pool")
+        pytest.fail("the resident never grew into the pool")  # ty: ignore[invalid-argument-type]
 
     res = _post(path, _prefill_payload(path, " ".join([_PROMPT_B] * 31), 8))
     assert res.status_code == 200
