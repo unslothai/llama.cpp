@@ -88,9 +88,12 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 # counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
 # no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
 # It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
-# Both are exempt only for a pin whose own diff moves an op count (it adds an op-count assert): a
-# pin that bumps PATCH for any other RPC change keeps that line in its contract.
+# A pin's own op-count assert (any family) is always exempt. Its PATCH line is exempt only when the
+# pin moves the main GGML_OP_COUNT (it adds a `static_assert(GGML_OP_COUNT ==` line), since that is
+# the only delta reconcile_op_count.py raises PATCH from: a pin that bumps PATCH for a unary/GLU-only
+# change or any other RPC change keeps that line in its contract.
 OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
+MAIN_OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_OP_COUNT\s*==")
 RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
 
 # Binary and generated paths whose "lines" are meaningless.
@@ -173,12 +176,16 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
             cur = None                       # /dev/null: a deletion
         elif cur and ln.startswith("+") and not ln.startswith("+++"):
             added.append((cur, ln[1:]))
-    op_count_pin = any(OP_COUNT_ASSERT_RE.match(text.strip()) for _, text in added)
+    # reconcile_op_count.py rewrites every op-count assert (any family), so a pin's own assert line
+    # is not owed. It moves RPC_PROTO_PATCH_VERSION only from the GGML_OP_COUNT delta, so the PATCH
+    # line is exempt only for a pin that changes the main GGML_OP_COUNT assert; a unary/GLU-only pin
+    # that bumps PATCH keeps that line in its contract.
+    main_op_pin = any(MAIN_OP_COUNT_ASSERT_RE.match(text.strip()) for _, text in added)
     for cur, text in added:
         stripped = text.strip()
         if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
-                and not (op_count_pin and (OP_COUNT_ASSERT_RE.match(stripped)
-                                           or RPC_PATCH_RE.match(stripped)))):
+                and not OP_COUNT_ASSERT_RE.match(stripped)
+                and not (main_op_pin and RPC_PATCH_RE.match(stripped))):
             lines[cur].append(stripped)
         code = COMMENT_RE.sub("", text).strip()
         if code:

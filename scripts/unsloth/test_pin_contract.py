@@ -252,6 +252,38 @@ rc, rep, err = run(d, ps9)
 check("a non-op PATCH bump that was lost fails the pin",
       rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
 
+# --- 10. a unary-only op change that bumps PATCH keeps the PATCH line --------
+# reconcile_op_count.py only raises PATCH from the GGML_OP_COUNT delta, so a pin whose only count
+# change is GGML_UNARY_OP_COUNT must still own its PATCH bump; its own unary assert stays exempt.
+UN_BASE = OPS_BASE + 'static_assert(GGML_UNARY_OP_COUNT == 1, "GGML_UNARY_OP_COUNT != 1");\n'
+d = Path(tempfile.mkdtemp(prefix="pc_"))
+git(d, "init", "-q", "-b", "main")
+(d / "ggml").mkdir()
+(d / "ggml" / "ggml.c").write_text(UN_BASE)
+git(d, "add", "-A")
+git(d, "commit", "-qm", "base")
+git(d, "tag", "b1")
+git(d, "checkout", "-qb", "unary", "b1")
+(d / "ggml" / "ggml.c").write_text(UN_BASE.replace("VERSION    0", "VERSION    1")
+                                   .replace("UNARY_OP_COUNT == 1, \"GGML_UNARY_OP_COUNT != 1",
+                                            "UNARY_OP_COUNT == 2, \"GGML_UNARY_OP_COUNT != 2"))
+git(d, "add", "-A")
+git(d, "commit", "-qm", "unary op")
+sha10 = git(d, "rev-parse", "HEAD").stdout.strip()
+git(d, "checkout", "-q", "main")
+git(d, "merge", "-q", "--no-ff", "--no-edit", "-m", "merge unary", "unary")
+ps10 = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
+ps10.write_text(json.dumps({"prs": [f"https://github.com/unslothai/llama.cpp/pull/10/commits/{sha10}"]}))
+c = d / "ggml" / "ggml.c"
+c.write_text(c.read_text().replace("UNARY_OP_COUNT == 2, \"GGML_UNARY_OP_COUNT != 2",
+                                   "UNARY_OP_COUNT == 3, \"GGML_UNARY_OP_COUNT != 3"))
+rc, rep, err = run(d, ps10)
+check("a rewritten unary assert does not fail the pin", rc == 0, err)
+c.write_text(c.read_text().replace("VERSION    1", "VERSION    0"))
+rc, rep, err = run(d, ps10)
+check("a unary-only pin whose PATCH bump was lost fails",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
