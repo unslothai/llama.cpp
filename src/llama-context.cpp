@@ -34,8 +34,8 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// [TAG_EXACT_CONCURRENCY] every per-layer weight and the output head must sit on a backend with the mode's kernels.
-// token_embd is exempt: GET_ROWS is a per-row copy, so it is width-invariant.
+// [TAG_EXACT_CONCURRENCY] every weight outside the input layer (per-layer weights, output head, classifier heads, norms) must sit on a backend with the mode's kernels.
+// Input-layer tensors (token_embd and the other embedding tables) are exempt: GET_ROWS is a per-row copy, so it is width-invariant.
 static void llama_exact_check_weights(const llama_model & model) {
     auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
         if (!t || !t->buffer) {
@@ -66,12 +66,12 @@ static void llama_exact_check_weights(const llama_model & model) {
     };
 
     for (const auto & [name, t] : model.tensors_by_name) {
-        if (name.rfind("blk.", 0) != 0) {
+        if (llm_tensor_name_is_input_layer(name)) {
             continue;
         }
 
         if (auto * buft = host_buft(t)) {
-            refuse(name.c_str(), buft, "layer weight");
+            refuse(name.c_str(), buft, name.rfind("blk.", 0) == 0 ? "layer weight" : "weight");
         }
     }
 

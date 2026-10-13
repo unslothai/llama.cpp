@@ -320,6 +320,10 @@ set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-downl
 llama_build_and_test(test-exact-pages.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-exact-pages PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# [TAG_EXACT_CONCURRENCY] a non-layer weight on the host is refused; skips itself where the mode cannot run
+llama_build_and_test(test-exact-weights.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-weights PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
