@@ -632,7 +632,6 @@ bool llama_batch_allocr::has_seq_wider_than(uint32_t n_tokens) const {
     std::vector<uint32_t> n_per_seq(n_seq_max, 0);
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        // tokens already placed in an earlier ubatch do not make the rest of the batch a prompt
         if (used[i]) {
             continue;
         }
@@ -658,7 +657,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
-    // [TAG_EXACT_CONCURRENCY] tokens left in the first set taken, when isolating: only sets with the same count join it, so every set in the ubatch finishes in it
+    // [TAG_EXACT_CONCURRENCY] only sets with the same tokens left join the first, so every set in the ubatch finishes in it.
     uint32_t n_left_first = 0;
 
     // determine the non-overlapping sequence sets participating in this ubatch
@@ -683,7 +682,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (add) {
-            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step carries is a prompt and gets a ubatch of its own; grouped sets need equal tokens left, or the expansion below changes their sum order
+            // [TAG_EXACT_CONCURRENCY] a set with more tokens left than a decode step is a prompt and gets its own ubatch.
             if (isolate_seqs_above > 0) {
                 uint32_t n_left = 0;
 
@@ -695,7 +694,6 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
                 if (n_left > isolate_seqs_above) {
                     if (!cur_seq_set.empty()) {
-                        // let the sets already taken have this ubatch; the prompt gets the next one
                         break;
                     }
 

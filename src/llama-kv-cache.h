@@ -274,7 +274,7 @@ private:
     static constexpr uint32_t exact_page_size = 256;
     bool exact_pages = false;
 
-    // [TAG_EXACT_CONCURRENCY] which (sequence, logical page) owns each physical page; seq < 0 means free, and it is kept current as cells are placed and dirtied by removals
+    // [TAG_EXACT_CONCURRENCY] (sequence, logical page) owning each physical page; seq < 0 means free.
     struct exact_page {
         llama_seq_id seq = -1;
         llama_pos    lpg = -1;
@@ -283,24 +283,20 @@ private:
     mutable std::vector<exact_page> exact_page_owner;
     mutable bool                    exact_page_owner_dirty = true;
 
-    // live cells in each physical page, so a removal can free the page it emptied without rescanning the pool
+    // Live cells per page, so a removal can free an emptied page without a rescan.
     mutable std::vector<uint32_t> exact_page_live;
 
-    // with LLAMA_KV_CACHE_DEBUG set this also rebuilds, to check what was maintained
     void exact_pages_sync() const;
 
     void exact_pages_rebuild() const;
 
     void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
 
-    // record that the cell at physical index idx has just become empty
     void exact_pages_release(uint32_t idx);
 
-    // how many cells have been released, so prepare() can tell whether a placement removed cells
-    // it is not going to restore
+    // Released cell count, so prepare() can tell whether a placement removed cells it will not restore.
     uint64_t exact_page_n_release = 0;
 
-    // scratch for find_slot(), which must not touch the ownership it reads
     mutable std::vector<exact_page> exact_page_owner_tmp;
 
     bool v_trans = true;  // the value tensor is transposed

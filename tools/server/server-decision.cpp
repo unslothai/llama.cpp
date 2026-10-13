@@ -808,7 +808,7 @@ json server_decision_context::format_answer(const server_decision_question & que
 //
 
 std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots) {
-    // [TAG_EXACT_CONCURRENCY] a child continues from the parent's cells through seq_cp, which exact mode refuses (a page belongs to one sequence): every task keeps its whole prompt
+    // [TAG_EXACT_CONCURRENCY] exact mode refuses seq_cp, so every task keeps its whole prompt.
     if (common_exact_concurrency()) {
         return std::move(tasks);
     }

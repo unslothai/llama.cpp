@@ -10,8 +10,7 @@
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 
-// [TAG_EXACT_CONCURRENCY] the page table of the paged path, which only the ordinary flash
-// attention op carries: another op is free to keep a tensor of its own in the same slot
+// [TAG_EXACT_CONCURRENCY] the page table of the paged path, carried only by the ordinary flash attention op.
 static __forceinline__ const ggml_tensor * ggml_cuda_fattn_pages(const ggml_tensor * dst) {
     return dst->op == GGML_OP_FLASH_ATTN_EXT ? dst->src[5] : nullptr;
 }
@@ -1120,7 +1119,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    // [TAG_BATCH_INVARIANT] without this scan the KV loop runs to K->ne[1], which grows with the other sequences; the mask bounds it by the sequence's own extent
+    // [TAG_BATCH_INVARIANT] the mask bounds the KV loop by the sequence's own extent, not K->ne[1].
     const bool batch_invariant_KV_max = ggml_cuda_batch_invariant() != 0;
     const bool scan_mask = !use_sparse && !ggml_cuda_fattn_pages(dst) && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || batch_invariant_KV_max);
     if (scan_mask) {
@@ -1197,7 +1196,7 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else if (ggml_cuda_fattn_pages(dst) || ggml_cuda_batch_invariant()) {
-        // [TAG_BATCH_INVARIANT] the KV split between blocks, and so the order the partials combine in, follows K->ne[1]: pin it to one block per tile
+        // [TAG_BATCH_INVARIANT] pin one block per tile so the partials' combine order does not follow K->ne[1].
         parallel_blocks = 1;
 
         blocks_num.x = ntiles_x;

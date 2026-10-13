@@ -603,10 +603,9 @@ bool ggml_cuda_mmvq_matches_single_column(enum ggml_type type, int cc, int64_t n
     }
     const mmvq_parameter_table_id table_id = get_device_table_id(cc);
     if (table_id == MMVQ_PARAMETERS_GB10) {
-        // There nwarps also depends on the K loop trip count, which the caller does not pass in.
+        // On GB10 nwarps also depends on the K loop trip count, which is not passed in.
         return ncols_dst == 1;
     }
-    // blocks_per_iter, which assigns K blocks to threads, is proportional to nwarps; rows_per_cuda_block only changes which rows a block owns, not the order within a row
     return calc_nwarps(type, 1, table_id) == calc_nwarps(type, (int) ncols_dst, table_id);
 }
 
@@ -653,7 +652,7 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     sample_dst = blockIdx.z;
-    // [TAG_BATCH_INVARIANT] with ids, a sample is a token: every token goes on the z axis of one single-column launch, so each (token, expert slot) block runs the single-token configuration
+    // [TAG_BATCH_INVARIANT] with ids each token goes on the z axis of one single-column launch.
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[sample_dst*ids_stride + channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y)                       : channel_dst;
 
@@ -1466,7 +1465,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    // [TAG_BATCH_INVARIANT] a multi-token MUL_MAT_ID becomes one launch of the single-token configuration with the tokens on the sample axis, so the count is not bounded by the column templates
+    // [TAG_BATCH_INVARIANT] multi-token MUL_MAT_ID puts tokens on the sample axis, so the count is not bounded by the column templates.
     const bool tokens_as_samples = ids && ne2 > 1 && ggml_cuda_batch_invariant();
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || tokens_as_samples);
@@ -1579,7 +1578,6 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (tokens_as_samples) {
         GGML_ASSERT(ne03 == 1 && ne13 == 1 && ne3 == 1);
-        // one column, one sample per token: y advances by s12 per token, dst by s2, x not at all
         mul_mat_vec_q_switch_type(
             src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
             ne01,              1,             s01, stride_col_y,     stride_col_dst,

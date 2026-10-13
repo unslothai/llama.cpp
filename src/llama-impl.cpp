@@ -211,8 +211,8 @@ bool llama_exact_backend_name(const char * reg_name) {
     return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
 }
 
-// [TAG_EXACT_CONCURRENCY] a host buffer is the case that matters: the scheduler runs an op on the backend that holds its weight, and moves a host weight's op to the GPU only once the batch is wide enough (ggml_backend_cuda_device_offload_op).
-// The CPU matmul picks between its SGEMM and its vector dot by the batch width too.
+// [TAG_EXACT_CONCURRENCY] the scheduler moves a host weight's op to the GPU only for wide batches, so host buffers are refused.
+// The CPU matmul also picks SGEMM or vector dot by batch width.
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
     if (!buft || ggml_backend_buft_is_host(buft)) {
         return false;
@@ -233,13 +233,12 @@ bool llama_exact_concurrency() {
     return enabled;
 }
 
-// [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h
+// [TAG_EXACT_CONCURRENCY] tokens one sequence contributes to a decode step, see llama.h.
 static std::atomic<uint32_t> g_exact_decode_tokens{1};
 
-// one lock for the token figure, the sequence count and the width: a report interleaved with a change of figure could leave the backend with a width that covers neither
+// One lock for all three, so a report cannot interleave with a change of figure.
 static std::recursive_mutex g_exact_mutex;
 
-// the most sequences any context was created with; the tokens figure is process wide, so raising it re-reports every context's width
 static std::atomic<uint32_t> g_exact_max_n_seq{0};
 
 static bool llama_exact_width_within_explicit_bound(uint32_t n_cols);
@@ -291,12 +290,12 @@ bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
 
     std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
 
-    // never lowered: a narrower context set up later would turn an existing speculative context's verify steps into prompts
+    // Never lowered: a narrower later context would turn speculative verify steps into prompts.
     if (n_tokens <= g_exact_decode_tokens.load(std::memory_order_relaxed)) {
         return true;
     }
 
-    // every context widens with the figure, so report the width first; one the explicit bound cannot cover leaves the old figure in place
+    // Report the width first; one the explicit bound cannot cover keeps the old figure.
     const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
 
     uint32_t n_cols = 0;
@@ -314,10 +313,9 @@ uint32_t llama_exact_decode_tokens(void) {
     return g_exact_decode_tokens.load(std::memory_order_relaxed);
 }
 
-// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h; reached through the registry so an absent or late-loaded backend costs nothing
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch reported so far, see llama.h.
 static std::atomic<uint32_t> g_exact_decode_width{0};
 
-// an explicit column bound wins in the CUDA backend, so a width above it would leave decodes batched past the bound
 static bool llama_exact_width_within_explicit_bound(uint32_t n_cols) {
     static const int explicit_cols = []() {
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");

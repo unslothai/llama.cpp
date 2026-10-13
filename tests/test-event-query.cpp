@@ -1,6 +1,5 @@
-// [TAG_EXACT_CONCURRENCY] a non-blocking event query is found through the backend registry. A CUDA
-// device must report it, since without it every poll of an asynchronous park blocks, and on every
-// device that reports it a recorded event that has been waited for reads as complete.
+// [TAG_EXACT_CONCURRENCY] a CUDA device must expose a non-blocking event query via the registry, or every async park poll blocks.
+// A waited-for event must read as complete.
 
 #include "ggml-backend.h"
 

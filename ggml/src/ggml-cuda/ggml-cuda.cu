@@ -1768,7 +1768,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
-    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single destination column only, so leaving it on would give a solo request a different code path from a batched one
+    // [TAG_BATCH_INVARIANT] mul_mat+GLU is fused for a single column only, so it would give solo and batched requests different paths.
     if (ggml_cuda_batch_invariant()) {
         return false;
     }
@@ -1833,7 +1833,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// [TAG_BATCH_INVARIANT] the token count picks the matmul and how its K loop is split, so the same request produces different bits. GGML_CUDA_BATCH_INVARIANT:
+// [TAG_BATCH_INVARIANT] the token count picks the matmul and its K split. GGML_CUDA_BATCH_INVARIANT:
 //   1 - compute every destination column on its own, exactly as a batch of one would
 //   2 - split off only the columns whose batch-of-one configuration differs from the batched one
 static bool ggml_cuda_exact_concurrency() {
@@ -1853,11 +1853,10 @@ int ggml_cuda_batch_invariant() {
     return mode;
 }
 
-// [TAG_EXACT_CONCURRENCY] the widest decode ubatch the caller says it can build, 0 if it never said
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch the caller reported, 0 if none.
 static std::atomic<int> g_exact_decode_width{0};
 
 void ggml_backend_cuda_set_exact_decode_width(int n_cols) {
-    // monotonic: the widest figure ever reported stays, whatever order the reports arrive in
     int cur = g_exact_decode_width.load(std::memory_order_relaxed);
 
     while (n_cols > cur && !g_exact_decode_width.compare_exchange_weak(cur, n_cols, std::memory_order_relaxed)) {
@@ -1865,7 +1864,7 @@ void ggml_backend_cuda_set_exact_decode_width(int n_cols) {
 }
 
 int ggml_cuda_batch_invariant_max_cols() {
-    // [TAG_EXACT_CONCURRENCY] prompt ubatches hold one sequence, so a prefill already matches its solo run; an explicit bound always wins
+    // [TAG_EXACT_CONCURRENCY] prompt ubatches hold one sequence, so prefills already match their solo run.
     static const int explicit_cols = []() {
         const char * val = getenv("GGML_CUDA_BATCH_INVARIANT_MAX_COLS");
         return val ? atoi(val) : -1;
@@ -1884,7 +1883,7 @@ int ggml_cuda_batch_invariant_max_cols() {
     return width > 0 ? width : 16;
 }
 
-// [TAG_EXACT_CONCURRENCY] a batch wider than the bound is left batched, so say so once. Only when nothing reported a decode width: with one, wider batches are single-sequence prefills.
+// [TAG_EXACT_CONCURRENCY] warn once when a batch wider than the bound is left batched.
 static void ggml_cuda_warn_above_exact_bound(const char * op, int64_t ncols, int max_cols) {
     if (!ggml_cuda_exact_concurrency()) {
         return;
@@ -1952,7 +1951,7 @@ static ggml_cuda_mm_path ggml_cuda_mul_mat_path(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT] the widest slice of columns that can be recomputed in one launch while every column still sums as a batch of one; always below ncols_dst, so the recursion ends
+// [TAG_BATCH_INVARIANT] the widest column slice that still sums as a batch of one; always below ncols_dst.
 static int64_t ggml_cuda_mul_mat_invariant_width(
         int cc, int warp_size, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
         ggml_cuda_mm_path path_one, int64_t ncols_dst) {
@@ -1975,8 +1974,7 @@ static int64_t ggml_cuda_mul_mat_invariant_width(
 static bool ggml_cuda_mul_mat_split_columns(
         ggml_backend_cuda_context & ctx, int cc, int warp_size,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // recurrent output projections broadcast one weight matrix over sequence planes, so normalize each plane before applying the column policy
-    // every mode owes the caller the batch-of-one column policy, and a plane the policy never sees is left batched
+    // Recurrent projections broadcast one weight over sequence planes, so apply the column policy per plane.
     if (ggml_cuda_batch_invariant() && src0->ne[2] == 1 && src0->ne[3] == 1 &&
             (dst->ne[2] > 1 || dst->ne[3] > 1) &&
             src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
@@ -2007,15 +2005,14 @@ static bool ggml_cuda_mul_mat_split_columns(
         return false;
     }
 
-    // mode 1 recomputes one column at a time; mode 2, which exact concurrency runs under, uses the widest slices that keep the batch-of-one arithmetic
+    // Mode 1 recomputes one column at a time; mode 2 uses the widest invariant slices.
     int64_t width = 1;
     if (ggml_cuda_batch_invariant() >= 2) {
         const ggml_cuda_mm_path path_one     = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, 1);
         const ggml_cuda_mm_path path_batched = ggml_cuda_mul_mat_path(cc, warp_size, src0, src1, dst, ncols_dst);
         if (path_one == path_batched) {
-            // same implementation, but it still has to sum in the same order
             if (path_batched == GGML_CUDA_MM_MMVF) {
-                return false; // the block size follows K alone
+                return false;
             }
             if (path_batched == GGML_CUDA_MM_MMVQ &&
                     ggml_cuda_mmvq_matches_single_column(src0->type, cc, ncols_dst)) {
@@ -2172,7 +2169,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    // [TAG_BATCH_INVARIANT] a split node runs as ntokens single-token calls, so the path that decides whether the stream is synchronized is the single-token one
+    // [TAG_BATCH_INVARIANT] a split node runs as single-token calls, so use the single-token sync decision.
     const int64_t ntokens = ggml_cuda_mul_mat_id_splits_tokens(dst) ? 1 : dst->ne[2];
 
     if (ntokens <= MMVQ_MAX_BATCH_SIZE) {
@@ -2198,7 +2195,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// [TAG_BATCH_INVARIANT] recompute dst one token at a time: every implementation below groups the ubatch's tokens by the expert they routed to, so shapes depend on the other tokens
+// [TAG_BATCH_INVARIANT] recompute dst one token at a time, since expert grouping depends on the other tokens.
 static void ggml_cuda_mul_mat_id_split_tokens(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2245,7 +2242,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_BATCH_INVARIANT]
     if (ggml_cuda_mul_mat_id_splits_tokens(dst)) {
         GGML_ASSERT(ne3 == 1 && src1->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
-        // a quantized expert matrix takes the single-token MMVQ path at every token count and can put the tokens on its sample axis in one launch; anything else goes token by token
         if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
             return;
@@ -3838,7 +3834,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // [TAG_BATCH_INVARIANT] the routing fusion passes its memory-range check only for a one-token ubatch, so a solo request takes the fused top-k kernel and a batched one the long chain
+    // [TAG_BATCH_INVARIANT] the routing fusion passes only for a one-token ubatch, so solo and batched paths differ.
     if (!ggml_cuda_batch_invariant() &&
             (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
@@ -6074,7 +6070,7 @@ static bool ggml_backend_cuda_device_event_query(ggml_backend_dev_t dev, ggml_ba
 
     const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
 
-    // not an error, and nothing to clear: cudaEventQuery() returns cudaErrorNotReady without recording it, so collecting one here would consume somebody else's
+    // cudaEventQuery() does not record cudaErrorNotReady, so there is nothing to clear.
     if (err == cudaErrorNotReady) {
         return false;
     }
@@ -6192,7 +6188,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
-    // reached through the registry rather than ggml_backend_device_i, so the interface keeps its layout
     if (strcmp(name, "ggml_backend_dev_event_query") == 0) {
         return (void *)ggml_backend_cuda_device_event_query;
     }

@@ -27,7 +27,7 @@
 
 // dedup helpers
 
-// [TAG_EXACT_CONCURRENCY] the page table is wired into llm_graph_input_attn_kv only, so a V-less layout would attend in physical order with the mode reporting itself on
+// [TAG_EXACT_CONCURRENCY] only llm_graph_input_attn_kv carries the page table, so a V-less layout is refused.
 static void llm_graph_reject_exact_concurrency(const char * layout) {
     if (!llama_exact_concurrency()) {
         return;

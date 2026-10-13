@@ -817,19 +817,19 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
-    // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible block: 1 ordinarily, larger where a mode places cells in blocks
-    // n contiguous tokens then occupy round_up(n, granularity) cells; a sequence left with holes still holds every block one live cell is in
+    // [TAG_EXACT_CONCURRENCY] cells the memory allocates in one indivisible block, 1 ordinarily.
+    // n contiguous tokens occupy round_up(n, granularity) cells, and a block is held while any cell in it is live.
     LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
 
-    // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
-    // takes the context because the update is a graph; returns true when one was run
+    // [TAG_PREEMPT] run the in-place update a seq_add() recorded, instead of at the next llama_decode().
+    // Returns true when an update was run.
     LLAMA_API bool llama_memory_update(struct llama_context * ctx);
 
-    // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1 plus the draft length. Never lowered; false when a column bound cannot cover it.
+    // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step; never lowered, false when a column bound cannot cover it.
     LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);
 
-    // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns; never lowered, and false when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is below it
+    // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build; false when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is below it.
     LLAMA_API bool     llama_set_exact_decode_width(uint32_t n_cols);
     LLAMA_API uint32_t llama_exact_decode_width(void);
 
@@ -969,24 +969,23 @@ extern "C" {
     // Until it completes the caller must not touch the buffer, free the cells read, or decode what is written.
     struct llama_state_seq_copy;
 
-    // NULL when the backends cannot copy asynchronously, or cannot say whether a copy has finished without waiting for it; the caller then uses the synchronous calls
-    // Also NULL for a recurrent or hybrid model: its states move between rows on every decode, so a transfer beside a decode can read another sequence
+    // NULL when the backends cannot copy and poll asynchronously, or for recurrent and hybrid models; use the synchronous calls then.
     LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
     LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
 
-    // size the transfer's host buffer, keeping no contents; NULL on failure. Grow-only: page-locking is far too slow to redo per transfer, so only llama_state_seq_copy_buf_free() frees it.
+    // Size the host buffer, keeping no contents; NULL on failure. Grow-only, freed by llama_state_seq_copy_buf_free().
     LLAMA_API uint8_t * llama_state_seq_copy_buf_resize  (struct llama_state_seq_copy * cpy, size_t size);
     LLAMA_API uint8_t * llama_state_seq_copy_buf         (struct llama_state_seq_copy * cpy);
     LLAMA_API size_t    llama_state_seq_copy_buf_size    (struct llama_state_seq_copy * cpy);
     LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
     LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
 
-    // true when the buffer held right now is page-locked. False while no buffer is held: ask llama_state_seq_copy_buf_can_pin() instead.
+    // True when the held buffer is page-locked; false while none is held.
     LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
 
     LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
 
-    // issue the copies; the bytes covered, 0 on failure. size must be within llama_state_seq_copy_buf_size(), and LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused.
+    // Issue the copies and return the bytes covered, 0 on failure. LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused.
     LLAMA_API size_t llama_state_seq_copy_get(
             struct llama_state_seq_copy * cpy,
                            size_t   size,

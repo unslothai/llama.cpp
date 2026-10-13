@@ -140,7 +140,7 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
-    // [TAG_PREEMPT] this request yielded more than one task, so index tells its results apart and the preempt notices carry it
+    // [TAG_PREEMPT] the request has several tasks, so index tells results and notices apart.
     bool batched = false;
 
     // used by SERVER_TASK_TYPE_CANCEL
@@ -374,7 +374,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
-    // [TAG_PREEMPT] how the request was served: how often it was parked, and how many of those parks re-prefilled instead of restoring saved bytes
+    // [TAG_PREEMPT] how often the request was parked, and how many parks re-prefilled.
     int32_t n_preempt   = 0;
     int32_t n_recompute = 0;
 
@@ -433,12 +433,12 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic_stream();
 };
 
-// [TAG_PREEMPT] out-of-band notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") every existing client ignores
+// [TAG_PREEMPT] SSE comment notice (": preempted", ": resumed") when a streaming task's slot is parked or restored.
 struct server_task_result_preempt_notice : server_task_result {
-    bool    parked     = false; // true when the slot was just parked, false when restored
-    bool    recomputed = false; // this resume re-prefilled its tokens instead of restoring saved bytes
-    int32_t n_preempt  = 0;     // how many times this task has been parked so far
-    bool    batched    = false; // one of several tasks of its request, so the notice names which one by index
+    bool    parked     = false;
+    bool    recomputed = false;
+    int32_t n_preempt  = 0;
+    bool    batched    = false;
 
     virtual bool is_stop() override {
         return false;

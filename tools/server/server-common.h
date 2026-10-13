@@ -521,7 +521,7 @@ struct server_metrics {
     uint64_t n_preempt = 0;
     uint64_t n_resume  = 0;
 
-    // [TAG_PREEMPT] parks that dropped their cells: those resumes re-prefill, and a re-prefill is not bit-for-bit the state that left
+    // [TAG_PREEMPT] parks that dropped their cells, whose resumes re-prefill and are not bit-exact.
     uint64_t n_preempt_recompute = 0;
 
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated

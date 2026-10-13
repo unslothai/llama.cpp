@@ -1,6 +1,4 @@
-// [TAG_EXACT_CONCURRENCY] a decision request whose questions share a prompt prefix is grouped so the
-// children continue from the parent's cells through seq_cp. Exact mode gives a page to one sequence
-// and refuses that copy, so the grouping must not happen there: every task keeps its whole prompt.
+// [TAG_EXACT_CONCURRENCY] exact mode refuses seq_cp, so decision tasks sharing a prefix must not be grouped.
 
 #include "server-decision.h"
 
@@ -18,7 +16,7 @@ static server_task make_task(int id, const llama_tokens & tokens) {
 }
 
 int main() {
-    // latched on first use, so set before anything reads it
+    // Latched on first use, so set before anything reads it.
 #ifdef _WIN32
     _putenv_s("LLAMA_EXACT_CONCURRENCY", "1");
 #else

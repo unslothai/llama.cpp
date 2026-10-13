@@ -110,7 +110,7 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 
-// [TAG_EXACT_CONCURRENCY] opt-in mode under which a sequence's attention depends only on its own cells, so its output does not change when others share the KV cache
+// [TAG_EXACT_CONCURRENCY] opt-in mode where a sequence's output does not change when others share the KV cache.
 bool llama_exact_concurrency();
 
 // [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's batch-invariant kernels
@@ -119,7 +119,7 @@ bool llama_exact_backend_name(const char * reg_name);
 // [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by such a backend
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft);
 
-// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend knows the width every context needs
+// [TAG_EXACT_CONCURRENCY] a context reports its sequence count so the backend knows the width every context needs.
 bool llama_exact_report_n_seq(uint32_t n_seq);
 
 bool llama_exact_check_n_seq(uint32_t n_seq);

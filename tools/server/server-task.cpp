@@ -363,7 +363,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
-// [TAG_PREEMPT] how the request was served: a recompute resume re-prefilled its tokens, so its continuation is not the bytes that were parked
+// [TAG_PREEMPT] how the request was served; a recompute resume is not the parked bytes.
 json server_task_result_cmpl_final::preempt_to_json() const {
     return json {
         {"parks",      n_preempt},
@@ -715,7 +715,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"total_tokens",  n_decoded + n_prompt_tokens},
                     {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
                 }},
-                // [TAG_PREEMPT] inside the response object, where the non-streaming body carries it: that object is what a client keeps from the stream
+                // [TAG_PREEMPT] inside the response object, which is what a streaming client keeps.
                 {"preempt",    preempt_to_json()},
             }},
         }}

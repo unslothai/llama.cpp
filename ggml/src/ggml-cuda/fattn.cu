@@ -634,7 +634,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // [TAG_BATCH_INVARIANT] every choice below switches on Q->ne[1] or K->ne[1], both of which grow with the other sequences, so pin the kernel a batch of one would use
+    // [TAG_BATCH_INVARIANT] Q->ne[1] and K->ne[1] grow with other sequences, so pin the kernel a batch of one would use.
     if (ggml_cuda_batch_invariant() && can_use_vector_kernel && Q->ne[1] == 1) {
         return BEST_FATTN_KERNEL_VEC;
     }
@@ -792,7 +792,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
             ggml_tensor mask_row;
             ggml_tensor dst_row = *dst;
-            // ne[2] runs to the end of dst so the F16 K/V scratch behind dst stays in place
             dst_row.ne[2] = dst->ne[2] - i;
             dst_row.data  = (char *) dst->data + i*dst->nb[2];
             dst_row.src[0] = &Q_row;

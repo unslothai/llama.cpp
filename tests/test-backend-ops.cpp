@@ -10399,7 +10399,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // MoE projections at the token counts a decode ubatch forms; 17 tokens is past the width exact concurrency pins
+    // MoE projections at decode ubatch token counts; 17 is past the width exact concurrency pins.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (int n : {1, 2, 4, 8, 17}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, true,   512, n, 2048));

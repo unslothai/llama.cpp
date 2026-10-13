@@ -39,7 +39,7 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 
-// [TAG_EXACT_CONCURRENCY] report the widest ubatch a decode step of this process can build, so the column policy covers it; call before the first graph is computed
+// [TAG_EXACT_CONCURRENCY] report the widest decode ubatch so the column policy covers it; call before the first graph.
 GGML_BACKEND_API void ggml_backend_cuda_set_exact_decode_width(int n_cols);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

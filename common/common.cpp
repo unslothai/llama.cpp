@@ -1230,7 +1230,7 @@ common_decision_type common_get_decision_type(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    // [TAG_EXACT_CONCURRENCY] before any context exists, so one is never created under a figure the explicit bound does not cover
+    // [TAG_EXACT_CONCURRENCY] set before any context exists, so none is created under an uncovered figure.
     if (!model_only && !common_exact_concurrency_init(params)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
         return;
@@ -1429,14 +1429,13 @@ int common_exact_decode_width(const common_params & params) {
 
     const int64_t n_draft = std::max(0, (int) common_speculative_n_max(&params.speculative));
 
-    // the product is handed to a backend as an int; one that overflows is reported, not wrapped
+    // The product is passed to a backend as an int, so overflow is reported.
     const int64_t n_cols = n_slots*(1 + n_draft);
 
     return n_cols > INT32_MAX ? -1 : (int) n_cols;
 }
 
 bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, int * n_batch_min) {
-    // an unset ubatch is the whole batch, and a ubatch never exceeds it
     const int n_ub = std::min(n_batch, n_ubatch <= 0 ? n_batch : n_ubatch);
 
     const int n_min = n_ub + std::max(0, n_decode_width);
@@ -1448,13 +1447,13 @@ bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, 
     return n_batch >= n_min;
 }
 
-// [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists
+// [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists.
 bool common_exact_concurrency_model(const common_params & params, const llama_model * model) {
     if (!common_exact_concurrency() || params.mmproj.path.empty()) {
         return true;
     }
 
-    // the paged pool places a cell from the sequence and the position alone, and M-RoPE gives every token of one image the same temporal position, so the second of them lands on the first one's cell and the batch is refused at the first image
+    // M-RoPE gives every token of an image one position, which the paged pool cannot place.
     const llama_rope_type rope_type = llama_model_rope_type(model);
 
     if (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) {
@@ -1470,7 +1469,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         return true;
     }
 
-    // DFlash drafting turns causal attention off on its draft context, which the paged attention needs; say so instead of asserting in the graph. DSpark is the same.
+    // DFlash and DSpark turn causal attention off on the draft context, which the paged attention needs.
     for (const auto type : params.speculative.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
             COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support --spec-type draft-dflash or draft-dspark: both disable causal attention on the draft, which the paged attention needs\n");
@@ -1499,8 +1498,8 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
-    // a prompt is added to a batch in whole ubatches, so a batch that cannot hold one beside a decode step of every slot would leave a prefill shorter ubatches than it gets alone, and the mode would report itself as on while a shared step changed the prompt's arithmetic
-    // a causal context clamps the batch to the context size, so that is the batch a prefill really gets; an unset -c is only known once the context exists, which common_exact_concurrency_context() checks
+    // A prompt is added in whole ubatches, so the batch must hold one beside a decode step of every slot.
+    // A causal context clamps the batch to n_ctx; an unset -c is checked in common_exact_concurrency_context().
     const int n_batch_eff = params.n_ctx > 0 ? std::min(params.n_ctx, params.n_batch) : params.n_batch;
 
     int n_batch_min = 0;
@@ -1515,7 +1514,7 @@ bool common_exact_concurrency_init(const common_params & params) {
         return false;
     }
 
-    // the batch splitter isolates prompts by width, so tell it how wide one sequence's decode step is; this also covers a caller that decodes before creating a context
+    // Tell the batch splitter one sequence's decode width, also for callers that decode before creating a context.
     if (!llama_set_exact_decode_tokens((uint32_t) (n_cols / std::max(1, params.n_parallel))) ||
         !llama_set_exact_decode_width((uint32_t) n_cols)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: the decode width could not be reported, see the error above\n");
@@ -1533,10 +1532,10 @@ bool common_exact_concurrency_context(const common_params & params, const llama_
     const int n_cols = common_exact_decode_width(params);
 
     if (n_cols < 0) {
-        return false; // already reported by common_exact_concurrency_init()
+        return false;
     }
 
-    // the context clamps the batch to the context size and the ubatch to the batch, and an unset -c takes its size from the model or from the fit to device memory, so this is the geometry a prefill really gets
+    // The geometry a prefill really gets after the context clamps the batch and ubatch.
     const int n_batch  = (int) llama_n_batch(ctx);
     const int n_ubatch = (int) llama_n_ubatch(ctx);
 
