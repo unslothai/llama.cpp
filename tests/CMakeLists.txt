@@ -292,6 +292,11 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# [TAG_EXACT_CONCURRENCY] the RPC server refuses a paged FLASH_ATTN_EXT; the test forks its own server, so POSIX only
+if (GGML_RPC AND NOT GGML_BACKEND_DL AND NOT WIN32)
+    llama_build_and_test(test-rpc-paged-fa.cpp)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
