@@ -1212,6 +1212,47 @@ void server_models::load(const std::string & name, const load_options & opts) {
             child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
         }
 
+        // GGML_RPC_TRACE names one file, and ggml_trace_open() opens it with "wb". base_env is a
+        // copy of our own environment, so without this every child would open the router's exact
+        // path: loading a model truncates the router's trace, and two children running at once
+        // interleave through independent file offsets, so the file is unusable and the damage is
+        // silent. Each child gets its own path keyed by port (unique among live children).
+        {
+            static const std::string tr_prefix = "GGML_RPC_TRACE=";
+
+            std::string base_trace;
+            for (const auto & e : child_env) {
+                if (e.rfind(tr_prefix, 0) == 0) {
+                    base_trace = e.substr(tr_prefix.size());
+                    break; // getenv() would return this first entry, so match it
+                }
+            }
+
+            if (!base_trace.empty()) {
+                // insert before the extension, if the last path component has one, so that the
+                // children of trace.jsonl are trace.<name>.<port>.jsonl and not trace.jsonl.<...>
+                std::string stem = base_trace;
+                std::string ext;
+                const size_t slash = base_trace.find_last_of("/\\");
+                const size_t dot   = base_trace.find_last_of('.');
+                if (dot != std::string::npos && (slash == std::string::npos || dot > slash + 1)) {
+                    stem = base_trace.substr(0, dot);
+                    ext  = base_trace.substr(dot);
+                }
+
+                std::string safe_name;
+                for (const char c : name) {
+                    safe_name += (std::isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
+                }
+
+                child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                                    [](const std::string & e) { return e.rfind(tr_prefix, 0) == 0; }),
+                                child_env.end());
+                child_env.push_back(tr_prefix + stem + "." + safe_name + "." +
+                                    std::to_string(inst.meta.port) + ext);
+            }
+        }
+
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");

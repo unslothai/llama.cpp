@@ -5994,6 +5994,152 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Tracer GPU marks, reached through ggml_backend_reg_get_proc_address so no caller links CUDA.
+struct ggml_cuda_trace_mark {
+    uint64_t    tag;
+    int         kind;
+    cudaEvent_t event;
+};
+
+// elapsed time is only defined between events of the same device, so each device needs its own
+// anchor and its own queues (one shared anchor silently dropped every other device's marks).
+struct ggml_cuda_trace_device {
+    std::vector<ggml_cuda_trace_mark> pending;
+    std::vector<cudaEvent_t>          spare;
+    cudaEvent_t                       anchor    = nullptr;
+    int64_t                           anchor_us = 0;  // 0 until the anchor's wall clock is known
+    cudaStream_t                      stream    = nullptr;
+    int                               device    = 0;
+    bool                              anchor_fixed = false;
+};
+
+struct ggml_cuda_trace_state {
+    std::mutex                             mutex;
+    std::map<int, ggml_cuda_trace_device>  devs;
+};
+
+static ggml_cuda_trace_state & ggml_cuda_trace() {
+    static ggml_cuda_trace_state state;
+    return state;
+}
+
+extern "C" GGML_BACKEND_API void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t tag, int kind);
+extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t tag, int kind) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_trace_state & st = ggml_cuda_trace();
+
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    ggml_cuda_trace_device & d = st.devs[cuda_ctx->device];
+    // events belong to the current device, which another backend may have switched
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if (d.anchor == nullptr) {
+        if (cudaEventCreate(&d.anchor) != cudaSuccess) {
+            d.anchor = nullptr;
+            return;
+        }
+        // every later mark is reported as anchor_us + elapsed(anchor, mark). Never wait on the
+        // anchor: synchronizing drains queued work and changes the execution being traced.
+        cudaEventRecord(d.anchor, cuda_ctx->stream());
+        d.stream = cuda_ctx->stream();
+        d.device = cuda_ctx->device;
+    }
+
+    cudaEvent_t event = nullptr;
+    if (!d.spare.empty()) {
+        event = d.spare.back();
+        d.spare.pop_back();
+    } else {
+        if (cudaEventCreate(&event) != cudaSuccess) {
+            return;
+        }
+    }
+
+    if (cudaEventRecord(event, cuda_ctx->stream()) != cudaSuccess) {
+        d.spare.push_back(event);
+        return;
+    }
+
+    d.pending.push_back({ tag, kind, event });
+}
+
+// never waits: returns the marks already completed, so the caller loops until it gets < `max`.
+extern "C" GGML_BACKEND_API int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max);
+extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max) {
+    ggml_cuda_trace_state & st = ggml_cuda_trace();
+
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    int n = 0;
+    for (auto & entry : st.devs) {
+        ggml_cuda_trace_device & d = entry.second;
+        if (d.anchor == nullptr) {
+            continue;
+        }
+        // recorded before any mark on this stream, so marks stay pending until the anchor completes
+        if (!d.anchor_fixed) {
+            if (cudaEventQuery(d.anchor) != cudaSuccess) {
+                continue;
+            }
+
+            // Taking ggml_time_us() here dates the anchor to this poll rather than to when it
+            // actually completed, and every mark is reported as anchor_us + elapsed(anchor, mark),
+            // so the whole device timeline shifts forward by however long the anchor had already
+            // been complete. So tie it to wall time through a probe, synchronized only when the
+            // stream is already idle (it then drains nothing).
+            if (cudaStreamQuery(d.stream) == cudaSuccess) {
+                ggml_cuda_set_device(d.device);
+
+                cudaEvent_t probe = nullptr;
+                if (!d.spare.empty()) {
+                    probe = d.spare.back();
+                    d.spare.pop_back();
+                } else if (cudaEventCreate(&probe) != cudaSuccess) {
+                    probe = nullptr;
+                }
+
+                if (probe != nullptr) {
+                    float ms = 0.0f;
+                    if (cudaEventRecord(probe, d.stream) == cudaSuccess &&
+                        cudaEventSynchronize(probe) == cudaSuccess &&
+                        cudaEventElapsedTime(&ms, d.anchor, probe) == cudaSuccess) {
+                        d.anchor_us    = ggml_time_us() - (int64_t)(ms * 1000.0f);
+                        d.anchor_fixed = true;
+                    }
+                    d.spare.push_back(probe);
+                }
+            }
+
+            if (!d.anchor_fixed) {
+                // freeze even this approximation: refining it later would step one device's timeline
+                d.anchor_us    = ggml_time_us();
+                d.anchor_fixed = true;
+            }
+        }
+
+        size_t keep = 0;
+        for (size_t i = 0; i < d.pending.size(); i++) {
+            ggml_cuda_trace_mark & mark = d.pending[i];
+            if (n < max && cudaEventQuery(mark.event) == cudaSuccess) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, d.anchor, mark.event) == cudaSuccess) {
+                    tags [n] = mark.tag;
+                    kinds[n] = mark.kind;
+                    t_us [n] = d.anchor_us + (int64_t)(ms * 1000.0f);
+                    n++;
+                }
+                d.spare.push_back(mark.event);
+            } else {
+                d.pending[keep++] = mark;
+            }
+        }
+        d.pending.resize(keep);
+    }
+
+    return n;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6013,6 +6159,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_trace_mark") == 0) {
+        return (void *)ggml_backend_cuda_trace_mark;
+    }
+    if (strcmp(name, "ggml_backend_cuda_trace_poll") == 0) {
+        return (void *)ggml_backend_cuda_trace_poll;
     }
     return nullptr;
 }

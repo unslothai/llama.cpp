@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-trace.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -102,6 +103,8 @@ int llama_server(int argc, char ** argv) {
     server_child child;
 
     std::setlocale(LC_NUMERIC, "C");
+
+    ggml_trace_open(nullptr, "llama-server");
 
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
