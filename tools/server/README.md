@@ -2372,20 +2372,11 @@ Details:
 - `N > 1` is refused at startup together with multimodal (`--mmproj`), `--control-vector` and
   `--sleep-idle-seconds`.
 - With `N = 1` nothing changes: one context, one batch and one update loop on the main thread.
-- Each group samples its rows serially, on its own decode thread. Sampling them over a worker pool
-  was tried and removed: `common_sampler_sample` begins with `llama_synchronize`, which does
-  non-atomic read-modify-writes on the context's timing counters, and `set_logits` then re-enters
-  the same context through six more getters, so the workers raced on a context they shared. Making
-  that safe means duplicating a large part of the context API.
 - Use `--cache-ram 0` with a layer split. The RAM prompt cache moves a whole slot state on every
   slot handover, and on a split most of that state lives on the remote node, so it goes over the
   wire; at 32 concurrent clients on the pair it costs about a quarter of the throughput with one
   group and much more with two, because the handover runs on the single task thread and the other
   group starves while it does.
-- `LLAMA_SERVER_PIPE_PROF=1` prints, every five seconds and per group, how long an iteration
-  spends waiting for the engine, in `pre_decode`, in `llama_decode`, in `llama_synchronize`, and
-  in `post_decode`, and splits `post_decode` per token into sampling, detokenization, stop-string
-  handling and the result queue. That is how the numbers above were found.
 
 ## More examples
 
