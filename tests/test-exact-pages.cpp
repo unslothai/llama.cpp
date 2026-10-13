@@ -1,4 +1,4 @@
-// [TAG_EXACT_CONCURRENCY] drives the removal paths of the paged KV pool - a removal that empties nothing, one that leaves holes, and the pages those holes keep reserved - while LLAMA_KV_CACHE_DEBUG=1 makes the pool cross-check page ownership against the live cells every ubatch.
+// [TAG_EXACT_CONCURRENCY] drives the removal paths of the paged KV pool - a removal that empties nothing, one that leaves holes, the pages those holes keep reserved, and a restore whose position has no page - while LLAMA_KV_CACHE_DEBUG=1 makes the pool cross-check page ownership against the live cells every ubatch.
 // Needs a CUDA build with 256-wide heads and a fully offloaded F16 cache; without one the test reports what it skipped and passes.
 
 #include "arg.h"
@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 static const uint32_t PAGE = 256;
@@ -158,7 +159,47 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal\n", __func__);
+    // a restored cell with a negative position has no page: the restore fails as a bad state does,
+    // and the same state unpatched still restores. After the magic and the sequence id, the
+    // attention cache comes first, as n_stream, cell_count, then the first cell's position
+    {
+        std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 1));
+        state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 1));
+
+        const size_t off_pos = 4*sizeof(uint32_t);
+
+        uint32_t head[4] = {};
+        int32_t  pos0    = -1;
+        if (state.size() >= off_pos + sizeof(pos0)) {
+            memcpy(head,  state.data(),           sizeof(head));
+            memcpy(&pos0, state.data() + off_pos, sizeof(pos0));
+        }
+
+        if (head[1] != 1 || head[2] != 1 || head[3] != 8*PAGE || pos0 < 0 || pos0 >= (int32_t) (8*PAGE)) {
+            fprintf(stderr, "%s : unexpected state layout: sequence %u, %u streams, %u cells, first position %d\n",
+                    __func__, head[1], head[2], head[3], pos0);
+            return 1;
+        }
+
+        std::vector<uint8_t> bad = state;
+        const int32_t neg = -1;
+        memcpy(bad.data() + off_pos, &neg, sizeof(neg));
+
+        if (llama_state_seq_set_data(ctx, bad.data(), bad.size(), 1) != 0) {
+            fprintf(stderr, "%s : a state with a negative position was restored\n", __func__);
+            return 1;
+        }
+
+        if (llama_state_seq_set_data(ctx, state.data(), state.size(), 1) == 0 ||
+            llama_memory_seq_pos_max(mem, 1) != (llama_pos) (8*PAGE - 1)) {
+            fprintf(stderr, "%s : the unpatched state did not restore, sequence 1 ends at %d\n",
+                    __func__, llama_memory_seq_pos_max(mem, 1));
+            return 1;
+        }
+
+    }
+
+    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position was refused\n", __func__);
 
     return 0;
 }
