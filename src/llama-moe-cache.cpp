@@ -243,6 +243,14 @@ struct llama_moe_cache::impl {
         std::vector<moe_cache_lru::fill> fills;
         uint32_t done = 0; // expert tensors whose slots were filled
         std::vector<seed_rec> pending; // LLAMA_MOE_CACHE_SEED_CHECK: copies of the layer being seeded
+
+        // LRU state before the plan of the seed, restored if the seed is dropped
+        std::vector<int32_t> old_key_of;
+        std::vector<int32_t> old_prev;
+        std::vector<int32_t> old_next;
+        int32_t  old_head = -1;
+        int32_t  old_tail = -1;
+        uint64_t gen      = 0; // generation of the LRU after the plan, the snapshot is only valid while it is unchanged
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -1018,9 +1026,15 @@ struct llama_moe_cache::impl {
             sd.il = b.il;
             sd.old_slots.assign(slots, slots + n_expert);
             sd.done = 0;
+            sd.old_key_of = g.lru.key_of;
+            sd.old_prev   = g.lru.prev;
+            sd.old_next   = g.lru.next;
+            sd.old_head   = g.lru.head;
+            sd.old_tail   = g.lru.tail;
             size_t n_hit = 0;
             const bool ok = g.lru.plan(b.il, seed_ids.data(), seed_ids.size(), sd.fills, n_hit);
             GGML_ASSERT(ok);
+            sd.gen = g.lru.gen;
         }
 
         // fill the new slots from the staged copy of the experts, after it was filled on the same backend
@@ -1091,6 +1105,22 @@ struct llama_moe_cache::impl {
             for (const auto & f : sd.fills) {
                 g.lru.slot_map[sd.il][f.expert] = -1;
                 g.lru.key_of[f.slot] = -1;
+            }
+            // the LRU did not change since the plan: restore its order and, if no slot was written, the experts it evicted
+            if (g.lru.gen == sd.gen) {
+                if (sd.done == 0) {
+                    for (const auto & f : sd.fills) {
+                        const int32_t k = sd.old_key_of[f.slot];
+                        g.lru.key_of[f.slot] = k;
+                        if (k >= 0) {
+                            g.lru.slot_map[k / g.lru.n_expert][k % g.lru.n_expert] = f.slot;
+                        }
+                    }
+                }
+                g.lru.prev = sd.old_prev;
+                g.lru.next = sd.old_next;
+                g.lru.head = sd.old_head;
+                g.lru.tail = sd.old_tail;
             }
             g.lru.gen++; // the device copy of the state is refreshed before the next device lookup
         }
