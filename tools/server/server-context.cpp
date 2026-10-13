@@ -140,17 +140,9 @@ constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the res
 constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000; // SSE keepalive period while a streaming slot is parked
 constexpr int32_t PREEMPT_N_STARVED  = 3;  // preemptions after which a slot is protected
 
-// [TAG_PREEMPT] The order parked slots come back in. Head of the line by park time, and nobody
-// passes a head that does not fit yet: the head keeps the room the pool frees until it fits, so
-// its wait is bounded by the slots ahead of it and not by how often a smaller slot can squeeze
-// in, grow, and be parked again. Simulated over 60 seeds at eight chats this cuts the longest
-// single wait by 2.5 to 3x for 0 to 3 percent of makespan at 8192 cells, and parks less often.
-// LLAMA_SERVER_PREEMPT_RESUME=pass keeps the previous order: most-preempted first, then longest
-// parked, and a smaller slot may pass a head that does not fit.
-// LLAMA_SERVER_PREEMPT_RESUME=head (the default) or pass; read once in load_model() and logged.
-// [TAG_PREEMPT] the SSE comment for a park or a resume. A request with several prompts
-// streams them through one reader, so the comment names the prompt it is about, except for
-// prompt 0, whose comment stays the bare form a single-prompt client matches on.
+// [TAG_PREEMPT] Resume order: head of the line by park time, and no slot passes a head that does not fit yet, which bounds the head's wait.
+// LLAMA_SERVER_PREEMPT_RESUME=head (default) or pass (old order: most-preempted first, and a smaller slot may pass the head).
+// [TAG_PREEMPT] Prompt 0 keeps the bare comment a single-prompt client matches on; other prompts are named.
 static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
     std::string res = notice.parked ? ": preempted" : ": resumed";
 
@@ -2395,9 +2387,7 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // [TAG_PREEMPT] tell a streaming client that its slot was parked or restored. The
-    // HTTP layer turns this into an SSE comment, so a client that does not know about
-    // preemption sees nothing, and one that does can show a pause instead of a stall.
+    // [TAG_PREEMPT] Becomes an SSE comment, invisible to clients that do not know about preemption.
     void send_preempt_notice(server_slot & slot, bool parked) {
         if (!slot.task || !slot.task->params.stream) {
             return;
@@ -3489,9 +3479,7 @@ private:
                 continue; // n_cmpl > 1 slots share one sequence, out of scope here
             }
 
-            // a started slot whose request the STARTED block is about to reject gets its
-            // error on its own pass, and nothing before it: a park notice would open the
-            // stream and turn that error into 200 plus an in-stream one
+            // A slot about to be rejected gets no park notice, since the notice would turn its error into 200 plus an in-stream error.
             if (slot.state == SLOT_STATE_STARTED) {
                 std::string msg;
                 error_type  type = ERROR_TYPE_SERVER;
@@ -3785,14 +3773,8 @@ private:
         }
     }
 
-    // the checks a slot's request has to pass before its prompt is processed, run from the
-    // SLOT_STATE_STARTED block below. true when the request is rejected, with the message and
-    // the type of the error it gets. The empty prompt is not here: it is a final response and
-    // not an error.
-    // [TAG_PREEMPT] the planner asks the same question before it parks a started slot, so a
-    // request that is about to be errored is never given a park notice ahead of its error: a
-    // notice opens the stream, and the client would get 200 plus an in-stream error where the
-    // non-stream 4xx belongs.
+    // Returns true when the request is rejected; the empty prompt is a final response, not an error.
+    // [TAG_PREEMPT] The planner calls this too, so a request about to be errored never gets a park notice first.
     bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
         if (!slot.task) {
             return false;
@@ -5673,17 +5655,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        // [TAG_PREEMPT] a slot can be parked while still processing its prompt, before any
-        // token exists. Those notices arrive ahead of the first real result; keep them and
-        // send them in front of it, so the client learns about the wait it just had.
+        // [TAG_PREEMPT] Notices from a park during prompt processing are sent ahead of the first real result.
         std::string preempt_prefix;
         std::set<size_t> parked_idx; // prompts of this request that are parked right now
         auto first_result = rd.next(req.should_stop);
         if (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
-            // [TAG_PREEMPT] parked before any token exists. The stream starts now, with the
-            // notice, so the parked keepalive runs through the wait instead of the client
-            // seeing nothing until the slot resumes; the first ordinary result follows in
-            // the stream, an error included, since the response has already begun.
+            // [TAG_PREEMPT] Parked before any token: start the stream with the notice so the keepalive runs during the wait.
             const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
             preempt_prefix = preempt_notice_comment(*notice);
             if (notice->parked) {
@@ -5722,8 +5699,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         res->status = 200;
         res->content_type = "text/event-stream";
         res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked_idx](std::string & output) mutable -> bool {
-            // [TAG_PREEMPT] the keepalive runs while ANY prompt of the request is parked: with
-            // several prompts in one stream, one resuming does not mean the others did
+            // [TAG_PREEMPT] The keepalive runs while ANY prompt of the request is parked.
             const bool parked = !parked_idx.empty();
 
             static auto format_error = [](task_response_type res_type, const json & res_json) {
@@ -5776,11 +5752,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // receive subsequent results
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
-                // [TAG_PREEMPT] a parked slot produces nothing for as long as the pool is
-                // full, so while parked the ping runs at least every 2 s whether or not
-                // --sse-ping asked for one, and is named, so a client can tell "waiting for
-                // cells" from "slow". A shorter interval the request asked for is kept: a
-                // client that wants a ping every second wants it most while nothing else comes.
+                // [TAG_PREEMPT] While parked, a named ping runs at least every 2 s even without --sse-ping; a shorter requested interval is kept.
                 const int64_t ping_cfg = sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1;
                 const int64_t ping_ms  = parked ? (ping_cfg > 0 ? std::min(ping_cfg, PREEMPT_KEEPALIVE_MS) : PREEMPT_KEEPALIVE_MS) : ping_cfg;
                 auto result = rd.next([&timeout, &start_time, ping_ms, &effective_should_stop]() {
@@ -5813,8 +5785,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
                 } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
-                    // [TAG_PREEMPT] an SSE comment: invisible to clients that do not know
-                    // about preemption, a pause indicator for the ones that do
                     if (notice->parked) {
                         parked_idx.insert(notice->index);
                     } else {
@@ -5828,10 +5798,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     );
                     json res_json = result->to_json();
                     if (res_json.is_null()) {
-                        // [TAG_PREEMPT] the signal a prompt sends before its first token, so
-                        // that the headers go out, carries no data. Normally it is the first
-                        // result and only opens the stream; after a notice opened the stream
-                        // it has nothing to add, and the sender skips an empty chunk.
+                        // [TAG_PREEMPT] The empty pre-first-token signal adds nothing once a notice has opened the stream.
                         return true;
                     }
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
