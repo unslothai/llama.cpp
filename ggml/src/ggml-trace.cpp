@@ -224,6 +224,17 @@ void ggml_trace_close(void) {
     }
 }
 
+void ggml_trace_flush(void) {
+    trace_state & s = state();
+
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (s.f != nullptr && s.n_unflushed > 0) {
+        s.n_unflushed = 0;
+        s.t_flush     = ggml_time_us();
+        fflush(s.f);
+    }
+}
+
 void ggml_trace_clock_offset(const char * peer, int64_t t1, int64_t t2, int64_t t3, int64_t t4) {
     if (!ggml_trace_flag) {
         return;

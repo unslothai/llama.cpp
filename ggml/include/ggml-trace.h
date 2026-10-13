@@ -18,6 +18,8 @@ extern "C" {
     // `path` NULL means GGML_RPC_TRACE; the first call with a usable path wins
     GGML_API int  ggml_trace_open(const char * path, const char * role);
     GGML_API void ggml_trace_close(void);
+    // write out buffered records now, e.g. before going idle where no later record would flush them
+    GGML_API void ggml_trace_flush(void);
 
     GGML_API int64_t ggml_trace_time_us(void);
 

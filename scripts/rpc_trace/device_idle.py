@@ -8,7 +8,7 @@ import os
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from merge import load, union, union_len, clip, gaps, Index          # noqa: E402
+from merge import load, union, union_len, clip, gaps, Index, attribute_gap  # noqa: E402
 
 
 def inside(outer, e):
@@ -151,14 +151,10 @@ def report(files, client, out):
                     len_host.append(g1 - g0)
                 dead = gaps(clip(busy[other], g0, g1), g0, g1)
                 for d0, d1 in dead:
-                    best, bestc = None, 0.0
-                    for name, ix in host.items():
-                        cv = ix.covered(d0, d1)
-                        if cv > bestc:
-                            bestc, best = cv, name
-                    if best is not None:
-                        attr[best] += bestc
-                    rest = (d1 - d0) - bestc
+                    cov = attribute_gap(host.values(), d0, d1)
+                    for name, cv in cov.items():
+                        attr[name] += cv
+                    rest = (d1 - d0) - sum(cov.values())
                     if rest > 0:
                         inside = iter_ix.covered(d0, d1)
                         attr["inside an iteration, untraced"] += min(rest, inside)

@@ -2931,6 +2931,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
     if (ggml_trace_flag) {
         ggml_trace_gpu_flush();
+        // the peer idles from here until it is killed, so nothing else would flush this tail
+        ggml_trace_flush();
     }
 }
 
