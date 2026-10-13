@@ -1322,3 +1322,22 @@ def test_a_growing_sequence_keeps_its_pinned_buffer_across_parks():
     sizes = re.findall(r"pinned park buffer (?:allocated|grown)", text)
     assert parks >= 40, parks
     assert 1 <= len(sizes) <= 4, f"{len(sizes)} pinned allocations for {parks} parks"
+
+
+def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():
+    # an array prompt is one ordinary task per prompt, each parked on its own; the OAI response merges them into one object, so its counters are the sum, as /completion reports them per prompt
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    _start()
+
+    body = {"prompt": [_PROMPT_A, _PROMPT_B], "max_tokens": 40, "temperature": 0.0}
+
+    per_prompt = server.make_request("POST", "/completion", data=body)
+    assert per_prompt.status_code == 200, per_prompt.body
+    counts = [r["preempt"] for r in per_prompt.body]
+    assert all(c["parks"] > 0 for c in counts), counts
+
+    merged = server.make_request("POST", "/v1/completions", data=body)
+    assert merged.status_code == 200, merged.body
+    assert len(merged.body["choices"]) == 2
+    assert merged.body["preempt"]["parks"] == sum(c["parks"] for c in counts), (merged.body["preempt"], counts)
+    assert merged.body["preempt"]["recomputes"] == sum(c["recomputes"] for c in counts), (merged.body["preempt"], counts)
