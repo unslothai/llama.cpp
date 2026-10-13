@@ -293,6 +293,30 @@ d = make(*TWO, rpc_n=103, patch=2)
 rc, out = run(d, base=None)
 check("ggml.c asserts are rewritten without --base-ref when the RPC assert is already right",
       rc == 0 and "GGML_OP_COUNT == 102 -> 103" in out and "rpc " not in out, out)
+check("and the output says the RPC version was not checked", "RPC_PROTO_*_VERSION not checked" in out, out)
+
+# One pin added an op and moved every assert, RPC included, to 102 but left RPC_PROTO_* at 8.0.0:
+# the RPC assert is current, the protocol was still not bumped.
+ONE = (BASE + ["MOE_CACHE_LOOKUP"], NAMES + ["MOE_CACHE_LOOKUP"], SYMS + ["moe_cache_lookup(x)"], 102)
+d = make(*ONE, patch=0)
+before = snapshot(d)
+rc, out = run(d)
+check("a current RPC assert with an unbumped version and --base-ref exits 1",
+      rc == 1 and "without bumping the RPC protocol" in out, out)
+check("and nothing is rewritten", snapshot(d) == before)
+rc, out = run(d, "--dry-run")
+check("--dry-run refuses the unbumped version too", rc == 1 and "without bumping the RPC protocol" in out, out)
+
+d = make(*ONE)
+before = snapshot(d)
+rc, out = run(d)
+check("a current RPC assert with a bumped version is clean",
+      rc == 0 and "clean" in out and "RPC_PROTO 8.0.0 -> 8.0.1" in out and snapshot(d) == before, out)
+
+d = make(*ONE, patch=0)
+rc, out = run(d, base=None)
+check("without --base-ref a current RPC assert passes and says the version was not checked",
+      rc == 0 and "RPC_PROTO_*_VERSION not checked" in out, out)
 
 # Commented-out and quoted asserts are text, not declarations: they stay as they are.
 d = make(*TWO)

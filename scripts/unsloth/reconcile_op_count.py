@@ -39,7 +39,11 @@ only rewritten with --base-ref (the tag the pins were merged onto), against whic
     base PATCH + the op count delta, and the output says so.
   * otherwise the assert is rewritten like the others.
 
-Without --base-ref a stale RPC assert is a refusal (exit 1), never a silent rewrite.
+With --base-ref the version is checked whenever the RPC assert is in the tree, also when the
+assert already says the merged count: a pin that added an op and updated the assert but not
+RPC_PROTO_*_VERSION is the same unbumped protocol. Without --base-ref a stale RPC assert is a
+refusal (exit 1), never a silent rewrite; a current one passes, and the output says the version
+was not checked.
 
 Nothing is committed: the tree is left modified, and the caller commits it if a tree id has to
 cover the rewrite. Run after the merge loop and before merge_checks.py, pin_contract.py and the
@@ -227,7 +231,7 @@ def git_show(root: Path, ref: str, path: str) -> str:
 
 
 def check_rpc(root: Path, base_ref: str | None, n: int) -> tuple[str, int | None]:
-    """('ok' | 'refuse: why', PATCH to write or None) for a stale RPC op-count assert."""
+    """('ok' | 'refuse: why', PATCH to write or None) for the RPC op-count assert versus base_ref."""
     if not base_ref:
         return ("refuse: the RPC assert guards RPC_PROTO_*_VERSION and can only be rewritten "
                 "against the base tag; pass --base-ref", None)
@@ -291,10 +295,12 @@ def main() -> int:
             bad += 1
             continue
         stale = [a for a in asserts if a[2] != n]
-        if not stale:
-            print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree, {len(asserts)} assert(s) already say {n}")
-            continue
-        if any(p == rpc_path for p, *_ in stale):
+        # the RPC assert guards RPC_PROTO_*_VERSION: with --base-ref the version is checked even
+        # when the assert is current (a pin may have updated it and not bumped the protocol)
+        rpc_stale = any(p == rpc_path for p, *_ in stale)
+        if any(p == rpc_path for p, *_ in asserts) and not args.base_ref and not rpc_stale:
+            print(f"note {RPC_HEADER}: RPC_PROTO_*_VERSION not checked (no --base-ref); the assert already says {n}")
+        elif any(p == rpc_path for p, *_ in asserts):
             verdict, patch = check_rpc(root, args.base_ref, n)
             if verdict != "ok":
                 print(f"{RPC_HEADER}: {verdict[len('refuse: '):]}", file=sys.stderr)
@@ -306,6 +312,9 @@ def main() -> int:
                 plan.setdefault(rpc_path, []).append((*spans["PATCH"], old, patch, False))
                 print(f"fix  {RPC_HEADER}: RPC_PROTO_PATCH_VERSION {old} -> {patch} (the op count rose by "
                       f"more than PATCH moved: identical bumps from several pins merged into one)")
+        if not stale:
+            print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree, {len(asserts)} assert(s) already say {n}")
+            continue
         for p, i, v, st, en in stale:
             plan.setdefault(p, []).append((st, en, v, n, True))
             print(f"fix  {p.relative_to(root)}:{i}: {count} == {v} -> {n}")
