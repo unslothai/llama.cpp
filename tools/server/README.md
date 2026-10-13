@@ -2357,8 +2357,9 @@ Details:
     lose it, but a single request still cannot reach `C` unless the KV is unified.
 
   The cost either way is that the KV memory over all groups is roughly `N` times that of a single
-  context, rather than equal to it. That is included in the parameter fit, so if it does not fit,
-  the fitter lowers `n_ctx` and reports it rather than the server quietly serving less than asked.
+  context, rather than equal to it. The parameter fit accounts for it, but `-c` is explicit here and
+  the fitter never lowers a user-set `n_ctx`: if the groups do not fit, lower `-c` or
+  `--pipeline-groups` yourself.
 - Slot selection for an incoming request still runs over *all* slots, so prompt cache similarity and
   the slot save / restore endpoints work exactly as before: a returning conversation lands on the
   slot that still holds its prefix, whichever group that slot belongs to.
