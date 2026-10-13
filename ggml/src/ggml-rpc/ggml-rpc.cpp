@@ -421,8 +421,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 
     sock->get_caps(request.conn_caps);
 
-    bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response))) {
+        LOG_ERROR("RPC server closed the connection or sent a malformed HELLO response\n");
+        return false;
+    }
 
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
@@ -507,7 +509,8 @@ public:
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
 
-    bool start(const std::string & endpoint);
+    // false with `error` set when the peer cannot be reached or the handshake fails
+    bool start(const std::string & endpoint, std::string & error);
     void work();
 
     ~rpc_dispatcher();
@@ -647,7 +650,7 @@ void rpc_dispatcher::busy_spin_release() {
     GGML_ASSERT(previous > 0);
 }
 
-bool rpc_dispatcher::start(const std::string & endpoint) {
+bool rpc_dispatcher::start(const std::string & endpoint, std::string & error) {
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -659,10 +662,13 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
 
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
+        error = "Failed to connect to " + endpoint;
         return false;
     }
     if (!negotiate_hello(sock)) {
-        GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+        sock = nullptr;
+        error = "RPC handshake failed for " + endpoint;
+        return false;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
@@ -731,10 +737,12 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
-    if (!dispatcher->start(endpoint)) {
+    std::string error;
+    if (!dispatcher->start(endpoint, error)) {
         if (abort_on_failure) {
-            GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+            GGML_ABORT("%s\n", error.c_str());
         }
+        GGML_LOG_ERROR("%s\n", error.c_str());
         return nullptr;
     }
     dispatchers[endpoint] = dispatcher;
