@@ -2778,6 +2778,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
+            // [TAG_EXACT_CONCURRENCY] the paged pool files a cell under its position's page, and a negative position has none
+            if (exact_pages && pos < 0) {
+                LLAMA_LOG_ERROR("%s: invalid position %d in a restored kv cell\n", __func__, pos);
+                return false;
+            }
+
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
