@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 #include "copy-regions.cuh"
 
 // device-to-device copies of many regions of any size with one launch: done by the SMs, so a batch of uploads on the copy

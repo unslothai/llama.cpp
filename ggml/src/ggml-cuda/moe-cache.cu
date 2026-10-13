@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 #include "moe-cache.cuh"
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
