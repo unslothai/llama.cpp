@@ -985,48 +985,6 @@ struct server_trace_scope {
     server_trace_scope & operator=(const server_trace_scope &) = delete;
 };
 
-static bool pipe_prof_enabled() {
-    const char * e = getenv("LLAMA_SERVER_PIPE_PROF");
-    return e != nullptr && atoi(e) != 0;
-}
-
-struct server_group_prof {
-    int64_t n_iter = 0;
-    int64_t n_tok  = 0;
-
-    int64_t t_lock   = 0; // waiting for the engine lock at the top of the iteration
-    int64_t t_pre    = 0; // pre_decode + render
-    int64_t t_submit = 0; // llama_decode
-    int64_t t_sync   = 0; // llama_synchronize
-    int64_t t_relock = 0; // re-taking the engine lock after the decode
-    int64_t t_post   = 0; // post_decode
-    int64_t t_sampl  = 0; //   of which: common_sampler_sample
-    int64_t t_piece  = 0; //   of which: common_token_to_piece
-    int64_t t_proc   = 0; //   of which: process_token (stop strings, streaming)
-    int64_t t_send   = 0; //   of which: queue_results.send
-    int64_t t_iter   = 0; // the whole iteration
-
-    int64_t t_prof_last = 0; // start of this group's reporting window
-};
-
-struct prof_timer {
-    int64_t * acc;
-    int64_t   t0;
-    prof_timer(int64_t * acc_, bool on) : acc(on ? acc_ : nullptr) {
-        if (acc) { t0 = ggml_time_us(); }
-    }
-    ~prof_timer() {
-        if (acc) { *acc += ggml_time_us() - t0; }
-    }
-    prof_timer(const prof_timer &) = delete;
-    prof_timer & operator=(const prof_timer &) = delete;
-};
-
-
-struct server_group;
-
-static thread_local server_group * tls_group = nullptr;
-
 struct server_group {
     int id = 0;
 
@@ -1064,8 +1022,6 @@ struct server_group {
     uint64_t n_prompt_queued = 0;
 
     int n_empty_consecutive = 0;
-
-    server_group_prof prof;
 
     // note: per group on purpose - one group's host path runs while the other is on the GPU
     std::thread thread;
@@ -1138,8 +1094,6 @@ private:
 
     int n_groups = 1;
     std::vector<std::unique_ptr<server_group>> groups;
-
-    const bool prof_on = pipe_prof_enabled();
 
     int n_seq_per_group = 1;
 
@@ -1377,6 +1331,11 @@ private:
 
         if (n_groups > 1) {
             params_ctx.n_parallel = n_seq_per_group;
+
+            // a per-slot cap bounds what one group's P/N slots can use, the rest of the pool is never reached
+            if (params_ctx.kv_unified_per_slot > 0) {
+                params_ctx.n_ctx = std::min(params_ctx.n_ctx, n_seq_per_group * params_ctx.kv_unified_per_slot);
+            }
 
             // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked
             // every request to be able to reach, and splitting the server into groups is an
@@ -2767,10 +2726,7 @@ private:
             res->stats = slot.stats;
         }
 
-        {
-            prof_timer psnd(tls_group ? &tls_group->prof.t_send : nullptr, prof_on && tls_group != nullptr);
-            queue_results.send(std::move(res));
-        }
+        queue_results.send(std::move(res));
     }
 
     void send_final_response(server_slot & slot) {
@@ -3736,44 +3692,6 @@ private:
     };
 #endif
 
-    // each group reports and resets only its own counters, under its own lock: a reporter elected
-    // across groups would read and clear the others while their workers are still updating them
-    void prof_report(server_group & grp) {
-        auto & pr = grp.prof;
-
-        const int64_t t_now  = ggml_time_us();
-        const int64_t t_last = pr.t_prof_last;
-
-        if (t_last != 0 && t_now - t_last < 5 * 1000 * 1000) {
-            return;
-        }
-
-        pr.t_prof_last = t_now;
-
-        if (t_last == 0) {
-            return; // first call only arms the window
-        }
-
-        const double t_win = (t_now - t_last) / 1000.0; // ms
-
-        const double n_it  = std::max<int64_t>(1, pr.n_iter);
-        const double n_tk  = std::max<int64_t>(1, pr.n_tok);
-        auto per_it = [&](int64_t v) { return v / 1000.0 / n_it; };
-        auto per_tk = [&](int64_t v) { return v / 1000.0 / n_tk; };
-
-        SRV_INF("PROF g%d win %.0f ms iters %" PRId64 " toks %" PRId64
-                " | per iter ms: lock %.2f pre %.2f submit %.2f sync %.2f relock %.2f post %.2f iter %.2f"
-                " | per tok ms: sampl %.3f piece %.3f proc %.3f send %.3f post %.3f\n",
-                grp.id, t_win, pr.n_iter, pr.n_tok,
-                per_it(pr.t_lock), per_it(pr.t_pre), per_it(pr.t_submit), per_it(pr.t_sync),
-                per_it(pr.t_relock), per_it(pr.t_post), per_it(pr.t_iter),
-                per_tk(pr.t_sampl), per_tk(pr.t_piece), per_tk(pr.t_proc),
-                per_tk(pr.t_send), per_tk(pr.t_post));
-
-        pr = server_group_prof();
-        pr.t_prof_last = t_now;
-    }
-
     // one iteration of the decode loop of a single group, returns true if it had work to do
     bool update_slots(server_group & grp) {
         // shadow the single-context members - everything below operates on this group only
@@ -3781,22 +3699,13 @@ private:
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
 
-        tls_group = &grp;
-
         std::unique_lock<std::mutex> lk;
         if (n_groups > 1) {
-            prof_timer tl(&grp.prof.t_lock, prof_on);
             lk = std::unique_lock<std::mutex>(grp.mtx);
             grp.cv.wait(lk, [&]{ return groups_stop.load(std::memory_order_relaxed) || grp.n_pause_req == 0; });
             if (groups_stop.load(std::memory_order_relaxed)) {
                 return false;
             }
-        }
-
-        prof_timer ti(&grp.prof.t_iter, prof_on);
-        if (prof_on) {
-            grp.prof.n_iter++;
-            prof_report(grp);
         }
 
 #ifdef DEBUG_TIMINGS
@@ -3855,7 +3764,6 @@ private:
         try {
             server_trace_scope span_build("batch_build", grp.id, n_slots_processing);
             scoped_timer t(t_pre_decode, n_pre_decode);
-            prof_timer tp(&grp.prof.t_pre, prof_on);
             pre_decode(grp);
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -3932,7 +3840,6 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                prof_timer tp(&grp.prof.t_post, prof_on);
                 post_decode(grp, n_tokens, off);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -4884,34 +4791,27 @@ private:
             // note: RAII, or a throwing decode leaves the group busy forever, or returns to the
             //       caller's error handling without the engine lock held
             struct decode_window {
-                server_context_impl * srv;
                 server_group * grp;
                 std::unique_lock<std::mutex> * lk;
-                decode_window(server_context_impl * srv, server_group * grp, std::unique_lock<std::mutex> * lk)
-                        : srv(srv), grp(grp), lk(lk) {
+                decode_window(server_group * grp, std::unique_lock<std::mutex> * lk) : grp(grp), lk(lk) {
                     grp->busy = true;
                     lk->unlock();
                 }
                 ~decode_window() {
-                    {
-                        prof_timer tr(&grp->prof.t_relock, srv->prof_on);
-                        lk->lock();
-                    }
+                    lk->lock();
                     grp->busy = false;
                     grp->cv.notify_all();
                 }
-            } window(this, &grp, &lk);
+            } window(&grp, &lk);
 
             {
                 server_trace_scope span("submit", grp.id, batch.view.size());
-                prof_timer ts(&grp.prof.t_submit, prof_on);
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             }
             // sync even with no output to read: ~decode_window clears busy, and a task thread that
             // takes the guard must not touch ctx while the decode is still in flight
             if (ret == 0) {
                 server_trace_scope span("synchronize", grp.id, batch.view.size());
-                prof_timer ts(&grp.prof.t_sync, prof_on);
                 llama_synchronize(ctx_tgt);
             }
         } else {
@@ -4920,12 +4820,10 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 {
                     server_trace_scope span("submit", grp.id, batch.view.size());
-                    prof_timer ts(&grp.prof.t_submit, prof_on);
                     ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
                 }
                 if (ret == 0 && has_output) {
                     server_trace_scope span("synchronize", grp.id, batch.view.size());
-                    prof_timer ts(&grp.prof.t_sync, prof_on);
                     llama_synchronize(ctx_tgt);
                 }
             });
@@ -5122,10 +5020,8 @@ private:
             {
                 server_trace_scope span("sampling", grp.id, slot.id);
                 scoped_timer timer(t_sampl, n_sampl);
-                prof_timer ps(&grp.prof.t_sampl, prof_on);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
-            if (prof_on) { grp.prof.n_tok++; }
 
             slot.i_batch = -1;
 
@@ -5146,10 +5042,7 @@ private:
 
             completion_token_output result;
             result.tok          = id;
-            {
-                prof_timer pp(&grp.prof.t_piece, prof_on);
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            }
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
             if (slot.task->params.sampling.n_probs > 0) {
@@ -5159,12 +5052,7 @@ private:
             {
                 server_trace_scope span("result_send", grp.id, slot.id);
 
-                bool keep_going;
-                {
-                    prof_timer pt(&grp.prof.t_proc, prof_on);
-                    keep_going = process_token(result, slot);
-                }
-                if (!keep_going) {
+                if (!process_token(result, slot)) {
                     // release slot because of stop condition
                     slot.print_timings();
                     send_final_response(slot);
