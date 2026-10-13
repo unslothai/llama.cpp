@@ -358,10 +358,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
 
-        // [TAG_EXACT_CONCURRENCY] the adapter follows the weight it adapts, so a weight the mode
-        // leaves on the host puts the adapted matmul there too. token_embd is exempt from the
-        // context's weight check because get_rows is not offloaded by width, but its adapter is
-        // applied with a mul_mat, which is: see llm_graph_context::build_inp_embd().
+        // [TAG_EXACT_CONCURRENCY] the adapter follows its weight's buffer; a host token_embd passes the context check (get_rows) but its adapter is a mul_mat, see build_inp_embd()
         if (llama_exact_concurrency() && !llama_exact_buft_invariant(buft)) {
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but the lora for '%s' would sit in a %s "
                     "buffer, which has no batch-invariant kernels: the adapted matmul's result would "
