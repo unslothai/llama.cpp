@@ -948,12 +948,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
-// Compact MoE tiling: instead of ceil(ncols_max/J) column tiles for every expert (mostly empty when each expert only
-// sees a small part of the tokens), the column tiles of all experts are numbered consecutively.
-// Expert e owns the virtual tiles starting at expert_bounds[e]/J + e, which is strictly increasing in e and leaves room
-// for the ceil((expert_bounds[e+1] - expert_bounds[e])/J) tiles of expert e, so the number of virtual tiles is
-// expert_bounds[nexperts]/J + nexperts. Virtual tiles past the last tile of their expert are empty (jt*J >= col_diff).
-// Each warp finds the expert for tile v on its own (no shared memory or synchronization), narrowing by warp_size per step.
+// Compact MoE tiling: the column tiles of all experts are numbered consecutively, expert e starts at tile expert_bounds[e]/J + e.
+// Tiles past the last tile of an expert are empty (jt*J >= col_diff). Finds the expert of tile v by a warp-wide search.
 template <int J>
 static __device__ __forceinline__ void mmq_moe_compact_tile(
         const int32_t * __restrict__ expert_bounds, const int nexperts, const int v, int & zt, int & jt) {
@@ -1419,9 +1415,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
-// Number of column tiles of the compact MoE tiling (see mmq_moe_compact_tile) for ncols_y rows over nexperts experts
-// and batches of ncols_max tokens, or 0 if it is not used: it has to give fewer tiles than ceil(ncols_max/J) tiles per
-// expert, and fit the y dimension of a CUDA grid.
+// number of tiles of the compact MoE tiling, or 0 if it does not give fewer tiles or does not fit the grid
 static int mmq_moe_compact_ntx(const int64_t ncols_y, const int64_t ncols_max, const int64_t nexperts, const int J) {
     const int64_t ntx_compact = ncols_y/J + nexperts;
     const int64_t ntx_expert  = (ncols_max + J - 1)/J;
@@ -1471,8 +1465,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     int       ntx = (args.ncols_max + config.J - 1) / config.J;
     int nchannels_y_tiles = args.nchannels_y;
 
-    // MoE: number the column tiles of all experts consecutively (see mmq_moe_compact_tile) if that gives fewer tiles,
-    // the per-expert grid is mostly empty tiles once an expert sees only a small part of the tokens.
+    // MoE: use the compact tiling (see mmq_moe_compact_tile) if it gives fewer tiles
     int nexperts_compact = 0;
     if (args.ids_dst != nullptr && channel_ratio == 1 && args.nsamples_y == 1) {
         const int ntx_compact = mmq_moe_compact_ntx(args.ncols_y, args.ncols_max, args.nchannels_y, config.J);

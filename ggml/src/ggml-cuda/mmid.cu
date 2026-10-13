@@ -23,8 +23,7 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
 template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
-// HIP has no __syncwarp. every kernel below that needs this runs one warp per block, so a block
-// barrier is an exact substitute there
+// HIP has no __syncwarp; the kernels that use this run one warp per block, so __syncthreads is equivalent
 static __device__ __forceinline__ void mm_ids_warp_sync() {
 #ifdef GGML_USE_HIP
     __syncthreads();
@@ -156,27 +155,7 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-// =================================================================================================
-// Counting sort: the same mapping, built with work proportional to the number of routed
-// assignments rather than to n_experts * n_tokens.
-//
-// mm_ids_helper above gives each expert one single-warp block and has it walk every token, so it
-// reads the ids tensor n_experts times and exposes only n_experts warps of parallelism. That is
-// the right trade for the MMQ/MMF callers, where n_tokens is small and one launch beats four. It
-// is the wrong one for the mul_mat_id caller: at 32k tokens and 128 experts it read 33.5M ids to
-// place 262k assignments on 128 warps, and measured 216.6 ms over 120 launches, 13.2% of all GPU
-// kernel time on a Qwen3.6-35B-A3B prefill.
-//
-// The sort below is a textbook stable counting sort: per-block histogram, exclusive scan over
-// (expert, block), stable scatter. It reads the ids exactly twice and its parallelism scales with
-// the token count.
-//
-// Stability is not incidental. Rows within one expert are independent dot products, so any
-// permutation of them would give the same answer, but only the stable one reproduces the exact
-// buffer layout the kernel above produces. Keeping it means the byte-identical-logits test still
-// distinguishes a real behaviour change from a reordering, and it keeps the mapping reproducible
-// run to run, which an atomics-based scatter would not.
-// =================================================================================================
+// Stable counting sort: the same mapping as mm_ids_helper, with work proportional to the number of assignments instead of n_experts*n_tokens.
 
 #define MM_IDS_SCAN_BLOCK 256
 
@@ -206,9 +185,7 @@ static __global__ void mm_ids_hist(
         const int itl = p / n_expert_used;
         const int iex = p - itl*n_expert_used;
         const int expert_used = ids[(size_t)(it0 + itl)*si1 + iex];
-        // An out of range id would otherwise corrupt shared memory. The host fallback in
-        // ggml_cuda_mul_mat_id asserts on the same condition; here it makes expert_bounds[n_experts]
-        // come out short, which the caller already checks.
+        // skip out of range ids: expert_bounds[n_experts] then comes out short, which the caller checks
         if (expert_used >= 0 && expert_used < n_experts) {
             atomicAdd(&counts[expert_used], 1);
         }
@@ -265,8 +242,7 @@ static __global__ void mm_ids_scan_rows(
     }
 }
 
-// Exclusive scan of the per-expert totals, i.e. exactly the nex_prev the kernel above computes by
-// counting every id below its own expert. Single block; n_experts is small.
+// Exclusive scan of the per-expert totals into expert_bounds. Single block.
 static __global__ void mm_ids_expert_prefix(
         const int32_t * __restrict__ row_total, int32_t * __restrict__ expert_bounds, const int n_experts) {
     __shared__ int32_t sdata[MM_IDS_SCAN_BLOCK];
@@ -309,8 +285,7 @@ static __global__ void mm_ids_expert_prefix(
     }
 }
 
-// Stable scatter. hist now holds the exclusive scan, so expert_bounds[e] + hist[e][w] is where
-// block w's first assignment to expert e goes.
+// Stable scatter: block w writes its first assignment to expert e at expert_bounds[e] + hist[e][w].
 template <int n_expert_used_template>
 static __global__ void mm_ids_scatter(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
@@ -348,10 +323,7 @@ static __global__ void mm_ids_scatter(
             expert_used = e >= 0 && e < n_experts ? e : -1;
         }
 
-        // Rank among the lanes of this step that route to the same expert. The lane index is the
-        // assignment index, so ranking by lane reproduces the token-major, slot-minor order the
-        // single-warp kernel gets from iterating tokens. Inactive and out of range lanes carry -1
-        // and group together harmlessly; they never reach the write below.
+        // rank by lane among lanes with the same expert: keeps the token-major, slot-minor order of mm_ids_helper
         int rank = 0;
         int cnt  = 0;
 #pragma unroll
@@ -394,8 +366,7 @@ static void launch_mm_ids_counting_sort(
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nsm       = ggml_cuda_info().devices[id].nsm;
 
-    // One warp per block over a contiguous range of tokens. Small ranges give more parallelism but
-    // a taller [n_experts][W] histogram to scan, so cap the block count at a few waves.
+    // one warp per block over a contiguous token range; cap the block count to keep the histogram small
     int tpb = 16;
     int W   = (n_tokens + tpb - 1) / tpb;
     const int max_W = 8*nsm;
@@ -436,9 +407,7 @@ static bool mm_ids_legacy_possible(const int n_tokens, const int n_expert_used) 
         n_tokens < (1 << 22) && n_expert_used < (1 << 10);
 }
 
-// GGML_CUDA_MM_IDS_SORT=0 pins the single-warp kernel, =1 pins the counting sort wherever it is
-// legal. Only for testing: the two paths must agree bit for bit, and test-backend-ops never
-// reaches shapes large enough to select the counting sort on its own.
+// GGML_CUDA_MM_IDS_SORT=0/1 forces the single-warp kernel/the counting sort, for testing
 static int mm_ids_sort_override() {
     static const int value = []() {
         const char * env = getenv("GGML_CUDA_MM_IDS_SORT");
@@ -447,11 +416,7 @@ static int mm_ids_sort_override() {
     return value;
 }
 
-// Which of the two implementations to use. The counting sort wins once there is enough work to pay
-// for four launches instead of one, and it is the only option when the token count outgrows the
-// other kernel's shared memory. The threshold is where the single-warp kernel's n_experts passes
-// over the tokens stop being cheaper than three extra launches; it is well below every shape the
-// mul_mat_id caller sees and well above every decode shape.
+// the counting sort needs 4 launches instead of 1, so use it only for large shapes or when the single-warp kernel cannot run
 static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, const int n_expert_used) {
     if (!mm_ids_counting_sort_possible(n_experts)) {
         return false;
@@ -466,8 +431,7 @@ static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, co
     return (int64_t) n_experts*n_tokens >= (1 << 16);
 }
 
-// ids_dst[ic] is the token slot that compact row ic was gathered from, and the mapping is a
-// permutation of [0, n), so inverting it is a plain scatter.
+// ids_dst is a permutation of [0, n), so the inverse is a scatter
 static __global__ void mm_ids_invert(
         const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n) {
     const int ic = blockIdx.x*blockDim.x + threadIdx.x;
@@ -476,8 +440,7 @@ static __global__ void mm_ids_invert(
         return;
     }
 
-    // the legacy single-warp path leaves holes in ids_dst if a token selects one expert twice, and a
-    // hole holds recycled pool memory. bound the index so bad ids give a wrong answer, not an OOB write
+    // repeated ids leave holes with garbage in ids_dst on the single-warp path: skip them, no OOB write
     const int32_t id = ids_dst[ic];
     if (id < 0 || id >= n) {
         return;

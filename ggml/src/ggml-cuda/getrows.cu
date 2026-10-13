@@ -129,17 +129,14 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
-// Vector width for the type-converting get_rows path. The load and the store have different
-// widths, so the widest of the two is what is capped at the 16 byte maximum access size:
-// f32 -> bf16 becomes a 16 byte load plus an 8 byte store per thread.
+// vector width for the type-converting path: the wider of load and store is capped at 16 bytes
 template<typename src0_t, typename dst_t>
 struct get_rows_vec_width {
     static constexpr size_t elem_max = sizeof(src0_t) > sizeof(dst_t) ? sizeof(src0_t) : sizeof(dst_t);
     static constexpr int    value    = elem_max <= 16 ? int(16 / elem_max) : 1;
 };
 
-// Plain aligned array so the compiler emits a single wide load/store per object.
-// N and sizeof(T) are both powers of two, so the alignment is always legal.
+// aligned array so that the compiler emits one wide load/store
 template<typename T, int N>
 struct __align__(sizeof(T) * N) get_rows_vec_t {
     T v[N];
@@ -184,8 +181,7 @@ static __global__ void k_get_rows_float_convert_vec(
 }
 
 
-// Rows shorter than a block: one thread per element over all rows, so that the threads of a block are not idle.
-// The element type T is the source type, or int4 for a vectorized copy of rows of the same type.
+// rows shorter than a block: one thread per element over all rows. T is the source type, or int4 for a vectorized copy
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float_flat(
         const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr, const uint32_t n,
@@ -360,8 +356,7 @@ static void get_rows_cuda_float(
         if (n_flat == 0) {
             return;
         }
-        // The flat index has to stay below 2^31: fastdiv computes (umulhi(n, mp) + n) in 32 bits, which can overflow
-        // for n >= 2^31, and the grid-stride step i += gridDim.x*blockDim.x must not wrap around in 32 bits.
+        // fastdiv and the grid-stride step use 32 bit math, so the flat index must stay below 2^31
         if (ne00_flat <= GET_ROWS_FLAT_MAX_NE00 && n_flat <= int64_t(INT32_MAX)) {
             const int64_t nblocks = (n_flat + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
             const dim3 block_nums(MIN(nblocks, int64_t(INT32_MAX)), 1, 1);
@@ -412,8 +407,7 @@ static void get_rows_cuda_float(
             return;
         }
     } else {
-        // Type-converting copy. The per-element operation is unchanged, only the number of
-        // elements handled per thread differs, so this stays numerically exact.
+        // type-converting copy, several elements per thread
         constexpr int    VEC           = get_rows_vec_width<src0_t, dst_t>::value;
         constexpr size_t src_vec_bytes = VEC * sizeof(src0_t);
         constexpr size_t dst_vec_bytes = VEC * sizeof(dst_t);
@@ -421,9 +415,7 @@ static void get_rows_cuda_float(
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
         const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        // Both sides need their own alignment guarantees because the widths differ: the row
-        // base offsets (nb0x for the source, nb* for the destination) and the two base pointers
-        // must each be a multiple of the respective vector size.
+        // load and store widths differ, so both sides need their own alignment
         const bool can_vec = VEC > 1 && enough_blocks &&
             (ne00 % VEC == 0) &&
             (nb01 % src_vec_bytes == 0) && (nb02 % src_vec_bytes == 0) && (nb03 % src_vec_bytes == 0) &&

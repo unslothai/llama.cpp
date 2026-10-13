@@ -2058,11 +2058,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    // The permutation that groups the tokens by expert is the same one the MMQ/MMF paths need, so
-    // reuse their device-side helper instead of copying the ids to the host and bucketing them there.
-    // The helper picks between a single-warp-per-expert kernel and a counting sort depending on the
-    // shape; ask it what it can handle rather than duplicating either one's limits here. Fall back
-    // to the host loop for that answer or for an ids layout the helper cannot address.
+    // sort the ids by expert on the device with the MMQ/MMF helper, else on the host
     const bool sort_on_device = ids->type == GGML_TYPE_I32 && ids->nb[0] == ggml_element_size(ids) &&
         ggml_cuda_mm_ids_helper_supported(ne02, ne12, n_expert_used);
 
@@ -2077,16 +2073,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        // The per-expert token counts size the GEMMs below and are therefore needed on the host.
-        // This is the only remaining synchronization on this path.
+        // the GEMMs below need the per-expert token counts on the host
         std::vector<int32_t> expert_bounds_host(ne02 + 1);
         CUDA_CHECK(cudaMemcpyAsync(expert_bounds_host.data(), expert_bounds_dev.ptr,
             (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // this trips on the legacy single-warp path, which takes at most one slot per (token, expert),
-        // and on out-of-range ids, which the helper drops. the counting sort counts every assignment,
-        // so a repeated expert still totals ne_get_rows and passes here; mm_ids_invert bounds it instead
+        // fails for out of range ids, and for repeated ids on the single-warp path
         GGML_ASSERT(expert_bounds_host[ne02] == ne_get_rows);
         GGML_ASSERT(expert_bounds_host[0] == 0);
 
