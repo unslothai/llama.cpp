@@ -599,9 +599,13 @@ jobs:
         working-directory: src
         run: |
           # GGML_OPENMP=OFF as on x64: no OpenMP runtime to ship.
+          # FindVulkan picks the x64 Lib\vulkan-1.lib on its own; lld-link refuses it for arm64.
+          $vkLib = "$env:VULKAN_SDK\Lib-ARM64\vulkan-1.lib"
+          if (-not (Test-Path $vkLib)) { Write-Error "$vkLib missing"; exit 1 }
           $env:CMAKE_PREFIX_PATH = $env:VULKAN_SDK
           cmake -S . -B build -G "Ninja Multi-Config" `
             -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake `
+            "-DVulkan_LIBRARY=$vkLib" `
             -DGGML_NATIVE=OFF `
             -DGGML_BACKEND_DL=ON `
             -DGGML_OPENMP=OFF `
@@ -641,16 +645,20 @@ jobs:
           }
           exit 0
 
-      # Cross-compiled, so it cannot run here: assert ggml-vulkan.dll is ARM64 (PE machine 0xAA64).
-      - name: Check ARM64 Vulkan backend
+      # Cross-compiled, so nothing can run here. The x64 vulkan-shaders-gen build tool lands in
+      # bin/Release too; drop it, then require every shipped exe/dll to be ARM64 (PE machine 0xAA64).
+      - name: Check ARM64 binaries
         run: |
-          $dll = "src/build/bin/Release/ggml-vulkan.dll"
-          if (-not (Test-Path $dll)) { Write-Error "$dll was not built"; exit 1 }
-          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $dll))
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
-          Write-Host ("ggml-vulkan.dll machine: 0x{0:X4}" -f $machine)
-          if ($machine -ne 0xAA64) { Write-Error "ggml-vulkan.dll is not ARM64"; exit 1 }
+          $rel = "src/build/bin/Release"
+          if (-not (Test-Path "$rel/ggml-vulkan.dll")) { Write-Error "ggml-vulkan.dll was not built"; exit 1 }
+          Remove-Item "$rel/vulkan-shaders-gen*" -ErrorAction SilentlyContinue
+          $bad = @()
+          foreach ($f in Get-ChildItem $rel -File | Where-Object { $_.Extension -in '.exe', '.dll' }) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3C) + 4)
+            if ($machine -ne 0xAA64) { $bad += ("{0} (0x{1:X4})" -f $f.Name, $machine) }
+          }
+          if ($bad) { Write-Error ("not ARM64: " + ($bad -join ", ")); exit 1 }
 
       - name: Fetch signing tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
