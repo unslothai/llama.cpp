@@ -514,9 +514,7 @@ struct llama_mmap::impl {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
 #if defined(__linux__) && defined(MADV_POPULATE_READ)
-                // MAP_POPULATE is not used when the file has lazy ranges, so populate the page tables of the
-                // other ranges explicitly: otherwise the first access at run time (e.g. uploading the experts
-                // of a layer kept in host memory) takes a page fault for every page
+                // lazy ranges disable MAP_POPULATE, so populate the other ranges here to avoid a page fault per page at run time
                 if (!lazy_ranges.empty()) {
                     const size_t page_size = sysconf(_SC_PAGESIZE);
                     const size_t beg = range.first & ~(page_size - 1);
