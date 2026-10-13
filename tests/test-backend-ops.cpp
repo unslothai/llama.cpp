@@ -11074,10 +11074,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // more than 64 experts
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, b, 128, 512, 256));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, b, 128, 300, 256));
-            // several k iterations per tile, tile count not a multiple of the SM count: stream-k fixup with empty tiles
-            for (int m : {128, 320}) {
-                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, m, 256, 2048));
-            }
+        }
+    }
+    // several k iterations per tile, tile count not a multiple of the SM count: stream-k fixup with empty tiles
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, 128, 128, 2048));
         }
     }
     // too many experts for the counting sort and too many used for the single-warp kernel: host fallback
