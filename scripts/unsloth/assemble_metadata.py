@@ -96,8 +96,7 @@ KIND_BY_VULKAN_TARGET = {
     "linux-x64":   {"manifest": "linux-vulkan",       "sha": "linux-vulkan-app"},
     "linux-arm64": {"manifest": "linux-vulkan",       "sha": "linux-arm64-vulkan-app"},
     "windows-x64": {"manifest": "windows-vulkan",     "sha": "windows-vulkan-app"},
-    # Own kind, not windows-vulkan: installers that predate it never select it, so
-    # no x64 host can be handed this ARM64 zip whatever its windows-vulkan logic.
+    # Own kind: installers predating it never select it, so no x64 host is handed this zip.
     "windows-arm64": {"manifest": "windows-arm64-vulkan", "sha": "windows-arm64-vulkan-app"},
 }
 

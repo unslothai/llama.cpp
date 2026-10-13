@@ -532,17 +532,11 @@ jobs:
           path: ${{ github.workspace }}\.ccache
           key: ccache-vulkan-windows-x64-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # Windows on ARM (Snapdragon X / Adreno). Its own job, not a row in the x64
-  # one: x64 builds with MSVC, while arm64 follows ggml-org's release.yml
-  # windows (vulkan, arm64) recipe, cross-compiling with clang on an x64 runner.
-  # No vcvarsall on purpose: it would put the ARM64-targeting cl.exe on PATH,
-  # and ggml-vulkan's host-compiler probe would then build vulkan-shaders-gen
-  # as an ARM64 binary that cannot run during the build. clang finds MSVC and
-  # the Windows SDK itself.
+  # ggml-org release.yml's Vulkan arm64 recipe: clang cross-compile on x64. No vcvarsall: its
+  # ARM64 cl.exe would make ggml-vulkan build vulkan-shaders-gen for ARM64, unrunnable here.
   build-windows-arm64:
     name: windows/arm64
     runs-on: windows-2025
-    # Same signing gate as windows/x64 above.
     environment: release-signing
     defaults:
       run:
@@ -574,7 +568,6 @@ jobs:
           save: false
 
       - name: Configure ccache
-        # Same positive check as windows/x64: never fail a release on the cache.
         run: |
           $ErrorActionPreference = 'Continue'
           $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
@@ -594,8 +587,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja --no-progress
 
-      # The x64-hosted SDK plus its ARM64 component: the host glslc compiles the
-      # shaders, the component supplies the ARM64 vulkan-1.lib to link against.
+      # The ARM64 component supplies the vulkan-1.lib to link; shaders compile with the host glslc.
       - name: Install Vulkan SDK
         run: |
           curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
@@ -606,9 +598,7 @@ jobs:
       - name: Configure
         working-directory: src
         run: |
-          # The windows/x64 recipe on the arm64 clang toolchain. No
-          # GGML_CPU_ALL_VARIANTS (an x86 microarch fan-out), and GGML_OPENMP=OFF
-          # as on x64 so no OpenMP runtime has to ship beside the binaries.
+          # GGML_OPENMP=OFF as on x64: no OpenMP runtime to ship.
           $env:CMAKE_PREFIX_PATH = $env:VULKAN_SDK
           cmake -S . -B build -G "Ninja Multi-Config" `
             -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake `
@@ -651,9 +641,7 @@ jobs:
           }
           exit 0
 
-      # Cross-compiled binaries cannot run here, so at least prove the Vulkan
-      # backend module was built for ARM64 (IMAGE_FILE_MACHINE_ARM64 = 0xAA64)
-      # and is in the tree that ships.
+      # Cross-compiled, so it cannot run here: assert ggml-vulkan.dll is ARM64 (PE machine 0xAA64).
       - name: Check ARM64 Vulkan backend
         run: |
           $dll = "src/build/bin/Release/ggml-vulkan.dll"
