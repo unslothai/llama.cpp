@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -39,6 +40,9 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+// [TAG_STATE_ASYNC] defined in llama-context.cpp
+struct llama_state_seq_copy;
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -162,6 +166,20 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // [TAG_STATE_ASYNC] the same two transfers, issued on a stream of their own and left running
+    llama_state_seq_copy * state_seq_copy_init();
+
+    size_t state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id,      llama_state_seq_flags flags);
+    size_t state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags);
+
+    // [TAG_STATE_ASYNC] recorded after every decode and encode once a transfer exists, for the copies to wait for
+    void state_seq_copy_fence();
+
+    // the last transfer released takes the fences with it
+    void state_seq_copy_release(llama_state_seq_copy * cpy);
+
+    void state_seq_copies_drain();
 
     bool state_load_file(
             const char * filepath,
@@ -358,6 +376,11 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // [TAG_STATE_ASYNC] one event per asynchronous device; see state_seq_copy_fence()
+    std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
+
+    std::set<llama_state_seq_copy *> state_copies;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

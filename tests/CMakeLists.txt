@@ -290,6 +290,9 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# [TAG_EXACT_CONCURRENCY] the event query a backend publishes through its registry is found and answers
+llama_build_and_test(test-event-query.cpp)
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -301,6 +304,10 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Guards on the asynchronous per-sequence state transfer
+# Skips itself on a backend that cannot copy asynchronously
+llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()

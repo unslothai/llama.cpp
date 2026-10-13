@@ -949,6 +949,52 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // [TAG_STATE_ASYNC] asynchronous per-sequence state transfer on a stream of its own; poll llama_state_seq_copy_done().
+    // The transfer owns its (pinned when possible) host buffer. Until completion the caller must not touch the buffer,
+    // free or reuse the cells of a sequence being read, or decode a sequence being written.
+    struct llama_state_seq_copy;
+
+    // NULL if the backends cannot copy asynchronously or query completion without blocking; use the synchronous calls then.
+    LLAMA_API struct llama_state_seq_copy * llama_state_seq_copy_init(struct llama_context * ctx);
+    LLAMA_API void llama_state_seq_copy_free(struct llama_state_seq_copy * cpy);
+
+    // Grow-only resize, contents not kept; NULL on failure. Pinning is too slow to redo per transfer.
+    LLAMA_API uint8_t * llama_state_seq_copy_buf_resize  (struct llama_state_seq_copy * cpy, size_t size);
+    LLAMA_API uint8_t * llama_state_seq_copy_buf         (struct llama_state_seq_copy * cpy);
+    LLAMA_API size_t    llama_state_seq_copy_buf_size    (struct llama_state_seq_copy * cpy);
+    // host memory actually held, which is what a host RAM budget has to count
+    LLAMA_API size_t    llama_state_seq_copy_buf_capacity(struct llama_state_seq_copy * cpy);
+    LLAMA_API void      llama_state_seq_copy_buf_free    (struct llama_state_seq_copy * cpy);
+
+    // true when the buffer held now is page-locked; false while none is held (see llama_state_seq_copy_buf_can_pin()).
+    LLAMA_API bool llama_state_seq_copy_buf_is_pinned(struct llama_state_seq_copy * cpy);
+
+    // true when the backend offers pinned host memory; an allocation can still come back pageable.
+    LLAMA_API bool llama_state_seq_copy_buf_can_pin(struct llama_state_seq_copy * cpy);
+
+    // Issue the copies; return the bytes covered, 0 on failure. size must be in [1, llama_state_seq_copy_buf_size()].
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is refused, since these copies go through host memory.
+    LLAMA_API size_t llama_state_seq_copy_get(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_copy_set(
+            struct llama_state_seq_copy * cpy,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+
+    // transfers the last issue posted: one per run of adjacent cells, per tensor
+    LLAMA_API size_t llama_state_seq_copy_n_copies(struct llama_state_seq_copy * cpy);
+
+    // microseconds the last issue spent waiting for the compute streams before it could start
+    LLAMA_API int64_t llama_state_seq_copy_sync_us(struct llama_state_seq_copy * cpy);
+
+    LLAMA_API bool llama_state_seq_copy_done(struct llama_state_seq_copy * cpy);
+    LLAMA_API void llama_state_seq_copy_wait(struct llama_state_seq_copy * cpy);
+
     //
     // Decoding
     //

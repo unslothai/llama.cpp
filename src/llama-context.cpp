@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -485,6 +486,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // Drain live transfers first: synchronize() does not cover their copy backends, and the KV buffers are about to go.
+    state_seq_copies_drain();
+
+    for (auto & it : state_copy_fences) {
+        ggml_backend_event_free(it.second);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1656,6 +1664,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    if (!state_copy_fences.empty()) {
+        state_seq_copy_fence();
+    }
+
     return 0;
 }
 
@@ -2107,6 +2119,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (!state_copy_fences.empty()) {
+        state_seq_copy_fence();
+    }
 
     return 0;
 }
@@ -2692,16 +2708,129 @@ private:
     size_t size_written = 0;
 };
 
+// [TAG_STATE_COALESCE] one transfer per run of adjacent cells, not one per cell; the restore side emits per cell.
+template <typename info_t>
+static size_t llama_io_run_end(const std::vector<info_t> & infos, size_t i) {
+    size_t end = i + 1;
+
+    while (end < infos.size() &&
+           infos[end].tensor == infos[end - 1].tensor &&
+           infos[end].offset == infos[end - 1].offset + infos[end - 1].size &&
+           infos[end].ptr    == infos[end - 1].ptr    + infos[end - 1].size) {
+        end++;
+    }
+
+    return end;
+}
+
+template <typename info_t>
+static size_t llama_io_run_size(const std::vector<info_t> & infos, size_t i, size_t end) {
+    size_t size = 0;
+
+    for (size_t j = i; j < end; ++j) {
+        size += infos[j].size;
+    }
+
+    return size;
+}
+
+// [TAG_STATE_COALESCE] runs of one length at a constant stride (a unified cache's comb) are a single strided copy.
+// emit(tensor, ptr, offset, size, n_copies, stride_tensor, stride_data); the strides are meaningless when n_copies == 1.
+template <typename info_t, typename emit_t>
+static void llama_io_emit(const std::vector<info_t> & infos, size_t first, size_t last, emit_t emit) {
+    std::vector<std::pair<size_t, size_t>> runs;
+
+    for (size_t i = first; i < last; ) {
+        const size_t end = llama_io_run_end(infos, i);
+
+        runs.emplace_back(i, end);
+
+        i = end;
+    }
+
+    for (size_t r = 0; r < runs.size(); ) {
+        const auto & head = infos[runs[r].first];
+
+        const size_t size = llama_io_run_size(infos, runs[r].first, runs[r].second);
+
+        size_t n_copies      = 1;
+        size_t stride_tensor = 0;
+        size_t stride_data   = 0;
+
+        if (r + 1 < runs.size()) {
+            const auto & next = infos[runs[r + 1].first];
+
+            if (next.tensor == head.tensor && next.offset > head.offset && next.ptr > head.ptr &&
+                llama_io_run_size(infos, runs[r + 1].first, runs[r + 1].second) == size) {
+                stride_tensor = next.offset - head.offset;
+                stride_data   = (size_t) (next.ptr - head.ptr);
+
+                // a strided copy may not have its rows overlap, on either side
+                if (stride_tensor >= size && stride_data >= size) {
+                    while (r + n_copies < runs.size()) {
+                        const auto & cur = infos[runs[r + n_copies].first];
+
+                        if (cur.tensor != head.tensor ||
+                            cur.offset != head.offset + n_copies * stride_tensor ||
+                            cur.ptr    != head.ptr    + n_copies * stride_data   ||
+                            llama_io_run_size(infos, runs[r + n_copies].first, runs[r + n_copies].second) != size) {
+                            break;
+                        }
+
+                        n_copies++;
+                    }
+                }
+            }
+        }
+
+        emit(head.tensor, head.ptr, head.offset, size, n_copies, stride_tensor, stride_data);
+
+        r += n_copies;
+    }
+}
+
+// a null backend means the copy is synchronous
+static void llama_io_get(ggml_backend_t backend, ggml_tensor * tensor, void * ptr,
+                         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies > 1) {
+        if (backend) {
+            ggml_backend_tensor_get_2d_async(backend, tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+        } else {
+            ggml_backend_tensor_get_2d(tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+        }
+    } else if (backend) {
+        ggml_backend_tensor_get_async(backend, tensor, ptr, offset, size);
+    } else {
+        ggml_backend_tensor_get(tensor, ptr, offset, size);
+    }
+}
+
+static void llama_io_set(ggml_backend_t backend, ggml_tensor * tensor, const void * ptr,
+                         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies > 1) {
+        if (backend) {
+            ggml_backend_tensor_set_2d_async(backend, tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+        } else {
+            ggml_backend_tensor_set_2d(tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+        }
+    } else if (backend) {
+        ggml_backend_tensor_set_async(backend, tensor, ptr, offset, size);
+    } else {
+        ggml_backend_tensor_set(tensor, ptr, offset, size);
+    }
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
-        }
+        llama_io_emit(winfos, 0, winfos.size(),
+                [](ggml_tensor * tensor, uint8_t * ptr, size_t offset, size_t size,
+                   size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                    llama_io_get(nullptr, tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+                });
     }
 
     void write(const void * src, size_t size) override {
@@ -2757,10 +2886,20 @@ public:
             while (end < rinfos.size() && rinfos[end].tensor == tensor) {
                 end++;
             }
+            // [TAG_STATE_COALESCE] cost is the number of runs, not fragments; stage the whole tensor only when even the runs are too many.
             const size_t tensor_bytes = ggml_nbytes(tensor);
             auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-            // Stage a fragmented tensor once instead of thousands of small device writes.
-            if (end - i >= 64 && tensor_bytes <= 64 * 1024 * 1024 &&
+
+            // A strided set of rows costs one transfer only on a buffer that copies 2-D.
+            const bool has_2d = ggml_backend_buffer_supports_2d(buffer);
+
+            size_t n_runs = 0;
+            llama_io_emit(rinfos, i, end,
+                    [&n_runs, has_2d](ggml_tensor *, const uint8_t *, size_t, size_t, size_t n_copies, size_t, size_t) {
+                        n_runs += has_2d ? 1 : n_copies;
+                    });
+            // Stage bounded, heavily fragmented tensors once, preserving other sequences' bytes.
+            if (n_runs >= 64 && tensor_bytes <= 64 * 1024 * 1024 &&
                     !ggml_backend_buffer_is_host(buffer)) {
                 std::vector<uint8_t> staging;
                 try {
@@ -2780,10 +2919,13 @@ public:
                     continue;
                 }
             }
-            for (; i < end; ++i) {
-                const auto & rinfo = rinfos[i];
-                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-            }
+            llama_io_emit(rinfos, i, end,
+                    [](ggml_tensor * tensor, const uint8_t * ptr, size_t offset, size_t size,
+                       size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                        llama_io_set(nullptr, tensor, ptr, offset, size, n_copies, stride_tensor, stride_data);
+                    });
+
+            i = end;
         }
     }
 
@@ -3220,6 +3362,353 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
+// [TAG_STATE_ASYNC] a sequence state transfer that runs beside the decode, with its own host buffer,
+// one backend (own stream) and one event per device holding part of the cache.
+struct llama_state_seq_copy {
+    llama_context * ctx = nullptr;
+
+    struct dev_copy {
+        ggml_backend_ptr     backend;
+        ggml_backend_event_t event   = nullptr;
+        bool                 pending = false;
+    };
+
+    std::map<ggml_backend_dev_t, dev_copy> devs;
+
+    ggml_backend_buffer_ptr host_buf;
+
+    bool counted = false; // held in the context's count of live transfers
+
+    uint8_t * data     = nullptr;
+    size_t    size     = 0;   // bytes the current transfer covers
+    size_t    capacity = 0;   // bytes actually held, kept across transfers
+    bool      pinned   = false;
+    bool      can_pin  = false;
+
+    size_t    n_copies = 0;
+    int64_t   t_sync_us = 0;
+
+    ~llama_state_seq_copy() {
+        if (counted) {
+            ctx->state_seq_copy_release(this);
+        }
+
+        wait();
+
+        for (auto & it : devs) {
+            if (it.second.event) {
+                ggml_backend_event_free(it.second.event);
+            }
+        }
+    }
+
+    // Null for host tensors and split / non-default buffers (which fail the async copy assert): those copy synchronously.
+    ggml_backend_t backend_for(const ggml_tensor * t) {
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+
+        if (!buf || ggml_backend_buffer_is_host(buf)) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+        if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
+            return nullptr;
+        }
+
+        auto it = devs.find(dev);
+
+        if (it == devs.end()) {
+            return nullptr;
+        }
+
+        it->second.pending = true;
+
+        return it->second.backend.get();
+    }
+
+    void record() {
+
+        for (auto & it : devs) {
+            if (it.second.pending) {
+                ggml_backend_event_record(it.second.event, it.second.backend.get());
+            }
+        }
+    }
+
+    // The copy stream waits on the context's fence, recorded at the end of every decode, so the host drains nothing.
+    // Recording it here instead would order each restore behind the previous one's copies.
+    void order_after(const std::map<ggml_backend_dev_t, ggml_backend_event_t> & fences) {
+        for (auto & it : devs) {
+            const auto fence = fences.find(it.first);
+
+            if (fence != fences.end()) {
+                ggml_backend_event_wait(it.second.backend.get(), fence->second);
+            }
+        }
+    }
+
+    // Restore only: the graphs wait on the device for the copies, since non-paged attention reads every cell
+    // up to n_kv, masked ones included. A park reads cells nobody writes until it has landed.
+    void order_before(const std::vector<ggml_backend_ptr> & compute) {
+        for (auto & it : devs) {
+            if (!it.second.pending) {
+                continue;
+            }
+
+            for (const auto & backend : compute) {
+                if (ggml_backend_get_device(backend.get()) == it.first) {
+                    ggml_backend_event_wait(backend.get(), it.second.event);
+                }
+            }
+        }
+    }
+
+    bool done() {
+        bool res = true;
+
+        for (auto & it : devs) {
+            if (!it.second.pending) {
+                continue;
+            }
+
+            if (ggml_backend_event_query(it.second.event)) {
+                it.second.pending = false;
+            } else {
+                res = false;
+            }
+        }
+
+        return res;
+    }
+
+    void wait() {
+        for (auto & it : devs) {
+            if (!it.second.pending) {
+                continue;
+            }
+
+            ggml_backend_event_synchronize(it.second.event);
+
+            it.second.pending = false;
+        }
+    }
+
+    // Grow-only: pinning costs about as long as the copy, so memory is kept until buf_free().
+    uint8_t * buf_resize(size_t size_new) {
+        if (size_new <= capacity) {
+            size = size_new;
+
+            return size_new == 0 ? nullptr : data;
+        }
+
+        wait();
+
+        host_buf.reset();
+
+        data     = nullptr;
+        size     = 0;
+        capacity = 0;
+        pinned   = false;
+
+        ggml_backend_buffer_type_t host_buft = host_buffer_type();
+
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, size_new);
+
+        if (!buf) {
+            return nullptr;
+        }
+
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+
+        if (!base) {
+            ggml_backend_buffer_free(buf);
+            return nullptr;
+        }
+
+        host_buf.reset(buf);
+
+        data     = base;
+        size     = size_new;
+        capacity = size_new;
+        // a host buffer type may hand back pageable memory, so trust the buffer, not the type
+        pinned   = can_pin && ggml_backend_buffer_get_type(buf) == host_buft;
+
+        return data;
+    }
+
+    void buf_free() {
+        wait();
+
+        host_buf.reset();
+
+        data     = nullptr;
+        size     = 0;
+        capacity = 0;
+        pinned   = false;
+    }
+
+    // Pageable memory makes the driver bounce the copy through a pinned buffer and block.
+    ggml_backend_buffer_type_t host_buffer_type() {
+        for (auto & it : devs) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(it.first);
+
+            if (buft) {
+                return buft;
+            }
+        }
+
+        return ggml_backend_cpu_buffer_type();
+    }
+};
+
+class llama_io_write_host_async : public llama_io_write_i {
+public:
+    llama_io_write_host_async(uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
+        ptr(p), buf_size(len), cpy(cpy) {}
+
+    // Copies are posted from the destructor only once serialisation completes, so a failed (zero) return
+    // leaves the buffer free to reuse at once.
+    void commit() {
+        committed = true;
+    }
+
+    ~llama_io_write_host_async() {
+        if (!committed) {
+            return;
+        }
+
+        llama_io_emit(winfos, 0, winfos.size(),
+                [this](ggml_tensor * tensor, uint8_t * ptr, size_t offset, size_t size,
+                       size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                    llama_io_get(cpy.backend_for(tensor), tensor, ptr, offset, size,
+                                 n_copies, stride_tensor, stride_data);
+
+                    cpy.n_copies++;
+                });
+
+        cpy.record();
+    }
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        winfos.push_back({tensor, ptr, size, offset});
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+    struct write_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<write_info> winfos;
+
+    llama_state_seq_copy & cpy;
+
+    bool committed = false;
+};
+
+class llama_io_read_host_async : public llama_io_read_i {
+public:
+    llama_io_read_host_async(const uint8_t * p, size_t len, llama_state_seq_copy & cpy) :
+        ptr(p), buf_size(len), cpy(cpy) {}
+
+    // see llama_io_write_host_async::commit(); a failed restore has already dropped the sequence
+    void commit() {
+        committed = true;
+    }
+
+    ~llama_io_read_host_async() {
+        if (!committed) {
+            return;
+        }
+
+        // No whole-tensor staging: its write-back would clobber what concurrently decoding sequences wrote to
+        // their own cells. Coalesced runs keep the per-run copies affordable.
+        llama_io_emit(rinfos, 0, rinfos.size(),
+                [this](ggml_tensor * tensor, const uint8_t * ptr, size_t offset, size_t size,
+                       size_t n_copies, size_t stride_tensor, size_t stride_data) {
+                    llama_io_set(cpy.backend_for(tensor), tensor, ptr, offset, size,
+                                 n_copies, stride_tensor, stride_data);
+
+                    cpy.n_copies++;
+                });
+
+        cpy.record();
+    }
+
+    void read(void * dst, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(dst, ptr, size);
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        rinfos.push_back({tensor, ptr, size, offset});
+
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+
+private:
+    const uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_read = 0;
+
+    struct read_info {
+        ggml_tensor * tensor;
+        const uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<read_info> rinfos;
+
+    llama_state_seq_copy & cpy;
+
+    bool committed = false;
+};
+
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -3292,6 +3781,238 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         io->discard();
         return 0;
     }
+}
+
+// [TAG_STATE_ASYNC]
+
+void llama_context::state_seq_copies_drain() {
+    for (auto * cpy : state_copies) {
+        cpy->wait();
+        cpy->ctx     = nullptr;
+        cpy->counted = false;
+    }
+
+    state_copies.clear();
+}
+
+void llama_context::state_seq_copy_release(llama_state_seq_copy * cpy) {
+    GGML_ASSERT(state_copies.erase(cpy) == 1);
+
+    if (state_copies.empty()) {
+        for (auto & it : state_copy_fences) {
+            ggml_backend_event_free(it.second);
+        }
+
+        state_copy_fences.clear();
+    }
+}
+
+void llama_context::state_seq_copy_fence() {
+    for (const auto & it : state_copy_fences) {
+        for (const auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == it.first) {
+                ggml_backend_event_record(it.second, backend.get());
+            }
+        }
+    }
+}
+
+llama_state_seq_copy * llama_context::state_seq_copy_init() {
+    std::unique_ptr<llama_state_seq_copy> cpy(new llama_state_seq_copy());
+
+    cpy->ctx = this;
+
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+
+        if (!dev || cpy->devs.find(dev) != cpy->devs.end()) {
+            continue;
+        }
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+
+        if (!props.caps.async || !props.caps.events) {
+            continue;
+        }
+
+        // A device without a real event_query would block on the first poll, so it is left out and init returns NULL.
+        if (!ggml_backend_dev_supports_event_query(dev)) {
+            static std::atomic<bool> warned(false);
+
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_INFO("%s: %s cannot test an event without waiting for it, so sequence "
+                               "states are copied synchronously\n", __func__, ggml_backend_dev_name(dev));
+            }
+
+            continue;
+        }
+
+        // a backend of its own: the graph backend may order its copies behind a graph
+        ggml_backend_t backend_cpy = ggml_backend_dev_init(dev, nullptr);
+
+        if (!backend_cpy) {
+            continue;
+        }
+
+        ggml_backend_event_t event = ggml_backend_event_new(dev);
+
+        if (!event) {
+            ggml_backend_free(backend_cpy);
+            continue;
+        }
+
+        auto & dc = cpy->devs[dev];
+
+        dc.backend.reset(backend_cpy);
+        dc.event = event;
+    }
+
+    if (cpy->devs.empty()) {
+        return nullptr;
+    }
+
+    // If the state lives in host memory (layers left on the CPU), every copy is synchronous, so refuse.
+    if (memory) {
+        bool on_device = false;
+
+        for (const auto & [buft, size] : memory->memory_breakdown()) {
+            if (size == 0) {
+                continue;
+            }
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+            if (ggml_backend_buft_is_host(buft) || !dev || buft != ggml_backend_dev_buffer_type(dev) ||
+                    cpy->devs.find(dev) == cpy->devs.end()) {
+                LLAMA_LOG_INFO("%s: the sequence state is not all in device memory (%s), so it is copied synchronously\n",
+                        __func__, ggml_backend_buft_name(buft));
+                return nullptr;
+            }
+
+            on_device = true;
+        }
+
+        if (!on_device) {
+            return nullptr;
+        }
+    }
+
+    cpy->can_pin = cpy->host_buffer_type() != ggml_backend_cpu_buffer_type();
+
+    // Fences are installed only after the checks above, so a refused transfer leaves nothing recording.
+    std::vector<ggml_backend_dev_t> fences_new;
+
+    for (const auto & it : cpy->devs) {
+        if (state_copy_fences.find(it.first) != state_copy_fences.end()) {
+            continue;
+        }
+
+        ggml_backend_event_t fence = ggml_backend_event_new(it.first);
+
+        if (!fence) {
+            for (auto dev : fences_new) {
+                ggml_backend_event_free(state_copy_fences[dev]);
+                state_copy_fences.erase(dev);
+            }
+
+            return nullptr;
+        }
+
+        state_copy_fences[it.first] = fence;
+        fences_new.push_back(it.first);
+    }
+
+    state_seq_copy_fence();
+
+    state_copies.insert(cpy.get());
+    cpy->counted = true;
+
+    return cpy.release();
+}
+
+size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // The library owns this buffer, so check the size: the io object's bounds checks trust it.
+    if (!cpy.data || size == 0 || size > cpy.size) {
+        LLAMA_LOG_ERROR("%s: cannot cover %zu bytes, the transfer's buffer holds %zu\n", __func__, size, cpy.size);
+        return 0;
+    }
+
+    // ON_DEVICE cannot be honoured through the host buffer, and its size_ext is metadata-sized.
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported here, the copies go through host memory\n", __func__);
+        return 0;
+    }
+
+    const int64_t t_sync = ggml_time_us();
+    cpy.order_after(state_copy_fences);
+    cpy.t_sync_us = ggml_time_us() - t_sync;
+
+    cpy.n_copies = 0;
+
+    llama_io_write_host_async io(cpy.data, size, cpy);
+
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+
+        io.commit();
+
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // The library owns this buffer, so check the size: the io object's bounds checks trust it.
+    if (!cpy.data || size == 0 || size > cpy.size) {
+        LLAMA_LOG_ERROR("%s: cannot cover %zu bytes, the transfer's buffer holds %zu\n", __func__, size, cpy.size);
+        return 0;
+    }
+
+    // ON_DEVICE cannot be honoured through the host buffer, and its size_ext is metadata-sized.
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported here, the copies go through host memory\n", __func__);
+        return 0;
+    }
+
+    const int64_t t_sync = ggml_time_us();
+    cpy.order_after(state_copy_fences);
+    cpy.t_sync_us = ggml_time_us() - t_sync;
+
+    cpy.n_copies = 0;
+
+    size_t n = 0;
+
+    {
+        llama_io_read_host_async io(cpy.data, size, cpy);
+
+        try {
+            uint32_t magic_read;
+            io.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io.read(&seq_id_read, sizeof(seq_id_read));
+
+            n = state_seq_read_data(io, seq_id, flags);
+
+            io.commit();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+            return 0;
+        }
+    }
+
+    cpy.order_before(backends);
+
+    return n;
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
@@ -4383,6 +5104,69 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+// [TAG_STATE_ASYNC]
+
+llama_state_seq_copy * llama_state_seq_copy_init(llama_context * ctx) {
+    return ctx->state_seq_copy_init();
+}
+
+void llama_state_seq_copy_free(llama_state_seq_copy * cpy) {
+    delete cpy; // waits for anything still in flight
+}
+
+uint8_t * llama_state_seq_copy_buf_resize(llama_state_seq_copy * cpy, size_t size) {
+    return cpy->buf_resize(size);
+}
+
+uint8_t * llama_state_seq_copy_buf(llama_state_seq_copy * cpy) {
+    return cpy->data;
+}
+
+size_t llama_state_seq_copy_buf_size(llama_state_seq_copy * cpy) {
+    return cpy->size;
+}
+
+size_t llama_state_seq_copy_buf_capacity(llama_state_seq_copy * cpy) {
+    return cpy->capacity;
+}
+
+size_t llama_state_seq_copy_n_copies(llama_state_seq_copy * cpy) {
+    return cpy->n_copies;
+}
+
+int64_t llama_state_seq_copy_sync_us(llama_state_seq_copy * cpy) {
+    return cpy->t_sync_us;
+}
+
+void llama_state_seq_copy_buf_free(llama_state_seq_copy * cpy) {
+    cpy->buf_free();
+}
+
+bool llama_state_seq_copy_buf_is_pinned(llama_state_seq_copy * cpy) {
+    // what was allocated: GGML_CUDA_NO_PINNED hands back pageable memory, and nothing is held before the first resize
+    return cpy->pinned;
+}
+
+bool llama_state_seq_copy_buf_can_pin(llama_state_seq_copy * cpy) {
+    return cpy->can_pin;
+}
+
+size_t llama_state_seq_copy_get(llama_state_seq_copy * cpy, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return cpy->ctx->state_seq_copy_get(*cpy, size, seq_id, flags);
+}
+
+size_t llama_state_seq_copy_set(llama_state_seq_copy * cpy, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
+    return cpy->ctx->state_seq_copy_set(*cpy, size, dest_seq_id, flags);
+}
+
+bool llama_state_seq_copy_done(llama_state_seq_copy * cpy) {
+    return cpy->done();
+}
+
+void llama_state_seq_copy_wait(llama_state_seq_copy * cpy) {
+    cpy->wait();
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
