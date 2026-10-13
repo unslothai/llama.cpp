@@ -422,9 +422,8 @@ private:
     void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
 
-    // ubatches of at least this many tokens prefetch the host weights on the copy queue of the scheduler, MoE experts whole
-    // without reading the ids; smaller ubatches (e.g. generation) use the regular path, where only the routed experts are
-    // copied (or the MoE cache serves them), so they do no staging or event work [GGML_SCHED_PREFETCH_MIN_BATCH]
+    // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
+    // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work
     int64_t prefetch_min_batch = 256;
 
     // tokens of the ubatch whose graph the scheduler is allocating, read by sched_prefetch_mode

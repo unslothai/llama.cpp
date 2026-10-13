@@ -126,12 +126,9 @@ extern "C" {
         size_t                     size;
     };
 
-    // queue many copies on `backend` as one batch, in stream order with the work queued before and after it, the copies
-    // of the batch may run in any order (they must not overlap)
-    // the destinations must be device memory of the backend, the sources device memory of the same device or host memory
-    // the backend can read asynchronously (e.g. pinned)
-    // returns false if the backend cannot batch these copies, nothing is copied then
-    // with n_regions == 0, returns whether the backend supports batched copies at all
+    // queue the copies on `backend` as one batch in stream order, the copies of a batch may run in any order and must not overlap
+    // dst: device memory of the backend; src: device memory of the same device, or host memory it can read async (e.g. pinned)
+    // returns false (nothing copied) if the backend cannot batch them; with n_regions == 0, returns whether batched copies are supported
     GGML_API bool ggml_backend_tensor_copy_regions_async(ggml_backend_t backend, const struct ggml_backend_copy_region * regions, size_t n_regions);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
@@ -358,12 +355,9 @@ extern "C" {
         GGML_BACKEND_SCHED_PREFETCH_ASYNC = 2, // copied into a staging slot on a separate copy queue, ahead of the split
     };
 
-    // Callback selecting the prefetch mode of an input weight `src` in a host buffer, `dst` is its copy and `graph` the graph of the split
-    // ASYNC copies are made by the copy callback (if set) called with the copy queue backend, or whole if it returns false
-    // such copies must not depend on the results of the graph computation (they may be issued before the previous splits are computed)
-    // return NONE for host tensors whose contents change during the graph computation
-    // when a copy callback is set and no prefetch callback is set, no weights are prefetched
-    // prefetching is controlled with the env vars GGML_SCHED_PREFETCH (0 = off) and GGML_SCHED_PREFETCH_DEPTH
+    // Callback selecting the prefetch mode of the host weight `src` (`dst` is its copy, `graph` the split graph), return NONE for host tensors that change during the graph computation
+    // ASYNC copies go through the copy callback with the copy queue backend (whole if it returns false) and may run before earlier splits, so they must not depend on graph results
+    // with a copy callback but no prefetch callback nothing is prefetched; env: GGML_SCHED_PREFETCH (0 = off), GGML_SCHED_PREFETCH_DEPTH
     typedef enum ggml_backend_sched_prefetch_mode (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, const struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index

@@ -1512,8 +1512,7 @@ extern "C" {
     // banks: the cached experts, [ne0, ne1, n_slots + 1] each (updated in place)
     // host:  device-accessible pointers to the experts of layer il in host memory, with the layout of the banks
     // the missing experts get a slot (the least recently used one, approximated with a CLOCK) and are copied from host memory
-    // result: I32 [n_expert_used, n_tokens], the slot of each selected expert, followed by the list of copied experts
-    //         use ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) as the ids of ggml_mul_mat_id with a bank
+    // result: I32 [n_expert_used, n_tokens] slots of the selected experts, then the copied experts; ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) gives the ids for ggml_mul_mat_id with a bank
     GGML_API struct ggml_tensor * ggml_moe_cache_lookup(
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,

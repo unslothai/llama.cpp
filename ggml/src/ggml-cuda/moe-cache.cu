@@ -5,9 +5,8 @@
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
 //
-// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6..7] unused,
-//        then key_of[n_slots] (il*n_expert + expert, -1 if empty), ref[n_slots] (CLOCK reference bits),
-//        pin[n_slots] (epoch of the last lookup that uses the slot, these are not evicted by the same lookup)
+// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6..7] unused, then key_of, ref and pin [n_slots]
+// key_of: il*n_expert + expert (-1 if empty); ref: CLOCK reference bits; pin: epoch of the last lookup using the slot (that lookup does not evict it)
 // dst:   slots[n_ids], then a row starting with the number of copied experts, then their experts[n_ids] and slots[n_ids]
 
 #define MOE_CACHE_HDR   8

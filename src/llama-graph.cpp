@@ -2533,8 +2533,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         }
     }
 
-    // large batches: the selected experts are kept as an output of the graph, the end of a prompt seeds the cache with the
-    // experts most used by the last large ubatch, even when the caller runs the last tokens as a separate small batch
+    // large batches: the selected experts are a graph output, so the end of a prompt can seed the cache with the experts most used by the last large ubatch
     if (n_tokens > llama_moe_cache::n_small_max) {
         selected_experts = ggml_cont(ctx0, selected_experts);
         ggml_set_output(selected_experts);

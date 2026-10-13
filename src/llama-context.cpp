@@ -2864,9 +2864,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the ubatch that seeds the MoE cache counts the experts used by the layers it caches
     const bool seed = lctx->moe_cache_seed && lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr;
 
-    // the scheduler calls this with its copy queue backend (not one of ours) only for the copies it prefetches
-    // (sched_prefetch_mode: when nearly all experts are used), which may be issued before the ids are computed: copy all
-    // on the regular path (no prefetch, or a split that is not prefetched) the ids are known: copy only the used experts
+    // the scheduler passes its copy queue backend only for prefetched copies (nearly all experts used), which may run before the ids exist: copy all
+    // on the regular path the ids are known: copy only the used experts
     const bool all = std::none_of(lctx->backends.begin(), lctx->backends.end(),
             [backend](const ggml_backend_ptr & b) { return b.get() == backend; });
 
@@ -2901,9 +2900,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
-    // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache, in one call with the uploads
-    // otherwise: only long cached runs are copied from the cache (many small copies are slower than the bytes they save),
-    // the copies from the MoE cache are issued first, then the uploads
+    // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache in one call with the uploads
+    // otherwise only long cached runs are copied from the cache (many small copies cost more than they save), before the uploads
     const bool batch = lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr && ggml_backend_tensor_copy_regions_async(backend, nullptr, 0);
 
     auto plan = [&](bool batched) {
@@ -2975,8 +2973,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     if (seed && !st.counts.empty()) {
         lctx->moe_cache->seed(backend, src, dst, st.counts, st.used);
     } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
-        // all experts were copied (prefetched): the routing of an earlier ubatch of the prompt; otherwise (regular path,
-        // e.g. this split was not prefetched) the ids of this ubatch were read and only its routed experts were staged
+        // all experts copied (prefetched): use the routing of an earlier ubatch; else the ids of this ubatch were read and only its routed experts staged
         const std::vector<int32_t> * counts = st.all ? lctx->moe_cache->get_seed_counts(src) : &st.counts;
         if (counts != nullptr && !counts->empty()) {
             lctx->moe_cache->seed(backend, src, dst, *counts, st.used);
@@ -2998,19 +2995,16 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         return;
     }
 
-    // the stored routing is used only while the prompt continues: same single sequence, next position, no outputs since
+    // the stored routing is used only while the prompt continues: same single sequence at the next position
     const bool cont = ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == moe_cache_seq && ubatch.pos[0] == moe_cache_pos_next;
     if (!cont) {
         moe_cache->clear_seed_counts();
     }
 
-    // a ubatch below the prefetch threshold uses the regular path, which reads its ids and copies only its routed experts:
-    // it seeds from them (a stored routing could name experts it does not stage), and the routing is only recorded when a
-    // later ubatch may be prefetched
+    // a ubatch below the prefetch threshold copies only its routed experts, so it seeds from its own ids (a stored routing could name unstaged experts)
     const bool prefetch = ubatch.n_tokens >= prefetch_min_batch;
 
-    // the routing outputs of the previous large ubatch are read before the graph of this ubatch replaces them, unless this
-    // ubatch records newer ones without seeding or the prompt ends here
+    // read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch records newer ones without seeding
     if (cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
@@ -3029,11 +3023,8 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     }
     moe_cache_ids.clear();
 
-    // the last large ubatch of the batch seeds the cache, with or without outputs: a caller may run the last tokens of the
-    // prompt as a separate small batch (e.g. the server saving a context checkpoint of a recurrent or SWA model first)
-    // with outputs (the prompt ends in this batch) or without an earlier routing of the prompt, it reads its own ids before
-    // copying the experts it uses; otherwise it seeds from the routing of the previous large ubatch of the prompt, and its
-    // copies of all of the experts do not wait for its ids (a prompt of several batches pays for at most one read)
+    // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
+    // with outputs or without an earlier routing it reads its own ids first; otherwise it seeds from the previous large ubatch, so its copies do not wait for its ids
     moe_cache_record    = large && prefetch_min_batch != INT64_MAX;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;

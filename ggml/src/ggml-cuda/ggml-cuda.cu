@@ -5166,11 +5166,9 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
-// maps host memory into the address space of the devices, so kernels can read it directly (zero-copy)
-// returns the device pointer of buffer, nullptr on failure; *registered is set if the caller holds a mapping reference and
-// must call ggml_backend_cuda_host_unmap(buffer) when done
-// buffers registered here are reference counted, so several users (e.g. contexts) can map the same buffer
-// pageable memory is never used through HMM/ATS even when the device could read it: that is an order of magnitude slower
+// maps host memory into the device address space so kernels read it directly (zero-copy), returns the device pointer or nullptr
+// mappings are reference counted: if *registered is set, call ggml_backend_cuda_host_unmap(buffer) when done
+// pageable memory is never read through HMM/ATS, it is an order of magnitude slower
 struct ggml_cuda_host_mapping {
     size_t size;
     void * dev_ptr;
@@ -6101,11 +6099,8 @@ static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
     return false;
 }
 
-// the device copies of a copy-only instance (the prefetch copy queue of the scheduler, whose copies overlap the compute of
-// another stream): the copy engines on HBM devices, the kernel otherwise. Measured with Qwen3.8-Flash-Next and the MoE cache:
-// B200 (HBM): with the kernel, generation after a prefetched prompt was ~5% slower, at the same prompt speed;
-// RTX PRO 6000 (GDDR7): with the copy engines, a prefetched 8k prompt was 9-16% slower, at the same generation speed.
-// GGML_CUDA_COPY_QUEUE_KERNEL=1 (kernel) / 0 (copy engines) overrides the choice
+// device copies of a copy-only instance (the scheduler copy queue, overlapping compute): copy engines on HBM devices (the kernel slows the compute), the kernel otherwise (copy engines are slow there)
+// GGML_CUDA_COPY_QUEUE_KERNEL=1 forces the kernel, 0 the copy engines
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
 static bool ggml_cuda_copy_queue_kernel(int device) {
     static const std::vector<bool> kernel = [] {
@@ -6127,8 +6122,8 @@ static bool ggml_cuda_copy_queue_kernel(int device) {
 }
 #endif
 
-// many small copies with two calls: the uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8) on the copy engines, the device
-// copies with one kernel (GGML_CUDA_COPY_REGIONS_KERNEL=0 puts them in the batch), GGML_CUDA_COPY_BATCH=0 disables both
+// many small copies in two calls: uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8), device copies with one kernel
+// GGML_CUDA_COPY_REGIONS_KERNEL=0 puts the device copies in the batch, GGML_CUDA_COPY_BATCH=0 disables both
 static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
     GGML_UNUSED(backend);

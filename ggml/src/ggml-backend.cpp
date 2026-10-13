@@ -939,20 +939,16 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
-    // host weight prefetch: index of the split among the prefetched splits of its backend (-1 if none)
-    // its weight copies are in staging slot pf_ordinal % depth
+    // host weight prefetch: index among the prefetched splits of its backend (-1 if none), the copies use staging slot pf_ordinal % depth
     int  pf_ordinal;
     size_t pf_size; // bytes of its weight copies in the slot
-    // the copies are issued ahead on the copy queue, otherwise they are made by the regular path (copy callback) into the slot
-    // (after a callback changed since the graph was allocated)
+    // copies issued ahead on the copy queue, else the regular path fills the slot (a callback changed since the graph was allocated)
     bool pf_async;
 };
 
-// host weight prefetch state of a backend
-// the weight copies of the prefetched splits live in a staging arena of `depth` slots outside of the graph allocator, so they never alias
-// with depth = 2 (default) the two slots are the two ends of the arena: even ordinals are placed at the start, odd ordinals end at the
-// end, so the arena only needs the largest sum of two consecutive splits instead of twice the largest split
-// slot lifecycle: copy queue waits retire[s] -> fills slot s -> records ready[s]; compute waits ready[s] -> reads slot s -> records retire[s]
+// host weight prefetch state of a backend: the copies live in a staging arena of `depth` slots outside the graph allocator, so they never alias
+// depth = 2: even ordinals start at the arena start, odd ones end at its end, so the arena needs the largest sum of two consecutive splits
+// slot s: copy queue waits retire[s], fills s, records ready[s]; compute waits ready[s], reads s, records retire[s]
 struct ggml_backend_sched_prefetch {
     bool checked;  // eligibility evaluated
     bool eligible; // the backend supports async copies and events
@@ -1891,12 +1887,7 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
 }
 
 //
-// host weight prefetch
-//
-// without it, each weight in host memory that is used by a GPU split is uploaded on the compute stream after a full
-// synchronization, so the transfers never overlap compute. with it, the weight copies of a split are bound to one of
-// `depth` staging slots of a device arena owned by the scheduler (outside of the graph allocator, so they never alias other
-// tensors), and they are uploaded on a copy queue up to `depth` splits ahead, ordered against compute with events.
+// host weight prefetch: the host weight copies of a split use one of `depth` staging slots and are uploaded on a copy queue up to `depth` splits ahead, ordered with events
 //
 
 static bool ggml_backend_sched_prefetch_backend_ok(ggml_backend_sched_t sched, int backend_id) {
@@ -2169,8 +2160,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 async = false;
             }
         }
-        // a split with a SYNC copy is not prefetched, its copies are allocated by the graph allocator as without prefetch,
-        // so the slots (and the copy queue) are only created for the splits whose copies are issued ahead
+        // a split with a SYNC copy is not prefetched (the graph allocator holds its copies), slots and the copy queue exist only for splits copied ahead
         if (bytes == 0 || !async) {
             continue;
         }
@@ -2232,8 +2222,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
         for (int k = 0; k < pf->n_bound; k++) {
             struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
-            // depth = 2: odd ordinals end at the end of the arena, so that consecutive splits never overlap
-            // (the size of the arena, which may be larger than the staging of this graph, is only known when it is not dry)
+            // depth = 2: odd ordinals end at the arena end so consecutive splits never overlap (the arena size is only known when not dry)
             size_t offset = (size_t) (k % sched->pf_depth) * pf->need;
             if (sched->pf_depth == 2) {
                 offset = k % 2 == 0 ? 0 : (dry ? pf->staging : pf->arena_size) - split->pf_size;
@@ -2269,8 +2258,7 @@ static bool ggml_backend_sched_prefetch_is_bound(ggml_backend_sched_t sched, con
     return input_cpy->buffer != NULL && input_cpy->buffer == sched->pf[split->backend_id].arena;
 }
 
-// the graph allocator failed while the staging arenas were allocated: unbind the copies, free the arenas and disable prefetch,
-// so that the allocation can be retried with the memory of the arenas, as without prefetch
+// the graph allocator failed with the staging arenas allocated: unbind the copies, free the arenas and disable prefetch, so the allocation can retry with that memory
 // returns false if nothing was freed
 static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
     bool freed = false;
@@ -2305,9 +2293,8 @@ static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
     return freed;
 }
 
-// issue the copies of the next prefetched splits of every backend
-// `consumed` splits have been queued for compute, the copies run up to depth - 1 splits ahead of them, so a copy only waits for
-// computes queued before the last one: with depth = 2, the copy of split k + 1 overlaps the compute of split k (double buffering)
+// issue the copies of the next prefetched splits of every backend, up to depth - 1 splits ahead of the `consumed` splits queued for compute
+// a copy only waits for computes queued before the last one: with depth = 2, the copy of split k + 1 overlaps the compute of split k
 static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
     const int ahead = std::max(sched->pf_depth - 1, 1);
     for (int b = 0; b < sched->n_backends; b++) {
@@ -2379,10 +2366,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
-// without pipeline parallelism (no events), a host-resident split input is queued as an async upload on the
-// split backend instead of a synchronous copy (2 host syncs per input); the caller synchronizes the split
-// backend once after queueing all of them, so the host data can be overwritten again as soon as
-// compute_splits moves on, as before
+// without pipeline parallelism, a host split input is queued as an async upload instead of a sync copy (2 host syncs per input)
+// the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
 static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2421,8 +2406,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         pf->issued   = 0;
         pf->consumed = 0;
-        // the copies of this graph run after the work queued on the backend before it, e.g. writes of earlier graphs
-        // to device memory that a copy callback reads
+        // the copies of this graph run after the work queued on the backend before it (e.g. earlier graphs writing memory a copy callback reads)
         if (sched->pf_active && pf->n_bound > 0 && pf->start != NULL) {
             ggml_backend_event_record(pf->start, sched->backends[b]);
             ggml_backend_event_wait(pf->copy_backend, pf->start);
@@ -2783,8 +2767,7 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_eval_user_data = user_data;
 }
 
-// the copies of the allocated graph were selected for prefetch with the previous callbacks: they are made by the regular path
-// (with the current callbacks) into their slots until the next allocation selects them again
+// the copies of the allocated graph were selected with the old callbacks: the regular path fills their slots until the next allocation
 static void ggml_backend_sched_prefetch_invalidate(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_splits; i++) {
         sched->splits[i].pf_async = false;

@@ -1455,8 +1455,7 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // a graph was computed with this instance; an instance that only copies (e.g. the copy queue of the scheduler) is not
-    // a compute instance
+    // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
 
 #ifdef USE_CUDA_GRAPH

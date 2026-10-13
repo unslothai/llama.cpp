@@ -1696,8 +1696,7 @@ static uint64_t common_model_file_bytes(const std::string & path) {
     return res;
 }
 
-// system memory that can be used without swapping, 0 if unknown
-// (the CPU backend reports the total memory as free on Linux and macOS)
+// system memory usable without swapping, 0 if unknown (the CPU backend reports total memory as free on Linux and macOS)
 static uint64_t common_available_memory() {
 #if defined(__linux__)
     std::ifstream f("/proc/meminfo");
@@ -1735,9 +1734,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
-        // the MoE cache looks up and copies the experts on the device, which needs the experts in pinned host memory
-        // memory-mapped files usually cannot be pinned, so the model is loaded without mmap if it fits in system memory
-        // (a larger model keeps mmap, so it can still be paged from disk, and the cache falls back to host lookups)
+        // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory
         const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
         ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if ((env == nullptr || atoi(env) != 0) && cpu != nullptr) {

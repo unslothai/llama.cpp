@@ -26,17 +26,14 @@ public:
     // n_ubatch is the size of the ubatch (n_tokens the rows of the layer, fewer for an output-only last layer)
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const;
 
-    // for small batches: the slots of the experts selected by ids [n_expert_used, n_tokens] in layer il, looked up on the device
-    // the missing experts are copied from host memory by the device, so the selected experts are never read by the host
-    // n_ubatch is the size of the ubatch, the same for all the layers (the last one may only compute the outputs), see prepare
-    // nullptr if the device lookup is not used for this layer and batch size, then get_slot_map can be used
+    // for small batches: the slots of the experts selected by ids [n_expert_used, n_tokens] in layer il, looked up on the device (which also copies the misses)
+    // n_ubatch is the ubatch size, the same for all layers; nullptr if the device lookup is not used, then use get_slot_map
     ggml_tensor * lookup(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const;
 
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
-    // device copy of a small per-expert tensor (scale or bias) of a cached layer kept in host memory, nullptr if there is none
-    // with it the lookups of small batches do not need the host
+    // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;
 
     // the experts of w in the cache, nullptr if w is not cached
@@ -70,13 +67,11 @@ public:
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
 
-    // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is computed and synchronized, compare the seeded slots
-    // with the host experts and log the mismatches
+    // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is synchronized, compare the seeded slots with the host experts
     bool seed_check() const;
     void seed_verify();
 
-    // the routing of an earlier large ubatch of the same prompt, for seed when the seeding ubatch copies all of the experts
-    // without reading its own ids: counts[e] is the number of tokens routed to expert e in the layer of w
+    // routing of an earlier large ubatch of the prompt, used to seed when the seeding ubatch copies all experts without reading its ids (counts[e] = tokens routed to e)
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();

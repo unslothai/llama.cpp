@@ -3,8 +3,7 @@
 
 #include "copy-regions.cuh"
 
-// device-to-device copies of many regions of any size with one launch: done by the SMs, so a batch of uploads on the copy
-// engines is not slowed down by them
+// device-to-device copies of many regions in one launch, run on the SMs so they do not slow down uploads on the copy engines
 
 #define COPY_REGIONS_MAX 128 // regions per launch, the kernel parameters stay below 4 KB
 

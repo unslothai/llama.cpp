@@ -582,8 +582,7 @@ struct llama_moe_cache::impl {
         if (device_lookup && !model.hparams.no_alloc) {
             init_device_lookup();
         } else if (device_lookup) {
-            // memory measurement: build the same graphs as with the device lookup, for the groups whose device can run it
-            // (whether the host experts can be mapped is only known when they are loaded)
+            // memory measurement: build the graphs of the device lookup for the groups whose device can run it (mapping is only known after loading)
             for (group & g : groups) {
                 g.dev_lookup = g.n_slots > 0 && lookup_capable(g);
             }
@@ -780,8 +779,7 @@ struct llama_moe_cache::impl {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
-        // with device lookups, the host state is used by the ubatches that do not use the device (see prepare), e.g. the
-        // last layer of a large ubatch computes only its outputs; a ubatch that uses the device keeps the state there
+        // with device lookups, ubatches that do not use the device use the host state (see prepare), a ubatch that uses the device keeps the state there
         if (use_device(groups[layers[il].ig], n_ubatch)) {
             return nullptr;
         }
@@ -815,8 +813,7 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
-        // the device state is newer (a small ubatch that did not use the device lookup, e.g. a warmup selecting every
-        // expert): the host slots are stale, upload everything
+        // the device state is newer (e.g. after a warmup that selected every expert on the host): the host slots are stale, upload everything
         if (g.dev_newer) {
             return 0;
         }
@@ -1004,8 +1001,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * src  = const_cast<ggml_tensor *>(dst);
         const auto & fills = sd.fills;
 
-        // the slots are planned by the first expert tensor of the layer: an expert tensor whose copy does not hold every
-        // planned expert (e.g. only its routed experts were uploaded) must not fill them, seed_end then drops the layer
+        // an expert tensor whose copy lacks a planned expert (e.g. only routed experts uploaded) must not fill the slots, seed_end then drops the layer
         GGML_ASSERT(staged.size() == (size_t) w->ne[2]);
         for (const auto & f : fills) {
             if (!staged[f.expert]) {
