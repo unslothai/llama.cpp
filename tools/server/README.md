@@ -1163,7 +1163,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:n_preempt_total` | Counter | Slots parked to make room in the unified KV cache (0 unless `--kv-unified` with more than one slot). |
 | `llamacpp:n_resume_total` | Counter | Parked slots put back. |
 | `llamacpp:preempt_recompute_total` | Counter | Parks that dropped their cells because `--preempt-ram` was spent, so the resume re-prefills the sequence instead of restoring its saved bytes. |
-| `llamacpp:requests_preempted` | Gauge | Requests currently parked, waiting for room in the unified KV cache. |
+| `llamacpp:requests_preempted` | Gauge | Requests currently parked for room in the unified KV cache, including those whose copy out or back in is still in flight (the `/slots` entries with `is_preempted` or `is_transferring`). None of them is decoding. |
 | `llamacpp:preempt_ram_bytes` | Gauge | Host RAM held by parked sequences. |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.

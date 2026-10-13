@@ -1637,7 +1637,7 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
         }, {
             "requests_preempted",
-            "Preemption: Number of requests currently parked, waiting for room in the unified KV cache",
+            "Preemption: Number of requests currently parked for room in the unified KV cache, including those whose copy out or back in is still in flight",
             (double) n_preempted_slots
         }, {
             "preempt_ram_bytes",
