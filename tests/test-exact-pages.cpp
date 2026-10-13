@@ -195,17 +195,37 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // a whole-context restore is refused up front in this mode, through the same error return
-        std::vector<uint8_t> whole(llama_state_get_size(ctx));
-        whole.resize(llama_state_get_data(ctx, whole.data(), whole.size()));
+        // a whole-context state cannot be restored in this mode, so it is not saved either: the size,
+        // the copy and the session file all fail, and no file is left behind to fail at the next load
+        std::vector<uint8_t> whole(state.size() + 4096);
 
-        if (whole.empty() || llama_state_set_data(ctx, whole.data(), whole.size()) != 0) {
-            fprintf(stderr, "%s : a whole-context state was %s\n", __func__, whole.empty() ? "not saved" : "restored");
+        if (llama_state_get_size(ctx) != 0 || llama_state_get_data(ctx, whole.data(), whole.size()) != 0) {
+            fprintf(stderr, "%s : a whole-context state was saved\n", __func__);
+            return 1;
+        }
+
+        const char * session = "test-exact-pages.session";
+        std::remove(session);
+
+        const llama_token tok = 1;
+        FILE * f = nullptr;
+        if (llama_state_save_file(ctx, session, &tok, 1) || (f = fopen(session, "rb")) != nullptr) {
+            if (f) {
+                fclose(f);
+            }
+            std::remove(session);
+            fprintf(stderr, "%s : a whole-context session file was written\n", __func__);
+            return 1;
+        }
+
+        // the restore stays refused through the same error return
+        if (llama_state_set_data(ctx, state.data(), state.size()) != 0) {
+            fprintf(stderr, "%s : a whole-context state was restored\n", __func__);
             return 1;
         }
     }
 
-    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position and a whole-context restore were refused\n", __func__);
+    printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position and a whole-context save and restore were refused\n", __func__);
 
     return 0;
 }
