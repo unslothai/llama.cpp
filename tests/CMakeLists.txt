@@ -310,6 +310,11 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+# [TAG_EXACT_CONCURRENCY] the RPC server refuses a paged FLASH_ATTN_EXT; the test forks its own server, so POSIX only
+if (GGML_RPC AND NOT GGML_BACKEND_DL AND NOT WIN32)
+    llama_build_and_test(test-rpc-paged-fa.cpp LINK ggml)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
