@@ -1782,7 +1782,8 @@ static uint64_t common_available_memory() {
 #endif
 }
 
-// whether the tensor overrides (terminated by a null pattern, nullptr for none) put some routed experts served by the MoE cache in a host buffer
+// whether the tensor overrides (terminated by a null pattern, nullptr for none) put every routed expert of some layer served by the MoE cache in a host buffer
+// the MoE cache only serves a layer whose expert tensors are all host-resident, so an override of a single expert family is not enough
 // the loader applies the first override whose pattern matches the tensor name (std::regex_search), so try representative expert names
 static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_override * overrides) {
     std::vector<std::regex> patterns;
@@ -1805,19 +1806,26 @@ static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_o
     if (!any_host) {
         return false;
     }
-    // the expert tensors the MoE cache serves (ffn_*_exps of llama-arch.cpp), the layer index matters for per-layer patterns such as --n-cpu-moe
-    static const char * const exps[] = { "ffn_gate_up_exps", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" };
-    for (int il = 0; il < 512; ++il) {
-        for (const char * e : exps) {
-            const std::string name = "blk." + std::to_string(il) + "." + e + ".weight";
-            for (size_t i = 0; i < patterns.size(); ++i) {
-                if (valid[i] && std::regex_search(name, patterns[i])) {
-                    if (overrides[i].buft != nullptr && ggml_backend_buft_is_host(overrides[i].buft)) {
-                        return true;
-                    }
-                    break;
-                }
+    // whether the first override matching the tensor name puts it in a host buffer
+    const auto is_host = [&](int il, const char * family) {
+        const std::string name = "blk." + std::to_string(il) + "." + family + ".weight";
+        for (size_t i = 0; i < patterns.size(); ++i) {
+            if (valid[i] && std::regex_search(name, patterns[i])) {
+                return overrides[i].buft != nullptr && ggml_backend_buft_is_host(overrides[i].buft);
             }
+        }
+        return false;
+    };
+    // the expert tensors the MoE cache serves (ffn_*_exps of llama-arch.cpp): a model has either separate gate/up/down experts or fused gate_up/down experts
+    // the tensor set of the model is unknown here, so a layer counts if either complete set is on the host
+    // the layer index matters for per-layer patterns such as --n-cpu-moe
+    for (int il = 0; il < 512; ++il) {
+        const bool down = is_host(il, "ffn_down_exps");
+        if (!down) {
+            continue;
+        }
+        if (is_host(il, "ffn_gate_up_exps") || (is_host(il, "ffn_gate_exps") && is_host(il, "ffn_up_exps"))) {
+            return true;
         }
     }
     return false;
@@ -1876,9 +1884,9 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    // without a fit run the experts end up on the host through the user overrides, or through --fit when the caller runs it later without deciding again
+    // without a deferred fit decide from the overrides as they are now: a caller that never runs common_fit_params() has no fitted placement, so --fit alone is no proof of host experts
     if (!fit_deferred) {
-        const bool experts_on_host = params.fit_params || common_overrides_put_experts_on_host(params.tensor_buft_overrides.empty() ? nullptr : params.tensor_buft_overrides.data());
+        const bool experts_on_host = common_overrides_put_experts_on_host(params.tensor_buft_overrides.empty() ? nullptr : params.tensor_buft_overrides.data());
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, params.n_gpu_layers, experts_on_host);
     }
     mparams.lazy_mode = params.lazy_mode;
