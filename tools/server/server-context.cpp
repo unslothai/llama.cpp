@@ -3579,6 +3579,7 @@ private:
                         if (slot.is_processing()) {
                             n_processing_slots++;
                         }
+                        // [TAG_PREEMPT] a transfer counts with the parked: none of them decodes, and a client excusing a silent stream needs all three
                         if (slot.preempt_is_out()) {
                             n_preempted_slots++;
                         }
