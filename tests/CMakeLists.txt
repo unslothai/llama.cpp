@@ -297,6 +297,9 @@ if (GGML_RPC AND NOT GGML_BACKEND_DL AND NOT WIN32)
     llama_build_and_test(test-rpc-paged-fa.cpp)
 endif()
 
+# [TAG_EXACT_CONCURRENCY] the event query a backend publishes through its registry is found and answers
+llama_build_and_test(test-event-query.cpp)
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
