@@ -118,8 +118,8 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks the weights. Every per-layer weight and the output head must sit on a backend with the mode's kernels, else a sequence's own matmuls change with the width of the step it shares.
-// token_embd is exempt: it feeds GET_ROWS, a per-row copy that reports a batch size of 0 to the offload test, so it stays put at every width. A tied head is that same tensor and model.output points at it, so the head check covers it; a lora on it runs as MUL_MAT, which llama_adapter_lora_init_impl() refuses on a host buffer.
+// [TAG_EXACT_CONCURRENCY] the caches check where the KV lives; this checks the weights. Every weight outside the input layer (per-layer weights, output head, classifier heads, norms) must sit on a backend with the mode's kernels, else a sequence's own ops change with the width of the step it shares.
+// Input-layer tensors (token_embd and the other embedding tables) are exempt: they feed GET_ROWS, a per-row copy that reports a batch size of 0 to the offload test, so it stays put at every width. A tied head is that same tensor and model.output points at it, so the head check covers it; a lora on it runs as MUL_MAT, which llama_adapter_lora_init_impl() refuses on a host buffer.
 static void llama_exact_check_weights(const llama_model & model) {
     auto host_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
         if (!t || !t->buffer) {
@@ -150,12 +150,12 @@ static void llama_exact_check_weights(const llama_model & model) {
     };
 
     for (const auto & [name, t] : model.tensors_by_name) {
-        if (name.rfind("blk.", 0) != 0) {
+        if (llm_tensor_name_is_input_layer(name)) {
             continue;
         }
 
         if (auto * buft = host_buft(t)) {
-            refuse(name.c_str(), buft, "layer weight");
+            refuse(name.c_str(), buft, name.rfind("blk.", 0) == 0 ? "layer weight" : "weight");
         }
     }
 
