@@ -1272,7 +1272,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
-static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
+static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, uint32_t num_subgroups = 4) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
     GGML_UNUSED(k_type);
@@ -1287,10 +1287,9 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t coopmat_block_rows = 16;
     const uint32_t coopmat_block_cols = 16;
 
-    const uint32_t num_subgroups = 4;
-
     result.block_rows = coopmat_block_rows;
-    result.block_cols = coopmat_block_cols * num_subgroups;
+    // Each subgroup computes Bc / (16 * num_subgroups) slabs of S.
+    result.block_cols = coopmat_block_cols * 4;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = num_subgroups * result.subgroup_size;
@@ -1347,11 +1346,21 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
         path = FA_SCALAR;
     }
 
+    uint32_t cm1_num_subgroups = 4;
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
-        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
-        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
+        // Two subgroups halve the V and O staging, which lets HSK 512/576 fit 32 KiB of shared
+        // memory (AMD proprietary driver) instead of falling back to the much slower scalar path.
+        bool shmem_ok = false;
+        for (uint32_t num_subgroups : { 4u, 2u }) {
+            const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, num_subgroups);
+            if (ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type)) {
+                cm1_num_subgroups = num_subgroups;
+                shmem_ok = true;
+                break;
+            }
+        }
 
         if (!shape_ok || !shmem_ok) {
             path = FA_SCALAR;
@@ -1367,7 +1376,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     case FA_SCALAR:
         return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     case FA_COOPMAT1:
-        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
+        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, cm1_num_subgroups);
     case FA_COOPMAT2:
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     default:
@@ -7983,7 +7992,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
     const uint32_t MatBr = 16, MatBc = 16;
 
-    const uint32_t row_split = Bc / MatBc;
+    const uint32_t row_split = params.row_split;
 
     const uint32_t hsk_pad = ROUNDUP_POW2(hsk, 16);
     const uint32_t hsv_pad = ROUNDUP_POW2(hsv, 16);
