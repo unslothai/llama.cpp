@@ -1,5 +1,6 @@
 #include "llama-moe-cache.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
