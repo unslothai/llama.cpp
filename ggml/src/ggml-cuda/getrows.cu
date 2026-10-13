@@ -136,7 +136,6 @@ struct get_rows_vec_width {
     static constexpr int    value    = elem_max <= 16 ? int(16 / elem_max) : 1;
 };
 
-// aligned array so that the compiler emits one wide load/store
 template<typename T, int N>
 struct __align__(sizeof(T) * N) get_rows_vec_t {
     T v[N];
@@ -214,7 +213,7 @@ static __global__ void k_get_rows_float_flat(
     }
 }
 
-// Most elements (or int4 vectors) per row for which k_get_rows_float_flat is used.
+// max elements (or int4 vectors) per row for k_get_rows_float_flat
 #define GET_ROWS_FLAT_MAX_NE00 64
 
 template<typename grad_t, typename dst_t>
@@ -342,7 +341,6 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    // short rows: one thread per element over all rows instead of a block per row
     {
         const bool same_type = std::is_same<src0_t, dst_t>::value;
         constexpr int VEC_FLAT = 16 / sizeof(dst_t);
@@ -407,7 +405,6 @@ static void get_rows_cuda_float(
             return;
         }
     } else {
-        // type-converting copy, several elements per thread
         constexpr int    VEC           = get_rows_vec_width<src0_t, dst_t>::value;
         constexpr size_t src_vec_bytes = VEC * sizeof(src0_t);
         constexpr size_t dst_vec_bytes = VEC * sizeof(dst_t);

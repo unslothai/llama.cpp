@@ -2098,8 +2098,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-            for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                     const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                     // GGML_ASSERT, not assert: plain assert compiles out in a release build

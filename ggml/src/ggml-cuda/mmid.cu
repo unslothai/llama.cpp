@@ -159,7 +159,7 @@ static void launch_mm_ids_helper(
 
 #define MM_IDS_SCAN_BLOCK 256
 
-// Per-block histogram over experts. Block w owns tokens [w*tpb, min((w+1)*tpb, n_tokens)).
+// per-block histogram over experts, block w owns tokens [w*tpb, min((w+1)*tpb, n_tokens))
 template <int n_expert_used_template>
 static __global__ void mm_ids_hist(
         const int32_t * __restrict__ ids, int32_t * __restrict__ hist,
@@ -431,7 +431,6 @@ static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, co
     return (int64_t) n_experts*n_tokens >= (1 << 16);
 }
 
-// ids_dst is a permutation of [0, n), so the inverse is a scatter
 static __global__ void mm_ids_invert(
         const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n) {
     const int ic = blockIdx.x*blockDim.x + threadIdx.x;

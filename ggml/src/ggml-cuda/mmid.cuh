@@ -2,7 +2,6 @@
 
 #include "common.cuh"
 
-// whether ggml_cuda_launch_mm_ids_helper can run this shape
 bool ggml_cuda_mm_ids_helper_supported(int n_experts, int n_tokens, int n_expert_used);
 
 void ggml_cuda_launch_mm_ids_helper(
