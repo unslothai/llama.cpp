@@ -4198,6 +4198,12 @@ private:
 
                         const int32_t n_left = slot.preempt_n_input() - n_have;
 
+                        // [TAG_PREEMPT] A re-prefill keeps the room it was resumed into, or later restores take it and park it again with no progress.
+                        if (slot.preempt_reprefill) {
+                            res += preempt_n_cells_step(n_have, std::max(0, n_left) + 1 + preempt_n_spec(slot));
+                            break;
+                        }
+
                         res_pmt += preempt_n_cells_step(n_have, std::max(1, std::min(n_batch, n_left)));
                         n_pmt++;
                     } break;
@@ -4309,7 +4315,11 @@ private:
             const int32_t n_mtmd = preempt_n_mtmd_pending(slot, n_have);
             const int32_t n_left = slot.preempt_n_input() - n_have;
 
-            res += preempt_n_cells_step(n_have, n_mtmd > 0 ? n_mtmd : std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left)));
+            if (n_mtmd == 0 && slot.preempt_reprefill) {
+                res += preempt_n_cells_step(n_have, std::max(0, n_left) + 1 + preempt_n_spec(slot));  // as preempt_kv_reserve() charges it
+            } else {
+                res += preempt_n_cells_step(n_have, n_mtmd > 0 ? n_mtmd : std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left)));
+            }
         }
 
         return res;
@@ -4353,6 +4363,11 @@ private:
         return true;
     }
 
+    // A slot mid re-prefill has produced nothing since it was dropped, so it is protected like a starved one.
+    static bool preempt_starved(const server_slot & slot) {
+        return slot.n_preempt >= PREEMPT_N_STARVED || slot.preempt_reprefill;
+    }
+
     server_slot * preempt_pick_victim_pass(const server_slot * exempt, bool recompute, int32_t n_deficit = 0) {
         server_slot * victim = nullptr;
 
@@ -4364,8 +4379,8 @@ private:
                 continue;
             }
 
-            const bool starved     = slot.n_preempt >= PREEMPT_N_STARVED;
-            const bool starved_cur = victim && victim->n_preempt >= PREEMPT_N_STARVED;
+            const bool starved     = preempt_starved(slot);
+            const bool starved_cur = victim && preempt_starved(*victim);
 
             if (!victim ||
                 (starved_cur && !starved) ||
@@ -4385,7 +4400,7 @@ private:
         }
 
         // a starved slot is only taken where the order would take one anyway
-        const bool victim_starved = victim && victim->n_preempt >= PREEMPT_N_STARVED;
+        const bool victim_starved = victim && preempt_starved(*victim);
 
         if (cover[0]) {
             return cover[0];

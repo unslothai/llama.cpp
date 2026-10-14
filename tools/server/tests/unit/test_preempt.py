@@ -1391,3 +1391,34 @@ def test_a_started_slot_that_fits_once_trimmed_parks_nobody():
     text = _log()
     assert "purging slot" not in text
     _assert_nothing_parked(text)
+
+
+def _reparked_mid_reprefill(text: str) -> list:
+    """(slot, cells parked, tokens it was re-prefilling) for every park that hit a slot before its re-prefill finished."""
+    pending, res = {}, []
+    for line in text.splitlines():
+        m = re.search(r"id +(\d+) \| task \d+ \| resumed after [\d.]+ s: (\d+) tokens to re-prefill", line)
+        if m:
+            pending[m.group(1)] = int(m.group(2))
+            continue
+        m = re.search(r"id +(\d+) \| task \d+ \| (?:preempted|rotated out)[^:]*: (\d+) cells", line)
+        if m and m.group(1) in pending:
+            need = pending.pop(m.group(1))
+            if int(m.group(2)) < need:
+                res.append((m.group(1), int(m.group(2)), need))
+    return res
+
+
+def test_a_resumed_re_prefill_keeps_its_room_until_it_is_done():
+    # The second park falls back to recompute; its resume was admitted for the whole sequence, but the restores behind it took the room and parked it again part way through.
+    os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "2"
+    _start(n_ctx=1024, n_slots=4, n_batch=128, n_ubatch=128)
+    prompts = [[10 + 20 * i + k % 20 for k in range(40)] for i in range(4)]
+    with ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda i: server.make_request("POST", "/completion", data={
+            "n_predict": 900, "prompt": prompts[i], "id_slot": i, "cache_prompt": False,
+            "ignore_eos": True, "temperature": 0.0, "seed": 42}), range(4)))
+    _assert_completed(results, 900)
+    text = _log()
+    assert "tokens to re-prefill on resume" in text, "nothing was parked by dropping its cells"
+    assert _reparked_mid_reprefill(text) == []
