@@ -6234,6 +6234,19 @@ private:
             return false;
         }
 
+        // [TAG_PREEMPT_ASYNC] A restoring slot holds its cells but is skipped below, so land it first: it may be the only other resident.
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_RESTORING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (slot.preempt_restore_poll()) {
+                preempt_restored(slot, " (waited for, as a last resort)");
+            }
+        }
+
         int32_t n_running = 0;
 
         for (auto & slot : slots) {
