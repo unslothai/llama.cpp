@@ -824,5 +824,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // [TAG_EXACT_CONCURRENCY] the paged path always runs the one-column F16 vector kernel, whatever the batch size or arch
+    if (const ggml_tensor * pages = ggml_cuda_fattn_pages(dst)) {
+#ifndef FLASH_ATTN_AVAILABLE
+        return false;
+#endif // FLASH_ATTN_AVAILABLE
+        float softcap;
+        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+
+        return dst->src[0]->ne[0] == 256 && dst->src[1]->ne[0] == 256 && dst->src[2]->ne[0] == 256 &&
+            dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16 &&
+            dst->src[3] && dst->src[0]->ne[3] == 1 && dst->src[0]->ne[2] % dst->src[1]->ne[2] == 0 &&
+            pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) && pages->ne[1] == dst->src[0]->ne[1] &&
+            softcap == 0.0f;
+    }
+
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

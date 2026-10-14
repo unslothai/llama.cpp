@@ -318,6 +318,36 @@ struct server_batch {
     }
 };
 
+// whether the prompt of a task may be split over several ubatches
+static bool task_can_split(const server_task & task, llama_context * ctx) {
+    // a decision over a non-causal context reads the whole prompt in one batch
+    if (task.type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx)) {
+        return false;
+    }
+    // MTP supports splitting - uses task.need_embd() not the slot's need_embd()
+    if (!task.need_embd()) {
+        return true;
+    }
+    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
+    if (!llama_get_memory(ctx)) {
+        return false;
+    }
+    // context can be chunked/split if the pooling type is LAST
+    const auto pooling = llama_pooling_type(ctx);
+    if (pooling == LLAMA_POOLING_TYPE_LAST) {
+        return true;
+    }
+    // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
+    if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx)) {
+        return true;
+    }
+    // a decision task reads its outputs from the last batch
+    if (task.type == SERVER_TASK_TYPE_DECISION) {
+        return true;
+    }
+    return false;
+}
+
 struct server_slot {
     int id;
 
@@ -980,32 +1010,7 @@ struct server_slot {
 
     bool can_split() const {
         GGML_ASSERT(task);
-        // a decision over a non-causal context reads the whole prompt in one batch
-        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
-            return false;
-        }
-        // MTP supports splitting - uses task->need_embd() not need_embd()
-        if (!task->need_embd()) {
-            return true;
-        }
-        // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-        if (!llama_get_memory(ctx_tgt)) {
-            return false;
-        }
-        // context can be chunked/split if the pooling type is LAST
-        const auto pooling = llama_pooling_type(ctx_tgt);
-        if (pooling == LLAMA_POOLING_TYPE_LAST) {
-            return true;
-        }
-        // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
-        if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
-            return true;
-        }
-        // a decision task reads its outputs from the last batch
-        if (task->type == SERVER_TASK_TYPE_DECISION) {
-            return true;
-        }
-        return false;
+        return task_can_split(*task, ctx_tgt);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -2995,6 +3000,7 @@ private:
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
         res->n_preempt             = slot.n_preempt;
         res->n_recompute           = slot.n_recompute;
+        res->preempt_report        = preempt_last_resort_possible();
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
@@ -4772,6 +4778,12 @@ private:
             return;
         }
 
+        // nothing can be parked: leave the shift to llama_decode(), which applies it together with any later one
+        if (!preempt_last_resort_possible()) {
+            preempt_shift_pending = false;
+            return;
+        }
+
         preempt_wait_for_shift();
 
         llama_memory_update(ctx_tgt);
@@ -5207,15 +5219,7 @@ private:
             return true;
         }
 
-        // Mirrors server_slot::can_split(), from the task alone.
-        const auto pooling   = llama_pooling_type(ctx_tgt);
-        const bool can_split =
-            !task.need_embd() ||
-            (llama_get_memory(ctx_tgt) &&
-             (pooling == LLAMA_POOLING_TYPE_LAST || (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) ||
-              task.type == SERVER_TASK_TYPE_DECISION));
-
-        if (!can_split) {
+        if (!task_can_split(task, ctx_tgt)) {
             const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
             if (task.n_tokens() > n_ubatch) {

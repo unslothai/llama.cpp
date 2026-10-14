@@ -347,8 +347,10 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
-        {"preempt",             preempt_to_json()},
     };
+    if (preempt_report) {
+        res["preempt"] = preempt_to_json();
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
@@ -407,7 +409,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
-        res["preempt"] = preempt_to_json();
+        if (preempt_report) {
+            res["preempt"] = preempt_to_json();
+        }
     }
 
     return res;
@@ -456,7 +460,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
-        res["preempt"] = preempt_to_json();
+        if (preempt_report) {
+            res["preempt"] = preempt_to_json();
+        }
     }
 
     return res;
@@ -518,7 +524,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
-        deltas.back()["preempt"] = preempt_to_json();
+        if (preempt_report) {
+            deltas.back()["preempt"] = preempt_to_json();
+        }
     }
 
     // extra fields for debugging purposes
@@ -595,8 +603,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
-        {"preempt",      preempt_to_json()},
     };
+    if (preempt_report) {
+        res["preempt"] = preempt_to_json();
+    }
 
     return res;
 }
@@ -707,11 +717,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"total_tokens",  n_decoded + n_prompt_tokens},
                     {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
                 }},
-                // [TAG_PREEMPT] inside the response object, where the non-streaming body carries it: that object is what a client keeps from the stream
-                {"preempt",    preempt_to_json()},
             }},
         }}
     });
+
+    // [TAG_PREEMPT] inside the response object, where the non-streaming body carries it: that object is what a client keeps from the stream
+    if (preempt_report) {
+        server_sent_events.back().at("data").at("response")["preempt"] = preempt_to_json();
+    }
 
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
@@ -731,8 +744,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
-        {"preempt", preempt_to_json()},
     };
+    if (preempt_report) {
+        event["preempt"] = preempt_to_json();
+    }
     return event;
 }
 
@@ -797,8 +812,10 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"input_tokens", n_prompt_tokens - n_prompt_tokens_cache},
             {"output_tokens", n_decoded}
         }},
-        {"preempt", preempt_to_json()}
     };
+    if (preempt_report) {
+        res["preempt"] = preempt_to_json();
+    }
 
     return res;
 }
@@ -977,10 +994,12 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             }},
             {"usage", {
                 {"output_tokens", n_decoded}
-            }},
-            {"preempt", preempt_to_json()}
+            }}
         }}
     });
+    if (preempt_report) {
+        events.back()["data"]["preempt"] = preempt_to_json();
+    }
 
     events.push_back({
         {"event", "message_stop"},

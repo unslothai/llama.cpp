@@ -363,8 +363,8 @@ llama_build_and_test(test-mtmd-impl.cpp LINK mtmd)
 # [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
 
-# server helpers that need no model
-if (LLAMA_BUILD_TOOLS)
+# server helpers that need no model; server-context exists only where tools/ adds the server
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
     llama_build_and_test(test-server-tokens.cpp)
     target_link_libraries(test-server-tokens PRIVATE server-context mtmd)
     target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
