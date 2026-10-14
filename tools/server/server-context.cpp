@@ -480,6 +480,11 @@ struct server_slot {
     bool                 preempt_hold_logged      = false;
     bool                 preempt_grow             = false;  // the next park may pin a buffer larger than the sequence
 
+    // [TAG_PREEMPT] Last budget refusal: tokens, held capacity and RAM in use then; -1 when none.
+    mutable int32_t      preempt_refused_n    = -1;
+    mutable size_t       preempt_refused_held = 0;
+    mutable size_t       preempt_refused_used = 0;
+
     // [TAG_PREEMPT] Service since the last resume, so two slots rotating for each other both make progress.
     int64_t              t_preempt_resume_us = 0;
     int32_t              n_gen_resume        = 0;
@@ -930,6 +935,7 @@ struct server_slot {
         t_preempt_resume_us  = 0;
         n_gen_resume         = 0;
         preempt_hold_logged  = false;
+        preempt_refused_n    = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
         backend_sampler = false;
@@ -4006,14 +4012,43 @@ private:
     bool preempt_fits_budget(const server_slot & slot) {
         const size_t budget = preempt_ram_budget();
 
+        if (budget == SIZE_MAX) {
+            return true;  // unlimited: no need to size the state
+        }
+
         // Capacity this slot already holds is reused, so the park costs only the rest.
-        const size_t held  = slot.preempt_state_size();
+        const size_t held = slot.preempt_state_size();
+
+        // [TAG_PREEMPT] Sizing walks the pool; a state that only grew cannot fit where it did not, unless RAM was freed.
+        if (slot.preempt_refused_n >= 0 && slot.prompt.n_tokens() >= slot.preempt_refused_n &&
+            held <= slot.preempt_refused_held && preempt_ram_used() >= slot.preempt_refused_used &&
+            !preempt_idle_ram_reclaimable(slot)) {
+            return false;
+        }
+
         const size_t need  = slot.preempt_state_required();
         const size_t extra = need > held ? need - held : 0;
 
         preempt_reclaim_idle_ram(budget, extra, slot);
 
-        return preempt_ram_used() + extra <= budget;
+        const bool res = preempt_ram_used() + extra <= budget;
+
+        slot.preempt_refused_n    = res ? -1 : slot.prompt.n_tokens();
+        slot.preempt_refused_held = held;
+        slot.preempt_refused_used = preempt_ram_used();
+
+        return res;
+    }
+
+    // preempt_reclaim_idle_ram() could free host RAM for `keep`.
+    bool preempt_idle_ram_reclaimable(const server_slot & keep) const {
+        for (const auto & other : slots) {
+            if (&other != &keep && !other.preempt_is_out() && other.preempt_state_size() > 0) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     void preempt_trim_ram(server_slot & slot) {
