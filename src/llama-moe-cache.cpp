@@ -458,10 +458,11 @@ struct llama_moe_cache::impl {
                 }
             }
             if (device_lookup) {
-                fixed += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment) + GGML_PAD(8*sizeof(int32_t), alignment);
+                fixed += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment);
             }
+            // padded like the state tensor allocated below
             auto total_size = [&](int32_t n_slots) {
-                return alloc_size(g, n_slots) + fixed + (device_lookup ? 3*sizeof(int32_t)*(size_t) n_slots : 0);
+                return alloc_size(g, n_slots) + fixed + (device_lookup ? GGML_PAD((8 + 3*(size_t) n_slots)*sizeof(int32_t), alignment) : 0);
             };
             while (g.n_slots < max_slots && total_size(g.n_slots + 1) <= budget) {
                 g.n_slots++;
@@ -1008,7 +1009,12 @@ struct llama_moe_cache::impl {
             seed_end(g);
 
             const int32_t n_expert = g.lru.n_expert;
-            const size_t  n_seed   = g.n_slots / g.layers.size();
+            size_t n_seed = g.n_slots / g.layers.size();
+            if (n_seed == 0) {
+                // fewer slots than layers: one expert for each of the first layers of the group, instead of none
+                const size_t pos = std::find(g.layers.begin(), g.layers.end(), b.il) - g.layers.begin();
+                n_seed = pos < (size_t) g.n_slots ? 1 : 0;
+            }
             GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
             for (int32_t e = 0; e < n_expert; ++e) {
