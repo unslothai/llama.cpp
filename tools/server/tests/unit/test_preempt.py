@@ -1338,3 +1338,35 @@ def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():
     assert len(merged.body["choices"]) == 2
     assert merged.body["preempt"]["parks"] == sum(c["parks"] for c in counts), (merged.body["preempt"], counts)
     assert merged.body["preempt"]["recomputes"] == sum(c["recomputes"] for c in counts), (merged.body["preempt"], counts)
+
+
+def _cached(n_predict: int, prompt: list, id_slot: int):
+    return server.make_request("POST", "/completion", data={
+        "n_predict": n_predict, "prompt": prompt, "id_slot": id_slot, "cache_prompt": True,
+        "ignore_eos": True, "temperature": 0.0, "seed": 42,
+    })
+
+
+def test_a_started_slot_replacing_its_prompt_does_not_purge_an_idle_slot():
+    # 200 of 256 cells are ever held; charging the started slot's old 100 cells beside its new 100 purged slot 1, so its rerun re-prefilled.
+    _start(n_ctx=256, n_batch=128, n_ubatch=64, cache_ram=0)
+    results = [_cached(1, [tok] * 100, slot) for slot, tok in ((0, 11), (1, 12), (0, 13), (1, 12))]
+    for res in results:
+        assert res.status_code == 200, res.body
+    assert results[3].body["timings"]["prompt_n"] == 1, results[3].body["timings"]
+    text = _log()
+    assert "purging slot" not in text
+    _assert_nothing_parked(text)
+
+
+def test_an_idle_slot_inside_the_margin_keeps_its_cache():
+    # 120 idle and 132 generating cells fit 256 with room for the step; purging slot 0 only to keep the planning margin made its rerun re-prefill.
+    _start(n_ctx=256, n_batch=128, n_ubatch=64, cache_ram=0)
+    first = [11] * 120
+    assert _cached(1, first, 0).status_code == 200
+    assert _cached(12, [12] * 120, 1).status_code == 200
+    res = _cached(1, first, 0)
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["prompt_n"] == 1, res.body["timings"]
+    assert "purging slot" not in _log()
+

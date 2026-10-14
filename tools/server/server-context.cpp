@@ -4125,6 +4125,19 @@ private:
         return res;
     }
 
+    // Cells try_clear_idle_slots() can free.
+    int32_t preempt_n_idle_cells() const {
+        int32_t res = 0;
+
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                res += preempt_n_cells(slot.prompt.n_tokens());
+            }
+        }
+
+        return res;
+    }
+
     // [TAG_PREEMPT_ASYNC] Room kept free so running slots can keep decoding until a park lands; resume candidates are charged the same.
     int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
         if (!preempt_async_ok) {
@@ -4908,6 +4921,16 @@ private:
             const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
 
             if (n_used + preempt_n_margin() <= n_cells) {
+                break;
+            }
+
+            // [TAG_PREEMPT] A started slot still holds its previous prompt: trim it before the shortfall is believed.
+            if (preempt_normalize_started_all()) {
+                continue;
+            }
+
+            // [TAG_PREEMPT] The step fits and purging idle slots would cover the margin: purging is instant, so keep their caches until the step needs the cells.
+            if (n_used <= n_cells && n_used - preempt_n_idle_cells() + preempt_n_margin() <= n_cells) {
                 break;
             }
 
