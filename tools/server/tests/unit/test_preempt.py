@@ -1564,3 +1564,17 @@ def test_a_prompt_dropped_in_its_prefill_waits_until_it_fits_whole(policy):
         assert res.body["timings"]["predicted_n"] == n_predict
     parked = older if older.body["preempt"]["parks"] > 0 else newer
     assert parked.body["preempt"]["parks"] == 1, (older.body["preempt"], newer.body["preempt"])
+
+
+def test_oversubscribed_bounded_chats_are_not_time_sliced():
+    # Four chats of 200 + 800 tokens need twice the pool; residents that end by themselves used to be rotated out every 2 s, parking and restoring whole sequences over and over.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=2048, n_slots=4, n_batch=256, n_ubatch=256, cache_ram=0)
+    with ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda i: _cached(800, [50 + 100 * i + k % 50 for k in range(200)], i), range(4)))
+    _assert_completed(results, 800)
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    assert "rotated out after" not in text
+    parks = sum(r.body["preempt"]["parks"] for r in results)
+    assert 1 <= parks <= 4, parks
