@@ -109,7 +109,6 @@
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model",
     "unslothai#251": "--moe-cache-mib auto sizes the ggml-org#29887 MoE expert cache from the fit; it only acts when a MoE model spills on a single GPU, the flag is off by default, and no runner in the pipeline has a GPU",
     "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
-    "unslothai#265": "x86 SIMD vec_dot for Q2_0; test-backend-ops compares a backend against the CPU reference, so a CPU kernel cannot be checked against itself (the PR compares SIMD builds against the scalar build as a second CPU backend instead)",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe"
   }
 }
