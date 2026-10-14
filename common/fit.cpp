@@ -358,6 +358,11 @@ static void common_params_fit_impl(
 
         int64_t size = std::min(size_requested, cache_bytes) + surplus;
         for (int it = 0; it < 4 && size > 0 && surplus_nc > 0; it++) {
+            // whole MiB, so that the printed --moe-cache-mib is the size that was measured
+            size -= size % MiB;
+            if (size <= 0) {
+                break;
+            }
             cparams->moe_cache_size = size;
             dmds_t dmds_test;
             try {

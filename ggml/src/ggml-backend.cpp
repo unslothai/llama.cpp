@@ -2395,6 +2395,21 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     if (sched->events[split_backend_id][sched->cur_copy] != NULL || split_backend->iface.set_tensor_async == NULL) {
         return false;
     }
+    // the same backends as the prefetch: off with GGML_SCHED_PREFETCH=0, the CUDA family by default, any with 2,
+    // never SYCL, where host memory has to go through the pinned staging of set_tensor
+    if (sched->pf_mode == 0) {
+        return false;
+    }
+    {
+        ggml_backend_reg_t reg = split_backend->device ? ggml_backend_dev_backend_reg(split_backend->device) : NULL;
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
+        if (strcmp(reg_name, "SYCL") == 0) {
+            return false;
+        }
+        if (sched->pf_mode == 1 && strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
+            return false;
+        }
+    }
     if (input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer)) {
         return false;
     }
