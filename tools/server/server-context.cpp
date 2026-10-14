@@ -4283,14 +4283,25 @@ private:
             return nullptr;
         }
 
-        // the largest-policy test knob exempts nobody
-        const server_slot * exempt = preempt_test_policy == "largest" ? nullptr : leader;
+        // the largest-policy test knob exempts nobody; an n_cmpl > 1 leader cannot be parked anyway, so exempting it keeps nobody else safe
+        const server_slot * exempt = preempt_test_policy == "largest" || preempt_is_family(*leader) ? nullptr : leader;
 
         // only the default policy weighs the deficit; the others pin the order
         if (preempt_test_policy != "smallest") {
             n_deficit = 0;
         }
 
+        server_slot * victim = preempt_pick_victim_pass_any(exempt, recompute, n_deficit);
+
+        // [TAG_PREEMPT] Beside n_cmpl > 1 slots the leader may be the only slot that can be parked; parking it lets them finish.
+        if (!victim && exempt && preempt_any_family_running()) {
+            victim = preempt_pick_victim_pass_any(nullptr, recompute, n_deficit);
+        }
+
+        return victim;
+    }
+
+    server_slot * preempt_pick_victim_pass_any(const server_slot * exempt, bool * recompute, int32_t n_deficit) {
         server_slot * victim = preempt_pick_victim_pass(exempt, false, n_deficit);
 
         if (!victim && recompute) {
@@ -4300,6 +4311,20 @@ private:
         }
 
         return victim;
+    }
+
+    static bool preempt_is_family(const server_slot & slot) {
+        return slot.task && (slot.task->is_parent() || slot.task->is_child());
+    }
+
+    bool preempt_any_family_running() const {
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && preempt_is_family(slot)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // [TAG_PREEMPT] Room a park frees: the slot's cells plus its next step.
@@ -6234,11 +6259,65 @@ private:
         }
 
         if (n_parked == 0) {
-            return false;  // nothing parked: the error path cleans up the rewind
+            return preempt_fail_largest_family();  // nothing parked: the error path cleans up the rewind
         }
 
         SRV_WRN("last resort: batch given up at off = %d, %d slot(s) parked, kv %d/%d resident\n",
                 off, n_parked, preempt_kv_used(), n_cells);
+
+        return true;
+    }
+
+    // [TAG_PREEMPT] n_cmpl > 1 slots cannot be parked: when nothing else can be, end only the family holding the most cells, not every slot.
+    bool preempt_fail_largest_family() {
+        auto family_of = [](const server_slot & slot) {
+            return slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
+        };
+
+        auto running = [](const server_slot & slot) {
+            return slot.is_processing() && !slot.preempt_is_out();
+        };
+
+        int     family  = -1;
+        int32_t n_cells = 0;
+
+        for (const auto & slot : slots) {
+            if (!running(slot) || !preempt_is_family(slot)) {
+                continue;
+            }
+
+            int32_t n = 0;
+
+            for (const auto & other : slots) {
+                if (running(other) && preempt_is_family(other) && family_of(other) == family_of(slot)) {
+                    n += other.prompt.n_tokens();
+                }
+            }
+
+            if (family < 0 || n > n_cells) {
+                family  = family_of(slot);
+                n_cells = n;
+            }
+        }
+
+        bool others = false;
+
+        for (const auto & slot : slots) {
+            others |= running(slot) && (!preempt_is_family(slot) || family_of(slot) != family);
+        }
+
+        if (family < 0 || !others) {
+            return false;
+        }
+
+        for (auto & slot : slots) {
+            if (running(slot) && preempt_is_family(slot) && family_of(slot) == family) {
+                SLT_WRN(slot, "%s", "the n_cmpl > 1 request holding the most cells cannot be parked, ending it alone\n");
+                send_error(slot, "Context size has been exceeded.");
+                slot.release();
+                slot.prompt_clear();
+            }
+        }
 
         return true;
     }

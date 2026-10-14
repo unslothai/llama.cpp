@@ -1422,3 +1422,43 @@ def test_a_resumed_re_prefill_keeps_its_room_until_it_is_done():
     text = _log()
     assert "tokens to re-prefill on resume" in text, "nothing was parked by dropping its cells"
     assert _reparked_mid_reprefill(text) == []
+
+
+def _oai_n(prompt: list, n: int, max_tokens: int):
+    return server.make_request("POST", "/v1/completions", data={
+        "prompt": prompt, "n": n, "max_tokens": max_tokens, "ignore_eos": True,
+        "temperature": 0.0, "seed": 42, "cache_prompt": False,
+    })
+
+
+def test_a_single_request_beside_an_n_2_request_is_parked_so_both_finish():
+    # 900 + 700 cells overflow 1024 while each fits alone; the n=1 slot was the exempt leader and the n=2 slots cannot be parked, so every slot failed.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128)
+    with ThreadPoolExecutor(1) as pool:
+        single = pool.submit(_cached, 300, [100 + k % 50 for k in range(600)], 0)
+        _wait_processing([0])
+        family = _oai_n([200 + k % 50 for k in range(200)], 2, 250)
+        single = single.result()
+    assert single.status_code == 200, single.body
+    assert single.body["timings"]["predicted_n"] == 300
+    assert family.status_code == 200, family.body
+    assert [c["finish_reason"] for c in family.body["choices"]] == ["length", "length"]
+    _assert_recovered(_log())
+
+
+def test_two_n_2_requests_that_do_not_fit_together_end_only_one():
+    # Neither n=2 request can be parked; ending every slot also ended the one that fits alone.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=1024, n_slots=4, n_batch=128, n_ubatch=128)
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(_oai_n, [100 + k % 50 for k in range(200)], 2, 250)
+        deadline = time.time() + 30
+        while time.time() < deadline and sum(s["is_processing"] for s in server.make_request("GET", "/slots").body) < 2:
+            time.sleep(0.005)
+        second = pool.submit(_oai_n, [200 + k % 50 for k in range(200)], 2, 250)
+        results = [first.result(), second.result()]
+    assert sorted(r.status_code for r in results) == [200, 500], [r.body for r in results]
+    ok = next(r for r in results if r.status_code == 200)
+    assert [c["finish_reason"] for c in ok.body["choices"]] == ["length", "length"]
+    assert "ending it alone" in _log()
