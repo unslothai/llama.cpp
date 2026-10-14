@@ -354,6 +354,23 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // a draft head that borrows the target's token_embd/output reads them where the target placed them,
+        // so the target's devices need a backend here even when the draft runs on other devices
+        if (cparams.model_tgt) {
+            for (const auto & dev : cparams.model_tgt->devices) {
+                const bool have = std::any_of(backends.begin(), backends.end(),
+                        [&](const ggml_backend_ptr & b) { return ggml_backend_get_device(b.get()) == dev.dev; });
+                if (have) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
