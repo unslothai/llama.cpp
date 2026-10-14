@@ -4130,6 +4130,10 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+            // like process_ubatch: the device lookups of small ubatches need the slot map state on the device
+            if (moe_cache) {
+                moe_cache->prepare(ubatch.n_tokens);
+            }
             copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
