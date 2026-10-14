@@ -827,6 +827,10 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_resident(const ggml_tensor * t) const {
+        // a trainable tensor (see llama_context::opt_init) changes after the copy was made and needs its gradient: use the original
+        if (t != nullptr && (t->flags & GGML_TENSOR_FLAG_PARAM)) {
+            return nullptr;
+        }
         const auto it = t != nullptr ? resident.find(t) : resident.end();
         return it != resident.end() ? it->second : nullptr;
     }
