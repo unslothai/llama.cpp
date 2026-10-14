@@ -1825,9 +1825,17 @@ static std::vector<ggml_backend_dev_t> common_default_model_devices() {
     return devs;
 }
 
-// number of repeating layers of the model (the <arch>.block_count key the loader reads into n_layer_all), -1 if unknown
-// for a split model the metadata is read from the first split
-static int64_t common_model_n_layer(const std::string & path) {
+// expert tensor layout of a model: separate ffn_gate_exps / ffn_up_exps or fused ffn_gate_up_exps, unknown if neither is seen
+enum common_expert_layout {
+    COMMON_EXPERT_LAYOUT_UNKNOWN,
+    COMMON_EXPERT_LAYOUT_SEPARATE,
+    COMMON_EXPERT_LAYOUT_FUSED,
+};
+
+// number of repeating layers of the model (the <arch>.block_count key the loader reads into n_layer_all), -1 if unknown, and its expert tensor layout
+// for a split model the metadata and the tensor names are read from the first split, which may hold no expert tensor: the layout is then unknown
+static int64_t common_model_n_layer(const std::string & path, common_expert_layout & layout) {
+    layout = COMMON_EXPERT_LAYOUT_UNKNOWN;
     std::string fname = path;
     static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
     std::smatch m;
@@ -1847,6 +1855,14 @@ static int64_t common_model_n_layer(const std::string & path) {
         return -1;
     }
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    for (int64_t i = 0; i < gguf_get_n_tensors(gguf_ctx.get()) && layout == COMMON_EXPERT_LAYOUT_UNKNOWN; ++i) {
+        const char * name = gguf_get_tensor_name(gguf_ctx.get(), i);
+        if (strstr(name, "ffn_gate_up_exps") != nullptr) {
+            layout = COMMON_EXPERT_LAYOUT_FUSED;
+        } else if (strstr(name, "ffn_gate_exps") != nullptr || strstr(name, "ffn_up_exps") != nullptr) {
+            layout = COMMON_EXPERT_LAYOUT_SEPARATE;
+        }
+    }
     const int64_t id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
     if (id < 0) {
         return -1;
@@ -1864,7 +1880,7 @@ static int64_t common_model_n_layer(const std::string & path) {
 // whether the tensor overrides (terminated by a null pattern, nullptr for none) put every routed expert of some layer in [il_begin, il_end) served by the MoE cache in a host buffer
 // the MoE cache only serves a layer whose expert tensors are all host-resident, so an override of a single expert family is not enough
 // the loader applies the first override whose pattern matches the tensor name (std::regex_search), so try representative expert names
-static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_override * overrides, int64_t il_begin, int64_t il_end) {
+static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_override * overrides, int64_t il_begin, int64_t il_end, common_expert_layout layout) {
     std::vector<std::regex> patterns;
     std::vector<bool> valid;
     bool any_host = false;
@@ -1896,7 +1912,7 @@ static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_o
         return false;
     };
     // the expert tensors the MoE cache serves (ffn_*_exps of llama-arch.cpp): a model has either separate gate/up/down experts or fused gate_up/down experts
-    // the tensor set of the model is unknown here, so a layer counts if either complete set is on the host
+    // the layout read from the GGUF picks the set to check, an unknown layout counts a layer if either complete set is on the host
     // the layer index matters for per-layer patterns such as --n-cpu-moe
     il_end = std::min<int64_t>(il_end, 512);
     for (int64_t il = std::max<int64_t>(il_begin, 0); il < il_end; ++il) {
@@ -1904,7 +1920,9 @@ static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_o
         if (!down) {
             continue;
         }
-        if (is_host((int) il, "ffn_gate_up_exps") || (is_host((int) il, "ffn_gate_exps") && is_host((int) il, "ffn_up_exps"))) {
+        const bool fused    = layout != COMMON_EXPERT_LAYOUT_SEPARATE && is_host((int) il, "ffn_gate_up_exps");
+        const bool separate = layout != COMMON_EXPERT_LAYOUT_FUSED && is_host((int) il, "ffn_gate_exps") && is_host((int) il, "ffn_up_exps");
+        if (fused || separate) {
             return true;
         }
     }
@@ -1919,12 +1937,13 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     if (params.moe_cache_size <= 0 || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
         return false;
     }
-    const int64_t n_layer = common_model_n_layer(params.model.path);
+    common_expert_layout layout = COMMON_EXPERT_LAYOUT_UNKNOWN;
+    const int64_t n_layer = common_model_n_layer(params.model.path, layout);
     if (n_layer < 0) {
-        return common_overrides_put_experts_on_host(overrides, 0, 512);
+        return common_overrides_put_experts_on_host(overrides, 0, 512, layout);
     }
     const int64_t n_gpu = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
-    return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer);
+    return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer, layout);
 }
 
 // the load mode for the MoE cache once the expert placement is known: n_gpu_layers and the tensor overrides are the ones the model is loaded with
