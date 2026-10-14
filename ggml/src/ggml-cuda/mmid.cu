@@ -418,7 +418,8 @@ static int mm_ids_sort_override() {
 
 // the counting sort needs 4 launches instead of 1, so use it only for large shapes or when the single-warp kernel cannot run
 static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, const int n_expert_used) {
-    if (!mm_ids_counting_sort_possible(n_experts)) {
+    // an empty batch would launch an empty grid, the single-warp kernel writes the zero bounds instead
+    if (n_tokens == 0 || !mm_ids_counting_sort_possible(n_experts)) {
         return false;
     }
     if (!mm_ids_legacy_possible(n_tokens, n_expert_used)) {
@@ -459,8 +460,10 @@ void ggml_cuda_launch_mm_ids_invert(
     mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
 }
 
+// only the counting sort gives a complete permutation for repeated ids, the single-warp kernel leaves holes,
+// so the host sort keeps rejecting those for the shapes the counting sort is not used for
 bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
-    return mm_ids_counting_sort_possible(n_experts) || mm_ids_legacy_possible(n_tokens, n_expert_used);
+    return mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
 }
 
 #define MM_IDS_DISPATCH(neu)                                                                                                    \

@@ -2079,7 +2079,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // fails for out of range ids, and for repeated ids on the single-warp path
+        // fails for out of range ids
         GGML_ASSERT(expert_bounds_host[ne02] == ne_get_rows);
         GGML_ASSERT(expert_bounds_host[0] == 0);
 
