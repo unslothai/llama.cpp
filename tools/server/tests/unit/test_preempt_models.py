@@ -13,6 +13,7 @@ START_TIMEOUT = 300  # the preload can be slow on a loaded host
 def create_server():
     global server
     server = ServerPreset.tinyllama2()
+    server.n_threads = 2
     yield
     os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
 
@@ -21,6 +22,7 @@ def create_server():
 def test_a_non_causal_decision_longer_than_the_ubatch_is_refused_and_the_server_lives(preempt_ram):
     global server
     server = ServerPreset.tinyopenjev()
+    server.n_threads = 2
     server.override_kv = ["qwen35.attention.causal=bool:false"]
     server.n_ctx = 1024
     server.n_slots = 2
