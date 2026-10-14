@@ -331,6 +331,91 @@ rc, rep, err = run(d, ps11)
 check("a higher PATCH under a different MINOR does not count as the pin's bump",
       rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
 
+
+def pin_repo(base_files, pin_files, num):
+    """Base tag b1 with base_files, one pin commit writing pin_files, merged; returns (repo, pr-set)."""
+    d = Path(tempfile.mkdtemp(prefix="pc_"))
+    git(d, "init", "-q", "-b", "main")
+    for files in (base_files, pin_files):
+        for rel, body in files.items():
+            (d / rel).parent.mkdir(parents=True, exist_ok=True)
+            (d / rel).write_text(body)
+        git(d, "add", "-A")
+        git(d, "commit", "-qm", "c")
+        if files is base_files:
+            git(d, "tag", "b1")
+            git(d, "checkout", "-qb", "pin")
+    sha = git(d, "rev-parse", "HEAD").stdout.strip()
+    git(d, "checkout", "-q", "main")
+    git(d, "merge", "-q", "--no-ff", "--no-edit", "-m", "merge pin", "pin")
+    ps = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
+    ps.write_text(json.dumps({"prs": [f"https://github.com/unslothai/llama.cpp/pull/{num}/commits/{sha}"]}))
+    return d, ps
+
+
+RPC_V = ("#define RPC_PROTO_MAJOR_VERSION    3\n#define RPC_PROTO_MINOR_VERSION    {mi}\n"
+         "#define RPC_PROTO_PATCH_VERSION    {p}\n")
+OP_H = "enum ggml_op {{\n    GGML_OP_NONE,\n{ops}    GGML_OP_COUNT,\n}};\n"
+HANDLER = "int rpc_new_command_handler(void) { return 3; }\n"
+
+# --- 12. a commented RPC_PROTO define is not the tree's version --------------
+# An RPC-only pin bumps PATCH 0 -> 1. The merged tree has PATCH 0 active under a comment naming PATCH 2:
+# the compiler sees 0, as reconcile_op_count.rpc_version does, so the bump is lost.
+d, ps = pin_repo({"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0)},
+                 {"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=1), "ggml/src/rpc.c": HANDLER}, 12)
+h = d / "ggml/include/ggml-rpc.h"
+h.write_text("/* a later revision:\n#define RPC_PROTO_PATCH_VERSION    2\n*/\n" + RPC_V.format(mi=6, p=0))
+rc, rep, err = run(d, ps)
+check("a PATCH named only in a comment does not cover a lost bump",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
+# --- 13. rewording an op-count assert does not make a pin an op pin ----------
+# The pin bumps PATCH for an RPC command and only rewords the GGML_OP_COUNT assert message; the enum is
+# unchanged, so reconcile_op_count.py never raises PATCH for it and the pin still owns its bump.
+ASSERT_C = 'static_assert(GGML_OP_COUNT == 1, "{msg}");\n'
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0),
+                  "ggml/src/ggml.c": ASSERT_C.format(msg="GGML_OP_COUNT != 1")},
+                 {"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=1), "ggml/src/rpc.c": HANDLER,
+                  "ggml/src/ggml.c": ASSERT_C.format(msg="op count changed: update the tables")}, 13)
+h = d / "ggml/include/ggml-rpc.h"
+h.write_text(RPC_V.format(mi=6, p=0))
+rc, rep, err = run(d, ps)
+check("an assert-message edit does not drop an RPC-only pin's PATCH bump",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+h.write_text(RPC_V.format(mi=7, p=0))
+rc, rep, err = run(d, ps)
+check("nor lets a newer MINOR stand in for it", rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
+# --- 14. a multiline op-count assert reconcile_op_count.py rewrote -----------
+# reconcile_op_count.py rewrites the number on both lines; neither line is the pin's to keep.
+ML = 'static_assert(GGML_OP_COUNT == {n},\n    "GGML_OP_COUNT != {n}");\nint keep_this_line_of_code(void);\n'
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/src/ggml.c": ML.format(n=1)},
+                 {"ggml/include/ggml.h": OP_H.format(ops="    GGML_OP_BANDED,\n"),
+                  "ggml/src/ggml.c": ML.format(n=2) + "int banded_kernel_entry_point(void);\n"}, 14)
+c = d / "ggml/src/ggml.c"
+c.write_text(c.read_text().replace("== 2", "== 3").replace("!= 2", "!= 3"))
+rc, rep, err = run(d, ps)
+check("a reconciled multiline op-count assert does not fail the pin", rc == 0, err)
+c.write_text(ML.format(n=3))
+rc, rep, err = run(d, ps)
+check("the multiline exemption covers only the assert", rc == 1 and "banded_kernel_entry_point" in err, err)
+
+# --- 15. an op pin's PATCH requirement is a floor, not exempt ----------------
+# The pin adds one op and takes PATCH 0 -> 2; a resolution that leaves PATCH 1 lost part of its bump.
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0),
+                  "ggml/src/ggml.c": ASSERT_C.format(msg="GGML_OP_COUNT != 1")},
+                 {"ggml/include/ggml.h": OP_H.format(ops="    GGML_OP_BANDED,\n"),
+                  "ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=2),
+                  "ggml/src/ggml.c": ASSERT_C.format(msg="GGML_OP_COUNT != 2").replace("== 1", "== 2")}, 15)
+h = d / "ggml/include/ggml-rpc.h"
+for v, want, name in ((RPC_V.format(mi=6, p=1), 1, "an op pin's PATCH left below its bump fails"),
+                      (RPC_V.format(mi=6, p=3), 0, "an op pin's PATCH raised past its bump passes"),
+                      (RPC_V.format(mi=7, p=0), 0, "an op pin under a newer MINOR passes"),
+                      (RPC_V.format(mi=5, p=9), 1, "an op pin under an older MINOR fails")):
+    h.write_text(v)
+    rc, rep, err = run(d, ps)
+    check(name, rc == want and (want == 0 or "RPC_PROTO_PATCH_VERSION" in err), err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)

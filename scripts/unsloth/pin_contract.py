@@ -53,6 +53,11 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reconcile_op_count import (  # noqa: E402
+    FAMILIES, HEADER, SCAN_SUFFIXES, LayoutError, assert_re, blank_comments_and_strings, enum_count,
+)
+
 PIN_RE = re.compile(
     r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/([0-9a-f]{40})/?$"
 )
@@ -88,15 +93,15 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 # counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
 # no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
 # It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
-# A pin's own op-count assert (any family) is always exempt. Its PATCH line is exempt only when the
-# pin moves the main GGML_OP_COUNT (it adds a `static_assert(GGML_OP_COUNT ==` line), since that is
-# the only delta reconcile_op_count.py raises PATCH from: a pin that bumps PATCH for a unary/GLU-only
-# change or any other RPC change keeps that line in its contract.
+# A pin's own op-count assert (any family, every line of it) is always exempt. Its PATCH line stays in
+# the contract and is satisfied by any PATCH at least the pin's under the same MAJOR.MINOR; for a pin
+# that changes the GGML_OP_COUNT enum (the only delta reconcile_op_count.py raises PATCH from, and
+# which it checks per pin itself) a newer MAJOR.MINOR also counts.
 OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
-MAIN_OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_OP_COUNT\s*==")
 RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
 # A PATCH line the pin keeps owning still survives when reconcile_op_count.py raised PATCH past it
 # (another pin's op bump merged into the same line): same MAJOR and MINOR, PATCH at least the pin's.
+# Read off comment-blanked text, as reconcile_op_count.rpc_version reads it.
 RPC_VERSION_RE = {p: re.compile(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + p + r"_VERSION[ \t]+(\d+)", re.M)
                   for p in ("MAJOR", "MINOR", "PATCH")}
 
@@ -159,6 +164,38 @@ def load_pins(pr_set: Path) -> list[dict]:
     return pins
 
 
+def op_assert_lines(text: str) -> set[str]:
+    """The stripped lines of text that hold nothing but op-count static_asserts.
+
+    Exactly the asserts reconcile_op_count.py finds and rewrites (any family, comment-blanked), to the
+    terminating `;`, so a continuation line holding the message is exempt along with the first.
+    """
+    joined = blank_comments_and_strings(text)
+    clean, hit = list(joined), [False] * len(joined)
+    for count, _, _ in FAMILIES:
+        for m in assert_re(count).finditer(joined):
+            end = joined.find(";", m.end())
+            for i in range(m.start(), end + 1 if end >= 0 else m.end()):
+                hit[i] = True
+                if clean[i] != "\n":
+                    clean[i] = " "
+    out, pos = set(), 0
+    for line in text.split("\n"):
+        span = range(pos, pos + len(line))
+        if line.strip() and any(hit[i] for i in span) and not "".join(clean[i] for i in span).strip():
+            out.add(line.strip())
+        pos += len(line) + 1
+    return out
+
+
+def op_count(rev: str, cwd: Path) -> int | None:
+    text = git(["show", f"{rev}:{HEADER}"], cwd, check=False)
+    try:
+        return enum_count(text, blank_comments_and_strings(text), "ggml_op", "GGML_OP_COUNT")[0]
+    except LayoutError:
+        return None
+
+
 def derive(pin: dict, base: str, cwd: Path) -> dict:
     """What this pin puts in the tree, read off its own diff against the base.
 
@@ -180,16 +217,19 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
             cur = None                       # /dev/null: a deletion
         elif cur and ln.startswith("+") and not ln.startswith("+++"):
             added.append((cur, ln[1:]))
-    # reconcile_op_count.py rewrites every op-count assert (any family), so a pin's own assert line
-    # is not owed. It moves RPC_PROTO_PATCH_VERSION only from the GGML_OP_COUNT delta, so the PATCH
-    # line is exempt only for a pin that changes the main GGML_OP_COUNT assert; a unary/GLU-only pin
-    # that bumps PATCH keeps that line in its contract.
-    main_op_pin = any(MAIN_OP_COUNT_ASSERT_RE.match(text.strip()) for _, text in added)
+    # reconcile_op_count.py rewrites every op-count assert (any family), so no line of a pin's own
+    # assert is owed. The PATCH line is (see rpc_raised); main_op_pin is read off the enum itself, as
+    # reconcile_op_count.py reads it, not off an assert line the pin may have only reworded.
+    asserts = {path: op_assert_lines(git(["show", f"{pin['sha']}:{path}"], cwd, check=False))
+               for path in {p for p, _ in added}
+               if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES}
+    pin_n = op_count(pin["sha"], cwd)
+    main_op_pin = pin_n is not None and pin_n != op_count(fork, cwd)
     for cur, text in added:
         stripped = text.strip()
         if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
                 and not OP_COUNT_ASSERT_RE.match(stripped)
-                and not (main_op_pin and RPC_PATCH_RE.match(stripped))):
+                and stripped not in asserts.get(cur, ())):
             lines[cur].append(stripped)
         code = COMMENT_RE.sub("", text).strip()
         if code:
@@ -220,6 +260,7 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
         "symbols": new_symbols,
         "added_files": added,
         "owned_paths": owned,
+        "main_op_pin": main_op_pin,
         "lines": {p: v for p, v in lines.items()
                   if not p.endswith(SKIP_SUFFIXES)},
     }
@@ -245,10 +286,18 @@ def redundancy(contract: dict, base: str, cwd: Path) -> tuple[int, int]:
     return hit, total
 
 
-def rpc_raised(pin_text: str, text: str) -> bool:
-    """text has the pin's RPC_PROTO MAJOR and MINOR and a PATCH at least the pin's."""
+def rpc_raised(pin_text: str, text: str, allow_newer_series: bool = False) -> bool:
+    """text has the pin's RPC_PROTO MAJOR and MINOR and a PATCH at least the pin's.
+
+    allow_newer_series: a higher MAJOR.MINOR also counts (a pin that changes the op enum, whose bump
+    reconcile_op_count.py checks per pin and re-derives against the base's version).
+    """
     v = [{p: (m.group(1) if (m := r.search(t)) else None) for p, r in RPC_VERSION_RE.items()}
-         for t in (pin_text, text)]
+         for t in map(blank_comments_and_strings, (pin_text, text))]
+    series = [(v[i]["MAJOR"], v[i]["MINOR"]) for i in (0, 1)]
+    if (allow_newer_series and None not in series[0] + series[1]
+            and tuple(map(int, series[1])) > tuple(map(int, series[0]))):
+        return True
     return (v[0]["PATCH"] is not None and v[1]["PATCH"] is not None
             and all(v[0][p] == v[1][p] for p in ("MAJOR", "MINOR"))
             and int(v[1]["PATCH"]) >= int(v[0]["PATCH"]))
@@ -278,7 +327,8 @@ def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
         text = target.read_text(errors="replace")
         lost = [w for w in wanted if w not in text]
         if any(RPC_PATCH_RE.match(w) for w in lost) and rpc_raised(
-                git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text):
+                git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text,
+                allow_newer_series=contract.get("main_op_pin", False)):
             lost = [w for w in lost if not RPC_PATCH_RE.match(w)]
         if not lost:
             continue
