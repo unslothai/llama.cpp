@@ -1157,8 +1157,16 @@ struct llama_moe_cache::impl {
             return;
         }
         std::vector<uint8_t> buf;
-        size_t n_bad = 0;
+        size_t n_bad     = 0;
+        size_t n_checked = 0;
         for (const auto & r : seed_committed) {
+            // a later lookup may have evicted the seeded expert (or the device state replaced the host slots): nothing to compare
+            const binding & b = bindings.at(r.w);
+            const group   & g = groups[layers[b.il].ig];
+            if (g.dev_newer || g.lru.key_of[r.slot] != b.il*g.lru.n_expert + r.expert) {
+                continue;
+            }
+            n_checked++;
             const size_t size = r.w->nb[2];
             GGML_ASSERT(r.bank->nb[2] == size && r.w->data != nullptr);
             buf.resize(size);
@@ -1167,8 +1175,9 @@ struct llama_moe_cache::impl {
                 n_bad++;
             }
         }
-        LLAMA_LOG_INFO("llama_moe_cache: seed check: %zu expert copies verified, %zu mismatches\n", seed_committed.size(), n_bad);
-        seed_checked    += seed_committed.size();
+        LLAMA_LOG_INFO("llama_moe_cache: seed check: %zu expert copies verified, %zu mismatches, %zu evicted since\n",
+            n_checked, n_bad, seed_committed.size() - n_checked);
+        seed_checked    += n_checked;
         seed_mismatches += n_bad;
         seed_committed.clear();
     }

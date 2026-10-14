@@ -1962,7 +1962,10 @@ static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_o
         }
         const bool fused    = (has & COMMON_EXPERT_GATE_UP) && is_host((int) il, "ffn_gate_up_exps");
         const bool separate = (has & COMMON_EXPERT_GATE) && (has & COMMON_EXPERT_UP) && is_host((int) il, "ffn_gate_exps") && is_host((int) il, "ffn_up_exps");
-        if (fused || separate) {
+        // ungated experts (e.g. Nemotron-H) have only up/down, which the cache serves as well; only when the GGUF says so
+        const bool ungated  = !experts.empty() && (has & COMMON_EXPERT_UP) && !(has & (COMMON_EXPERT_GATE | COMMON_EXPERT_GATE_UP)) &&
+                              is_host((int) il, "ffn_up_exps");
+        if (fused || separate || ungated) {
             return true;
         }
     }
