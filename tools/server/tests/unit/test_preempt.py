@@ -1462,3 +1462,23 @@ def test_two_n_2_requests_that_do_not_fit_together_end_only_one():
     ok = next(r for r in results if r.status_code == 200)
     assert [c["finish_reason"] for c in ok.body["choices"]] == ["length", "length"]
     assert "ending it alone" in _log()
+
+
+def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generating_one():
+    # Slot 1 keeps 600 cells of an earlier conversation; its follow-up started beside a generating request, was the largest, became the exempt leader, and the older request was parked for it.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=1024, n_slots=2, n_batch=128, n_ubatch=128, cache_ram=0)
+    earlier = [200 + k % 50 for k in range(600)]
+    assert _cached(1, earlier, 1).status_code == 200
+    with ThreadPoolExecutor(1) as pool:
+        older = pool.submit(_cached, 600, [100 + k % 50 for k in range(40)], 0)
+        deadline = time.time() + 60
+        while time.time() < deadline and _n_decoded(_slot_view(0)) < 280:
+            time.sleep(0.002)
+        newer = _cached(4, earlier + [300 + k % 50 for k in range(300)], 1)
+        older = older.result()
+    for res, n_predict in ((older, 600), (newer, 4)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+    assert older.body["preempt"]["parks"] == 0, "the older generating request was parked for a newer one"
+    assert newer.body["preempt"]["parks"] > 0

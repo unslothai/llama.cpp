@@ -4303,11 +4303,15 @@ private:
             preempt_normalize_started(slot);
         }
 
+        // [TAG_PREEMPT] A started slot is not the leader: the cells it keeps are an earlier request's, and exempting them would park an older request already running.
         for (auto & slot : slots) {
             if (slot.is_processing() && !slot.preempt_is_out()) {
                 n_running++;
 
-                if (!leader || slot.prompt.n_tokens() > leader->prompt.n_tokens()) {
+                const bool started     = slot.state == SLOT_STATE_STARTED;
+                const bool started_cur = leader && leader->state == SLOT_STATE_STARTED;
+
+                if (!leader || (started_cur && !started) || (started == started_cur && slot.prompt.n_tokens() > leader->prompt.n_tokens())) {
                     leader = &slot;
                 }
             }
