@@ -53,7 +53,7 @@ def create_server():
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
                  "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
                  "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
-                 "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY"):
+                 "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY", "LLAMA_ARG_PREEMPT_POLICY"):
         os.environ.pop(name, None)
 
 
@@ -1279,7 +1279,7 @@ def test_props_reports_the_preemption_setup(ram):
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
     preempt = res.body["preempt"]
-    assert sorted(preempt) == ["async", "enabled", "granularity", "notices", "ram_mib", "recurrent"]
+    assert sorted(preempt) == ["async", "enabled", "granularity", "notices", "policy", "ram_mib", "recurrent"]
     assert preempt["enabled"] is (ram == "8192")
     assert preempt["ram_mib"] == (8192 if ram == "8192" else 0)
     assert preempt["async"] is False or ram == "8192"
@@ -1287,6 +1287,7 @@ def test_props_reports_the_preemption_setup(ram):
     assert preempt["notices"] == 2
     assert preempt["recurrent"] is False
     assert preempt["granularity"] == 1
+    assert preempt["policy"] == "cost"
 
 
 def test_props_reports_preemption_off_without_a_unified_cache():
@@ -1482,3 +1483,61 @@ def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generati
         assert res.body["timings"]["predicted_n"] == n_predict
     assert older.body["preempt"]["parks"] == 0, "the older generating request was parked for a newer one"
     assert newer.body["preempt"]["parks"] > 0
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_the_policy_decides_whether_the_newest_or_the_cheapest_slot_is_parked(policy):
+    # The older request is smaller: cost parks it and exempts the larger one, fcfs parks the newer one. Both first purge the idle slot.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
+    _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128, cache_ram=0)
+    assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
+    assert _cached(1, [300 + k % 50 for k in range(150)], 2).status_code == 200
+    with ThreadPoolExecutor(1) as pool:
+        older = pool.submit(_cached, 600, [100 + k % 50 for k in range(40)], 0)
+        deadline = time.time() + 60
+        while time.time() < deadline and _n_decoded(_slot_view(0)) < 20:
+            time.sleep(0.005)
+        newer = _cached(500, [200 + k % 50 for k in range(300)], 1)
+        older = older.result()
+    for res, n_predict in ((older, 600), (newer, 500)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+    parked, exempt = (newer, older) if policy == "fcfs" else (older, newer)
+    assert exempt.body["preempt"]["parks"] == 0
+    assert parked.body["preempt"]["parks"] > 0
+    text = _log()
+    assert 0 <= text.find("purging slot 2") < text.find("preempted:"), "a running slot was parked while an idle one held cells"
+
+
+def test_fcfs_resumes_parked_requests_in_arrival_order():
+    # The newest is parked first, so park time and arrival disagree: the older of the two parked requests comes back first.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "fcfs"
+    _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128)
+    with ThreadPoolExecutor(3) as pool:
+        futures = []
+        for i, n_predict in enumerate((700, 450, 450)):
+            futures.append(pool.submit(_cached, n_predict, [100 * (i + 1) + k % 50 for k in range(40)], i))
+            _wait_processing([i])
+        results = [f.result() for f in futures]
+    for res, n_predict in zip(results, (700, 450, 450)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+    assert results[0].body["preempt"]["parks"] == 0, "the oldest request was parked"
+    text = _log()
+    resumed = [int(m) for m in re.findall(r"id +(\d+) \| task \d+ \| resumed after", text)]
+    assert resumed, "nothing was parked"
+    parked = [int(m) for m in re.findall(r"id +(\d+) \| task \d+ \| preempted:", text)]
+    assert parked[0] == 2, parked
+    if 1 in parked:
+        assert resumed.index(1) < resumed.index(2), resumed
+
+
+def test_the_old_policy_knob_selects_fcfs():
+    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = "fcfs"
+    try:
+        _start(n_ctx=256)
+        assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
+    finally:
+        os.environ.pop("LLAMA_SERVER_PREEMPT_POLICY", None)

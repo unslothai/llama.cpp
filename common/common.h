@@ -38,6 +38,9 @@
 #define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// --preempt-policy default: "cost" (park the cheapest slot, the largest exempt) or "fcfs" (park the newest arrival)
+#define COMMON_PREEMPT_POLICY_DEFAULT "cost"
+
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
@@ -640,6 +643,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t preempt_ram_mib     = 0;     // host RAM for parked (preempted) sequences: 0 = preemption off (the default), -1 = no limit
     bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
+    std::string preempt_policy  = COMMON_PREEMPT_POLICY_DEFAULT;  // victim choice: "fcfs" or "cost"
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

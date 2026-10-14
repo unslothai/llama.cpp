@@ -2142,9 +2142,19 @@ private:
             const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
             preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
 
-            // LLAMA_SERVER_PREEMPT_POLICY: smallest (default), largest, youngest or oldest.
+            preempt_fcfs = params_base.preempt_policy == "fcfs";
+
+            // LLAMA_SERVER_PREEMPT_POLICY: fcfs or cost, as --preempt-policy when LLAMA_ARG_PREEMPT_POLICY is unset; or a cost test knob: smallest (default), largest, youngest or oldest.
             const char * LLAMA_SERVER_PREEMPT_POLICY = getenv("LLAMA_SERVER_PREEMPT_POLICY");
-            preempt_test_policy = LLAMA_SERVER_PREEMPT_POLICY ? LLAMA_SERVER_PREEMPT_POLICY : "smallest";
+            preempt_test_policy = "smallest";
+
+            if (LLAMA_SERVER_PREEMPT_POLICY && (strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0 || strcmp(LLAMA_SERVER_PREEMPT_POLICY, "cost") == 0)) {
+                if (!getenv("LLAMA_ARG_PREEMPT_POLICY")) {
+                    preempt_fcfs = strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0;
+                }
+            } else if (LLAMA_SERVER_PREEMPT_POLICY) {
+                preempt_test_policy = LLAMA_SERVER_PREEMPT_POLICY;
+            }
 
             if (preempt_test_policy != "smallest") {
                 SRV_WRN("LLAMA_SERVER_PREEMPT_POLICY = %s (test knob: victim choice for comparison only)\n", preempt_test_policy.c_str());
@@ -3887,6 +3897,9 @@ private:
     int32_t preempt_test_every = 0;
     std::string preempt_test_policy = "smallest"; // LLAMA_SERVER_PREEMPT_POLICY, see load_model
 
+    // [TAG_PREEMPT] --preempt-policy fcfs: park the newest arrival, resume and reserve in arrival order.
+    bool preempt_fcfs = false;
+
     // [TAG_PREEMPT_ASYNC] False with --no-preempt-async or a backend without async copies.
     bool preempt_async_ok = false;
 
@@ -4322,6 +4335,10 @@ private:
             return nullptr;
         }
 
+        if (preempt_fcfs) {
+            return preempt_pick_victim_fcfs(recompute);
+        }
+
         // the largest-policy test knob exempts nobody; an n_cmpl > 1 leader cannot be parked anyway, so exempting it keeps nobody else safe
         const server_slot * exempt = preempt_test_policy == "largest" || preempt_is_family(*leader) ? nullptr : leader;
 
@@ -4347,6 +4364,27 @@ private:
             victim = preempt_pick_victim_pass(exempt, true, n_deficit);
 
             *recompute = victim != nullptr;
+        }
+
+        return victim;
+    }
+
+    // [TAG_PREEMPT] The most recently arrived resident, with no exemption: the oldest always runs. Copied if the budget holds it, else dropped.
+    server_slot * preempt_pick_victim_fcfs(bool * recompute) {
+        server_slot * victim = nullptr;
+
+        for (auto & slot : slots) {
+            if (preempt_victim_eligible(slot, nullptr, true) && (!victim || slot.task->id > victim->task->id)) {
+                victim = &slot;
+            }
+        }
+
+        if (victim && !preempt_fits_budget(*victim)) {
+            if (!recompute) {
+                return nullptr;
+            }
+
+            *recompute = true;
         }
 
         return victim;
@@ -4500,12 +4538,18 @@ private:
         const server_slot * head = nullptr;
 
         for (const auto & slot : slots) {
-            if (slot.state == SLOT_STATE_PREEMPTED && (!head || slot.t_preempt_us < head->t_preempt_us)) {
+            if (slot.state == SLOT_STATE_PREEMPTED && (!head || preempt_resumes_before(slot, *head))) {
                 head = &slot;
             }
         }
 
-        preempt_reserved_for = head && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US ? head : nullptr;
+        // under fcfs the oldest parked request holds its room against newer ones at once
+        preempt_reserved_for = head && (preempt_fcfs || ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) ? head : nullptr;
+    }
+
+    // [TAG_PREEMPT] Resume order: arrival under fcfs, park time under cost.
+    bool preempt_resumes_before(const server_slot & a, const server_slot & b) const {
+        return preempt_fcfs ? a.task->id < b.task->id : a.t_preempt_us < b.t_preempt_us;
     }
 
     // [TAG_PREEMPT] A never-resident prompt waits while the head's reservation stands. Re-prefills, resumed prompts, and empty or rejected prompts go on.
@@ -4515,6 +4559,10 @@ private:
         }
 
         if (slot.n_preempt > 0 || slot.preempt_reprefill) {
+            return false;
+        }
+
+        if (preempt_fcfs && slot.task->id < preempt_reserved_for->task->id) {
             return false;
         }
 
@@ -4530,7 +4578,8 @@ private:
         }
 
         if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
-            return slot.stats.t_start > preempt_reserved_for->t_preempt_us;
+            return preempt_fcfs ? slot.task->id > preempt_reserved_for->task->id
+                                : slot.stats.t_start > preempt_reserved_for->t_preempt_us;
         }
 
         return false;
@@ -4769,12 +4818,12 @@ private:
                 break;
             }
 
-            std::sort(parked.begin(), parked.end(), [head_of_line](const server_slot * a, const server_slot * b) {
+            std::sort(parked.begin(), parked.end(), [this, head_of_line](const server_slot * a, const server_slot * b) {
                 if (!head_of_line && a->n_preempt != b->n_preempt) {
                     return a->n_preempt > b->n_preempt;
                 }
 
-                return a->t_preempt_us < b->t_preempt_us;
+                return preempt_resumes_before(*a, *b);
             });
 
             if (head_of_line) {
@@ -4846,6 +4895,11 @@ private:
                             }
 
                             if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+                                continue;
+                            }
+
+                            // [TAG_PREEMPT] Under fcfs an older resident is rotated only if it context-shifts, as it may never end.
+                            if (preempt_fcfs && !held && slot.task->id < head->task->id && slot.n_ctx_shift == 0) {
                                 continue;
                             }
 
@@ -6225,6 +6279,7 @@ private:
             { "notices",     2 },
             { "recurrent",   preempt_recurrent },
             { "granularity", preempt_alloc_granularity },
+            { "policy",      preempt_fcfs ? "fcfs" : "cost" },
         };
     }
 

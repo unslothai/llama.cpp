@@ -1748,6 +1748,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREEMPT_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--preempt-policy"}, "{fcfs,cost}",
+        string_format("which slot is parked when the cache fills: fcfs parks the most recently arrived request and resumes "
+            "in arrival order; cost parks the slot that frees the room most cheaply and never the largest generating one "
+            "(default: %s)", COMMON_PREEMPT_POLICY_DEFAULT),
+        [](common_params & params, const std::string & value) {
+            if (value != "fcfs" && value != "cost") {
+                throw std::invalid_argument("invalid value");
+            }
+            params.preempt_policy = value;
+        }
+    ).set_env("LLAMA_ARG_PREEMPT_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
