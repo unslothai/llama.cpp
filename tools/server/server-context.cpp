@@ -481,6 +481,7 @@ struct server_slot {
     bool                 preempt_rotation_refused = false;
     bool                 preempt_hold_logged      = false;
     bool                 preempt_grow             = false;  // the next park may pin a buffer larger than the sequence
+    int64_t              preempt_rank             = -1;     // fcfs resume order once rotated out, -1 = by arrival
 
     // [TAG_PREEMPT] Last budget refusal: tokens, held capacity and RAM in use then; -1 when none.
     mutable int32_t      preempt_refused_n    = -1;
@@ -937,6 +938,7 @@ struct server_slot {
         t_preempt_resume_us  = 0;
         n_gen_resume         = 0;
         preempt_hold_logged  = false;
+        preempt_rank         = -1;
         preempt_refused_n    = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
@@ -4583,7 +4585,12 @@ private:
 
     // [TAG_PREEMPT] Resume order: arrival under fcfs, park time under cost.
     bool preempt_resumes_before(const server_slot & a, const server_slot & b) const {
-        return preempt_fcfs ? a.task->id < b.task->id : a.t_preempt_us < b.t_preempt_us;
+        return preempt_fcfs ? preempt_rank(a) < preempt_rank(b) : a.t_preempt_us < b.t_preempt_us;
+    }
+
+    // [TAG_PREEMPT] fcfs order: twice the task id, or just behind the head a slot was rotated out for, or it would resume at once ahead of it.
+    static int64_t preempt_rank(const server_slot & slot) {
+        return slot.preempt_rank >= 0 ? slot.preempt_rank : 2 * (int64_t) slot.task->id;
     }
 
     // [TAG_PREEMPT] A never-resident prompt waits while the head's reservation stands. Re-prefills, resumed prompts, and empty or rejected prompts go on.
@@ -4999,6 +5006,8 @@ private:
 
                     if (pick && preempt_park(*pick, t_start, recompute)) {
                         server_slot & slot = *pick;
+
+                        slot.preempt_rank = std::max(preempt_rank(slot), preempt_rank(*head) + 1);
 
                         if (slot.preempt_recompute) {
                             SLT_WRN(slot, "rotated out after %d context shifts: %d cells dropped, %d tokens to re-prefill on resume, a head parked %.1f s takes its turn%s, preemptions %d\n",

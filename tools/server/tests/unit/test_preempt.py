@@ -383,9 +383,12 @@ def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
         assert res.body["timings"]["predicted_n"] == n_predict
 
 
-def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute(policy):
     # 1 MiB holds no snapshot, so rotation used to refuse every resident and the head waited forever behind a context-shifting one.
+    # Under fcfs the rotated-out resident is older than the head, and resumed ahead of it at once until it queued behind it.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _start(n_ctx=2048, n_slots=2, n_batch=2048, enable_ctx_shift=True)
 
     # A small n_discard keeps the resident near the end of the pool, so its state never fits the budget.
