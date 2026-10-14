@@ -1202,18 +1202,21 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
 
 
 @pytest.mark.slow
-def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head(policy):
     # Only context-shifting residents used to be rotated, so a long generation that fit held the pool and the parked slot waited for all of it.
+    # A resident that ends by itself is rotated once the head has waited 30 s and it would run 30 s more, so the head's wait is bounded either way.
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _serve_with_training_context(16384)
     _start(n_ctx=16384, n_slots=2, n_batch=2048)
 
     done = {}
 
     def run(name, n_predict, prompt, id_slot):
-        res = _raw_completion(n_predict, prompt, id_slot, timeout=900)
+        res = _raw_completion(n_predict, prompt, id_slot, timeout=1800)
         done[name] = (time.time(), res)
 
-    # A leads B by 564 cells, so B is parked once the pool fills, and A then runs far longer than the 2 s a parked head waits.
+    # A leads B by 564 cells, so B is parked once the pool fills.
     a = threading.Thread(target=run, args=("a", 16000, _prompt_of(64, _PROMPT_A), 0))
     a.start()
     deadline = time.time() + 300
@@ -1221,8 +1224,8 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
         time.sleep(0.01)
     b = threading.Thread(target=run, args=("b", 8000, _prompt_of(1500, _PROMPT_B), 1))
     b.start()
-    a.join(900)
-    b.join(900)
+    a.join(1800)
+    b.join(1800)
 
     for name in ("a", "b"):
         assert done[name][1].status_code == 200, done[name][1].body
@@ -1232,8 +1235,10 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
     text = _log()
     assert "Context size has been exceeded" not in text
     assert "slot context shift" not in text
-    assert "rotated out after 0 context shifts" in text, "the long resident was never rotated out"
-    assert done["b"][0] < done["a"][0], "the parked slot only came back once the long resident had finished"
+    waits = [float(w) for w in re.findall(r"id +1 \| task \d+ \| resumed after ([\d.]+) s", text)]
+    assert waits, "the second request was never parked"
+    # 30 s before a rotation is considered, plus at most 30 s of the resident's own estimated remainder.
+    assert max(waits) < 90.0, f"the parked request waited {waits} s behind a resident that ends by itself"
 
 
 def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():

@@ -159,8 +159,7 @@ constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // Only applies afte
 constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // A parked head waiting this long gets a resident rotated out for it, and new prompts wait.
 constexpr int64_t PREEMPT_ROTATE_RECOMPUTE_US = 30ll * 1000 * 1000;  // After this long the head may also rotate a resident that would need a re-prefill.
 constexpr int32_t PREEMPT_ROTATE_MIN_GEN = 32;  // Tokens a resumed slot decodes before it can be rotated out again.
-constexpr int64_t PREEMPT_ROTATE_BOUNDED_US = 30ll * 1000 * 1000;  // A resident that will end by itself (no context shift, bounded output) is rotated only for a head parked this long,
-constexpr int32_t PREEMPT_ROTATE_MIN_LEFT   = 4096;                  // and only while it has more than this many tokens left to generate.
+constexpr int64_t PREEMPT_ROTATE_BOUNDED_US = 30ll * 1000 * 1000;  // A resident that will end by itself is rotated only for a head parked this long, and only if it would run longer than this again.
 
 // [TAG_PREEMPT_ASYNC] An async park frees cells only when its copy lands, so it must start this many steps before the pool runs out.
 constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
@@ -4648,6 +4647,28 @@ private:
                (n_gen > 0 && ggml_time_us() - t_from >= PREEMPT_ROTATE_US);
     }
 
+    // [TAG_PREEMPT] Time until a resident ends by itself, at its rate since it last resumed; -1 if it may never end (it context-shifts, or may shift with no output limit).
+    int64_t preempt_us_to_end(const server_slot & slot) const {
+        if (slot.n_ctx_shift > 0 || (params_base.ctx_shift && slot.n_remaining() < 0)) {
+            return -1;
+        }
+
+        int64_t n_left = slot.n_remaining() >= 0 ? slot.n_remaining() : INT32_MAX;
+
+        if (!params_base.ctx_shift) {
+            n_left = std::min<int64_t>(n_left, std::max(0, slot.n_ctx - slot.prompt.n_tokens()));
+        }
+
+        const int32_t n_gen  = (int32_t) slot.stats.n_gen - slot.n_gen_resume;
+        const int64_t t_from = slot.n_preempt == 0 ? slot.stats.t_prompt_last : slot.t_preempt_resume_us;
+
+        if (n_gen <= 0) {
+            return INT64_MAX;
+        }
+
+        return (int64_t) std::min<double>((double) n_left * (double) (ggml_time_us() - t_from) / n_gen, (double) INT64_MAX / 2);
+    }
+
     bool preempt_any_out() const {
         for (const auto & slot : slots) {
             if (slot.preempt_is_out()) {
@@ -4943,15 +4964,13 @@ private:
                                 continue;
                             }
 
-                            // [TAG_PREEMPT] Under fcfs an older resident is rotated only if it context-shifts, as it may never end.
-                            if (preempt_fcfs && !held && slot.task->id < head->task->id && slot.n_ctx_shift == 0) {
-                                continue;
-                            }
+                            // [TAG_PREEMPT] Time-slicing residents that end by themselves only trades park copies for nothing; one that would still hold the head long yields once the head has waited long. Under fcfs a resident newer than the head always yields.
+                            if (!held && !(preempt_fcfs && preempt_rank(slot) > preempt_rank(*head))) {
+                                const int64_t t_end = preempt_us_to_end(slot);
 
-                            // [TAG_PREEMPT] Time-slicing residents that end by themselves only trades park copies for nothing; a long one still yields to a head that waited long.
-                            if (!held && slot.n_ctx_shift == 0 && slot.n_remaining() >= 0 &&
-                                (slot.n_remaining() <= PREEMPT_ROTATE_MIN_LEFT || ggml_time_us() - head->t_preempt_us < PREEMPT_ROTATE_BOUNDED_US)) {
-                                continue;
+                                if (t_end >= 0 && (ggml_time_us() - head->t_preempt_us < PREEMPT_ROTATE_BOUNDED_US || t_end < PREEMPT_ROTATE_BOUNDED_US)) {
+                                    continue;
+                                }
                             }
 
                             // The head's bytes are not credited: the resident is parked before the head is freed, so both states are held at once.
