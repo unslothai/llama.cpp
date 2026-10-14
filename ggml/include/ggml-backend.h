@@ -351,7 +351,7 @@ extern "C" {
     // How an input weight in a host buffer is copied to the backend of the split that uses it
     enum ggml_backend_sched_prefetch_mode {
         GGML_BACKEND_SCHED_PREFETCH_NONE  = 0, // copied when the split starts, the copy is allocated by the graph allocator (no prefetch)
-        GGML_BACKEND_SCHED_PREFETCH_SYNC  = 1, // copied when the split starts (the copy needs results of earlier splits), no weight of the split is prefetched
+        GGML_BACKEND_SCHED_PREFETCH_SYNC  = 1, // copied when the split starts (the copy needs results of earlier splits), no weight of the split is prefetched, the copy uses a staging slot if the backend has an arena
         GGML_BACKEND_SCHED_PREFETCH_ASYNC = 2, // copied into a staging slot on a separate copy queue, ahead of the split
     };
 

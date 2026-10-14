@@ -2809,9 +2809,9 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
 
-    // small ubatches are not prefetched
+    // small ubatches are not prefetched, their copies reuse the staging arena of the prompt (if any) instead of growing the graph allocator next to it
     if (lctx->prefetch_n_tokens < lctx->prefetch_min_batch) {
-        return GGML_BACKEND_SCHED_PREFETCH_NONE;
+        return GGML_BACKEND_SCHED_PREFETCH_SYNC;
     }
 
     // experts: the copy callback can copy them ahead only if it does not need the ids, which are computed by an earlier split
