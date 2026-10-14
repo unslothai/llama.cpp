@@ -167,7 +167,8 @@ llama_context::llama_context(
 
     // not via ctx_other: for draft-mtp that means the draft shares the target's memory
     cparams.model_tgt = nullptr;
-    if (model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
+    // a vocab-only model has no tensors at all
+    if (!hparams.vocab_only && model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
         const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
         if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
             tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
