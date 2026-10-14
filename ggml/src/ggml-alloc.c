@@ -939,6 +939,9 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // the assignments point into the freed buffer: the next ggml_gallocr_alloc_graph must reserve again instead of using them
+                    galloc->n_nodes = 0;
+                    galloc->n_leafs = 0;
                     return false;
                 }
             }
