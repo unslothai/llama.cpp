@@ -15,6 +15,9 @@
     "     fork deliberately owns no llama.cpp source; that is what makes a sync provably additive",
     "     and lets scripts/unsloth/verify_upstream_sync.py check it exactly rather than by eye.",
     "     If this ever fails, the fork has acquired source divergence and syncs stop being cheap.",
+    "     `removed_ok` lists upstream repo-metadata files master deleted on purpose (AGENTS.md",
+    "     8700cfd7f, CLAUDE.md 4f39f5756, CODEOWNERS 43b49facd, 2026-08-27/31). Only their",
+    "     deletion is waived, never an edit.",
     "",
     "Note for whoever runs the next sync: verify_upstream_sync.py derives its base from",
     "merge-base(--fork, --upstream). Pass a --fork ref whose ancestry is already correct, or it",
@@ -22,5 +25,6 @@
   ],
   "tag": "b11436",
   "commit": "b9a5a00b86fd285a445916086a0b1dc35bee6d66",
-  "synced_at": "2026-10-06"
+  "synced_at": "2026-10-06",
+  "removed_ok": ["AGENTS.md", "CLAUDE.md", "CODEOWNERS"]
 }
