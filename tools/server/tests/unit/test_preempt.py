@@ -1541,3 +1541,24 @@ def test_the_old_policy_knob_selects_fcfs():
         assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
     finally:
         os.environ.pop("LLAMA_SERVER_PREEMPT_POLICY", None)
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_prompt_dropped_in_its_prefill_waits_until_it_fits_whole(policy):
+    # The newer prompt is parked by dropping its cells part way through its prefill; resumed as soon as one chunk fitted, it was prefilled and dropped again until the older request ended.
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
+    _serve_with_training_context(8192)
+    _start(n_ctx=4096, n_slots=2, n_batch=256, n_ubatch=256, cache_ram=0)
+    with ThreadPoolExecutor(1) as pool:
+        older = pool.submit(_cached, 1500, [100 + k % 50 for k in range(1500)], 0)
+        deadline = time.time() + 120
+        while time.time() < deadline and _n_decoded(_slot_view(0)) < 100:
+            time.sleep(0.005)
+        newer = _cached(4, [200 + k % 50 for k in range(2500)], 1)
+        older = older.result()
+    for res, n_predict in ((older, 1500), (newer, 4)):
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["predicted_n"] == n_predict
+    parked = older if older.body["preempt"]["parks"] > 0 else newer
+    assert parked.body["preempt"]["parks"] == 1, (older.body["preempt"], newer.body["preempt"])

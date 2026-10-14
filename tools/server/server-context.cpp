@@ -4088,7 +4088,7 @@ private:
     // A freshly assigned slot still mirrors the previous prompt, so count from preempt_n_keep().
     int32_t preempt_n_retained(const server_slot & slot) const {
         if (slot.preempt_recompute) {
-            return (int32_t) slot.preempt_tokens.size();  // a recompute park needs all its cells back at once
+            return slot.preempt_n_input();  // a recompute park needs all its cells back at once; a prompt dropped in its prefill restarts, so it waits for room for all of it
         }
 
         if (slot.state == SLOT_STATE_STARTED && slot.task) {
