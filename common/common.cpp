@@ -1268,6 +1268,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra : nullptr,
             params.moe_cache_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        if (params.moe_cache_auto) {
+            // the fit writes its expert placement into params, keep the cache size it chose with it,
+            // so that a reload from params (e.g. the server waking from sleep) gets the same cache
+            params.moe_cache_size = cparams.moe_cache_size;
+            params.moe_cache_auto = false;
+        }
     } else if (params.moe_cache_auto) {
         LOG_WRN("%s: --moe-cache-mib auto needs --fit on, not using a MoE cache\n", __func__);
     }

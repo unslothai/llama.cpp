@@ -2782,9 +2782,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
         [](common_params & params, const std::string & value) {
             const bool is_auto = value == "auto" || value == "-1";
-            const int  n       = is_auto ? 0 : std::stoi(value);
-            if (n < 0) {
-                throw std::invalid_argument("invalid value");
+            long long  n       = 0;
+            if (!is_auto) {
+                size_t pos = 0;
+                n = std::stoll(value, &pos);
+                if (pos != value.size() || n < 0 || n > (long long) (SIZE_MAX >> 20)) {
+                    throw std::invalid_argument("invalid value");
+                }
             }
             params.moe_cache_auto = is_auto;
             params.moe_cache_size = (size_t) n*1024*1024;

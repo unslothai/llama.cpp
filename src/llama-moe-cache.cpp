@@ -646,7 +646,13 @@ static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backe
 }
 
 size_t llama_model_moe_cache_min_size(const llama_model * model) {
-    if (model->hparams.n_expert == 0 || model->devices.size() != 1) {
+    if (model->hparams.n_expert == 0 || model->hparams.n_expert_used_max() == 0 || model->devices.size() != 1 ||
+            model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return 0;
+    }
+    // same devices as the cache itself
+    const auto dev_type = ggml_backend_dev_type(model->devices[0].dev);
+    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
         return 0;
     }
     return llama_moe_cache_min_size_dev(*model, model->devices[0].dev);
