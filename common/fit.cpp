@@ -326,14 +326,27 @@ static void common_params_fit_impl(
 
     // shrinks the MoE cache until the measured placement dmds (model params mp) meets the targets, returns the remaining total surplus
     // the cache memory is measured (probe without the cache), the slot sizing itself stays in llama_moe_cache
+    // with several devices every device must meet its own target: the cache is split over the devices of its layers, so a device short of
+    // memory needs the total shrunk by its deficit scaled by its share of the cache (a total surplus can hide a device that misses its target)
     auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
+        auto margin_of = [&](size_t id) -> int64_t {
+            return use_margins ? int64_t(margins[id]) : 0;
+        };
         auto surplus_of = [&](const dmds_t & d) {
             int64_t s = 0;
             for (size_t id = 0; id < nd; id++) {
                 s += d[id].free;
-                s -= int64_t(d[id].mb.total()) + (use_margins ? margins[id] : 0);
+                s -= int64_t(d[id].mb.total()) + margin_of(id);
             }
             return s;
+        };
+        auto devices_ok = [&](const dmds_t & d) {
+            for (size_t id = 0; id < nd; id++) {
+                if (int64_t(d[id].free) - int64_t(d[id].mb.total()) - margin_of(id) < 0) {
+                    return false;
+                }
+            }
+            return true;
         };
         auto measure = [&](const llama_context_params * cp) {
             dmds_t res = common_get_device_memory_data_impl(path_model, mp, cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
@@ -341,7 +354,7 @@ static void common_params_fit_impl(
             return res;
         };
         const int64_t surplus = surplus_of(dmds);
-        if (surplus >= 0) {
+        if (surplus >= 0 && devices_ok(dmds)) {
             return surplus;
         }
         const int64_t size_requested = cparams->moe_cache_size;
@@ -356,8 +369,31 @@ static void common_params_fit_impl(
             return surplus; // no layer of this placement uses the cache
         }
 
-        int64_t size = std::min(size_requested, cache_bytes) + surplus;
-        for (int it = 0; it < 4 && size > 0 && surplus_nc > 0; it++) {
+        // bytes of cache to give back so that the total and every device meet their targets, INT64_MAX if a device misses its target
+        // even without its share of the cache
+        auto shortfall = [&](const dmds_t & d) -> int64_t {
+            int64_t need = -surplus_of(d);
+            int64_t cache_total = 0;
+            for (size_t id = 0; id < nd; id++) {
+                cache_total += std::max<int64_t>(0, int64_t(d[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
+            }
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t s_id = int64_t(d[id].free) - int64_t(d[id].mb.total()) - margin_of(id);
+                if (s_id >= 0) {
+                    continue;
+                }
+                const int64_t cache_id = std::max<int64_t>(0, int64_t(d[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
+                if (cache_id <= 0 || cache_total <= 0) {
+                    return INT64_MAX;
+                }
+                need = std::max(need, int64_t(double(-s_id) * double(cache_total) / double(cache_id)));
+            }
+            return need;
+        };
+
+        const int64_t need0 = shortfall(dmds);
+        int64_t size = need0 == INT64_MAX ? 0 : std::min(size_requested, cache_bytes) - need0;
+        for (int it = 0; it < 6 && size > 0 && surplus_nc > 0; it++) {
             // whole MiB, so that the printed --moe-cache-mib is the size that was measured
             size -= size % MiB;
             if (size <= 0) {
@@ -370,14 +406,17 @@ static void common_params_fit_impl(
             } catch (const std::runtime_error &) {
                 break; // too small to hold the experts of one token
             }
-            const int64_t s = surplus_of(dmds_test);
-            if (s >= 0) {
+            const int64_t need = shortfall(dmds_test);
+            if (need <= 0) {
                 LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",
                     __func__, size_requested/MiB, size/MiB);
                 dmds = dmds_test;
-                return s;
+                return surplus_of(dmds_test);
             }
-            size += s - MiB;
+            if (need == INT64_MAX) {
+                break;
+            }
+            size -= need + MiB;
         }
         LOG_TRC("%s: MoE cache disabled (requested %" PRId64 " MiB) to keep the layers in device memory\n", __func__, size_requested/MiB);
         cparams->moe_cache_size = 0;
