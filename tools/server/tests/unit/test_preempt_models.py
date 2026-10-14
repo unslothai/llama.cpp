@@ -41,3 +41,43 @@ def test_a_non_causal_decision_longer_than_the_ubatch_is_refused_and_the_server_
     assert res.status_code == 500
     assert "too large to process" in res.body["error"]["message"]
     assert server.make_request("GET", "/health").status_code == 200
+
+
+def _final_bodies():
+    """The final record of a completion on every endpoint that reports how the request was served."""
+    msgs = [{"role": "user", "content": "Hello"}]
+    bodies = {}
+    res = server.make_request("POST", "/completion", data={"prompt": "Hello", "n_predict": 4})
+    bodies["completion"] = res.body
+    res = server.make_request("POST", "/v1/completions", data={"prompt": "Hello", "max_tokens": 4})
+    bodies["oai_completion"] = res.body
+    res = server.make_request("POST", "/v1/chat/completions", data={"messages": msgs, "max_tokens": 4})
+    bodies["chat"] = res.body
+    res = server.make_request("POST", "/v1/responses", data={"input": "Hello", "max_output_tokens": 4})
+    bodies["responses"] = res.body
+    res = server.make_request("POST", "/v1/messages", data={"messages": msgs, "max_tokens": 4})
+    bodies["messages"] = res.body
+    events = list(server.make_stream_request("POST", "/v1/chat/completions", data={
+        "messages": msgs, "max_tokens": 4, "stream": True, "stream_options": {"include_usage": True}}))
+    bodies["chat_stream"] = events[-1]
+    events = list(server.make_stream_request("POST", "/v1/responses", data={
+        "input": "Hello", "max_output_tokens": 4, "stream": True}))
+    bodies["responses_stream"] = [e for e in events if e.get("type") == "response.completed"][0]["response"]
+    return bodies
+
+
+@pytest.mark.parametrize("preempt_ram", [None, "1024"])
+def test_the_preempt_record_is_sent_only_by_a_server_that_can_park(preempt_ram):
+    global server
+    server.n_slots = 2
+    server.kv_unified = True
+    server.jinja = True
+    if preempt_ram is not None:
+        os.environ["LLAMA_ARG_PREEMPT_RAM"] = preempt_ram
+    server.start(timeout_seconds=START_TIMEOUT)
+    for name, body in _final_bodies().items():
+        if preempt_ram is None:
+            assert "preempt" not in body, name
+        else:
+            assert body["preempt"] == {"parks": 0, "recomputes": 0}, name
+

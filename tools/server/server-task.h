@@ -388,6 +388,7 @@ struct server_task_result_cmpl_final : server_task_result {
     // [TAG_PREEMPT] how the request was served: how often it was parked, and how many of those parks re-prefilled instead of restoring saved bytes
     int32_t n_preempt   = 0;
     int32_t n_recompute = 0;
+    bool    preempt_report = false; // the server can park, so the response carries the record
 
     json preempt_to_json() const;
 

@@ -2982,6 +2982,7 @@ private:
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
         res->n_preempt             = slot.n_preempt;
         res->n_recompute           = slot.n_recompute;
+        res->preempt_report        = preempt_last_resort_possible();
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
