@@ -22,7 +22,8 @@
 		FileExtensionText,
 		KeyboardKey,
 		MimeTypeText,
-		SpecialFileType
+		SpecialFileType,
+		ToolSource
 	} from '$lib/enums';
 	import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
 	import {
@@ -32,7 +33,8 @@
 		modelsStore,
 		serverStore,
 		settingsStore,
-		toolsStore
+		toolsStore,
+		uiStore
 	} from '$lib/stores';
 	import type {
 		FileMentionEntry,
@@ -72,7 +74,6 @@
 		disabled?: boolean;
 		isLoading?: boolean;
 		placeholder?: string;
-		showMcpPromptButton?: boolean;
 		showAddButton?: boolean;
 		showModelSelector?: boolean;
 
@@ -102,7 +103,6 @@
 		onValueChange,
 		placeholder = 'Type a message...',
 		showAddButton = true,
-		showMcpPromptButton = false,
 		showModelSelector = true,
 		uploadedFiles = $bindable([]),
 		value = $bindable('')
@@ -151,9 +151,18 @@
 		getServerHome: () => toolsStore.serverHome ?? null,
 		getShowModelSelector: () => showModelSelector,
 		getValue: () => value,
-		hasCwdTools: () => toolsStore.hasEnabledCwdTools,
-		hasPrompts: () =>
-			mcpStore.hasPromptsCapability(conversationsStore.preferences.getAllMcpServerOverrides()),
+		hasCwdTools: () => conversationsStore.preferences.hasEnabledCwdTools(),
+		// policy-aware, same rule as the agentic flow: MCP category on and at
+		// least one globally-enabled server whose group key is not disabled
+		hasPrompts: () => {
+			const prefs = conversationsStore.preferences;
+
+			if (!prefs.isCategoryEnabled(ToolSource.MCP)) return false;
+
+			return mcpStore
+				.getServers()
+				.some((s) => s.enabled && prefs.isServerToolsEnabled(s.id) && s.url.trim());
+		},
 		openModelSelector: () => chatFormActionsRef?.openModelSelector(),
 		setCaretOffset: (offset) => inputRef?.setCaretOffset(offset),
 		setValue: (v) => {
@@ -182,6 +191,8 @@
 	// Resource Dialog State
 	let isResourceDialogOpen = $state(false);
 	let preSelectedResourceUri = $state<string | undefined>(undefined);
+
+	// MCP Servers Dialog State
 
 	let currentConfig = $derived(settingsStore.config);
 
@@ -466,6 +477,19 @@
 		queueMicrotask(() => inputRef?.focus());
 	}
 
+	// A flow outside the chat, e.g. the models manager closing onto it, asks for the
+	// composer back. The dialog's focus scope is still tearing down, so focus on a
+	// frame of its own.
+	$effect(() => {
+		if (uiStore.manageModelsOpen) return;
+
+		if (!uiStore.composerFocusRequested) return;
+
+		uiStore.composerFocusRequested = false;
+
+		setTimeout(() => inputRef?.focus(), 0);
+	});
+
 	// Splice the mention link in place of the `@<query>` token. Uses the
 	// live cursor, not a stale snapshot - the token may have been edited.
 	function handleMentionSelect(entry: FileMentionEntry) {
@@ -616,8 +640,6 @@
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
 				onFileUpload={handleFileUpload}
-				onMcpPromptClick={showMcpPromptButton ? () => pickers.openPromptPicker() : undefined}
-				onMcpResourcesClick={() => (isResourceDialogOpen = true)}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
@@ -630,7 +652,7 @@
 
 	<ContextGaugePopup />
 
-	{#if toolsStore.hasEnabledCwdTools}
+	{#if conversationsStore.preferences.hasEnabledCwdTools()}
 		<ChatFormCurrentWorkingDirectory
 			bind:query={pickers.workingDirectoryQuery}
 			customAnchor={mentionAnchor}

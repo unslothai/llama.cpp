@@ -33,6 +33,7 @@
 	}: Props = $props();
 
 	let chatFormRef: ChatForm | undefined = $state(undefined);
+
 	let formWrapperEl: HTMLDivElement | undefined = $state();
 	let chatId = $derived(page.params.id as string | undefined);
 
@@ -160,6 +161,5 @@
 		onSubmit={handleSubmit}
 		onSystemPromptClick={handleSystemPromptClick}
 		onUploadedFileRemove={handleUploadedFileRemove}
-		showMcpPromptButton
 	/>
 </div>
