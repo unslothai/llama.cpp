@@ -38,8 +38,8 @@
 #define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
-// --preempt-policy default: "cost" (park the cheapest slot, the largest exempt) or "fcfs" (park the newest arrival)
-#define COMMON_PREEMPT_POLICY_DEFAULT "cost"
+// --preempt-policy default: "fcfs" (park the newest arrival) or "cost" (park the cheapest slot, the largest exempt)
+#define COMMON_PREEMPT_POLICY_DEFAULT "fcfs"
 
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)

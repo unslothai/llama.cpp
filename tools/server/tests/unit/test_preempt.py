@@ -20,6 +20,7 @@ _ASYNC_BANNER = "parking and resuming asynchronously"
 
 _scratch = []  # files a test wrote, removed after it
 _cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")  # restored after a test that hides the GPUs
+_policy = os.environ.get("LLAMA_ARG_PREEMPT_POLICY")  # restored after a test that picks one, so the suite can run under either
 
 _PROMPT_A = "Once upon a time there was a brave knight who"
 _PROMPT_B = "The quick brown fox jumps over the lazy dog and"
@@ -55,6 +56,8 @@ def create_server():
                  "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY", "LLAMA_ARG_PREEMPT_POLICY"):
         os.environ.pop(name, None)
+    if _policy is not None:
+        os.environ["LLAMA_ARG_PREEMPT_POLICY"] = _policy
 
 
 def _start(**kwargs):
@@ -383,9 +386,12 @@ def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
         assert res.body["timings"]["predicted_n"] == n_predict
 
 
-def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute():
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute(policy):
     # 1 MiB holds no snapshot, so rotation used to refuse every resident and the head waited forever behind a context-shifting one.
+    # Under fcfs the rotated-out resident is older than the head, and resumed ahead of it at once until it queued behind it.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _start(n_ctx=2048, n_slots=2, n_batch=2048, enable_ctx_shift=True)
 
     # A small n_discard keeps the resident near the end of the pool, so its state never fits the budget.
@@ -1199,18 +1205,21 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
 
 
 @pytest.mark.slow
-def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head(policy):
     # Only context-shifting residents used to be rotated, so a long generation that fit held the pool and the parked slot waited for all of it.
+    # A resident that ends by itself is rotated once the head has waited 30 s and it would run 30 s more, so the head's wait is bounded either way.
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _serve_with_training_context(16384)
     _start(n_ctx=16384, n_slots=2, n_batch=2048)
 
     done = {}
 
     def run(name, n_predict, prompt, id_slot):
-        res = _raw_completion(n_predict, prompt, id_slot, timeout=900)
+        res = _raw_completion(n_predict, prompt, id_slot, timeout=1800)
         done[name] = (time.time(), res)
 
-    # A leads B by 564 cells, so B is parked once the pool fills, and A then runs far longer than the 2 s a parked head waits.
+    # A leads B by 564 cells, so B is parked once the pool fills.
     a = threading.Thread(target=run, args=("a", 16000, _prompt_of(64, _PROMPT_A), 0))
     a.start()
     deadline = time.time() + 300
@@ -1218,8 +1227,8 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
         time.sleep(0.01)
     b = threading.Thread(target=run, args=("b", 8000, _prompt_of(1500, _PROMPT_B), 1))
     b.start()
-    a.join(900)
-    b.join(900)
+    a.join(1800)
+    b.join(1800)
 
     for name in ("a", "b"):
         assert done[name][1].status_code == 200, done[name][1].body
@@ -1229,8 +1238,10 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head():
     text = _log()
     assert "Context size has been exceeded" not in text
     assert "slot context shift" not in text
-    assert "rotated out after 0 context shifts" in text, "the long resident was never rotated out"
-    assert done["b"][0] < done["a"][0], "the parked slot only came back once the long resident had finished"
+    waits = [float(w) for w in re.findall(r"id +1 \| task \d+ \| resumed after ([\d.]+) s", text)]
+    assert waits, "the second request was never parked"
+    # 30 s before a rotation is considered, plus at most 30 s of the resident's own estimated remainder.
+    assert max(waits) < 90.0, f"the parked request waited {waits} s behind a resident that ends by itself"
 
 
 def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():
@@ -1287,7 +1298,7 @@ def test_props_reports_the_preemption_setup(ram):
     assert preempt["notices"] == 2
     assert preempt["recurrent"] is False
     assert preempt["granularity"] == 1
-    assert preempt["policy"] == "cost"
+    assert preempt["policy"] == (_policy or "fcfs")
 
 
 def test_props_reports_preemption_off_without_a_unified_cache():
@@ -1537,11 +1548,14 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
         assert resumed.index(1) < resumed.index(2), resumed
 
 
-def test_the_old_policy_knob_selects_fcfs():
-    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = "fcfs"
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_the_old_policy_knob_selects_the_policy(policy):
+    # The old test knob is an alias only while LLAMA_ARG_PREEMPT_POLICY is unset.
+    os.environ.pop("LLAMA_ARG_PREEMPT_POLICY", None)
+    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = policy
     try:
         _start(n_ctx=256)
-        assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
+        assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
     finally:
         os.environ.pop("LLAMA_SERVER_PREEMPT_POLICY", None)
 
