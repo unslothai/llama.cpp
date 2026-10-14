@@ -646,6 +646,7 @@ static void common_params_fit_impl(
     const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
     int64_t global_surplus_cpu_moe = 0;
     int64_t mem_cpu_moe            = 0; // memory use of device 0 with all MoE tensors in system memory
+    int64_t mem_cpu_moe_model      = 0; // model memory of device 0 with all MoE tensors in system memory
     size_t  moe_cache_min_size     = 0;
     if (hp_nex > 0) {
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
@@ -657,7 +658,8 @@ static void common_params_fit_impl(
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, moe_cache_auto ? &moe_cache_min_size : nullptr);
         add_extra_memory(dmds_cpu_moe);
-        mem_cpu_moe = dmds_cpu_moe[0].mb.total();
+        mem_cpu_moe       = dmds_cpu_moe[0].mb.total();
+        mem_cpu_moe_model = dmds_cpu_moe[0].mb.model;
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -684,7 +686,8 @@ static void common_params_fit_impl(
     // memory already holds most of the experts the split wins: its resident layers cost nothing per token, while the
     // cache pays an upload for every miss
     const int64_t target_moe     = dmds_full[0].free - margins[0];
-    const int64_t mem_experts    = int64_t(dmds_full[0].mb.total()) - mem_cpu_moe;
+    // compare model memory only: dmds_full can be measured at a larger context than the one the fit settled on
+    const int64_t mem_experts    = int64_t(dmds_full[0].mb.model) - mem_cpu_moe_model;
     const double  frac_resident  = mem_experts > 0 ? double(target_moe - mem_cpu_moe) / double(mem_experts) : 1.0;
     if (moe_cache_auto && global_surplus_cpu_moe > 0 && frac_resident >= MOE_CACHE_AUTO_MAX_RESIDENT) {
         LOG_INF("%s: moe cache auto: the layer split keeps %.0f%% of the expert weights in device memory, not using a MoE cache\n",
@@ -715,9 +718,11 @@ static void common_params_fit_impl(
         const int64_t cache_min = 2*int64_t(moe_cache_min_size);
         int64_t cache = target - mem_cpu_moe;
         cache -= cache % MiB;
+        int64_t cache_tested = cache; // last size that was measured, for the log
         bool fits = false;
         for (int i = 0; i < 4 && cache_min > 0 && cache >= cache_min; i++) {
             cparams->moe_cache_size = cache;
+            cache_tested = cache;
             LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
             dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
             add_extra_memory(dmds);
@@ -736,7 +741,7 @@ static void common_params_fit_impl(
         }
 
         LOG_INF("%s: moe cache auto: cache of %" PRId64 " MiB does not fit or is below the minimum of %" PRId64 " MiB, not using a MoE cache\n",
-            __func__, std::max<int64_t>(cache, 0)/MiB, cache_min/MiB);
+            __func__, std::max<int64_t>(cache_tested, 0)/MiB, cache_min/MiB);
     } else if (moe_cache_auto) {
         LOG_INF("%s: moe cache auto: the dense weights do not fit, not using a MoE cache\n", __func__);
     }
