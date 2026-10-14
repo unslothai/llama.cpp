@@ -49,9 +49,9 @@ void llama_model_nemotron_h::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_nemotron_h::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only    = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.attn_norm.weight") == nullptr;
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    const int  mtp_flags   = !ml.load_mtp ? TENSOR_SKIP : 0;
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     // mamba2 Mixer SSM params
     // NOTE: int64_t for tensor dimensions
@@ -259,8 +259,6 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 ggml_tensor * llama_model_nemotron_h::graph::build_attention_layer(ggml_tensor *             cur,

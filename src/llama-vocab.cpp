@@ -1021,7 +1021,20 @@ struct llm_tokenizer_ugm_session {
 
         // normalize the input first
         std::string normalized;
-        normalize(text, &normalized);
+        if (vocab.get_normalizer_opts().nfc) {
+            try {
+                std::string canonical;
+                for (const uint32_t cpt : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text))) {
+                    canonical += unicode_cpt_to_utf8(cpt);
+                }
+                normalize(canonical, &normalized);
+            } catch (const std::invalid_argument &) {
+                // Use the existing UGM normalization path for malformed input.
+                normalize(text, &normalized);
+            }
+        } else {
+            normalize(text, &normalized);
+        }
         size_t input_len = normalized.size();
         if (input_len == 0) {
             return;
@@ -1950,7 +1963,7 @@ struct llama_vocab::impl {
     bool escape_whitespaces         = true;
     bool treat_whitespace_as_suffix = false;
 
-    // BertNormalizer options
+    // Tokenizer normalizer options
     llama_vocab::normalizer_options normalizer_opts;
 
     std::unordered_map<std::string, llama_token> token_to_id;
@@ -2778,7 +2791,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             }
         }
 
-        // BertNormalizer options
+        // Tokenizer normalizer options
+        ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_NFC, normalizer_opts.nfc, false);
         ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_LOWERCASE,     normalizer_opts.lowercase,     false);
         normalizer_opts.strip_accents = normalizer_opts.lowercase;
         ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_STRIP_ACCENTS, normalizer_opts.strip_accents, false);
@@ -2860,6 +2874,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "▁<PRE>"          // CodeLlama
                         || t.first == "<|code_prefix|>" // GLM-4.5
                         || t.first == "<|prefix|>"      // Falcon-H1-Tiny-Coder
+                        || t.first == "<|plamo:fim_prefix|>" // PLaMo-3
                         ) {
                     special_fim_pre_id = t.second;
                     if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
@@ -2881,6 +2896,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "▁<SUF>"         // CodeLlama
                         || t.first == "<|code_suffix|>" // GLM-4.5
                         || t.first == "<|suffix|>"      // Falcon-H1-Tiny-Coder
+                        || t.first == "<|plamo:fim_suffix|>" // PLaMo-3
                         ) {
                     special_fim_suf_id = t.second;
                     if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
@@ -2902,6 +2918,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "▁<MID>"         // CodeLlama
                         || t.first == "<|code_middle|>" // GLM-4.5
                         || t.first == "<|middle|>"      // Falcon-H1-Tiny-Coder
+                        || t.first == "<|plamo:fim_middle|>" // PLaMo-3
                         ) {
                     special_fim_mid_id = t.second;
                     if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
@@ -2952,6 +2969,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             if (special_fim_sep_id == LLAMA_TOKEN_NULL) {
                 if (false
                         || t.first == "<|file_sep|>" // Qwen
+                        || t.first == "<|plamo:file_separator|>" // PLaMo-2/3
                         ) {
                     special_fim_sep_id = t.second;
                     if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
