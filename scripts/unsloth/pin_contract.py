@@ -93,11 +93,11 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 # counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
 # no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
 # It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
-# A pin's own op-count assert (any family, every line of it) is always exempt. Its PATCH line stays in
+# A pin's own op-count assert, as a whole line reconcile_op_count.py rewrites (any family, ggml/ only), is
+# exempt; anything else on those lines is still owed. Its PATCH line stays in
 # the contract and is satisfied by any PATCH at least the pin's under the same MAJOR.MINOR; for a pin
 # that changes the GGML_OP_COUNT enum (the only delta reconcile_op_count.py raises PATCH from, and
 # which it checks per pin itself) a newer MAJOR.MINOR also counts.
-OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
 RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
 # A PATCH line the pin keeps owning still survives when reconcile_op_count.py raised PATCH past it
 # (another pin's op bump merged into the same line): same MAJOR and MINOR, PATCH at least the pin's.
@@ -228,7 +228,6 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
     for cur, text in added:
         stripped = text.strip()
         if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
-                and not OP_COUNT_ASSERT_RE.match(stripped)
                 and stripped not in asserts.get(cur, ())):
             lines[cur].append(stripped)
         code = COMMENT_RE.sub("", text).strip()

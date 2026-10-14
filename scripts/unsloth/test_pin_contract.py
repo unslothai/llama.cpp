@@ -416,6 +416,26 @@ for v, want, name in ((RPC_V.format(mi=6, p=1), 1, "an op pin's PATCH left below
     rc, rep, err = run(d, ps)
     check(name, rc == want and (want == 0 or "RPC_PROTO_PATCH_VERSION" in err), err)
 
+# --- 16. only whole-line asserts reconcile_op_count.py rewrites are exempt ----
+# Code sharing a line with an op-count assert, and an assert outside ggml/ (which reconcile never
+# rewrites), are still the pin's: a merge that drops them loses the pin. The base already names every
+# symbol on those lines, so only line survival can catch the loss.
+SHARED = 'static_assert(GGML_OP_COUNT == 1, "count"); int required_kernel_entry(void);\n'
+OUTSIDE = 'static_assert(GGML_OP_COUNT == 1, "tools guard on the op count");\n'
+BASE_C = "int required_kernel_entry(void); int count = GGML_OP_COUNT;\n"
+BASE_T = "int tool_ops = GGML_OP_COUNT;\n"
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/src/ggml.c": BASE_C, "tools/t.cpp": BASE_T},
+                 {"ggml/src/ggml.c": BASE_C + SHARED, "tools/t.cpp": BASE_T + OUTSIDE}, 16)
+rc, rep, err = run(d, ps)
+check("(fixture) an intact merge with both lines passes", rc == 0, err)
+(d / "ggml/src/ggml.c").write_text(BASE_C)
+rc, rep, err = run(d, ps)
+check("code after an op-count assert on the same line is still owed", rc == 1 and "ggml/src/ggml.c" in err, err)
+(d / "ggml/src/ggml.c").write_text(BASE_C + SHARED)
+(d / "tools/t.cpp").write_text(BASE_T)
+rc, rep, err = run(d, ps)
+check("an op-count assert outside ggml/ is still owed", rc == 1 and "tools/t.cpp" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
