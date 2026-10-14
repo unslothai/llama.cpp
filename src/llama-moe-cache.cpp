@@ -1102,9 +1102,15 @@ struct llama_moe_cache::impl {
             seed_committed.insert(seed_committed.end(), sd.pending.begin(), sd.pending.end());
         } else {
             // some expert tensors were copied without filling their slots, drop the experts admitted to the layer
+            // a host lookup of another layer may have reassigned a slot since the plan, its new owner stays
+            const int32_t key0 = sd.il*g.lru.n_expert;
             for (const auto & f : sd.fills) {
-                g.lru.slot_map[sd.il][f.expert] = -1;
-                g.lru.key_of[f.slot] = -1;
+                if (g.lru.slot_map[sd.il][f.expert] == f.slot) {
+                    g.lru.slot_map[sd.il][f.expert] = -1;
+                }
+                if (g.lru.key_of[f.slot] == key0 + f.expert) {
+                    g.lru.key_of[f.slot] = -1;
+                }
             }
             // the LRU did not change since the plan: restore its order and, if no slot was written, the experts it evicted
             if (g.lru.gen == sd.gen) {
