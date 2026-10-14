@@ -1515,6 +1515,7 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "fcfs"
     _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128)
+    assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
     with ThreadPoolExecutor(3) as pool:
         futures = []
         for i, n_predict in enumerate((700, 450, 450)):
@@ -1550,6 +1551,7 @@ def test_a_prompt_dropped_in_its_prefill_waits_until_it_fits_whole(policy):
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _serve_with_training_context(8192)
     _start(n_ctx=4096, n_slots=2, n_batch=256, n_ubatch=256, cache_ram=0)
+    assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
     with ThreadPoolExecutor(1) as pool:
         older = pool.submit(_cached, 1500, [100 + k % 50 for k in range(1500)], 0)
         deadline = time.time() + 120
