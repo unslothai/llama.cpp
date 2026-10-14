@@ -164,29 +164,49 @@ def load_pins(pr_set: Path) -> list[dict]:
     return pins
 
 
-def op_assert_lines(text: str) -> dict[str, str]:
-    """Stripped lines of text holding op-count static_asserts -> what of the line is still owed.
-
-    Exactly the asserts reconcile_op_count.py finds and rewrites (any family, comment-blanked), to the
-    terminating `;`, so a continuation line holding the message is exempt along with the first. A line
-    of nothing but asserts owes "" (exempt); code sharing the line owes itself, without the assert.
-    """
+def _op_assert_spans(text: str) -> list[range]:
+    """Every op-count static_assert reconcile_op_count.py rewrites (any family, comment-blanked), to its `;`."""
     joined = blank_comments_and_strings(text)
-    clean, hit = list(joined), [False] * len(joined)
+    spans = []
     for count, _, _ in FAMILIES:
         for m in assert_re(count).finditer(joined):
             end = joined.find(";", m.end())
-            for i in range(m.start(), end + 1 if end >= 0 else m.end()):
-                hit[i] = True
-                if clean[i] != "\n":
-                    clean[i] = " "
+            spans.append(range(m.start(), end + 1 if end >= 0 else m.end()))
+    return spans
+
+
+def normalize_op_asserts(text: str) -> str:
+    """text with every digit inside an op-count assert (count and message) replaced by '#'.
+
+    Those are the only characters reconcile_op_count.py rewrites, so a contract line and the merged
+    tree compared in this form agree whatever count the reconcile settled on.
+    """
+    chars = list(text)
+    for span in _op_assert_spans(text):
+        for i in span:
+            if chars[i].isdigit():
+                chars[i] = "#"
+    return "".join(chars)
+
+
+def op_assert_lines(text: str) -> dict[str, str]:
+    """Stripped lines of text holding op-count static_asserts -> what of the line is still owed.
+
+    A line of nothing but asserts (a continuation line holding the message included) owes "" (exempt).
+    A line where code shares the line with an assert owes the whole line in normalize_op_asserts form,
+    which check() matches against the merged tree in the same form.
+    """
+    hit = [False] * len(text)
+    for span in _op_assert_spans(text):
+        for i in span:
+            hit[i] = True
+    joined, norm = blank_comments_and_strings(text), normalize_op_asserts(text)
     out, pos = {}, 0
     for line in text.split("\n"):
         span = range(pos, pos + len(line))
         if line.strip() and any(hit[i] for i in span):
-            rest = "" if not "".join(clean[i] for i in span).strip() else \
-                "".join(text[i] for i in span if not hit[i]).strip()
-            out[line.strip()] = rest
+            code_left = "".join(joined[i] for i in span if not hit[i]).strip()
+            out[line.strip()] = norm[pos:pos + len(line)].strip() if code_left else ""
         pos += len(line) + 1
     return out
 
@@ -283,6 +303,8 @@ def redundancy(contract: dict, base: str, cwd: Path) -> tuple[int, int]:
     total = hit = 0
     for path, wanted in contract["lines"].items():
         text = git(["show", f"{base}:{path}"], cwd, check=False)
+        if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES:
+            text = normalize_op_asserts(text)
         total += len(wanted)
         hit += sum(1 for w in wanted if w in text)
     return hit, total
@@ -327,6 +349,8 @@ def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
         if not target.is_file():
             continue                          # already reported, or a deletion
         text = target.read_text(errors="replace")
+        if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES:
+            text = normalize_op_asserts(text)       # shared-line contract entries are in this form
         lost = [w for w in wanted if w not in text]
         if any(RPC_PATCH_RE.match(w) for w in lost) and rpc_raised(
                 git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text,

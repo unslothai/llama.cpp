@@ -439,6 +439,22 @@ check("a reconciled assert sharing a line with kept code does not fail the pin",
 rc, rep, err = run(d, ps)
 check("an op-count assert outside ggml/ is still owed", rc == 1 and "tools/t.cpp" in err, err)
 
+# --- 17. an op-count assert between code on one line ------------------------
+# An assert between code on one line: the intact and the reconciled line both pass; a dropped short call
+# after the assert still fails (the whole line is owed, digits of the assert aside).
+MID = 'int checked_count() { static_assert(GGML_OP_COUNT == 1, "op count"); return GGML_OP_COUNT; }\n'
+TAIL = 'static_assert(GGML_OP_COUNT == 1, "c"); f();\n'
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/src/ggml.c": BASE_C + "void f(void);\n"},
+                 {"ggml/src/ggml.c": BASE_C + "void f(void);\n" + MID + TAIL}, 17)
+rc, rep, err = run(d, ps)
+check("an assert between code on one line passes intact", rc == 0, err)
+(d / "ggml/src/ggml.c").write_text(BASE_C + "void f(void);\n" + MID.replace("== 1", "== 2").replace("count\")", "count\")") + TAIL.replace("== 1", "== 2"))
+rc, rep, err = run(d, ps)
+check("and passes with its count reconciled", rc == 0, err)
+(d / "ggml/src/ggml.c").write_text(BASE_C + "void f(void);\n" + MID + 'static_assert(GGML_OP_COUNT == 1, "c");\n')
+rc, rep, err = run(d, ps)
+check("a short call dropped after an assert still fails", rc == 1, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
