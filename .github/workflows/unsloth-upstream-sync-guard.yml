@@ -80,7 +80,12 @@ jobs:
             exit 1
           fi
 
-          STRAY="$(jq -r '.files[].filename' <<<"$RESP" | grep -vE '^(\.github/|scripts/unsloth/)' || true)"
+          # A path listed in `removed_ok` may be absent from master (upstream repo metadata the fork
+          # deleted on purpose). Only a deletion is waived: if one of them reappears with fork edits,
+          # its status is no longer "removed" and it fails like any other source divergence.
+          STRAY="$(jq -r --slurpfile cfg "$FILE" '($cfg[0].removed_ok // []) as $ok
+                   | .files[] | select((.status == "removed" and (.filename | IN($ok[]))) | not) | .filename' <<<"$RESP" \
+                   | grep -vE '^(\.github/|scripts/unsloth/)' || true)"
           if [ -n "$STRAY" ]; then
             echo "::error file=$FILE::the fork now diverges from upstream outside .github/ and scripts/unsloth/:"
             echo "$STRAY" | sed 's/^/  /'
