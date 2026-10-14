@@ -81,3 +81,32 @@ def test_the_preempt_record_is_sent_only_by_a_server_that_can_park(preempt_ram):
         else:
             assert body["preempt"] == {"parks": 0, "recomputes": 0}, name
 
+
+@pytest.mark.parametrize("preempt_ram", [None, "1024"])
+def test_a_context_shift_is_left_to_the_decode_unless_parking_is_on(preempt_ram, tmp_path):
+    global server
+    server.n_ctx = 256
+    server.n_slots = 2
+    server.kv_unified = True
+    server.enable_ctx_shift = True
+    server.debug = True
+    server.temperature = 0.0
+    server.log_path = str(tmp_path / "server.log")
+    if preempt_ram is not None:
+        os.environ["LLAMA_ARG_PREEMPT_RAM"] = preempt_ram
+    server.start(timeout_seconds=START_TIMEOUT)
+    res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 320})
+    assert res.status_code == 200
+    assert res.body["truncated"] is True
+    server.stop()
+
+    text = open(server.log_path).read()
+    after = text[text.index("slot context shift"):]
+    i_decode = after.index("n_batch (effective)")
+    i_update = after.index("applying K-shift")
+    if preempt_ram is None:
+        # as upstream: the K-shift runs inside llama_decode()
+        assert i_decode < i_update
+    else:
+        # a park before the decode must see shifted K, so the shift runs first
+        assert i_update < i_decode

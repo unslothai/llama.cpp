@@ -4604,6 +4604,12 @@ private:
             return;
         }
 
+        // nothing can be parked: leave the shift to llama_decode(), which applies it together with any later one
+        if (!preempt_last_resort_possible()) {
+            preempt_shift_pending = false;
+            return;
+        }
+
         preempt_wait_for_shift();
 
         llama_memory_update(ctx_tgt);
