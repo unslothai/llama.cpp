@@ -17,11 +17,20 @@ int main() {
         const char * reg_name  = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
         const bool   supported = ggml_backend_dev_supports_event_query(dev);
 
-        printf("%s (%s): event query %s\n", ggml_backend_dev_name(dev), reg_name, supported ? "yes" : "no");
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+
+        printf("%s (%s): events %s, event query %s\n", ggml_backend_dev_name(dev), reg_name,
+               props.caps.events ? "yes" : "no", supported ? "yes" : "no");
+
+        // a build without events (GGML_CUDA_NO_PEER_COPY) parks synchronously, so there is nothing to query
+        if (!props.caps.events) {
+            continue;
+        }
 
         if (!supported) {
-            if (strcmp(reg_name, "CUDA") == 0) {
-                fprintf(stderr, "%s is a CUDA device without a non-blocking event query\n", ggml_backend_dev_name(dev));
+            if (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0) {
+                fprintf(stderr, "%s is a %s device without a non-blocking event query\n", ggml_backend_dev_name(dev), reg_name);
                 rc = 1;
             }
             continue;
