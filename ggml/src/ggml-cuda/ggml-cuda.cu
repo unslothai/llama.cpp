@@ -2684,6 +2684,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // dimension, which is what changes when a verify batch changes size. a shape this does not
 // separate just shares an entry and re-captures, exactly as before, so it can only help.
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes == 0) {
+        return 0;
+    }
+
     uint64_t key = (uint64_t) (uintptr_t) cgraph->nodes[0];
 
     auto mix = [&key](uint64_t v) {
