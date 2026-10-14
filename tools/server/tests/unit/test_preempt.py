@@ -20,6 +20,7 @@ _ASYNC_BANNER = "parking and resuming asynchronously"
 
 _scratch = []  # files a test wrote, removed after it
 _cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")  # restored after a test that hides the GPUs
+_policy = os.environ.get("LLAMA_ARG_PREEMPT_POLICY")  # restored after a test that picks one, so the suite can run under either
 
 _PROMPT_A = "Once upon a time there was a brave knight who"
 _PROMPT_B = "The quick brown fox jumps over the lazy dog and"
@@ -55,6 +56,8 @@ def create_server():
                  "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY", "LLAMA_ARG_PREEMPT_POLICY"):
         os.environ.pop(name, None)
+    if _policy is not None:
+        os.environ["LLAMA_ARG_PREEMPT_POLICY"] = _policy
 
 
 def _start(**kwargs):
@@ -1295,7 +1298,7 @@ def test_props_reports_the_preemption_setup(ram):
     assert preempt["notices"] == 2
     assert preempt["recurrent"] is False
     assert preempt["granularity"] == 1
-    assert preempt["policy"] == "cost"
+    assert preempt["policy"] == (_policy or "fcfs")
 
 
 def test_props_reports_preemption_off_without_a_unified_cache():
@@ -1545,11 +1548,14 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
         assert resumed.index(1) < resumed.index(2), resumed
 
 
-def test_the_old_policy_knob_selects_fcfs():
-    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = "fcfs"
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_the_old_policy_knob_selects_the_policy(policy):
+    # The old test knob is an alias only while LLAMA_ARG_PREEMPT_POLICY is unset.
+    os.environ.pop("LLAMA_ARG_PREEMPT_POLICY", None)
+    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = policy
     try:
         _start(n_ctx=256)
-        assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
+        assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
     finally:
         os.environ.pop("LLAMA_SERVER_PREEMPT_POLICY", None)
 
