@@ -186,28 +186,15 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (ggml_cuda_unified_memory_enabled()) {
-#if defined(GGML_USE_HIP)
-        // Say so once. Every report of this path going wrong has come from someone
-        // who did not know a front-end had set the variable for them.
-        //
-        // This deliberately does NOT warn about corrupted output. An earlier draft
-        // did, pointing at ggml-org#26148, but that defect is the cpy 2D fast path
-        // using cudaMemcpyDeviceToDevice on managed pages, and it is fixed
-        // separately. Warning about it in a tree that carries the fix would send
-        // users chasing a bug their build does not have.
-        //
-        // What remains true is the cost. On an integrated GPU managed allocation
-        // draws host RAM instead of the device carve-out rather than adding to it,
-        // so it is usually slower and can lower the ceiling: a model that loads
-        // without the variable may be OOM-killed with it.
-        GGML_LOG_WARN_ONCE("GGML_CUDA_ENABLE_UNIFIED_MEMORY is set, allocating device memory as managed. "
-                           "On integrated GPUs this draws host RAM instead of the device carve-out, which is "
-                           "usually slower and can reduce the largest model that will load. Unset the variable "
-                           "to disable it.\n");
-#endif // defined(GGML_USE_HIP)
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
+            // said once: reports of this path going wrong come from users who did not know a front-end set the variable
+            GGML_LOG_WARN_ONCE("GGML_CUDA_ENABLE_UNIFIED_MEMORY is set, allocating device memory as managed. "
+                               "On integrated GPUs this draws host RAM instead of the device carve-out, which is "
+                               "usually slower and can reduce the largest model that will load. Unset the variable "
+                               "or set it to 0 to disable it.\n");
+
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
             // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
             (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
