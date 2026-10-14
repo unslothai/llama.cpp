@@ -3601,7 +3601,6 @@ private:
                         if (slot.is_processing()) {
                             n_processing_slots++;
                         }
-                        // [TAG_PREEMPT] Transfers count as parked: none of them decodes.
                         if (slot.preempt_is_out()) {
                             n_preempted_slots++;
                         }
@@ -3909,7 +3908,6 @@ private:
     // [TAG_PREEMPT] --preempt-policy fcfs: park the newest arrival, resume and reserve in arrival order.
     bool preempt_fcfs = false;
 
-    // [TAG_PREEMPT_ASYNC] False with --no-preempt-async or a backend without async copies.
     bool preempt_async_ok = false;
 
     // [TAG_EXACT_CONCURRENCY] Pool allocation granularity: 1, or the page size under exact concurrency; LLAMA_SERVER_PREEMPT_GRANULARITY overrides.
@@ -3942,7 +3940,6 @@ private:
 
     bool preempt_ram_kind_logged = false;
 
-    // [TAG_PREEMPT] Logged once, not per park.
     bool preempt_recompute_logged = false;
 
     void preempt_log_ram_kind(const server_slot & slot) {
@@ -4214,7 +4211,6 @@ private:
         return res;
     }
 
-    // Cells try_clear_idle_slots() can free.
     int32_t preempt_n_idle_cells() const {
         int32_t res = 0;
 
@@ -4445,7 +4441,6 @@ private:
         return false;
     }
 
-    // [TAG_PREEMPT] Room a park frees: the slot's cells plus its next step.
     int32_t preempt_n_freed(const server_slot & slot) const {
         const int32_t n_cur = slot.prompt.n_tokens();
 
@@ -4480,7 +4475,6 @@ private:
             return false;
         }
 
-        // a held prompt with no cells frees nothing
         if (preempt_held(slot) && slot.prompt.n_tokens() == 0) {
             return false;
         }
@@ -4514,7 +4508,6 @@ private:
     server_slot * preempt_pick_victim_pass(const server_slot * exempt, bool recompute, int32_t n_deficit = 0) {
         server_slot * victim = nullptr;
 
-        // the smallest single victim covering the deficit, unstarved first
         server_slot * cover[2] = { nullptr, nullptr };
 
         for (auto & slot : slots) {
@@ -4862,7 +4855,6 @@ private:
             return;  // no cache (embedding model): nothing to park
         }
 
-        // [TAG_PREEMPT] With --preempt-ram 0 and nothing parked there is nothing to scan.
         if (params_base.preempt_ram_mib == 0 && !preempt_any_out()) {
             return;
         }
@@ -5105,7 +5097,6 @@ private:
 
             metrics.n_resume++;
 
-            // [TAG_PREEMPT] A synchronous restore lands as it is issued.
             send_preempt_notice(*best, false, recompute);
 
             if (recompute) {
@@ -5653,7 +5644,6 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                // [TAG_PREEMPT] A parked slot has nothing in the cache to batch.
                 if (!slot.is_processing() || slot.preempt_is_out()) {
                     return;
                 }
@@ -6225,7 +6215,6 @@ private:
 
                         slot.i_batch = batch.size() - 1;
 
-                        // [TAG_PREEMPT] The sampler and counters carry on from where the park left them.
                         if (!slot.preempt_reprefill) {
                             slot.stats.n_gen = 0;
 
@@ -6339,7 +6328,6 @@ private:
         return preempt_state_relocates(model_tgt) || preempt_state_relocates(model_dft);
     }
 
-    // [TAG_PREEMPT_ASYNC] Whether a park can happen at all and go asynchronously.
     bool preempt_async_possible() const {
         return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
                slots.size() >= 2 && llama_get_memory(ctx_tgt) && !preempt_state_relocates();
@@ -6435,7 +6423,6 @@ private:
 
             n_parked++;
 
-            // [TAG_PREEMPT_ASYNC] The cells are needed now: wait for the copy.
             if (victim->state == SLOT_STATE_PREEMPTING) {
                 while (preempt_wait_in_flight()) {
                 }
@@ -7324,7 +7311,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 for (size_t i = 1; i < arr.size(); i++) {
                     choices.push_back(std::move(arr[i]["choices"][0]));
                 }
-                // [TAG_PREEMPT] One response covers every prompt, so its counters sum all results.
                 if (arr[0].contains("preempt")) {
                     int64_t n_parks      = 0;
                     int64_t n_recomputes = 0;
@@ -7627,7 +7613,6 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_metrics",            params.endpoint_metrics },
         // [TAG_EXACT_CONCURRENCY] Tells clients whether the mode is active, since a build ignoring the variable still starts.
         { "exact_concurrency",           common_exact_concurrency() },
-        // [TAG_PREEMPT] Whether and how this process parks sequences under pressure.
         { "preempt",                     meta.preempt },
         { "ui",                          params.ui },
         { "ui_settings",                 meta.json_ui_settings },

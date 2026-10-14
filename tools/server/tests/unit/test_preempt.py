@@ -33,7 +33,6 @@ def create_server():
     server = ServerPreset.tinyllama2()
     server.n_slots = 2
     server.kv_unified = True
-    # --preempt-ram defaults to 0, so parking must be enabled.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     server.server_slots = True
     server.server_metrics = True
@@ -738,7 +737,6 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
         assert res.status_code == 200, res.body
         assert res.body["timings"]["prompt_n"] == 3500
         text = _log()[mark:]
-        # Decode steps are one token per slot, so the wide ubatches are the prompt's.
         return [w for w in _ubatch_widths(text) if w > 3]
 
     alone = prefill(1000)
@@ -825,7 +823,6 @@ def test_a_park_right_after_a_context_shift_does_not_change_the_output():
     n_prompt = reference.body["timings"]["prompt_n"]
     server.stop()
 
-    # The pool holds n_ctx cells, so the first shift is that many tokens in.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = str(256 - n_prompt)
     _start()
@@ -1068,7 +1065,6 @@ def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
 
 def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     # A recompute park mid-prefill restarts the prefill, so the prompt count before the park must be dropped too.
-    # The park's host allocation is forced to fail, so it drops the cells instead.
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
     _start(n_ctx=2048, n_batch=256)
 
@@ -1144,7 +1140,6 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     # A 7300-cell parked head used to wait forever while short requests kept a resident present. Once the head has waited its turn, never-resident prompts wait for it.
     # 1 MiB holds no short request's state, so only the reservation brings the head back before PREEMPT_ROTATE_RECOMPUTE_US.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
-    # Parks the head while it generates.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "48"
     # On CUDA a prompt chunk across position 2048 of this model hangs llama_decode (also on base), so run on CPU; the code under test is host-side.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -1280,7 +1275,6 @@ def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small
 
 @pytest.mark.parametrize("ram", ["8192", "0", "unset"])
 def test_props_reports_the_preemption_setup(ram):
-    # Clients read this instead of guessing from the version.
     if ram == "unset":
         os.environ.pop("LLAMA_ARG_PREEMPT_RAM", None)
     else:
