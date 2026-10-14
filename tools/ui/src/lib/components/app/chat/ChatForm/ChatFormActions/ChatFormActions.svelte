@@ -1,20 +1,21 @@
 <script lang="ts">
 	import { SkipForward, Square } from '@lucide/svelte';
-	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import {
-		ChatFormActionModels,
+		ChatFormActionReasoning,
 		ChatFormActionRecord,
 		ChatFormActionsAdd,
 		ChatFormActionSubmit,
-		ChatFormContextGauge
+		ChatFormContextGauge,
+		ModelsSelector
 	} from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
-	import { ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { setChatFormActionsContext } from '$lib/contexts';
 	import { FileTypeCategory, MessageRole } from '$lib/enums';
+	import { useChatFormModel } from '$lib/hooks/use-chat-form-model.svelte';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, mcpStore, settingsStore } from '$lib/stores';
+	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -32,8 +33,6 @@
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
-		onMcpPromptClick?: () => void;
-		onMcpResourcesClick?: () => void;
 	}
 
 	let {
@@ -45,8 +44,6 @@
 		isReasoning = false,
 		isRecording = false,
 		onFileUpload,
-		onMcpPromptClick,
-		onMcpResourcesClick,
 		onMicClick,
 		onStop,
 		onSystemPromptClick,
@@ -57,24 +54,20 @@
 
 	let currentConfig = $derived(settingsStore.config);
 
-	let hasMcpPromptsSupport = $derived.by(() => {
-		const perChatOverrides = conversationsStore.preferences.getAllMcpServerOverrides();
+	const formModel = useChatFormModel();
 
-		return mcpStore.hasPromptsCapability(perChatOverrides);
+	let hasAudioModality = $derived(formModel.hasAudioModality);
+	let hasVideoModality = $derived(formModel.hasVideoModality);
+	let hasVisionModality = $derived(formModel.hasVisionModality);
+	let hasModelSelected = $derived(formModel.hasModelSelected);
+	let isSelectedModelInCache = $derived(formModel.isSelectedModelInCache);
+	let submitTooltip = $derived.by(() => {
+		if (!hasModelSelected) return 'Please select a model first';
+
+		if (!isSelectedModelInCache) return 'Selected model is not available, please select another';
+
+		return '';
 	});
-
-	let hasMcpResourcesSupport = $derived.by(() => {
-		const perChatOverrides = conversationsStore.preferences.getAllMcpServerOverrides();
-
-		return mcpStore.hasResourcesCapability(perChatOverrides);
-	});
-
-	let hasAudioModality = $state(false);
-	let hasVideoModality = $state(false);
-	let hasVisionModality = $state(false);
-	let hasModelSelected = $state(false);
-	let isSelectedModelInCache = $state(true);
-	let submitTooltip = $state('');
 
 	let hasAudioAttachments = $derived(
 		uploadedFiles.some((file) => getFileTypeCategory(file.type) === FileTypeCategory.AUDIO)
@@ -83,7 +76,7 @@
 		hasAudioModality && !canSubmit && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
 
-	let selectorModelRef: ChatFormActionModels | undefined = $state(undefined);
+	let selectorModelRef: ModelsSelector | undefined = $state(undefined);
 
 	export function openModelSelector() {
 		selectorModelRef?.open();
@@ -141,12 +134,6 @@
 		get hasAudioModality() {
 			return hasAudioModality;
 		},
-		get hasMcpPromptsSupport() {
-			return hasMcpPromptsSupport;
-		},
-		get hasMcpResourcesSupport() {
-			return hasMcpResourcesSupport;
-		},
 		get hasVideoModality() {
 			return hasVideoModality;
 		},
@@ -155,15 +142,6 @@
 		},
 		get onFileUpload() {
 			return onFileUpload;
-		},
-		get onMcpPromptClick() {
-			return onMcpPromptClick;
-		},
-		get onMcpResourcesClick() {
-			return onMcpResourcesClick;
-		},
-		get onMcpSettingsClick() {
-			return () => goto(ROUTES.MCP_SERVERS);
 		},
 		get onSystemPromptClick() {
 			return onSystemPromptClick;
@@ -187,13 +165,9 @@
 		{/if}
 
 		{#if showModelSelector}
-			<ChatFormActionModels
-				bind:hasAudioModality
-				bind:hasModelSelected
-				bind:hasVideoModality
-				bind:hasVisionModality
-				bind:isSelectedModelInCache
-				bind:submitTooltip
+			<ChatFormActionReasoning />
+
+			<ModelsSelector
 				bind:this={selectorModelRef}
 				{disabled}
 				forceForegroundText
@@ -204,7 +178,7 @@
 
 	{#if isReasoning}
 		<Button
-			class="group h-8 w-8 rounded-full p-0"
+			class="group h-8 w-8 rounded-full p-0 max-md:h-9 max-md:w-9"
 			onclick={() =>
 				ChatService.stopReasoning(activeMessage?.completionId ?? '', activeMessage?.model)}
 			title="Skip reasoning"
@@ -221,7 +195,7 @@
 
 	{#if isLoading && !canSubmit}
 		<Button
-			class="group h-8 w-8 rounded-full p-0 hover:bg-destructive/10!"
+			class="group h-8 w-8 rounded-full p-0 max-md:h-9 max-md:w-9 hover:bg-destructive/10!"
 			onclick={onStop}
 			type="button"
 			variant="secondary"
