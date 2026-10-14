@@ -1857,7 +1857,8 @@ static int64_t common_model_n_layer(const std::string & path) {
         case GGUF_TYPE_INT32:  n_layer = gguf_get_val_i32(gguf_ctx.get(), id); break;
         default: break;
     }
-    return n_layer > 0 ? n_layer : -1;
+    // the loader rejects more than LLAMA_MAX_LAYERS (512) layers, so a larger count is malformed: treat it as unknown rather than scan it
+    return n_layer > 0 && n_layer <= 512 ? n_layer : -1;
 }
 
 // whether the tensor overrides (terminated by a null pattern, nullptr for none) put every routed expert of some layer in [il_begin, il_end) served by the MoE cache in a host buffer
@@ -1897,7 +1898,8 @@ static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_o
     // the expert tensors the MoE cache serves (ffn_*_exps of llama-arch.cpp): a model has either separate gate/up/down experts or fused gate_up/down experts
     // the tensor set of the model is unknown here, so a layer counts if either complete set is on the host
     // the layer index matters for per-layer patterns such as --n-cpu-moe
-    for (int64_t il = il_begin; il < il_end; ++il) {
+    il_end = std::min<int64_t>(il_end, 512);
+    for (int64_t il = std::max<int64_t>(il_begin, 0); il < il_end; ++il) {
         const bool down = is_host((int) il, "ffn_down_exps");
         if (!down) {
             continue;
