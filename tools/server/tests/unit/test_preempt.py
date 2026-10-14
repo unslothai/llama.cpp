@@ -1370,3 +1370,24 @@ def test_an_idle_slot_inside_the_margin_keeps_its_cache():
     assert res.body["timings"]["prompt_n"] == 1, res.body["timings"]
     assert "purging slot" not in _log()
 
+
+def test_a_started_slot_that_fits_once_trimmed_parks_nobody():
+    # Slot 0 keeps 300 of its 600 old cells: 300 + 336 + 60 + 310 fit 1024, but the untrimmed count parked the generating slot and purged slot 2.
+    _start(n_ctx=1024, n_slots=3, n_batch=512, n_ubatch=512, cache_ram=0)
+    old = [100 + i % 50 for i in range(600)]
+    idle = [300 + i % 30 for i in range(60)]
+    assert _cached(1, old, 0).status_code == 200
+    assert _cached(1, idle, 2).status_code == 200
+    with ThreadPoolExecutor(1) as pool:
+        gen = pool.submit(_cached, 220, [200 + i for i in range(90)], 1)
+        _wait_processing([1])
+        started = _cached(4, old[:300] + [400 + i % 100 for i in range(336)], 0)
+        generating = gen.result()
+    for res in (started, generating):
+        assert res.status_code == 200, res.body
+        assert res.body["preempt"]["parks"] == 0, res.body["preempt"]
+    rerun = _cached(1, idle, 2)
+    assert rerun.body["timings"]["cache_n"] == 59, rerun.body["timings"]
+    text = _log()
+    assert "purging slot" not in text
+    _assert_nothing_parked(text)
