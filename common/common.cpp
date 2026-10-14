@@ -1280,6 +1280,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
+        // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
+        params.moe_cache_size = cparams.moe_cache_size;
+
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers, common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers));
