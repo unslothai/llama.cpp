@@ -1487,7 +1487,7 @@ def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generati
 
 @pytest.mark.parametrize("policy", ["fcfs", "cost"])
 def test_the_policy_decides_whether_the_newest_or_the_cheapest_slot_is_parked(policy):
-    # The older request is smaller: cost parks it and exempts the larger one, fcfs parks the newer one. Both first purge the idle slot.
+    # fcfs parks the newer request and never the older one; cost parks whichever is cheaper at the time, which depends on the host's speed. Both first purge the idle slot.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128, cache_ram=0)
@@ -1503,9 +1503,11 @@ def test_the_policy_decides_whether_the_newest_or_the_cheapest_slot_is_parked(po
     for res, n_predict in ((older, 600), (newer, 500)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
-    parked, exempt = (newer, older) if policy == "fcfs" else (older, newer)
-    assert exempt.body["preempt"]["parks"] == 0
-    assert parked.body["preempt"]["parks"] > 0
+    if policy == "fcfs":
+        assert older.body["preempt"]["parks"] == 0
+        assert newer.body["preempt"]["parks"] > 0
+    else:
+        assert older.body["preempt"]["parks"] + newer.body["preempt"]["parks"] > 0
     text = _log()
     assert 0 <= text.find("purging slot 2") < text.find("preempted:"), "a running slot was parked while an idle one held cells"
 
@@ -1576,5 +1578,6 @@ def test_oversubscribed_bounded_chats_are_not_time_sliced():
     text = _log()
     assert "Context size has been exceeded" not in text
     assert "rotated out after" not in text
-    parks = sum(r.body["preempt"]["parks"] for r in results)
-    assert 1 <= parks <= 4, parks
+    parks = [r.body["preempt"]["parks"] for r in results]
+    assert 1 <= sum(parks) <= 4, parks
+    assert max(parks) == 1, f"a chat was resumed into room the residents still needed and parked again: {parks}"

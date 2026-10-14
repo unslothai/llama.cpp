@@ -4175,6 +4175,38 @@ private:
         return res;
     }
 
+    // [TAG_PREEMPT] Cells a slot holds once its output limit is reached; -1 if it has no limit.
+    int32_t preempt_n_final(const server_slot & slot) const {
+        if (!slot.task || slot.n_remaining() < 0) {
+            return -1;
+        }
+
+        const int32_t n_cur = std::max(slot.prompt.n_tokens(), slot.state == SLOT_STATE_GENERATING ? 0 : slot.preempt_n_input());
+
+        return preempt_n_cells(std::min(slot.n_ctx, n_cur + slot.n_remaining() + 1));
+    }
+
+    // Cells the residents hold once each reaches its output limit; -1 if one has no limit, or shares cells with a sibling.
+    int32_t preempt_kv_projected() const {
+        int32_t res = 0;
+
+        for (const auto & slot : slots) {
+            if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
+                continue;
+            }
+
+            const int32_t n = preempt_n_final(slot);
+
+            if (n < 0 || preempt_is_family(slot) || slot.state == SLOT_STATE_WAIT_OTHER) {
+                return -1;
+            }
+
+            res += n;
+        }
+
+        return res;
+    }
+
     // Cells try_clear_idle_slots() can free.
     int32_t preempt_n_idle_cells() const {
         int32_t res = 0;
@@ -4850,8 +4882,12 @@ private:
                 const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
                 const int32_t margin   = occupied == 0 ? 0 : preempt_n_margin(1);
 
+                // [TAG_PREEMPT] With every resident bounded, also wait until all of them can reach their output limit beside it, or the growth parks someone again.
+                const int32_t projected = occupied == 0 ? 0 : preempt_kv_projected();
+
                 for (auto * slot : parked) {
-                    if (occupied + preempt_n_need(*slot) + margin <= n_cells) {
+                    if (occupied + preempt_n_need(*slot) + margin <= n_cells &&
+                        (projected < 0 || preempt_n_final(*slot) < 0 || projected + preempt_n_final(*slot) + margin <= n_cells)) {
                         best = slot;
                         break;
                     }
