@@ -776,6 +776,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
             case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
             case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
+            case GGML_TYPE_IQ1_XS:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_XS;   break;
+            case GGML_TYPE_IQ1_XXS:  ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXS;  break;
+            case GGML_TYPE_IQ1_XXXS: ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXXS; break;
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;

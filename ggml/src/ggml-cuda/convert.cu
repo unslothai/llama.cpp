@@ -610,6 +610,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_iq3_xxs_cuda;
         case GGML_TYPE_IQ1_S:
             return dequantize_row_iq1_s_cuda;
+        case GGML_TYPE_IQ1_XS:
+            return dequantize_row_iq1_xs_cuda;
+        case GGML_TYPE_IQ1_XXS:
+            return dequantize_row_iq1_xxs_cuda;
+        case GGML_TYPE_IQ1_XXXS:
+            return dequantize_row_iq1_xxxs_cuda;
         case GGML_TYPE_IQ1_M:
             return dequantize_row_iq1_m_cuda;
         case GGML_TYPE_IQ4_NL:
