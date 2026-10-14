@@ -8505,8 +8505,8 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 
 // same attention as the CPU mask reference, but visiting nonadjacent pages in a different order
 struct test_flash_attn_ext_pages : public test_flash_attn_ext {
-    test_flash_attn_ext_pages(int64_t batch) :
-        test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, batch) {}
+    test_flash_attn_ext_pages(int64_t batch, int64_t hs = 256, ggml_type type_KV = GGML_TYPE_F16, float logit_softcap = 0.0f) :
+        test_flash_attn_ext(hs, hs, 2, {8, 1}, 1024, batch, true, false, 0.0f, logit_softcap, GGML_PREC_F32, type_KV, type_KV) {}
 
     std::string vars() override { return test_flash_attn_ext::vars() + ",exact_pages=1"; }
 
@@ -11717,6 +11717,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t batch : {1, 4, 12}) {
         test_cases.emplace_back(new test_flash_attn_ext_pages(batch));
     }
+    // shapes the paged kernel does not cover: a backend must refuse them, not abort
+    test_cases.emplace_back(new test_flash_attn_ext_pages(4, 64));
+    test_cases.emplace_back(new test_flash_attn_ext_pages(4, 256, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext_pages(4, 256, GGML_TYPE_F16, 30.0f));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
