@@ -4545,14 +4545,13 @@ private:
 
     // [TAG_PREEMPT] A resumed slot is not rotated out before PREEMPT_ROTATE_MIN_GEN tokens (or one token and PREEMPT_ROTATE_US), so two slots cannot swap cells without progress.
     bool preempt_served(const server_slot & slot) const {
-        if (slot.n_preempt == 0) {
-            return true;
-        }
-
         const int32_t n_gen = (int32_t) slot.stats.n_gen - slot.n_gen_resume;
 
+        // a slot never parked counts from its first token, or a long prefill is rotated out after one token
+        const int64_t t_from = slot.n_preempt == 0 ? slot.stats.t_prompt_last : slot.t_preempt_resume_us;
+
         return n_gen >= PREEMPT_ROTATE_MIN_GEN ||
-               (n_gen > 0 && ggml_time_us() - slot.t_preempt_resume_us >= PREEMPT_ROTATE_US);
+               (n_gen > 0 && ggml_time_us() - t_from >= PREEMPT_ROTATE_US);
     }
 
     bool preempt_any_out() const {
@@ -4829,8 +4828,11 @@ private:
                     bool          pick_enough    = false;
                     bool          budget_refused = false;
                     bool          recompute      = false;
+                    int32_t       n_freed_all    = 0;
 
                     auto rotate_pick = [&](bool with_recompute) {
+                        n_freed_all = 0;
+
                         for (auto & slot : slots) {
                             // [TAG_PREEMPT] Residents that have had their service since resuming, and held prompts sitting on cells.
                             const bool held = preempt_held(slot) && slot.prompt.n_tokens() > 0;
@@ -4852,6 +4854,8 @@ private:
                             const int32_t n_freed = preempt_n_freed(slot);
                             const int32_t n_pick  = pick ? preempt_n_freed(*pick) : 0;
 
+                            n_freed_all += n_freed;
+
                             const bool enough = occupied - n_freed + need <= n_cells;
 
                             if (!pick ||
@@ -4863,11 +4867,20 @@ private:
                         }
                     };
 
+                    // [TAG_PREEMPT] Short alone, a pick is only a first step: if every candidate together cannot make room, it would wait parked beside the head for nothing.
+                    auto drop_futile = [&]() {
+                        if (pick && !pick_enough && occupied - n_freed_all + need > n_cells) {
+                            pick = nullptr;
+                        }
+                    };
+
                     rotate_pick(false);
+                    drop_futile();
 
                     // [TAG_PREEMPT] A resident the budget cannot swap is rotated by dropping its cells, since waiting has no bound. The head waits longer for this, as it costs the resident a full re-prefill.
                     if (!pick && budget_refused && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_RECOMPUTE_US) {
                         rotate_pick(true);
+                        drop_futile();
 
                         recompute = pick != nullptr;
                     }
