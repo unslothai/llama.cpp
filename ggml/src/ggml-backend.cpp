@@ -2194,10 +2194,30 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         }
     }
 
+    // backends with SYNC copies, which the graph allocator holds
+    std::vector<bool> has_sync(sched->n_backends, false);
+    for (const ggml_tensor * t : sync_copies) {
+        auto it = owner.find(t);
+        if (it != owner.end() && shared.count(t) == 0) {
+            has_sync[sched->splits[it->second].backend_id] = true;
+        }
+    }
+
     static char dry_placeholder;
 
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+
+        // the reserve does not budget the SYNC copies of this graph on top of a larger arena kept from an earlier graph (e.g. the ubatch that seeds the MoE cache)
+        // free it, so that the graph allocator can grow into that memory, the arena is allocated again when a graph needs more staging
+        if (!dry && has_sync[b] && pf->arena != NULL && pf->arena_size > pf->staging) {
+            // the old arena may still be read or written
+            ggml_backend_sched_prefetch_sync(sched);
+            ggml_backend_buffer_free(pf->arena);
+            pf->arena      = NULL;
+            pf->arena_size = 0;
+        }
+
         if (pf->n_bound == 0) {
             continue;
         }
