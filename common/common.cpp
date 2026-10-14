@@ -1266,7 +1266,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
+            params.moe_cache_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        if (params.moe_cache_auto) {
+            // the fit writes its expert placement into params, keep the cache size it chose with it,
+            // so that a reload from params (e.g. the server waking from sleep) gets the same cache
+            params.moe_cache_size = cparams.moe_cache_size;
+            params.moe_cache_auto = false;
+        }
+    } else if (params.moe_cache_auto) {
+        LOG_WRN("%s: --moe-cache-mib auto needs --fit on, not using a MoE cache\n", __func__);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
