@@ -1833,14 +1833,18 @@ enum common_expert_layout {
 };
 
 // number of repeating layers of the model (the <arch>.block_count key the loader reads into n_layer_all), -1 if unknown, and its expert tensor layout
-// for a split model the metadata and the tensor names are read from the first split, which may hold no expert tensor: the layout is then unknown
+// for a split model the metadata is read from the first split, the tensor names from the first split that holds an expert tensor (e.g. the first split may hold no tensor)
 static int64_t common_model_n_layer(const std::string & path, common_expert_layout & layout) {
     layout = COMMON_EXPERT_LAYOUT_UNKNOWN;
     std::string fname = path;
+    std::string prefix;
+    int n_split = 1;
     static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
     std::smatch m;
     if (std::regex_search(path, m, re_split)) {
-        fname = path.substr(0, m.position(0)) + "-00001-of-" + m[2].str() + ".gguf";
+        prefix  = path.substr(0, m.position(0));
+        n_split = std::stoi(m[2].str());
+        fname   = prefix + "-00001-of-" + m[2].str() + ".gguf";
     }
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
@@ -1855,12 +1859,24 @@ static int64_t common_model_n_layer(const std::string & path, common_expert_layo
         return -1;
     }
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
-    for (int64_t i = 0; i < gguf_get_n_tensors(gguf_ctx.get()) && layout == COMMON_EXPERT_LAYOUT_UNKNOWN; ++i) {
-        const char * name = gguf_get_tensor_name(gguf_ctx.get(), i);
-        if (strstr(name, "ffn_gate_up_exps") != nullptr) {
-            layout = COMMON_EXPERT_LAYOUT_FUSED;
-        } else if (strstr(name, "ffn_gate_exps") != nullptr || strstr(name, "ffn_up_exps") != nullptr) {
-            layout = COMMON_EXPERT_LAYOUT_SEPARATE;
+    const auto scan_layout = [&layout](const gguf_context * ctx) {
+        for (int64_t i = 0; i < gguf_get_n_tensors(ctx) && layout == COMMON_EXPERT_LAYOUT_UNKNOWN; ++i) {
+            const char * name = gguf_get_tensor_name(ctx, i);
+            if (strstr(name, "ffn_gate_up_exps") != nullptr) {
+                layout = COMMON_EXPERT_LAYOUT_FUSED;
+            } else if (strstr(name, "ffn_gate_exps") != nullptr || strstr(name, "ffn_up_exps") != nullptr) {
+                layout = COMMON_EXPERT_LAYOUT_SEPARATE;
+            }
+        }
+    };
+    scan_layout(gguf_ctx.get());
+    // only the metadata of the other splits is read, a missing split leaves the layout unknown
+    for (int i = 1; i < n_split && layout == COMMON_EXPERT_LAYOUT_UNKNOWN; ++i) {
+        std::vector<char> split_path(prefix.size() + 32);
+        llama_split_path(split_path.data(), split_path.size(), prefix.c_str(), i, n_split);
+        gguf_context_ptr split_ctx(gguf_init_from_file(split_path.data(), gguf_params));
+        if (split_ctx) {
+            scan_layout(split_ctx.get());
         }
     }
     const int64_t id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
