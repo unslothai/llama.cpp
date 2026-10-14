@@ -164,11 +164,12 @@ def load_pins(pr_set: Path) -> list[dict]:
     return pins
 
 
-def op_assert_lines(text: str) -> set[str]:
-    """The stripped lines of text that hold nothing but op-count static_asserts.
+def op_assert_lines(text: str) -> dict[str, str]:
+    """Stripped lines of text holding op-count static_asserts -> what of the line is still owed.
 
     Exactly the asserts reconcile_op_count.py finds and rewrites (any family, comment-blanked), to the
-    terminating `;`, so a continuation line holding the message is exempt along with the first.
+    terminating `;`, so a continuation line holding the message is exempt along with the first. A line
+    of nothing but asserts owes "" (exempt); code sharing the line owes itself, without the assert.
     """
     joined = blank_comments_and_strings(text)
     clean, hit = list(joined), [False] * len(joined)
@@ -179,11 +180,13 @@ def op_assert_lines(text: str) -> set[str]:
                 hit[i] = True
                 if clean[i] != "\n":
                     clean[i] = " "
-    out, pos = set(), 0
+    out, pos = {}, 0
     for line in text.split("\n"):
         span = range(pos, pos + len(line))
-        if line.strip() and any(hit[i] for i in span) and not "".join(clean[i] for i in span).strip():
-            out.add(line.strip())
+        if line.strip() and any(hit[i] for i in span):
+            rest = "" if not "".join(clean[i] for i in span).strip() else \
+                "".join(text[i] for i in span if not hit[i]).strip()
+            out[line.strip()] = rest
         pos += len(line) + 1
     return out
 
@@ -227,9 +230,9 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
     main_op_pin = pin_n is not None and pin_n != op_count(fork, cwd)
     for cur, text in added:
         stripped = text.strip()
-        if (len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped)
-                and stripped not in asserts.get(cur, ())):
-            lines[cur].append(stripped)
+        owed = asserts.get(cur, {}).get(stripped, stripped)
+        if len(owed) >= MIN_LINE and not TRIVIAL_RE.match(owed):
+            lines[cur].append(owed)
         code = COMMENT_RE.sub("", text).strip()
         if code:
             symbols[cur].update(SYMBOL_RE.findall(code))
