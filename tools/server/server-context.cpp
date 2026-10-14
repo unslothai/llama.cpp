@@ -159,6 +159,8 @@ constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // Only applies afte
 constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // A parked head waiting this long gets a resident rotated out for it, and new prompts wait.
 constexpr int64_t PREEMPT_ROTATE_RECOMPUTE_US = 30ll * 1000 * 1000;  // After this long the head may also rotate a resident that would need a re-prefill.
 constexpr int32_t PREEMPT_ROTATE_MIN_GEN = 32;  // Tokens a resumed slot decodes before it can be rotated out again.
+constexpr int64_t PREEMPT_ROTATE_BOUNDED_US = 30ll * 1000 * 1000;  // A resident that will end by itself (no context shift, bounded output) is rotated only for a head parked this long,
+constexpr int32_t PREEMPT_ROTATE_MIN_LEFT   = 4096;                  // and only while it has more than this many tokens left to generate.
 
 // [TAG_PREEMPT_ASYNC] An async park frees cells only when its copy lands, so it must start this many steps before the pool runs out.
 constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
@@ -4900,6 +4902,12 @@ private:
 
                             // [TAG_PREEMPT] Under fcfs an older resident is rotated only if it context-shifts, as it may never end.
                             if (preempt_fcfs && !held && slot.task->id < head->task->id && slot.n_ctx_shift == 0) {
+                                continue;
+                            }
+
+                            // [TAG_PREEMPT] Time-slicing residents that end by themselves only trades park copies for nothing; a long one still yields to a head that waited long.
+                            if (!held && slot.n_ctx_shift == 0 && slot.n_remaining() >= 0 &&
+                                (slot.n_remaining() <= PREEMPT_ROTATE_MIN_LEFT || ggml_time_us() - head->t_preempt_us < PREEMPT_ROTATE_BOUNDED_US)) {
                                 continue;
                             }
 
