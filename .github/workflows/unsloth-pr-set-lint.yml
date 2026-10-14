@@ -19,6 +19,8 @@ on:
       - scripts/unsloth/pin_merge.py
       - scripts/unsloth/merge_checks.py
       - scripts/unsloth/reconcile_op_count.py
+      - scripts/unsloth/pin_contract.py
+      - scripts/unsloth/repin.py
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
@@ -35,6 +37,8 @@ on:
       - scripts/unsloth/pin_merge.py
       - scripts/unsloth/merge_checks.py
       - scripts/unsloth/reconcile_op_count.py
+      - scripts/unsloth/pin_contract.py
+      - scripts/unsloth/repin.py
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/test_*.py
@@ -147,6 +151,7 @@ jobs:
                    scripts/unsloth/test_sync_deletes.py \
                    scripts/unsloth/test_carry_vintage.py \
                    scripts/unsloth/test_pin_contract.py \
+                   scripts/unsloth/test_repin.py \
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py; do
             echo "::group::$t"

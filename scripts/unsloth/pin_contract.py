@@ -95,6 +95,10 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_(?:UNARY_|GLU_)?OP_COUNT\s*==")
 MAIN_OP_COUNT_ASSERT_RE = re.compile(r"^static_assert\s*\(\s*GGML_OP_COUNT\s*==")
 RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
+# A PATCH line the pin keeps owning still survives when reconcile_op_count.py raised PATCH past it
+# (another pin's op bump merged into the same line): same MAJOR and MINOR, PATCH at least the pin's.
+RPC_VERSION_RE = {p: re.compile(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + p + r"_VERSION[ \t]+(\d+)", re.M)
+                  for p in ("MAJOR", "MINOR", "PATCH")}
 
 # Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")
@@ -241,6 +245,15 @@ def redundancy(contract: dict, base: str, cwd: Path) -> tuple[int, int]:
     return hit, total
 
 
+def rpc_raised(pin_text: str, text: str) -> bool:
+    """text has the pin's RPC_PROTO MAJOR and MINOR and a PATCH at least the pin's."""
+    v = [{p: (m.group(1) if (m := r.search(t)) else None) for p, r in RPC_VERSION_RE.items()}
+         for t in (pin_text, text)]
+    return (v[0]["PATCH"] is not None and v[1]["PATCH"] is not None
+            and all(v[0][p] == v[1][p] for p in ("MAJOR", "MINOR"))
+            and int(v[1]["PATCH"]) >= int(v[0]["PATCH"]))
+
+
 def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
           threshold: float) -> list[str]:
     problems = []
@@ -264,6 +277,9 @@ def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
             continue                          # already reported, or a deletion
         text = target.read_text(errors="replace")
         lost = [w for w in wanted if w not in text]
+        if any(RPC_PATCH_RE.match(w) for w in lost) and rpc_raised(
+                git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text):
+            lost = [w for w in lost if not RPC_PATCH_RE.match(w)]
         if not lost:
             continue
         kept = len(wanted) - len(lost)

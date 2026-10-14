@@ -45,6 +45,13 @@ only rewritten with --base-ref (the tag the pins were merged onto), against whic
     PATCH is set to base PATCH + |op count delta|, and the output says so.
   * otherwise the assert is rewritten like the others.
 
+The merged tree alone hides two cases, so each pin merged since --base-ref (the side parents of
+HEAD's first-parent merges, or the pin a base was merged into) is also checked against its own fork
+point, merge-base(base, pin): a pin that changed GGML_OP_COUNT there and left RPC_PROTO_*_VERSION
+equal is refused even when another pin's bump covers the merged version, and a version that equals
+the base's is accepted when the op-changing pins all bumped it (upstream made the same bump from
+the same fork point), then PATCH is raised as above.
+
 With --base-ref the version is checked whenever ggml-rpc.h exists, also when the assert already
 says the merged count (a pin that added an op and updated the assert but not RPC_PROTO_*_VERSION
 is the same unbumped protocol) and when it is gone: an RPC assert the base had and the merged tree
@@ -106,6 +113,8 @@ def blank_comments_and_strings(text: str) -> str:
                 if out[k] != "\n":
                     out[k] = " "
             i = j
+        elif c == "'" and re.search(r"(?<![\w.])\.?\d[\w.']*$", text[max(0, i - 64):i]):
+            i += 1      # a C++14 digit separator (100'000, 0x1'0000), not a char literal
         elif c in "\"'":
             j = i + 1
             while j < n and text[j] != c:
@@ -178,7 +187,9 @@ def enum_entries(text: str, clean: str, enum: str, count: str) -> tuple[int, int
         if init:
             if not re.fullmatch(r"\d+", init):
                 raise LayoutError(f"enum {enum}: {name} = {init} is not a plain integer")
-            value = int(init)
+            if int(init) != value:
+                # the tables are indexed by enum value: a gap, alias or reordering breaks that
+                raise LayoutError(f"enum {enum}: {name} = {init}, expected the sequential value {value}")
         if name == count:
             return value, line_of(text, m.start()), names
         names.append(name)
@@ -198,6 +209,9 @@ def table_entries(text: str, clean: str, table: str) -> tuple[list[tuple[str, in
     if not m:
         raise LayoutError(f"table {table} not found in {SOURCE}")
     start, end = braced_body(clean, m.end() - 1)
+    # an initializer under #if is counted here and missing from a build where the condition is false
+    if re.search(r"^\s*#", clean[start:end], re.M):
+        raise LayoutError(f"table {table} ({SOURCE}:{line_of(text, m.start())}) has preprocessor lines")
     items = []
     for a, b in item_spans(clean[start:end]):
         a, b = start + a, start + b
@@ -222,9 +236,19 @@ def check_order(names: list[str], prefix: str, table: str, entries: list[tuple[s
     return bad
 
 
+def git_text(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="surrogateescape")
+
+
 def git_lines(root: Path, *args: str) -> list[str]:
-    r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
-    return r.stdout.splitlines() if r.returncode == 0 else []
+    """stdout lines; `git grep` exits 1 for no match, anything else nonzero (a bad ref) is an error."""
+    r = git_text(root, *args)
+    if r.returncode == 1 and args[0] == "grep":
+        return []
+    if r.returncode:
+        raise LayoutError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r.stdout.splitlines()
 
 
 def base_has_assert(root: Path, ref: str, count: str) -> bool:
@@ -267,7 +291,7 @@ def find_asserts(root: Path, count: str) -> list[tuple[Path, int, int, int, int]
     for p in sorted((root / "ggml").rglob("*")):
         if p.suffix not in SCAN_SUFFIXES or not p.is_file():
             continue
-        text = p.read_text(errors="replace")
+        text = p.read_text(encoding="utf-8", errors="surrogateescape")
         if count not in text:
             continue
         for m in pat.finditer(blank_comments_and_strings(text)):
@@ -281,8 +305,10 @@ def rewrite_assert(text: str, start: int, end: int, old: int, new: int) -> str:
     text = text[:start] + str(new) + text[end:]
     clean = clean[:start] + str(new) + clean[end:]
     comma = clean.find(",", start)
-    s = text.find('"', comma)
-    if comma >= 0 and s >= 0 and not text[comma + 1:s].strip():
+    s = comma + 1
+    while 0 < s < len(clean) and clean[s].isspace():     # comments between are blank in clean
+        s += 1
+    if comma >= 0 and s < len(text) and text[s] == '"':
         e = s
         while e < len(clean) and clean[e] == "S":
             e += 1
@@ -303,10 +329,69 @@ def rpc_version(text: str) -> tuple[dict[str, int], dict[str, tuple[int, int]]]:
 
 
 def git_show(root: Path, ref: str, path: str) -> str:
-    r = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{path}"], capture_output=True, text=True)
+    r = git_text(root, "show", f"{ref}:{path}")
     if r.returncode:
         raise LayoutError(f"cannot read {path} at {ref}: {r.stderr.strip()}")
     return r.stdout
+
+
+def base_has_file(root: Path, ref: str, path: str) -> bool:
+    return bool(git_lines(root, "ls-tree", "--name-only", ref, "--", path))
+
+
+def is_ancestor(root: Path, a: str, b: str) -> bool:
+    r = git_text(root, "merge-base", "--is-ancestor", a, b)
+    if r.returncode not in (0, 1):
+        raise LayoutError(f"git merge-base --is-ancestor {a} {b} failed: {r.stderr.strip()}")
+    return r.returncode == 0
+
+
+def merged_pins(root: Path, base_ref: str) -> list[str]:
+    """The commits merged onto base_ref to make HEAD, read off its first-parent history.
+
+    The nightly checks out the base and merges each pin (`git merge --no-ff`): every first-parent
+    merge's other parents are pins. repin.py merges the base INTO a pin: a merge whose other parents
+    are all in the base has the pin as its first parent, and everything below it is that pin's own
+    history. Non-merge commits (a reconcile commit) are skipped. [] when HEAD has no such merges.
+    """
+    pins = []
+    for line in git_lines(root, "rev-list", "--first-parent", "--parents", f"{base_ref}..HEAD"):
+        parents = line.split()[1:]
+        if len(parents) < 2:
+            continue
+        side = [p for p in parents[1:] if not is_ancestor(root, p, base_ref)]
+        if side:
+            pins += side
+        else:
+            pins.append(parents[0])
+            break
+    return pins
+
+
+def unbumped_pins(root: Path, base_ref: str) -> tuple[list[str], int]:
+    """(problems, number of pins that changed GGML_OP_COUNT and bumped RPC_PROTO_*_VERSION).
+
+    Each merged pin against its own fork point merge-base(base_ref, pin): a pin that changed the op
+    count must have moved the version. The merged tree alone cannot say this. One pin's bump hides
+    another's missing one (both PATCH 0 -> 1 or 0 -> 0 merge to 1), and upstream bumping PATCH to the
+    same value as a pin, from the same fork point, leaves the merged version equal to the base's.
+    """
+    bad, bumped = [], 0
+    for pin in merged_pins(root, base_ref):
+        fork = git_lines(root, "merge-base", base_ref, pin)[0]
+        ph, fh = git_show(root, pin, HEADER), git_show(root, fork, HEADER)
+        pn, _ = enum_count(ph, blank_comments_and_strings(ph), "ggml_op", "GGML_OP_COUNT")
+        fn, _ = enum_count(fh, blank_comments_and_strings(fh), "ggml_op", "GGML_OP_COUNT")
+        if pn == fn:
+            continue
+        pv, _ = rpc_version(git_show(root, pin, RPC_HEADER))
+        fv, _ = rpc_version(git_show(root, fork, RPC_HEADER))
+        if pv == fv:
+            bad.append(f"merged pin {pin[:12]} changed GGML_OP_COUNT by {pn - fn:+d} versus its fork point "
+                       f"{fork[:12]} without bumping RPC_PROTO_*_VERSION")
+        else:
+            bumped += 1
+    return bad, bumped
 
 
 def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True) -> tuple[str, int | None]:
@@ -323,7 +408,8 @@ def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True)
         base_n, _ = enum_count(bh, blank_comments_and_strings(bh), "ggml_op", "GGML_OP_COUNT")
         base_rpc = git_show(root, base_ref, RPC_HEADER)
         base_v, _ = rpc_version(base_rpc)
-        cur_v, _ = rpc_version((root / RPC_HEADER).read_text(errors="replace"))
+        cur_v, _ = rpc_version((root / RPC_HEADER).read_text(encoding="utf-8", errors="surrogateescape"))
+        unbumped, bumped = unbumped_pins(root, base_ref)
     except (LayoutError, OSError) as e:
         return (f"refuse: {e}", None)
     if not has_assert and assert_re("GGML_OP_COUNT").search(blank_comments_and_strings(base_rpc)):
@@ -332,7 +418,11 @@ def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True)
     fmt = lambda v: ".".join(str(v[p]) for p in RPC_PARTS)  # noqa: E731
     delta = n - base_n
     print(f"rpc  GGML_OP_COUNT {base_n} at {base_ref} -> {n}; RPC_PROTO {fmt(base_v)} -> {fmt(cur_v)}")
-    if delta and cur_v == base_v:
+    if unbumped:
+        return ("refuse: " + "; ".join(unbumped) + "; a pin added or removed an op without bumping the RPC "
+                "protocol", None)
+    # unchanged with a bumping pin merged: upstream made the same bump from the same fork point
+    if delta and cur_v == base_v and not bumped:
         return (f"refuse: GGML_OP_COUNT changed by {delta:+d} versus {base_ref} but RPC_PROTO_*_VERSION "
                 f"is still {fmt(base_v)}; a pin added or removed an op without bumping the RPC protocol", None)
     same_mm = all(cur_v[p] == base_v[p] for p in ("MAJOR", "MINOR"))
@@ -353,8 +443,8 @@ def main() -> int:
     root = Path(args.root).resolve()
 
     try:
-        htext = (root / HEADER).read_text(errors="replace")
-        stext = (root / SOURCE).read_text(errors="replace")
+        htext = (root / HEADER).read_text(encoding="utf-8", errors="surrogateescape")
+        stext = (root / SOURCE).read_text(encoding="utf-8", errors="surrogateescape")
     except OSError as e:
         print(f"reconcile_op_count: {e}", file=sys.stderr)
         return 2
@@ -367,19 +457,11 @@ def main() -> int:
     for count, enum, tables in FAMILIES:
         asserts = find_asserts(root, count)
         # with --base-ref the RPC version is checked even when no GGML_OP_COUNT assert is left
-        rpc_check = count == "GGML_OP_COUNT" and bool(args.base_ref) and rpc_path.is_file()
-        try:
-            n, eline, names = enum_entries(htext, hclean, enum, count)
-            entries = {t: table_entries(stext, sclean, t) for t in tables}
-        except LayoutError as e:
-            if not asserts and not rpc_check:
-                print(f"skip {count}: no static_assert in the tree and {e}")
-                continue
-            print(f"ERROR {count}: {e}", file=sys.stderr)
-            layout += 1
-            continue
-        # the enum and tables are checked whether or not any assert is left: a merge that deleted the
-        # last assert must not also switch off the check that it existed for
+        # also when the merge deleted ggml-rpc.h: the base had it, so check_rpc refuses its absence
+        rpc_check = count == "GGML_OP_COUNT" and bool(args.base_ref) and (
+            rpc_path.is_file() or base_has_file(root, args.base_ref, RPC_HEADER))
+        # before the enum and tables are parsed: a merge that deleted the last assert must not pass
+        # because it also left a layout this cannot read (that would take the skip below)
         if not asserts and args.base_ref:
             try:
                 had = base_has_assert(root, args.base_ref, count)
@@ -392,6 +474,17 @@ def main() -> int:
                       "tree has none (deleted or commented out); restore it", file=sys.stderr)
                 bad += 1
                 continue
+        # the enum and tables are checked whether or not any assert is left
+        try:
+            n, eline, names = enum_entries(htext, hclean, enum, count)
+            entries = {t: table_entries(stext, sclean, t) for t in tables}
+        except LayoutError as e:
+            if not asserts and not rpc_check:
+                print(f"skip {count}: no static_assert in the tree and {e}")
+                continue
+            print(f"ERROR {count}: {e}", file=sys.stderr)
+            layout += 1
+            continue
         wrong = {t: (len(v[0]), v[1]) for t, v in entries.items() if len(v[0]) != n}
         if wrong:
             for t, (k, tline) in wrong.items():
@@ -430,7 +523,7 @@ def main() -> int:
                 bad += 1
                 continue
             if patch is not None:
-                vals, spans = rpc_version(rpc_path.read_text(errors="replace"))
+                vals, spans = rpc_version(rpc_path.read_text(encoding="utf-8", errors="surrogateescape"))
                 old = vals["PATCH"]
                 plan.setdefault(rpc_path, []).append((*spans["PATCH"], old, patch, False))
                 print(f"fix  {RPC_HEADER}: RPC_PROTO_PATCH_VERSION {old} -> {patch} (the op count changed by "
@@ -440,7 +533,7 @@ def main() -> int:
             continue
         for p, i, v, st, en in stale:
             plan.setdefault(p, []).append((st, en, v, n, True))
-            print(f"fix  {p.relative_to(root)}:{i}: {count} == {v} -> {n}")
+            print(f"fix  {p.relative_to(root).as_posix()}:{i}: {count} == {v} -> {n}")
         print(f"ok   {count} = {n}: enum and {', '.join(tables)} agree; {len(stale)} of {len(asserts)} "
               f"assert(s) {'would be ' if args.dry_run else ''}rewritten")
 
@@ -450,14 +543,14 @@ def main() -> int:
         return 1 if bad else 2
     if not args.dry_run:
         for p, edits in plan.items():
-            text = p.read_text()
+            text = p.read_text(encoding="utf-8", errors="surrogateescape")
             # back to front, so earlier offsets stay valid
             for st, en, old, new, is_assert in sorted(edits, reverse=True):
                 if is_assert:
                     text = rewrite_assert(text, st, en, old, new)
                 else:
                     text = text[:st] + str(new) + text[en:]
-            p.write_text(text)
+            p.write_text(text, encoding="utf-8", errors="surrogateescape")
     nfix = sum(map(len, plan.values()))
     print(f"reconcile_op_count: {'clean' if not plan else ('would rewrite ' if args.dry_run else 'rewrote ') + str(nfix) + ' line(s)'}")
     return 0

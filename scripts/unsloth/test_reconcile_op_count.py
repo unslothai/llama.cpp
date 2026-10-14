@@ -483,6 +483,157 @@ rc, out = run(d)
 check("op count fell and the version did not move: exit 1",
       rc == 1 and "without bumping the RPC protocol" in out, out)
 
+# --- the pins as real merges: each one is checked against its own fork point -----------------
+MID = BASE[:50] + ["UP_NEW"] + BASE[50:]          # an op inserted mid-enum: merges apart from an append
+
+
+def tree(ops, n, patch):
+    return (ops, ["NONE"] + ops, ["none"] + [o.lower() + "(x)" for o in ops], n, None, 8, patch)
+
+
+def commit_tree(d, msg, t):
+    write_tree(d, *t)
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", msg)
+
+
+def history(upstream, pins, merge_into_pin=False, resolved=None):
+    """tag fork = the 101-op tree; tag base = fork + upstream (None: no change); pins branch off fork.
+
+    resolved: the tree a conflicted merge is resolved to (an unbumped PATCH line next to a bumped one
+    conflicts; the resolution keeps the bump, which is what hides the unbumped pin)."""
+    d = Path(tempfile.mkdtemp(prefix="roc_"))
+    git(d, "init", "-q", "-b", "main")
+    commit_tree(d, "fork", tree(BASE, 101, 0))
+    git(d, "tag", "fork")
+    if upstream:
+        commit_tree(d, "upstream", upstream)
+    git(d, "tag", "base")
+    for i, t in enumerate(pins):
+        git(d, "checkout", "-qb", f"pin{i}", "fork")
+        commit_tree(d, f"pin{i}", t)
+    if merge_into_pin:                               # repin.py: the base merged into the pin
+        git(d, "checkout", "-q", "pin0")
+        git(d, "merge", "-q", "--no-ff", "--no-edit", "base")
+    else:                                            # the nightly: the pins merged onto the base
+        git(d, "checkout", "-q", "--detach", "base")
+        for i in range(len(pins)):
+            r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q",
+                                "--no-ff", "--no-edit", f"pin{i}"], capture_output=True)
+            if r.returncode:
+                commit_tree(d, f"merge pin{i}", resolved)
+    return d
+
+
+# argon 1: upstream and a pin each add an op and bump PATCH 0 -> 1 from the same fork point. The
+# merged version equals the base's, yet both bumped: accepted, PATCH raised to cover the pin's op.
+for into_pin in (False, True):
+    d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 1)], merge_into_pin=into_pin)
+    rc, out = run(d)
+    rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+    src = (d / "ggml" / "src" / "ggml.c").read_text()
+    how = "base merged into the pin" if into_pin else "pin merged onto the base"
+    check(f"upstream and a pin made the same PATCH bump ({how}): reconciled, not refused",
+          rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc and "GGML_OP_COUNT == 103" in rpc
+          and src.count("GGML_OP_COUNT == 103") == 2, out)
+
+d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 0)], resolved=tree(MID + ["PIN_NEW"], 102, 1))
+before = snapshot(d)
+rc, out = run(d)
+check("upstream bumped and the pin did not: still refused",
+      rc == 1 and "without bumping" in out and snapshot(d) == before, out)
+
+# argon 3: pin A bumps PATCH, pin B adds an op without: A's bump must not cover B.
+A, B = BASE[:30] + ["PIN_A"] + BASE[30:], BASE + ["PIN_B"]
+AB = BASE[:30] + ["PIN_A"] + BASE[30:] + ["PIN_B"]
+d = history(None, [tree(A, 102, 1), tree(B, 102, 0)], resolved=tree(AB, 102, 1))
+before = snapshot(d)
+rc, out = run(d)
+check("one pin's RPC bump does not mask another op-changing pin's missing one",
+      rc == 1 and "without bumping RPC_PROTO_*_VERSION" in out and snapshot(d) == before, out)
+d = history(None, [tree(A, 102, 1), tree(B, 102, 1)])
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("both pins bumped (the 10-13 shape as real merges): PATCH 0 + 2",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc and "GGML_OP_COUNT == 103" in rpc, out)
+
+# argon 4: a C++14 digit separator is not a char literal; char literals still are.
+d = make(*TWO)
+p = d / "ggml" / "src" / "extra.cpp"
+p.write_text("static const int BUF = 100'000;\nstatic const wchar_t Q = L'\"';\n"
+             'static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");\n')
+rc, out = run(d)
+check("an assert after a digit separator is still found and rewritten",
+      rc == 0 and 'static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");' in p.read_text(), out + p.read_text())
+
+# argon 5: a comment between the condition and the message.
+d = make(*TWO)
+p = d / "ggml" / "src" / "extra.c"
+p.write_text('static_assert(GGML_OP_COUNT == 102, /* keep "102" */ "GGML_OP_COUNT != 102");\n')
+rc, out = run(d)
+check("the message is rewritten past a comment",
+      rc == 0 and p.read_text() == 'static_assert(GGML_OP_COUNT == 103, /* keep "102" */ "GGML_OP_COUNT != 103");\n',
+      p.read_text())
+
+# argon 6: a fatal git error is not "no match".
+import importlib.util  # noqa: E402
+spec = importlib.util.spec_from_file_location("roc", SCRIPT)
+roc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(roc)
+d = make(BASE, NAMES, SYMS, 101)
+try:
+    r = roc.base_has_assert(d, "no-such-ref", "GGML_OP_COUNT")
+    check("base_has_assert on a bad ref raises", False, f"returned {r}")
+except roc.LayoutError:
+    check("base_has_assert on a bad ref raises", True)
+check("base_has_assert still finds the base's assert", roc.base_has_assert(d, "base", "GGML_OP_COUNT"))
+
+# argon 7: a byte that is not UTF-8 survives the rewrite, and does not crash it.
+d = make(*TWO)
+p = d / "ggml" / "src" / "extra.c"
+p.write_bytes(b'// caf\xe9\nstatic_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");\n')
+rc, out = run(d)
+check("a non-UTF-8 byte is kept and the assert rewritten",
+      rc == 0 and p.read_bytes() == b'// caf\xe9\nstatic_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");\n',
+      out + repr(p.read_bytes()))
+
+# astra 5 / argon 8: explicit enum values that are not sequential break the value-indexed tables.
+d = make(BASE, NAMES, SYMS, 101)
+h = d / "ggml" / "include" / "ggml.h"
+h.write_text(h.read_text().replace("GGML_OP_OP0,", "GGML_OP_OP0 = 2,").replace("GGML_OP_OP1,", "GGML_OP_OP1 = 1,")
+             .replace("GGML_OP_OP2,", "GGML_OP_OP2 = 3,"))
+before = snapshot(d)
+rc, out = run(d)
+check("non-sequential explicit enum values exit 2", rc == 2 and "expected the sequential value" in out
+      and snapshot(d) == before, out)
+
+# astra 1: the last GLU assert deleted and the GLU table unreadable must not take the skip.
+d = make(*TWO)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace(GLU_ASSERT, "")
+               .replace("static const char * GGML_GLU_OP_NAME", "static const char * const GGML_GLU_OP_NAME"))
+before = snapshot(d)
+rc, out = run(d)
+check("a deleted assert next to an unreadable table is refused, not skipped",
+      rc == 1 and "base has a static_assert(GGML_GLU_OP_COUNT" in out and snapshot(d) == before, out)
+
+# astra 3: an initializer under #if is missing from builds where the condition is false.
+d = make(*TWO)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace('    "flash_attn_ext_banded(x)",\n    "moe_cache_lookup(x)",',
+                                       '#ifdef GGML_USE_CUDA\n    "flash_attn_ext_banded(x)",\n    "moe_cache_lookup(x)"\n#endif'))
+before = snapshot(d)
+rc, out = run(d)
+check("a preprocessor line inside a table exits 2", rc == 2 and "GGML_OP_SYMBOL" in out and "preprocessor" in out
+      and snapshot(d) == before, out)
+
+# astra 4: deleting ggml-rpc.h, which the base has, must not switch the RPC check off.
+d = make(*TWO)
+(d / "ggml" / "include" / "ggml-rpc.h").unlink()
+before = snapshot(d)
+rc, out = run(d)
+check("ggml-rpc.h deleted by the merge: exit 1, nothing rewritten", rc == 1 and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)

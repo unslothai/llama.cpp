@@ -284,6 +284,53 @@ rc, rep, err = run(d, ps10)
 check("a unary-only pin whose PATCH bump was lost fails",
       rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
 
+# --- 11. an RPC-only pin whose PATCH bump reconcile_op_count.py raised -------
+# Two op pins and an RPC-only pin each bump PATCH 0 -> 1; the three identical edits merge to one, and
+# reconcile_op_count.py raises PATCH to 0 + 2 for the two ops. The RPC-only pin's own "PATCH 1" line
+# is gone, but its bump is still covered (PATCH only went up): that must not fail the pin. A PATCH
+# that went below the pin's, or a MINOR that moved, still does.
+RPC_H = ("#define RPC_PROTO_MAJOR_VERSION    3\n#define RPC_PROTO_MINOR_VERSION    6\n"
+         "#define RPC_PROTO_PATCH_VERSION    {p}\n\n\n\n"
+         'static_assert(GGML_OP_COUNT == {n}, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");\n')
+ENUM_C = "enum ggml_op {{\n    GGML_OP_NONE,\n{ops}    GGML_OP_COUNT,\n}};\n"
+d = Path(tempfile.mkdtemp(prefix="pc_"))
+git(d, "init", "-q", "-b", "main")
+(d / "ggml").mkdir()
+(d / "ggml" / "ggml-rpc.h").write_text(RPC_H.format(p=0, n=1))
+(d / "ggml" / "ggml.c").write_text(ENUM_C.format(ops=""))
+git(d, "add", "-A"); git(d, "commit", "-qm", "base"); git(d, "tag", "b1")
+shas = []
+git(d, "checkout", "-qb", "rpconly", "b1")
+(d / "ggml" / "ggml-rpc.h").write_text(RPC_H.format(p=1, n=1))
+(d / "ggml" / "rpc.c").write_text("int rpc_new_command_handler(void) { return 3; }\n")
+git(d, "add", "-A"); git(d, "commit", "-qm", "rpc only"); shas.append(git(d, "rev-parse", "HEAD").stdout.strip())
+for op in ("GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
+    git(d, "checkout", "-qb", op, "b1")
+    (d / "ggml" / "ggml-rpc.h").write_text(RPC_H.format(p=1, n=2))
+    (d / "ggml" / "ggml.c").write_text(ENUM_C.format(ops=f"    {op},\n"))
+    git(d, "add", "-A"); git(d, "commit", "-qm", op); shas.append(git(d, "rev-parse", "HEAD").stdout.strip())
+git(d, "checkout", "-q", "main")
+for b in ("rpconly", "GGML_OP_BANDED", "GGML_OP_MOE_CACHE"):
+    if git(d, "merge", "-q", "--no-ff", "--no-edit", b).returncode:     # both ops above COUNT: keep both
+        (d / "ggml" / "ggml.c").write_text(ENUM_C.format(ops="    GGML_OP_BANDED,\n    GGML_OP_MOE_CACHE,\n"))
+        git(d, "add", "-A"); git(d, "commit", "-qm", f"merge {b}")
+rpc = d / "ggml" / "ggml-rpc.h"
+check("(fixture) the three PATCH bumps merged into one", "PATCH_VERSION    1\n" in rpc.read_text(), rpc.read_text())
+rpc.write_text(RPC_H.format(p=2, n=3))                 # what reconcile_op_count.py writes
+ps11 = Path(tempfile.mkdtemp(prefix="pcset_")) / "pr-set.json"
+ps11.write_text(json.dumps({"prs": [
+    f"https://github.com/unslothai/llama.cpp/pull/{i}/commits/{s}" for i, s in enumerate(shas, 11)]}))
+rc, rep, err = run(d, ps11)
+check("an RPC-only pin whose PATCH reconcile raised past it passes", rc == 0, err)
+rpc.write_text(RPC_H.format(p=0, n=3))
+rc, rep, err = run(d, ps11)
+check("the RPC-only pin with PATCH back below its bump still fails",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+rpc.write_text(RPC_H.format(p=2, n=3).replace("MINOR_VERSION    6", "MINOR_VERSION    7"))
+rc, rep, err = run(d, ps11)
+check("a higher PATCH under a different MINOR does not count as the pin's bump",
+      rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
