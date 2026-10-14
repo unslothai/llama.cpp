@@ -3024,46 +3024,41 @@ static size_t llama_io_run_size(const std::vector<info_t> & infos, size_t i, siz
 // [TAG_STATE_COALESCE] Equal runs at a constant stride (sequences interleaved in a unified cache) are one strided copy.
 template <typename info_t, typename emit_t>
 static void llama_io_emit(const std::vector<info_t> & infos, size_t first, size_t last, emit_t emit) {
-    std::vector<std::pair<size_t, size_t>> runs;
-
+    // one pass and no allocation: this also runs from the host I/O destructors, where a bad_alloc would terminate
     for (size_t i = first; i < last; ) {
-        const size_t end = llama_io_run_end(infos, i);
-
-        runs.emplace_back(i, end);
-
-        i = end;
-    }
-
-    for (size_t r = 0; r < runs.size(); ) {
-        const auto & head = infos[runs[r].first];
-
-        const size_t size = llama_io_run_size(infos, runs[r].first, runs[r].second);
+        const size_t end  = llama_io_run_end(infos, i);
+        const auto & head = infos[i];
+        const size_t size = llama_io_run_size(infos, i, end);
 
         size_t n_copies      = 1;
         size_t stride_tensor = 0;
         size_t stride_data   = 0;
+        size_t next          = end;
 
-        if (r + 1 < runs.size()) {
-            const auto & next = infos[runs[r + 1].first];
+        if (end < last) {
+            const auto & second     = infos[end];
+            const size_t second_end = llama_io_run_end(infos, end);
 
-            if (next.tensor == head.tensor && next.offset > head.offset && next.ptr > head.ptr &&
-                llama_io_run_size(infos, runs[r + 1].first, runs[r + 1].second) == size) {
-                stride_tensor = next.offset - head.offset;
-                stride_data   = (size_t) (next.ptr - head.ptr);
+            if (second.tensor == head.tensor && second.offset > head.offset && second.ptr > head.ptr &&
+                llama_io_run_size(infos, end, second_end) == size) {
+                stride_tensor = second.offset - head.offset;
+                stride_data   = (size_t) (second.ptr - head.ptr);
 
                 // a strided copy may not have its rows overlap, on either side
                 if (stride_tensor >= size && stride_data >= size) {
-                    while (r + n_copies < runs.size()) {
-                        const auto & cur = infos[runs[r + n_copies].first];
+                    while (next < last) {
+                        const auto & cur     = infos[next];
+                        const size_t cur_end = llama_io_run_end(infos, next);
 
                         if (cur.tensor != head.tensor ||
                             cur.offset != head.offset + n_copies * stride_tensor ||
                             cur.ptr    != head.ptr    + n_copies * stride_data   ||
-                            llama_io_run_size(infos, runs[r + n_copies].first, runs[r + n_copies].second) != size) {
+                            llama_io_run_size(infos, next, cur_end) != size) {
                             break;
                         }
 
                         n_copies++;
+                        next = cur_end;
                     }
                 }
             }
@@ -3071,7 +3066,7 @@ static void llama_io_emit(const std::vector<info_t> & infos, size_t first, size_
 
         emit(head.tensor, head.ptr, head.offset, size, n_copies, stride_tensor, stride_data);
 
-        r += n_copies;
+        i = next;
     }
 }
 

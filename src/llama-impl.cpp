@@ -334,6 +334,12 @@ static bool llama_exact_width_within_explicit_bound(uint32_t n_cols) {
 }
 
 bool llama_set_exact_decode_width(uint32_t n_cols) {
+    // the backends take the width as an int; a wider one would reach them negative and be ignored, while the maximum kept it
+    if (n_cols > (uint32_t) INT32_MAX) {
+        LLAMA_LOG_ERROR("%s: a decode width of %u columns is too wide to report\n", __func__, n_cols);
+        return false;
+    }
+
     if (!llama_exact_width_within_explicit_bound(n_cols)) {
         return false;
     }

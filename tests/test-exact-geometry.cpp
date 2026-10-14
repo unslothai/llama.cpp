@@ -45,6 +45,11 @@ int main() {
     assert(common_exact_batch_geometry(512, 512, 0, &n_min));
     assert(n_min == 512);
 
+    // a width the backends cannot take as an int is refused, and does not pin the maximum above every later width
+    const uint32_t width = llama_exact_decode_width();
+    assert(!llama_set_exact_decode_width((uint32_t) INT32_MAX + 1));
+    assert(llama_exact_decode_width() == width);
+
     printf("%s: all tests passed\n", __func__);
 
     return 0;
