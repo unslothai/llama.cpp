@@ -2152,12 +2152,12 @@ private:
 
             preempt_fcfs = params_base.preempt_policy == "fcfs";
 
-            // LLAMA_SERVER_PREEMPT_POLICY: fcfs or cost, as --preempt-policy when LLAMA_ARG_PREEMPT_POLICY is unset; or a cost test knob: smallest (default), largest, youngest or oldest.
+            // LLAMA_SERVER_PREEMPT_POLICY: fcfs or cost, as --preempt-policy when neither that flag nor LLAMA_ARG_PREEMPT_POLICY was given; or a cost test knob: smallest (default), largest, youngest or oldest.
             const char * LLAMA_SERVER_PREEMPT_POLICY = getenv("LLAMA_SERVER_PREEMPT_POLICY");
             preempt_test_policy = "smallest";
 
             if (LLAMA_SERVER_PREEMPT_POLICY && (strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0 || strcmp(LLAMA_SERVER_PREEMPT_POLICY, "cost") == 0)) {
-                if (!getenv("LLAMA_ARG_PREEMPT_POLICY")) {
+                if (!params_base.preempt_policy_set) {
                     preempt_fcfs = strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0;
                 }
             } else if (LLAMA_SERVER_PREEMPT_POLICY) {

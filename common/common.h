@@ -644,6 +644,7 @@ struct common_params {
     int32_t preempt_ram_mib     = 0;     // host RAM for parked (preempted) sequences: 0 = preemption off (the default), -1 = no limit
     bool    preempt_async       = true;  // park and restore on a stream of their own, off the decode loop
     std::string preempt_policy  = COMMON_PREEMPT_POLICY_DEFAULT;  // victim choice: "fcfs" or "cost"
+    bool    preempt_policy_set  = false; // --preempt-policy or LLAMA_ARG_PREEMPT_POLICY was given
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

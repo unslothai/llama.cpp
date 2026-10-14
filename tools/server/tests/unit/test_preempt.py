@@ -1561,6 +1561,20 @@ def test_the_old_policy_knob_selects_the_policy(policy):
 
 
 @pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_the_command_line_policy_wins_over_the_old_knob(policy, monkeypatch):
+    # The old knob only stands in for an unset policy: --preempt-policy outranks it like any environment value.
+    os.environ.pop("LLAMA_ARG_PREEMPT_POLICY", None)
+    os.environ["LLAMA_SERVER_PREEMPT_POLICY"] = "cost" if policy == "fcfs" else "fcfs"
+    popen = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", lambda args, *a, **k: popen([*args, "--preempt-policy", policy], *a, **k))
+    try:
+        _start(n_ctx=256)
+        assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
+    finally:
+        os.environ.pop("LLAMA_SERVER_PREEMPT_POLICY", None)
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
 def test_a_prompt_dropped_in_its_prefill_waits_until_it_fits_whole(policy):
     # The newer prompt is parked by dropping its cells part way through its prefill; resumed as soon as one chunk fitted, it was prefilled and dropped again until the older request ended.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"

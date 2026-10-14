@@ -1756,7 +1756,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value != "fcfs" && value != "cost") {
                 throw std::invalid_argument("invalid value");
             }
-            params.preempt_policy = value;
+            params.preempt_policy     = value;
+            params.preempt_policy_set = true;
         }
     ).set_env("LLAMA_ARG_PREEMPT_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
