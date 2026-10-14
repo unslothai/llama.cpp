@@ -2985,6 +2985,10 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
     // Apply frequency and presence penalties to the cur_p
     if (by_index) {
         for (const auto & it : ctx->token_count) {
+            // the history can hold ids outside the candidates (e.g. a truncated list or LLAMA_TOKEN_NULL)
+            if (it.first < 0 || (size_t) it.first >= cur_p->size) {
+                continue;
+            }
             penalize(cur_p->data[it.first], it.second);
         }
     } else {

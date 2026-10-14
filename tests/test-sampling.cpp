@@ -457,6 +457,8 @@ int main(void) {
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 50.0f, 0.0f, 0.0f);
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.0f, 0.0f, 1.5f);
     test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.1f, 5.0f, 5.0f);
+    // history ids outside the vocab (LLAMA_TOKEN_NULL, n_vocab) are ignored on both paths
+    test_penalties_reordered({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {LLAMA_TOKEN_NULL, 5, 0}, 1.0f, 0.0f, 1.5f);
 
     test_penalties_duplicate_ids({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 50.0f, 0.0f, 0.0f);
     test_penalties_duplicate_ids({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, 1.0f, 0.0f, 1.5f);
