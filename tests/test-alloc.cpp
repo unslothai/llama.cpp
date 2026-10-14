@@ -16,6 +16,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    size_t alloc_limit     = SIZE_MAX; // larger buffers fail to allocate
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -42,6 +43,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (size > ctx->alloc_limit) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -642,6 +646,46 @@ static void test_reallocation() {
     }
 }
 
+// a reserve that fails to allocate its buffer must not leave assignments into the freed buffer for the next alloc_graph
+static void test_failed_reserve() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr galloc = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    auto build = [](ggml_context * ctx, ggml_cgraph * graph, size_t size) {
+        ggml_tensor * x0 = make_input_with_size(ctx, size);
+        ggml_tensor * x1 = make_input_with_size(ctx, size);
+        ggml_tensor * x2 = ggml_add(ctx, x0, x1);
+        ggml_tensor * x3 = ggml_scale(ctx, x2, 2.0f);
+        assign_names(ctx);
+        ggml_set_output(x3);
+        ggml_build_forward_expand(graph, x3);
+    };
+    const int ids[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, 16);
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+    {
+        // the same graph with larger tensors does not fit
+        backend_a.context->alloc_limit = 64;
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, 64);
+        GGML_ASSERT(!ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+        // with more memory the next reserve succeeds
+        backend_a.context->alloc_limit = SIZE_MAX;
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1164,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_failed_reserve", test_failed_reserve);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
