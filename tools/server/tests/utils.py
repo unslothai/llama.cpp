@@ -126,7 +126,7 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
-    override_kv: List[str] | None = None
+    override_kvs: List[str] | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -189,7 +189,7 @@ class ServerProcess:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
-        for kv in self.override_kv or []:
+        for kv in self.override_kvs or []:
             server_args.extend(["--override-kv", kv])
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])

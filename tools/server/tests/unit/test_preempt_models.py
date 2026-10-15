@@ -22,7 +22,7 @@ def test_a_non_causal_decision_longer_than_the_ubatch_is_refused_and_the_server_
     global server
     server = ServerPreset.tinyopenjev()
     server.n_threads = 2
-    server.override_kv = ["qwen35.attention.causal=bool:false"]
+    server.override_kvs = ["qwen35.attention.causal=bool:false"]
     server.n_ctx = 1024
     server.n_slots = 2
     server.kv_unified = True
