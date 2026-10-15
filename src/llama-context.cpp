@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -163,6 +164,18 @@ llama_context::llama_context(
             }
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    // not via ctx_other: for draft-mtp that means the draft shares the target's memory
+    cparams.model_tgt = nullptr;
+    // a vocab-only model has no tensors at all
+    if (!hparams.vocab_only && model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
+        const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
+            tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
+            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target (this warning is normal during memory fitting)");
+        }
+        cparams.model_tgt = tgt;
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -341,6 +354,23 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // a draft head that borrows the target's token_embd/output reads them where the target placed them,
+        // so the target's devices need a backend here even when the draft runs on other devices
+        if (cparams.model_tgt) {
+            for (const auto & dev : cparams.model_tgt->devices) {
+                const bool have = std::any_of(backends.begin(), backends.end(),
+                        [&](const ggml_backend_ptr & b) { return ggml_backend_get_device(b.get()) == dev.dev; });
+                if (have) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
