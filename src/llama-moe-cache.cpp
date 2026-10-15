@@ -78,51 +78,96 @@ ggml_backend_buffer_t llama_moe_cache_materialize_mapped(ggml_tensor ** tensors,
     return buf;
 }
 
-// system memory that can still be allocated: MemAvailable within the cgroup limit (Linux), available physical memory (Windows), 0 if unknown
-static uint64_t llama_moe_cache_available_memory() {
-#if defined(__linux__)
-    uint64_t res = 0;
+// first number in a file, false if it is missing or not a number (e.g. "max")
+static bool llama_moe_cache_read_u64(const std::string & path, uint64_t & res) {
+    std::ifstream f(path);
+    return (bool) (f >> res);
+}
+
+// value of a key of a memory.stat file, 0 if it is missing
+static uint64_t llama_moe_cache_stat(const std::string & path, const char * name) {
+    std::ifstream f(path);
+    std::string k;
+    uint64_t v = 0;
+    while (f >> k >> v) {
+        if (k == name) {
+            return v;
+        }
+    }
+    return 0;
+}
+
+// see llama-ext.h; the limits are the ones common_available_memory checks for the automatic load mode (common/common.cpp), the page cache
+// charged to a cgroup is reclaimed before its limit is hit, except shmem (tmpfs, shm segments, shared anonymous mappings) which is swap-backed
+uint64_t llama_moe_cache_available_memory_linux(const char * root_c) {
+    const std::string root = root_c != nullptr ? root_c : "";
+    uint64_t res   = UINT64_MAX;
+    bool     known = false;
     {
-        std::ifstream f("/proc/meminfo");
+        std::ifstream f(root + "/proc/meminfo");
         std::string key;
         uint64_t value = 0;
         std::string unit;
         while (f >> key >> value) {
             std::getline(f, unit);
             if (key == "MemAvailable:") {
-                res = value*1024;
+                res   = value*1024;
+                known = true;
                 break;
             }
         }
     }
-    // cgroup v2 limit of this process
-    std::ifstream fc("/proc/self/cgroup");
+    std::ifstream fc(root + "/proc/self/cgroup");
     std::string line;
     while (std::getline(fc, line)) {
-        if (line.rfind("0::", 0) != 0) {
+        // "0::<path>" (v2) or "<id>:<controllers>:<path>" (v1)
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) {
             continue;
         }
-        const std::string dir = "/sys/fs/cgroup" + line.substr(3);
-        uint64_t max = 0;
-        uint64_t cur = 0;
-        std::ifstream fmax(dir + "/memory.max");
-        std::ifstream fcur(dir + "/memory.current");
-        if ((fmax >> max) && (fcur >> cur)) {
-            // the page cache charged to the cgroup is reclaimed before the limit is hit
-            std::ifstream fstat(dir + "/memory.stat");
-            std::string k;
-            uint64_t v = 0;
-            while (fstat >> k >> v) {
-                if (k == "file") {
-                    cur -= std::min(cur, v);
-                    break;
-                }
+        const std::string ctrl = line.substr(a + 1, b - a - 1);
+        std::string path = line.substr(b + 1);
+        std::string dir_root;
+        const char * f_max;
+        const char * f_cur;
+        const char * k_file;
+        const char * k_shmem;
+        if (line.compare(0, a, "0") == 0 && ctrl.empty()) {
+            dir_root = root + "/sys/fs/cgroup";
+            f_max = "/memory.max"; f_cur = "/memory.current"; k_file = "file"; k_shmem = "shmem";
+        } else if (("," + ctrl + ",").find(",memory,") != std::string::npos) {
+            dir_root = root + "/sys/fs/cgroup/memory";
+            f_max = "/memory.limit_in_bytes"; f_cur = "/memory.usage_in_bytes"; k_file = "total_cache"; k_shmem = "total_shmem";
+        } else {
+            continue;
+        }
+        // the limit of every ancestor applies too
+        while (true) {
+            const std::string dir = dir_root + (path == "/" ? "" : path);
+            uint64_t lim = 0;
+            uint64_t cur = 0;
+            if (llama_moe_cache_read_u64(dir + f_max, lim) && lim < (UINT64_C(1) << 60) && llama_moe_cache_read_u64(dir + f_cur, cur)) {
+                const uint64_t file  = llama_moe_cache_stat(dir + "/memory.stat", k_file);
+                const uint64_t shmem = llama_moe_cache_stat(dir + "/memory.stat", k_shmem);
+                cur -= std::min(cur, file > shmem ? file - shmem : 0);
+                res   = std::min(res, lim > cur ? lim - cur : 0);
+                known = true;
             }
-            const uint64_t left = max > cur ? max - cur : 0;
-            res = res == 0 ? left : std::min(res, left);
+            if (path.empty() || path == "/") {
+                break;
+            }
+            const size_t p = path.find_last_of('/');
+            path = p == 0 || p == std::string::npos ? "/" : path.substr(0, p);
         }
     }
-    return res;
+    return known ? std::max<uint64_t>(1, res) : 0; // 0 means unknown, 1 exhausted
+}
+
+// system memory that can still be allocated: MemAvailable within the cgroup limits (Linux), available physical memory (Windows), 0 if unknown
+static uint64_t llama_moe_cache_available_memory() {
+#if defined(__linux__)
+    return llama_moe_cache_available_memory_linux("");
 #elif defined(_WIN32)
     MEMORYSTATUSEX status;
     status.dwLength = sizeof(status);

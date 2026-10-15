@@ -154,3 +154,8 @@ LLAMA_API bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev);
 // the other tensors are left untouched; the new buffer has usage WEIGHTS and is returned (the caller owns it), nullptr if no tensor was moved
 // used by the MoE cache when the device lookup cannot map memory-mapped experts (for example hipHostRegister on a read-only file mapping)
 LLAMA_API ggml_backend_buffer_t llama_moe_cache_materialize_mapped(struct ggml_tensor ** tensors, size_t n_tensors);
+
+// Linux system memory the MoE cache may still allocate when it copies memory-mapped experts: MemAvailable capped by the memory left under the
+// cgroup v2 and v1 limits of this process and of all its ancestors, with the non-shmem page cache of each cgroup counted as reclaimable
+// root prefixes /proc and /sys/fs/cgroup (tests feed a fake hierarchy, "" reads the system); 0 if unknown, at least 1 if known (1 = exhausted)
+LLAMA_API uint64_t llama_moe_cache_available_memory_linux(const char * root);
