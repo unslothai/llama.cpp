@@ -132,6 +132,27 @@ def case_arms(lines: list[str]) -> set[str] | None:
     return {ln for ln in ident if CASE_LABEL.match(ln)}
 
 
+# `struct Foo : Base {`, `class Foo final {`, `enum class Foo {`. Only a definition
+# that opens with its name counts; a forward declaration or a use does not.
+TYPE_DECL = re.compile(r"^(?:struct|class|union|enum(?:\s+class)?)\s+([A-Za-z_]\w*)\b[^;]*$")
+# A comment line above a definition (`// Inkling dMel: ...`) says nothing about which
+# construct follows, so it does not decide whether a side opens with one.
+COMMENT = re.compile(r"^(?://|/\*|\*)")
+
+
+def type_defs(lines: list[str]) -> set[str] | None:
+    """The type names this side defines, or None if it does not open with a type definition.
+
+    The same reasoning as case_arms: two independent types added at one spot share
+    method signatures by construction (two audio preprocessors both override
+    `preprocess(...)`), which says nothing about the two additions being one change.
+    """
+    ident = [ln for ln in nonblank(lines) if not STRUCTURAL.match(ln) and not COMMENT.match(ln)]
+    if not ident or not TYPE_DECL.match(ident[0]):
+        return None
+    return {m.group(1) for ln in ident if (m := TYPE_DECL.match(ln))}
+
+
 def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[str]:
     """Return the union, or raise if this region is not a pure add/add."""
     if nonblank(base):
@@ -158,6 +179,13 @@ def resolve_region(ours: list[str], base: list[str], theirs: list[str]) -> list[
         # check below instead. This is the one place where a shared line is
         # allowed, and it is allowed because the labels prove the arms are
         # distinct -- a duplicated label would not even compile.
+        return list(theirs) + list(ours)
+    ours_types, theirs_types = type_defs(ours), type_defs(theirs)
+    if ours_types and theirs_types and ours_types.isdisjoint(theirs_types):
+        # Both sides define new types, and no type name is on both sides. Two
+        # differently named definitions are two constructs, so a shared member
+        # declaration is a coincidence of the interface they implement. The
+        # same type added twice keeps its name and is refused below.
         return list(theirs) + list(ours)
     shared = identifying(ours) & identifying(theirs)
     if shared:

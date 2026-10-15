@@ -7,7 +7,7 @@ Produces, matching the schema consumed by unslothai/unsloth's installer:
   - llama-prebuilt-manifest.json : describes every locally-built bundle in this
     release (CUDA x64/arm64 profiles + ROCm Linux/Windows per gfx target +
     macOS arm64/x64 + CPU Linux/Windows x64+arm64 + Vulkan Linux x64/arm64 and
-    Windows x64), with the dispatch metadata the installer needs to pick the
+    Windows x64/arm64), with the dispatch metadata the installer needs to pick the
     right one.
   - llama-prebuilt-sha256.json   : a cross-OS integrity index covering both the
     locally-built bundles AND the upstream ggml-org assets the installer still
@@ -46,13 +46,13 @@ ROCM_BUNDLE_RE = re.compile(
 # unsloth-prebuilt-vulkan.yml. Like ROCm/macOS they are raw build/bin archives
 # with no embedded UNSLOTH_PREBUILT_INFO.json, so everything in the manifest
 # entry is derived from the filename. CPU covers Linux/Windows x64 + arm64;
-# Vulkan covers Linux x64 + arm64 and Windows x64.
+# Vulkan covers Linux x64 + arm64 and Windows x64 + arm64.
 CPU_BUNDLE_RE = re.compile(
     r"^app-(?P<tag>[^/]+)-(?P<platform>linux|windows)-(?P<arch>x64|arm64)-cpu\.(?P<ext>tar\.gz|zip)$"
 )
 
 VULKAN_BUNDLE_RE = re.compile(
-    r"^app-(?P<tag>[^/]+)-(?P<target>linux-(?:x64|arm64)|windows-x64)-vulkan\.(?P<ext>tar\.gz|zip)$"
+    r"^app-(?P<tag>[^/]+)-(?P<target>(?:linux|windows)-(?:x64|arm64))-vulkan\.(?P<ext>tar\.gz|zip)$"
 )
 
 # macOS slices are built by unsloth-prebuilt-macos.yml and land in dist/ under
@@ -96,6 +96,8 @@ KIND_BY_VULKAN_TARGET = {
     "linux-x64":   {"manifest": "linux-vulkan",       "sha": "linux-vulkan-app"},
     "linux-arm64": {"manifest": "linux-vulkan",       "sha": "linux-arm64-vulkan-app"},
     "windows-x64": {"manifest": "windows-vulkan",     "sha": "windows-vulkan-app"},
+    # Own kind: installers predating it never select it, so no x64 host is handed this zip.
+    "windows-arm64": {"manifest": "windows-arm64-vulkan", "sha": "windows-arm64-vulkan-app"},
 }
 
 # macOS slices: install_kind / sha-index kind / manifest bundle_profile per arch.
