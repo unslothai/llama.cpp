@@ -1844,10 +1844,6 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    if (!state_copy_fences.empty()) {
-        state_seq_copy_fence();
-    }
-
     return 0;
 }
 
@@ -2307,10 +2303,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
-
-    if (!state_copy_fences.empty()) {
-        state_seq_copy_fence();
-    }
 
     return 0;
 }
@@ -3731,7 +3723,7 @@ struct llama_state_seq_copy {
         }
     }
 
-    // Order the copies after compute already queued: the copy stream waits for the fence recorded at the end of every decode.
+    // Order the copies after compute already queued: the copy stream waits for the fence recorded as the transfer is issued.
     void order_after(const std::map<ggml_backend_dev_t, ggml_backend_event_t> & fences) {
         for (auto & it : devs) {
             const auto fence = fences.find(it.first);
@@ -4120,7 +4112,7 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
 
     cpy->can_pin = cpy->host_buffer_type() != ggml_backend_cpu_buffer_type();
 
-    // One fence per device, shared by all transfers and recorded after every decode; installed after the checks so a refused transfer leaves nothing.
+    // One fence per device, shared by all transfers and recorded when one is issued; installed after the checks so a refused transfer leaves nothing.
     std::vector<ggml_backend_dev_t> fences_new;
 
     for (const auto & it : cpy->devs) {
@@ -4143,8 +4135,6 @@ llama_state_seq_copy * llama_context::state_seq_copy_init() {
         fences_new.push_back(it.first);
     }
 
-    state_seq_copy_fence();
-
     state_copies.insert(cpy.get());
     cpy->counted = true;
 
@@ -4165,6 +4155,7 @@ size_t llama_context::state_seq_copy_get(llama_state_seq_copy & cpy, size_t size
     }
 
     const int64_t t_sync = ggml_time_us();
+    state_seq_copy_fence();
     cpy.order_after(state_copy_fences);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 
@@ -4200,6 +4191,7 @@ size_t llama_context::state_seq_copy_set(llama_state_seq_copy & cpy, size_t size
 
     // A graph in flight may still read these cells (masked), so the copy stream waits for compute, see order_after().
     const int64_t t_sync = ggml_time_us();
+    state_seq_copy_fence();
     cpy.order_after(state_copy_fences);
     cpy.t_sync_us = ggml_time_us() - t_sync;
 

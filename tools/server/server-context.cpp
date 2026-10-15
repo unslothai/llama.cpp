@@ -2038,7 +2038,7 @@ private:
                 }
             };
 
-            // [TAG_PREEMPT_ASYNC] One transfer per context: each owns a backend and installs the fences the context records after every decode.
+            // [TAG_PREEMPT_ASYNC] One transfer per context: each owns a backend and installs the fences the context records as a transfer is issued.
             if (preempt_async_possible()) {
                 slot.preempt_cpy_tgt = llama_state_seq_copy_make(ctx_tgt);
 
@@ -4673,12 +4673,21 @@ private:
         return (int64_t) std::min<double>((double) n_left * (double) (ggml_time_us() - t_from) / n_gen, (double) INT64_MAX / 2);
     }
 
-    bool preempt_any_out() const {
+    // [TAG_PREEMPT] Set by every park and cleared by the first scan that finds nobody out, so an idle or disabled server skips the slot scans.
+    bool preempt_maybe_out = false;
+
+    bool preempt_any_out() {
+        if (!preempt_maybe_out) {
+            return false;
+        }
+
         for (const auto & slot : slots) {
             if (slot.preempt_is_out()) {
                 return true;
             }
         }
+
+        preempt_maybe_out = false;
 
         return false;
     }
@@ -4686,6 +4695,8 @@ private:
     // [TAG_PREEMPT] Sync parks finish here, async ones are counted by update_preempt_copies() when they land. The notice is sent with the save, since the slot is already detached and silent.
     bool preempt_park(server_slot & slot, int64_t t_start, bool recompute = false) {
         slot.t_preempt_copy_us = t_start;
+
+        preempt_maybe_out = true;
 
         // [TAG_PREEMPT_ASYNC] Reserve ahead only if the budget still fits another state that size: the slack is charged and must not block the next park.
         if (!recompute && slot.preempt_is_async()) {
@@ -4860,11 +4871,15 @@ private:
             return;  // no cache (embedding model): nothing to park
         }
 
-        if (params_base.preempt_ram_mib == 0 && !preempt_any_out()) {
+        const bool any_out = preempt_any_out();
+
+        if (params_base.preempt_ram_mib == 0 && !any_out) {
             return;
         }
 
-        update_preempt_copies();
+        if (any_out) {
+            update_preempt_copies();
+        }
 
         if (params_base.preempt_ram_mib == 0 || preempt_recurrent) {
             return;  // --preempt-ram 0 or a recurrent cache: retry ladder only
@@ -4874,7 +4889,8 @@ private:
 
         const bool head_of_line = preempt_resume_head;
 
-        for (;;) {
+        // nobody parked: nothing to resume
+        while (any_out) {
             preempt_update_reservation();
 
             std::vector<server_slot *> parked;

@@ -174,7 +174,7 @@ struct llama_context {
     size_t state_seq_copy_get(llama_state_seq_copy & cpy, size_t size, llama_seq_id seq_id,      llama_state_seq_flags flags);
     size_t state_seq_copy_set(llama_state_seq_copy & cpy, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags);
 
-    // [TAG_STATE_ASYNC] mark the point the compute streams have reached, for the copies to wait for; recorded after every decode and encode once a transfer exists
+    // [TAG_STATE_ASYNC] mark the point the compute streams have reached, for the copies to wait for; recorded as each transfer is issued, so a decode records nothing
     void state_seq_copy_fence();
 
     void state_seq_copy_release(llama_state_seq_copy * cpy);
@@ -412,7 +412,7 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
-    // [TAG_STATE_ASYNC] one event per device that copies asynchronously, recorded on the compute stream at the end of every decode; see state_seq_copy_fence()
+    // [TAG_STATE_ASYNC] one event per device that copies asynchronously, recorded on the compute stream as a transfer is issued; see state_seq_copy_fence()
     std::map<ggml_backend_dev_t, ggml_backend_event_t> state_copy_fences;
 
     // Live transfers; the fences go with the last one, and freeing the context drains live transfers first.
