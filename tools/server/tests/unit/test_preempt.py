@@ -1030,12 +1030,15 @@ def test_a_recompute_restore_does_not_count_its_replay_as_prompt():
 
     n_prompt = 1950
     n_predict = 24
+    # A first prefill this size pays one-time backend setup, which on a GPU outweighs the warm re-prefills: warm up on other text first.
+    assert _complete(n_predict, _prompt_of(n_prompt, _PROMPT_A)).status_code == 200
     res = _complete(n_predict, _prompt_of(n_prompt, _PROMPT_C))
 
     assert res.status_code == 200, res.body
     assert res.body["preempt"]["recomputes"] >= 1, res.body["preempt"]
 
     timings = res.body["timings"]
+    assert timings["cache_n"] == 0, timings
     assert timings["prompt_n"] == n_prompt, timings
     assert timings["predicted_n"] == n_predict, timings
     # Every re-prefill happens during generation, so the generation time is the longer.
