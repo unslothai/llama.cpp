@@ -168,6 +168,40 @@ rc, rep = run(repo)
 check("scaffolding-only addition refuses",
       rc == 1 and "scaffolding" in json.dumps(rep), rep)
 
+# --- 3d. two distinct struct definitions sharing an override: union ---------
+# The real tools/mtmd/mtmd-audio.h collision: Inkling and Muse Spark each add an
+# audio preprocessor at the same spot, and both declare the same preprocess()
+# override, which the shared-line check read as one change made twice.
+base = "struct a {\n};\n\nstruct z {\n};\n"
+ours = ("struct a {\n};\n\n"
+        "// Inkling dMel: 100 ms Slaney-mel magnitude windows at a 50 ms hop.\n"
+        "struct mtmd_audio_preprocessor_inkling : mtmd_audio_preprocessor {\n"
+        "    void initialize() override;\n"
+        "    bool preprocess(const float * samples, size_t n_samples) const override;\n"
+        "private:\n    mtmd_audio_cache cache;\n};\n\n"
+        "struct z {\n};\n")
+theirs = ("struct a {\n};\n\n"
+          "struct mtmd_audio_preprocessor_muse_spark_audio : mtmd_audio_preprocessor {\n"
+          "    void initialize() override {}\n"
+          "    bool preprocess(const float * samples, size_t n_samples) const override;\n"
+          "};\n\n"
+          "struct z {\n};\n")
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+txt = f.read_text()
+check("distinct struct definitions with a shared override resolve", rc == 0 and rep["ok"], rep)
+check("distinct struct definitions keep both, upstream first",
+      "muse_spark_audio" in txt and "inkling" in txt and txt.count("preprocess(") == 2
+      and txt.index("muse_spark_audio") < txt.index("inkling") and "<<<<" not in txt, txt)
+
+# --- 3e. the same struct added on both sides still refuses ------------------
+ours = "struct a {\n};\n\nstruct foo {\n    int x;\n    int y;\n};\n\nstruct z {\n};\n"
+theirs = "struct a {\n};\n\nstruct foo {\n    int x;\n};\n\nstruct z {\n};\n"
+repo, f = make_conflict(base, ours, theirs)
+rc, rep = run(repo)
+check("the same struct name on both sides still refuses",
+      rc == 1 and "made twice" in json.dumps(rep), rep)
+
 # --- 4. one file good, one file bad: refuse the whole merge ----------------
 d = Path(tempfile.mkdtemp(prefix="am_"))
 git(d, "init", "-q", "-b", "main")
