@@ -2027,7 +2027,10 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
             mem_avail = std::min(mem_avail, mem_sys);
         }
         const uint64_t model_bytes = common_model_file_bytes(params.model.path);
-        if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
+        const bool fits = model_bytes > 0 && model_bytes <= 0.8*mem_avail;
+        LOG_INF("%s: MoE cache: %.0f MiB of model files, %.0f MiB of system memory available: load %s\n", __func__,
+            model_bytes/1048576.0, mem_avail/1048576.0, fits ? "without mmap" : "with mmap (the device lookup copies the experts it cannot map)");
+        if (fits) {
             return LLAMA_LOAD_MODE_NONE;
         }
     }
