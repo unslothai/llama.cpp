@@ -8517,7 +8517,6 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
-// same attention as the CPU mask reference, but visiting nonadjacent pages in a different order
 struct test_flash_attn_ext_pages : public test_flash_attn_ext {
     test_flash_attn_ext_pages(int64_t batch, int64_t hs = 256, ggml_type type_KV = GGML_TYPE_F16, float logit_softcap = 0.0f) :
         test_flash_attn_ext(hs, hs, 2, {8, 1}, 1024, batch, true, false, 0.0f, logit_softcap, GGML_PREC_F32, type_KV, type_KV) {}
@@ -10753,7 +10752,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // MoE projections at the token counts a decode ubatch forms; 17 tokens is past the width exact concurrency pins
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (int n : {1, 2, 4, 8, 17}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, true,   512, n, 2048));
@@ -11749,7 +11747,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t batch : {1, 4, 12}) {
         test_cases.emplace_back(new test_flash_attn_ext_pages(batch));
     }
-    // shapes the paged kernel does not cover: a backend must refuse them, not abort
     test_cases.emplace_back(new test_flash_attn_ext_pages(4, 64));
     test_cases.emplace_back(new test_flash_attn_ext_pages(4, 256, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext_pages(4, 256, GGML_TYPE_F16, 30.0f));

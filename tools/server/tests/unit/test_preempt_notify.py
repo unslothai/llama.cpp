@@ -8,7 +8,6 @@ import pytest
 import requests
 from utils import *
 
-# [TAG_PREEMPT] Streaming clients get SSE comment notices on park and restore, and a 2 s keepalive keeps proxies from giving up.
 
 server = ServerPreset.tinyllama2()
 
@@ -171,7 +170,6 @@ def _prefill_payload(path: str, prompt: str, n_predict: int) -> dict:
 
 @pytest.mark.parametrize("path", ["/completion", "/v1/chat/completions", "/v1/responses", "/v1/messages"])
 def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
-    # A park before the first token looks like a stall, so its notice goes out with the response headers.
     server.server_slots = True
     _start(n_ctx=2048, n_batch=256)
 
@@ -183,8 +181,6 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     t = threading.Thread(target=_resident, daemon=True)
     t.start()
 
-    # The pool must be nearly full before the second prompt starts, so its prefill runs out of cells.
-    # the resident grows by decoding: 1400 tokens took over 12 s on a loaded CI runner
     deadline = time.time() + 90
     while t.is_alive() and time.time() < deadline:
         slots = requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
@@ -214,13 +210,11 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     assert comments and comments[0][1] == ": preempted", [line for _, line in seen[:4]]
     assert datas, "the request never produced a chunk"
 
-    # sent when the slot was parked, not batched with the chunk that came later
     assert comments[0][0] + 0.05 < datas[0][0], [(round(at, 3), line[:24]) for at, line in seen[:4]]
     assert any(line == ": resumed" for _, line in comments), [line for _, line in comments[:4]]
 
 
 def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
-    # n_batch: the whole prompt in one batch, so the planner sees its size at once
     _start(n_ctx=512, n_batch=512)
 
     status, _, lines = _behind_a_resident(_completion_payload(32, " ".join([_PROMPT_B] * 14)))
@@ -234,7 +228,6 @@ def test_a_stream_parked_before_its_first_token_starts_with_the_notice():
 
 
 def test_an_oversized_prompt_is_errored_instead_of_parked():
-    # A newly assigned slot has not passed prompt checks, and a notice opens the stream, so parking it would turn an error response into 200 plus an in-stream error.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512, n_batch=512)
 
@@ -245,12 +238,10 @@ def test_an_oversized_prompt_is_errored_instead_of_parked():
 
 
 def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept_alive():
-    # 2 MiB holds one parked state but not two, so rotation is refused and the head stays parked past the 2 s keepalive.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "2"
     _start(n_slots=3, n_ctx=2048, enable_ctx_shift=True)
 
     n_predict = 12000
-    # the default 2 s keepalive equals the rotation window, so a park could end before its ping; ask for 1 s instead.
     results = _stream_all(n_predict, (_PROMPT_A, _PROMPT_B, _PROMPT_C), sse_ping_interval=1)
     n_parked = n_keepalive = 0
     for comments, datas in results:
@@ -270,7 +261,6 @@ def test_a_rotation_tells_both_streams_and_a_head_parked_past_the_budget_is_kept
 
 
 def test_every_notice_of_a_multi_prompt_stream_names_the_prompt_it_is_about():
-    # Clients sharing a stream tell notices apart by index, so index 0 must be explicit too.
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
     _start(n_ctx=512)
 
@@ -284,7 +274,6 @@ def test_every_notice_of_a_multi_prompt_stream_names_the_prompt_it_is_about():
 
 
 def test_an_oversized_sibling_prompt_is_errored_before_a_valid_one_is_parked():
-    # A valid prompt's park notice opens the stream, so a sibling that does not fit must be rejected before any is queued.
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     _start(n_ctx=256, n_slots=3, n_batch=512)
 

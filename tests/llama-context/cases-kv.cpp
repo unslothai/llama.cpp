@@ -628,7 +628,6 @@ struct case_state_restore_fragmented : ctx_test {
             return case_result::fail();
         }
 
-        // a fragmented restore may stage a whole device tensor, so the neighbours are checked byte for byte too
         std::vector<uint8_t> neighbours_before[2];
         if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, neighbours_before[0]) ||
             !get_seq_state(ctx.get(), 2, LLAMA_STATE_SEQ_FLAGS_NONE, neighbours_before[1])) {

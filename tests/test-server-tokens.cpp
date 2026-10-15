@@ -29,28 +29,27 @@ struct chunk_writer {
     }
 };
 
-// nx*ny tokens of one image, max(nx, ny) positions under M-RoPE
 static mtmd::input_chunk_ptr make_image_chunk(uint32_t nx, uint32_t ny) {
     chunk_writer w;
 
-    w.put<uint64_t>(2);                          // MTMD_SERIALIZATION_VERSION
+    w.put<uint64_t>(2);
     w.put<uint32_t>(MTMD_INPUT_CHUNK_TYPE_IMAGE);
-    w.put<uint64_t>(0);                          // tokens_text
-    w.put<uint8_t>(1);                           // tokens_image follows
+    w.put<uint64_t>(0);
+    w.put<uint8_t>(1);
     w.put<uint32_t>(nx);
     w.put<uint32_t>(ny);
-    w.put<uint32_t>(1);                          // MTMD_POS_TYPE_MROPE
-    w.put<uint32_t>(0);                          // image_idx
-    w.put<uint32_t>(1);                          // n_temporal_merge
-    w.put_str("test-image");                     // id
-    w.put<uint8_t>(0);                           // batch_f32.is_audio
-    w.put<uint64_t>(1);                          // one entry
-    w.put<uint8_t>(0);                           // entry.add_viewsep
-    w.put<uint8_t>(0);                           // entry.add_newline
-    w.put<int32_t>(0);                           // entry.lead_pad
-    w.put<int32_t>(1);                           // entry.nx
-    w.put<int32_t>(1);                           // entry.ny
-    w.put<uint8_t>(0);                           // no tokens_audio
+    w.put<uint32_t>(1);
+    w.put<uint32_t>(0);
+    w.put<uint32_t>(1);
+    w.put_str("test-image");
+    w.put<uint8_t>(0);
+    w.put<uint64_t>(1);
+    w.put<uint8_t>(0);
+    w.put<uint8_t>(0);
+    w.put<int32_t>(0);
+    w.put<int32_t>(1);
+    w.put<int32_t>(1);
+    w.put<uint8_t>(0);
 
     mtmd::input_chunk_ptr chunk(mtmd_input_chunk_load(w.buf.data(), w.buf.size()));
 
@@ -59,7 +58,6 @@ static mtmd::input_chunk_ptr make_image_chunk(uint32_t nx, uint32_t ny) {
     return chunk;
 }
 
-// 10 text tokens, an image of 256 tokens and 16 positions, 20 text tokens, then n_gen generated tokens
 static server_tokens make_prompt(size_t n_gen, const mtmd_input_chunk * chunk) {
     server_tokens res;
 
@@ -88,7 +86,6 @@ int main() {
     assert(mtmd_input_chunk_get_n_tokens(chunk.get()) == 256);
     assert(mtmd_input_chunk_get_n_pos   (chunk.get()) == 16);
 
-    // a cut in the generated tail: the cache reports 86 positions, which is 326 tokens
     {
         server_tokens prompt = make_prompt(40, chunk.get());
 
@@ -101,7 +98,6 @@ int main() {
         assert(n_cached == 326);
         assert(prompt.pos_next(n_cached) == pos_cached);
 
-        // the same number taken for a token count falls inside the image
         bool threw = false;
 
         try {
@@ -113,14 +109,13 @@ int main() {
         assert(threw && "a position used as a token count cuts the image in half");
     }
 
-    // the same prompt with a longer tail, cut inside the generated tokens
     {
         server_tokens prompt = make_prompt(300, chunk.get());
 
         assert(prompt.size()     == 586);
         assert(prompt.pos_next() == 346);
 
-        const llama_pos pos_cached = 106; // 10 text + 16 image + 20 text + 60 generated
+        const llama_pos pos_cached = 106;
         const size_t    n_cached   = prompt.size_up_to_pos(pos_cached);
 
         assert(n_cached == 346);
@@ -132,27 +127,24 @@ int main() {
         assert(prompt.pos_next() == pos_cached);
     }
 
-    // a cut before the image, and one at its first token: both are token boundaries
     {
         server_tokens prompt = make_prompt(0, chunk.get());
 
         assert(prompt.size_up_to_pos(10) == 10);
         assert(prompt.pos_next(10) == 10);
 
-        // the image ends at position 26 and token 266
         assert(prompt.size_up_to_pos(26) == 266);
         assert(prompt.pos_next(266) == 26);
     }
 
-    // a cut inside the image: the conversion cannot land there, and stepping back reaches the chunk's first token
     {
         server_tokens prompt = make_prompt(0, chunk.get());
 
-        const llama_pos pos_cached = 20; // inside the image, which spans positions 10..25
+        const llama_pos pos_cached = 20;
 
         size_t n_cached = prompt.size_up_to_pos(pos_cached);
 
-        assert(n_cached == 266); // rounded up to the whole chunk
+        assert(n_cached == 266);
 
         while (n_cached > 0 && prompt.pos_next(n_cached) > pos_cached) {
             n_cached--;
@@ -161,11 +153,10 @@ int main() {
         assert(n_cached == 10);
         assert(prompt.pos_next(n_cached) == 10);
 
-        prompt.keep_first(n_cached); // would throw if it cut the image in half
+        prompt.keep_first(n_cached);
         assert(prompt.size() == 10);
     }
 
-    // an empty cache has to be handled by the caller: the walk always consumes its first token
     {
         server_tokens prompt = make_prompt(4, chunk.get());
 

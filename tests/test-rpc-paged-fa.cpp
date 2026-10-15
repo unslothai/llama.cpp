@@ -1,5 +1,4 @@
 // [TAG_EXACT_CONCURRENCY] an RPC server must refuse a FLASH_ATTN_EXT with a page table (src[5]), since a client can send any graph.
-// The server and each client run in child processes, so a refused graph only drops that client.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -32,7 +31,6 @@ static bool port_open(int port) {
     return ok;
 }
 
-// runs in a child: one FLASH_ATTN_EXT over a single 256-cell page, computed on the server
 [[noreturn]] static void send_graph(const std::string & endpoint, bool paged) {
     alarm(120);
 
@@ -67,14 +65,12 @@ static bool port_open(int port) {
 
     ggml_backend_graph_compute(backend, gf);
 
-    // the read is the round trip that sees whether the server kept the connection
     std::vector<float> res(ggml_nelements(out));
     ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
 
     _exit(0);
 }
 
-// exit status of one client, or -signal
 static int run_client(const std::string & endpoint, bool paged) {
     const pid_t pid = fork();
     if (pid == 0) {
@@ -110,11 +106,8 @@ int main() {
         fprintf(stderr, "the RPC server did not start on %s\n", endpoint.c_str());
         rc = 1;
     } else {
-        // an unpaged graph computes, which shows the harness works
         const int plain = run_client(endpoint, false);
-        // a paged one is refused, so the client loses its connection and its read fails
         const int paged = run_client(endpoint, true);
-        // and the server is still there for the next client
         const int after = run_client(endpoint, false);
 
         printf("unpaged: %d, paged: %d, unpaged after: %d\n", plain, paged, after);

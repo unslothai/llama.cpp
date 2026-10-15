@@ -1,5 +1,4 @@
 // [TAG_EXACT_CONCURRENCY] the non-blocking event query is found through the registry; CUDA must report it, else every async park poll blocks.
-// On every device that reports it, a recorded event that was waited for reads as complete.
 
 #include "ggml-backend.h"
 
@@ -23,7 +22,6 @@ int main() {
         printf("%s (%s): events %s, event query %s\n", ggml_backend_dev_name(dev), reg_name,
                props.caps.events ? "yes" : "no", supported ? "yes" : "no");
 
-        // a build without events (GGML_CUDA_NO_PEER_COPY) parks synchronously, so there is nothing to query
         if (!props.caps.events) {
             continue;
         }

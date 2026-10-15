@@ -2,11 +2,10 @@ import os
 import pytest
 from utils import *
 
-# Requests and models outside the parking path that the preemption change must leave as upstream serves them.
 
 server = ServerPreset.tinyllama2()
 
-START_TIMEOUT = 300  # the preload can be slow on a loaded host
+START_TIMEOUT = 300
 
 
 @pytest.fixture(autouse=True)
@@ -107,8 +106,6 @@ def test_a_context_shift_is_left_to_the_decode_unless_parking_is_on(preempt_ram,
     i_decode = after.index("n_batch (effective)")
     i_update = after.index("applying K-shift")
     if preempt_ram is None:
-        # as upstream: the K-shift runs inside llama_decode()
         assert i_decode < i_update
     else:
-        # a park before the decode must see shifted K, so the shift runs first
         assert i_update < i_decode

@@ -1,5 +1,4 @@
 // [TAG_EXACT_CONCURRENCY] The context refuses a non-layer weight (output_norm) kept on host by an override, and accepts the same model fully offloaded.
-// Needs a batch-invariant GPU backend; without one the test reports what it skipped and passes.
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -8,7 +7,6 @@
 #include <cstdlib>
 #include <cstring>
 
-// Windows has no setenv
 static void set_env_default(const char * name, const char * value) {
     if (getenv(name)) {
         return;
@@ -47,7 +45,6 @@ static bool context_ok(const char * path, const llama_model_tensor_buft_override
 }
 
 int main(int argc, char ** argv) {
-    // read before the model is loaded: latched on first use
     set_env_default("LLAMA_EXACT_CONCURRENCY", "1");
 
     const char * path = nullptr;

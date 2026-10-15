@@ -1,4 +1,3 @@
-// [TAG_STATE_ASYNC] Async state transfer guards: an oversized size is refused since the transfer owns the buffer, and ON_DEVICE is refused since copies go via host.
 
 #include "arg.h"
 #include "common.h"
@@ -42,7 +41,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // two sequences interleaved, so the cells of each are a comb rather than one block, which is what the transfer is built for
     std::vector<llama_token> tokens(60, 1);
 
     common_batch batch(ctx);
@@ -60,7 +58,6 @@ int main(int argc, char ** argv) {
 
     llama_state_seq_copy * cpy = llama_state_seq_copy_init(ctx);
 
-    // a recurrent state does not stay in one row, so these models are refused a transfer whatever the backend can do
     if (llama_model_is_recurrent(llama_init->model()) || llama_model_is_hybrid(llama_init->model())) {
         CHECK(cpy == nullptr);
         fprintf(stderr, "%s : a recurrent or hybrid model is refused a transfer, as it must be\n", __func__);
@@ -77,7 +74,6 @@ int main(int argc, char ** argv) {
 
     CHECK(size > 0);
 
-    // nothing is allocated yet, so nothing is page-locked yet, whatever the backend offers
     CHECK(llama_state_seq_copy_buf_is_pinned(cpy) == false);
     CHECK(llama_state_seq_copy_buf(cpy) == nullptr);
 
@@ -102,7 +98,6 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : oversized, empty and ON_DEVICE transfers are all refused\n", __func__);
 
-    // a transfer that fails part way must post nothing: the caller is told it failed and is free to reuse the buffer at once
     CHECK(llama_state_seq_copy_get(cpy, size - 1, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0);
     CHECK(llama_state_seq_copy_n_copies(cpy) == 0);
     CHECK(llama_state_seq_copy_done(cpy));
