@@ -69,6 +69,24 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
+# [TAG_JCC_ALIGN] On x86 cores with the JCC erratum microcode (Skylake through Cascade Lake), a jump that crosses or ends on
+# a 32-byte boundary is not cached in the decoded uop cache, so a hot loop that lands on one runs slower. Where a loop lands
+# moves with any unrelated change to the code linked before it: the per-token sampler loops over the vocabulary did, costing
+# 1-2% of server decode speed with no change to the code that runs. Keeping branches off those boundaries removes that.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$" AND NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    # GCC passes it to binutils as; clang's integrated assembler takes it only as a driver flag
+    check_cxx_compiler_flag("-Wa,-mbranches-within-32B-boundaries" LLAMA_CXX_HAS_JCC_ALIGN)
+    if (LLAMA_CXX_HAS_JCC_ALIGN)
+        target_compile_options(llama PRIVATE -Wa,-mbranches-within-32B-boundaries)
+    else()
+        check_cxx_compiler_flag("-mbranches-within-32B-boundaries" LLAMA_CXX_HAS_JCC_ALIGN_DRIVER)
+        if (LLAMA_CXX_HAS_JCC_ALIGN_DRIVER)
+            target_compile_options(llama PRIVATE -mbranches-within-32B-boundaries)
+        endif()
+    endif()
+endif()
+
 target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)
