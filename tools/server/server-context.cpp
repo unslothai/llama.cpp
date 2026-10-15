@@ -175,6 +175,17 @@ static bool preempt_fail_save() {
     return n_left > 0 && --n_left == 0;
 }
 
+// [TAG_PREEMPT_ASYNC] Test knob: LLAMA_SERVER_PREEMPT_PAGEABLE=N treats the Nth async park's buffer as pageable, as a large allocation can be.
+static bool preempt_force_pageable() {
+    static int32_t n_left = []() {
+        const char * val = getenv("LLAMA_SERVER_PREEMPT_PAGEABLE");
+
+        return val ? std::max(0, atoi(val)) : 0;
+    }();
+
+    return n_left > 0 && --n_left == 0;
+}
+
 using llama_state_seq_copy_ptr = std::shared_ptr<llama_state_seq_copy>;
 
 static llama_state_seq_copy_ptr llama_state_seq_copy_make(llama_context * ctx) {
@@ -749,7 +760,8 @@ struct server_slot {
 
             // [TAG_PREEMPT_ASYNC] A large buffer can still come back pageable, and copies into pageable memory block, so this slot parks synchronously from now on.
             const bool pageable = !llama_state_seq_copy_buf_is_pinned(preempt_cpy_tgt.get()) ||
-                                  (size_dft > 0 && !llama_state_seq_copy_buf_is_pinned(preempt_cpy_dft.get()));
+                                  (size_dft > 0 && !llama_state_seq_copy_buf_is_pinned(preempt_cpy_dft.get())) ||
+                                  preempt_force_pageable();
 
             if (pageable) {
                 SLT_WRN(*this, "the host memory for a %.3f MiB park is pageable, so this slot parks synchronously from now on\n",
@@ -2114,6 +2126,8 @@ private:
                     slot.preempt_cpy_dft.reset();
                 }
             }
+
+            preempt_async_all = preempt_async_ok;
         }
 
         {
@@ -3915,7 +3929,18 @@ private:
     // [TAG_PREEMPT] --preempt-policy fcfs: park the newest arrival, resume and reserve in arrival order.
     bool preempt_fcfs = false;
 
-    bool preempt_async_ok = false;
+    bool preempt_async_ok  = false;  // some slot still parks asynchronously: keep the async margin
+    bool preempt_async_all = false;  // every slot does, as /props reports
+
+    void preempt_async_refresh() {
+        preempt_async_ok  = false;
+        preempt_async_all = !slots.empty();
+
+        for (const auto & slot : slots) {
+            preempt_async_ok  = preempt_async_ok  || slot.preempt_is_async();
+            preempt_async_all = preempt_async_all && slot.preempt_is_async();
+        }
+    }
 
     // [TAG_EXACT_CONCURRENCY] Pool allocation granularity: 1, or the page size under exact concurrency; LLAMA_SERVER_PREEMPT_GRANULARITY overrides.
     int32_t preempt_alloc_granularity = 1;
@@ -4715,11 +4740,18 @@ private:
             slot.preempt_grow = preempt_ram_used() - held + 2 * grown <= preempt_ram_budget();
         }
 
+        const bool was_async = slot.preempt_is_async();
+
         // [TAG_PREEMPT] Budget checks do not guarantee the allocation; preempt_save() unwinds on failure, so fall back to a recompute park.
         if (!recompute && !slot.preempt_save()) {
             SLT_WRN(slot, "%s", "the park could not take the host memory the budget allowed, so it drops its cells instead and the resume re-prefills its tokens\n");
 
             recompute = true;
+        }
+
+        // [TAG_PREEMPT_ASYNC] A slot whose buffer came back pageable parks synchronously from now on: the margin and /props follow the slots left.
+        if (was_async && !slot.preempt_is_async()) {
+            preempt_async_refresh();
         }
 
         if (recompute) {
@@ -6377,7 +6409,7 @@ private:
             { "enabled",     params_base.kv_unified && slots.size() >= 2 && params_base.preempt_ram_mib != 0 &&
                              !preempt_recurrent && !preempt_unshared && ctx_tgt && llama_get_memory(ctx_tgt) },
             { "ram_mib",     params_base.preempt_ram_mib },
-            { "async",       preempt_async_ok },
+            { "async",       preempt_async_all },
             { "notices",     2 },
             { "recurrent",   preempt_recurrent },
             { "granularity", preempt_alloc_granularity },

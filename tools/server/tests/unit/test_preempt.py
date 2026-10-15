@@ -51,7 +51,7 @@ def create_server():
         os.remove(_scratch.pop())
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
-                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
+                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_SERVER_PREEMPT_PAGEABLE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
                  "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY", "LLAMA_ARG_PREEMPT_POLICY"):
         os.environ.pop(name, None)
@@ -1411,6 +1411,22 @@ def test_a_growing_sequence_keeps_its_pinned_buffer_across_parks():
     sizes = re.findall(r"pinned park buffer (?:allocated|grown)", text)
     assert parks >= 40, parks
     assert 1 <= len(sizes) <= 4, f"{len(sizes)} pinned allocations for {parks} parks"
+
+
+def test_a_slot_whose_park_buffer_comes_back_pageable_is_no_longer_reported_async():
+    # The load-time probe pins 1 MiB, but a larger buffer can still be pageable: that slot parks synchronously, and /props must say so.
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    os.environ["LLAMA_SERVER_PREEMPT_PAGEABLE"] = "1"
+    _start_async(n_ctx=512)
+    assert server.make_request("GET", "/props").body["preempt"]["async"] is True
+
+    res = _complete(32)
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["predicted_n"] == 32
+    assert res.body["preempt"]["parks"] > 0, res.body["preempt"]
+
+    assert "is pageable, so this slot parks synchronously from now on" in _log()
+    assert server.make_request("GET", "/props").body["preempt"]["async"] is False
 
 
 def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():
