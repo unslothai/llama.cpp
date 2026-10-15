@@ -133,12 +133,13 @@ uint64_t llama_moe_cache_available_memory_linux(const char * root_c) {
         const char * f_cur;
         const char * k_file;
         const char * k_shmem;
+        const char * k_unevictable;
         if (line.compare(0, a, "0") == 0 && ctrl.empty()) {
             dir_root = root + "/sys/fs/cgroup";
-            f_max = "/memory.max"; f_cur = "/memory.current"; k_file = "file"; k_shmem = "shmem";
+            f_max = "/memory.max"; f_cur = "/memory.current"; k_file = "file"; k_shmem = "shmem"; k_unevictable = "unevictable";
         } else if (("," + ctrl + ",").find(",memory,") != std::string::npos) {
             dir_root = root + "/sys/fs/cgroup/memory";
-            f_max = "/memory.limit_in_bytes"; f_cur = "/memory.usage_in_bytes"; k_file = "total_cache"; k_shmem = "total_shmem";
+            f_max = "/memory.limit_in_bytes"; f_cur = "/memory.usage_in_bytes"; k_file = "total_cache"; k_shmem = "total_shmem"; k_unevictable = "total_unevictable";
         } else {
             continue;
         }
@@ -150,7 +151,10 @@ uint64_t llama_moe_cache_available_memory_linux(const char * root_c) {
             if (llama_moe_cache_read_u64(dir + f_max, lim) && lim < (UINT64_C(1) << 60) && llama_moe_cache_read_u64(dir + f_cur, cur)) {
                 const uint64_t file  = llama_moe_cache_stat(dir + "/memory.stat", k_file);
                 const uint64_t shmem = llama_moe_cache_stat(dir + "/memory.stat", k_shmem);
-                cur -= std::min(cur, file > shmem ? file - shmem : 0);
+                // page cache that can be dropped: not tmpfs/shmem, and not mlock'd (counted as unevictable)
+                const uint64_t cache = file > shmem ? file - shmem : 0;
+                const uint64_t locked = llama_moe_cache_stat(dir + "/memory.stat", k_unevictable);
+                cur -= std::min(cur, cache > locked ? cache - locked : 0);
                 res   = std::min(res, lim > cur ? lim - cur : 0);
                 known = true;
             }

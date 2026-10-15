@@ -1,5 +1,5 @@
 // llama_moe_cache_available_memory_linux: the memory the MoE cache may use to copy memory-mapped experts, read from a fake /proc and
-// /sys/fs/cgroup: the limits of the ancestor cgroups and of cgroup v1 apply, tmpfs/shmem is not reclaimable, exhausted is not unknown
+// /sys/fs/cgroup: the limits of the ancestor cgroups and of cgroup v1 apply, tmpfs/shmem and mlock'd (unevictable) pages are not reclaimable, exhausted is not unknown
 
 #include "../src/llama-ext.h"
 
@@ -122,6 +122,26 @@ int main() {
         put(r, "sys/fs/cgroup/a/memory.current", n(7*GiB) + "\n");
         put(r, "sys/fs/cgroup/a/memory.stat", "anon 1073741824\nfile 6442450944\nshmem 0\n");
         CHECK(avail(r) == 7*GiB);
+    }
+    // v2 cgroup whose page cache is the model file mmap'd and mlock'd: locked pages are unevictable, not reclaimable
+    {
+        const fs::path r = base / "v2_mlock";
+        put(r, "proc/meminfo", meminfo);
+        put(r, "proc/self/cgroup", "0::/a\n");
+        put(r, "sys/fs/cgroup/a/memory.max", n(8*GiB) + "\n");
+        put(r, "sys/fs/cgroup/a/memory.current", n(7*GiB) + "\n");
+        put(r, "sys/fs/cgroup/a/memory.stat", "anon 1073741824\nfile 6442450944\nshmem 0\nunevictable 6442450944\n");
+        CHECK(avail(r) == 1*GiB);
+    }
+    // cgroup v1 with mlock'd page cache: total_unevictable is not reclaimable either
+    {
+        const fs::path r = base / "v1_mlock";
+        put(r, "proc/meminfo", meminfo);
+        put(r, "proc/self/cgroup", "4:memory:/x\n");
+        put(r, "sys/fs/cgroup/memory/x/memory.limit_in_bytes", n(8*GiB) + "\n");
+        put(r, "sys/fs/cgroup/memory/x/memory.usage_in_bytes", n(7*GiB) + "\n");
+        put(r, "sys/fs/cgroup/memory/x/memory.stat", "total_cache 6442450944\ntotal_shmem 0\ntotal_unevictable 4294967296\n");
+        CHECK(avail(r) == 3*GiB);
     }
     // MemAvailable is lower than the cgroup headroom
     {
