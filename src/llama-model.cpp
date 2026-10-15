@@ -2426,6 +2426,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    // copies the MoE cache made of memory-mapped experts are resident on top of the mapping
+    for (const auto & buf : pimpl->adopted_bufs) {
+        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    }
     return ret;
 }
 
