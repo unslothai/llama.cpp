@@ -64,6 +64,13 @@
         { "kind": "arch", "arch": "diffusion-gemma" }
       ]
     },
+    "nemotron-3.5": {
+      "owner": "ggml-org#30520",
+      "checks": [
+        { "kind": "arch", "arch": "nemotron_h_moe" },
+        { "kind": "mtmd", "projector": "nemotron_omni" }
+      ]
+    },
     "kimi-k3": {
       "owner": "unslothai#70",
       "checks": [
