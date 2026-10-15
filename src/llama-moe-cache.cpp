@@ -7,12 +7,26 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <fstream>
 #include <map>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 
 bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
@@ -22,6 +36,106 @@ bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
     return reg != nullptr &&
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map")   != nullptr &&
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") != nullptr;
+}
+
+// whether the buffer is a memory-mapped file (see ggml_backend_cpu_buffer_from_ptr), the device lookup may fail to map it
+static bool llama_moe_cache_is_mapped_file(ggml_backend_buffer_t buf) {
+    return buf != nullptr && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)), "CPU_Mapped") == 0;
+}
+
+ggml_backend_buffer_t llama_moe_cache_materialize_mapped(ggml_tensor ** tensors, size_t n_tensors) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+
+    std::vector<ggml_tensor *> moved;
+    std::set<ggml_tensor *> seen;
+    size_t size = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        ggml_tensor * t = tensors[i];
+        if (t == nullptr || t->data == nullptr || t->view_src != nullptr || !llama_moe_cache_is_mapped_file(t->buffer) || !seen.insert(t).second) {
+            continue;
+        }
+        moved.push_back(t);
+        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+    }
+    if (moved.empty()) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    size_t offs = 0;
+    for (ggml_tensor * t : moved) {
+        uint8_t * dst = base + offs;
+        memcpy(dst, t->data, ggml_nbytes(t));
+        t->data   = dst;
+        t->buffer = buf;
+        offs += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+    }
+    return buf;
+}
+
+// system memory that can still be allocated: MemAvailable within the cgroup limit (Linux), available physical memory (Windows), 0 if unknown
+static uint64_t llama_moe_cache_available_memory() {
+#if defined(__linux__)
+    uint64_t res = 0;
+    {
+        std::ifstream f("/proc/meminfo");
+        std::string key;
+        uint64_t value = 0;
+        std::string unit;
+        while (f >> key >> value) {
+            std::getline(f, unit);
+            if (key == "MemAvailable:") {
+                res = value*1024;
+                break;
+            }
+        }
+    }
+    // cgroup v2 limit of this process
+    std::ifstream fc("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(fc, line)) {
+        if (line.rfind("0::", 0) != 0) {
+            continue;
+        }
+        const std::string dir = "/sys/fs/cgroup" + line.substr(3);
+        uint64_t max = 0;
+        uint64_t cur = 0;
+        std::ifstream fmax(dir + "/memory.max");
+        std::ifstream fcur(dir + "/memory.current");
+        if ((fmax >> max) && (fcur >> cur)) {
+            // the page cache charged to the cgroup is reclaimed before the limit is hit
+            std::ifstream fstat(dir + "/memory.stat");
+            std::string k;
+            uint64_t v = 0;
+            while (fstat >> k >> v) {
+                if (k == "file") {
+                    cur -= std::min(cur, v);
+                    break;
+                }
+            }
+            const uint64_t left = max > cur ? max - cur : 0;
+            res = res == 0 ? left : std::min(res, left);
+        }
+    }
+    return res;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? (uint64_t) status.ullAvailPhys : 0;
+#else
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    size_t free = 0;
+    size_t total = 0;
+    if (cpu != nullptr) {
+        ggml_backend_dev_memory(cpu, &free, &total);
+    }
+    return free;
+#endif
 }
 
 namespace {
@@ -603,7 +717,7 @@ struct llama_moe_cache::impl {
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
-            init_device_lookup();
+            init_device_lookup(model);
         } else if (device_lookup) {
             // memory measurement: build the graphs of the device lookup for the groups whose device can run it (mapping is only known after loading)
             for (group & g : groups) {
@@ -673,9 +787,52 @@ struct llama_moe_cache::impl {
         return ggml_backend_supports_op(backend, op);
     }
 
+    // the device lookup reads the misses from host memory mapped into the device address space; a memory-mapped model file often cannot be
+    // mapped: ROCm registers host memory as a KFD userptr that is always faulted in for writing, so a read-only file mapping fails, and CUDA
+    // needs cudaHostRegisterReadOnly, which not every device or driver supports (cudaDevAttrHostRegisterReadOnlySupported, e.g. Windows WDDM)
+    // the memory-mapped experts of the group are then copied once into anonymous host memory owned by the model (what --load-mode none does
+    // for every weight), if they fit in the available system memory less a margin; LLAMA_MOE_CACHE_MATERIALIZE=0 keeps the host lookups
+    bool materialize_mapped(const llama_model & model, const group & g, ggml_backend_t backend) {
+        const char * env = getenv("LLAMA_MOE_CACHE_MATERIALIZE");
+        if (env != nullptr && atoi(env) == 0) {
+            return false;
+        }
+        std::vector<ggml_tensor *> tensors;
+        std::set<ggml_tensor *> seen;
+        uint64_t need = 0;
+        for (int32_t il : g.layers) {
+            for (ggml_tensor * t : layers[il].experts) {
+                if (llama_moe_cache_is_mapped_file(t->buffer) && seen.insert(t).second) {
+                    tensors.push_back(t);
+                    need += ggml_nbytes(t);
+                }
+            }
+        }
+        if (tensors.empty()) {
+            return false;
+        }
+        const uint64_t avail  = llama_moe_cache_available_memory();
+        const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
+        if (avail > 0 && need + margin > avail) {
+            LLAMA_LOG_WARN("%s: %s: %.0f MiB of memory-mapped host experts do not fit in the %.0f MiB of system memory available (less a %.0f MiB margin), not copied\n",
+                __func__, ggml_backend_name(backend), need/1048576.0, avail/1048576.0, margin/1048576.0);
+            return false;
+        }
+        const int64_t t_start = ggml_time_us();
+        ggml_backend_buffer_t buf = llama_moe_cache_materialize_mapped(tensors.data(), tensors.size());
+        if (buf == nullptr) {
+            LLAMA_LOG_WARN("%s: %s: failed to allocate %.0f MiB of host memory for the memory-mapped host experts\n", __func__, ggml_backend_name(backend), need/1048576.0);
+            return false;
+        }
+        model.adopt_buffer(ggml_backend_buffer_ptr(buf));
+        LLAMA_LOG_INFO("%s: %s: the memory-mapped host experts of %zu layers cannot be mapped for the device lookup, copied %.0f MiB of them into host memory in %.1f s (LLAMA_MOE_CACHE_MATERIALIZE=0 to disable)\n",
+            __func__, ggml_backend_name(backend), g.layers.size(), need/1048576.0, (ggml_time_us() - t_start)/1e6);
+        return true;
+    }
+
     // for each group: checks that its device supports the lookup and maps the host experts into its address space
     // the groups of devices without the lookup op or the host_map function (backend capability) keep the host lookups
-    void init_device_lookup() {
+    void init_device_lookup(const llama_model & model) {
 
         // device pointer of each mapped host buffer, per device (the device address of a host buffer may differ between devices)
         std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
@@ -694,41 +851,53 @@ struct llama_moe_cache::impl {
             auto host_map   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
             auto host_unmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
 
-            // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
-            const size_t n_mapped = mapped.size();
-            std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
+            std::vector<std::vector<const void *>> host_dev;
+            // maps the host experts of the group, on failure the mappings registered for this group only are released again,
+            // so that the host experts do not stay page-locked until the cache is destroyed
+            auto map_group = [&]() -> bool {
+                // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
+                const size_t n_mapped = mapped.size();
+                std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
 
-            bool ok = true;
-            std::vector<std::vector<const void *>> host_dev(g.layers.size());
-            for (size_t i = 0; i < g.layers.size() && ok; ++i) {
-                for (const ggml_tensor * t : layers[g.layers[i]].experts) {
-                    auto it = dev_base.find({ dev, t->buffer });
-                    if (it == dev_base.end()) {
-                        void * base = ggml_backend_buffer_get_base(t->buffer);
-                        bool registered = false;
-                        void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
-                        if (registered) {
-                            mapped.emplace_back(host_unmap, base);
-                            added.emplace_back(dev, t->buffer);
+                bool ok = true;
+                host_dev.assign(g.layers.size(), {});
+                for (size_t i = 0; i < g.layers.size() && ok; ++i) {
+                    for (const ggml_tensor * t : layers[g.layers[i]].experts) {
+                        auto it = dev_base.find({ dev, t->buffer });
+                        if (it == dev_base.end()) {
+                            void * base = ggml_backend_buffer_get_base(t->buffer);
+                            bool registered = false;
+                            void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
+                            if (registered) {
+                                mapped.emplace_back(host_unmap, base);
+                                added.emplace_back(dev, t->buffer);
+                            }
+                            it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
                         }
-                        it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
+                        if (it->second == nullptr) {
+                            ok = false;
+                            break;
+                        }
+                        host_dev[i].push_back(it->second + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(t->buffer)));
                     }
-                    if (it->second == nullptr) {
-                        ok = false;
-                        break;
-                    }
-                    host_dev[i].push_back(it->second + ((const uint8_t *) t->data - (const uint8_t *) ggml_backend_buffer_get_base(t->buffer)));
                 }
+                if (!ok) {
+                    for (size_t i = n_mapped; i < mapped.size(); ++i) {
+                        mapped[i].first(mapped[i].second);
+                    }
+                    mapped.resize(n_mapped);
+                    for (const auto & key : added) {
+                        dev_base.erase(key);
+                    }
+                }
+                return ok;
+            };
+
+            bool ok = map_group();
+            if (!ok && materialize_mapped(model, g, backend)) {
+                ok = map_group();
             }
             if (!ok) {
-                // release the mappings registered for this group only, so that the host experts do not stay page-locked until the cache is destroyed
-                for (size_t i = n_mapped; i < mapped.size(); ++i) {
-                    mapped[i].first(mapped[i].second);
-                }
-                mapped.resize(n_mapped);
-                for (const auto & key : added) {
-                    dev_base.erase(key);
-                }
                 LLAMA_LOG_WARN("%s: %s cannot map the host experts (pageable or memory-mapped), the MoE cache uses host lookups for %zu layers\n",
                     __func__, ggml_backend_name(backend), g.layers.size());
                 continue;

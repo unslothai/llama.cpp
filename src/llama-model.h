@@ -7,6 +7,8 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include "ggml-cpp.h"
+
 #include <map>
 #include <memory>
 #include <string>
@@ -820,6 +822,9 @@ struct llama_model {
     void print_info() const;
 
     ggml_backend_dev_t dev_layer(int il) const;
+
+    // keeps a buffer that model tensors were moved into after loading (for example by the MoE cache) alive as long as the model
+    void adopt_buffer(ggml_backend_buffer_ptr buf) const;
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;

@@ -1250,6 +1250,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // buffers that model tensors were moved into after loading, see adopt_buffer
+    std::vector<ggml_backend_buffer_ptr> adopted_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -2656,6 +2659,12 @@ void llama_model::print_info() const {
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
+}
+
+void llama_model::adopt_buffer(ggml_backend_buffer_ptr buf) const {
+    if (buf) {
+        pimpl->adopted_bufs.push_back(std::move(buf));
+    }
 }
 
 ggml_backend_dev_t llama_model::dev_output() const {

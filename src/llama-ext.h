@@ -149,3 +149,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 
 // the backend of the device can map host memory for the device lookup of the MoE cache (moe_cache_size)
 LLAMA_API bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev);
+
+// copies the tensors that live in memory-mapped file buffers (CPU_Mapped) into one new anonymous host buffer and points them at it
+// the other tensors are left untouched; the new buffer has usage WEIGHTS and is returned (the caller owns it), nullptr if no tensor was moved
+// used by the MoE cache when the device lookup cannot map memory-mapped experts (for example hipHostRegister on a read-only file mapping)
+LLAMA_API ggml_backend_buffer_t llama_moe_cache_materialize_mapped(struct ggml_tensor ** tensors, size_t n_tensors);
