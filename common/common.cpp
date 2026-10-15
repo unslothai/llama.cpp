@@ -2004,7 +2004,8 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
             devs.push_back(dev);
         }
     }
-    if (devs.empty()) {
+    // only an unset list means the default devices: an explicit --device none ({nullptr}) uses none
+    if (params.devices.empty()) {
         devs = common_default_model_devices();
     }
     if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !devs.empty()) {
