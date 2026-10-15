@@ -133,6 +133,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool shares_cells() const override { return get_n_stream() == 1; }  // one stream: every sequence draws on the same cells
+
     // [TAG_EXACT_CONCURRENCY] the page size under exact mode, 1 otherwise
     uint32_t alloc_granularity() const override;
 

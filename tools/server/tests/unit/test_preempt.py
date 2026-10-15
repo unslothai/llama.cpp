@@ -679,6 +679,51 @@ def test_a_hybrid_model_parks_synchronously():
     _assert_recovered(text, "preempted on request")
 
 
+def _generated_model(arch: str, name: str) -> str:
+    """A model made by test-llama-archs beside the server binary; LLAMA_SERVER_TEST_GENERATED_MODELS names a directory that already holds it."""
+    have = os.environ.get("LLAMA_SERVER_TEST_GENERATED_MODELS")
+    if have:
+        return os.path.join(have, f"{name}.gguf")
+    gen = os.path.join(os.path.dirname(os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server")),
+                       "test-llama-archs.exe" if os.name == "nt" else "test-llama-archs")
+    if not os.path.exists(gen):
+        pytest.skip("build test-llama-archs, or set LLAMA_SERVER_TEST_GENERATED_MODELS to a directory of its models")  # ty: ignore[too-many-positional-arguments]
+    out = tempfile.mkdtemp()
+    subprocess.run([gen, "-a", f"^{arch}$", "-s", "2981215097", "-o", out], check=True, capture_output=True, timeout=300)
+    fd, path = tempfile.mkstemp(suffix=".gguf")
+    os.close(fd)
+    _scratch.append(path)
+    os.replace(os.path.join(out, f"{name}.gguf"), path)
+    for f in os.listdir(out):
+        os.remove(os.path.join(out, f))
+    os.rmdir(out)
+    return path
+
+
+@pytest.mark.parametrize("arch,name,shared", [("deepseek4", "deepseek4-moe", False), ("llama", "llama-dense", True)])
+def test_only_a_cache_whose_sequences_share_cells_is_parked(arch, name, shared):
+    # DeepSeek V4 keeps a cache per sequence even under --kv-unified: two prompts that overflow n_ctx together each fit their own, and a park freed nothing the other could use.
+    # The llama control shares one pool, so the same pair overflows it and one is parked.
+    server.model_file = _generated_model(arch, name)
+    server.model_hf_repo = server.model_hf_file = None
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=256, n_batch=128, n_ubatch=64, fa="on", n_gpu_layer=0)
+    assert server.make_request("GET", "/props").body["preempt"]["enabled"] is shared
+
+    results = parallel_function_calls([(_raw_completion, (80, [1] * 140)) for _ in range(2)])
+    _assert_completed(results, 80)
+    parks = [(res.body.get("preempt") or {}).get("parks", 0) for res in results]
+
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    if shared:
+        assert sum(parks) >= 1, parks
+        _assert_recovered(text)
+    else:
+        assert parks == [0, 0], parks
+        _assert_nothing_parked(text)
+
+
 # [TAG_EXACT_CONCURRENCY] The paged pool places a cell by sequence and position, so layouts with shared positions cannot be served.
 
 def _mrope_model() -> str:

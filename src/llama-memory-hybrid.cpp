@@ -150,6 +150,10 @@ uint32_t llama_memory_hybrid::alloc_granularity() const {
     return mem_attn->alloc_granularity();
 }
 
+bool llama_memory_hybrid::shares_cells() const {
+    return mem_attn->shares_cells();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

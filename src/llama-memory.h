@@ -104,6 +104,9 @@ struct llama_memory_i {
     // [TAG_EXACT_CONCURRENCY] Allocation granularity: n tokens occupy round_up(n, granularity) cells. Not pure virtual, so old modules inherit 1.
     virtual uint32_t alloc_granularity() const { return 1; }
 
+    // [TAG_PREEMPT] True when the sequences draw on one pool of cells, so one sequence's growth takes room from the others. Not pure virtual, so old modules inherit true.
+    virtual bool shares_cells() const { return true; }
+
     //
     // ops
     //

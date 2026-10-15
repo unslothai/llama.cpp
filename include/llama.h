@@ -824,6 +824,10 @@ extern "C" {
     // n contiguous tokens then occupy round_up(n, granularity) cells; a sequence left with holes still holds every block one live cell is in
     LLAMA_API uint32_t llama_memory_alloc_granularity(llama_memory_t mem);
 
+    // [TAG_PREEMPT] true when the sequences draw on one pool of cells, so one sequence's growth takes room from the others
+    // false for a recurrent state, a cache with a stream per sequence, or one that keeps its own streams per sequence whatever the unified flag says
+    LLAMA_API bool llama_memory_shares_cells(llama_memory_t mem);
+
     // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
     // takes the context because the update is a graph; returns true when one was run
     LLAMA_API bool llama_memory_update(struct llama_context * ctx);

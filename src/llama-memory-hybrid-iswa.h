@@ -58,6 +58,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool shares_cells() const override { return mem_attn->shares_cells(); }  // the recurrent half holds one state per sequence
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

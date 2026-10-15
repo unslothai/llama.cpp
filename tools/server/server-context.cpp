@@ -2186,6 +2186,13 @@ private:
             if (preempt_recurrent && params_base.preempt_ram_mib != 0) {
                 SRV_WRN("%s", "preemption: off, the recurrent cache holds one state per sequence whatever its length, so there is no cell pool to run out of\n");
             }
+
+            // [TAG_PREEMPT] A cache with its own cells per sequence (DeepSeek V4, even when unified): parking one frees nothing another sequence could use.
+            preempt_unshared = !preempt_recurrent && llama_get_memory(ctx_tgt) && !llama_memory_shares_cells(llama_get_memory(ctx_tgt));
+
+            if (preempt_unshared && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+                SRV_WRN("%s", "preemption: off, this cache keeps its own cells per sequence even when unified, so parking one frees no room for another\n");
+            }
         }
 
         {
@@ -3929,6 +3936,8 @@ private:
 
     bool preempt_recurrent = false;
 
+    bool preempt_unshared = false;  // the sequences do not draw on one pool of cells
+
     bool preempt_batch_abandoned = false;
 
     // [TAG_PREEMPT_ASYNC] A context shift is pending; it is applied in place inside the next llama_decode.
@@ -4881,8 +4890,8 @@ private:
             update_preempt_copies();
         }
 
-        if (params_base.preempt_ram_mib == 0 || preempt_recurrent) {
-            return;  // --preempt-ram 0 or a recurrent cache: retry ladder only
+        if (params_base.preempt_ram_mib == 0 || preempt_recurrent || preempt_unshared) {
+            return;  // --preempt-ram 0, or no shared pool of cells: retry ladder only
         }
 
         const int32_t n_cells = n_ctx;
@@ -6366,7 +6375,7 @@ private:
     json preempt_props() const {
         return json {
             { "enabled",     params_base.kv_unified && slots.size() >= 2 && params_base.preempt_ram_mib != 0 &&
-                             !preempt_recurrent && ctx_tgt && llama_get_memory(ctx_tgt) },
+                             !preempt_recurrent && !preempt_unshared && ctx_tgt && llama_get_memory(ctx_tgt) },
             { "ram_mib",     params_base.preempt_ram_mib },
             { "async",       preempt_async_ok },
             { "notices",     2 },
@@ -6377,7 +6386,7 @@ private:
     }
 
     bool preempt_last_resort_possible() const {
-        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && slots.size() >= 2 && llama_get_memory(ctx_tgt);
+        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && !preempt_unshared && slots.size() >= 2 && llama_get_memory(ctx_tgt);
     }
 
     // [TAG_PREEMPT] Retry ladder exhausted: give up the batch, rewind residents to the cache's token boundary and park the smallest. A media chunk mid-prompt keeps the old path.
