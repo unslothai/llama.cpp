@@ -1258,6 +1258,11 @@ json server_decision_context::format_answer(const server_decision_question & que
 //
 
 std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots) {
+    // [TAG_EXACT_CONCURRENCY] Exact mode refuses seq_cp (a page belongs to one sequence), so every task keeps its whole prompt.
+    if (common_exact_concurrency()) {
+        return std::move(tasks);
+    }
+
     n_slots = std::max(n_slots, (size_t) 1);
 
     std::vector<server_task> groups;

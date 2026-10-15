@@ -133,6 +133,11 @@ public:
 
     bool get_can_shift() const override;
 
+    bool shares_cells() const override { return get_n_stream() == 1; }  // one stream: every sequence draws on the same cells
+
+    // [TAG_EXACT_CONCURRENCY] the page size under exact mode, 1 otherwise
+    uint32_t alloc_granularity() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -224,6 +229,8 @@ public:
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
@@ -265,6 +272,37 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+    static constexpr uint32_t exact_page_size = 256;
+    bool exact_pages = false;
+
+    // [TAG_EXACT_CONCURRENCY] The (sequence, logical page) owning each physical page; seq < 0 is free. Kept current on placement and removal.
+    struct exact_page {
+        llama_seq_id seq = -1;
+        llama_pos    lpg = -1;
+    };
+
+    mutable std::vector<exact_page> exact_page_owner;
+    mutable bool                    exact_page_owner_dirty = true;
+
+    // live cells in each physical page, so a removal can free the page it emptied without rescanning the pool
+    mutable std::vector<uint32_t> exact_page_live;
+
+    // with LLAMA_KV_CACHE_DEBUG set this also rebuilds, to check what was maintained
+    void exact_pages_sync() const;
+
+    void exact_pages_rebuild() const;
+
+    void exact_pages_claim(uint32_t idx, llama_seq_id seq, llama_pos pos);
+
+    // record that the cell at physical index idx has just become empty
+    void exact_pages_release(uint32_t idx);
+
+    // released cell count, so prepare() can tell whether a placement removed cells it does not restore.
+    uint64_t exact_page_n_release = 0;
+
+    // scratch for find_slot(), which must not touch the ownership it reads
+    mutable std::vector<exact_page> exact_page_owner_tmp;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -421,6 +459,8 @@ public:
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_pages(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_pages(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;

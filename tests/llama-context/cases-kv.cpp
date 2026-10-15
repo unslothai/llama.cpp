@@ -628,6 +628,12 @@ struct case_state_restore_fragmented : ctx_test {
             return case_result::fail();
         }
 
+        std::vector<uint8_t> neighbours_before[2];
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, neighbours_before[0]) ||
+            !get_seq_state(ctx.get(), 2, LLAMA_STATE_SEQ_FLAGS_NONE, neighbours_before[1])) {
+            return case_result::fail();
+        }
+
         // clearing seq 1 leaves holes where its cells were - no contiguous block large enough
         // for the seq 1 state is left in the cache
         llama_memory_seq_rm(llama_get_memory(ctx.get()), 1, -1, -1);
@@ -647,6 +653,15 @@ struct case_state_restore_fragmented : ctx_test {
         }
 
         CTX_REQUIRE(blobs_equal(state_before, state_after), "restoring into a fragmented cache changed the state of seq 1");
+
+        for (int i = 0; i < 2; ++i) {
+            const llama_seq_id s = i == 0 ? 0 : 2;
+            std::vector<uint8_t> neighbour_after;
+            if (!get_seq_state(ctx.get(), s, LLAMA_STATE_SEQ_FLAGS_NONE, neighbour_after)) {
+                return case_result::fail();
+            }
+            CTX_REQUIRE(blobs_equal(neighbours_before[i], neighbour_after), "restoring seq 1 into a fragmented cache changed a neighbouring sequence");
+        }
 
         // the restored sequence must continue exactly as the untouched one - decode the same token
         //   on seq 1 in both contexts and compare the logits they produce

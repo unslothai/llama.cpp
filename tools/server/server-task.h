@@ -140,6 +140,9 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // [TAG_PREEMPT] this request yielded more than one task, so index tells its results apart and the preempt notices carry it
+    bool batched = false;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -387,6 +390,13 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
 
+    // [TAG_PREEMPT] how the request was served: how often it was parked, and how many of those parks re-prefilled instead of restoring saved bytes
+    int32_t n_preempt   = 0;
+    int32_t n_recompute = 0;
+    bool    preempt_report = false; // the server can park, so the response carries the record
+
+    json preempt_to_json() const;
+
     task_params generation_params;
 
     // response formatting
@@ -438,6 +448,19 @@ struct server_task_result_cmpl_final : server_task_result {
     json to_json_anthropic();
 
     json to_json_anthropic_stream();
+};
+
+// [TAG_PREEMPT] Notice for a streaming task whose slot was parked or restored, sent as an SSE comment (": preempted", ": resumed") that clients ignore.
+struct server_task_result_preempt_notice : server_task_result {
+    bool    parked     = false; // true when the slot was just parked, false when restored
+    bool    recomputed = false; // this resume re-prefilled its tokens instead of restoring saved bytes
+    int32_t n_preempt  = 0;     // how many times this task has been parked so far
+    bool    batched    = false; // one of several tasks of its request, so the notice names which one by index
+
+    virtual bool is_stop() override {
+        return false;
+    }
+    virtual json to_json() override;
 };
 
 struct server_task_result_cmpl_partial : server_task_result {
@@ -550,6 +573,8 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
+    int n_preempted_slots = 0;        // [TAG_PREEMPT] processing slots currently parked or moving to or from host memory
+    size_t preempt_ram_bytes = 0;     // [TAG_PREEMPT] host RAM held for parking, including buffers kept after a restore
 
     server_metrics metrics;
 

@@ -187,6 +187,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp LINK llama)
     llama_build_and_test(test-batch-alloc.cpp LINK llama)
+    # [TAG_EXACT_CONCURRENCY] the buffer types the mode treats as invariant, through llama-impl.h
+    llama_build_and_test(test-exact-buft.cpp LINK llama)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -315,10 +317,31 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+# [TAG_EXACT_CONCURRENCY] the RPC server refuses a paged FLASH_ATTN_EXT; the test forks its own server, so POSIX only
+if (GGML_RPC AND NOT GGML_BACKEND_DL AND NOT WIN32)
+    llama_build_and_test(test-rpc-paged-fa.cpp LINK ggml)
+endif()
+
+# [TAG_EXACT_CONCURRENCY] the event query a backend publishes through its registry is found and answers
+llama_build_and_test(test-event-query.cpp LINK ggml)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+
+# Guards on the asynchronous per-sequence state transfer
+# Skips itself on a backend that cannot copy asynchronously
+llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool; skips itself where the mode cannot run
+llama_build_and_test(test-exact-pages.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-pages PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# [TAG_EXACT_CONCURRENCY] a non-layer weight on the host is refused; skips itself where the mode cannot run
+llama_build_and_test(test-exact-weights.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-weights PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
@@ -338,6 +361,19 @@ endif()
 llama_build_and_test(test-mtmd-c-api.c LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp LINK mtmd)
+
+# [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
+llama_build_and_test(test-exact-geometry.cpp)
+
+# server helpers that need no model; server-context exists only where tools/ adds the server
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    llama_build_and_test(test-server-tokens.cpp)
+    target_link_libraries(test-server-tokens PRIVATE server-context mtmd)
+    target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    llama_build_and_test(test-server-decision-exact.cpp)
+    target_link_libraries(test-server-decision-exact PRIVATE server-context mtmd)
+    target_include_directories(test-server-decision-exact PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
