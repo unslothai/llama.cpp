@@ -4,7 +4,6 @@
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -757,6 +756,16 @@ static enum ggml_status mock_graph_compute(ggml_backend_t backend, ggml_cgraph *
 static void mock_event_record(ggml_backend_t, ggml_backend_event_t) {}
 static void mock_event_wait(ggml_backend_t, ggml_backend_event_t) {}
 
+// the CPU backend can be a dynamically loaded module (GGML_BACKEND_DL), so resolve it through the registry
+static ggml_backend_t test_cpu_backend_init() {
+    static bool loaded = false;
+    if (!loaded) {
+        ggml_backend_load_all();
+        loaded = true;
+    }
+    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+}
+
 static ggml_backend_t mock_backend_init(ggml_backend_dev_t dev, const char *) {
     static ggml_guid guid = { 0x4d, 0x6f, 0x63, 0x6b };
     ggml_backend_i iface = {};
@@ -767,7 +776,7 @@ static ggml_backend_t mock_backend_init(ggml_backend_dev_t dev, const char *) {
     iface.graph_compute    = mock_graph_compute;
     iface.event_record     = mock_event_record;
     iface.event_wait       = mock_event_wait;
-    return new ggml_backend { &guid, iface, dev, ggml_backend_cpu_init() };
+    return new ggml_backend { &guid, iface, dev, test_cpu_backend_init() };
 }
 
 static const char * mock_dev_get_name(ggml_backend_dev_t) { return "MockGPU"; }
@@ -844,7 +853,7 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     setenv("GGML_SCHED_PREFETCH", prefetch ? "2" : "0", 1);
 #endif
     ggml_backend_t gpu = mock_backend_init(&mock.dev, nullptr);
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = test_cpu_backend_init();
     ggml_backend_t backends[2] = { gpu, cpu };
     ggml_backend_buffer_type_t bufts[2] = { &mock.buft, ggml_backend_cpu_buffer_type() };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 256, false, true);
@@ -937,6 +946,13 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
 
 // every path that allocates graph buffers with a staging arena must leave the headroom free, else drop the prefetch
 static void test_prefetch_headroom() {
+    ggml_backend_t cpu = test_cpu_backend_init();
+    if (cpu == nullptr) {
+        printf("skipped, no CPU backend ");
+        return;
+    }
+    ggml_backend_free(cpu);
+
     const size_t MiB = 1024*1024;
     void * prev_user_data = nullptr;
     ggml_log_get(&mock_prev_log, &prev_user_data);
