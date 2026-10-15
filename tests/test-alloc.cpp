@@ -838,7 +838,11 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     mock.dev.iface.event_free        = mock_dev_event_free;
     mock.dev.iface.event_synchronize = mock_dev_event_synchronize;
 
+#if defined(_WIN32)
+    _putenv_s("GGML_SCHED_PREFETCH", prefetch ? "2" : "0");
+#else
     setenv("GGML_SCHED_PREFETCH", prefetch ? "2" : "0", 1);
+#endif
     ggml_backend_t gpu = mock_backend_init(&mock.dev, nullptr);
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_t backends[2] = { gpu, cpu };
@@ -922,7 +926,11 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     ggml_free(wctx);
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);
+#if defined(_WIN32)
+    _putenv_s("GGML_SCHED_PREFETCH", "");
+#else
     unsetenv("GGML_SCHED_PREFETCH");
+#endif
     GGML_ASSERT(mock.used == 0);
     return used;
 }
