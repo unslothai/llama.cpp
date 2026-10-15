@@ -73,6 +73,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from merge_checks import _raw_delim  # noqa: E402  (one raw-string reader for every scanner here)
+
 HEADER = "ggml/include/ggml.h"
 SOURCE = "ggml/src/ggml.c"
 RPC_HEADER = "ggml/include/ggml-rpc.h"
@@ -100,7 +103,16 @@ def blank_comments_and_strings(text: str) -> str:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if text.startswith("//", i):
+        delim = _raw_delim(text, i)
+        if delim is not None:
+            # a raw string ends only at )delim": quotes and backslashes inside it are text
+            end = text.find(")" + delim + '"', i + len(delim) + 3)
+            j = n if end < 0 else end + len(delim) + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = "S"
+            i = j
+        elif text.startswith("//", i):
             j = text.find("\n", i)
             j = n if j < 0 else j
             for k in range(i, j):
@@ -395,6 +407,26 @@ def merged_pins(root: Path, base_ref: str) -> list[str]:
     return pins
 
 
+def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
+    """pin, or the commit below the base merge repin.py made into it, when nothing after that merge moved the
+    op count or the RPC version.
+
+    A refreshed carry pin has the base in its history, so merge-base(base_ref, pin) is the base itself, which
+    already carries upstream's own PATCH bump: an identical bump of the pin's would read as none.
+    """
+    for line in git_lines(root, "rev-list", "--first-parent", "--parents", f"{base_ref}..{pin}"):
+        commit, *parents = line.split()
+        if len(parents) < 2:
+            continue                         # e.g. a commit that only rewrote the asserts after the merge
+        if (all(is_ancestor(root, p, base_ref) for p in parents[1:])
+                and git_show(root, pin, HEADER) == git_show(root, commit, HEADER)
+                and rpc_version(git_show(root, pin, RPC_HEADER))[0]
+                == rpc_version(git_show(root, commit, RPC_HEADER))[0]):
+            return pin_before_base_merge(root, base_ref, parents[0])
+        break
+    return pin
+
+
 def unbumped_pins(root: Path, base_ref: str) -> tuple[list[str], int]:
     """(problems, number of pins that changed GGML_OP_COUNT and bumped RPC_PROTO_*_VERSION).
 
@@ -405,6 +437,7 @@ def unbumped_pins(root: Path, base_ref: str) -> tuple[list[str], int]:
     """
     bad, bumped = [], 0
     for pin in merged_pins(root, base_ref):
+        pin = pin_before_base_merge(root, base_ref, pin)
         fork = git_lines(root, "merge-base", base_ref, pin)[0]
         ph, fh = git_show(root, pin, HEADER), git_show(root, fork, HEADER)
         pn, _ = enum_count(ph, blank_comments_and_strings(ph), "ggml_op", "GGML_OP_COUNT")

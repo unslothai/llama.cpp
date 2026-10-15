@@ -688,6 +688,40 @@ for repl, name in (("#define RPC_PROTO_PATCH_VERSION    1 - 1\n", "an expression
     check(f"{name} is refused, nothing rewritten", rc == 1 and "RPC_PROTO_PATCH_VERSION" in out
           and snapshot(d) == before, out)
 
+# astra r9 1: a raw string holding a quote and assert-like text is a literal, not code.
+d = make(*TWO)
+p = d / "ggml" / "src" / "extra.c"
+RAW = 'const char * doc = R"doc(a " quote\nstatic_assert(GGML_OP_COUNT == 101, "literal 101");\n)doc";\n'
+p.write_text(RAW + 'static_assert(GGML_OP_COUNT == 101, "real 101");\n')
+rc, out = run(d)
+check("a raw string's assert-like text is left alone and the real assert after it is rewritten",
+      rc == 0 and p.read_text() == RAW + 'static_assert(GGML_OP_COUNT == 103, "real 103");\n', p.read_text() + out)
+
+# astra r9 2: a carry pin refreshed by repin.py (the base merged into it), then merged onto the base by the
+# nightly. Upstream and the pin each added an op and made the same PATCH 0 -> 1 edit.
+d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 1)], merge_into_pin=True)
+git(d, "checkout", "-q", "--detach", "base")
+git(d, "merge", "-q", "--no-ff", "--no-edit", "pin0")
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("a refreshed carry pin is judged on its own bump, not refused: PATCH 0 + 2",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc and "GGML_OP_COUNT == 103" in rpc, out)
+d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 0)],     # the nightly merge is redone below
+            resolved=tree(MID + ["PIN_NEW"], 102, 1))
+git(d, "checkout", "-q", "pin0")
+r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff",
+                    "--no-edit", "base"], capture_output=True)
+if r.returncode:                                     # repin.py's resolution: both ops, upstream's PATCH
+    commit_tree(d, "refresh pin0", tree(MID + ["PIN_NEW"], 103, 1))
+git(d, "checkout", "-q", "--detach", "base")
+r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff",
+                    "--no-edit", "pin0"], capture_output=True)
+check("(fixture) the refreshed pin merges onto the base cleanly", r.returncode == 0, r.stdout + r.stderr)
+before = snapshot(d)
+rc, out = run(d)
+check("a refreshed carry pin that never bumped is still refused",
+      rc == 1 and "without bumping" in out and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)
