@@ -362,6 +362,44 @@ def test_a_resident_cycling_through_context_shifts_is_rotated_out_for_a_parked_h
     assert "slot context shift" in text
 
 
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_a_parked_head_that_needs_the_whole_pool_is_rotated_in(policy):
+    # 506 of 512 cells fit only with nobody else resident; the rotation still charged the residents' margin, so a resident that context-shifts forever kept the pool.
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
+    _start(n_ctx=512, n_batch=512, cache_ram=0, enable_ctx_shift=True, n_predict=-1)
+    head = _prompt_of(506, _PROMPT_B)
+    alone = _raw_completion(1, head, 1, timeout=60)
+    assert alone.status_code == 200, alone.body
+
+    stop = threading.Event()
+
+    def lead():
+        with requests.post(server.make_url("/completion"), json={
+            "n_predict": -1, "prompt": _prompt_of(320, _PROMPT_A), "id_slot": 0, "cache_prompt": False,
+            "ignore_eos": True, "temperature": 0.0, "seed": 42, "stream": True,
+        }, stream=True, timeout=120) as res:
+            for _ in res.iter_lines():
+                if stop.is_set():
+                    break
+
+    leader = threading.Thread(target=lead, daemon=True)
+    leader.start()
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and _n_decoded(_slot_view(0)) <= 40:
+            time.sleep(0.005)
+        # Rotation waits 2 s for the head; without it the head waits for a leader that never ends.
+        res = _raw_completion(1, head, 1, timeout=60)
+    finally:
+        stop.set()
+        leader.join(30)
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["predicted_n"] == 1
+    text = _log()
+    assert "Context size has been exceeded" not in text
+    assert "rotated out after" in text
+
+
 def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
     # A failed save used to stop the planner and let the pool overflow, though the victim could still be parked by dropping its cells.
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"

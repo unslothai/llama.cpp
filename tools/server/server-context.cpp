@@ -4950,7 +4950,15 @@ private:
                 // [TAG_PREEMPT_ASYNC] A park still copying holds its cells, so rotating now would park a second resident.
                 if (!preempt_copies_in_flight() && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
                     const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
-                    const int32_t need     = preempt_n_need(*head) + preempt_n_margin(1);
+                    const int32_t need     = preempt_n_need(*head);
+                    const int32_t margin   = preempt_n_margin(1);
+
+                    // [TAG_PREEMPT] The margin is charged on what stays resident after the rotation; with nobody left an exact fit is allowed, as on restore.
+                    auto room_after = [&](int32_t n_freed) {
+                        const int32_t n_left = occupied - n_freed;
+
+                        return n_left + need + (n_left <= 0 ? 0 : margin) <= n_cells;
+                    };
 
                     server_slot * pick           = nullptr;
                     bool          pick_enough    = false;
@@ -4993,7 +5001,7 @@ private:
 
                             n_freed_all += n_freed;
 
-                            const bool enough = occupied - n_freed + need <= n_cells;
+                            const bool enough = room_after(n_freed);
 
                             if (!pick ||
                                 (enough && !pick_enough) ||
@@ -5006,7 +5014,7 @@ private:
 
                     // [TAG_PREEMPT] Short alone, a pick is only a first step: if every candidate together cannot make room, it would wait parked beside the head for nothing.
                     auto drop_futile = [&]() {
-                        if (pick && !pick_enough && occupied - n_freed_all + need > n_cells) {
+                        if (pick && !pick_enough && !room_after(n_freed_all)) {
                             pick = nullptr;
                         }
                     };
