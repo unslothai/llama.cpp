@@ -86,6 +86,13 @@
         { "kind": "backend-op", "op": "TOPK_QSA" }
       ]
     },
+    "cuda-moe-prompt": {
+      "owner": "unslothai#264",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT_ID", "params": "^(?!.*dup=1)" },
+        { "kind": "backend-op", "op": "GET_ROWS" }
+      ]
+    },
     "projector-registry": {
       "owner": "unslothai#176",
       "checks": [
@@ -101,6 +108,7 @@
     "unslothai#241": "CUDA graph cache keyed by shape with no count cap (tensor split keeps replaying its 2 * n_layers + 1 graphs per device), macOS row prefetch and the F16 glm5-next indexer cache under a quantized -ctk (the NextN draft graph is upstream since ggml-org#29928); the first needs a CUDA host (multi-GPU for the cap), the second has no observable output difference, the last needs a real GLM-5-Next model",
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model",
     "unslothai#251": "--moe-cache-mib auto sizes the ggml-org#29887 MoE expert cache from the fit; it only acts when a MoE model spills on a single GPU, the flag is off by default, and no runner in the pipeline has a GPU",
-    "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one"
+    "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
+    "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe"
   }
 }
