@@ -4601,6 +4601,11 @@ private:
             return false;
         }
 
+        // [TAG_PREEMPT] An n_cmpl > 1 prompt on cells cannot be parked or rotated, so holding it keeps the head from the cells it sits on.
+        if (preempt_is_family(slot) && slot.prompt.n_tokens() > 0) {
+            return false;
+        }
+
         if (preempt_fcfs && slot.task->id < preempt_reserved_for->task->id) {
             return false;
         }

@@ -1430,11 +1430,11 @@ def test_a_resumed_re_prefill_keeps_its_room_until_it_is_done():
     assert _reparked_mid_reprefill(text) == []
 
 
-def _oai_n(prompt: list, n: int, max_tokens: int):
+def _oai_n(prompt: list, n: int, max_tokens: int, timeout: float = DEFAULT_REQUEST_TIMEOUT):
     return server.make_request("POST", "/v1/completions", data={
         "prompt": prompt, "n": n, "max_tokens": max_tokens, "ignore_eos": True,
         "temperature": 0.0, "seed": 42, "cache_prompt": False,
-    })
+    }, timeout=timeout)
 
 
 def test_a_single_request_beside_an_n_2_request_is_parked_so_both_finish():
@@ -1468,6 +1468,25 @@ def test_two_n_2_requests_that_do_not_fit_together_end_only_one():
     ok = next(r for r in results if r.status_code == 200)
     assert [c["finish_reason"] for c in ok.body["choices"]] == ["length", "length"]
     assert "ending it alone" in _log()
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "cost"])
+def test_an_n_2_prompt_that_parked_an_older_request_is_not_held_behind_it(policy):
+    # The n=2 prompt cannot be parked, so the older request is parked for it; fcfs then held the prompt behind that head, which waited for the cells the prompt sat on.
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
+    _start(n_ctx=1024, n_slots=3, n_batch=128, cache_ram=0)
+    with ThreadPoolExecutor(1) as pool:
+        single = pool.submit(_raw_completion, 300, [100 + k % 50 for k in range(600)], 0, 90)
+        deadline = time.time() + 60
+        while time.time() < deadline and _n_decoded(_slot_view(0)) <= 4:
+            time.sleep(0.002)
+        family = _oai_n([200 + k % 50 for k in range(800)], 2, 1, timeout=90)
+        single = single.result()
+    assert single.status_code == 200, single.body
+    assert single.body["timings"]["predicted_n"] == 300
+    assert family.status_code == 200, family.body
+    assert [c["finish_reason"] for c in family.body["choices"]] == ["length", "length"]
+    _assert_recovered(_log())
 
 
 def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generating_one():
