@@ -30,6 +30,10 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
 }
 
 static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // its op params hold process-local pointers, which cannot cross the remoting boundary (as in ggml-rpc)
+    if (op->op == GGML_OP_MOE_CACHE_LOOKUP) {
+        return false;
+    }
 #if USE_ALWAYS_TRUE_SUPPORTS_OP == 1
     /* ggml-rpc cheats it like this */
     /* with the current implementation of serialize_tensor, the src/view aren't properly passed */

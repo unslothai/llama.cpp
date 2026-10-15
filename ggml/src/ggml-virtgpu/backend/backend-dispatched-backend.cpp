@@ -67,6 +67,18 @@ uint32_t backend_backend_graph_compute(apir_encoder * enc, apir_decoder * dec, v
     }
 
     ggml_status status;
+    // its op params hold process-local pointers, which a guest must never supply: rejected whatever
+    // APIR_BACKEND_CHECK_SUPPORTS_OP says (as ggml-rpc does when deserializing)
+    for (int idx = 0; idx < cgraph->n_nodes; idx++) {
+        const ggml_tensor * op = ggml_graph_node(cgraph, idx);
+        if (op != nullptr && op->op == GGML_OP_MOE_CACHE_LOOKUP) {
+            GGML_LOG_ERROR(GGML_VIRTGPU_BCK "%s: Graph node %d (%s) is not supported over the remoting boundary\n", __func__,
+                           idx, ggml_op_desc(op));
+            status = GGML_STATUS_ABORTED;
+            apir_encode_ggml_status(enc, &status);
+            return 0;
+        }
+    }
 #if APIR_BACKEND_CHECK_SUPPORTS_OP == 1
     for (int idx = 0; idx < cgraph->n_nodes; idx++) {
         ggml_tensor * op = ggml_graph_node(cgraph, idx);
