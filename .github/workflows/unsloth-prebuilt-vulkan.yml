@@ -545,11 +545,16 @@ jobs:
         shell: pwsh
     steps:
       - name: Download source @ ${{ inputs.tag }}
+        id: src_dl
+        continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
         with:
           name: ${{ inputs.source_artifact }}
           path: srcpkg
       - name: Extract source
+        id: src
+        if: steps.src_dl.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
           set -eux
@@ -570,6 +575,7 @@ jobs:
           save: false
 
       - name: Configure ccache
+        continue-on-error: true
         run: |
           $ErrorActionPreference = 'Continue'
           $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
@@ -587,11 +593,14 @@ jobs:
           }
 
       - name: Install Ninja
+        id: ninja
+        continue-on-error: true
         run: choco install ninja --no-progress
 
       # The ARM64 component supplies the vulkan-1.lib to link; shaders compile with the host glslc.
       - name: Install Vulkan SDK
         id: sdk
+        if: steps.src.outcome == 'success' && steps.ninja.outcome == 'success'
         continue-on-error: true
         run: |
           curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
@@ -636,6 +645,7 @@ jobs:
 
       - name: Build DiffusionGemma binaries (best-effort; mix builds only)
         if: steps.build.outcome == 'success'
+        continue-on-error: true
         working-directory: src
         run: |
           if (-not (Test-Path "examples/diffusion-gemma-server")) {
@@ -675,7 +685,9 @@ jobs:
           if ($bad) { Write-Error ("not ARM64: " + ($bad -join ", ")); exit 1 }
 
       - name: Fetch signing tooling
+        id: tooling
         if: steps.check.outcome == 'success'
+        continue-on-error: true
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           path: signing-tooling
@@ -684,7 +696,7 @@ jobs:
 
       - name: Sign Windows binaries
         id: sign_windows
-        if: steps.check.outcome == 'success'
+        if: steps.tooling.outcome == 'success'
         continue-on-error: true
         uses: ./signing-tooling/.github/actions/sign-windows
         with:
@@ -718,6 +730,7 @@ jobs:
       - name: Upload bundle artifact
         id: upload
         if: ${{ steps.package.outcome == 'success' && steps.verify.outcome != 'failure' }}
+        continue-on-error: true
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: app-${{ inputs.tag }}-windows-arm64-vulkan
@@ -726,8 +739,9 @@ jobs:
 
       - name: Report a skipped bundle
         if: ${{ !cancelled() && steps.upload.outcome != 'success' }}
+        continue-on-error: true
         run: |
-          Write-Output "::warning::windows/arm64 Vulkan bundle not published this run (sdk=${{ steps.sdk.outcome }} configure=${{ steps.configure.outcome }} build=${{ steps.build.outcome }} check=${{ steps.check.outcome }} sign=${{ steps.sign_windows.outcome }} package=${{ steps.package.outcome }} verify=${{ steps.verify.outcome }})"
+          Write-Output "::warning::windows/arm64 Vulkan bundle not published this run (source=${{ steps.src.outcome }} ninja=${{ steps.ninja.outcome }} sdk=${{ steps.sdk.outcome }} configure=${{ steps.configure.outcome }} build=${{ steps.build.outcome }} check=${{ steps.check.outcome }} tooling=${{ steps.tooling.outcome }} sign=${{ steps.sign_windows.outcome }} package=${{ steps.package.outcome }} verify=${{ steps.verify.outcome }} upload=${{ steps.upload.outcome }})"
           "- windows/arm64 Vulkan bundle skipped; the release ships without it" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
       - name: Evict stale ccache files
@@ -737,6 +751,7 @@ jobs:
 
       - name: Save ccache
         if: ${{ always() }}
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
