@@ -726,6 +726,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
+    // with the MoE cache a memory measurement counts the staging (see sched_reserve), the cache sizing leaves room for it
+    if (moe_cache) {
+        ggml_backend_sched_set_prefetch_headroom(sched.get(), 0);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -798,6 +802,16 @@ void llama_context::sched_reserve() {
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+        }
+
+        // a memory measurement (e.g. --fit) does not count the staging memory of the host weight prefetch: it only uses memory that is
+        // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
+        // places the same layers as without the prefetch instead of moving one to the host for the staging copies
+        // with the MoE cache the cache takes the memory left after the layers: the measurement keeps the staging
+        if (model.hparams.no_alloc && !moe_cache) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
             }
         }
 
