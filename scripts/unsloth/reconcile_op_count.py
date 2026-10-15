@@ -413,6 +413,16 @@ def op_entries_at(root: Path, ref: str) -> list[str]:
     return enum_entries(text, blank_comments_and_strings(text), "ggml_op", "GGML_OP_COUNT")[2]
 
 
+def base_side_parent(root: Path, base_ref: str, parent: str) -> bool:
+    """parent is the base, or upstream past it with the base's ops and RPC version (a pin refreshed onto newer upstream)."""
+    if is_ancestor(root, parent, base_ref):
+        return True
+    return (is_ancestor(root, base_ref, parent)
+            and op_entries_at(root, parent) == op_entries_at(root, base_ref)
+            and rpc_version(git_show(root, parent, RPC_HEADER))[0]
+            == rpc_version(git_show(root, base_ref, RPC_HEADER))[0])
+
+
 def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
     """pin, or the commit below the base merge repin.py made into it, when nothing after that merge moved the
     op count or the RPC version.
@@ -424,7 +434,7 @@ def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
         commit, *parents = line.split()
         if len(parents) < 2:
             continue                         # e.g. a commit that only rewrote the asserts after the merge
-        if (all(is_ancestor(root, p, base_ref) for p in parents[1:])
+        if (all(base_side_parent(root, base_ref, p) for p in parents[1:])
                 and op_entries_at(root, pin) == op_entries_at(root, commit)
                 and rpc_version(git_show(root, pin, RPC_HEADER))[0]
                 == rpc_version(git_show(root, commit, RPC_HEADER))[0]):

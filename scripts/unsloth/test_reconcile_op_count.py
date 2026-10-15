@@ -744,6 +744,35 @@ rc, out = run(d, base=None)
 check("a declared family with no assert and an unreadable table exits 2, nothing rewritten",
       rc == 2 and "GGML_GLU_OP_NAME" in out and snapshot(d) == before, out)
 
+# astra r11: the pin merged an upstream commit newer than the tag the nightly uses (same ops, same RPC version).
+def newer_upstream_refresh(pin_patch):
+    d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, pin_patch)],
+                resolved=tree(MID + ["PIN_NEW"], 102, 1))
+    git(d, "checkout", "-q", "-b", "upstream_next", "base")
+    (d / "ggml" / "README.md").write_text("an unrelated upstream change past the tag\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "upstream after the tag")
+    git(d, "checkout", "-q", "pin0")
+    r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff",
+                        "--no-edit", "upstream_next"], capture_output=True)
+    if r.returncode:
+        commit_tree(d, "refresh pin0 onto newer upstream", tree(MID + ["PIN_NEW"], 103, 1))
+    git(d, "checkout", "-q", "--detach", "base")
+    git(d, "merge", "-q", "--no-ff", "--no-edit", "pin0")
+    return d
+
+
+d = newer_upstream_refresh(1)
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("a pin refreshed onto upstream past the tag is judged on its own bump: PATCH 0 + 2",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc, out)
+d = newer_upstream_refresh(0)
+before = snapshot(d)
+rc, out = run(d)
+check("the same refresh of a pin that never bumped is still refused",
+      rc == 1 and "without bumping" in out and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)
