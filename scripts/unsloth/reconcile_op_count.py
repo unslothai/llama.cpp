@@ -325,12 +325,17 @@ def rpc_version_matches(text: str) -> dict[str, re.Match]:
     clean = blank_comments_and_strings(text)
     found = {}
     for part in RPC_PARTS:
-        ms = list(re.finditer(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + part + r"_VERSION[ \t]+(\d+)\b",
-                              clean, re.M))
+        prefix = r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + part + r"_VERSION\b"
+        # every definition, whatever its value, so a second one in another form is not missed
+        ms = list(re.finditer(prefix + r"[^\n]*", clean, re.M))
         if not ms:
             continue
         if len(ms) > 1:
             raise LayoutError(f"{len(ms)} RPC_PROTO_{part}_VERSION definitions in {RPC_HEADER}")
+        # the value must be the whole plain integer: "1 - 1" is 0 to the compiler, not 1
+        ms = [re.compile(prefix + r"[ \t]+(\d+)[ \t\r]*", re.M).fullmatch(clean, ms[0].start(), ms[0].end())]
+        if ms[0] is None:
+            raise LayoutError(f"RPC_PROTO_{part}_VERSION is not a plain integer in {RPC_HEADER}")
         depth = sum(-1 if d == "endif" else 1
                     for d in re.findall(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|endif)\b", clean[:ms[0].start()], re.M))
         if depth:
@@ -453,6 +458,10 @@ def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True)
         return (f"refuse: GGML_OP_COUNT changed by {delta:+d} versus {base_ref} but RPC_PROTO_*_VERSION "
                 f"is still {fmt(base_v)}; a pin added or removed an op without bumping the RPC protocol", None)
     same_mm = all(cur_v[p] == base_v[p] for p in ("MAJOR", "MINOR"))
+    # with an op change the PATCH repair below raises it past the base's anyway
+    if same_mm and not delta and cur_v["PATCH"] < base_v["PATCH"]:
+        return (f"refuse: RPC_PROTO_*_VERSION regressed from {fmt(base_v)} at {base_ref} to {fmt(cur_v)} "
+                "in the merged tree", None)
     # removed ops are handled like added ones: every pin bumps PATCH by one per op it changes, and
     # identical bumps merge to one in either direction
     if delta and same_mm and cur_v["PATCH"] - base_v["PATCH"] < abs(delta):

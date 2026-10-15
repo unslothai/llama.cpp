@@ -668,6 +668,26 @@ for repl, word, name in (
     rc, out = run(d)
     check(f"{name} is refused, nothing rewritten", rc == 1 and word in out and snapshot(d) == before, out)
 
+# astra r8 1: no op change, and the merge kept an older PATCH than the base's (upstream bumped it).
+d = history((BASE, ["NONE"] + BASE, ["none"] + [o.lower() + "(x)" for o in BASE], 101, None, 8, 2), [])
+h = d / "ggml" / "include" / "ggml-rpc.h"
+h.write_text(h.read_text().replace("RPC_PROTO_PATCH_VERSION    2", "RPC_PROTO_PATCH_VERSION    1"))
+before = snapshot(d)
+rc, out = run(d)
+check("a PATCH below the base's with no op change is refused", rc == 1 and "regressed" in out and snapshot(d) == before, out)
+
+# astra r8 2: an RPC define that is not a plain integer, or a second one the number regex misses.
+for repl, name in (("#define RPC_PROTO_PATCH_VERSION    1 - 1\n", "an expression as the PATCH value"),
+                   ("#define RPC_PROTO_PATCH_VERSION    1\n#undef RPC_PROTO_PATCH_VERSION\n"
+                    "#define RPC_PROTO_PATCH_VERSION (0)\n", "a parenthesized redefinition")):
+    d = make(*TWO)
+    h = d / "ggml" / "include" / "ggml-rpc.h"
+    h.write_text(h.read_text().replace("#define RPC_PROTO_PATCH_VERSION    1\n", repl))
+    before = snapshot(d)
+    rc, out = run(d)
+    check(f"{name} is refused, nothing rewritten", rc == 1 and "RPC_PROTO_PATCH_VERSION" in out
+          and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)
