@@ -1342,13 +1342,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    // a LiliCorr block has a fixed size, so the per-call bound from the caller's remaining context stops the walk instead
-                    if (dp.n_max > 0 && (int32_t) result.size() >= dp.n_max) {
-                        break;
-                    }
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
+                    // a LiliCorr block has a fixed size, so the per-call bound from the caller's remaining context stops the walk instead
+                    // (kept clear of the loop header, which ggml-org#30520 rewrites)
+                    if (dp.n_max > 0 && (int32_t) result.size() >= dp.n_max) {
+                        break;
+                    }
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
