@@ -176,17 +176,14 @@ def _op_assert_spans(text: str) -> list[range]:
 
 
 def normalize_op_asserts(text: str) -> str:
-    """text with every digit inside an op-count assert (count and message) replaced by '#'.
+    """text with every number inside an op-count assert (count and message) replaced by one '#'.
 
     Those are the only characters reconcile_op_count.py rewrites, so a contract line and the merged
-    tree compared in this form agree whatever count the reconcile settled on.
+    tree compared in this form agree whatever count the reconcile settled on (9 -> 10 included).
     """
-    chars = list(text)
-    for span in _op_assert_spans(text):
-        for i in span:
-            if chars[i].isdigit():
-                chars[i] = "#"
-    return "".join(chars)
+    for span in sorted(_op_assert_spans(text), key=lambda r: r.start, reverse=True):
+        text = text[:span.start] + re.sub(r"\d+", "#", text[span.start:span.stop]) + text[span.stop:]
+    return text
 
 
 def op_assert_lines(text: str) -> dict[str, str]:
@@ -200,13 +197,14 @@ def op_assert_lines(text: str) -> dict[str, str]:
     for span in _op_assert_spans(text):
         for i in span:
             hit[i] = True
-    joined, norm = blank_comments_and_strings(text), normalize_op_asserts(text)
+    joined = blank_comments_and_strings(text)
     out, pos = {}, 0
-    for line in text.split("\n"):
+    # numbers are replaced within a line only, so the normalized text has the same lines
+    for line, norm_line in zip(text.split("\n"), normalize_op_asserts(text).split("\n")):
         span = range(pos, pos + len(line))
         if line.strip() and any(hit[i] for i in span):
             code_left = "".join(joined[i] for i in span if not hit[i]).strip()
-            out[line.strip()] = norm[pos:pos + len(line)].strip() if code_left else ""
+            out[line.strip()] = norm_line.strip() if code_left else ""
         pos += len(line) + 1
     return out
 
@@ -351,11 +349,12 @@ def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
         text = target.read_text(errors="replace")
         if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES:
             text = normalize_op_asserts(text)       # shared-line contract entries are in this form
-        lost = [w for w in wanted if w not in text]
-        if any(RPC_PATCH_RE.match(w) for w in lost) and rpc_raised(
-                git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text,
-                allow_newer_series=contract.get("main_op_pin", False)):
-            lost = [w for w in lost if not RPC_PATCH_RE.match(w)]
+        # a PATCH line is judged on the active (comment-blanked) version only, never on its raw text
+        patch = [w for w in wanted if RPC_PATCH_RE.match(w)]
+        lost = [w for w in wanted if not RPC_PATCH_RE.match(w) and w not in text]
+        if patch and not rpc_raised(git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text,
+                                    allow_newer_series=contract.get("main_op_pin", False)):
+            lost += patch
         if not lost:
             continue
         kept = len(wanted) - len(lost)

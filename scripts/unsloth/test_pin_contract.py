@@ -455,6 +455,20 @@ check("and passes with its count reconciled", rc == 0, err)
 rc, rep, err = run(d, ps)
 check("a short call dropped after an assert still fails", rc == 1, err)
 
+# --- 18. a count crossing a decimal boundary, and a PATCH line kept only in a comment --------
+WIDE = 'static_assert(GGML_OP_COUNT == 99, "count 99"); int required_kernel_entry = 1;\n'
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/src/ggml.c": BASE_C},
+                 {"ggml/src/ggml.c": BASE_C + WIDE}, 18)
+(d / "ggml/src/ggml.c").write_text(BASE_C + WIDE.replace("99", "100"))
+rc, rep, err = run(d, ps)
+check("a shared-line assert reconciled from 99 to 100 does not fail the pin", rc == 0, err)
+d, ps = pin_repo({"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0)},
+                 {"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=1), "ggml/src/rpc.c": HANDLER}, 19)
+(d / "ggml/include/ggml-rpc.h").write_text(
+    "/* was:\n#define RPC_PROTO_PATCH_VERSION    1\n*/\n" + RPC_V.format(mi=6, p=0))
+rc, rep, err = run(d, ps)
+check("the pin's PATCH line kept only in a comment fails", rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
