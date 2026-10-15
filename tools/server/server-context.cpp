@@ -1521,6 +1521,9 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // [TAG_PREEMPT_ASYNC] Whether every slot still parks asynchronously, for the HTTP thread: /props is served from metadata copied at load.
+    std::atomic<bool> preempt_async_live { false };
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -2128,7 +2131,8 @@ private:
                 }
             }
 
-            preempt_async_all = preempt_async_ok;
+            preempt_async_all  = preempt_async_ok;
+            preempt_async_live = preempt_async_all;
         }
 
         {
@@ -3940,6 +3944,7 @@ private:
     bool preempt_async_ok  = false;  // some slot still parks asynchronously: keep the async margin
     bool preempt_async_all = false;  // every slot does, as /props reports
 
+
     void preempt_async_refresh() {
         preempt_async_ok  = false;
         preempt_async_all = !slots.empty();
@@ -3948,6 +3953,8 @@ private:
             preempt_async_ok  = preempt_async_ok  || slot.preempt_is_async();
             preempt_async_all = preempt_async_all && slot.preempt_is_async();
         }
+
+        preempt_async_live = preempt_async_all;
     }
 
     // [TAG_EXACT_CONCURRENCY] Pool allocation granularity: 1, or the page size under exact concurrency; LLAMA_SERVER_PREEMPT_GRANULARITY overrides.
@@ -7874,7 +7881,12 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            // [TAG_PREEMPT_ASYNC] A slot can fall back to synchronous parks after load, which the copied metadata does not see.
+            if (props["preempt"].contains("async")) {
+                props["preempt"]["async"] = ctx_server.preempt_async_live.load();
+            }
+            res->ok(props);
         }
         return res;
     };
