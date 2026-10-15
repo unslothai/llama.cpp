@@ -722,6 +722,28 @@ rc, out = run(d)
 check("a refreshed carry pin that never bumped is still refused",
       rc == 1 and "without bumping" in out and snapshot(d) == before, out)
 
+# astra r10 1: an unrelated ggml.h edit after repin.py's base merge does not hide the pin's own bump.
+d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 1)], merge_into_pin=True)
+h = d / "ggml" / "include" / "ggml.h"
+h.write_text(h.read_text() + "// a later unrelated declaration\nint ggml_unrelated_helper(void);\n")
+git(d, "commit", "-qam", "unrelated header edit on the pin")
+git(d, "checkout", "-q", "--detach", "base")
+git(d, "merge", "-q", "--no-ff", "--no-edit", "pin0")
+rc, out = run(d)
+rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
+check("a refreshed carry pin with a later unrelated header edit: PATCH 0 + 2",
+      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc, out)
+
+# astra r10 2: a family whose enum is declared, with no assert left, and a table this cannot read is refused,
+# not skipped (the skip is for a family the tree does not have at all).
+d = make(BASE, NAMES, SYMS, 101)
+src = d / "ggml" / "src" / "ggml.c"
+src.write_text(src.read_text().replace(GLU_ASSERT, "").replace('    "GEGLU",\n', '#ifdef X\n    "GEGLU",\n#endif\n'))
+before = snapshot(d)
+rc, out = run(d, base=None)
+check("a declared family with no assert and an unreadable table exits 2, nothing rewritten",
+      rc == 2 and "GGML_GLU_OP_NAME" in out and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)

@@ -407,6 +407,12 @@ def merged_pins(root: Path, base_ref: str) -> list[str]:
     return pins
 
 
+def op_entries_at(root: Path, ref: str) -> list[str]:
+    """The ggml_op entries at ref, in order: the same ops, not just the same count, and not the whole header."""
+    text = git_show(root, ref, HEADER)
+    return enum_entries(text, blank_comments_and_strings(text), "ggml_op", "GGML_OP_COUNT")[2]
+
+
 def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
     """pin, or the commit below the base merge repin.py made into it, when nothing after that merge moved the
     op count or the RPC version.
@@ -419,7 +425,7 @@ def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
         if len(parents) < 2:
             continue                         # e.g. a commit that only rewrote the asserts after the merge
         if (all(is_ancestor(root, p, base_ref) for p in parents[1:])
-                and git_show(root, pin, HEADER) == git_show(root, commit, HEADER)
+                and op_entries_at(root, pin) == op_entries_at(root, commit)
                 and rpc_version(git_show(root, pin, RPC_HEADER))[0]
                 == rpc_version(git_show(root, commit, RPC_HEADER))[0]):
             return pin_before_base_merge(root, base_ref, parents[0])
@@ -548,7 +554,8 @@ def main() -> int:
             n, eline, names = enum_entries(htext, hclean, enum, count)
             entries = {t: table_entries(stext, sclean, t) for t in tables}
         except LayoutError as e:
-            if not asserts and not rpc_check:
+            # skip only a family the tree does not declare (an older tag); a declared one is still validated
+            if not asserts and not rpc_check and not re.search(r"\benum\s+" + re.escape(enum) + r"\b", hclean):
                 print(f"skip {count}: no static_assert in the tree and {e}")
                 continue
             print(f"ERROR {count}: {e}", file=sys.stderr)
