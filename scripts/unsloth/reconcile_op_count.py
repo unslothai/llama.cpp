@@ -316,15 +316,37 @@ def rewrite_assert(text: str, start: int, end: int, old: int, new: int) -> str:
     return text
 
 
+def rpc_version_matches(text: str) -> dict[str, re.Match]:
+    """The one active #define of each RPC_PROTO_*_VERSION text has (parts it lacks are left out).
+
+    A define under #if/#ifdef/#ifndef, or a second one, makes the version depend on the build, as a
+    preprocessor line inside the enum or a table does: LayoutError.
+    """
+    clean = blank_comments_and_strings(text)
+    found = {}
+    for part in RPC_PARTS:
+        ms = list(re.finditer(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + part + r"_VERSION[ \t]+(\d+)\b",
+                              clean, re.M))
+        if not ms:
+            continue
+        if len(ms) > 1:
+            raise LayoutError(f"{len(ms)} RPC_PROTO_{part}_VERSION definitions in {RPC_HEADER}")
+        depth = sum(-1 if d == "endif" else 1
+                    for d in re.findall(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|endif)\b", clean[:ms[0].start()], re.M))
+        if depth:
+            raise LayoutError(f"RPC_PROTO_{part}_VERSION is defined under a conditional in {RPC_HEADER}")
+        found[part] = ms[0]
+    return found
+
+
 def rpc_version(text: str) -> tuple[dict[str, int], dict[str, tuple[int, int]]]:
     """RPC_PROTO_*_VERSION values and the (start, end) of each number."""
-    clean = blank_comments_and_strings(text)
+    found = rpc_version_matches(text)
     vals, spans = {}, {}
     for part in RPC_PARTS:
-        m = re.search(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + part + r"_VERSION[ \t]+(\d+)\b", clean, re.M)
-        if not m:
+        if part not in found:
             raise LayoutError(f"RPC_PROTO_{part}_VERSION not found in {RPC_HEADER}")
-        vals[part], spans[part] = int(m.group(1)), m.span(1)
+        vals[part], spans[part] = int(found[part].group(1)), found[part].span(1)
     return vals, spans
 
 
@@ -386,7 +408,8 @@ def unbumped_pins(root: Path, base_ref: str) -> tuple[list[str], int]:
             continue
         pv, _ = rpc_version(git_show(root, pin, RPC_HEADER))
         fv, _ = rpc_version(git_show(root, fork, RPC_HEADER))
-        if pv == fv:
+        # a lower version is no bump either
+        if tuple(pv[p] for p in RPC_PARTS) <= tuple(fv[p] for p in RPC_PARTS):
             bad.append(f"merged pin {pin[:12]} changed GGML_OP_COUNT by {pn - fn:+d} versus its fork point "
                        f"{fork[:12]} without bumping RPC_PROTO_*_VERSION")
         else:
@@ -416,6 +439,10 @@ def check_rpc(root: Path, base_ref: str | None, n: int, has_assert: bool = True)
         return (f"refuse: the GGML_OP_COUNT static_assert that {RPC_HEADER} has at {base_ref} is gone from the "
                 "merged tree (deleted or commented out); it is what makes an op change bump RPC_PROTO_*_VERSION", None)
     fmt = lambda v: ".".join(str(v[p]) for p in RPC_PARTS)  # noqa: E731
+    # a resolution that kept a pin's older series over the base's rolls the protocol back
+    if (cur_v["MAJOR"], cur_v["MINOR"]) < (base_v["MAJOR"], base_v["MINOR"]):
+        return (f"refuse: RPC_PROTO_*_VERSION regressed from {fmt(base_v)} at {base_ref} to {fmt(cur_v)} "
+                "in the merged tree", None)
     delta = n - base_n
     print(f"rpc  GGML_OP_COUNT {base_n} at {base_ref} -> {n}; RPC_PROTO {fmt(base_v)} -> {fmt(cur_v)}")
     if unbumped:

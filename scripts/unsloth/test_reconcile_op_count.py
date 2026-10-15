@@ -634,6 +634,40 @@ before = snapshot(d)
 rc, out = run(d)
 check("ggml-rpc.h deleted by the merge: exit 1, nothing rewritten", rc == 1 and snapshot(d) == before, out)
 
+# astra r7 2: the merge kept a pin's older protocol series (8.0.1) over upstream's 9.0.0.
+d = history((BASE, ["NONE"] + BASE, ["none"] + [o.lower() + "(x)" for o in BASE], 101, None, 9, 0),
+            [tree(BASE + ["PIN_NEW"], 102, 1)],
+            resolved=tree(BASE + ["PIN_NEW"], 102, 1))
+h = d / "ggml" / "include" / "ggml-rpc.h"
+h.write_text(h.read_text().replace("RPC_PROTO_MAJOR_VERSION    9", "RPC_PROTO_MAJOR_VERSION    8"))
+before = snapshot(d)
+rc, out = run(d)
+check("a merged RPC series older than the base's is refused", rc == 1 and "regressed" in out and snapshot(d) == before, out)
+
+# astra r7 3: a pin that changed the op count and LOWERED its version did not bump it.
+d = history(None, [(BASE + ["PIN_NEW"], ["NONE"] + BASE + ["PIN_NEW"],
+                    ["none"] + [o.lower() + "(x)" for o in BASE + ["PIN_NEW"]], 102, None, 7, 9)])
+h = d / "ggml" / "include" / "ggml-rpc.h"
+h.write_text(h.read_text().replace("RPC_PROTO_MAJOR_VERSION    7", "RPC_PROTO_MAJOR_VERSION    8")
+             .replace("RPC_PROTO_PATCH_VERSION    9", "RPC_PROTO_PATCH_VERSION    1"))
+before = snapshot(d)
+rc, out = run(d)
+check("a pin whose op change lowered RPC_PROTO_* is refused as unbumped",
+      rc == 1 and "without bumping RPC_PROTO_*_VERSION" in out and snapshot(d) == before, out)
+
+# astra r7 4: an RPC define under #if is not the version every build sees.
+for repl, word, name in (
+        ("#if 0\n#define RPC_PROTO_PATCH_VERSION    1\n#else\n#define RPC_PROTO_PATCH_VERSION    0\n#endif\n",
+         "definitions", "an #if/#else pair of RPC_PROTO defines"),
+        ("#ifndef GGML_RPC_OLD\n#define RPC_PROTO_PATCH_VERSION    1\n#endif\n",
+         "conditional", "a single RPC_PROTO define under #ifndef")):
+    d = make(*TWO)
+    h = d / "ggml" / "include" / "ggml-rpc.h"
+    h.write_text(h.read_text().replace("#define RPC_PROTO_PATCH_VERSION    1\n", repl))
+    before = snapshot(d)
+    rc, out = run(d)
+    check(f"{name} is refused, nothing rewritten", rc == 1 and word in out and snapshot(d) == before, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")
 sys.exit(1 if FAILS else 0)

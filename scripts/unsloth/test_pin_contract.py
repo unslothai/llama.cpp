@@ -469,6 +469,27 @@ d, ps = pin_repo({"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0)},
 rc, rep, err = run(d, ps)
 check("the pin's PATCH line kept only in a comment fails", rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
 
+# --- 19. a whole-line op-count assert is owed (count normalized), not exempt -------
+d, ps = pin_repo({"ggml/include/ggml.h": OP_H.format(ops=""), "ggml/src/ggml.c": BASE_C},
+                 {"ggml/include/ggml.h": OP_H.format(ops="    GGML_OP_BANDED,\n"),
+                  "ggml/src/ggml.c": BASE_C + ASSERT_C.format(msg="GGML_OP_COUNT != 2").replace("== 1", "== 2")}, 20)
+c = d / "ggml/src/ggml.c"
+c.write_text(c.read_text().replace("2", "3"))
+rc, rep, err = run(d, ps)
+check("a reconciled whole-line assert passes", rc == 0, err)
+c.write_text(BASE_C)
+rc, rep, err = run(d, ps)
+check("a whole-line op-count assert the merge deleted fails the pin", rc == 1 and "ggml/src/ggml.c" in err, err)
+
+# --- 20. an RPC_PROTO define under #if is not the tree's version ------------------
+d, ps = pin_repo({"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=0)},
+                 {"ggml/include/ggml-rpc.h": RPC_V.format(mi=6, p=1), "ggml/src/rpc.c": HANDLER}, 21)
+(d / "ggml/include/ggml-rpc.h").write_text(
+    RPC_V.format(mi=6, p=0).replace("#define RPC_PROTO_PATCH_VERSION    0\n",
+                                    "#if 0\n#define RPC_PROTO_PATCH_VERSION    1\n#else\n#define RPC_PROTO_PATCH_VERSION    0\n#endif\n"))
+rc, rep, err = run(d, ps)
+check("a PATCH bump only under #if 0 fails the pin", rc == 1 and "RPC_PROTO_PATCH_VERSION" in err, err)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)

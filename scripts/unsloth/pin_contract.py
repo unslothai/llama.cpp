@@ -55,7 +55,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reconcile_op_count import (  # noqa: E402
-    FAMILIES, HEADER, SCAN_SUFFIXES, LayoutError, assert_re, blank_comments_and_strings, enum_count,
+    FAMILIES, HEADER, RPC_PARTS, SCAN_SUFFIXES, LayoutError, assert_re, blank_comments_and_strings, enum_count,
+    rpc_version_matches,
 )
 
 PIN_RE = re.compile(
@@ -101,9 +102,7 @@ COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|
 RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
 # A PATCH line the pin keeps owning still survives when reconcile_op_count.py raised PATCH past it
 # (another pin's op bump merged into the same line): same MAJOR and MINOR, PATCH at least the pin's.
-# Read off comment-blanked text, as reconcile_op_count.rpc_version reads it.
-RPC_VERSION_RE = {p: re.compile(r"^[ \t]*#[ \t]*define[ \t]+RPC_PROTO_" + p + r"_VERSION[ \t]+(\d+)", re.M)
-                  for p in ("MAJOR", "MINOR", "PATCH")}
+# Read with reconcile_op_count.rpc_version_matches: comment-blanked, the one unconditional define.
 
 # Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")
@@ -187,24 +186,21 @@ def normalize_op_asserts(text: str) -> str:
 
 
 def op_assert_lines(text: str) -> dict[str, str]:
-    """Stripped lines of text holding op-count static_asserts -> what of the line is still owed.
+    """Stripped lines of text holding op-count static_asserts -> the line in normalize_op_asserts form.
 
-    A line of nothing but asserts (a continuation line holding the message included) owes "" (exempt).
-    A line where code shares the line with an assert owes the whole line in normalize_op_asserts form,
-    which check() matches against the merged tree in the same form.
+    The line stays owed (a merge that deletes the assert loses the pin); only the count, which
+    reconcile_op_count.py rewrites, is free. check() matches it against the merged tree in the same form.
     """
     hit = [False] * len(text)
     for span in _op_assert_spans(text):
         for i in span:
             hit[i] = True
-    joined = blank_comments_and_strings(text)
     out, pos = {}, 0
     # numbers are replaced within a line only, so the normalized text has the same lines
     for line, norm_line in zip(text.split("\n"), normalize_op_asserts(text).split("\n")):
         span = range(pos, pos + len(line))
         if line.strip() and any(hit[i] for i in span):
-            code_left = "".join(joined[i] for i in span if not hit[i]).strip()
-            out[line.strip()] = norm_line.strip() if code_left else ""
+            out[line.strip()] = norm_line.strip()
         pos += len(line) + 1
     return out
 
@@ -238,8 +234,8 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
             cur = None                       # /dev/null: a deletion
         elif cur and ln.startswith("+") and not ln.startswith("+++"):
             added.append((cur, ln[1:]))
-    # reconcile_op_count.py rewrites every op-count assert (any family), so no line of a pin's own
-    # assert is owed. The PATCH line is (see rpc_raised); main_op_pin is read off the enum itself, as
+    # reconcile_op_count.py rewrites the count of every op-count assert (any family), so a pin's assert
+    # lines are owed with the count normalized. The PATCH line is (see rpc_raised); main_op_pin is read off the enum itself, as
     # reconcile_op_count.py reads it, not off an assert line the pin may have only reworded.
     asserts = {path: op_assert_lines(git(["show", f"{pin['sha']}:{path}"], cwd, check=False))
                for path in {p for p, _ in added}
@@ -314,8 +310,11 @@ def rpc_raised(pin_text: str, text: str, allow_newer_series: bool = False) -> bo
     allow_newer_series: a higher MAJOR.MINOR also counts (a pin that changes the op enum, whose bump
     reconcile_op_count.py checks per pin and re-derives against the base's version).
     """
-    v = [{p: (m.group(1) if (m := r.search(t)) else None) for p, r in RPC_VERSION_RE.items()}
-         for t in map(blank_comments_and_strings, (pin_text, text))]
+    try:
+        found = [rpc_version_matches(t) for t in (pin_text, text)]
+    except LayoutError:
+        return False
+    v = [{p: (m[p].group(1) if p in m else None) for p in RPC_PARTS} for m in found]
     series = [(v[i]["MAJOR"], v[i]["MINOR"]) for i in (0, 1)]
     if (allow_newer_series and None not in series[0] + series[1]
             and tuple(map(int, series[1])) > tuple(map(int, series[0]))):
