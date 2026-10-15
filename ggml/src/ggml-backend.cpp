@@ -2441,6 +2441,10 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     if (input_cpy->buffer == NULL || ggml_backend_buffer_is_host(input_cpy->buffer)) {
         return false;
     }
+    // a meta (tensor parallel) buffer splits the copy by its split state, its async set only handles some of them: the sync copy below
+    if (ggml_backend_buffer_is_meta(input_cpy->buffer)) {
+        return false;
+    }
 
     if (!synced) {
         // wait for the split backend to finish using its input copies before overwriting them
