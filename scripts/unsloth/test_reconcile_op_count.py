@@ -762,16 +762,38 @@ def newer_upstream_refresh(pin_patch):
     return d
 
 
-d = newer_upstream_refresh(1)
-rc, out = run(d)
-rpc = (d / "ggml" / "include" / "ggml-rpc.h").read_text()
-check("a pin refreshed onto upstream past the tag is judged on its own bump: PATCH 0 + 2",
-      rc == 0 and "#define RPC_PROTO_PATCH_VERSION    2\n" in rpc, out)
-d = newer_upstream_refresh(0)
+# Its own bump cannot be told apart from upstream's past the tag (astra r12: a changed-op upstream past the tag
+# hides a missing bump), so such a pin is refused outright with the fix: repin it onto the tag.
+for patch, how in ((1, "that bumped"), (0, "that never bumped")):
+    d = newer_upstream_refresh(patch)
+    before = snapshot(d)
+    rc, out = run(d)
+    check(f"a pin {how}, refreshed onto upstream past the tag: refused, repin onto the tag",
+          rc == 1 and "past base" in out and "repin" in out and snapshot(d) == before, out)
+    git(d, "checkout", "-q", "pin0")                 # astra r12 1: the refreshed pin checked on its own
+    before = snapshot(d)
+    rc, out = run(d)
+    check(f"the same pin {how} checked directly: refused the same way",
+          rc == 1 and "past base" in out and snapshot(d) == before, out)
+
+# astra r12 2: upstream past the tag changed the ops and bumped; the pin's own op had no bump.
+d = history(tree(MID, 102, 1), [tree(BASE + ["PIN_NEW"], 102, 0)], resolved=tree(MID + ["PIN_NEW"], 102, 1))
+git(d, "checkout", "-q", "-b", "upstream_next", "base")
+commit_tree(d, "upstream adds another op past the tag", tree(MID + ["UP_NEXT"], 103, 2))
+git(d, "checkout", "-q", "pin0")
+r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff",
+                    "--no-edit", "upstream_next"], capture_output=True)
+if r.returncode:
+    commit_tree(d, "refresh pin0", tree(MID + ["UP_NEXT", "PIN_NEW"], 103, 2))
+git(d, "checkout", "-q", "--detach", "base")
+r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff",
+                    "--no-edit", "pin0"], capture_output=True)
+if r.returncode:
+    commit_tree(d, "merge pin0", tree(MID + ["UP_NEXT", "PIN_NEW"], 103, 2))
 before = snapshot(d)
 rc, out = run(d)
-check("the same refresh of a pin that never bumped is still refused",
-      rc == 1 and "without bumping" in out and snapshot(d) == before, out)
+check("upstream's bump past the tag does not cover the pin's missing one: refused",
+      rc == 1 and snapshot(d) == before, out)
 
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all reconcile_op_count tests passed")

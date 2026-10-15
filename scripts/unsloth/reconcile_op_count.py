@@ -399,6 +399,11 @@ def merged_pins(root: Path, base_ref: str) -> list[str]:
         if len(parents) < 2:
             continue
         side = [p for p in parents[1:] if not is_ancestor(root, p, base_ref)]
+        # a pin checked on its own (not the nightly, whose first parent holds the base) refreshed past the tag
+        if side and not is_ancestor(root, base_ref, parents[0]):
+            for p in side:
+                if past_base(root, base_ref, p):
+                    refuse_past_base(base_ref, line.split()[0], p)
         if side:
             pins += side
         else:
@@ -413,14 +418,16 @@ def op_entries_at(root: Path, ref: str) -> list[str]:
     return enum_entries(text, blank_comments_and_strings(text), "ggml_op", "GGML_OP_COUNT")[2]
 
 
-def base_side_parent(root: Path, base_ref: str, parent: str) -> bool:
-    """parent is the base, or upstream past it with the base's ops and RPC version (a pin refreshed onto newer upstream)."""
-    if is_ancestor(root, parent, base_ref):
-        return True
-    return (is_ancestor(root, base_ref, parent)
-            and op_entries_at(root, parent) == op_entries_at(root, base_ref)
-            and rpc_version(git_show(root, parent, RPC_HEADER))[0]
-            == rpc_version(git_show(root, base_ref, RPC_HEADER))[0])
+def past_base(root: Path, base_ref: str, commit: str) -> bool:
+    """commit is upstream strictly past base_ref (base_ref is its ancestor, it is not base_ref's)."""
+    return is_ancestor(root, base_ref, commit) and not is_ancestor(root, commit, base_ref)
+
+
+def refuse_past_base(base_ref: str, merge: str, parent: str) -> None:
+    # a pin's own op and RPC bump cannot be told apart from upstream's past the tag (a changed-op upstream
+    # bump would hide a missing one), so such a pin is refused rather than guessed at
+    raise LayoutError(f"{merge[:12]} merges {parent[:12]}, upstream past base {base_ref}; repin it onto {base_ref} "
+                      "(repin.py) so its own RPC bump can be checked")
 
 
 def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
@@ -434,7 +441,10 @@ def pin_before_base_merge(root: Path, base_ref: str, pin: str) -> str:
         commit, *parents = line.split()
         if len(parents) < 2:
             continue                         # e.g. a commit that only rewrote the asserts after the merge
-        if (all(base_side_parent(root, base_ref, p) for p in parents[1:])
+        for p in parents[1:]:
+            if past_base(root, base_ref, p):
+                refuse_past_base(base_ref, commit, p)
+        if (all(is_ancestor(root, p, base_ref) for p in parents[1:])
                 and op_entries_at(root, pin) == op_entries_at(root, commit)
                 and rpc_version(git_show(root, pin, RPC_HEADER))[0]
                 == rpc_version(git_show(root, commit, RPC_HEADER))[0]):
