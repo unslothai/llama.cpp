@@ -384,6 +384,7 @@ jobs:
           set "mapped_target=%current_target%"
         )
         echo Mapped target: %mapped_target%
+        echo MAPPED_TARGET=%mapped_target%>> "%GITHUB_ENV%"
 
         REM Set up environment variables and PATH
         set HIP_PATH=C:\opt\rocm
@@ -511,6 +512,20 @@ jobs:
           Write-Error "ROCm bin directory not found: $rocmBinPath"
           exit 1
         }
+
+    # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
+    - name: Fetch kpack tooling
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      with:
+        path: kpack-tooling
+        sparse-checkout: scripts/unsloth
+        persist-credentials: false
+
+    # rocBLAS / hipBLASLt keep their own kernels in ../.kpack, outside a flat bundle (unslothai/unsloth#13663).
+    - name: Ship the rocBLAS kernel packs
+      run: |
+        python kpack-tooling\scripts\unsloth\relocate_kpack.py --bundle llama.cpp\build\bin --kpack-src C:\opt\rocm\.kpack --archs "$env:MAPPED_TARGET"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Check the bundle carries every ROCm DLL it imports
       run: |
@@ -844,6 +859,7 @@ jobs:
           mapped_target="$current_target"
         fi
         echo "Mapped target: $mapped_target"
+        echo "MAPPED_TARGET=$mapped_target" >> "$GITHUB_ENV"
 
         # Create build directory
         cd llama.cpp
@@ -1065,6 +1081,18 @@ jobs:
         for file in *.so* llama-*; do
           [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
         done
+
+    # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
+    - name: Fetch kpack tooling
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      with:
+        path: kpack-tooling
+        sparse-checkout: scripts/unsloth
+        persist-credentials: false
+
+    # After patchelf, which can leave a second copy of the reference; rewrites every copy (unslothai/unsloth#13663).
+    - name: Ship the rocBLAS kernel packs
+      run: python3 kpack-tooling/scripts/unsloth/relocate_kpack.py --bundle llama.cpp/build/bin --kpack-src /opt/rocm/.kpack --archs "$MAPPED_TARGET"
 
     # Reject missing dependencies and runner libraries that mask an incomplete
     # bundle. Only glibc, libstdc++ and libgcc_s may resolve outside the bundle.
