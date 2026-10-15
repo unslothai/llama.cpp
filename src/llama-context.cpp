@@ -805,16 +805,6 @@ void llama_context::sched_reserve() {
             }
         }
 
-        // a memory measurement (e.g. --fit) does not count the staging memory of the host weight prefetch: it only uses memory that is
-        // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
-        // places the same layers as without the prefetch instead of moving one to the host for the staging copies
-        // with the MoE cache the cache takes the memory left after the layers: the measurement keeps the staging
-        if (model.hparams.no_alloc && !moe_cache) {
-            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
-            }
-        }
-
         n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp         = ggml_graph_n_nodes(gf);
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
@@ -2817,6 +2807,14 @@ ggml_status llama_context::graph_compute(
 
 ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // a memory measurement (e.g. --fit) without the MoE cache prices the weight copies as the graph allocator holds them: the prefetch
+    // only takes memory left after the layers (the reserve drops it when the compute buffers do not fit with it or leave no headroom),
+    // so a fit places the same layers as without the prefetch, and a run that drops it still has the memory its copies need
+    // with the MoE cache the cache takes the memory left after the layers: the measurement keeps the staging
+    if (lctx->model.hparams.no_alloc && !lctx->moe_cache) {
+        return GGML_BACKEND_SCHED_PREFETCH_NONE;
+    }
 
     // the slot maps of the MoE cache change between graph computations, they must go through the copy callback
     if (lctx->moe_cache && lctx->moe_cache->is_slot_map(src)) {
