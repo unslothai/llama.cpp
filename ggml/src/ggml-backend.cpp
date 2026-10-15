@@ -1032,6 +1032,7 @@ struct ggml_backend_sched {
     int  pf_depth;     // number of staging slots per backend
     size_t pf_headroom; // free device memory a reserve must leave with a staging arena, else the prefetch is dropped
     bool pf_active;    // the current graph has prefetched splits
+    bool pf_check;     // a staging arena was allocated since the headroom was last checked
     struct ggml_backend_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
 
     char * context_buffer;
@@ -1819,7 +1820,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+static bool ggml_backend_sched_prefetch_headroom_ok(ggml_backend_sched_t sched);
+static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched);
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    // like ggml_backend_sched_reserve: a staging arena allocated for this graph must leave the headroom, also when the graph fits the current buffers
+    if (sched->pf_check && !ggml_backend_sched_prefetch_headroom_ok(sched)) {
+        ggml_backend_sched_prefetch_disable(sched);
+    }
+    sched->pf_check = false;
+
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1869,6 +1879,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            return false;
+        }
+        // the larger graph buffers next to the staging arena must leave the headroom, else drop the arena and reserve again
+        if (!ggml_backend_sched_prefetch_headroom_ok(sched) && ggml_backend_sched_prefetch_disable(sched) &&
+            !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
@@ -2055,6 +2071,7 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     // the copies behave like graph allocator tensors (e.g. kernels clear the padding of quantized tensors in compute buffers)
     ggml_backend_buffer_set_usage(pf->arena, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     pf->arena_size = pf->staging;
+    sched->pf_check = true;
 
     GGML_LOG_INFO("%s: %s host weight prefetch: depth = %d, staging = %.2f MiB (largest split %.2f MiB), eligible splits = %d (%d async) of %d\n",
         __func__, ggml_backend_name(backend), sched->pf_depth, pf->arena_size / 1024.0 / 1024.0, pf->need / 1024.0 / 1024.0, pf->n_bound, pf->n_async, sched->n_splits);
@@ -2770,6 +2787,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
             return false;
         }
     }
+    sched->pf_check = false;
 
     ggml_backend_sched_reset(sched);
 
