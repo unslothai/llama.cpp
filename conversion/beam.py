@@ -43,6 +43,8 @@ class BeamModel(TextModel):
             raise ValueError("Beam: layer_types / mlp_layer_types must have num_hidden_layers entries")
         if any(t not in ("sliding_attention", "full_attention") for t in layer_types):
             raise ValueError(f"Beam: unknown layer type in {layer_types}")
+        if "sliding_attention" not in layer_types:
+            raise ValueError("Beam: expected at least one sliding_attention layer")
         n_dense = 0
         while n_dense < n_layer and mlp_types[n_dense] == "dense":
             n_dense += 1

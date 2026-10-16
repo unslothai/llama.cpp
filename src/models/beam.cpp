@@ -25,6 +25,9 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("beam: requires a positive sliding window and a sliding window pattern for each layer");
     }
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    if (!hparams.is_swa_any()) {
+        throw std::runtime_error("beam: sliding window pattern has no sliding window layer");
+    }
 
     // full layers are NoPE
     hparams.rope_pattern = hparams.is_swa_impl;
