@@ -277,6 +277,9 @@ struct llama_hparams {
     uint32_t n_attn_temp_floor_scale = 0;
     float    f_attn_temp_scale       = 0.0f;
     float    f_attn_temp_offset      = 0.0f; // offset position index
+    // beam: power-law query scale (1 + (pos + f_attn_temp_offset) / n_attn_temp_floor_scale) ^ f_attn_temp_scale
+    //       instead of the default log(floor((pos + offset) / n_attn_temp_floor_scale) + 1) * f_attn_temp_scale + 1
+    bool     attn_temp_pow           = false;
 
     // gemma3n altup
     uint32_t n_altup      = 4; // altup_num_inputs
