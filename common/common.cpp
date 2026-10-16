@@ -36,7 +36,6 @@
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
-#include <mach/mach.h>
 #endif
 
 #if defined(_WIN32)
@@ -1708,81 +1707,11 @@ static uint64_t common_model_file_bytes(const std::string & path) {
     return res;
 }
 
-#if defined(__linux__)
-// first number in a file, false if it is missing or not a number (e.g. "max")
-static bool common_read_u64(const std::string & path, uint64_t & res) {
-    std::ifstream f(path);
-    return (bool) (f >> res);
-}
-
-// memory left under the cgroup limits of this process and of its parent cgroups (v2 and v1), UINT64_MAX if there is no limit
-static uint64_t common_cgroup_available_memory() {
-    uint64_t res = UINT64_MAX;
-    std::ifstream f("/proc/self/cgroup");
-    std::string line;
-    while (std::getline(f, line)) {
-        // "0::<path>" (v2) or "<id>:<controllers>:<path>" (v1)
-        const size_t a = line.find(':');
-        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
-        if (b == std::string::npos) {
-            continue;
-        }
-        const std::string ctrl = line.substr(a + 1, b - a - 1);
-        std::string path = line.substr(b + 1);
-        std::string root;
-        std::string f_max;
-        std::string f_cur;
-        if (line.compare(0, a, "0") == 0 && ctrl.empty()) {
-            root = "/sys/fs/cgroup"; f_max = "/memory.max"; f_cur = "/memory.current";
-        } else if (("," + ctrl + ",").find(",memory,") != std::string::npos) {
-            root = "/sys/fs/cgroup/memory"; f_max = "/memory.limit_in_bytes"; f_cur = "/memory.usage_in_bytes";
-        } else {
-            continue;
-        }
-        // the limit of every ancestor applies too
-        while (true) {
-            const std::string dir = root + (path == "/" ? "" : path);
-            uint64_t lim = 0;
-            uint64_t cur = 0;
-            if (common_read_u64(dir + f_max, lim) && lim < (UINT64_C(1) << 60) && common_read_u64(dir + f_cur, cur)) {
-                res = std::min(res, lim > cur ? lim - cur : 0);
-            }
-            if (path.empty() || path == "/") {
-                break;
-            }
-            const size_t p = path.find_last_of('/');
-            path = p == 0 || p == std::string::npos ? "/" : path.substr(0, p);
-        }
-    }
-    return res;
-}
-#endif
-
 // system memory usable without swapping, 0 if unknown (the CPU backend reports total memory as free on Linux and macOS)
-// on Linux it is also capped by the cgroup limits, /proc/meminfo shows the memory of the host in a container
+// the estimate of the MoE cache when it copies memory-mapped experts (src/llama-moe-cache.cpp), so that both decide on the same memory:
+// on Linux MemAvailable capped by the cgroup limits (/proc/meminfo shows the memory of the host in a container), with reclaimable page cache
 static uint64_t common_available_memory() {
-#if defined(__linux__)
-    std::ifstream f("/proc/meminfo");
-    std::string key;
-    uint64_t value = 0;
-    std::string unit;
-    while (f >> key >> value) {
-        std::getline(f, unit);
-        if (key == "MemAvailable:") {
-            return std::max<uint64_t>(1, std::min(value*1024, common_cgroup_available_memory())); // 0 means unknown
-        }
-    }
-    return 0;
-#elif defined(__APPLE__) && defined(__MACH__)
-    vm_statistics64_data_t vm;
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
-        return 0;
-    }
-    return ((uint64_t) vm.free_count + vm.inactive_count + vm.purgeable_count)*(uint64_t) vm_page_size;
-#else
-    return 0;
-#endif
+    return llama_moe_cache_available_memory();
 }
 
 // the devices llama_model_load picks when none are given (src/llama.cpp): RPC servers, GPUs without a duplicate device id, integrated GPUs only without a discrete one

@@ -26,6 +26,8 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#elif defined(__APPLE__) && defined(__MACH__)
+#    include <mach/mach.h>
 #endif
 
 bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
@@ -97,7 +99,7 @@ static uint64_t llama_moe_cache_stat(const std::string & path, const char * name
     return 0;
 }
 
-// see llama-ext.h; the limits are the ones common_available_memory checks for the automatic load mode (common/common.cpp), the page cache
+// see llama-ext.h; also the estimate of common_available_memory for the automatic load mode (common/common.cpp), the page cache
 // charged to a cgroup is reclaimed before its limit is hit, except shmem (tmpfs, shm segments, shared anonymous mappings) which is swap-backed
 uint64_t llama_moe_cache_available_memory_linux(const char * root_c) {
     const std::string root = root_c != nullptr ? root_c : "";
@@ -168,22 +170,24 @@ uint64_t llama_moe_cache_available_memory_linux(const char * root_c) {
     return known ? std::max<uint64_t>(1, res) : 0; // 0 means unknown, 1 exhausted
 }
 
-// system memory that can still be allocated: MemAvailable within the cgroup limits (Linux), available physical memory (Windows), 0 if unknown
-static uint64_t llama_moe_cache_available_memory() {
+// see llama-ext.h
+uint64_t llama_moe_cache_available_memory(void) {
 #if defined(__linux__)
     return llama_moe_cache_available_memory_linux("");
 #elif defined(_WIN32)
     MEMORYSTATUSEX status;
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? (uint64_t) status.ullAvailPhys : 0;
-#else
-    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    size_t free = 0;
-    size_t total = 0;
-    if (cpu != nullptr) {
-        ggml_backend_dev_memory(cpu, &free, &total);
+#elif defined(__APPLE__) && defined(__MACH__)
+    // free, inactive and purgeable pages (the CPU backend reports the total memory as free)
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
+        return 0;
     }
-    return free;
+    return ((uint64_t) vm.free_count + vm.inactive_count + vm.purgeable_count)*(uint64_t) vm_page_size;
+#else
+    return 0;
 #endif
 }
 

@@ -159,3 +159,7 @@ LLAMA_API ggml_backend_buffer_t llama_moe_cache_materialize_mapped(struct ggml_t
 // cgroup v2 and v1 limits of this process and of all its ancestors, with the non-shmem page cache of each cgroup counted as reclaimable
 // root prefixes /proc and /sys/fs/cgroup (tests feed a fake hierarchy, "" reads the system); 0 if unknown, at least 1 if known (1 = exhausted)
 LLAMA_API uint64_t llama_moe_cache_available_memory_linux(const char * root);
+
+// system memory that can still be allocated: llama_moe_cache_available_memory_linux("") on Linux, the available physical memory on Windows,
+// the free, inactive and purgeable pages on macOS; 0 if unknown
+LLAMA_API uint64_t llama_moe_cache_available_memory(void);
