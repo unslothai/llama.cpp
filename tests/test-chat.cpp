@@ -7098,6 +7098,32 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({ { "set_config", R"({"config": {"key": "v", "n": 2}})", {} } })
             .run();
 
+        // Object keys in another order than the schema declares them
+        static common_chat_tool settings_tool{
+            /* .name = */ "set_settings",
+            /* .description = */ "Apply settings",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "retries": { "type": "integer" },
+                            "timeout_s": { "type": "number" },
+                            "tags": { "type": "array", "items": { "type": "string" } }
+                        }
+                    }
+                },
+                "required": ["settings"]
+            })",
+        };
+        tst.test(
+               " to=set_settings<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"settings\">\n{\"retries\": 3, \"tags\": [\"blue\"], \"timeout_s\": 2.5}\n</rfl:parameter><|call|>")
+            .tools({ settings_tool })
+            .expect_tool_calls({ { "set_settings", R"({"settings": {"retries": 3, "tags": ["blue"], "timeout_s": 2.5}})", {} } })
+            .run();
+
         // Typed value without its closing tag, a blank line, then the end of the call (as the grammar allows)
         tst.test(
                " to=toggle<|channel|>analysis <|constrain|>xml<|message|>"

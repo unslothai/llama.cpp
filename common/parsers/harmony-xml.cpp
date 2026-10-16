@@ -122,7 +122,11 @@ common_chat_params common_chat_params_init_harmony_xml(const common_chat_templat
 
                     auto types     = param.schema->value_types();
                     auto arg_value = p.eps();
-                    if (!types.has(common_chat_schema::TYPE_STRING)) {
+                    if (!types.has(common_chat_schema::TYPE_STRING) &&
+                        (types.has(common_chat_schema::TYPE_OBJECT) || types.has(common_chat_schema::TYPE_ARRAY))) {
+                        // the schema grammar fixes the key order, and the model writes keys in its own order
+                        arg_value = p.tool_arg_json_value(p.json()) + arg_close;
+                    } else if (!types.has(common_chat_schema::TYPE_STRING)) {
                         arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
