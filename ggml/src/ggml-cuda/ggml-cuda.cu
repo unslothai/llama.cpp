@@ -2118,10 +2118,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
-        CUDA_CHECK(cudaMemcpyAsync(ids_to_sorted, ids_to_sorted_host.data(),
-            ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(ids_from_sorted, ids_to_sorted_host.data() + ne_get_rows,
-            ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        // ids_to_sorted and ids_from_sorted are adjacent in ids_buf_dev: one copy as before
+        CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
