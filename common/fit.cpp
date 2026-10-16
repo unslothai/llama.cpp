@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <cinttypes>
-#include <cmath>
 #include <set>
 #include <string>
 #include <vector>
@@ -787,55 +786,29 @@ static void common_params_fit_impl(
             if (fits_per_device && !keep) {
                 // the cache has its requested size: steps 3 and 4 may add experts in device memory if they fit next to it,
                 // their first placement keeps the experts of one layer in device memory, without room for it they would drop layers instead
-                // probe: the layers split over the devices by the memory each can use (free less its target), the experts of the first layer
-                // of the last device in device memory, every device checked against its own target (a total surplus can hide a device that
-                // misses it); with several devices the placement of steps 3 and 4 can still differ, it is checked again at the end
-                std::vector<ngl_t> ngl_all(nd);
-                {
-                    auto usable = [&](size_t id) {
-                        return double(std::max<int64_t>(0, int64_t(dmds_cpu_moe[id].free) - margins[id]));
-                    };
-                    double sum_usable = 0.0;
-                    for (size_t id = 0; id < nd; id++) {
-                        sum_usable += usable(id);
+                // one device: that first placement is probed, if it misses the target the placement with all experts in system memory is final
+                // several devices: no single split decides it (the output layer, the compute buffers and the shares of the cache are per-device
+                // costs that a split by layers misjudges), a failed probe could discard a placement of steps 3 and 4 with more experts in device
+                // memory: they always run, and their placement is replaced at the end only if it cannot keep every layer in device memory
+                if (nd == 1) {
+                    std::vector<ngl_t> ngl_all(nd);
+                    ngl_all[0].n_layer = hp_ngl + 1;
+                    ngl_all[0].n_part  = hp_ngl;
+                    llama_model_params mparams_all = *mparams;
+                    set_ngl_tensor_split_tbo(ngl_all, std::vector<ggml_backend_buffer_type_t>(nd, cpu_buft), mparams_all);
+                    LOG_TRC("%s: getting device memory data with all layers in device memory and the experts of one layer:\n", __func__);
+                    dmds_t dmds_all = common_get_device_memory_data_impl(
+                        path_model, &mparams_all, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    add_extra_memory(dmds_all);
+                    keep = int64_t(dmds_all[0].free) - int64_t(dmds_all[0].mb.total()) < margins[0];
+                    // restore the overrides of the probe with all MoE tensors in system memory
+                    for (size_t i = 0; i < n_user; i++) {
+                        tensor_buft_overrides[i] = tbo_user[i];
                     }
-                    uint32_t n_assigned = 0;
-                    double   cum_usable = 0.0;
-                    for (size_t id = 0; id < nd; id++) {
-                        cum_usable += usable(id);
-                        uint32_t n_layer = hp_ngl + 1 - n_assigned;
-                        if (id < nd - 1) {
-                            // at least one layer is left for the last device (the output layer)
-                            const uint32_t n_cum = sum_usable > 0.0 ? uint32_t(std::lround(double(hp_ngl + 1)*cum_usable/sum_usable)) : 0;
-                            n_layer = std::min(n_cum > n_assigned ? n_cum - n_assigned : 0, hp_ngl - n_assigned);
-                        }
-                        ngl_all[id].n_layer = n_layer;
-                        ngl_all[id].n_part  = id < nd - 1 ? n_layer : n_layer - 1;
-                        n_assigned += n_layer;
-                    }
+                    tensor_buft_overrides[n_user + 0] = {pattern_moe_all.c_str(), cpu_buft};
+                    tensor_buft_overrides[n_user + 1] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tensor_buft_overrides;
                 }
-                std::vector<float> tensor_split_saved; // set_ngl_tensor_split_tbo writes the shared tensor_split buffer
-                if (nd > 1) {
-                    tensor_split_saved.assign(tensor_split, tensor_split + nd);
-                }
-                llama_model_params mparams_all = *mparams;
-                set_ngl_tensor_split_tbo(ngl_all, std::vector<ggml_backend_buffer_type_t>(nd, cpu_buft), mparams_all);
-                std::copy(tensor_split_saved.begin(), tensor_split_saved.end(), tensor_split);
-                LOG_TRC("%s: getting device memory data with all layers in device memory and the experts of one layer:\n", __func__);
-                dmds_t dmds_all = common_get_device_memory_data_impl(
-                    path_model, &mparams_all, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                add_extra_memory(dmds_all);
-                keep = false;
-                for (size_t id = 0; id < nd; id++) {
-                    keep = keep || int64_t(dmds_all[id].free) - int64_t(dmds_all[id].mb.total()) < margins[id];
-                }
-                // restore the overrides of the probe with all MoE tensors in system memory
-                for (size_t i = 0; i < n_user; i++) {
-                    tensor_buft_overrides[i] = tbo_user[i];
-                }
-                tensor_buft_overrides[n_user + 0] = {pattern_moe_all.c_str(), cpu_buft};
-                tensor_buft_overrides[n_user + 1] = {nullptr, nullptr};
-                mparams->tensor_buft_overrides = tensor_buft_overrides;
                 if (!keep) {
                     tbo_cpu_moe.assign(tensor_buft_overrides, tensor_buft_overrides + n_user + 2);
                     ngl_cpu_moe = mparams->n_gpu_layers;
