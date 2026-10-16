@@ -3,8 +3,11 @@
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -16,6 +19,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    size_t alloc_limit     = SIZE_MAX; // larger buffers fail to allocate
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -42,6 +46,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (size > ctx->alloc_limit) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -642,6 +649,400 @@ static void test_reallocation() {
     }
 }
 
+// a reserve that fails to allocate its buffer must not leave assignments into the freed buffer for the next alloc_graph
+static void test_failed_reserve() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr galloc = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    auto build = [](ggml_context * ctx, ggml_cgraph * graph, size_t size) {
+        ggml_tensor * x0 = make_input_with_size(ctx, size);
+        ggml_tensor * x1 = make_input_with_size(ctx, size);
+        ggml_tensor * x2 = ggml_add(ctx, x0, x1);
+        ggml_tensor * x3 = ggml_scale(ctx, x2, 2.0f);
+        assign_names(ctx);
+        ggml_set_output(x3);
+        ggml_build_forward_expand(graph, x3);
+    };
+    const int ids[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, 16);
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+    {
+        // the same graph with larger tensors does not fit
+        backend_a.context->alloc_limit = 64;
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, 64);
+        GGML_ASSERT(!ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+        // with more memory the next reserve succeeds
+        backend_a.context->alloc_limit = SIZE_MAX;
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, ids, ids));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+}
+
+//
+// host weight prefetch with a device of limited memory: a mock GPU device whose buffers live in host memory (not marked host) and whose
+// graph_compute needs `workspace` free bytes, like the CUDA pool
+//
+
+struct mock_gpu {
+    size_t total     = 0;
+    size_t used      = 0;
+    size_t workspace = 0;
+    int    n_pf_log  = 0; // staging arenas allocated
+    int    n_copy_wait = 0; // event waits of the copy queues (backends other than `compute`)
+    int    n_realloc_unexpected = 0; // graph reallocations with unchanged backend ids and graph size (GGML_SCHED_DEBUG_REALLOC aborts on them)
+    ggml_backend_t compute = nullptr;
+    ggml_backend_buffer_type buft;
+    ggml_backend_device      dev;
+};
+
+static mock_gpu mock;
+static void (*mock_cpu_free_buffer)(ggml_backend_buffer_t buffer);
+
+static void mock_free_buffer(ggml_backend_buffer_t buffer) {
+    mock.used -= ggml_backend_buffer_get_size(buffer);
+    mock_cpu_free_buffer(buffer);
+}
+
+static ggml_backend_buffer_t mock_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (mock.used + size > mock.total) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    mock_cpu_free_buffer     = buffer->iface.free_buffer;
+    buffer->iface.free_buffer = mock_free_buffer;
+    buffer->buft              = buft;
+    mock.used += ggml_backend_buffer_get_size(buffer);
+    return buffer;
+}
+
+static const char * mock_buft_get_name(ggml_backend_buffer_type_t) { return "MockGPU"; }
+static size_t mock_buft_get_alignment(ggml_backend_buffer_type_t) { return 64; }
+static bool mock_buft_is_host(ggml_backend_buffer_type_t) { return false; }
+
+static const char * mock_backend_get_name(ggml_backend_t) { return "MockGPU"; }
+
+static void mock_backend_free(ggml_backend_t backend) {
+    ggml_backend_free((ggml_backend_t) backend->context);
+    delete backend;
+}
+
+static void mock_set_tensor_async(ggml_backend_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *) tensor->data + offset, data, size);
+}
+
+static void mock_get_tensor_async(ggml_backend_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+}
+
+static enum ggml_status mock_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (mock.total - mock.used < mock.workspace) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    ggml_backend_t cpu = (ggml_backend_t) backend->context;
+    return cpu->iface.graph_compute(cpu, cgraph);
+}
+
+static void mock_event_record(ggml_backend_t, ggml_backend_event_t) {}
+static void mock_event_wait(ggml_backend_t backend, ggml_backend_event_t) {
+    if (backend != mock.compute) {
+        mock.n_copy_wait++;
+    }
+}
+
+// the CPU backend can be a dynamically loaded module (GGML_BACKEND_DL), so resolve it through the registry
+static ggml_backend_t test_cpu_backend_init() {
+    static bool loaded = false;
+    if (!loaded) {
+        ggml_backend_load_all();
+        loaded = true;
+    }
+    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+}
+
+static ggml_backend_t mock_backend_init(ggml_backend_dev_t dev, const char *) {
+    static ggml_guid guid = { 0x4d, 0x6f, 0x63, 0x6b };
+    ggml_backend_i iface = {};
+    iface.get_name         = mock_backend_get_name;
+    iface.free             = mock_backend_free;
+    iface.set_tensor_async = mock_set_tensor_async;
+    iface.get_tensor_async = mock_get_tensor_async;
+    iface.graph_compute    = mock_graph_compute;
+    iface.event_record     = mock_event_record;
+    iface.event_wait       = mock_event_wait;
+    return new ggml_backend { &guid, iface, dev, test_cpu_backend_init() };
+}
+
+static const char * mock_dev_get_name(ggml_backend_dev_t) { return "MockGPU"; }
+static void mock_dev_get_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
+    *free  = mock.total - mock.used;
+    *total = mock.total;
+}
+static enum ggml_backend_dev_type mock_dev_get_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; }
+static void mock_dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    *props             = {};
+    props->name        = "MockGPU";
+    props->description = "MockGPU";
+    props->type        = GGML_BACKEND_DEVICE_TYPE_GPU;
+    mock_dev_get_memory(dev, &props->memory_free, &props->memory_total);
+    props->caps.async  = true;
+    props->caps.events = true;
+}
+static ggml_backend_buffer_type_t mock_dev_get_buffer_type(ggml_backend_dev_t) { return &mock.buft; }
+// GGML_OP_SCALE runs on the CPU, so that the graph has several splits
+static bool mock_dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) { return op->op != GGML_OP_SCALE; }
+static bool mock_dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) { return buft == &mock.buft; }
+static bool mock_dev_offload_op(ggml_backend_dev_t, const ggml_tensor * op) { return op->op == GGML_OP_MUL_MAT; }
+static ggml_backend_event_t mock_dev_event_new(ggml_backend_dev_t dev) { return new ggml_backend_event { dev, nullptr }; }
+static void mock_dev_event_free(ggml_backend_dev_t, ggml_backend_event_t event) { delete event; }
+static void mock_dev_event_synchronize(ggml_backend_dev_t, ggml_backend_event_t) {}
+
+static ggml_log_callback mock_prev_log;
+static void mock_log(enum ggml_log_level level, const char * text, void * user_data) {
+    if (strstr(text, "host weight prefetch: depth") != nullptr) {
+        mock.n_pf_log++;
+    }
+    if (getenv("TEST_ALLOC_VERBOSE") != nullptr) {
+        mock_prev_log(level, text, user_data);
+    }
+}
+
+// like GGML_SCHED_DEBUG_REALLOC, which CI sets: a reallocation of a graph whose size did not change means that the reservation was not sufficient
+static void mock_realloc(ggml_backend_sched_t, ggml_cgraph *, bool backend_ids_changed, bool graph_size_changed, void *) {
+    if (!backend_ids_changed && !graph_size_changed) {
+        mock.n_realloc_unexpected++;
+    }
+}
+
+static enum ggml_backend_sched_prefetch_mode mock_prefetch_none(const ggml_tensor *, const ggml_tensor *, ggml_cgraph *, void *) {
+    return GGML_BACKEND_SCHED_PREFETCH_NONE;
+}
+
+enum mock_alloc {
+    MOCK_ALLOC_DIRECT,               // alloc_graph without a reserve
+    MOCK_ALLOC_RESERVE,              // reserve the same graph first
+    MOCK_ALLOC_RESERVE_UNPREFETCHED, // reserve without the prefetch: the graph fits the buffers, the arena is allocated by alloc_graph
+    MOCK_ALLOC_RESERVE_SMALL,        // reserve a smaller batch of a smaller graph: alloc_graph reserves larger graph buffers next to the arena
+};
+
+// two splits on the device with 1 MiB of host weights each: without prefetch the graph allocator reuses one 1 MiB copy,
+// the depth = 2 staging arena holds both copies. Returns the device memory used by the graph buffers and the staging arena.
+static enum ggml_backend_sched_prefetch_mode mock_prefetch_async(const ggml_tensor *, const ggml_tensor *, ggml_cgraph *, void *) {
+    return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
+}
+
+// invalidate: after the first computation, change the prefetch callback (the copies of the allocated graph then go through the
+// regular path) and compute the allocated graph again, which must not use the copy queue
+static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headroom, bool prefetch, mock_alloc mode, int * n_pf_log, int batch = 4,
+        bool invalidate = false) {
+    mock.total     = total;
+    mock.used      = 0;
+    mock.workspace = workspace;
+    mock.n_pf_log  = 0;
+    mock.buft = { { mock_buft_get_name, mock_buft_alloc_buffer, nullptr, mock_buft_get_alignment, nullptr, nullptr, nullptr, mock_buft_is_host }, &mock.dev, nullptr };
+    mock.dev  = {};
+    mock.dev.iface.get_name          = mock_dev_get_name;
+    mock.dev.iface.get_description   = mock_dev_get_name;
+    mock.dev.iface.get_memory        = mock_dev_get_memory;
+    mock.dev.iface.get_type          = mock_dev_get_type;
+    mock.dev.iface.get_props         = mock_dev_get_props;
+    mock.dev.iface.init_backend      = mock_backend_init;
+    mock.dev.iface.get_buffer_type   = mock_dev_get_buffer_type;
+    mock.dev.iface.supports_op       = mock_dev_supports_op;
+    mock.dev.iface.supports_buft     = mock_dev_supports_buft;
+    mock.dev.iface.offload_op        = mock_dev_offload_op;
+    mock.dev.iface.event_new         = mock_dev_event_new;
+    mock.dev.iface.event_free        = mock_dev_event_free;
+    mock.dev.iface.event_synchronize = mock_dev_event_synchronize;
+
+#if defined(_WIN32)
+    _putenv_s("GGML_SCHED_PREFETCH", prefetch ? "2" : "0");
+#else
+    setenv("GGML_SCHED_PREFETCH", prefetch ? "2" : "0", 1);
+#endif
+    ggml_backend_t gpu = mock_backend_init(&mock.dev, nullptr);
+    mock.compute     = gpu;
+    mock.n_copy_wait = 0;
+    mock.n_realloc_unexpected = 0;
+    ggml_backend_t cpu = test_cpu_backend_init();
+    ggml_backend_t backends[2] = { gpu, cpu };
+    ggml_backend_buffer_type_t bufts[2] = { &mock.buft, ggml_backend_cpu_buffer_type() };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 256, false, true);
+    ggml_backend_sched_set_prefetch_headroom(sched, headroom);
+    ggml_backend_sched_set_realloc_callback(sched, mock_realloc, nullptr);
+
+    const int n = 512;
+    ggml_init_params wparams = { 4*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * wctx = ggml_init(wparams);
+    ggml_tensor * w[2];
+    for (auto & t : w) {
+        t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n, n);
+    }
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, cpu);
+    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> ident(n*n, 0.0f);
+    for (int i = 0; i < n; i++) {
+        ident[i*n + i] = 1.0f;
+    }
+    for (auto & t : w) {
+        ggml_backend_tensor_set(t, ident.data(), 0, ggml_nbytes(t));
+    }
+
+    // extra: one more device node, so that the graph size differs (a reserve of the same graph with a smaller batch is not sufficient for
+    // a larger one, which the scheduler counts as an unexpected reallocation: llama.cpp reserves the largest batch of each graph)
+    auto build = [&](ggml_context * ctx, int n_batch, bool extra) {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_batch);
+        ggml_set_input(x);
+        ggml_set_name(x, "x");
+        ggml_tensor * y = ggml_mul_mat(ctx, w[0], x);
+        y = ggml_scale(ctx, y, 2.0f);
+        y = ggml_mul_mat(ctx, w[1], y);
+        if (extra) {
+            y = ggml_neg(ctx, y);
+        }
+        ggml_set_output(y);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        return gf;
+    };
+    ggml_init_params gparams = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+
+    if (mode != MOCK_ALLOC_DIRECT) {
+        if (mode == MOCK_ALLOC_RESERVE_UNPREFETCHED) {
+            // reserve without the prefetch, so that the graph buffers already hold the copies when the staging arena is allocated
+            ggml_backend_sched_set_prefetch_callback(sched, mock_prefetch_none, nullptr);
+        }
+        ggml_context * rctx = ggml_init(gparams);
+        GGML_ASSERT(ggml_backend_sched_reserve(sched, mode == MOCK_ALLOC_RESERVE_SMALL ? build(rctx, 4, true) : build(rctx, batch, false)));
+        ggml_free(rctx);
+        ggml_backend_sched_set_prefetch_callback(sched, nullptr, nullptr);
+    }
+
+    ggml_context * ctx = ggml_init(gparams);
+    ggml_cgraph * gf = build(ctx, batch, false);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, gf));
+    const size_t used = mock.used;
+    if (getenv("TEST_ALLOC_VERBOSE") != nullptr) {
+        fprintf(stderr, "%s: total %zu, prefetch %d, mode %d, batch %d: %zu bytes used\n", __func__, total, (int) prefetch, (int) mode, batch, used);
+    }
+
+    ggml_tensor * x = ggml_get_tensor(ctx, "x");
+    std::vector<float> xv(ggml_nelements(x));
+    for (size_t i = 0; i < xv.size(); i++) {
+        xv[i] = (float) i;
+    }
+    ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+    const enum ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "\n%s: graph compute failed with status %d, %zu of %zu bytes used, %zu bytes of workspace needed\n",
+            __func__, (int) st, used, total, workspace);
+    }
+    GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+    ggml_tensor * out = ggml_graph_node(gf, -1);
+    std::vector<float> ov(ggml_nelements(out));
+    ggml_backend_tensor_get(out, ov.data(), 0, ggml_nbytes(out));
+    for (size_t i = 0; i < ov.size(); i++) {
+        GGML_ASSERT(ov[i] == 2.0f*xv[i]);
+    }
+
+    if (invalidate) {
+        GGML_ASSERT(mock.n_copy_wait > 0); // the copies were made on the copy queue
+        ggml_backend_sched_set_prefetch_callback(sched, mock_prefetch_async, nullptr);
+        mock.n_copy_wait = 0;
+        for (size_t i = 0; i < xv.size(); i++) {
+            xv[i] = 3.0f*(float) i;
+        }
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out, ov.data(), 0, ggml_nbytes(out));
+        for (size_t i = 0; i < ov.size(); i++) {
+            GGML_ASSERT(ov[i] == 2.0f*xv[i]);
+        }
+        if (mock.n_copy_wait != 0) {
+            fprintf(stderr, "\n%s: %d copy queue waits after the prefetch was invalidated\n", __func__, mock.n_copy_wait);
+        }
+        GGML_ASSERT(mock.n_copy_wait == 0);
+    }
+
+    // dropping the prefetch (headroom, failed allocation) and the invalidation never reallocate a graph whose size did not change
+    if (mock.n_realloc_unexpected != 0) {
+        fprintf(stderr, "\n%s: %d unexpected graph reallocations (mode %d, prefetch %d)\n", __func__, mock.n_realloc_unexpected, (int) mode, (int) prefetch);
+    }
+    GGML_ASSERT(mock.n_realloc_unexpected == 0);
+
+    *n_pf_log = mock.n_pf_log;
+    ggml_free(ctx);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+    mock.compute = nullptr;
+#if defined(_WIN32)
+    _putenv_s("GGML_SCHED_PREFETCH", "");
+#else
+    unsetenv("GGML_SCHED_PREFETCH");
+#endif
+    GGML_ASSERT(mock.used == 0);
+    return used;
+}
+
+// every path that allocates graph buffers with a staging arena must leave the headroom free, else drop the prefetch
+static void test_prefetch_headroom() {
+    ggml_backend_t cpu = test_cpu_backend_init();
+    if (cpu == nullptr) {
+        printf("skipped, no CPU backend ");
+        return;
+    }
+    ggml_backend_free(cpu);
+
+    const size_t MiB = 1024*1024;
+    void * prev_user_data = nullptr;
+    ggml_log_get(&mock_prev_log, &prev_user_data);
+    ggml_log_set(mock_log, prev_user_data);
+    int n_pf_log = 0;
+
+    // enough memory: the prefetch is used and takes more memory than the graph allocator alone
+    const size_t used_off = run_prefetch_headroom(64*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, false, MOCK_ALLOC_DIRECT, &n_pf_log);
+    GGML_ASSERT(n_pf_log == 0);
+    const mock_alloc modes[] = { MOCK_ALLOC_DIRECT, MOCK_ALLOC_RESERVE, MOCK_ALLOC_RESERVE_UNPREFETCHED };
+    for (mock_alloc mode : modes) {
+        const size_t used_on = run_prefetch_headroom(64*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, true, mode, &n_pf_log);
+        GGML_ASSERT(n_pf_log == 1);
+        GGML_ASSERT(used_on > used_off + MiB/2);
+    }
+
+    // 4 MiB device: the 2.5 MiB workspace fits next to the graph buffers but not next to the staging arena
+    for (mock_alloc mode : modes) {
+        GGML_ASSERT(run_prefetch_headroom(4*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, false, mode, &n_pf_log) == used_off);
+        GGML_ASSERT(run_prefetch_headroom(4*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, true,  mode, &n_pf_log) == used_off);
+    }
+
+    // 6 MiB device, 3.5 MiB workspace: the reserve of a small batch leaves it next to the arena, the graph buffers of a 256 batch do not
+    const size_t used_big = run_prefetch_headroom(6*MiB, 3*MiB + MiB/2, 3*MiB + MiB/2, false, MOCK_ALLOC_RESERVE_SMALL, &n_pf_log, 256);
+    GGML_ASSERT(run_prefetch_headroom(6*MiB, 3*MiB + MiB/2, 3*MiB + MiB/2, true, MOCK_ALLOC_RESERVE_SMALL, &n_pf_log, 256) == used_big);
+    GGML_ASSERT(n_pf_log == 1);
+
+    // a new prefetch callback invalidates the copies of the allocated graph: computing it again uses no copy queue
+    run_prefetch_headroom(64*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, true, MOCK_ALLOC_DIRECT, &n_pf_log, 4, true);
+    GGML_ASSERT(n_pf_log == 1);
+
+    ggml_log_set(mock_prev_log, prev_user_data);
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1521,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_failed_reserve", test_failed_reserve);
+    run("test_prefetch_headroom", test_prefetch_headroom);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);

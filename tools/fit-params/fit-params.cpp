@@ -66,7 +66,12 @@ int llama_fit_params(int argc, char ** argv) {
             printf("%s%s=%s", itbo > 0 ? "," : "", mparams.tensor_buft_overrides[itbo].pattern, ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft));
             any_tbo = true;
         }
-        printf("%s\n", any_tbo ? "\"" : "");
+        printf("%s", any_tbo ? "\"" : "");
+        if (params.moe_cache_size > 0) {
+            // the fit may reduce the MoE cache, print the fitted size
+            printf(" --moe-cache-mib %zu", cparams.moe_cache_size/(1024*1024));
+        }
+        printf("\n");
     } else {
         LOG_INF("%s: printing estimated memory in MiB to stdout (device, model, context, compute) ...\n", __func__);
         common_log_flush(common_log_main());

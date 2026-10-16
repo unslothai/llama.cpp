@@ -146,3 +146,20 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// the backend of the device can map host memory for the device lookup of the MoE cache (moe_cache_size)
+LLAMA_API bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev);
+
+// copies the tensors that live in memory-mapped file buffers (CPU_Mapped) into one new anonymous host buffer and points them at it
+// the other tensors are left untouched; the new buffer has usage WEIGHTS and is returned (the caller owns it), nullptr if no tensor was moved
+// used by the MoE cache when the device lookup cannot map memory-mapped experts (for example hipHostRegister on a read-only file mapping)
+LLAMA_API ggml_backend_buffer_t llama_moe_cache_materialize_mapped(struct ggml_tensor ** tensors, size_t n_tensors);
+
+// Linux system memory the MoE cache may still allocate when it copies memory-mapped experts: MemAvailable capped by the memory left under the
+// cgroup v2 and v1 limits of this process and of all its ancestors, with the non-shmem page cache of each cgroup counted as reclaimable
+// root prefixes /proc and /sys/fs/cgroup (tests feed a fake hierarchy, "" reads the system); 0 if unknown, at least 1 if known (1 = exhausted)
+LLAMA_API uint64_t llama_moe_cache_available_memory_linux(const char * root);
+
+// system memory that can still be allocated: llama_moe_cache_available_memory_linux("") on Linux, the available physical memory on Windows,
+// the free, inactive and purgeable pages on macOS; 0 if unknown
+LLAMA_API uint64_t llama_moe_cache_available_memory(void);

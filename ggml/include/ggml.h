@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_CACHE_LOOKUP,
+
         GGML_OP_COUNT,
     };
 
@@ -1502,6 +1504,24 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // device-side lookup in a cache of MoE experts (see llama-moe-cache.cpp)
+    // ids:   I32 [n_expert_used, n_tokens], the experts selected in layer il
+    // map:   I32 [n_expert, n_layer], the slot of each expert of each layer, -1 if not cached (updated in place)
+    // state: I32 [8 + 3*n_slots], eviction state of the slots of the cache (updated in place)
+    // banks: the cached experts, [ne0, ne1, n_slots + 1] each (updated in place)
+    // host:  device-accessible pointers to the experts of layer il in host memory, with the layout of the banks
+    // the missing experts get a slot (the least recently used one, approximated with a CLOCK) and are copied from host memory
+    // result: I32 [n_expert_used, n_tokens] slots of the selected experts, then the copied experts; ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) gives the ids for ggml_mul_mat_id with a bank
+    GGML_API struct ggml_tensor * ggml_moe_cache_lookup(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map,
+            struct ggml_tensor  * state,
+            struct ggml_tensor ** banks,
+            const void         ** host,
+            int                   n_banks,
+            int                   il);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

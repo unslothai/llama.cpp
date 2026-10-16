@@ -5,8 +5,10 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -307,6 +309,129 @@ static void common_params_fit_impl(
         }
     }
 
+    // the MoE cache (--moe-cache-mib) has the lowest priority: it gets the device memory that is left once the layers are placed,
+    // the requested size is only a cap; LLAMA_FIT_MOE_CACHE=0 restores the old behaviour, which kept the requested size and placed the layers around it
+    // user tensor overrides (-ot, --cpu-moe, --n-cpu-moe) are then kept as constraints instead of aborting the fit
+    const char * fit_moe_cache_env = getenv("LLAMA_FIT_MOE_CACHE");
+    const bool   fit_moe_cache     = nd > 0 && hp_nex > 0 && cparams->moe_cache_size > 0 &&
+        (fit_moe_cache_env == nullptr || atoi(fit_moe_cache_env) != 0);
+
+    // the user overrides come first in every placement written below: the first matching pattern wins
+    std::vector<llama_model_tensor_buft_override> tbo_user;
+    if (fit_moe_cache && mparams->tensor_buft_overrides) {
+        for (const llama_model_tensor_buft_override * tbo = mparams->tensor_buft_overrides; tbo->pattern != nullptr; tbo++) {
+            tbo_user.push_back(*tbo);
+        }
+    }
+
+    // shrinks the MoE cache until the measured placement dmds (model params mp) meets the targets, returns the remaining total surplus
+    // the cache memory is measured (probe without the cache), the slot sizing itself stays in llama_moe_cache
+    // with several devices every device must meet its own target: the cache is split over the devices of its layers, so a device short of
+    // memory needs the total shrunk by its deficit scaled by its share of the cache (a total surplus can hide a device that misses its target)
+    auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
+        auto margin_of = [&](size_t id) -> int64_t {
+            return use_margins ? int64_t(margins[id]) : 0;
+        };
+        auto surplus_of = [&](const dmds_t & d) {
+            int64_t s = 0;
+            for (size_t id = 0; id < nd; id++) {
+                s += d[id].free;
+                s -= int64_t(d[id].mb.total()) + margin_of(id);
+            }
+            return s;
+        };
+        auto devices_ok = [&](const dmds_t & d) {
+            for (size_t id = 0; id < nd; id++) {
+                if (int64_t(d[id].free) - int64_t(d[id].mb.total()) - margin_of(id) < 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto measure = [&](const llama_context_params * cp) {
+            dmds_t res = common_get_device_memory_data_impl(path_model, mp, cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(res);
+            return res;
+        };
+        const int64_t surplus = surplus_of(dmds);
+        if (surplus >= 0 && devices_ok(dmds)) {
+            return surplus;
+        }
+        const int64_t size_requested = cparams->moe_cache_size;
+
+        llama_context_params cparams_nc = *cparams;
+        cparams_nc.moe_cache_size = 0;
+        LOG_TRC("%s: getting device memory data without the MoE cache:\n", __func__);
+        dmds_t dmds_nc = measure(&cparams_nc);
+        const int64_t surplus_nc  = surplus_of(dmds_nc);
+        const int64_t cache_bytes = surplus_nc - surplus; // device memory the cache takes in this placement
+        if (cache_bytes <= 0) {
+            return surplus; // no layer of this placement uses the cache
+        }
+
+        // bytes of cache to give back so that the total and every device meet their targets, INT64_MAX if a device misses its target
+        // even without its share of the cache
+        auto shortfall = [&](const dmds_t & d) -> int64_t {
+            int64_t need = -surplus_of(d);
+            int64_t cache_total = 0;
+            for (size_t id = 0; id < nd; id++) {
+                cache_total += std::max<int64_t>(0, int64_t(d[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
+            }
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t s_id = int64_t(d[id].free) - int64_t(d[id].mb.total()) - margin_of(id);
+                if (s_id >= 0) {
+                    continue;
+                }
+                const int64_t cache_id = std::max<int64_t>(0, int64_t(d[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
+                if (cache_id <= 0 || cache_total <= 0) {
+                    return INT64_MAX;
+                }
+                need = std::max(need, int64_t(double(-s_id) * double(cache_total) / double(cache_id)));
+            }
+            return need;
+        };
+
+        const int64_t need0 = shortfall(dmds);
+        int64_t size = need0 == INT64_MAX ? 0 : std::min(size_requested, cache_bytes) - need0;
+        for (int it = 0; it < 6 && size > 0 && surplus_nc > 0; it++) {
+            // whole MiB, so that the printed --moe-cache-mib is the size that was measured
+            size -= size % MiB;
+            if (size <= 0) {
+                break;
+            }
+            cparams->moe_cache_size = size;
+            dmds_t dmds_test;
+            try {
+                dmds_test = measure(cparams);
+            } catch (const std::runtime_error &) {
+                break; // too small to hold the experts of one token
+            }
+            const int64_t need = shortfall(dmds_test);
+            if (need <= 0) {
+                LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",
+                    __func__, size_requested/MiB, size/MiB);
+                dmds = dmds_test;
+                return surplus_of(dmds_test);
+            }
+            if (need == INT64_MAX) {
+                break;
+            }
+            size -= need + MiB;
+        }
+        LOG_TRC("%s: MoE cache disabled (requested %" PRId64 " MiB) to keep the layers in device memory\n", __func__, size_requested/MiB);
+        cparams->moe_cache_size = 0;
+        dmds = dmds_nc;
+        return surplus_nc;
+    };
+
+    // a placement given by the user (host experts through overrides) already holds the cache: shrink it before the context or the layers
+    // the margins stay the target with user-fixed layers too: else the context would be reduced to make room for the cache
+    // the requested size is kept: the placements with the experts in system memory below get the cache back if it fits next to them
+    const size_t moe_cache_size_requested = cparams->moe_cache_size;
+    if (fit_moe_cache && !tbo_user.empty()) {
+        fit_moe_cache_size(dmds_full, mparams, true);
+    }
+
     int64_t sum_free            = 0;
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
@@ -481,7 +606,7 @@ static void common_params_fit_impl(
     if (!tensor_buft_overrides) {
         throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
     }
-    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
+    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft) && tbo_user.empty()) {
         throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
     }
 
@@ -562,6 +687,9 @@ static void common_params_fit_impl(
         mparams.tensor_split = tensor_split;
 
         size_t itbo = 0;
+        for (const llama_model_tensor_buft_override & tbo : tbo_user) {
+            tensor_buft_overrides[itbo++] = tbo;
+        }
         for (size_t id = 0; id < nd; id++) {
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
@@ -614,18 +742,93 @@ static void common_params_fit_impl(
     };
 
     int64_t global_surplus_cpu_moe = 0;
+
+    // the placement with every layer in device memory, all experts in system memory and the MoE cache at its requested size, when it fits:
+    // steps 3 and 4 below are only used instead if they place every layer in device memory as well
+    std::vector<llama_model_tensor_buft_override> tbo_cpu_moe; // empty if that placement does not fit
+    int32_t            ngl_cpu_moe = 0;
+    const float *      ts_cpu_moe  = nullptr;
+    std::vector<float> ts_cpu_moe_vals;
+
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
-        tensor_buft_overrides[1] = {nullptr, nullptr};
+        const size_t n_user = tbo_user.size();
+        if (n_user + 2 > llama_max_tensor_buft_overrides()) {
+            throw common_params_fit_exception("too many tensor_buft_overrides set by user, abort");
+        }
+        for (size_t i = 0; i < n_user; i++) {
+            tensor_buft_overrides[i] = tbo_user[i];
+        }
+        tensor_buft_overrides[n_user + 0] = {pattern_moe_all.c_str(), cpu_buft};
+        tensor_buft_overrides[n_user + 1] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        // the cache may have been shrunk for the placement of the user at the full context: measured again at its requested size
+        if (fit_moe_cache) {
+            cparams->moe_cache_size = moe_cache_size_requested;
+        }
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmds_cpu_moe);
 
+        if (fit_moe_cache) {
+            // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
+            const size_t size_before = cparams->moe_cache_size;
+            fit_moe_cache_size(dmds_cpu_moe, mparams, true);
+            bool fits_per_device = cparams->moe_cache_size > 0;
+            for (size_t id = 0; id < nd; id++) {
+                fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
+            }
+            bool keep = fits_per_device && cparams->moe_cache_size != size_before;
+            if (fits_per_device && !keep) {
+                // the cache has its requested size: steps 3 and 4 may add experts in device memory if they fit next to it,
+                // their first placement keeps the experts of one layer in device memory, without room for it they would drop layers instead
+                // one device: that first placement is probed, if it misses the target the placement with all experts in system memory is final
+                // several devices: no single split decides it (the output layer, the compute buffers and the shares of the cache are per-device
+                // costs that a split by layers misjudges), a failed probe could discard a placement of steps 3 and 4 with more experts in device
+                // memory: they always run, and their placement is replaced at the end only if it cannot keep every layer in device memory
+                if (nd == 1) {
+                    std::vector<ngl_t> ngl_all(nd);
+                    ngl_all[0].n_layer = hp_ngl + 1;
+                    ngl_all[0].n_part  = hp_ngl;
+                    llama_model_params mparams_all = *mparams;
+                    set_ngl_tensor_split_tbo(ngl_all, std::vector<ggml_backend_buffer_type_t>(nd, cpu_buft), mparams_all);
+                    LOG_TRC("%s: getting device memory data with all layers in device memory and the experts of one layer:\n", __func__);
+                    dmds_t dmds_all = common_get_device_memory_data_impl(
+                        path_model, &mparams_all, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    add_extra_memory(dmds_all);
+                    keep = int64_t(dmds_all[0].free) - int64_t(dmds_all[0].mb.total()) < margins[0];
+                    // restore the overrides of the probe with all MoE tensors in system memory
+                    for (size_t i = 0; i < n_user; i++) {
+                        tensor_buft_overrides[i] = tbo_user[i];
+                    }
+                    tensor_buft_overrides[n_user + 0] = {pattern_moe_all.c_str(), cpu_buft};
+                    tensor_buft_overrides[n_user + 1] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tensor_buft_overrides;
+                }
+                if (!keep) {
+                    tbo_cpu_moe.assign(tensor_buft_overrides, tensor_buft_overrides + n_user + 2);
+                    ngl_cpu_moe = mparams->n_gpu_layers;
+                    ts_cpu_moe  = mparams->tensor_split;
+                    if (ts_cpu_moe != nullptr) {
+                        ts_cpu_moe_vals.assign(ts_cpu_moe, ts_cpu_moe + nd);
+                    }
+                }
+            }
+            if (keep) {
+                // every layer in device memory with all experts in system memory and the cache: the placement of --cpu-moe
+                LOG_TRC("%s: all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB\n",
+                    __func__, cparams->moe_cache_size/MiB);
+                for (size_t id = 0; id < nd; id++) {
+                    LOG_TRC("%s:   - %s: %6" PRId64 " MiB used, %6" PRId64 " MiB free\n", __func__, dev_names[id].c_str(),
+                        int64_t(dmds_cpu_moe[id].mb.total())/MiB, (int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()))/MiB);
+                }
+                return;
+            }
+        }
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
             global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
@@ -640,7 +843,7 @@ static void common_params_fit_impl(
         }
 
         // reset
-        tensor_buft_overrides[0] = {nullptr, nullptr};
+        tensor_buft_overrides[n_user] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
@@ -727,8 +930,31 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
+    // writes the placement of steps 3 and 4, or the one with all experts in system memory if they could not place every layer in device memory
+    auto set_final_placement = [&]() {
+        uint32_t n_layer = 0;
+        for (size_t id = 0; id < nd; id++) {
+            n_layer += ngl_per_device[id].n_layer;
+        }
+        if (tbo_cpu_moe.empty() || n_layer >= hp_ngl + 1) {
+            set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+            return;
+        }
+        LOG_TRC("%s: %" PRIu32 " of %" PRIu32 " layers in device memory with experts next to the MoE cache: "
+            "all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB instead\n",
+            __func__, n_layer, hp_ngl + 1, cparams->moe_cache_size/MiB);
+        std::copy(tbo_cpu_moe.begin(), tbo_cpu_moe.end(), tensor_buft_overrides);
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+        mparams->n_gpu_layers = ngl_cpu_moe;
+        if (ts_cpu_moe != nullptr && ts_cpu_moe == tensor_split) {
+            // the tensor_split of the user is the buffer that set_ngl_tensor_split_tbo writes to
+            std::copy(ts_cpu_moe_vals.begin(), ts_cpu_moe_vals.end(), tensor_split);
+        }
+        mparams->tensor_split = ts_cpu_moe;
+    };
+
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        set_final_placement();
         return;
     }
 
@@ -873,7 +1099,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    set_final_placement();
 }
 
 enum common_params_fit_status common_fit_params(

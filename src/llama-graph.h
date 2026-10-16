@@ -1207,8 +1207,9 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    // for large batches of a cached layer, selected_experts is replaced by a graph output the cache reads after the graph
     ggml_tensor * build_moe_cache_slots(
-             ggml_tensor * selected_experts,
+             ggml_tensor *& selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,

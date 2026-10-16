@@ -278,6 +278,11 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
+    static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+
+    // true if the copy of the experts used by a MUL_MAT_ID with these ids may skip reading the ids (all experts are copied)
+    bool sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const;
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
@@ -373,11 +378,18 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
+        bool                 all = false; // used was set to every expert without reading the ids
+
+        std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
+        std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            counts.clear();
+            all = false;
         }
     };
 
@@ -387,6 +399,35 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+
+    // the MoE cache admits the most used experts at the end of a prompt (see moe_cache_seed_begin):
+    // seed:      from the ids of this ubatch, read before its experts are copied
+    // seed_prev: from the routing of an earlier ubatch of the prompt, the copies of this ubatch do not wait for its ids
+    // record:    keep the routing outputs of this ubatch, for a later seed_prev
+    bool moe_cache_seed         = false;
+    bool moe_cache_seed_prev    = false;
+    bool moe_cache_record       = false;
+    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+
+    // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
+    bool moe_cache_seed_graph = false;
+
+    // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
+    std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> moe_cache_ids;
+
+    // the prompt the stored routing belongs to: its sequence and the position of its next token
+    llama_seq_id moe_cache_seq     = -1;
+    llama_pos    moe_cache_pos_next = -1;
+
+    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
+    void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
+
+    // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
+    // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work
+    int64_t prefetch_min_batch = 256;
+
+    // tokens of the ubatch whose graph the scheduler is allocating, read by sched_prefetch_mode
+    int64_t prefetch_n_tokens = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

@@ -82,7 +82,8 @@ uint32_t backend_device_supports_op(apir_encoder * enc, apir_decoder * dec, virg
 
     const ggml_tensor * op = apir_decode_ggml_tensor_inplace(dec);
 
-    bool supports_op = dev->iface.supports_op(dev, op);
+    // its op params hold process-local pointers, which a guest must never supply
+    bool supports_op = op != nullptr && op->op != GGML_OP_MOE_CACHE_LOOKUP && dev->iface.supports_op(dev, op);
 
     apir_encode_bool_t(enc, &supports_op);
 

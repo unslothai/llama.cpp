@@ -1658,6 +1658,11 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
     }
 
+    // its op params hold process-local pointers, which a client must never supply
+    if (tensor->op == GGML_OP_MOE_CACHE_LOOKUP) {
+        LOG_ERROR("[%s] op %s is not supported over RPC\n", __func__, ggml_op_name(GGML_OP_MOE_CACHE_LOOKUP));
+        return nullptr;
+    }
     result->op = (ggml_op) tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
         result->op_params[i] = tensor->op_params[i];
@@ -2852,9 +2857,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results
-    return true;
+    return op->op != GGML_OP_MOE_CACHE_LOOKUP;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

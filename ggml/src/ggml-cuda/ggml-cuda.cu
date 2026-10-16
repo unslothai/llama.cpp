@@ -62,6 +62,8 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/moe-cache.cuh"
+#include "ggml-cuda/copy-regions.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2477,6 +2479,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_CACHE_LOOKUP:
+            ggml_cuda_op_moe_cache_lookup(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -4635,6 +4640,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->computes = true;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5160,6 +5166,106 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// maps host memory into the device address space so kernels read it directly (zero-copy), returns the device pointer or nullptr
+// mappings are reference counted: if *registered is set, call ggml_backend_cuda_host_unmap(buffer) when done
+// pageable memory is never read through HMM/ATS, it is an order of magnitude slower
+// the device pointer is taken per device: HIP maps registered memory into the address space of the current device
+struct ggml_cuda_host_mapping {
+    size_t size;
+    void * dev_ptr[GGML_CUDA_MAX_DEVICES];
+    int    refs;
+};
+
+static std::mutex & ggml_cuda_host_mappings_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+static std::unordered_map<void *, ggml_cuda_host_mapping> & ggml_cuda_host_mappings() {
+    static std::unordered_map<void *, ggml_cuda_host_mapping> m;
+    return m;
+}
+
+static void * ggml_cuda_host_map(int device, void * buffer, size_t size, bool * registered) {
+    *registered = false;
+    void * dev_ptr = nullptr;
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    auto & mappings = ggml_cuda_host_mappings();
+
+    ggml_cuda_set_device(device);
+
+    // registered here before: one more reference, with the device pointer of this device
+    auto it = mappings.find(buffer);
+    if (it != mappings.end()) {
+        if (size > it->second.size) {
+            return nullptr;
+        }
+        if (it->second.dev_ptr[device] == nullptr) {
+            if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
+                (void)cudaGetLastError();
+                return nullptr;
+            }
+            it->second.dev_ptr[device] = dev_ptr;
+        }
+        it->second.refs++;
+        *registered = true;
+        return it->second.dev_ptr[device];
+    }
+
+    // pinned by someone else, for example a CUDA host buffer (registering it again fails): not owned here
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, buffer) == cudaSuccess && attr.type == cudaMemoryTypeHost) {
+        if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) == cudaSuccess && dev_ptr != nullptr) {
+            return dev_ptr;
+        }
+    }
+    (void)cudaGetLastError();
+
+    // read-only registration also accepts read-only mappings (mmap), but not every device supports it
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+    bool read_only_ok = false;
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    read_only_ok = cudaHostRegister(buffer, size, flags | cudaHostRegisterReadOnly) == cudaSuccess;
+    if (!read_only_ok) {
+        (void)cudaGetLastError();
+    }
+#endif
+    cudaError_t err = read_only_ok ? cudaSuccess : cudaHostRegister(buffer, size, flags);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to map %.2f MiB of host memory: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    if (cudaHostGetDevicePointer(&dev_ptr, buffer, 0) != cudaSuccess || dev_ptr == nullptr) {
+        (void)cudaGetLastError();
+        cudaHostUnregister(buffer);
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    ggml_cuda_host_mapping & m = mappings[buffer];
+    m = {};
+    m.size = size;
+    m.dev_ptr[device] = dev_ptr;
+    m.refs = 1;
+    *registered = true;
+    return dev_ptr;
+}
+
+// releases a reference taken by ggml_backend_cuda_host_map, the memory is unregistered with the last one
+static void ggml_backend_cuda_host_unmap(void * buffer) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    auto & mappings = ggml_cuda_host_mappings();
+    auto it = mappings.find(buffer);
+    if (it == mappings.end() || --it->second.refs > 0) {
+        return;
+    }
+    mappings.erase(it);
+    if (cudaHostUnregister(buffer) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return;
@@ -5182,6 +5288,12 @@ struct ggml_backend_cuda_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
+
+// maps host memory into the address space of the device dev (see ggml_cuda_host_map)
+static void * ggml_backend_cuda_host_map(ggml_backend_dev_t dev, void * buffer, size_t size, bool * registered) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    return ggml_cuda_host_map(ctx->device, buffer, size, registered);
+}
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -5815,6 +5927,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_CACHE_LOOKUP:
+            return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
@@ -5994,8 +6108,148 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+// host memory that device can read in stream order: registered by ggml_backend_cuda_host_map, or pinned by someone else (which
+// ggml_cuda_host_map maps without registering it), for that device or for all of them (portable)
+static bool ggml_cuda_host_is_mapped(int device, const void * ptr, size_t size) {
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+        for (const auto & [base, m] : ggml_cuda_host_mappings()) {
+            if ((const char *) ptr >= (const char *) base && (const char *) ptr + size <= (const char *) base + m.size) {
+                return true;
+            }
+        }
+    }
+    // both ends of the range in page-locked memory
+    for (const char * p : { (const char *) ptr, (const char *) ptr + (size > 0 ? size - 1 : 0) }) {
+        cudaPointerAttributes attr;
+        unsigned int flags = 0;
+        if (cudaPointerGetAttributes(&attr, p) != cudaSuccess || attr.type != cudaMemoryTypeHost ||
+            (attr.device != device && (cudaHostGetFlags(&flags, const_cast<char *>(p)) != cudaSuccess || !(flags & cudaHostAllocPortable)))) {
+            (void)cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+// device copies of a copy-only instance (the scheduler copy queue): the kernel, except copy engines on compute capability 10.x where they measured faster (GGML_CUDA_COPY_QUEUE_KERNEL=0/1 overrides)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+static bool ggml_cuda_copy_queue_kernel(int device) {
+    static const std::vector<bool> kernel = [] {
+        const char * env = getenv("GGML_CUDA_COPY_QUEUE_KERNEL");
+        std::vector<bool> res(ggml_cuda_info().device_count, true);
+        for (int id = 0; id < (int) res.size(); id++) {
+            const int cc = ggml_cuda_info().devices[id].cc;
+            res[id] = env != nullptr ? atoi(env) != 0 : !(cc >= 1000 && cc < 1100);
+            GGML_LOG_INFO("ggml_cuda_copy_queue_kernel: device %d: compute capability %d.%d, device copies of a copy queue with the %s\n", id, cc/100, (cc%100)/10,
+                res[id] ? "kernel" : "copy engines");
+        }
+        return res;
+    }();
+    return device >= 0 && device < (int) kernel.size() ? kernel[device] : true;
+}
+#endif
+
+// many small copies in two calls: uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8), device copies with one kernel
+// GGML_CUDA_COPY_REGIONS_KERNEL=0 puts the device copies in the batch, GGML_CUDA_COPY_BATCH=0 disables both
+static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+    GGML_UNUSED(backend);
+    GGML_UNUSED(regions);
+    GGML_UNUSED(n_regions);
+    return false;
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_COPY_BATCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    if (n_regions == 0) {
+        return true;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    static const bool d2d_kernel = [] {
+        const char * env = getenv("GGML_CUDA_COPY_REGIONS_KERNEL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    std::vector<void *>       dsts;
+    std::vector<const void *> srcs;
+    std::vector<size_t>       sizes;
+    std::vector<void *>       d2d_dsts;
+    std::vector<const void *> d2d_srcs;
+    std::vector<size_t>       d2d_sizes;
+    dsts.reserve(n_regions);
+    srcs.reserve(n_regions);
+    sizes.reserve(n_regions);
+    for (size_t i = 0; i < n_regions; i++) {
+        const ggml_backend_copy_region & r = regions[i];
+        ggml_backend_buffer_t buf_dst = r.dst->view_src ? r.dst->view_src->buffer : r.dst->buffer;
+        ggml_backend_buffer_t buf_src = r.src->view_src ? r.src->view_src->buffer : r.src->buffer;
+        if (buf_dst == nullptr || !ggml_backend_buffer_is_cuda(buf_dst) ||
+            ((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx->device) {
+            return false;
+        }
+        // device memory of the same device, or pinned host memory (pageable memory cannot be read in stream order)
+        const bool src_dev  = buf_src != nullptr && ggml_backend_buffer_is_cuda(buf_src) &&
+            ((ggml_backend_cuda_buffer_context *) buf_src->context)->device == cuda_ctx->device;
+        const bool src_host = buf_src != nullptr && !src_dev &&
+            (ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src)) ||
+             (ggml_backend_buffer_is_host(buf_src) && ggml_cuda_host_is_mapped(cuda_ctx->device, (const char *) r.src->data + r.src_offset, r.size)));
+        if (!src_dev && !src_host) {
+            return false;
+        }
+        GGML_ASSERT(r.dst_offset + r.size <= ggml_nbytes(r.dst) && r.src_offset + r.size <= ggml_nbytes(r.src));
+        if (r.size == 0) {
+            continue;
+        }
+        void       * d = (char *) r.dst->data + r.dst_offset;
+        const void * s = (const char *) r.src->data + r.src_offset;
+        // a copy-only instance uses the kernel only where the copy engines are slow for device copies (see above)
+        if (src_dev && d2d_kernel && (cuda_ctx->computes || ggml_cuda_copy_queue_kernel(cuda_ctx->device))) {
+            d2d_dsts.push_back(d);
+            d2d_srcs.push_back(s);
+            d2d_sizes.push_back(r.size);
+        } else {
+            dsts.push_back(d);
+            srcs.push_back(s);
+            sizes.push_back(r.size);
+        }
+    }
+
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attr_idx = 0;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (!d2d_dsts.empty()) {
+        ggml_cuda_copy_regions_d2d(cuda_ctx->stream(), ggml_cuda_info().devices[cuda_ctx->device].nsm,
+            d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
+    }
+    if (!dsts.empty()) {
+#if CUDART_VERSION >= 13000
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attr, &attr_idx, 1, cuda_ctx->stream()));
+#else
+        size_t fail_idx = 0;
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), dsts.size(), &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
+#endif
+    }
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_regions_async;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -6007,6 +6261,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_host_map") == 0) {
+        return (void *)ggml_backend_cuda_host_map;
+    }
+    if (strcmp(name, "ggml_backend_host_unmap") == 0) {
+        return (void *)ggml_backend_cuda_host_unmap;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;

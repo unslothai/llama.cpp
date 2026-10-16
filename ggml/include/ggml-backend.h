@@ -117,6 +117,20 @@ extern "C" {
     // automatic fallback to sync copy if async is not supported
     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // a copy of `size` bytes from `src` at byte offset `src_offset` to `dst` at byte offset `dst_offset`
+    struct ggml_backend_copy_region {
+        const struct ggml_tensor * src;
+        size_t                     src_offset;
+        struct ggml_tensor *       dst;
+        size_t                     dst_offset;
+        size_t                     size;
+    };
+
+    // queue the copies on `backend` as one batch in stream order, the copies of a batch may run in any order and must not overlap
+    // dst: device memory of the backend; src: device memory of the same device, or host memory it can read async (e.g. pinned)
+    // returns false (nothing copied) if the backend cannot batch them; with n_regions == 0, returns whether batched copies are supported
+    GGML_API bool ggml_backend_tensor_copy_regions_async(ggml_backend_t backend, const struct ggml_backend_copy_region * regions, size_t n_regions);
+
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 
     //
@@ -334,6 +348,18 @@ extern "C" {
     // `graph_size_changed` is true if the graph size changed since the last allocation
     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // How an input weight in a host buffer is copied to the backend of the split that uses it
+    enum ggml_backend_sched_prefetch_mode {
+        GGML_BACKEND_SCHED_PREFETCH_NONE  = 0, // copied when the split starts, the copy is allocated by the graph allocator (no prefetch)
+        GGML_BACKEND_SCHED_PREFETCH_SYNC  = 1, // copied when the split starts (the copy needs results of earlier splits), no weight of the split is prefetched, the copy uses a staging slot if the backend has an arena
+        GGML_BACKEND_SCHED_PREFETCH_ASYNC = 2, // copied into a staging slot on a separate copy queue, ahead of the split
+    };
+
+    // Callback selecting the prefetch mode of the host weight `src` (`dst` is its copy, `graph` the split graph), return NONE for host tensors that change during the graph computation
+    // ASYNC copies go through the copy callback with the copy queue backend (whole if it returns false) and may run before earlier splits, so they must not depend on graph results
+    // with a copy callback but no prefetch callback nothing is prefetched; env: GGML_SCHED_PREFETCH (0 = off), GGML_SCHED_PREFETCH_DEPTH
+    typedef enum ggml_backend_sched_prefetch_mode (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, const struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -351,6 +377,9 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // a reserve that leaves less than `headroom` bytes free on a device with a staging arena drops the host weight prefetch (0 = never),
+    // default GGML_SCHED_PREFETCH_HEADROOM_MIB (512): for users whose memory measurement does not count the staging
+    GGML_API void                       ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
@@ -377,6 +406,9 @@ extern "C" {
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+
+    // Set a callback that selects how the input weights in host buffers are prefetched
+    GGML_API void                 ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data);
 
     //
     // Meta backend
