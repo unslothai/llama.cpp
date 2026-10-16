@@ -24,7 +24,12 @@ class BeamModel(TextModel):
         rope = hp.get("rope_parameters") or {}
         if rope.get("full_attention") is not None:
             raise ValueError("Beam: expected NoPE full-attention layers (rope_parameters.full_attention = null)")
-        swa_rope = rope.get("sliding_attention") or {}
+        if "sliding_attention" in rope:
+            swa_rope = rope["sliding_attention"] or {}
+        else:
+            # flat rope_theta / rope_scaling, already normalized by TextModel
+            swa_rope = {k: v for k, v in self.rope_parameters.items() if k not in ("sliding_attention", "full_attention", "type")}
+            swa_rope.update(self.rope_parameters.get("sliding_attention") or {})
         if swa_rope.get("rope_type", "default") != "default":
             raise ValueError(f"Beam: unsupported sliding-attention rope type {swa_rope.get('rope_type')!r}")
         # full layers are NoPE, so mirror the sliding rope params for the base class
