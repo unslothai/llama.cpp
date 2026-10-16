@@ -184,7 +184,7 @@ public:
     const llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ;
 };
 
-// temperature tuning, used by llama4 (and beam, with the power-law form)
+// temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
     llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset, bool attn_temp_pow = false)
@@ -193,7 +193,6 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    // the scale is recomputed from the positions in every set_input, so only the shape must match
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * attn_scale = nullptr; // F32 [n_batch]

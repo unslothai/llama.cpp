@@ -219,7 +219,7 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
 
         std::vector<float> attn_scale_data(n_tokens, 0.0f);
         if (attn_temp_pow) {
-            // beam: (1 + (pos + offset) / length) ^ power, i.e. exp(power * log1p((pos + offset) / length))
+            // (1 + (pos + offset) / length) ^ power
             for (int i = 0; i < n_tokens; ++i) {
                 const double pos = ubatch->pos[i];
                 attn_scale_data[i] = (float) std::exp((double) f_attn_temp_scale *

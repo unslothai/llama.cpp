@@ -1,17 +1,5 @@
 #include "models.h"
 
-// Sparse MoE text model with iSWA and NoPE full-attention layers
-//
-// - interleaved sliding-window attention (pattern from layer_types); RoPE (NeoX) only on the sliding layers
-// - full-attention layers are NoPE; their queries are scaled by (1 + (pos + 1) / 2048) ^ 0.1 after the q norm
-// - per-head q/k RMSNorm, attention output gate: o * sigmoid(gate_proj(x) + gate_bias[head]) before o_proj
-// - sandwich norms (input, post_attention, pre_feedforward, post_feedforward; plain RMSNorm weight)
-// - depth-scaled residual: x = h / sqrt(i) + r * sqrt((i - 1) / i), with i = 2 (il + 1) after attention and
-//   i = 2 (il + 1) + 1 after the MLP (fixed function of the layer index, computed here; weights are unchanged)
-// - leading dense SwiGLU layers, then DeepSeek-V3 grouped sigmoid routing with a selection bias,
-//   normalized top-k weights and a routed scaling factor
-// - final logit softcapping
-
 void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
@@ -19,7 +7,7 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
-    hparams.f_final_logit_softcapping = 0.0f; // the llama_hparams default is 30; absent key = no softcap
+    hparams.f_final_logit_softcapping = 0.0f; // absent key = no softcap (default is 30)
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,           hparams.f_final_logit_softcapping, false);
 
     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
@@ -29,9 +17,8 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("beam: leading_dense_block_count exceeds the layer count");
     }
 
-    // interleaved SWA; the per-layer pattern is required (layer_types in the HF config)
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
-    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // masked iff p1 - p0 >= n_swa, same as the reference mask
+    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // masked iff p1 - p0 >= n_swa, as in the reference
     uint32_t n_pattern = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
     if (hparams.n_swa == 0 || n_pattern != hparams.n_layer_all) {
@@ -39,13 +26,13 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     }
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
 
-    // RoPE only on the sliding layers; the full layers are NoPE (also keeps the K-shift off them)
+    // full layers are NoPE
     hparams.rope_pattern = hparams.is_swa_impl;
     hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
 
-    // NoPE query scale (1 + (pos + 1) / length) ^ power; defaults are the reference constants
+    // NoPE query scale uses pos + 1
     hparams.f_attn_temp_scale = 0.1f;
     hparams.attn_temp_length  = 2048;
     ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_SCALE,  hparams.f_attn_temp_scale, false);
@@ -113,7 +100,6 @@ std::unique_ptr<llm_graph_context> llama_model_beam::build_arch_graph(const llm_
     return std::make_unique<graph>(*this, params);
 }
 
-// depth-scaled residual add: h / sqrt(i) + r * sqrt((i - 1) / i)
 static ggml_tensor * beam_residual_add(ggml_context * ctx, ggml_tensor * h, ggml_tensor * r, int i) {
     const float h_scale = (float) (1.0 / std::sqrt((double) i));
     const float r_scale = (float) std::sqrt((double) (i - 1) / (double) i);
@@ -131,7 +117,6 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
 
     ggml_tensor * inp_pos = build_inp_pos();
 
-    // NoPE query scale, [1, 1, n_tokens]; only built when a full-attention layer will consume it
     bool has_nope = false;
     for (int il = 0; il < n_layer; ++il) {
         has_nope = has_nope || !hparams.is_swa(il);
@@ -154,7 +139,6 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
         cur = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // self-attention
         {
             ggml_tensor * attn_inp = cur;
 
@@ -178,7 +162,6 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
                 cb(Qcur, "Qcur_rope", il);
                 cb(Kcur, "Kcur_rope", il);
             } else {
-                // NoPE layer: position-dependent query scale (keys are cached unscaled)
                 Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
                 cb(Qcur, "Qcur_scaled", il);
             }
@@ -188,7 +171,6 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
 
-            // output gate: sigmoid(gate_proj(x) + gate_bias[head]), broadcast over head_dim
             ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, attn_inp);
             cb(gate, "attn_gate_proj", il);
             gate = ggml_reshape_3d(ctx0, gate, n_embd_head, n_head, n_tokens);

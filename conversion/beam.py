@@ -12,19 +12,9 @@ from .base import ModelBase, TextModel, gguf, logger
 
 @ModelBase.register("BeamForCausalLM")
 class BeamModel(TextModel):
-    """Sparse MoE text model (model_type "beam").
-
-    - interleaved sliding-window attention from `layer_types`; RoPE only on sliding layers,
-      full-attention layers are NoPE with a position-dependent query scale
-      (1 + (pos + 1) / 2048) ** 0.1 (as in the reference implementation)
-    - per-head q/k RMSNorm, attention output gate o * sigmoid(gate_proj(x) + gate_bias[head])
-    - sandwich norms and a depth-scaled residual (applied in the graph, weights are stored as-is)
-    - leading dense SwiGLU layers, then DeepSeek-V3 style grouped sigmoid routing
-    - final logit softcapping
-    """
     model_arch = gguf.MODEL_ARCH.BEAM
 
-    # constants of the reference's compute_attention_scaling(); not present in config.json
+    # reference NoPE query-scale constants; not in config.json
     NOPE_SCALE_POWER  = 0.1
     NOPE_SCALE_LENGTH = 2048
 
@@ -37,9 +27,7 @@ class BeamModel(TextModel):
         swa_rope = rope.get("sliding_attention") or {}
         if swa_rope.get("rope_type", "default") != "default":
             raise ValueError(f"Beam: unsupported sliding-attention rope type {swa_rope.get('rope_type')!r}")
-        # The base class reads the "full_attention" entry for rope_freq_base; full layers are NoPE so
-        # that value is never used by the graph. Mirror the sliding entry so the base stays generic.
-        # ("default" is plain RoPE; drop it so the base class does not warn about an unknown scaling type)
+        # full layers are NoPE, so mirror the sliding rope params for the base class
         swa_rope = {k: v for k, v in swa_rope.items() if not (k == "rope_type" and v == "default")}
         self.rope_parameters = {"sliding_attention": dict(swa_rope), "full_attention": dict(swa_rope)}
 
@@ -61,9 +49,8 @@ class BeamModel(TextModel):
         self._experts: dict[tuple[int, str], dict[int, Tensor]] = {}
 
     def set_vocab(self):
-        # add_bos_token=False is written by SpecialVocab (bos_token is null in tokenizer_config.json)
         self._set_vocab_gpt2()
-        # the harmony end-of-message token; llama.cpp otherwise guesses EOT from a hash-ordered scan
+        # otherwise EOT is guessed from a hash-ordered scan
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(self.dir_model)
         ret_id = tok.convert_tokens_to_ids("<|return|>")  # ty: ignore[unresolved-attribute]
@@ -87,7 +74,7 @@ class BeamModel(TextModel):
         self.gguf_writer.add_expert_feed_forward_length(hp["moe_intermediate_size"])
         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
         self.gguf_writer.add_expert_weights_norm(bool(hp.get("norm_topk_prob", True)))
-        # applied after aggregation in the reference; linear, so equal to scaling the weights
+        # equivalent to the reference's post-aggregation scaling
         self.gguf_writer.add_expert_weights_scale(float(hp["routed_scaling_factor"]))
 
         if (softcap := hp.get("final_logit_softcapping")) is not None:
@@ -96,14 +83,12 @@ class BeamModel(TextModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-        # one gate bias per head; stored as attn_gate.bias
         if name.endswith(".self_attn.gate_bias"):
             name = name.replace(".self_attn.gate_bias", ".self_attn.gate_proj.bias")
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         hp = self.hparams
-        # source-checkpoint facts the GGUF layout relies on (asserted here: the loader only sees the result)
         if name.endswith(".self_attn.gate_proj.bias"):
             assert tuple(data_torch.shape) == (hp["num_attention_heads"],), f"{name}: one gate bias per head expected, got {tuple(data_torch.shape)}"
         elif name.endswith(".self_attn.gate_proj.weight"):
@@ -114,14 +99,10 @@ class BeamModel(TextModel):
             assert tuple(data_torch.shape) == (hp["head_dim"],), f"{name}: per-head q/k norm expected, got {tuple(data_torch.shape)}"
         elif bid is not None and bid < self._n_dense_lead and ".mlp.experts." in name:
             raise ValueError(f"Beam: expert tensor {name} in a dense layer")
-        # The checkpoint stores routed experts unpacked: mlp.experts.{e}.{gate,up,down}_proj.weight.
-        # Stack each projection as soon as all of its experts have arrived (the tensors are lazy, so
-        # only references are held until the stacked tensor is written).
         if ".mlp.experts." in name:
             assert bid is not None
             n_experts = self.hparams["num_experts"]
             parts = name.split(".")
-            # model.layers.{bid}.mlp.experts.{e}.{proj}.weight
             xid = int(parts[parts.index("experts") + 1])
             proj = parts[parts.index("experts") + 2]
             if proj not in ("gate_proj", "up_proj", "down_proj"):
