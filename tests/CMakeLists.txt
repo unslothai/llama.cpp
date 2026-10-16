@@ -371,8 +371,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp LINK ggml)
 endif()
 
-llama_build_and_test(test-moe-cache-materialize.cpp)
-llama_build_and_test(test-moe-cache-available-memory.cpp)
+llama_build_and_test(test-moe-cache-materialize.cpp LINK llama)
+llama_build_and_test(test-moe-cache-available-memory.cpp LINK llama)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
