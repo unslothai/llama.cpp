@@ -238,6 +238,10 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_attn_temp::can_reuse(const llm_graph_params & params) {
+    return attn_scale != nullptr && attn_scale->ne[2] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
