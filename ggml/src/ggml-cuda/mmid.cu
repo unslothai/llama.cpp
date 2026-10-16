@@ -50,6 +50,7 @@ static __global__ void mm_ids_helper(
 
     int nex_prev   = 0; // Number of columns for experts with a lower index.
     int it_compact = 0; // Running index for the compact slice of this expert.
+    int n_match    = 0; // Number of slots that use this expert, more than it_compact if a token repeats it.
 
     if constexpr (n_expert_used_template == 0) {
         // Generic implementation:
@@ -58,6 +59,7 @@ static __global__ void mm_ids_helper(
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
                 nex_prev += expert_used < expert;
+                n_match  += expert_used == expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -84,6 +86,7 @@ static __global__ void mm_ids_helper(
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
+            n_match  += expert_used == expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -107,18 +110,52 @@ static __global__ void mm_ids_helper(
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    n_match  = warp_reduce_sum<warp_size>(n_match);
     ggml_cuda_syncwarp();
 
-    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
-        const mm_ids_helper_store store_it = store[itc];
-        const int it       = store_it.it();
-        const int iex_used = store_it.iex_used();
-        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
-        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
-        if (write_inverse) {
-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
-        } else {
-            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+    if (n_match == it_compact) {
+        for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
+            const mm_ids_helper_store store_it = store[itc];
+            const int it       = store_it.it();
+            const int iex_used = store_it.iex_used();
+            ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
+            // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
+            } else {
+                ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+            }
+        }
+    } else {
+        // A token uses this expert in more than one slot: the store holds one column per token, but the lower experts
+        // were counted per slot, so write one column per slot instead, else the range of this expert keeps unwritten
+        // columns that the matrix multiplication reads. Slow, only for repeated ids, which top-k routing never gives.
+        int itc0 = 0;
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex0 = 0; iex0 < n_expert_used; iex0 += warp_size) {
+                const int  iex   = iex0 + threadIdx.x;
+                const bool match = iex < n_expert_used && ids[it*si1 + iex] == expert;
+
+                int nlower = match; // inclusive count of the matching lanes up to this one
+#pragma unroll
+                for (int offset = 1; offset < warp_size; offset <<= 1) {
+                    const int tmp = __shfl_up_sync(0xFFFFFFFF, nlower, offset, warp_size);
+                    if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+                        nlower += tmp;
+                    }
+                }
+
+                if (match) {
+                    const int itc = itc0 + nlower - 1;
+                    ids_dst[nex_prev + itc] = it*n_expert_used + iex;
+                    if (write_inverse) {
+                        ids_src1[it*n_expert_used + iex] = nex_prev + itc;
+                    } else {
+                        ids_src1[nex_prev + itc] = it*sis1 + iex % nchannels_y;
+                    }
+                }
+                itc0 += __shfl_sync(0xFFFFFFFF, nlower, warp_size - 1, warp_size);
+            }
         }
     }
 
@@ -132,7 +169,7 @@ static __global__ void mm_ids_helper(
         return;
     }
 
-    expert_bounds[gridDim.x] = nex_prev + it_compact;
+    expert_bounds[gridDim.x] = nex_prev + n_match;
 }
 
 template <int n_expert_used_template>
