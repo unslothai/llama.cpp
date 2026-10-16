@@ -423,9 +423,10 @@ static bool mm_ids_counting_sort_faster(const int n_tokens) {
     return n_tokens >= 512;
 }
 
-// cuBLAS fallback: the device counting sort against the host sort, which synchronizes on the ids and loops over all of them per expert
-static bool mm_ids_device_sort_faster(const int n_tokens, const int n_expert_used) {
-    return (int64_t) n_tokens*n_expert_used >= 64;
+// cuBLAS fallback: the device counting sort against the host sort, which loops over all n_tokens*n_expert_used ids once per expert;
+// the device sort was faster in every measured cell from n_experts*n_tokens*n_expert_used >= 16384 on, and up to 3% slower below
+static bool mm_ids_device_sort_faster(const int n_experts, const int n_tokens, const int n_expert_used) {
+    return (int64_t) n_experts*n_tokens*n_expert_used >= 16384;
 }
 
 static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, const int n_expert_used) {
@@ -481,7 +482,7 @@ bool ggml_cuda_mm_ids_device_sort_supported(const int n_experts, const int n_tok
     if (forced >= 0) {
         return forced != 0;
     }
-    return mm_ids_device_sort_faster(n_tokens, n_expert_used);
+    return mm_ids_device_sort_faster(n_experts, n_tokens, n_expert_used);
 }
 
 #define MM_IDS_DISPATCH(neu)                                                                                                    \
