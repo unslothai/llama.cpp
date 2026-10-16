@@ -40,6 +40,9 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     hparams.attn_temp_length  = 2048;
     ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_SCALE,  hparams.f_attn_temp_scale, false);
     ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_LENGTH, hparams.attn_temp_length,  false);
+    if (hparams.f_attn_temp_scale == 0.0f) {
+        throw std::runtime_error("beam: attention.temperature_scale must be nonzero");
+    }
     if (hparams.attn_temp_length == 0) {
         throw std::runtime_error("beam: attention.temperature_length must be positive");
     }
