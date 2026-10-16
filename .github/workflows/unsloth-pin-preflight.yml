@@ -183,6 +183,14 @@ jobs:
 
           # Only when a pin actually merged. With no pins, or only optional closed ones, this tree is pristine upstream, and a finding there is not a pin problem to alert on. The nightly gates the same check on MERGED_PINS.
           if [ -z "$PROBLEMS" ] && [ -n "$MERGED" ]; then
+            # As in the nightly, first: two pins that each add a ggml op both take
+            # static_assert(GGML_OP_COUNT == N) to the same N+1, git merges the
+            # identical edits silently and the tree does not compile. This rewrites
+            # the asserts when every op table matches the enum and fails otherwise.
+            if ! python3 ../scripts/unsloth/reconcile_op_count.py --root . --base-ref "refs/tags/${BASE}" ; then
+              PROBLEMS="${PROBLEMS}- the pins add ggml ops and either an op name table no longer matches its enum or the op count changed without an RPC_PROTO version bump. See the run log for file and line.\n"
+            fi
+
             # Merging cleanly is not the same as merging correctly. Two mistakes
             # made on 08-27 compiled fine and would have shipped: a tensor-map key
             # defined twice, which Python resolves silently by keeping the last,
