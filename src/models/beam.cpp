@@ -18,7 +18,7 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     }
 
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
-    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // masked iff p1 - p0 >= n_swa, as in the reference
+    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // masked iff p1 - p0 >= n_swa
     uint32_t n_pattern = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
     if (hparams.n_swa == 0 || n_pattern != hparams.n_layer_all) {

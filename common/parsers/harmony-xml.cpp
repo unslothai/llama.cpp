@@ -88,7 +88,7 @@ common_chat_params common_chat_params_init_harmony_xml(const common_chat_templat
         }
 
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            // a missing closing tag is tolerated before the next parameter, the next call or the end of the call
+            // tolerate a missing closing tag
             std::vector<std::string> value_ends = with_eog({ PARAM_OPEN, "<|end|>" });
             std::vector<std::string> string_ends = { PARAM_CLOSE };
             auto next_open = p.choice();
