@@ -209,9 +209,9 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
-                    layer.ffn_up,   NULL, NULL,
-                    layer.ffn_gate, NULL, NULL,
-                    layer.ffn_down, NULL, NULL,
+                    layer.ffn_up,   NULL, layer.ffn_up_s,
+                    layer.ffn_gate, NULL, layer.ffn_gate_s,
+                    layer.ffn_down, NULL, layer.ffn_down_s,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -227,7 +227,11 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    nullptr, nullptr,
+                    layer.ffn_up_exps_s,
+                    layer.ffn_gate_exps_s,
+                    layer.ffn_down_exps_s);
             cb(cur, "ffn_moe_out", il);
         }
 
