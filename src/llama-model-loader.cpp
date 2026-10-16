@@ -1437,6 +1437,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // a file with lazy ranges is mapped without MAP_POPULATE, so populate the tensors that are read from the mapping instead:
     // not the lazy ones, nor the ones that were never created (TENSOR_SKIP, e.g. MTP without a drafter, or another model's)
     // all or nothing per file, within the available RAM, else the pages fault in on demand as without MAP_POPULATE
+    // LLAMA_MMAP_POPULATE=0 turns this off; files without lazy ranges keep MAP_POPULATE either way, as before
 #ifdef __linux__
     const char * populate_env = getenv("LLAMA_MMAP_POPULATE");
     const bool populate_enabled = !populate_env || strcmp(populate_env, "0") != 0;
@@ -1468,6 +1469,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
         if (!populate_init) {
             populate_left = llama_populate_budget();
+            // the files without lazy ranges are populated in full by MAP_POPULATE, before or after this one;
+            // the earlier ones are not reflected in MemAvailable either, which counts their page cache as available
+            for (uint32_t i = 0; i < files.size(); i++) {
+                if (lazy.for_file(i).empty()) {
+                    populate_left -= std::min(populate_left, files[i]->size());
+                }
+            }
             populate_init = true;
         }
         if (need > populate_left) {
@@ -1477,7 +1485,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
         const int64_t t_start_us = ggml_time_us();
         const size_t done = mapping.populate(rs);
-        populate_left -= done;
+        // a failed run may have populated part of itself, and the next file would likely fail the same way
+        populate_left = done < need ? 0 : populate_left - done;
         LLAMA_LOG_INFO("%s: file %u: populated %.2f MiB of %.2f MiB tensor data in %zu runs (%.2f MiB file), %.0f ms\n",
                 func, idx, done/1024.0/1024.0, need/1024.0/1024.0, rs.size(), mapping.size()/1024.0/1024.0,
                 (ggml_time_us() - t_start_us)/1000.0);
