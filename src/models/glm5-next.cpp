@@ -271,13 +271,14 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * sel_mask      = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
+    ggml_tensor * sel_mask_2d   = nullptr; // F32     [n_sel, n_tokens] view of sel_mask, shared by the layers
     // n_new is never below 1, see build_inp_kpool
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
+    ggml_tensor * new_pool_flat = nullptr; // I32     [kpool*n_new]    view of new_pool_idxs, shared by the layers
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
 
-    // Views of the inputs above, built once per graph: the scheduler copies every view of a host input to
-    // the device on its own, so a per-layer view of an input costs a copy per layer.
-    ggml_tensor * gather_live = nullptr;
+    // Chunks of new_pool_flat for the chunked re-pooling, built once per graph: the scheduler copies every
+    // view of a host input to the device on its own, so a per-layer view of an input costs a copy per layer.
     std::vector<ggml_tensor *> new_pool_idxs_chunks;
 
     const llama_memory_hybrid_idx_context * mctx;
@@ -331,12 +332,15 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         ggml_set_input(inp->sel_mask);
         // set_input_kpool always fills the mask, so it stays allocated in every graph
         ggml_build_forward_expand(gf, inp->sel_mask);
+        // one view for all layers: each view of a host input is a separate upload
+        inp->sel_mask_2d = ggml_reshape_2d(ctx0, inp->sel_mask, n_sel, n_tokens);
     }
 
     inp->n_new = n_new;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_new);
     ggml_set_input(inp->new_pool_idxs);
+    inp->new_pool_flat = ggml_reshape_1d(ctx0, inp->new_pool_idxs, kpool*n_new);
     // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
     inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new);
     ggml_set_input(inp->new_pool_rep);
@@ -929,8 +933,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     if (inp_kpool->new_pool_idxs_chunks.empty()) {
         for (int64_t i0 = 0; i0 < n_new; i0 += n_new_chunk) {
             const int64_t nc = std::min(n_new_chunk, n_new - i0);
-            inp_kpool->new_pool_idxs_chunks.push_back(ggml_view_1d(ctx0, inp_kpool->new_pool_idxs, kpool*nc,
-                    i0*inp_kpool->new_pool_idxs->nb[1]));
+            // a single chunk is the whole input: reuse the shared view
+            inp_kpool->new_pool_idxs_chunks.push_back(nc == n_new ? inp_kpool->new_pool_flat :
+                    ggml_view_1d(ctx0, inp_kpool->new_pool_idxs, kpool*nc, i0*inp_kpool->new_pool_idxs->nb[1]));
         }
     }
     for (int64_t i0 = 0, ic = 0; i0 < n_new; i0 += n_new_chunk, ++ic) {
@@ -1027,10 +1032,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     // Live slots (visible pools, real tail cells) address disjoint cells. Each dead slot writes its own dump row
     // n_kv + slot, so the scatter indices of a token are unique: idx = dump + live*(idx - dump), live = exp(mask).
     GGML_ASSERT(inp_kpool->sel_mask->ne[0] == n_sel && inp_kpool->sel_mask->ne[3] == n_tokens);
-    if (!inp_kpool->gather_live) {
-        inp_kpool->gather_live = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
-    }
-    ggml_tensor * live  = inp_kpool->gather_live;
+    ggml_tensor * live  = ggml_exp(ctx0, inp_kpool->sel_mask_2d);
     ggml_tensor * dump  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
