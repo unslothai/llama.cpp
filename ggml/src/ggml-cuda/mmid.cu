@@ -407,7 +407,7 @@ static bool mm_ids_legacy_possible(const int n_tokens, const int n_expert_used) 
         n_tokens < (1 << 22) && n_expert_used < (1 << 10);
 }
 
-// GGML_CUDA_MM_IDS_SORT=0/1 forces the single-warp kernel/the counting sort, for testing
+// GGML_CUDA_MM_IDS_SORT=0/1 forces the single-warp kernel/the counting sort (cuBLAS fallback: the host/device sort), for testing
 static int mm_ids_sort_override() {
     static const int value = []() {
         const char * env = getenv("GGML_CUDA_MM_IDS_SORT");
@@ -416,7 +416,18 @@ static int mm_ids_sort_override() {
     return value;
 }
 
-// the counting sort needs 4 launches instead of 1, so use it only for large shapes or when the single-warp kernel cannot run
+// MMQ/MMF: one warp per expert scans all ids in the single-warp kernel, the counting sort costs 4 launches instead of 1.
+// Both scale with n_expert_used the same way and the experts run in parallel, so the crossover is in n_tokens:
+// measured at 256-512 tokens for 64-512 experts and 2-8 used on T4, L4 and RTX PRO 6000
+static bool mm_ids_counting_sort_faster(const int n_tokens) {
+    return n_tokens >= 512;
+}
+
+// cuBLAS fallback: the device counting sort against the host sort, which synchronizes on the ids and loops over all of them per expert
+static bool mm_ids_device_sort_faster(const int n_tokens, const int n_expert_used) {
+    return (int64_t) n_tokens*n_expert_used >= 64;
+}
+
 static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, const int n_expert_used) {
     // an empty batch would launch an empty grid, the single-warp kernel writes the zero bounds instead
     if (n_tokens == 0 || !mm_ids_counting_sort_possible(n_experts)) {
@@ -429,7 +440,7 @@ static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, co
     if (forced >= 0) {
         return forced != 0;
     }
-    return (int64_t) n_experts*n_tokens >= (1 << 16);
+    return mm_ids_counting_sort_faster(n_tokens);
 }
 
 static __global__ void mm_ids_invert(
@@ -461,9 +472,16 @@ void ggml_cuda_launch_mm_ids_invert(
 }
 
 // only the counting sort gives a complete permutation for repeated ids, the single-warp kernel leaves holes,
-// so the host sort keeps rejecting those for the shapes the counting sort is not used for
-bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
-    return mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
+// so the device sort of the cuBLAS fallback is always the counting sort, and the host sort keeps rejecting those otherwise
+bool ggml_cuda_mm_ids_device_sort_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
+    if (n_tokens == 0 || !mm_ids_counting_sort_possible(n_experts)) {
+        return false;
+    }
+    const int forced = mm_ids_sort_override();
+    if (forced >= 0) {
+        return forced != 0;
+    }
+    return mm_ids_device_sort_faster(n_tokens, n_expert_used);
 }
 
 #define MM_IDS_DISPATCH(neu)                                                                                                    \
@@ -480,8 +498,10 @@ bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, 
 void ggml_cuda_launch_mm_ids_helper(
         ggml_cuda_pool & pool,
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-    const bool counting_sort = mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream,
+        const bool complete) {
+    GGML_ASSERT(!complete || (n_tokens > 0 && mm_ids_counting_sort_possible(n_experts)));
+    const bool counting_sort = complete || mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
 
     switch (n_expert_used) {
         case  2: MM_IDS_DISPATCH( 2); break;

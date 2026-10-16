@@ -231,7 +231,12 @@ void ggml_cuda_mul_mat_q(
             int J_expert        = 0;
             int nthreads_expert = 0;
             pick_J(ncols_expert, J_expert, nthreads_expert);
-            if (J_expert > 0 &&
+
+            // for up to 16 tokens the expert tiles are at most 2x narrower than the dense ones: the compact tiling was
+            // measured slower there on Blackwell, and on T4/L4 for at most 1 column per 16 experts, keep the dense tiling
+            const bool compact_gain = !(ne12 <= 16 &&
+                ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL) || ne12*n_expert_used*16 <= ne02));
+            if (J_expert > 0 && compact_gain &&
                     mmq_moe_compact_ntx(ne12*n_expert_used, ne12, ne02, J_expert) > 0) {
                 J_best        = J_expert;
                 nthreads_best = nthreads_expert;
