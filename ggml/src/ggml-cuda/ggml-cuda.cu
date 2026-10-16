@@ -6108,16 +6108,31 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// host memory registered by ggml_backend_cuda_host_map (pinned)
-static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
-    for (const auto & [base, m] : ggml_cuda_host_mappings()) {
-        if ((const char *) ptr >= (const char *) base && (const char *) ptr + size <= (const char *) base + m.size) {
-            return true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+// host memory that device can read in stream order: registered by ggml_backend_cuda_host_map, or pinned by someone else (which
+// ggml_cuda_host_map maps without registering it), for that device or for all of them (portable)
+static bool ggml_cuda_host_is_mapped(int device, const void * ptr, size_t size) {
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+        for (const auto & [base, m] : ggml_cuda_host_mappings()) {
+            if ((const char *) ptr >= (const char *) base && (const char *) ptr + size <= (const char *) base + m.size) {
+                return true;
+            }
         }
     }
-    return false;
+    // both ends of the range in page-locked memory
+    for (const char * p : { (const char *) ptr, (const char *) ptr + (size > 0 ? size - 1 : 0) }) {
+        cudaPointerAttributes attr;
+        unsigned int flags = 0;
+        if (cudaPointerGetAttributes(&attr, p) != cudaSuccess || attr.type != cudaMemoryTypeHost ||
+            (attr.device != device && (cudaHostGetFlags(&flags, const_cast<char *>(p)) != cudaSuccess || !(flags & cudaHostAllocPortable)))) {
+            (void)cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
 }
+#endif
 
 // device copies of a copy-only instance (the scheduler copy queue): the kernel, except copy engines on compute capability 10.x where they measured faster (GGML_CUDA_COPY_QUEUE_KERNEL=0/1 overrides)
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
@@ -6186,7 +6201,7 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
             ((ggml_backend_cuda_buffer_context *) buf_src->context)->device == cuda_ctx->device;
         const bool src_host = buf_src != nullptr && !src_dev &&
             (ggml_backend_buft_is_cuda_host(ggml_backend_buffer_get_type(buf_src)) ||
-             (ggml_backend_buffer_is_host(buf_src) && ggml_cuda_host_is_mapped((const char *) r.src->data + r.src_offset, r.size)));
+             (ggml_backend_buffer_is_host(buf_src) && ggml_cuda_host_is_mapped(cuda_ctx->device, (const char *) r.src->data + r.src_offset, r.size)));
         if (!src_dev && !src_host) {
             return false;
         }
