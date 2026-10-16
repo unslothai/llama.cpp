@@ -489,7 +489,7 @@ static __global__ void mm_ids_invert(
         return;
     }
 
-    // repeated ids leave holes with garbage in ids_dst on the single-warp path: skip them, no OOB write
+    // out of range ids leave unwritten rows in ids_dst: skip them, no OOB write
     const int32_t id = ids_dst[ic];
     if (id < 0 || id >= n) {
         return;
@@ -509,8 +509,7 @@ void ggml_cuda_launch_mm_ids_invert(
     mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
 }
 
-// only the counting sort gives a complete permutation for repeated ids, the single-warp kernel leaves holes,
-// so the device sort of the cuBLAS fallback is always the counting sort, and the host sort keeps rejecting those otherwise
+// the device sort of the cuBLAS fallback always uses the counting sort (complete = true), it is only picked where that is faster
 bool ggml_cuda_mm_ids_device_sort_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
     if (n_tokens == 0 || !mm_ids_counting_sort_possible(n_experts)) {
         return false;
