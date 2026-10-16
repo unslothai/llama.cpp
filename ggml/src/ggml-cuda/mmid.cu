@@ -222,7 +222,7 @@ static __global__ void mm_ids_hist(
         const int itl = p / n_expert_used;
         const int iex = p - itl*n_expert_used;
         const int expert_used = ids[(size_t)(it0 + itl)*si1 + iex];
-        // skip out of range ids: expert_bounds[n_experts] then comes out short, which the caller checks
+        // skip out of range ids: expert_bounds[n_experts] then comes out short, which mm_ids_expert_prefix checks
         if (expert_used >= 0 && expert_used < n_experts) {
             atomicAdd(&counts[expert_used], 1);
         }
@@ -281,7 +281,8 @@ static __global__ void mm_ids_scan_rows(
 
 // Exclusive scan of the per-expert totals into expert_bounds. Single block.
 static __global__ void mm_ids_expert_prefix(
-        const int32_t * __restrict__ row_total, int32_t * __restrict__ expert_bounds, const int n_experts) {
+        const int32_t * __restrict__ row_total, int32_t * __restrict__ expert_bounds, const int n_experts,
+        const int64_t n_assignments) {
     __shared__ int32_t sdata[MM_IDS_SCAN_BLOCK];
     __shared__ int32_t carry;
 
@@ -318,6 +319,12 @@ static __global__ void mm_ids_expert_prefix(
     }
 
     if (threadIdx.x == 0) {
+        // the histogram skips out of range ids, and every consumer of the sort needs a complete permutation:
+        // stop here, as the host checks of the other paths do, instead of handing on unwritten entries
+        if (int64_t(carry) != n_assignments) {
+            printf("mm_ids: expert id out of range\n");
+            __trap();
+        }
         expert_bounds[n_experts] = carry;
     }
 }
@@ -424,7 +431,7 @@ static void launch_mm_ids_counting_sort(
     mm_ids_scan_rows<<<n_experts, MM_IDS_SCAN_BLOCK, 0, stream>>>(hist.ptr, row_total.ptr, W);
     CUDA_CHECK(cudaGetLastError());
 
-    mm_ids_expert_prefix<<<1, MM_IDS_SCAN_BLOCK, 0, stream>>>(row_total.ptr, expert_bounds, n_experts);
+    mm_ids_expert_prefix<<<1, MM_IDS_SCAN_BLOCK, 0, stream>>>(row_total.ptr, expert_bounds, n_experts, int64_t(n_tokens)*n_expert_used_var);
     CUDA_CHECK(cudaGetLastError());
 
     mm_ids_scatter<n_expert_used_template><<<W, warp_size, nbytes_shared, stream>>>
