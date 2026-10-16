@@ -103,6 +103,18 @@ class BeamModel(TextModel):
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        hp = self.hparams
+        # source-checkpoint facts the GGUF layout relies on (asserted here: the loader only sees the result)
+        if name.endswith(".self_attn.gate_proj.bias"):
+            assert tuple(data_torch.shape) == (hp["num_attention_heads"],), f"{name}: one gate bias per head expected, got {tuple(data_torch.shape)}"
+        elif name.endswith(".self_attn.gate_proj.weight"):
+            assert tuple(data_torch.shape) == (hp["num_attention_heads"] * hp["head_dim"], hp["hidden_size"]), f"{name}: {tuple(data_torch.shape)}"
+        elif name.endswith(".mlp.gate.e_score_correction.bias"):
+            assert tuple(data_torch.shape) == (hp["num_experts"],), f"{name}: {tuple(data_torch.shape)}"
+        elif name.endswith((".self_attn.q_norm.weight", ".self_attn.k_norm.weight")):
+            assert tuple(data_torch.shape) == (hp["head_dim"],), f"{name}: per-head q/k norm expected, got {tuple(data_torch.shape)}"
+        elif bid is not None and bid < self._n_dense_lead and ".mlp.experts." in name:
+            raise ValueError(f"Beam: expert tensor {name} in a dense layer")
         # The checkpoint stores routed experts unpacked: mlp.experts.{e}.{gate,up,down}_proj.weight.
         # Stack each projection as soon as all of its experts have arrived (the tensors are lazy, so
         # only references are held until the stacked tensor is written).
