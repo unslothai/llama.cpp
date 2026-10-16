@@ -65,6 +65,7 @@
       ]
     },
     "muse-spark": { "owner": "ggml-org#30616", "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
+    "beam": { "owner": "unslothai#0", "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": "ggml-org#30520",
       "checks": [
