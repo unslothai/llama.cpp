@@ -58,6 +58,13 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // fault in the pages of these ranges now, like MAP_POPULATE does for the whole file (Linux 5.14+, else a no-op)
+    // returns the number of bytes populated
+    size_t populate(const ranges & rs);
+
+    // the ranges widened to whole pages, clamped to [0, limit), sorted and merged
+    static ranges page_runs(ranges rs, size_t limit, size_t page_size);
+
     static const bool SUPPORTED;
 
 private:

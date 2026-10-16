@@ -528,6 +528,24 @@ struct llama_mmap::impl {
         mapped_fragments.emplace_back(0, file->size());
     }
 
+    size_t populate(const llama_mmap::ranges & rs) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+        size_t n = 0;
+        for (const auto & run : llama_mmap::page_runs(rs, size, sysconf(_SC_PAGESIZE))) {
+            if (madvise((char *) addr + run.first, run.second - run.first, MADV_POPULATE_READ)) {
+                // EINVAL before Linux 5.14: the pages fault in on demand instead
+                LLAMA_LOG_DEBUG("%s: madvise(.., MADV_POPULATE_READ) failed: %s\n", __func__, strerror(errno));
+                break;
+            }
+            n += run.second - run.first;
+        }
+        return n;
+#else
+        GGML_UNUSED(rs);
+        return 0;
+#endif
+    }
+
     static void align_range(size_t * first, size_t * last, size_t page_size) {
         size_t offset_in_page = *first & (page_size - 1);
         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
@@ -640,6 +658,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+        return 0;
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -670,6 +693,12 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -684,6 +713,31 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+size_t llama_mmap::populate(const ranges & rs) { return pimpl->populate(rs); }
+
+llama_mmap::ranges llama_mmap::page_runs(ranges rs, size_t limit, size_t page_size) {
+    rs.erase(std::remove_if(rs.begin(), rs.end(), [](const auto & r) { return r.first >= r.second; }), rs.end());
+    for (auto & r : rs) {
+        r.first  = r.first & ~(page_size - 1);
+        r.second = std::min((r.second + page_size - 1) & ~(page_size - 1), limit);
+    }
+    std::sort(rs.begin(), rs.end());
+
+    ranges res;
+    for (const auto & r : rs) {
+        if (r.first >= r.second) {
+            continue;
+        }
+        if (!res.empty() && r.first <= res.back().second) {
+            res.back().second = std::max(res.back().second, r.second);
+        } else {
+            res.push_back(r);
+        }
+    }
+
+    return res;
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
