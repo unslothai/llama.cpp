@@ -77,7 +77,7 @@ jobs:
           fi
           echo "base $BASE"
 
-          git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp.git scratch
+          git clone -q https://github.com/ggml-org/llama.cpp.git scratch
           cd scratch
           # GITHUB_TOKEN mirrors most pins, but GitHub refuses any ref that ADDS
           # a workflow file the repo does not already have. Observed on 08-03,
@@ -171,7 +171,7 @@ jobs:
             # 64 KiB pipe buffer, since a smaller one is written before `head`
             # ever closes it, which is why most conflicts got reported fine.
             HUNKS="$(git diff --diff-filter=U -U0 2>/dev/null | grep -E '^\+|^-' | grep -vE '^(\+\+\+|---)' | head -20 || true)"
-            git merge --abort 2>/dev/null
+            git merge --abort 2>/dev/null || true
             PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` (\`${SHA:0:10}\`) does not merge onto \`${BASE}\` + the pins before it.\n\n  Conflicting files:\n\n\`\`\`\n${FILES}\n\`\`\`\n\n  <details><summary>conflict hunks</summary>\n\n\`\`\`diff\n${HUNKS}\n\`\`\`\n\n  </details>\n"
             # Stop here, like resolve does. Probing later pins against a tree
             # missing this one reports conflicts that are consequences of it.
