@@ -2864,6 +2864,10 @@ static void ggml_backend_sched_prefetch_invalidate(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_splits; i++) {
         sched->splits[i].pf_async = false;
     }
+    // no copy is issued on the copy queues: the computation does not order them after the compute queues either
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->pf[b].n_async = 0;
+    }
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

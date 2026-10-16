@@ -699,6 +699,8 @@ struct mock_gpu {
     size_t used      = 0;
     size_t workspace = 0;
     int    n_pf_log  = 0; // staging arenas allocated
+    int    n_copy_wait = 0; // event waits of the copy queues (backends other than `compute`)
+    ggml_backend_t compute = nullptr;
     ggml_backend_buffer_type buft;
     ggml_backend_device      dev;
 };
@@ -754,7 +756,11 @@ static enum ggml_status mock_graph_compute(ggml_backend_t backend, ggml_cgraph *
 }
 
 static void mock_event_record(ggml_backend_t, ggml_backend_event_t) {}
-static void mock_event_wait(ggml_backend_t, ggml_backend_event_t) {}
+static void mock_event_wait(ggml_backend_t backend, ggml_backend_event_t) {
+    if (backend != mock.compute) {
+        mock.n_copy_wait++;
+    }
+}
 
 // the CPU backend can be a dynamically loaded module (GGML_BACKEND_DL), so resolve it through the registry
 static ggml_backend_t test_cpu_backend_init() {
@@ -826,7 +832,14 @@ enum mock_alloc {
 
 // two splits on the device with 1 MiB of host weights each: without prefetch the graph allocator reuses one 1 MiB copy,
 // the depth = 2 staging arena holds both copies. Returns the device memory used by the graph buffers and the staging arena.
-static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headroom, bool prefetch, mock_alloc mode, int * n_pf_log, int batch = 4) {
+static enum ggml_backend_sched_prefetch_mode mock_prefetch_async(const ggml_tensor *, const ggml_tensor *, ggml_cgraph *, void *) {
+    return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
+}
+
+// invalidate: after the first computation, change the prefetch callback (the copies of the allocated graph then go through the
+// regular path) and compute the allocated graph again, which must not use the copy queue
+static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headroom, bool prefetch, mock_alloc mode, int * n_pf_log, int batch = 4,
+        bool invalidate = false) {
     mock.total     = total;
     mock.used      = 0;
     mock.workspace = workspace;
@@ -853,6 +866,8 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     setenv("GGML_SCHED_PREFETCH", prefetch ? "2" : "0", 1);
 #endif
     ggml_backend_t gpu = mock_backend_init(&mock.dev, nullptr);
+    mock.compute     = gpu;
+    mock.n_copy_wait = 0;
     ggml_backend_t cpu = test_cpu_backend_init();
     ggml_backend_t backends[2] = { gpu, cpu };
     ggml_backend_buffer_type_t bufts[2] = { &mock.buft, ggml_backend_cpu_buffer_type() };
@@ -928,6 +943,25 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
         GGML_ASSERT(ov[i] == 2.0f*xv[i]);
     }
 
+    if (invalidate) {
+        GGML_ASSERT(mock.n_copy_wait > 0); // the copies were made on the copy queue
+        ggml_backend_sched_set_prefetch_callback(sched, mock_prefetch_async, nullptr);
+        mock.n_copy_wait = 0;
+        for (size_t i = 0; i < xv.size(); i++) {
+            xv[i] = 3.0f*(float) i;
+        }
+        ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out, ov.data(), 0, ggml_nbytes(out));
+        for (size_t i = 0; i < ov.size(); i++) {
+            GGML_ASSERT(ov[i] == 2.0f*xv[i]);
+        }
+        if (mock.n_copy_wait != 0) {
+            fprintf(stderr, "\n%s: %d copy queue waits after the prefetch was invalidated\n", __func__, mock.n_copy_wait);
+        }
+        GGML_ASSERT(mock.n_copy_wait == 0);
+    }
+
     *n_pf_log = mock.n_pf_log;
     ggml_free(ctx);
     ggml_backend_sched_free(sched);
@@ -935,6 +969,7 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     ggml_free(wctx);
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);
+    mock.compute = nullptr;
 #if defined(_WIN32)
     _putenv_s("GGML_SCHED_PREFETCH", "");
 #else
@@ -978,6 +1013,10 @@ static void test_prefetch_headroom() {
     // 6 MiB device, 3.5 MiB workspace: the reserve of a small batch leaves it next to the arena, the graph buffers of a 256 batch do not
     const size_t used_big = run_prefetch_headroom(6*MiB, 3*MiB + MiB/2, 3*MiB + MiB/2, false, MOCK_ALLOC_RESERVE_SMALL, &n_pf_log, 256);
     GGML_ASSERT(run_prefetch_headroom(6*MiB, 3*MiB + MiB/2, 3*MiB + MiB/2, true, MOCK_ALLOC_RESERVE_SMALL, &n_pf_log, 256) == used_big);
+    GGML_ASSERT(n_pf_log == 1);
+
+    // a new prefetch callback invalidates the copies of the allocated graph: computing it again uses no copy queue
+    run_prefetch_headroom(64*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, true, MOCK_ALLOC_DIRECT, &n_pf_log, 4, true);
     GGML_ASSERT(n_pf_log == 1);
 
     ggml_log_set(mock_prev_log, prev_user_data);
