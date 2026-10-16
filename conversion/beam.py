@@ -11,13 +11,12 @@ from .base import ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("BeamForCausalLM")
-@ModelBase.example("reflection/Beam-1.0-501B-A23B")
 class BeamModel(TextModel):
-    """Reflection Beam (model_type "beam").
+    """Sparse MoE text model (model_type "beam").
 
     - interleaved sliding-window attention from `layer_types`; RoPE only on sliding layers,
       full-attention layers are NoPE with a position-dependent query scale
-      (1 + (pos + 1) / 2048) ** 0.1 (reference: compute_attention_scaling in modeling_beam.py)
+      (1 + (pos + 1) / 2048) ** 0.1 (as in the reference implementation)
     - per-head q/k RMSNorm, attention output gate o * sigmoid(gate_proj(x) + gate_bias[head])
     - sandwich norms and a depth-scaled residual (applied in the graph, weights are stored as-is)
     - leading dense SwiGLU layers, then DeepSeek-V3 style grouped sigmoid routing

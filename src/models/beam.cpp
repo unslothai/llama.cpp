@@ -1,6 +1,6 @@
 #include "models.h"
 
-// Reflection Beam (BeamForCausalLM)
+// Sparse MoE text model with iSWA and NoPE full-attention layers
 //
 // - interleaved sliding-window attention (pattern from layer_types); RoPE (NeoX) only on the sliding layers
 // - full-attention layers are NoPE; their queries are scaled by (1 + (pos + 1) / 2048) ^ 0.1 after the q norm
@@ -58,7 +58,7 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     hparams.attn_temp_pow           = true;
 
     switch (hparams.n_layer()) {
-        case 52: type = LLM_TYPE_UNKNOWN; break; // Beam-1.0-501B-A23B
+        case 52: type = LLM_TYPE_UNKNOWN; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
 }
