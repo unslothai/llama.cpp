@@ -14,6 +14,10 @@
 #include <future>
 #include <regex>
 
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1407,7 +1411,79 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+#ifdef __linux__
+// bytes that can be populated without pushing the system into reclaim: MemAvailable minus max(2 GiB, MemTotal/16), 0 if unknown
+static size_t llama_populate_budget() {
+    size_t avail = 0;
+    size_t total = 0;
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long kb = 0;
+            if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+                total = kb*kiB;
+            } else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                avail = kb*kiB;
+            }
+        }
+        fclose(f);
+    }
+    const size_t headroom = std::max(2*GiB, total/16);
+    return avail > headroom ? avail - headroom : 0;
+}
+#endif
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // a file with lazy ranges is mapped without MAP_POPULATE, so populate the tensors that are read from the mapping instead:
+    // not the lazy ones, nor the ones that were never created (TENSOR_SKIP, e.g. MTP without a drafter, or another model's)
+    // all or nothing per file, within the available RAM, else the pages fault in on demand as without MAP_POPULATE
+#ifdef __linux__
+    const char * populate_env = getenv("LLAMA_MMAP_POPULATE");
+    const bool populate_enabled = !populate_env || strcmp(populate_env, "0") != 0;
+    size_t populate_left = 0;
+    bool   populate_init = false;
+    const char * func = __func__;
+
+    auto populate = [&](uint32_t idx, llama_mmap & mapping) {
+        if (!populate_enabled) {
+            LLAMA_LOG_INFO("%s: file %u: not populating, LLAMA_MMAP_POPULATE=0\n", func, idx);
+            return;
+        }
+        llama_mmap::ranges rs;
+        for (const auto & [key, ctx] : ctx_map) {
+            if (key.lazy) {
+                continue;
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                const auto * w = get_weight(ggml_get_name(t));
+                if (w && w->idx == idx && !lazy.has(t)) {
+                    rs.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+                }
+            }
+        }
+        rs = llama_mmap::page_runs(std::move(rs), mapping.size(), sysconf(_SC_PAGESIZE));
+        size_t need = 0;
+        for (const auto & r : rs) {
+            need += r.second - r.first;
+        }
+        if (!populate_init) {
+            populate_left = llama_populate_budget();
+            populate_init = true;
+        }
+        if (need > populate_left) {
+            LLAMA_LOG_INFO("%s: file %u: not populating %.2f MiB of tensor data, over the RAM budget of %.2f MiB\n",
+                    func, idx, need/1024.0/1024.0, populate_left/1024.0/1024.0);
+            return;
+        }
+        const int64_t t_start_us = ggml_time_us();
+        const size_t done = mapping.populate(rs);
+        populate_left -= done;
+        LLAMA_LOG_INFO("%s: file %u: populated %.2f MiB of %.2f MiB tensor data in %zu runs (%.2f MiB file), %.0f ms\n",
+                func, idx, done/1024.0/1024.0, need/1024.0/1024.0, rs.size(), mapping.size()/1024.0/1024.0,
+                (ggml_time_us() - t_start_us)/1000.0);
+    };
+#endif
+
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1430,6 +1506,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
+#ifdef __linux__
+            if (prefetch_size > 0 && !is_numa && !no_alloc && !lazy.for_file(idx).empty()) {
+                populate(idx, *mapping);
+            }
+#endif
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
