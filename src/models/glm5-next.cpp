@@ -277,6 +277,10 @@ public:
     ggml_tensor * new_pool_flat = nullptr; // I32     [kpool*n_new]    view of new_pool_idxs, shared by the layers
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
 
+    // Chunks of new_pool_flat for the chunked re-pooling, built once per graph: the scheduler copies every
+    // view of a host input to the device on its own, so a per-layer view of an input costs a copy per layer.
+    std::vector<ggml_tensor *> new_pool_idxs_chunks;
+
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
     uint32_t n_new = 0;
@@ -922,21 +926,39 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_kv = mctx_lid->get_n_kv();
 
     // Pool the entries completed by this ubatch. The last one is a dummy when the ubatch completes none.
-    ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_flat);
-    rows = ggml_reshape_3d(ctx0, rows, 2*n_embd_indexer, kpool, n_new);
+    // Chunked: re-pooling every pool (the full-context reserve, or a shared cache) would otherwise hold
+    // several f32 [head_dim, kpool] copies per pool at once, GiBs at long contexts.
+    const int64_t n_new_chunk = 16384;
+    ggml_tensor * pooled_new = nullptr;
+    if (inp_kpool->new_pool_idxs_chunks.empty()) {
+        for (int64_t i0 = 0; i0 < n_new; i0 += n_new_chunk) {
+            const int64_t nc = std::min(n_new_chunk, n_new - i0);
+            // a single chunk is the whole input: reuse the shared view
+            inp_kpool->new_pool_idxs_chunks.push_back(nc == n_new ? inp_kpool->new_pool_flat :
+                    ggml_view_1d(ctx0, inp_kpool->new_pool_idxs, kpool*nc, i0*inp_kpool->new_pool_idxs->nb[1]));
+        }
+    }
+    for (int64_t i0 = 0, ic = 0; i0 < n_new; i0 += n_new_chunk, ++ic) {
+        const int64_t nc = std::min(n_new_chunk, n_new - i0);
 
-    ggml_tensor * pk = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, n_new, rows->nb[1], rows->nb[2], 0);
-    ggml_tensor * pg = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, n_new, rows->nb[1], rows->nb[2], ggml_row_size(rows->type, n_embd_indexer));
+        ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_idxs_chunks[ic]);
+        rows = ggml_reshape_3d(ctx0, rows, 2*n_embd_indexer, kpool, nc);
 
-    ggml_tensor * logits = ggml_add(ctx0, pg, layer.indexer_kpool_ape);
-    logits = ggml_cont(ctx0, ggml_permute(ctx0, logits, 1, 0, 2, 3)); // [kpool, head_dim, n_new]
-    // fold the pool axis into rows, soft_max maps ne[2] to CUDA gridDim.y which caps at 65535
-    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, logits, kpool, n_embd_indexer*n_new));
-    probs = ggml_reshape_3d(ctx0, probs, kpool, n_embd_indexer, n_new);
+        ggml_tensor * pk = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, nc, rows->nb[1], rows->nb[2], 0);
+        ggml_tensor * pg = ggml_view_3d(ctx0, rows, n_embd_indexer, kpool, nc, rows->nb[1], rows->nb[2], ggml_row_size(rows->type, n_embd_indexer));
 
-    pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
-    ggml_tensor * pooled_new = ggml_sum_rows(ctx0, ggml_mul(ctx0, probs, pk)); // [1, head_dim, n_new]
-    pooled_new = ggml_reshape_2d(ctx0, pooled_new, n_embd_indexer, n_new);
+        ggml_tensor * logits = ggml_add(ctx0, pg, layer.indexer_kpool_ape);
+        logits = ggml_cont(ctx0, ggml_permute(ctx0, logits, 1, 0, 2, 3)); // [kpool, head_dim, nc]
+        // fold the pool axis into rows, soft_max maps ne[2] to CUDA gridDim.y which caps at 65535
+        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, logits, kpool, n_embd_indexer*nc));
+        probs = ggml_reshape_3d(ctx0, probs, kpool, n_embd_indexer, nc);
+
+        pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
+        ggml_tensor * chunk = ggml_sum_rows(ctx0, ggml_mul(ctx0, probs, pk)); // [1, head_dim, nc]
+        chunk = ggml_reshape_2d(ctx0, chunk, n_embd_indexer, nc);
+
+        pooled_new = pooled_new ? ggml_concat(ctx0, pooled_new, chunk, 1) : chunk;
+    }
     cb(pooled_new, "indexer_pool_k_new", il);
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
