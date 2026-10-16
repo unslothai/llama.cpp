@@ -239,7 +239,8 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_temp::can_reuse(const llm_graph_params & params) {
-    return attn_scale != nullptr && attn_scale->ne[2] == params.ubatch.n_tokens;
+    // only the power form opts in, so the log-form users keep upstream's no-reuse default
+    return attn_temp_pow && attn_scale != nullptr && attn_scale->ne[2] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
