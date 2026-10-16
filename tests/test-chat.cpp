@@ -6914,6 +6914,650 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Harmony with XML tool-call bodies: <|start|>assistant to=NAME ... <|constrain|>xml, rfl:parameter arguments
+    {
+        auto tst = peg_tester("models/templates/harmony-xml.jinja", detailed_debug);
+
+        static common_chat_tool weather_days_tool{
+            /* .name = */ "get_weather",
+            /* .description = */ "Get the weather",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" },
+                    "days": { "type": "integer" }
+                },
+                "required": ["city"]
+            })",
+        };
+
+        // Final channel, reasoning + content
+        tst.test("<|channel|>final<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's "
+               "up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Reasoning kept in content when not extracted
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<|channel|>analysis<|message|>I'm\nthinking<|end|>Hello")
+            .run();
+
+        // No channel header: returned as content
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+        tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).run();
+
+        // HTML end tags in an answer are text, not end of generation
+        tst.test("<|channel|>final<|message|>a <s>b</s> c").expect_content("a <s>b</s> c").run();
+
+        // Partial reasoning
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect_reasoning("I'm\nthinking")
+            .run();
+
+        // Final answer with tools available
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's "
+               "up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Reasoning + single call, integer argument typed from the schema
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+               "<|start|>assistant to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .expect_rules({ "tool-0" })
+            .run();
+
+        // Final answer closed by <|return|>
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?<|return|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_thoughts)
+            .run();
+
+        // A call closed by another end-of-generation token instead of <|call|>
+        tst.test(
+               " to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|return|>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+        tst.test(
+               " to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|endoftext|>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Reasoning ended by an end-of-generation token
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|return|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .run();
+
+        // Call without a reasoning block
+        tst.test(
+               " to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|call|>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // String values are kept verbatim, including inner newlines and markup-like text
+        tst.test(
+               "<|channel|>analysis<|message|>Let me check.<|end|>"
+               "<|start|>assistant to=magic<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"name\">\nline one\n  line \"two\" <b>\n</rfl:parameter>\n"
+               "<rfl:parameter name=\"ref\">\n5123123\n</rfl:parameter><|call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ magic_tool })
+            .expect_reasoning("Let me check.")
+            .expect_tool_calls({
+                { "magic", R"({"name": "line one\n  line \"two\" <b>", "ref": "5123123"})", {} },
+            })
+            .run();
+
+        // Two parallel calls separated by <|end|>; the second is missing a closing tag
+        tst.test(
+               "<|channel|>analysis<|message|>I will check both cities.<|end|>"
+               "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"city\">\nParis\n</rfl:parameter>\n"
+               "<rfl:parameter name=\"days\">\n3\n</rfl:parameter><|end|>"
+               "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"city\">\nNew York\n"
+               "<rfl:parameter name=\"days\">\n3\n</rfl:parameter><|call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ weather_days_tool })
+            .parallel_tool_calls(true)
+            .expect_reasoning("I will check both cities.")
+            .expect_tool_calls({
+                { "get_weather", R"({"city": "Paris", "days": 3})", {} },
+                { "get_weather", R"({"city": "New York", "days": 3})", {} },
+            })
+            .run();
+
+        // Two different tools in parallel, optional argument omitted
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+               "<|start|>assistant to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|end|>"
+               "<|start|>assistant to=special_function_with_opt<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter>\n"
+               "<rfl:parameter name=\"arg2\">\n2\n</rfl:parameter><|call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .parallel_tool_calls(true)
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        // Tool choice required (eager grammar)
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+               "<|start|>assistant to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter><|call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        // Typed arguments: number, boolean, array, object, nullable string
+        tst.test(
+               " to=amount<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"orig\">\n12.5\n</rfl:parameter><|call|>")
+            .tools({ amount_tool })
+            .expect_tool_calls({ { "amount", R"({"orig": 12.5})", {} } })
+            .run();
+        tst.test(
+               " to=todo_list<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"todos\">\n[\"a\", \"b\"]\n</rfl:parameter><|call|>")
+            .tools({ todo_list })
+            .expect_tool_calls({ { "todo_list", R"({"todos": ["a", "b"]})", {} } })
+            .run();
+        tst.test(
+               " to=set_config<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"config\">\n{\"key\": \"v\", \"n\": 2}\n</rfl:parameter><|call|>")
+            .tools({ config_tool })
+            .expect_tool_calls({ { "set_config", R"({"config": {"key": "v", "n": 2}})", {} } })
+            .run();
+
+        // Typed value without its closing tag, a blank line, then the end of the call (as the grammar allows)
+        tst.test(
+               " to=toggle<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"enabled\">\nfalse\n\n<|call|>")
+            .tools({ toggle_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_tool_calls({ { "toggle", R"({"enabled": false})", {} } })
+            .run();
+
+        // Parallel calls without <|end|> between them
+        tst.test(
+               " to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n1\n</rfl:parameter>"
+               "<|start|>assistant to=special_function<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"arg1\">\n2\n</rfl:parameter><|call|>")
+            .tools({ special_function_tool })
+            .parallel_tool_calls(true)
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function", R"({"arg1": 2})", {} },
+            })
+            .run();
+
+        // Tool without declared parameters
+        tst.test(
+               " to=empty_args<|channel|>analysis <|constrain|>xml<|message|><|call|>")
+            .tools({ empty_args_tool })
+            .expect_tool_calls({ { "empty_args", "{}", {} } })
+            .run();
+
+        // Partial call while streaming the first argument
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+               "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"city\">\nPar")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .is_partial(true)
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({ { "get_weather", R"({"city": "Par)", {} } })
+            .run();
+
+        // Unsolicited call without tools is consumed, not a parse error
+        tst.test(
+               "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+               "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
+               "<rfl:parameter name=\"command\">\nls\n</rfl:parameter>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("I'm\nthinking")
+            .run();
+
+        // Structured output
+        tst.test(
+               "<|channel|>analysis<|message|>I need to output the invoice details in JSON<|end|>"
+               "<|start|>assistant<|channel|>final<|message|>"
+               R"({"amount": 123.45, "date": "2025-12-03"})" "<|return|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+    }
+
+    // Reference-parser corpus
+    {
+        static common_chat_tool hx_tool_get_weather{ R"~~(get_weather)~~", R"~~(get_weather tool)~~", R"~~({"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]})~~" };
+        static common_chat_tool hx_tool_search_docs{ R"~~(search.docs)~~", R"~~(search.docs tool)~~", R"~~({"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}}, "required": ["query"]})~~" };
+        static common_chat_tool hx_tool_get_time{ R"~~(get_time)~~", R"~~(get_time tool)~~", R"~~({"type": "object", "properties": {}, "required": []})~~" };
+        static common_chat_tool hx_tool_python{ R"~~(python)~~", R"~~(python tool)~~", R"~~({"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]})~~" };
+        static common_chat_tool hx_tool_write_file{ R"~~(write_file)~~", R"~~(write_file tool)~~", R"~~({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]})~~" };
+        static common_chat_tool hx_tool_set_config{ R"~~(set_config)~~", R"~~(set_config tool)~~", R"~~({"type": "object", "properties": {"enabled": {"type": "boolean"}, "ratio": {"type": "number"}, "count": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}, "opts": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "string"}}}, "mode": {"type": "string", "enum": ["fast", "slow"]}, "limit": {"type": ["integer", "string"]}}, "required": ["enabled"]})~~" };
+        static common_chat_tool hx_tool_my_tool_v2_x{ R"~~(my_tool-v2_x)~~", R"~~(my_tool-v2_x tool)~~", R"~~({"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]})~~" };
+        auto tst = peg_tester("models/templates/harmony-xml.jinja", detailed_debug);
+        // single_call
+        tst.test(R"~~(<|channel|>analysis<|message|>Look it up.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter>
+<rfl:parameter name="days">
+3
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Look it up.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Paris", "days": 3})~~", {} } })
+            .run();
+        // single_call_no_thinking
+        tst.test(R"~~(<|channel|>analysis<|message|><|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~()~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Paris"})~~", {} } })
+            .run();
+        // parallel_2
+        tst.test(R"~~(<|channel|>analysis<|message|>Both cities.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter>
+<rfl:parameter name="days">
+3
+</rfl:parameter><|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+New York
+</rfl:parameter>
+<rfl:parameter name="days">
+1
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Both cities.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Paris", "days": 3})~~", {} }, { R"~~(get_weather)~~", R"~~({"city": "New York", "days": 1})~~", {} } })
+            .run();
+        // parallel_3_mixed
+        tst.test(R"~~(<|channel|>analysis<|message|>Three things.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Tokyo
+</rfl:parameter><|end|><|start|>assistant to=search.docs<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="query">
+rope scaling
+</rfl:parameter>
+<rfl:parameter name="top_k">
+5
+</rfl:parameter><|end|><|start|>assistant to=get_time<|channel|>analysis <|constrain|>xml<|message|><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather, hx_tool_search_docs, hx_tool_get_time })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Three things.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Tokyo"})~~", {} }, { R"~~(search.docs)~~", R"~~({"query": "rope scaling", "top_k": 5})~~", {} }, { R"~~(get_time)~~", R"~~({})~~", {} } })
+            .run();
+        // multiline_code
+        tst.test(R"~~(<|channel|>analysis<|message|>Run code.<|end|><|start|>assistant to=python<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="code">
+def f(x):
+    if x < 3 and x > 0:
+        return "a" + 'b'
+    return {"k": [1, 2]}
+
+print(f(1))
+
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_python })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Run code.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(python)~~", R"~~({"code": "def f(x):\n    if x < 3 and x > 0:\n        return \"a\" + 'b'\n    return {\"k\": [1, 2]}\n\nprint(f(1))\n"})~~", {} } })
+            .run();
+        // string_with_markup
+        tst.test(R"~~(<|channel|>analysis<|message|>Write it.<|end|><|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="path">
+/tmp/a b/<x>.html
+</rfl:parameter>
+<rfl:parameter name="content">
+<html><body a="1">
+  <p>5 < 6 & "q" 'r'</p>
+  <rfl:note>not a param</rfl:note>
+</body></html>
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_write_file })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Write it.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(write_file)~~", R"~~({"path": "/tmp/a b/<x>.html", "content": "<html><body a=\"1\">\n  <p>5 < 6 & \"q\" 'r'</p>\n  <rfl:note>not a param</rfl:note>\n</body></html>"})~~", {} } })
+            .run();
+        // string_json_like
+        tst.test(R"~~(<|channel|>analysis<|message|>Save JSON.<|end|><|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="path">
+cfg.json
+</rfl:parameter>
+<rfl:parameter name="content">
+{"a": 1, "b": [true, null]}
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_write_file })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Save JSON.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(write_file)~~", R"~~({"path": "cfg.json", "content": "{\"a\": 1, \"b\": [true, null]}"})~~", {} } })
+            .run();
+        // string_numeric_like
+        tst.test(R"~~(<|channel|>analysis<|message|><|end|><|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="path">
+123
+</rfl:parameter>
+<rfl:parameter name="content">
+true
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_write_file })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~()~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(write_file)~~", R"~~({"path": "123", "content": "true"})~~", {} } })
+            .run();
+        // string_leading_trailing_ws
+        tst.test(R"~~(<|channel|>analysis<|message|>ws<|end|><|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="path">
+ x 
+</rfl:parameter>
+<rfl:parameter name="content">
+
+
+indented
+
+
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_write_file })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(ws)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(write_file)~~", R"~~({"path": " x ", "content": "\n\nindented\n\n"})~~", {} } })
+            .run();
+        // typed_args
+        tst.test(R"~~(<|channel|>analysis<|message|>Configure.<|end|><|start|>assistant to=set_config<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="enabled">
+true
+</rfl:parameter>
+<rfl:parameter name="ratio">
+0.25
+</rfl:parameter>
+<rfl:parameter name="count">
+7
+</rfl:parameter>
+<rfl:parameter name="tags">
+["x", "y z"]
+</rfl:parameter>
+<rfl:parameter name="opts">
+{"a": 1, "b": "two"}
+</rfl:parameter>
+<rfl:parameter name="mode">
+fast
+</rfl:parameter>
+<rfl:parameter name="limit">
+10
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_set_config })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Configure.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(set_config)~~", R"~~({"enabled": true, "ratio": 0.25, "count": 7, "tags": ["x", "y z"], "opts": {"a": 1, "b": "two"}, "mode": "fast", "limit": 10})~~", {} } })
+            .run();
+        // typed_args_false_neg_float_int
+        tst.test(R"~~(<|channel|>analysis<|message|>Edge numbers.<|end|><|start|>assistant to=set_config<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="enabled">
+false
+</rfl:parameter>
+<rfl:parameter name="ratio">
+-0.0015
+</rfl:parameter>
+<rfl:parameter name="count">
+-2
+</rfl:parameter>
+<rfl:parameter name="tags">
+[]
+</rfl:parameter>
+<rfl:parameter name="opts">
+{}
+</rfl:parameter>
+<rfl:parameter name="limit">
+unbounded
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_set_config })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Edge numbers.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(set_config)~~", R"~~({"enabled": false, "ratio": -0.0015, "count": -2, "tags": [], "opts": {}, "limit": "unbounded"})~~", {} } })
+            .run();
+        // typed_number_integral
+        tst.test(R"~~(<|channel|>analysis<|message|>n<|end|><|start|>assistant to=set_config<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="enabled">
+true
+</rfl:parameter>
+<rfl:parameter name="ratio">
+2
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_set_config })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(n)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(set_config)~~", R"~~({"enabled": true, "ratio": 2})~~", {} } })
+            .run();
+        // empty_params
+        tst.test(R"~~(<|channel|>analysis<|message|>Time.<|end|><|start|>assistant to=get_time<|channel|>analysis <|constrain|>xml<|message|><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_time })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Time.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_time)~~", R"~~({})~~", {} } })
+            .run();
+        // dotted_name
+        tst.test(R"~~(<|channel|>analysis<|message|>Search.<|end|><|start|>assistant to=search.docs<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="query">
+a.b c
+</rfl:parameter>
+<rfl:parameter name="top_k">
+2
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_search_docs })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Search.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(search.docs)~~", R"~~({"query": "a.b c", "top_k": 2})~~", {} } })
+            .run();
+        // dash_underscore_name
+        tst.test(R"~~(<|channel|>analysis<|message|>Use v2.<|end|><|start|>assistant to=my_tool-v2_x<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="x">
+y
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_my_tool_v2_x })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Use v2.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(my_tool-v2_x)~~", R"~~({"x": "y"})~~", {} } })
+            .run();
+        // unicode_values
+        tst.test(R"~~(<|channel|>analysis<|message|>Unicode é中<|end|><|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="path">
+文件.txt
+</rfl:parameter>
+<rfl:parameter name="content">
+café — 😀
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_write_file })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Unicode é中)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(write_file)~~", R"~~({"path": "文件.txt", "content": "café — 😀"})~~", {} } })
+            .run();
+        // content_with_reasoning
+        tst.test(R"~~(<|channel|>analysis<|message|>Simple answer.<|end|><|start|>assistant<|channel|>final<|message|>Hello!
+How can I help?<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Simple answer.)~~")
+            .expect_content(R"~~(Hello!
+How can I help?)~~")
+            .run();
+        // content_no_tools
+        tst.test(R"~~(<|channel|>analysis<|message|>Greeting.<|end|><|start|>assistant<|channel|>final<|message|>Hi there.<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning(R"~~(Greeting.)~~")
+            .expect_content(R"~~(Hi there.)~~")
+            .run();
+        // content_empty_reasoning
+        tst.test(R"~~(<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>Just content.<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning(R"~~()~~")
+            .expect_content(R"~~(Just content.)~~")
+            .run();
+        // final_after_tool_result_by_id
+        tst.test(R"~~(<|channel|>analysis<|message|>The tool says sunny.<|end|><|start|>assistant<|channel|>final<|message|>It is sunny in Paris (21 C).<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(The tool says sunny.)~~")
+            .expect_content(R"~~(It is sunny in Paris (21 C).)~~")
+            .run();
+        // final_after_tool_result_by_name
+        tst.test(R"~~(<|channel|>analysis<|message|>Rain.<|end|><|start|>assistant<|channel|>final<|message|>Bring an umbrella.<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Rain.)~~")
+            .expect_content(R"~~(Bring an umbrella.)~~")
+            .run();
+        // call_after_tool_result
+        tst.test(R"~~(<|channel|>analysis<|message|>Now Rome.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Rome
+</rfl:parameter>
+<rfl:parameter name="days">
+2
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Now Rome.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Rome", "days": 2})~~", {} } })
+            .run();
+        // missing_close_tag
+        tst.test(R"~~(<|channel|>analysis<|message|>I will check both cities.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter>
+<rfl:parameter name="days">
+3
+</rfl:parameter><|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+New York
+<rfl:parameter name="days">
+3
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(I will check both cities.)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Paris", "days": 3})~~", {} }, { R"~~(get_weather)~~", R"~~({"city": "New York", "days": 3})~~", {} } })
+            .run();
+        // missing_close_tag_last_param (kept, unlike the HF parser which drops a last value that runs into <|call|>)
+        tst.test(R"~~(<|channel|>analysis<|message|>x<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter>
+<rfl:parameter name="days">
+4
+<|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(x)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Paris", "days": 4})~~", {} } })
+            .run();
+        // direct_call_no_analysis
+        tst.test(R"~~( to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Oslo
+</rfl:parameter><|call|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~()~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Oslo"})~~", {} } })
+            .run();
+        // content_only_no_analysis
+        tst.test(R"~~(<|channel|>final<|message|>Hello, world!
+What's up?<|return|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning(R"~~()~~")
+            .expect_content(R"~~(Hello, world!
+What's up?)~~")
+            .run();
+        // content_terminated_by_end
+        tst.test(R"~~(<|channel|>analysis<|message|>t<|end|><|start|>assistant<|channel|>final<|message|>Done.<|end|>)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning(R"~~(t)~~")
+            .expect_content(R"~~(Done.)~~")
+            .run();
+        // reasoning_only_truncated
+        tst.test(R"~~(<|channel|>analysis<|message|>Still thinking about)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .expect_reasoning(R"~~(Still thinking about)~~")
+            .expect_content(R"~~()~~")
+            .run();
+        // call_truncated_mid_value (no end-of-generation token: the call stays open)
+        tst.test(R"~~(<|channel|>analysis<|message|>go<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Par)~~")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ hx_tool_get_weather })
+            .parallel_tool_calls(true)
+            .is_partial(true)
+            .expect_reasoning(R"~~(go)~~")
+            .expect_content(R"~~()~~")
+            .expect_tool_calls({ { R"~~(get_weather)~~", R"~~({"city": "Par)~~", {} } })
+            .run();
+    }
+
     {
         auto tst = peg_tester("models/templates/StepFun3.5-Flash.jinja", detailed_debug);
 
