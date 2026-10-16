@@ -137,7 +137,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_MAION_CODER) {
         n_head = 4;
-        n_layer = 4;
+        n_layer = 4; // dense and MoE layers, each with local and full attention
     } else if (arch == LLM_ARCH_GEMMA4) {
         n_embd = 128;
         n_head = 2;
@@ -186,7 +186,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER) {
-        n_head_kv = 2;
+        n_head_kv = 2; // GQA coverage
     }
     if (arch == LLM_ARCH_BEAM) {
         n_head    = 4;
