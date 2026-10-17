@@ -159,7 +159,7 @@ class DeepseekV41Model(DeepseekV4Model):
     separate GGUF with --mtp. The vision tower is not converted yet.
 
     Environment overrides:
-      DSV41_DENSE_TYPE   bf16 (default, lossless) | q8_0  for the dequantised FP8 linears
+      DSV41_DENSE_TYPE   bf16 | q8_0 for the 2D dense tensors (default: q8_0 with --outtype q8_0, else bf16)
       DSV41_ENGRAM_TYPE  mxfp8 (default, lossless) | bf16 (lossless, 2x larger) | f32
     """
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
@@ -171,7 +171,9 @@ class DeepseekV41Model(DeepseekV4Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         hp = self.hparams
-        self._dense_type = os.environ.get("DSV41_DENSE_TYPE", "bf16").lower()
+        # dense (non-expert, non-Engram) linears follow --outtype: bf16 is lossless, q8_0 is the B2 Q8_0 companion
+        default_dense = "q8_0" if self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0 else "bf16"
+        self._dense_type = os.environ.get("DSV41_DENSE_TYPE", default_dense).lower()
         self._engram_type = os.environ.get("DSV41_ENGRAM_TYPE", "mxfp8").lower()
         if self._dense_type not in ("bf16", "q8_0"):
             raise ValueError(f"DSV41_DENSE_TYPE={self._dense_type!r}")
@@ -531,13 +533,14 @@ class DeepseekV41Model(DeepseekV4Model):
         return [(new_name, data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        if new_name.endswith(".engram_gate.weight") or new_name == "conf_proj.weight":
+        # router, engram gate and confidence head stay F32 (exact from bf16; verify_types.py pins the router to F32)
+        if new_name.endswith((".engram_gate.weight", ".ffn_gate_inp.weight")) or new_name == "conf_proj.weight":
             return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0 if self._dense_type == "q8_0" else gguf.GGMLQuantizationType.BF16
         if name in self._dsv4_f32_tensors:
             return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_bf16_tensors and n_dims >= 2:
-            return gguf.GGMLQuantizationType.BF16
+            return gguf.GGMLQuantizationType.Q8_0 if self._dense_type == "q8_0" else gguf.GGMLQuantizationType.BF16
         return False
 
