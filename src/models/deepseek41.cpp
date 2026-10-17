@@ -358,6 +358,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids; // per engram layer: I32 [n_cols*n_tokens]
+    ggml_tensor * engram_keep = nullptr;    // F32 [1, 1, n_tokens], 0 for embedding (image) tokens; only in embd ubatches
     ggml_tensor * cand_pin = nullptr;       // F32 [n_blk, n_tokens/n_stream, 1, n_stream]
     bool cand_csa = false;                  // candidate source reads the CSA (ratio 2) slot, else HCA (ratio 1)
 
@@ -367,6 +368,7 @@ public:
     std::vector<llama_token> prev;
     std::vector<int32_t> ids;
     std::vector<float> pin;
+    std::vector<float> keep;
 
 private:
     const llama_kv_cache_dsv4_context::comp_plan & cand_plan(const llama_ubatch & ubatch) const {
@@ -388,6 +390,16 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             model.engram_hash((int) e, *ubatch, prev, ids);
             ggml_backend_tensor_set(engram_ids[e], ids.data(), 0, ids.size()*sizeof(int32_t));
         }
+    }
+
+    // image tokens take no part in an n-gram (hashed DEAD above) and get no Engram contribution (gate 0), as model.py
+    if (engram_keep && engram_keep->buffer) {
+        keep.resize(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[i]);
+            keep[i] = is_embd ? 0.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(engram_keep, keep.data(), 0, keep.size()*sizeof(float));
     }
 
     if (cand_pin && cand_pin->buffer) {
@@ -414,6 +426,10 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
     bool res = true;
     for (auto * t : engram_ids) {
         res &= t->ne[0] == (int64_t) model.engram_n_cols()*params.ubatch.n_tokens;
+    }
+    res &= (engram_keep != nullptr) == (!engram_ids.empty() && params.ubatch.embd != nullptr);
+    if (engram_keep) {
+        res &= engram_keep->ne[2] == (int64_t) params.ubatch.n_tokens;
     }
     if (cand_pin) {
         const auto & plan = cand_plan(params.ubatch);
@@ -493,6 +509,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
         const llama_model_deepseek41 & model,
         ggml_tensor * x,
         ggml_tensor * ids,
+        ggml_tensor * keep,
         int il) const {
     const auto & layer = model.layers[il];
     const int64_t hc     = hparams.dsv4_hc_mult;
@@ -526,6 +543,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     // gate = sigmoid(sign(dot) * sqrt(max(|dot|, 1e-6)))
     ggml_tensor * mag = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, mag, ggml_sgn(ctx0, dot)));
+    if (keep) {
+        gate = ggml_mul(ctx0, gate, keep); // [1, hc, nt] * [1, 1, nt]: image tokens pass through untouched
+    }
     cb(gate, "engram_gate", il);
 
     ggml_tensor * upd = ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate);
@@ -866,6 +886,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_set_name(engram_ids[e], ("engram_ids-" + std::to_string(model.engram_layers[e])).c_str());
     }
     inp41->engram_ids = engram_ids;
+    ggml_tensor * engram_keep = nullptr;
+    if (!engram_ids.empty() && ubatch.embd) {
+        engram_keep = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
+        ggml_set_input(engram_keep);
+        ggml_set_name(engram_keep, "engram_keep");
+        inp41->engram_keep = engram_keep;
+    }
     ggml_tensor * cand_pin = nullptr;
     if (hparams.dsv41_cand_src >= 0) {
         const int32_t cs = hparams.dsv41_cand_src;
@@ -895,7 +922,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         const int e = model.engram_index(il);
         if (e >= 0) {
-            inpL = build_engram(model, inpL, engram_ids[e], il);
+            inpL = build_engram(model, inpL, engram_ids[e], engram_keep, il);
             cb(inpL, "engram_out", il);
         }
 

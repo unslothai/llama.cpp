@@ -205,6 +205,15 @@ Sizes: experts 289 GB (MXFP4), dense ~14 GB BF16 (FP8 dequant), embed+head 2.7 G
    KV); the GGUF port does not, so expect KL above the fixture's 1e-11 even when correct. Measure the oracle with and without
    fake-quant on a few prompts (`DSV41_FAKE_QUANT=1` in the shim emulates it on CPU).
 
+## Image-span Engram (embedding inputs)
+model.py: image tokens are hashed DEAD (no n-gram spans them) and the Engram gate is 0 there; routing uses bias_vl.
+llama.cpp: embd tokens hash DEAD, KV cells of embd tokens record LLAMA_TOKEN_NULL (dsv41_tok_hist), and embd ubatches
+get an `engram_keep` input (0 for embd tokens) multiplied into the gate; text-only graphs are unchanged (no extra op).
+Test (`scripts/dsv41/image_ref.py` + `embd_test.cpp`, small fixture, 48 wiki tokens, [16,24) fed as an embedding
+ubatch of the same token rows, reference with token_types image mask and bias_vl): KL 4.4e-12 CPU, 5.2e-12 CUDA,
+top-1 1.0; without the gate fix KL 0.97; image vs text reference differ by KL 1.0 (the test can fail). Text parity
+unchanged (4.6e-12..4.9e-12 at ub 7), test-llama-archs CPU 137/137.
+
 ## Engram placement guard
 `llama-model-loader.cpp`: an `engram_embd` placement on a non-host buffer (from `-ot`, or any split mode) is refused with a
 warning and the table goes to the CPU buffer. Test `scripts/dsv41/engram_placement.cpp` (all layers offloaded,
@@ -216,6 +225,6 @@ logits bitwise equal to the run without the override; negative control (build wi
 - A5 (pin PR / pinset sim) not started; full-model parity waits for B's GGUF and the oracle.
 - The F32 KL gate cannot be met at the real top-k budgets on any implementation (the fp32 reference misses its own
   float64-rope version by KL 6.6e-4); long-context acceptance = selection parity with near-tie gap evidence.
-- Image tokens: Engram DEAD / gate-off for embd inputs is hashed as DEAD but the gate is not forced to 0 yet; vision not ported.
+- Vision tower not ported (the text side of image spans is done, see below).
 - No ubatch shares a token across sequences (asserts, as the PLE path).
 - DSpark drafting graph not implemented.

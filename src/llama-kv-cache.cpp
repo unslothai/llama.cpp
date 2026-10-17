@@ -1150,7 +1150,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+            // dsv41_tok_hist: embd cells must record LLAMA_TOKEN_NULL (Engram treats it as DEAD), never a stale id
+            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0 || hparams.dsv41_tok_hist) {
                 llama_kv_cell_ext ext;
 
                 if (ubatch.is_pos_2d()) {
