@@ -44,6 +44,8 @@ Notes
   row for hash id r is `float(w[r]).view(8,32) * 2^(scale[r]-127)`. Never repack, never offload: the graph gathers it on
   the host with `ggml_get_rows`. Any type with get_rows on CPU works for the graph.
 - FP8 linear weights use 32x32 `ue8m0` blocks (derive the block from the scale shape, do not hard-code 128).
+- Keep F32 in every output file (checked by gguf_build `eval/verify_types.py`): `ffn_gate_inp` (router), `exp_probs_b`,
+  `exp_probs_b_vl`, every `*norm.weight` (incl. `attn_compressor_norm`, `indexer.k_norm`), `hc_*`, `attn_sinks`, `engram_gate`.
 - Every layer `0..39` has all backbone attention/HC/MoE tensors; DSpark blocks have 128 experts (`dspark.expert_count`).
 
 ## Keys (`deepseek41.` prefix)

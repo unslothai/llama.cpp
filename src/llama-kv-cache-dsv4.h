@@ -31,6 +31,7 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
+    bool     is_overlap()     const; // overlapped (V4 CSA) pooling: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
@@ -213,6 +214,9 @@ public:
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
+
+    // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     size_t i_next = 0;

@@ -136,6 +136,13 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         return false;
     }
 
+    // debug: GGML_CUDA_F32_EXACT=1 keeps F32 weights off the TF32 tensor-core path (together with
+    // NVIDIA_TF32_OVERRIDE=0 for cuBLAS), for exact-F32 parity tests against a CPU / PyTorch reference
+    static const bool f32_exact = getenv("GGML_CUDA_F32_EXACT") != nullptr;
+    if (type == GGML_TYPE_F32 && f32_exact) {
+        return false;
+    }
+
     const size_t ts = ggml_type_size(type);
     if (src0_ne[0] % (warp_size * (4/ts)) != 0) {
         return false;
