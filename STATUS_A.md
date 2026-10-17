@@ -301,3 +301,17 @@ the aged base b11707, so the pin re-applies upstream code (pr-set doc: delete th
 Real DSpark draft: models/dsv41/gguf/dspark/DeepSeek-V4.1-Flash-1017-DSpark-DFLASH-BF16.gguf (8.5 GB, 78 tensors,
 target_layers 37/38/39, 128 experts top-3, 13 s). Acceptance run: scripts/dsv41/dspark_accept_real.sh with the MXFP8=43
 build temp/wt_dsv41_43 (7a582830e) because pkg is not patched yet; gpu_queue --gb 36 (--cpu-moe target).
+
+### Full-model selection sets vs official MATCHED traces (CPU BF16 GGUF, ub 512; logits bitwise = the CPU arm)
+Capture: `scripts/dsv41/dump_sel.cpp` (chunked per ubatch: sel_top_k's width min(n_comp, 512) changes while
+n_comp < 512, so plain concatenation misaligns rows; outputs/dsv41_full/sel_ub512 sel_top_k files are affected).
+Analysis `scripts/dsv41/sel_full.py`: per layer rows whose visible selected set differs; for index layers the gap
+(lowest llama-only pick minus highest reference-only pick, llama's own scores) relative to the row's top score.
+wiki1100 (T 1100): L2 12 / 75 binding rows (all single swaps, gap max 1.1e-3), L8 26, L14 57 (gap max 8.4e-2),
+L20-L36 579-587 / 588 binding rows (median 6 swaps; gap <= 1e-2 on 526-555 rows, > 1e-1 on 5-21); candidate pool 0
+mismatches (no exclusion below 16k). long17k (T 17000): L2 13092 / 15975 binding rows (median 1 swap, gap <= 1e-3 on
+11861, max 9.7e-3); L8 15760, L14 15942, ratio-1 index layers ~16480 / 16488 (median 13-15 swaps, gap <= 1e-2 on
+99.5%, > 1e-1 on <= 21 rows); candidate pool 558 / 17000 rows (616 with real exclusion), median 3 block swaps, gap
+median 2.3e-3, <= 1e-2 on 461. Reuse layers equal their source. Every first-index-layer flip is a near-tie at the
+BF16 activation precision of the CPU path (vs 87 / 17000 L2 rows on the F32 budget fixture); later layers inherit.
+No reference scores exist in the traces, so large-gap rows (cascades) cannot be classified further.
