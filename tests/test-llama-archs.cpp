@@ -191,8 +191,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
-    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER) {
+    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER) {
         n_head_kv = 2; // GQA coverage
+    }
+    if (arch == LLM_ARCH_BEAM) {
+        n_head    = 4;
+        n_head_kv = 2;
+        n_layer   = 4;
     }
     const uint32_t n_embd_head = n_embd / n_head;
 
@@ -300,6 +305,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_MAION_CODER) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>{1, 1, 0, 0});
+    } else if (arch == LLM_ARCH_BEAM) {
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 2);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_GEMMA4) {
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
         ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
@@ -309,7 +321,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
-            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
+            arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
             arch == LLM_ARCH_MAPLE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
@@ -319,6 +331,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
+    }
+
+    if (arch == LLM_ARCH_MUSE_SPARK) {
+        ms.add_kv(LLM_KV_POST_NORM_EPS,           1e-5f);
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,      10000.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING, 30.0f);
+        ms.add_kv(LLM_KV_MOE_LATENT_SIZE,         n_embd/2);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
     }
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
@@ -480,7 +501,21 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : 2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
+
+        uint32_t gating_func = 2;
+        switch (arch) {
+            case LLM_ARCH_MELLUM:
+                gating_func = 1;
+                break;
+            case LLM_ARCH_DEEPSEEK4:
+            case LLM_ARCH_DEEPSEEK41:
+                gating_func = 4;
+                break;
+            default:
+                break;
+        }
+
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         gating_func); // sigmoid : softmax : sqrtsoftplus
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
         if (arch == LLM_ARCH_K2_HORIZON) {
@@ -489,9 +524,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         }
     }
 
+    if (arch == LLM_ARCH_BEAM) {
+        ms.add_kv(LLM_KV_EXPERT_COUNT,            uint32_t(8));
+        ms.add_kv(LLM_KV_EXPERT_GROUP_COUNT,      uint32_t(4));
+        ms.add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT, uint32_t(2));
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    2.5f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+    }
+
     if (arch == LLM_ARCH_MAION_CODER) {
         ms.add_kv(LLM_KV_MOE_LATENT_SIZE, n_embd / 2);
-        ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(4));
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, std::vector<uint32_t>{n_ff, n_ff / 2, n_ff, n_ff});
     }
 
@@ -733,6 +775,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_AFMOE:
+        case LLM_ARCH_BEAM:
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
@@ -757,6 +800,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_MAPLE:
+        case LLM_ARCH_MUSE_SPARK:
             return true;
         default:
             return false;
