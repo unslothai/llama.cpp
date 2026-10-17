@@ -327,3 +327,30 @@ mismatches (no exclusion below 16k). long17k (T 17000): L2 13092 / 15975 binding
 median 2.3e-3, <= 1e-2 on 461. Reuse layers equal their source. Every first-index-layer flip is a near-tie at the
 BF16 activation precision of the CPU path (vs 87 / 17000 L2 rows on the F32 budget fixture); later layers inherit.
 No reference scores exist in the traces, so large-gap rows (cascades) cannot be classified further.
+
+## CUDA small-ubatch divergence (A3, 2026-10-17): root cause TF32 on F32 weights, fixed
+- Symptom (full model, CUDA, vs official MATCHED): wiki1100 KL mean ub512 6.1e-3 / ub7 9.9e-3 (max 1.94 at t=406);
+  t1025 2.3e-2 / 5.7e-2. CPU is ub-invariant (bitwise).
+- Not a leak: per-layer dumps at wiki t=406 (ub7 vs ub512, `scripts/dsv41/ubsweep/full_an.py`) show l_out drifting by
+  5e-4..7.5e-3 relative over L0-L4, then a routed-expert flip at L5 (173 vs 81) and more flips downstream; no
+  mask / selection / state anomaly. The drift source: F32-weight matmuls (MoE router `ffn_gate_inp`, mHC `hc_*_fn`,
+  indexer score `idx_k x idx_q`, and K/Q/V with an F32 KV cache) run in TF32 on CUDA, with a precision that depends
+  on the ubatch size: ncols <= 3 MMVF (exact F32), 4..16 MMF tensor cores (TF32, max err 7e-5 of sum|a*b|), >= 17
+  cuBLAS with CUBLAS_TF32_TENSOR_OP_MATH (2.4e-5) (`scripts/dsv41/ubsweep/mm_prec.cpp`). The 384-expert top-6 router
+  is near-tie sensitive, so ubatch size changed routing. Full-model A/B: ub7 with GGML_CUDA_F32_EXACT=1 +
+  NVIDIA_TF32_OVERRIDE=0 = 6.0e-3 (excess gone); ub8 6.2e-3, ub9 6.7e-3 (same TF32, luckier tails).
+- Fix (commit below): CUDA honours `ggml_prec_set_src(mm, GGML_PREC_F32, 1)` for F32 x F32 MUL_MAT (no TF32: MMVF up
+  to 8 columns, else cuBLAS SGEMM with CUBLAS_DEFAULT_MATH); the DSV4.1 graph requests it on the router logits, the
+  hc mixes, the indexer scores and kq / kqv (no-op for F16 / quantized KV caches). Arch-gated: other models unchanged
+  (random V4 model bitwise identical base vs fix at ub 7 / 256; test-llama-archs deepseek2/4/41, glm-dsa 12/12).
+- After (full model, same GPUs/tokens, 2 x B200): wiki1100 ub512 5.74e-3, ub7 5.75e-3, ub5 5.56e-3, ub8 6.91e-3
+  (CPU 6.21e-3); medians 4.6e-6..9e-6. t1025 ub512 3.3e-2, ub7 3.0e-2: t1025 position 0 is degenerate (random first
+  token): CPU 0.84, fixed CUDA 0.92 / 1.07, old TF32 ub512 0.058 by luck; random-id prompts stay uninformative.
+- Gates: new `scripts/dsv41/gate_ub_cuda.sh` (A: F32X exact, ub 1..17 vs one-shot KL <= 1.7e-8 mean, one near-tie
+  position; B: hc_mixes-0 token 0 at every ub vs ub1 <= 2.7e-7 rel, real dtypes, no env) PASS; negative control (pre-fix 7a582830e): A passes
+  (the graph itself was always ub-invariant), B FAILS at 2.6e-4 for every ub >= 4 and the one-shot; test-backend-ops new
+  `MUL_MAT(m,n,k,bs)` prec-F32 cases 18/18 OK (negative control without the CUDA change: FAIL, NMSE 4.7e-7 MMF /
+  6.8e-8 cuBLAS vs 1e-10); fixture gate_c CPU t129 / t1027 9.2e-12 / 1.1e-7, CUDA exact t129 / t1027 / t3001
+  8.6e-12 / 4.5e-9 / 5.8e-5 (unchanged).
+- Upstream V4-Flash: same code path (F32 router / hc_fn on CUDA go through MMF TF32 at 4..16 columns and cuBLAS TF32
+  above; ubatch-dependent routing). Not changed here (arch gate). Candidate upstream issue, not filed.

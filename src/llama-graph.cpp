@@ -2154,6 +2154,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // F32 router: keep the logits off TF32 on CUDA (top-6 of 384 is near-tie sensitive; with TF32 the routing
+            // depended on the ubatch size, 4..16-token batches being the worst)
+            ggml_prec_set_src(logits, GGML_PREC_F32, 1);
+        }
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
@@ -2936,6 +2941,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
         ggml_prec_set_acc(kq, GGML_PREC_F32);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // with an F32 KV cache: no TF32 rounding of K / Q on CUDA (no-op for F16 / quantized caches)
+            ggml_prec_set_src(kq, GGML_PREC_F32, 1);
+        }
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -2975,6 +2984,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            ggml_prec_set_src(kqv, GGML_PREC_F32, 1);
+        }
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
