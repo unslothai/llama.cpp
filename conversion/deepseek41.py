@@ -285,6 +285,13 @@ class DeepseekV41Model(DeepseekV4Model):
         w.add_engram_token_map(token_map)
         w.add_engram_multipliers([m for row in mults for m in row])
         w.add_engram_primes([p for layer in primes for per in layer for p in per])
+        # per-layer row offsets of each (order, head) bucket range: exclusive cumsum of that layer's primes (order-major,
+        # head-minor) = NgramHashState.offsets; u64 so table addressing never narrows (tables are > 100 GB)
+        offsets = []
+        for layer in primes:
+            flat = [p for per in layer for p in per]
+            offsets += [sum(flat[:i]) for i in range(len(flat))]
+        w.add_key_value(f"{self.gguf_writer.arch}.engram.offsets", offsets, gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT64)
         logger.info(f"engram: compressed vocab {cvocab}, pad -> {token_map[hp['engram_pad_token_id']]}, multipliers {mults}")
 
         # DSpark (block layout only matters to the --mtp file, but the keys are cheap)

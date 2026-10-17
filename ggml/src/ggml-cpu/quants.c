@@ -58,10 +58,6 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp4_ref(x, y, k);
 }
 
-void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_mxfp8_ref(x, y, k);
-}
-
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
 }
@@ -326,33 +322,6 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
         }
         sumf += d * (sumi1 + sumi2);
-    }
-    *s = sumf;
-}
-
-// MXFP8: scalar reference only (the format is used for host-side row gathers)
-void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
-    assert(n % QK_MXFP8 == 0);
-    static_assert(QK_MXFP8 == QK8_0, "QK_MXFP8 and QK8_0 must be the same");
-
-    const block_mxfp8 * GGML_RESTRICT x = vx;
-    const block_q8_0  * GGML_RESTRICT y = vy;
-
-    const int nb = n / QK_MXFP8;
-
-    float sumf = 0;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        float sumq = 0;
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            sumq += ggml_e4m3_to_fp32(x[ib].qs[j]) * y[ib].qs[j];
-        }
-        sumf += GGML_CPU_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32(x[ib].e) * sumq;
     }
     *s = sumf;
 }

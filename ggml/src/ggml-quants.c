@@ -352,9 +352,9 @@ void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RE
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int64_t nb = k / qk;
 
-    for (int i = 0; i < nb; i++) {
+    for (int64_t i = 0; i < nb; i++) {
         float amax = 0.0f;
         for (int j = 0; j < qk; j++) {
             amax = MAX(amax, fabsf(x[i*qk + j]));
@@ -620,9 +620,9 @@ void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_REST
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int64_t nb = k / qk;
 
-    for (int i = 0; i < nb; i++) {
+    for (int64_t i = 0; i < nb; i++) {
         // exact: e4m3 * 2^(e-127) is representable in fp32 for every code and scale
         const float d = x[i].e == 0xFF ? NAN : GGML_E8M0_TO_FP32(x[i].e);
 
