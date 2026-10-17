@@ -53,6 +53,10 @@ CUDA (`GGML_CUDA_F32_EXACT=1`, gate build `build-cuda`): fx_base t129 / t1027 / 
 KL 8.6e-12 / 4.5e-9 / 5.8e-5, top-1 1.0 / 1.0 / 0.999: PASS.
 Full model: `scripts/dsv41/full_dump.sh` (3 B200 x 125 GB, ~45 min, window requested from main) dumps the run-of-record
 pkg/BF16 GGUF on C's fx_base token files + real-text wiki1100 / long17k, for the TP8 MATCHED oracle.
+First full-model results (GPUs 0,2,3, ub 512, fa=0, F32 KV; load + 6 prompts in ~10 min): all finite; real-text
+self-perplexity wiki1100 2.11 (next-token top-1 0.826), long17k 2.0 / 1.28 / 1.80 / 2.08 / 3.03 on [0,1k) / [1k,4k) /
+[4k,8k) / [8k,16384) / [16384,17k); 256-token bands before the pool threshold already range 1.6..3.0 (text-dependent, no
+jump at 16,392). ub 7 / ub 1 / fa=1 phases and the oracle comparison pending (outputs/dsv41_full/bf16_ub512).
 
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
