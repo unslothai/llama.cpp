@@ -44,7 +44,10 @@ with MXFP4 experts the CPU matmul quantizes activations to q8_0 and the gate fai
 | fx_long (real 2048-block pool) | t2001 / sp20001 (ub 4096) | 1.2e-5 / 5.1e-4 | 1.1e-2 | 0.9861 |
 | fx_base ub 7 / ub 1 | t129, t1027, sp1600 / t129, t700 | identical to one-shot | | 1.0000 |
 llama.cpp vs matched is the same size as matched_f32 vs matched_f64 (the fp32 floor). sp20001 is the long-context
-near-tie regime characterised above. CUDA on these fixtures not yet run.
+near-tie regime characterised above. CUDA (`GGML_CUDA_F32_EXACT=1`, gate build `build-cuda`): fx_base t129 / t1027 / t3001
+KL 8.6e-12 / 4.5e-9 / 5.8e-5, top-1 1.0 / 1.0 / 0.999: PASS.
+Full model: `scripts/dsv41/full_dump.sh` (3 B200 x 125 GB, ~45 min, window requested from main) dumps the run-of-record
+pkg/BF16 GGUF on C's fx_base token files + real-text wiki1100 / long17k, for the TP8 MATCHED oracle.
 
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
