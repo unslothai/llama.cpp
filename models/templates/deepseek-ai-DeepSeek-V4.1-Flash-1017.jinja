@@ -75,7 +75,7 @@
 {%- endmacro -%}
 
 {#- 1. Merge tool results (and consecutive user turns) into user messages made of content blocks. -#}
-{%- set mns = namespace(list=[]) -%}
+{%- set mns = namespace(msgs=[]) -%}
 {%- for msg in messages -%}
     {%- set content = msg.get("content") -%}
     {%- set is_blocks = content is iterable and content is not string and content is not mapping -%}
@@ -86,46 +86,46 @@
     {%- if rc is string and IMG in rc -%}
         {{- raise_exception("reasoning_content contains image special token " ~ IMG) -}}
     {%- endif -%}
-    {%- set prev = mns.list[-1] if mns.list else none -%}
+    {%- set prev = mns.msgs[-1] if mns.msgs else none -%}
     {%- if msg.role == "tool" -%}
         {%- set tblock = {"type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""), "content": content if content is not none else ""} -%}
         {%- if prev is not none and prev.role == "user" and prev.content_blocks is defined -%}
-            {%- set mns.list = mns.list[:-1] + [dict(prev, content_blocks=prev.content_blocks + [tblock])] -%}
+            {%- set mns.msgs = mns.msgs[:-1] + [dict(prev, content_blocks=prev.content_blocks + [tblock])] -%}
         {%- else -%}
-            {%- set mns.list = mns.list + [{"role": "user", "content_blocks": [tblock]}] -%}
+            {%- set mns.msgs = mns.msgs + [{"role": "user", "content_blocks": [tblock]}] -%}
         {%- endif -%}
     {%- elif msg.role == "user" -%}
         {%- set blocks = content if is_blocks else [{"type": "text", "text": content or ""}] -%}
         {%- if prev is not none and prev.role == "user" and prev.content_blocks is defined and prev.get("task") is none -%}
-            {%- set mns.list = mns.list[:-1] + [dict(prev, content_blocks=prev.content_blocks + blocks)] -%}
+            {%- set mns.msgs = mns.msgs[:-1] + [dict(prev, content_blocks=prev.content_blocks + blocks)] -%}
         {%- else -%}
-            {%- set mns.list = mns.list + [dict(msg, content_blocks=blocks)] -%}
+            {%- set mns.msgs = mns.msgs + [dict(msg, content_blocks=blocks)] -%}
         {%- endif -%}
     {%- else -%}
-        {%- set mns.list = mns.list + [msg] -%}
+        {%- set mns.msgs = mns.msgs + [msg] -%}
     {%- endif -%}
 {%- endfor -%}
 
 {#- Top-level tools / response_format attach to a leading system message, or to a new empty one. -#}
 {%- if tools or response_format -%}
-    {%- if not (mns.list and mns.list[0].role == "system") -%}
-        {%- set mns.list = [{"role": "system", "content": ""}] + mns.list -%}
+    {%- if not (mns.msgs and mns.msgs[0].role == "system") -%}
+        {%- set mns.msgs = [{"role": "system", "content": ""}] + mns.msgs -%}
     {%- endif -%}
-    {%- set first = mns.list[0] -%}
+    {%- set first = mns.msgs[0] -%}
     {%- if tools and not first.get("tools") -%}{%- set first = dict(first, tools=tools) -%}{%- endif -%}
     {%- if response_format and not first.get("response_format") -%}{%- set first = dict(first, response_format=response_format) -%}{%- endif -%}
-    {%- set mns.list = [first] + mns.list[1:] -%}
+    {%- set mns.msgs = [first] + mns.msgs[1:] -%}
 {%- endif -%}
 
 {#- 2. Reorder tool results to match the tool_calls order of the preceding assistant message. -#}
-{%- set sns = namespace(list=[], ids=[]) -%}
-{%- for m in mns.list -%}
+{%- set sns = namespace(msgs=[], ids=[]) -%}
+{%- for m in mns.msgs -%}
     {%- if m.role == "assistant" and m.get("tool_calls") -%}
         {%- set sns.ids = [] -%}
         {%- for tc in m.tool_calls -%}
             {%- set sns.ids = sns.ids + [tc.get("id") or (tc.function.get("id", "") if tc.function is defined else "")] -%}
         {%- endfor -%}
-        {%- set sns.list = sns.list + [m] -%}
+        {%- set sns.msgs = sns.msgs + [m] -%}
     {%- elif m.role == "user" and m.content_blocks -%}
         {%- set tb = namespace(blocks=[]) -%}
         {%- for b in m.content_blocks if b.type == "tool_result" -%}
@@ -146,15 +146,15 @@
                     {%- set rb.blocks = rb.blocks + [b] -%}
                 {%- endif -%}
             {%- endfor -%}
-            {%- set sns.list = sns.list + [dict(m, content_blocks=rb.blocks)] -%}
+            {%- set sns.msgs = sns.msgs + [dict(m, content_blocks=rb.blocks)] -%}
         {%- else -%}
-            {%- set sns.list = sns.list + [m] -%}
+            {%- set sns.msgs = sns.msgs + [m] -%}
         {%- endif -%}
     {%- else -%}
-        {%- set sns.list = sns.list + [m] -%}
+        {%- set sns.msgs = sns.msgs + [m] -%}
     {%- endif -%}
 {%- endfor -%}
-{%- set msgs = sns.list -%}
+{%- set msgs = sns.msgs -%}
 
 {#- Last user turn: users and mid-conversation systems count, except user turns made only of tool results.
     Tools anywhere disable drop_thinking. -#}
