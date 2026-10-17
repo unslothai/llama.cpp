@@ -393,17 +393,17 @@ class DeepseekV41Model(DeepseekV4Model):
                 return f"mtp.{int(m.group(1)) - n_main}.{m.group(2)}"
             return n
         names = [(src_name(wn), src_name(sn)) for wn, sn in names]
-        parts = {wn: self._tensor_part(wn) for wn, _ in names}
+        parts = {n: self._tensor_part(n) for pair in names for n in pair}  # weight and scale may sit in different shards
         local = threading.local()
 
         def one(ws: tuple[str, str]) -> np.ndarray:
             wn, sn = ws
             hs = local.__dict__.setdefault("h", {})
-            part = parts[wn]
-            if part not in hs:
-                hs[part] = safe_open(part, framework="pt")
-            w = hs[part].get_tensor(wn).view(torch.uint8).numpy()
-            sc = hs[part].get_tensor(sn).view(torch.uint8).numpy()
+            for part in (parts[wn], parts[sn]):
+                if part not in hs:
+                    hs[part] = safe_open(part, framework="pt")
+            w = hs[parts[wn]].get_tensor(wn).view(torch.uint8).numpy()
+            sc = hs[parts[sn]].get_tensor(sn).view(torch.uint8).numpy()
             return self._repack_mxfp4_np(w, sc)
 
         def chunks() -> Iterable[np.ndarray]:
@@ -421,13 +421,13 @@ class DeepseekV41Model(DeepseekV4Model):
         if rows != self.hparams["engram_num_embeddings"][li]:
             raise ValueError(f"{wn}: {rows} rows != engram_num_embeddings {self.hparams['engram_num_embeddings'][li]}")
         new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid)
-        part = self._tensor_part(wn)
+        wpart, spart = self._tensor_part(wn), self._tensor_part(sn)
         chunk_rows = 1 << 20
 
         def raw_chunks() -> Iterable[tuple[np.ndarray, np.ndarray]]:
             from safetensors import safe_open
-            with safe_open(part, framework="pt") as f:
-                ws, ss = f.get_slice(wn), f.get_slice(sn)
+            with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+                ws, ss = fw.get_slice(wn), fs.get_slice(sn)
                 for r0 in range(0, rows, chunk_rows):
                     r1 = min(rows, r0 + chunk_rows)
                     q = ws[r0:r1].view(torch.uint8).numpy().reshape(-1, 32)
