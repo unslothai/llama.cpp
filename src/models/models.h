@@ -1458,6 +1458,8 @@ struct llama_model_deepseek41 : public llama_model_base {
 
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
+        // helpers only (no graph built): base of the DSpark draft graph (llama_model_dflash::graph_dsv41)
+        explicit graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
 
         // HC coefficients of one sublayer: returns pre [hc, n_tokens], fills post / comb
         ggml_tensor * build_hc_mixes(
@@ -1550,6 +1552,11 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
         graph_dsv4(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // DeepSeek-V4.1 DSpark: single-pass mHC (lagged pre-mix, no hc_head), no per-head q norm
+    struct graph_dsv41 : public llama_model_deepseek41::graph {
+        graph_dsv41(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

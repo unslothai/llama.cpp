@@ -186,7 +186,7 @@ class DeepseekV41Model(DeepseekV4Model):
             raise ValueError(f"unsupported FP8 scale format {qc.get('scale_fmt')!r}")
 
         # the V4 constructor installed the V4 template; V4.1 has its own
-        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.1.jinja"
+        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja"
         if template_path.is_file():
             self.gguf_writer.add_chat_template(template_path.read_text(encoding="utf-8"))
 
@@ -554,3 +554,99 @@ class DeepseekV41Model(DeepseekV4Model):
             return dense_qt
         return False
 
+
+
+class DeepseekV41DSparkModel(DeepseekV41Model):
+    """DeepSeek-V4.1 DSpark speculative draft (mtp.0..2 of the checkpoint) as a DFLASH GGUF (`--dspark`).
+
+    Layout = the V4 DSpark draft (conversion/deepseek.py DeepseekV4DSparkModel) with V4.1's differences flagged by
+    `dflash.hyper_connection.single_pass`: stages blk.0..2 (128 experts top-3, MXFP4 bit-exact, dense BF16),
+    mtp.0.main_proj / main_norm -> fc / enc.output_norm, mtp.2.norm -> output_norm, markov_head.embed / head ->
+    markov_w1 / markov_w2, confidence_head.proj -> conf_proj (F32), no hc_head. Token embeddings and the lm head are
+    the target's (shared at runtime through ctx_other). target_layers are the V4.1 ids as-is: the draft reads the
+    attention input of those layers (model.py Transformer.forward), which is what llama_set_embeddings_layer_inp
+    extracts.
+    """
+    model_arch = gguf.MODEL_ARCH.DFLASH
+    mtp_only = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hp = self.hparams
+        self._n_main = hp["num_hidden_layers"]
+        self._n_stage = hp["num_nextn_predict_layers"]
+        if self._n_stage <= 0 or "dspark_block_size" not in hp:
+            raise ValueError("DeepSeek-V4.1 DSpark export needs num_nextn_predict_layers > 0 and the dspark_* config")
+        # the main-model rekey (mtp.M -> layers.n_main+M) is kept for tensor selection and the MXFP4 expert source
+        # names; format_tensor_name() maps the block ids back to 0..n_stage-1
+        self.block_count = self._n_main + self._n_stage
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self._n_stage)
+
+    def format_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
+        if bid is not None and bid >= self._n_main:
+            bid -= self._n_main
+        return super().format_tensor_name(key, bid, suffix)
+
+    def set_vocab(self):
+        super().set_vocab()
+        self.gguf_writer.add_mask_token_id(self.hparams["dspark_noise_token_id"])
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        n = self._n_stage
+        w = self.gguf_writer
+        w.add_block_count(n)
+        w.add_context_length(hp["max_position_embeddings"])
+        w.add_embedding_length(hp["hidden_size"])
+        w.add_feed_forward_length(hp["moe_intermediate_size"])
+        w.add_head_count(hp["num_attention_heads"])
+        w.add_head_count_kv(1)
+        w.add_key_length(hp["head_dim"])
+        w.add_value_length(hp["head_dim"])
+        w.add_rope_dimension_count(hp["qk_rope_head_dim"])
+        # DSpark stages are compress-ratio-0 layers: plain rope at rope_theta, no YaRN
+        w.add_rope_freq_base(float(hp["rope_theta"]))
+        w.add_layer_norm_rms_eps(hp["rms_norm_eps"])
+        w.add_q_lora_rank(hp["q_lora_rank"])
+        w.add_sliding_window(hp["sliding_window"])
+        w.add_expert_count(hp["dspark_n_routed_experts"])
+        w.add_expert_used_count(hp["dspark_num_experts_per_tok"])
+        w.add_expert_feed_forward_length(hp["moe_intermediate_size"])
+        w.add_expert_shared_count(hp["n_shared_experts"])
+        w.add_expert_weights_scale(hp["routed_scaling_factor"])
+        w.add_expert_weights_norm(hp["norm_topk_prob"])
+        w.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRTSOFTPLUS)
+        w.add_swiglu_clamp_exp([hp["swiglu_limit"]] * n)
+        w.add_swiglu_clamp_shexp([hp["swiglu_limit"]] * n)
+        w.add_attention_output_group_count(hp["o_groups"])
+        w.add_attention_output_lora_rank(hp["o_lora_rank"])
+        w.add_attention_compress_ratios([0] * n)
+        w.add_hyper_connection_count(hp["hc_mult"])
+        w.add_hyper_connection_sinkhorn_iterations(hp["hc_sinkhorn_iters"])
+        w.add_hyper_connection_epsilon(hp["hc_eps"])
+        w.add_hyper_connection_single_pass(True)
+        w.add_block_size(hp["dspark_block_size"])
+        w.add_target_layers(hp["dspark_target_layer_ids"])
+        w.add_sample_from_anchor(True)
+        w.add_has_confidence_head(True)
+        w.add_file_type(self.ftype)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # stage experts only (no Engram tables in the draft)
+        return super().generate_extra_tensors()
+
+    _DSPARK_ROOT: dict[str, gguf.MODEL_TENSOR] = {
+        "main_proj.weight": gguf.MODEL_TENSOR.FC,
+        "main_norm.weight": gguf.MODEL_TENSOR.ENC_OUTPUT_NORM,
+        "norm.weight": gguf.MODEL_TENSOR.OUTPUT_NORM,
+    }
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in ("embed.weight", "head.weight", "norm.weight"):
+            return []  # the target's (ctx_other)
+        if name.endswith(".ffn.gate.bias_vl"):
+            return []  # drafts are text-only
+        m = re.match(r"layers\.(\d+)\.(main_proj\.weight|main_norm\.weight|norm\.weight)$", name)
+        if m is not None and int(m.group(1)) >= self._n_main:
+            return [(self.format_tensor_name(self._DSPARK_ROOT[m.group(2)], None), data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
