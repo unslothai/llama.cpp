@@ -9,7 +9,7 @@ Branch `dsv41` in `$W/wt_dsv41` (off llama.cpp_pinset fd55cb98f). Contract for b
 | A2 parity (bundled tools/dump_logits + port/compare_ref.py, F32 gate --max-kl-mean 1e-6 --min-top1 1.0 --min-cos 0.99999) | done (CPU), CUDA calibrated | see "A2 numbers" below; 13/13 seeded bugs FAIL on the small fixture, 5/5 on real dims |
 | A3 template + V4.1 DSML tool parser | done (1d51c092f) | template `models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja` (= `$W/models/dsv41/chat_template.jinja`, 5/5 byte parity with encoding.py). V4.1 tags carry a leading space (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); detection in common/chat.cpp keys on `｜DSML｜ calls>` (the template never names `dsml_token`), parser = the V4 parser with the spaced tags. test-chat: the V4 parser suite ported to V4.1 markup (content, thinking, single / parallel / mixed-type calls, content before calls, continuation, reconstruction) all pass; negative control (V4.1 tag switch off) aborts on the V4.1 block. |
 | A4 never break other models | done | test-chat all passed; test-llama-archs CPU all 137 passed; CUDA: full suite exceeded its 2 h box (killed, no verdict), so the archs sharing touched code were run: deepseek4/41, deepseek2/32, glm-dsa, glm5-next, maple, qwen3moe, qwen35moe, qwen4exp on CUDA + CPU + Meta: 28/28 passed; deepseek41 on CPU / CUDA / Meta OK; test-backend-ops for used ops pass; V4 logits bitwise identical base vs head; no vocab change (vocab differential N/A) |
-| A5 pin PR / pinset sim | not started (after A3 and B's GGUF) | |
+| A5 pin PR / pinset sim | local branch `dsv41-pin` (worktree `wt_dsv41_pin`), not pushed | see "A5" below |
 
 ### A2 numbers
 - CPU, F32 KV, FA off, single-shot / ub 7 / ub 1, swa_full 1 and 0: small fixture KL mean <= 4.9e-12, top-1 1.0, router top-k
@@ -140,7 +140,7 @@ closer to the truth is for C's full-model MATCHED oracle (prompts: outputs/dsv41
 | 3 graph + KV-cache generalisation, CPU + CUDA parity | done | bae963fb2 |
 | 4 test-llama-archs (CPU, CUDA, Meta split), test-backend-ops, V4 regression | done | d29889d8f |
 | 5 full-model handoff (below) | written, waiting for B's GGUF | |
-| 6 DSpark / MTP graph | not started (tensors load as optional, graph throws on the MTP context) | |
+| 6 DSpark / MTP graph | done (DFLASH draft) | 1c9a39a25, see "DSpark" below |
 
 ## What the graph implements (`src/models/deepseek41.cpp`)
 Engram (host n-gram hash from the raw-cache token history, CPU get_rows on `engram_embd`, gate as model.py), single-pass mHC
@@ -228,3 +228,54 @@ logits bitwise equal to the run without the override; negative control (build wi
 - Vision tower not ported (the text side of image spans is done, see below).
 - No ubatch shares a token across sequences (asserts, as the PLE path).
 - DSpark drafting graph not implemented.
+
+## A2 additions (2026-10-17)
+### CPU full model vs official MATCHED (`scripts/dsv41/score_arms.py <prompt>`, dumps `outputs/dsv41_full/cpu_wiki1100`)
+CPU ngl 0, ub 512, F32 KV, fa 0, 96 threads (`scripts/dsv41/dump_logits_mt.cpp`, DUMP_THREADS), ~220 s per prompt.
+KL(matched || arm) mean: wiki1100 CPU 6.21e-3, CUDA ub512 6.11e-3, ub7 9.9e-3, ub1 6.2e-3, fa1 6.3e-3, native 2.6e-2;
+at the 30 CPU-vs-CUDA sensitive positions (KL > 0.05) CPU 7.4e-2 vs CUDA 8.1e-2, CPU closer on 60%: no systematic
+winner. t1025 (random tokens): CPU 3.95e-2, CUDA 2.26e-2, native 9.4e-2; CPU is already off at t0 (KL 0.84 vs CUDA
+0.058), i.e. per-token kernel numerics amplified by a chaotic input. Both arms sit ~6x over 1e-3, at C's bf16 floor.
+
+### A5 (pin PR = upstream + this change; local only)
+Branch `dsv41-pin` = dsv41 minus STATUS_A.md / TENSORS.md / the GGML_CUDA_F32_EXACT debug knob, plus
+`git merge --no-ff b11707` ("Fix merge conflicts": test-llama-archs gating switch, upstream added MELLUM, DEEPSEEK41 added
+to the DEEPSEEK4 case), plus later dsv41 merges. Upstream #30670 (Beam) added a jinja object builtin `list` that shadows
+the template's `namespace(list=...)` attribute ("Function is not a bool value" in test-chat): fixed in the template
+(attribute renamed to msgs, cd1714ad9; 5/5 encoding.py parity re-verified; `models/dsv41/chat_template.jinja` updated,
+old copy kept as `.pre_msgs_rename`). GGUFs built before this embed the old template and break on the nightly (which
+pins #30670). Converter template path fixed (`deepseek-ai-DeepSeek-V4.1.jinja` was deleted in 47dd9807b, so the
+converter silently kept the V4 template).
+b11714 + pin (CPU): test-llama-archs 140/140, test-chat all pass, DSpark gate PASS (below).
+`llama_pinset.py sim --tags window` with the pin appended (placeholder `danielhanchen#99999`, `temp/dsv41_pinset/pr-set.json`):
+REFUSED on every tag b11707..b11714 on `ggml/include/ggml.h` + `gguf-py/gguf/constants.py` against unslothai#61
+(IQ1_XS/XXS/XXXS at 64..66, GGML_TYPE_COUNT 67) vs MXFP8 = 43 / COUNT 44: both pins edit the GGML_TYPE_COUNT line, not
+additive. Needs a decision (fold MXFP8 into the pinset next to #61, or order + a resolved type list). Baseline without
+the pin already FAILs: ggml-org#30670 REFUSED (common/parsers/*, + llama-arch/model on b11714), pre-existing.
+
+### DSpark (MTP) draft
+DeepSeek-V4.1 DSpark = upstream's DFLASH DSpark draft (V4 `graph_dsv4`, driver `--spec-type draft-dspark`) with
+`dflash.hyper_connection.single_pass = true` selecting `llama_model_dflash::graph_dsv41`: single-pass mHC (identity copy 0
+for stage 0, FFN uses the attention pre-mix), no hc_head (collapse with the last FFN pre-mix), no per-head q norm, plain
+rope; target_layers = the V4.1 ids (attention INPUT of layers 37-39, after Engram, as model.py). Exact ring window: every
+block query sees the 128-position main-KV ring plus the block (get_dspark_topk_idxs); the graph gives all block queries
+the mask row of the first one and n_swa = window + 1. Converter: `convert_hf_to_gguf.py <V4.1 dir> --dspark` ->
+`DeepseekV41DSparkModel` (fixture output value-identical, 78/78 tensors, to `scripts/dsv41/dspark_fixture_gguf.py`).
+Reference: `scripts/dsv41/dspark_ref.py` (C's ref_run.build matched, forward_spec at temperature 0, fx_base t700, draft
+points s = 64 / 127 / 128 / 300 / 699) -> `outputs/dsv41_dspark/ref`. Gate `scripts/dsv41/dspark_gate.py` + harness
+`dspark_test.cpp` (target prefill with layer-input extraction, embd injection, [anchor, noise x4] block, logits incl.
+markov bias, sigmoid confidence):
+| build | KL mean (all points) | chain top-1 | conf abs err |
+|---|---|---|---|
+| CPU F32 | 9.6e-13 .. 2.3e-11 | 25/25 | <= 6.5e-7 |
+| CUDA F32 exact | 1.0e-12 .. 4.3e-12 | 25/25 | <= 5.2e-7 |
+| b11714 + pin, CPU | same as CPU | 25/25 | |
+| converter GGUF (MXFP4 experts), CPU | 2.8e-5 .. 3.0e-5 (q8_0 activations) | 10/10 (s64, s300) | 1.2e-3 |
+Negative control: before the block-window mask (standard SWA 128) s >= 127 FAILED (KL 3e-3 .. 5e-3, chain 3/5 .. 4/5).
+Server loop (`scripts/dsv41/dspark_server_smoke.sh`, llama-server, greedy 300 tokens): with F32 KV + fa off, output with
+the draft is identical to no draft (881 drafted, 4 accepted: random fixture weights). With server defaults (F16 KV,
+FA auto) both draft-dspark and draft-simple (self-draft, 97% accepted) diverge at the same token, a 0.009-logit near-tie:
+F16 attention numerics of the batched verify. Target rollback via the API (seq_test rollback on fx_base, D 4, R 3,
+acc 1..4) is exact: max abs logit diff 9.5e-6 vs one-shot.
+Not proven: real-model DSpark acceptance (needs the 7.9 GB mtp.* converted + a GPU window); multi-sequence DSpark
+blocks; KV eviction of ring cells in a long running loop with swa_full off (the smoke ran 300 tokens past the window).
