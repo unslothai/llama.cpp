@@ -172,10 +172,10 @@ class DeepseekV41Model(DeepseekV4Model):
         super().__init__(*args, **kwargs)
         hp = self.hparams
         # dense (non-expert, non-Engram) linears follow --outtype: bf16 is lossless, q8_0 is the B2 Q8_0 companion
-        default_dense = "q8_0" if self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0 else "bf16"
+        default_dense = {gguf.LlamaFileType.MOSTLY_Q8_0: "q8_0", gguf.LlamaFileType.ALL_F32: "f32"}.get(self.ftype, "bf16")
         self._dense_type = os.environ.get("DSV41_DENSE_TYPE", default_dense).lower()
         self._engram_type = os.environ.get("DSV41_ENGRAM_TYPE", "mxfp8").lower()
-        if self._dense_type not in ("bf16", "q8_0"):
+        if self._dense_type not in ("bf16", "q8_0", "f32"):
             raise ValueError(f"DSV41_DENSE_TYPE={self._dense_type!r}")
         if self._engram_type not in ("mxfp8", "bf16", "f32"):
             raise ValueError(f"DSV41_ENGRAM_TYPE={self._engram_type!r}")
@@ -260,39 +260,40 @@ class DeepseekV41Model(DeepseekV4Model):
         w.add_indexer_candidate_top_k_blocks(hp["candidate_topk_blocks"])
         w.add_indexer_candidate_block_size(hp["candidate_block_size"])
 
-        # Engram
-        layer_ids = list(hp["engram_layer_ids"])
-        max_ngram, n_heads = hp["engram_max_ngram_size"], hp["engram_n_heads"]
-        primes = engram_primes(len(layer_ids), max_ngram, n_heads, hp["engram_vocab_size"])
-        for li, layer_primes in enumerate(primes):
-            total = sum(p for per in layer_primes for p in per)
-            if total != hp["engram_num_embeddings"][li]:
-                raise ValueError(f"engram layer {layer_ids[li]}: prime sum {total} != num_embeddings {hp['engram_num_embeddings'][li]}")
-        token_map, cvocab = engram_compressed_token_map(self.dir_model if self.target_model_dir is None else self.target_model_dir)
-        if cvocab != hp["engram_compressed_vocab_size"]:
-            raise ValueError(f"compressed vocab {cvocab} != engram_compressed_vocab_size {hp['engram_compressed_vocab_size']}")
-        if len(token_map) != hp["vocab_size"]:
-            raise ValueError(f"token map has {len(token_map)} entries, vocab_size is {hp['vocab_size']}")
-        mults = engram_multipliers(layer_ids, max_ngram, cvocab)
-        w.add_engram_layers(layer_ids)
-        w.add_engram_num_embeddings(hp["engram_num_embeddings"])
-        w.add_engram_max_ngram_size(max_ngram)
-        w.add_engram_vocab_size(hp["engram_vocab_size"])
-        w.add_engram_head_count(n_heads)
-        w.add_engram_head_dim(hp["engram_head_dim"])
-        w.add_engram_pad_token_id(hp["engram_pad_token_id"])
-        w.add_engram_compressed_vocab_size(cvocab)
-        w.add_engram_token_map(token_map)
-        w.add_engram_multipliers([m for row in mults for m in row])
-        w.add_engram_primes([p for layer in primes for per in layer for p in per])
-        # per-layer row offsets of each (order, head) bucket range: exclusive cumsum of that layer's primes (order-major,
-        # head-minor) = NgramHashState.offsets; u64 so table addressing never narrows (tables are > 100 GB)
-        offsets = []
-        for layer in primes:
-            flat = [p for per in layer for p in per]
-            offsets += [sum(flat[:i]) for i in range(len(flat))]
-        w.add_key_value(f"{self.gguf_writer.arch}.engram.offsets", offsets, gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT64)
-        logger.info(f"engram: compressed vocab {cvocab}, pad -> {token_map[hp['engram_pad_token_id']]}, multipliers {mults}")
+        # Engram (keys omitted when the model has no Engram layers: GGUF cannot hold empty arrays, the loader treats them as optional)
+        layer_ids = list(hp.get("engram_layer_ids") or [])
+        if layer_ids:
+            max_ngram, n_heads = hp["engram_max_ngram_size"], hp["engram_n_heads"]
+            primes = engram_primes(len(layer_ids), max_ngram, n_heads, hp["engram_vocab_size"])
+            for li, layer_primes in enumerate(primes):
+                total = sum(p for per in layer_primes for p in per)
+                if total != hp["engram_num_embeddings"][li]:
+                    raise ValueError(f"engram layer {layer_ids[li]}: prime sum {total} != num_embeddings {hp['engram_num_embeddings'][li]}")
+            token_map, cvocab = engram_compressed_token_map(self.dir_model if self.target_model_dir is None else self.target_model_dir)
+            if cvocab != hp["engram_compressed_vocab_size"]:
+                raise ValueError(f"compressed vocab {cvocab} != engram_compressed_vocab_size {hp['engram_compressed_vocab_size']}")
+            if len(token_map) != hp["vocab_size"]:
+                raise ValueError(f"token map has {len(token_map)} entries, vocab_size is {hp['vocab_size']}")
+            mults = engram_multipliers(layer_ids, max_ngram, cvocab)
+            w.add_engram_layers(layer_ids)
+            w.add_engram_num_embeddings(hp["engram_num_embeddings"])
+            w.add_engram_max_ngram_size(max_ngram)
+            w.add_engram_vocab_size(hp["engram_vocab_size"])
+            w.add_engram_head_count(n_heads)
+            w.add_engram_head_dim(hp["engram_head_dim"])
+            w.add_engram_pad_token_id(hp["engram_pad_token_id"])
+            w.add_engram_compressed_vocab_size(cvocab)
+            w.add_engram_token_map(token_map)
+            w.add_engram_multipliers([m for row in mults for m in row])
+            w.add_engram_primes([p for layer in primes for per in layer for p in per])
+            # per-layer row offsets of each (order, head) bucket range: exclusive cumsum of that layer's primes (order-major,
+            # head-minor) = NgramHashState.offsets; u64 so table addressing never narrows (tables are > 100 GB)
+            offsets = []
+            for layer in primes:
+                flat = [p for per in layer for p in per]
+                offsets += [sum(flat[:i]) for i in range(len(flat))]
+            w.add_key_value(f"{self.gguf_writer.arch}.engram.offsets", offsets, gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT64)
+            logger.info(f"engram: compressed vocab {cvocab}, pad -> {token_map[hp['engram_pad_token_id']]}, multipliers {mults}")
 
         # DSpark (block layout only matters to the --mtp file, but the keys are cheap)
         if "dspark_block_size" in hp:
@@ -543,11 +544,13 @@ class DeepseekV41Model(DeepseekV4Model):
         # router, engram gate and confidence head stay F32 (exact from bf16; verify_types.py pins the router to F32)
         if new_name.endswith((".engram_gate.weight", ".ffn_gate_inp.weight")) or new_name == "conf_proj.weight":
             return gguf.GGMLQuantizationType.F32
+        dense_qt = {"q8_0": gguf.GGMLQuantizationType.Q8_0, "f32": gguf.GGMLQuantizationType.F32}.get(
+            self._dense_type, gguf.GGMLQuantizationType.BF16)
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
-            return gguf.GGMLQuantizationType.Q8_0 if self._dense_type == "q8_0" else gguf.GGMLQuantizationType.BF16
+            return dense_qt
         if name in self._dsv4_f32_tensors:
             return gguf.GGMLQuantizationType.F32
         if name in self._dsv4_bf16_tensors and n_dims >= 2:
-            return gguf.GGMLQuantizationType.Q8_0 if self._dense_type == "q8_0" else gguf.GGMLQuantizationType.BF16
+            return dense_qt
         return False
 
