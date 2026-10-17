@@ -95,6 +95,26 @@ pkg/BF16 GGUF on C's fx_base token files + real-text wiki1100 / long17k, for the
    check), CUDA, 600 tokens, F32 KV, FA off: logits bitwise identical base (fd55cb98f) vs head at ub 512 and ub 7; head
    A/A also bitwise. Plus the random V4 model (bitwise, ub 256 / 7).
 
+## Flash attention (fa=1) and multi-sequence / rollback (coordinator items 1, 2)
+- FA graph is exact: with K/V kept F32 inside the FA op (debug-only patch, not committed) fa=1 matches the reference at
+  KL 5.0e-12 / 5.0e-12 / 4.6e-12 (short / wiki330 / rep300): mask concat (window + top-k -inf), attn_sinks, padding and
+  the compressed-row concat are right. FA accumulation is already GGML_PREC_F32 for every arch (llama-graph.cpp).
+- The fa=1 excess is the F16 kernel: llama vs the reference with q/k/v rounded to F16 is still 1.9e-2 on short16 (floor
+  7.9e-7, error from position 1 on, attn_raw-0 rel err 3e-4..2e-3 per row). The CPU single-chunk kernel also rounds Q to
+  F16 and accumulates V*softmax in an F16 VKQ16 buffer, which input rounding alone does not model; the small fixture
+  then amplifies it (routing flips). Not a V4.1 defect.
+- What users see, on agent C's non-chaotic fx_base (F16 KV, fa=1, vs MATCHED): CPU KL 6.5e-8 (t129), 4.1e-5 (t1027),
+  1.2e-4 (c1600), 3.4e-4 (t3001), top-1 >= 0.992; CUDA (default precision) 4.0e-4 / 3.0e-4 / 4.4e-4 / 9.3e-4, top-1
+  >= 0.983. All < 1e-3 and 5-80x below C's bf16 floor (5.1e-3).
+- Multi-sequence (`scripts/dsv41/seq_test.cpp multi`, n_seq_max 2, every ubatch interleaves wiki330 on seq 0 and rep300
+  on seq 1, ub 7 and 64): each sequence vs its own single-sequence reference KL 4.6e-12..4.9e-12 (CPU), 1.6e-11..2.8e-11
+  (CUDA exact), top-1 1.0.
+- Rollback snapshots (`seq_test rollback`, n_rs_seq R; after each true chunk decode a draft whose tail is garbage tokens,
+  seq_rm the rejected tail, continue; odd chunk sizes so ratio-2 groups straddle the rollback point; garbage passes
+  through Engram history, compressor state and KV): R4/D4/acc1 (23 rollbacks), R4/D4/acc3, R2/D5/acc3: KL 4.9e-12 CPU,
+  2.8e-11 CUDA, top-1 1.0. Negative control (keep one rejected token): KL 1.9, so the gate sees pollution.
+- Slot reuse / prefix restore: state_test above (PASS).
+
 ## Milestones
 | # | state | commit |
 |---|---|---|
@@ -169,6 +189,5 @@ Sizes: experts 289 GB (MXFP4), dense ~14 GB BF16 (FP8 dequant), embed+head 2.7 G
 - The F32 KL gate cannot be met at the real top-k budgets on any implementation (the fp32 reference misses its own
   float64-rope version by KL 6.6e-4); long-context acceptance = selection parity with near-tie gap evidence.
 - Image tokens: Engram DEAD / gate-off for embd inputs is hashed as DEAD but the gate is not forced to 0 yet; vision not ported.
-- Multi-sequence batches (n_seq_max > 1) and rollback snapshots (n_rs_seq > 0) are wired like V4 but not parity-tested.
 - No ubatch shares a token across sequences (asserts, as the PLE path).
 - DSpark drafting graph not implemented.
