@@ -2,6 +2,35 @@
 
 Branch `dsv41` in `$W/wt_dsv41` (off llama.cpp_pinset fd55cb98f). Contract for builder B: `TENSORS.md`.
 
+## Porting workflow (unslothai/scripts #649 bundle, `temp/us_gguf`: gguf_build_workflow.md A1-A5, PORTING.md)
+| step | state | evidence |
+|---|---|---|
+| A1 recon + reuse map + fixture + converter + graph | done | reuse map in deepseek41.cpp header (V4 HC/MLA/MoE/raw cache reused; new: Engram, lagged mHC, ratio 1/2 + sharing + candidates). Two fixtures: `tiny_fixture` (small dims, fast, seeded-bug harness) and `tiny_fixture_realdim` (A1 rule: REAL dims 5120 / 64x512 heads / rope 64 / q 1280 / o 8x1024 / expert 2304 / index 32x128 / Engram 8x256 n-gram 4 / window 128 / block 8 / YaRN 65536x16; only counts shrunk: 10 layers, 8 experts top-2, Engram bucket start 1009, index top-k 64, 16 candidate blocks). Rare-path thresholds: window 128, ratio-2 top-k binds > 128 tokens, candidate mask binds > 128 ratio-1 rows; prompt wiki1100 exceeds all. Reference = official model.py (no transformers implementation of deepseek_v41 exists in 4.57 / 5.x, so ref_logits.py --generic cannot load it); the fixture writes the ref_logits.py npz schema + full logits. Fixture generates under the reference (prefill vs decode max abs 2.7e-5 at real dims). |
+| A2 parity (bundled tools/dump_logits + port/compare_ref.py, F32 gate --max-kl-mean 1e-6 --min-top1 1.0 --min-cos 0.99999) | done (CPU), CUDA calibrated | see "A2 numbers" below; 13/13 seeded bugs FAIL on the small fixture, 5/5 on real dims |
+| A3 template + V4.1 DSML tool parser | not started (next) | template candidate exists: models/dsv41/chat_template.jinja (5/5 byte parity, Phase 0) |
+| A4 never break other models | done | test-chat all passed; test-llama-archs CPU all 137 passed; CUDA: full suite exceeded its 2 h box (killed, no verdict), so the archs sharing touched code were run: deepseek4/41, deepseek2/32, glm-dsa, glm5-next, maple, qwen3moe, qwen35moe, qwen4exp on CUDA + CPU + Meta: 28/28 passed; deepseek41 on CPU / CUDA / Meta OK; test-backend-ops for used ops pass; V4 logits bitwise identical base vs head; no vocab change (vocab differential N/A) |
+| A5 pin PR / pinset sim | not started (after A3 and B's GGUF) | |
+
+### A2 numbers
+- CPU, F32 KV, FA off, single-shot / ub 7 / ub 1, swa_full 1 and 0: small fixture KL mean <= 4.9e-12, top-1 1.0, router top-k
+  exact on all 10 MoE layers; real-dims fixture (incl. wiki1100) KL mean <= 2.7e-11, max 3.0e-10, top-1 1.0, router exact
+  40/40 (prompt x layer), l_out rel err <= 4e-6 on every layer.
+- Seeded bugs (scripts/dsv41/seeded_bugs.py, every one must FAIL): Engram signed-sqrt dropped, Engram history order,
+  Engram ungated, mHC not lagged, output collapse with wrong pre, V4 per-head q norm, compressor softmax axis, index-K rope
+  dims, compressed-KV rope dims, indexer ReLU dropped, candidate pin dropped, candidate mask not applied, top-k reuse
+  replaced by dense: 13/13 FAIL (KL 4e-3 .. 2). On real dims: candidate pin / candidate mask / reuse / ReLU / Engram
+  history: 5/5 FAIL. Free oracle: below 16 visible ratio-1 rows the candidate bugs are inert (short16 passes), as the
+  architecture guarantees.
+- CUDA (B200), `NVIDIA_TF32_OVERRIDE=0` alone: FAILS (KL 1e-3..7e-2): the override does not reach the mmf tf32 path for
+  F32 weights (PORTING.md Phase 5). With `GGML_CUDA_F32_EXACT=1` (debug knob in mmf.cu, default off) as well: small
+  fixture passes every cell (ub 0/7/1, graphs on and off); real dims pass everything except wiki1100 at ub 0/7 (KL mean
+  2.3e-6, top-1 1.0, max 2.4e-3 at t=1035). Chased: one indexer near-tie at layer 2, t=1035, k-th vs (k+1)-th CPU score
+  gap 4.4e-5 relative while CUDA batched idx_score differs from CPU by 1.7e-5..2.6e-5 relative (score = signed sum of
+  relu terms, ~10x cancellation); the flip then propagates to that token's selections in later layers. Decode (ub 1) passes.
+  Classified as precision, not a defect; CUDA gate = CPU gate except one near-tie token.
+- CUDA graphs on vs off (B10 A/B): identical results, no hang under the 1200 s watchdog (timeout -k 15 => SIGKILL).
+- FA on (F16 attention) is an acceptance config, not a parity config (see older numbers below).
+
 ## Milestones
 | # | state | commit |
 |---|---|---|
@@ -20,7 +49,7 @@ reused in between, two-level candidate blocks (pool_1d max per block, pin newest
 no per-head q norm. KV cache: `llama-kv-cache-dsv4` slots are ratio-parametrised (V4: CSA 4 overlap + LID, HCA 128;
 V4.1: CSA slot = ratio 2, HCA slot = ratio 1, only kv-source layers own rows, no LID).
 
-## Tiny fixture (`$W/models/dsv41/tiny_fixture`, GGUF `$W/models/dsv41/tiny_gguf/tiny-f32.gguf`)
+## Tiny fixtures (`$W/models/dsv41/tiny_fixture` small dims; `tiny_fixture_realdim` + `tiny_gguf/realdim-f32.gguf` real dims, 24.6 GB F32). Small fixture (`$W/models/dsv41/tiny_fixture`, GGUF `$W/models/dsv41/tiny_gguf/tiny-f32.gguf`)
 10 layers, dim 128, real tokenizer + real 99,092-id Engram token map, Engram on L1/L4, ratios [0,0,2,2,2,2,1,1,1,1],
 kv sources 2/4/6, index sources 2/4/6/8, candidate source 6 (4 blocks x 4), index_topk 8, window 16, YaRN orig 64.
 Checkpoint in official naming and storage formats (FP8 32x32 ue8m0, FP4 experts, Engram FP8 + per-row-32 scales).
