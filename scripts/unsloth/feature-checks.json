@@ -107,6 +107,12 @@
       "checks": [
         { "kind": "mtmd", "projector": "*" }
       ]
+    },
+    "penalize-prompt": {
+      "owner": "unslothai#283",
+      "checks": [
+        { "kind": "penalize-prompt", "field": "penalize_prompt" }
+      ]
     }
   },
   "unchecked": {
