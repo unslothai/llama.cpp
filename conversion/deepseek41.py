@@ -342,22 +342,74 @@ class DeepseekV41Model(DeepseekV4Model):
         consumed: list[str] = []
         for proj, key in (("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP), ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
                           ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP)):
-            loaders = []
+            loaders, names = [], []
             for eid in range(n_experts):
                 wn, sn = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight", f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
                 if wn not in self.model_tensors or sn not in self.model_tensors:
                     raise KeyError(f"Missing routed expert tensors {wn}")
                 loaders.append((self.model_tensors[wn], self.model_tensors[sn]))
+                names.append((wn, sn))
                 consumed += [wn, sn]
             extra = sorted(n for n in self.model_tensors
                            if re.match(rf"layers\.{bid}\.ffn\.experts\.(\d+)\.{proj}\.weight$", n)
                            and int(n.split(".")[4]) >= n_experts)
             if extra:
                 raise KeyError(f"layer {bid}: unexpected experts beyond {n_experts}: {extra[:3]}")
-            data = self._mxfp4_expert_tensor(loaders)
+            data = self._mxfp4_expert_stream(names, loaders)
             new_name = self.format_tensor_name(key, bid)
             self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
         return consumed
+
+    @staticmethod
+    def _repack_mxfp4_np(packed: np.ndarray, scale: np.ndarray) -> np.ndarray:
+        """Same bytes as TextModel.repack_mxfp4_blocks (checked on the real experts), vectorised:
+        source byte k of a 32-group holds elements 2k (low) / 2k+1 (high); ggml byte j holds j (low) / j+16 (high)."""
+        rows, packed_cols = packed.shape
+        nb = packed_cols * 2 // 32
+        if packed_cols * 2 % 32 != 0 or scale.shape != (rows, nb):
+            raise ValueError(f"MXFP4 shapes {packed.shape} / {scale.shape} do not match")
+        src = packed.reshape(rows, nb, 16)
+        lo_src, hi_src = src[:, :, :8], src[:, :, 8:]  # elements 0..15 and 16..31
+        out = np.empty((rows, nb, 17), dtype=np.uint8)
+        out[:, :, 0] = scale
+        q = out[:, :, 1:].reshape(rows, nb, 8, 2)
+        q[..., 0] = (lo_src & 0x0F) | ((hi_src & 0x0F) << 4)  # j = 2k
+        q[..., 1] = (lo_src >> 4) | (hi_src & 0xF0)            # j = 2k + 1
+        return out.reshape(rows, nb * 17)
+
+    def _mxfp4_expert_stream(self, names: list[tuple[str, str]], loaders) -> _StreamedBytes:
+        """Stacked [n_expert, rows, blocks*17] MXFP4 tensor, repacked by a thread pool at write time."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from safetensors import safe_open
+
+        rows, packed_cols = loaders[0][0]().shape
+        shape = (len(names), rows, packed_cols * 2 // 32 * 17)
+        n_main = self.hparams["num_hidden_layers"]
+
+        def src_name(n: str) -> str:  # undo the mtp.M -> layers.(n_main+M) rekey of filter_tensors
+            m = re.match(r"layers\.(\d+)\.(.+)$", n)
+            if m is not None and int(m.group(1)) >= n_main:
+                return f"mtp.{int(m.group(1)) - n_main}.{m.group(2)}"
+            return n
+        names = [(src_name(wn), src_name(sn)) for wn, sn in names]
+        parts = {wn: self._tensor_part(wn) for wn, _ in names}
+        local = threading.local()
+
+        def one(ws: tuple[str, str]) -> np.ndarray:
+            wn, sn = ws
+            hs = local.__dict__.setdefault("h", {})
+            part = parts[wn]
+            if part not in hs:
+                hs[part] = safe_open(part, framework="pt")
+            w = hs[part].get_tensor(wn).view(torch.uint8).numpy()
+            sc = hs[part].get_tensor(sn).view(torch.uint8).numpy()
+            return self._repack_mxfp4_np(w, sc)
+
+        def chunks() -> Iterable[np.ndarray]:
+            with ThreadPoolExecutor(int(os.environ.get("DSV41_THREADS", "16"))) as ex:
+                yield from ex.map(one, names)
+        return _StreamedBytes(shape, chunks)
 
     def _engram_embed_tensor(self, bid: int) -> list[str]:
         wn, sn = f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"
@@ -408,10 +460,14 @@ class DeepseekV41Model(DeepseekV4Model):
         logger.info(f"{new_name}: Engram table {rows} x {dim} copied as {self._engram_type.upper()}")
         return [wn, sn]
 
+    _weight_map: dict[str, str] | None = None
+
     def _tensor_part(self, name: str) -> Path:
-        import json
-        with open(self.dir_model / "model.safetensors.index.json", "r", encoding="utf-8") as f:
-            return self.dir_model / json.load(f)["weight_map"][name]
+        if self._weight_map is None:
+            import json
+            with open(self.dir_model / "model.safetensors.index.json", "r", encoding="utf-8") as f:
+                self._weight_map = json.load(f)["weight_map"]
+        return self.dir_model / self._weight_map[name]
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if self._dsv4_mxfp4_generated:
