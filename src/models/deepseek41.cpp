@@ -208,7 +208,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_idx_embd  = hparams.indexer_head_size;
     const int64_t n_idx_head  = hparams.indexer_n_head;
 
-    // DSpark stages (blk.n_layer..) are loaded as optional tensors; the graph does not use them yet
+    // DSpark stages (blk.n_layer..) are loaded as optional tensors and unused here: the draft runs as a DFLASH model
     uint32_t n_expert_dspark = n_expert;
     ml.get_key(LLM_KV_DSPARK_EXPERT_COUNT, n_expert_dspark, false);
 
@@ -288,7 +288,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        throw std::runtime_error("DeepSeek-V4.1 DSpark drafting is not implemented yet");
+        throw std::runtime_error("DeepSeek-V4.1 has no MTP graph: its DSpark draft is a separate DFLASH GGUF "
+                "(convert_hf_to_gguf.py --dspark), used with --spec-type draft-dspark");
     }
     return std::make_unique<graph>(*this, params);
 }

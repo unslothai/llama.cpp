@@ -248,6 +248,8 @@ class Keys:
         MAGNITUDE            = "{arch}.hyper_connection.magnitude"
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
+        # single-pass mHC: each sublayer collapses with the previous sublayer's pre-mix (DeepSeek-V4.1)
+        SINGLE_PASS          = "{arch}.hyper_connection.single_pass"
 
     class Engram:  # deepseek41 hashed n-gram memory
         LAYERS                = "{arch}.engram.layers"                 # u32[n_engram]
