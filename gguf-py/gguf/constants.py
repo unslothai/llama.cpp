@@ -6289,7 +6289,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
-    MXFP8   = 43
+    MXFP8   = 67  # fork-local id (42..63 reserved for upstream)
 
 
 class ExpertGatingFuncType(IntEnum):
