@@ -2127,6 +2127,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_FREQUENCY_PENALTY"));
     add_opt(common_arg(
+        {"--penalize-prompt"},
+        {"--no-penalize-prompt"},
+        string_format("whether prompt tokens count towards the repeat, presence, frequency and DRY penalties (default: %s)", params.sampling.penalize_prompt ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.penalize_prompt = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PENALIZE_PROMPT"));
+    add_opt(common_arg(
         {"--dry-multiplier"}, "N",
         string_format("set DRY sampling multiplier (default: %.2f, 0.0 = disabled)", (double)params.sampling.dry_multiplier),
         [](common_params & params, const std::string & value) {
