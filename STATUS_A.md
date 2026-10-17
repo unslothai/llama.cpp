@@ -56,7 +56,15 @@ pkg/BF16 GGUF on C's fx_base token files + real-text wiki1100 / long17k, for the
 First full-model results (GPUs 0,2,3, ub 512, fa=0, F32 KV; load + 6 prompts in ~10 min): all finite; real-text
 self-perplexity wiki1100 2.11 (next-token top-1 0.826), long17k 2.0 / 1.28 / 1.80 / 2.08 / 3.03 on [0,1k) / [1k,4k) /
 [4k,8k) / [8k,16384) / [16384,17k); 256-token bands before the pool threshold already range 1.6..3.0 (text-dependent, no
-jump at 16,392). ub 7 / ub 1 / fa=1 phases and the oracle comparison pending (outputs/dsv41_full/bf16_ub512).
+jump at 16,392). All phases done (outputs/dsv41_full/bf16_ub512/{ub512,ub7,ub1,fa1_ub512}), all finite; self-ppl
+wiki1100 2.105 / 2.102 / 2.103 / 2.086 and long17k 1.862 / 1.862 / - / 1.858 for ub512 / ub7 / ub1 / fa1.
+CUDA batch-split is not bitwise on the full model: ub7 vs ub512 KL mean 9.6e-3 (wiki1100), 3.4e-3 (long17k), 6e-2 on
+the random-token t1025; fa1 vs ub512 7.4e-3 / 3.2e-3. Attribution: the full model on CPU (ngl 0, 12 wiki tokens,
+~5 min) is bitwise identical at ub 512 and ub 7, and CPU vs each CUDA arm shows the same per-position profile (KL
+3e-6 at t0, 0.08-0.2 at t5-t6) whichever ubatch / FA is used: those positions are numerically sensitive and CUDA's
+kernels (MMQ / MMVQ, q8_1 activations) differ from CPU there. Released V4-Flash (UD-IQ1_S) on the same text: ub7 vs
+ub512 KL mean 3.4e-2, 0.4 at t6. So the graph is batch-invariant; the CUDA spread is kernel numerics. Which side is
+closer to the truth is for C's full-model MATCHED oracle (prompts: outputs/dsv41_full/bf16_ub512/tokens).
 
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
