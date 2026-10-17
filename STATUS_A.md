@@ -279,3 +279,25 @@ F16 attention numerics of the batched verify. Target rollback via the API (seq_t
 acc 1..4) is exact: max abs logit diff 9.5e-6 vs one-shot.
 Not proven: real-model DSpark acceptance (needs the 7.9 GB mtp.* converted + a GPU window); multi-sequence DSpark
 blocks; KV eviction of ring cells in a long running loop with swa_full off (the smoke ran 300 tokens past the window).
+
+### MXFP8 renumber to fork-local 67 (main's decision, da47a97a9)
+GGML_TYPE_MXFP8 = 67, GGML_TYPE_COUNT = 68 (42..63 reserved for upstream, as #61). No other literal 43 / COUNT-sized
+table depends on it (type_traits designated initialisers; type loops already skip NULL names / blck_size 0).
+New build rejects old (43) files and old builds reject 67 files (`invalid ggml type`), both checked.
+Header patcher `scripts/dsv41/gguf_header_patch.py` (dry run default; --apply backs up header bytes; pwrite inside the
+header only): type 43 -> 67 for `blk.N.engram_embd.weight` (2-D, ne0 % 32, size checked), template list -> msgs
+(same length; patched template == the repo jinja byte for byte). On copies (temp/dsv41_patch_test): fx_base, fx_engram0,
+pkg shard-1 copy, pkg shard-8 header + 256 MiB: data sha256 unchanged; cmp vs original = 126 bytes, all below
+data_start. Dry run on pkg/BF16 (read only): shard 1 template, shards 8 and 9 one Engram table each, mtp-*.gguf template.
+NOT applied to pkg/* (main applies after D's grid). verify_all.py accepts type 67 (or 43) for Engram MXFP8.
+Fixture gate on the patched fx_base with the new build: unchanged (t129 9.2e-12, t3001 2.30e-5); DSpark gate unchanged;
+CUDA test-backend-ops GET_ROWS 225/225 (MXFP8 incl.).
+Pin: `dsv41-pin` (f8cfdaedb) = upstream + change (MXFP8 67) still REFUSED after #61 (both edit the COUNT line).
+`dsv41-pin-after61` (71752e6e0) = dsv41-pin + #61 merged, COUNT pre-resolved to 68: merges clean on b11707..b11714;
+pin_contract FAILs only unslothai#61 (`GGML_TYPE_COUNT = 67` not kept: replaced by 68) -> needs the fold (#241/#253
+precedent). Mix tree b11714 + pins (temp/dsv41_mix_b11714): test-llama-archs 142/142, test-chat pass, fx_base gate PASS
+(t3001 2.44e-5), DSpark gate PASS. ggml-org#30670 REFUSED on every tag before us: its squash 01fc3aae8 is already in
+the aged base b11707, so the pin re-applies upstream code (pr-set doc: delete the entry once a base tag carries it).
+Real DSpark draft: models/dsv41/gguf/dspark/DeepSeek-V4.1-Flash-1017-DSpark-DFLASH-BF16.gguf (8.5 GB, 78 tensors,
+target_layers 37/38/39, 128 experts top-3, 13 s). Acceptance run: scripts/dsv41/dspark_accept_real.sh with the MXFP8=43
+build temp/wt_dsv41_43 (7a582830e) because pkg is not patched yet; gpu_queue --gb 36 (--cpu-moe target).
