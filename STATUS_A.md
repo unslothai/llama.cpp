@@ -367,3 +367,14 @@ No reference scores exist in the traces, so large-gap rows (cascades) cannot be 
   base top-2 " all" -0.87 vs " these" -1.17). Bitwise draft == no-draft needs batch-invariant dense kernels: ub 1 runs
   BF16 weights through MMVF with F32 activations, a 6-token verify batch through MMF with BF16-rounded activations.
   Not a defect; the TF32 fix cannot and does not claim to close it.
+- CUDA run-to-run nondeterminism (C's long17k finding), reproduced on ONE card on fixture fx_long (sp20001 truncated to
+  1536 tokens, ub 512): row 1085 bimodal, 2 of 4 runs differ. First differing tensor between runs: attn_comp-10 (l_out
+  -9 identical); the visible selection at layer 10 (index source, level two under the layer-8 candidate mask) swaps
+  one row (787 vs 601) at row 1085. Cause: the CUDA radix top-k (nrows > SM count or ncols > 1024) placed elements
+  equal to the k-th key via atomicAdd order, so with exact ties at the cut (ReLU-zeroed / masked scores) the chosen
+  set changed run to run. Fix (commit below): ties now take the lowest column indices (ordered per-row scan with a
+  block prefix count); the greater-than-cut elements are unchanged. After: 6/6 runs bitwise equal at 1536 tokens and
+  2/2 at the full 20,001 tokens (`scripts/dsv41/gate_det_cuda.sh`); test-backend-ops TOP_K OK; gate_c CUDA exact
+  fx_long t2001 9.5e-6, fx_base t1027 / t3001 4.5e-9 / 5.8e-5; random V4 bitwise unchanged; test-llama-archs 8/8.
+  Upstream: the radix top-k is upstream code, so V4-Flash's indexer (and any top-k with ties beyond the bitonic
+  range) is run-to-run nondeterministic on CUDA too. Candidate upstream issue, not filed.
