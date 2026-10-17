@@ -94,6 +94,9 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
+    // Message keys the OpenAI fields above do not cover (e.g. "task", per-message "tools", tool call
+    // "namespace"), kept as a JSON object string. Only templates that read them get them (DeepSeek V4.1).
+    std::string                               extra_json;
 
     common_json to_json_oaicompat(bool concat_typed_text = false) const;
 
