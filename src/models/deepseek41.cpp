@@ -965,6 +965,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
 
+        // flat [n_embd*hc, n_tokens] alias for parity tooling (compare_ref.py reads l_out-<L>)
+        ggml_tensor * l_out = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        cb(l_out, "l_out", il);
+        ggml_build_forward_expand(gf, l_out);
+
         pre_prev = ffn_pre;
     }
 
