@@ -136,6 +136,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("presence_penalty", params.sampling.penalty_present))
         ->set_desc("Repeat alpha presence penalty (0 = disabled)"));
 
+    add((new field_bool("penalize_prompt", params.sampling.penalize_prompt))
+        ->set_desc("Whether prompt tokens count towards the repeat, presence, frequency and DRY penalties. When false, only generated tokens are penalized"));
+
     add((new field_num("dry_multiplier", params.sampling.dry_multiplier))
         ->set_desc("Set the DRY (Don't Repeat Yourself) repetition penalty multiplier (0 = disabled)"));
 
