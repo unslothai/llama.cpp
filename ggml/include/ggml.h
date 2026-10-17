@@ -430,8 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_MXFP8   = 43, // MXFP8 E4M3 (32 elements, E8M0 scale)
-        GGML_TYPE_COUNT   = 44,
+        // fork-local (unslothai): 42..63 stay reserved for upstream, so a stock build rejects these files
+        // instead of misreading them
+        GGML_TYPE_MXFP8   = 67, // MXFP8 E4M3 (32 elements, E8M0 scale)
+        GGML_TYPE_COUNT   = 68,
     };
 
     // [TAG_GGML_PREC]
