@@ -159,7 +159,11 @@ sweep: `bash scripts/dsv41/run_parity.sh <build> <gguf> <outdir> <ngl> "fa:ub ..
   itself with q/k/v rounded to F16 (4.5e-3 wiki, 1.7e-2 rep300): the random fixture's top-k / routing flips amplify F16 noise.
 - Mechanisms are live: KL(ref || ref without X) = Engram 3.1, candidate mask 0.17, top-k reuse (dense instead) 1.2,
   single-pass mHC (standard instead) 0.6; llama.cpp matches the full reference, not any ablation.
-- MXFP4 experts (bit-exact repack verified): short16 KL 2.8e-4 from the Q8 activation quantisation of the MXFP4 matmul.
+- MXFP4 experts (bit-exact repack verified): the 2.8e-4 short16 figure was from an older fixture and is stale. Current
+  small fixture: short 2.0e-2, wiki330 1.4e-1 (chaotic fixture). On C's fx_base (B's MXFP4-expert -F32 GGUF, CPU) vs
+  MATCHED: t129 3.2e-4, t1027 9.1e-4, t3001 2.1e-3 (top-1 0.965), vs the F32-expert copy at <= 2.3e-5: the CPU MXFP4
+  matmul quantizes activations to q8_0 (C localised it: with q8_0 applied in the reference the expert outputs agree to
+  5e-8). Kernel precision shared by every MXFP4 model, below the bf16 floor (5e-3), not a port defect.
 
 ## Other checks
 - test-llama-archs deepseek41: CPU OK, CUDA NMSE 3.3e-6, Meta (tensor split) OK, roundtrip OK. deepseek4: still OK.
