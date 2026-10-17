@@ -193,6 +193,13 @@ Sizes: experts 289 GB (MXFP4), dense ~14 GB BF16 (FP8 dequant), embed+head 2.7 G
    KV); the GGUF port does not, so expect KL above the fixture's 1e-11 even when correct. Measure the oracle with and without
    fake-quant on a few prompts (`DSV41_FAKE_QUANT=1` in the shim emulates it on CPU).
 
+## Engram placement guard
+`llama-model-loader.cpp`: an `engram_embd` placement on a non-host buffer (from `-ot`, or any split mode) is refused with a
+warning and the table goes to the CPU buffer. Test `scripts/dsv41/engram_placement.cpp` (all layers offloaded,
+override engram_embd -> CUDA0): with the guard, a warning per table, CUDA0 model buffer 78.90 MiB (= no override) and
+logits bitwise equal to the run without the override; negative control (build without the guard): CUDA0 buffer
+80.53 MiB, i.e. the tables were uploaded.
+
 ## Not proven / open
 - A5 (pin PR / pinset sim) not started; full-model parity waits for B's GGUF and the oracle.
 - The F32 KL gate cannot be met at the real top-k budgets on any implementation (the fp32 reference misses its own

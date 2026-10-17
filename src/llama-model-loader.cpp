@@ -1270,6 +1270,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // deepseek41 Engram tables (~100 GB each on the full model) are host-resident gather tables: the graph only
+        // get_rows a few rows per token on the CPU. Never let an override or a split mode put them in device memory.
+        if (tn.tensor == LLM_TENSOR_ENGRAM_EMBD && !ggml_backend_buft_is_host(buft)) {
+            LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
+            buft = ggml_backend_cpu_buffer_type();
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
