@@ -167,6 +167,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error("DeepSeek-V4.1 engram metadata is inconsistent");
         }
         engram_layers.assign(e_layers.begin(), e_layers.end());
+        hparams.dsv41_tok_hist = true; // state save/restore must carry the n-gram history
         engram_pad_cid = engram_token_map[pad_id];
         engram_primes.assign(primes.begin(), primes.end());
         engram_offsets.resize(primes.size());
