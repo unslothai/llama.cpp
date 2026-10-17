@@ -354,3 +354,16 @@ No reference scores exist in the traces, so large-gap rows (cascades) cannot be 
   8.6e-12 / 4.5e-9 / 5.8e-5 (unchanged).
 - Upstream V4-Flash: same code path (F32 router / hc_fn on CUDA go through MMF TF32 at 4..16 columns and cuBLAS TF32
   above; ubatch-dependent routing). Not changed here (arch gate). Candidate upstream issue, not filed.
+- Full-model selection traces (main's item): the multi-ubatch sel_top_k dump is a concatenation with a per-ubatch row
+  width k = min(n_comp, 512) (ratio-2 layers: k = 256 in the first 512-token ubatch), so shape.txt's [T-256, 512] is a
+  misparse; `scripts/dsv41/ubsweep/sel_full.py` parses per ubatch. Correctly parsed, t3001 L2 still differs on
+  1515 / 3001 rows (1458 with the TF32 fix), mostly single swaps, from the first binding row (t = 1041). Not a split
+  defect: the fixture at ONE ubatch with the real dtypes (fx_base BF16 + MXFP4) gives L2 1426 / 3001, L8 2377, L12
+  2406, while F32X exact gives 12 / 129 / 174. The gap is llama.cpp's bf16 / q8 activation rounding vs the f32
+  MATCHED oracle at near-tie top-k boundaries (score the selections against a bf16-activation oracle to gate them).
+- DSpark draft vs no-draft (F32 KV, fa off, greedy): fixture F32X with GGML_CUDA_F32_EXACT=1 + NVIDIA_TF32_OVERRIDE=0:
+  IDENTICAL (300 tokens, pre- and post-fix), so the speculative verify path is exact. Default precision: differs
+  (fixture: dense F32 weights stay TF32 by design; real model, --cpu-moe, fixed build: first diff at token 50,
+  base top-2 " all" -0.87 vs " these" -1.17). Bitwise draft == no-draft needs batch-invariant dense kernels: ub 1 runs
+  BF16 weights through MMVF with F32 activations, a 6-token verify batch through MMF with BF16-rounded activations.
+  Not a defect; the TF32 fix cannot and does not claim to close it.
