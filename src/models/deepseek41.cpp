@@ -774,6 +774,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
             }
 
+            {
+                // per-layer alias of the top-k this layer attends with (reused on consumers), for selection parity
+                ggml_tensor * sel = ggml_view_2d(ctx0, top_k, top_k->ne[0], top_k->ne[1]*top_k->ne[2]*top_k->ne[3], top_k->nb[1], 0);
+                cb(sel, "sel_top_k", il);
+                ggml_build_forward_expand(gf, sel);
+            }
+
             // ---- sparse attention over [window raw KV | selected compressed rows]
             ggml_tensor * k_rot = inp_attn->self_k_rot;
             if (k_rot) {
