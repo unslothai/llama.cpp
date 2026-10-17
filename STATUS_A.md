@@ -7,7 +7,7 @@ Branch `dsv41` in `$W/wt_dsv41` (off llama.cpp_pinset fd55cb98f). Contract for b
 |---|---|---|
 | A1 recon + reuse map + fixture + converter + graph | done | reuse map in deepseek41.cpp header (V4 HC/MLA/MoE/raw cache reused; new: Engram, lagged mHC, ratio 1/2 + sharing + candidates). Two fixtures: `tiny_fixture` (small dims, fast, seeded-bug harness) and `tiny_fixture_realdim` (A1 rule: REAL dims 5120 / 64x512 heads / rope 64 / q 1280 / o 8x1024 / expert 2304 / index 32x128 / Engram 8x256 n-gram 4 / window 128 / block 8 / YaRN 65536x16; only counts shrunk: 10 layers, 8 experts top-2, Engram bucket start 1009, index top-k 64, 16 candidate blocks). Rare-path thresholds: window 128, ratio-2 top-k binds > 128 tokens, candidate mask binds > 128 ratio-1 rows; prompt wiki1100 exceeds all. Reference = official model.py (no transformers implementation of deepseek_v41 exists in 4.57 / 5.x, so ref_logits.py --generic cannot load it); the fixture writes the ref_logits.py npz schema + full logits. Fixture generates under the reference (prefill vs decode max abs 2.7e-5 at real dims). |
 | A2 parity (bundled tools/dump_logits + port/compare_ref.py, F32 gate --max-kl-mean 1e-6 --min-top1 1.0 --min-cos 0.99999) | done (CPU), CUDA calibrated | see "A2 numbers" below; 13/13 seeded bugs FAIL on the small fixture, 5/5 on real dims |
-| A3 template + V4.1 DSML tool parser | not started (next) | template candidate exists: models/dsv41/chat_template.jinja (5/5 byte parity, Phase 0) |
+| A3 template + V4.1 DSML tool parser | done (1d51c092f) | template `models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja` (= `$W/models/dsv41/chat_template.jinja`, 5/5 byte parity with encoding.py). V4.1 tags carry a leading space (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); detection in common/chat.cpp keys on `｜DSML｜ calls>` (the template never names `dsml_token`), parser = the V4 parser with the spaced tags. test-chat: the V4 parser suite ported to V4.1 markup (content, thinking, single / parallel / mixed-type calls, content before calls, continuation, reconstruction) all pass; negative control (V4.1 tag switch off) aborts on the V4.1 block. |
 | A4 never break other models | done | test-chat all passed; test-llama-archs CPU all 137 passed; CUDA: full suite exceeded its 2 h box (killed, no verdict), so the archs sharing touched code were run: deepseek4/41, deepseek2/32, glm-dsa, glm5-next, maple, qwen3moe, qwen35moe, qwen4exp on CUDA + CPU + Meta: 28/28 passed; deepseek41 on CPU / CUDA / Meta OK; test-backend-ops for used ops pass; V4 logits bitwise identical base vs head; no vocab change (vocab differential N/A) |
 | A5 pin PR / pinset sim | not started (after A3 and B's GGUF) | |
 
@@ -30,6 +30,52 @@ Branch `dsv41` in `$W/wt_dsv41` (off llama.cpp_pinset fd55cb98f). Contract for b
   Classified as precision, not a defect; CUDA gate = CPU gate except one near-tie token.
 - CUDA graphs on vs off (B10 A/B): identical results, no hang under the 1200 s watchdog (timeout -k 15 => SIGKILL).
 - FA on (F16 attention) is an acceptance config, not a parity config (see older numbers below).
+
+## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
+1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
+2. MATCHED oracle: the fixture ref/ IS the matched reference (shim act_quant / fp4_act_quant = identity); every gate above is
+   against it. NATIVE (in-graph FP8/FP4 activation quant emulated on CPU, `scripts/dsv41/native_gap.py`) vs MATCHED:
+   small KL 0.24..0.60, real dims 0.69..1.47 (random weights are chaotic); llama vs MATCHED 1.7e-11..2.7e-11 on the same
+   prompts. The gap belongs to the oracle, not to the port; on the real model gate against MATCHED (KL < 1e-3 + p99).
+3. Harness uses full logits: `ref_forward` asserts `[1, T, vocab]` (ParallelHead full_logits path), dumps are [T, V].
+4. Epsilons kept separate: norms 1e-20 (as `RMSNorm.eps` in model.py), hc_eps 1e-6, router weight sum +1e-20 (2f4055f00;
+   V4 keeps its 6.1e-5 clamp); norm statistics in F32.
+5. Boundaries, `tiny_fixture_budget` (real budgets on small dims: window 128, index top-k 512, candidate pool 2048 x 8 =
+   16384 rows, YaRN 65536 x 16; one 17,000-token prompt, so every t is its own boundary: window 127/128/129, top-k
+   511/512/513 at both ratios, pool 16383/16384/16385; 616 rows with real exclusion, up to 77 blocks excluded):
+   - candidate invariants (reference): newest partial block kept on every row, kept-block count = min(visible, 2048) on
+     every row, real exclusion present: PASS.
+   - CPU llama.cpp, single shot / ub 4096 / ub 1025 (odd ratio-2 groups split across ubatches): logits and every
+     selected set bitwise identical across the three splits.
+   - vs the fp32 reference: top-1 99.75%, KL median ~1e-7, mean 3.0e-4 (p99 3.9e-4, max 0.42), i.e. heavy-tailed, and 0
+     below t=1100. Selection: L2 (first index layer) differs on 87 / 17000 rows, every one a single swap at rank 512/513;
+     llama-vs-reference index-score error (max over a row / row top score) median 1.3e-5, p99 4.7e-5; the reference's own
+     gap for each swapped pair is <= 2.4e-5 (median 2.3e-6), below the error p99 on 87 / 87 rows. Later layers inherit
+     the flips (L4 349, L6 1291, L8 2422 rows; picks outside the reference pool only on rows whose pool itself flipped).
+     The score error grows linearly with position (median 1.2e-6 at t < 1100 -> 2.5e-5 at t > 12000): float32 rope
+     angle rounding (|angle| up to ~1.7e4 rad, ~2e-4 rad rounding at t = 16000 on both sides, rounded differently:
+     ggml multiplies theta by theta_scale per pair, model.py multiplies t by a rounded freq).
+     Attribution (`scripts/dsv41/ref_precision_floor.py`, reference variants, same weights):
+     | reference variant | KL(variant ‖ ref32) | L2 / L4 / L6 / L8 rows differing from ref32 | llama vs variant: KL, L2 / L4 / L6 / L8 |
+     |---|---|---|---|
+     | float64 upcasts (fp32 angles) | 1.6e-4 | 8 / 53 / 616 / 1267 | 4.0e-4, 93 / 388 / 1721 / 3154 |
+     | exact (float64) rope angles | 6.6e-4 | 139 / 623 / 2519 / 4200 | 7.5e-4, 150 / 687 / 2781 / 4675 |
+     | ggml-rounded rope angles | 3.7e-4 | 87 / 338 / 1371 / 2648 | 1.1e-4, 8 / 40 / 274 / 701 |
+     With the reference rounding its rope angles the way ggml does, llama.cpp's L2 differences fall from 87 to 8 rows,
+     the same count as the reference's own fp32-vs-fp64 noise; with exact angles the fp32 reference is itself further
+     from the truth than llama.cpp is from it. Classified as precision (rope-angle rounding + fp32 arithmetic), no defect.
+   - CUDA (`GGML_CUDA_F32_EXACT=1`): same shape, more flips (L2 1539 rows, 97% single swaps; the >= 3-swap rows all sit
+     in the 128-token window after one L0 router near-tie at t=16017). KL mean 3.2e-3, top-1 98.2%; decode (ub 1, 17,000
+     steps) gives the same numbers (KL 3.1e-3). CUDA rope rounds theta differently again (`pos*powf(theta_scale, i)`).
+   The 1e-6 F32 gate holds wherever the top-k does not bind on a near-tie (all of small / real-dims fixtures, and
+   t < 1100 here); at the real budgets the right gate is selection parity with gap evidence, as above.
+6. Slot reuse / prefix restore (`scripts/dsv41/state_test.cpp`): save seq 0 after n1 tokens, clear memory, restore into
+   seq 0 or 1, continue: PASS (n1 201 / 17 / 164). Real defect found and fixed here: the Engram n-gram token history was
+   not in the saved state (2f4055f00, `has_cell_ext()`); negative control with the fix off FAILS (KL 0.115).
+   Compressor state rides the existing DSV4 snapshot path.
+7. V4-Flash regression on the real model: unsloth/DeepSeek-V4-Flash-0731-GGUF UD-IQ1_S (77 GB, downloaded for this
+   check), CUDA, 600 tokens, F32 KV, FA off: logits bitwise identical base (fd55cb98f) vs head at ub 512 and ub 7; head
+   A/A also bitwise. Plus the random V4 model (bitwise, ub 256 / 7).
 
 ## Milestones
 | # | state | commit |
@@ -101,6 +147,9 @@ Sizes: experts 289 GB (MXFP4), dense ~14 GB BF16 (FP8 dequant), embed+head 2.7 G
    fake-quant on a few prompts (`DSV41_FAKE_QUANT=1` in the shim emulates it on CPU).
 
 ## Not proven / open
+- A5 (pin PR / pinset sim) not started; full-model parity waits for B's GGUF and the oracle.
+- The F32 KL gate cannot be met at the real top-k budgets on any implementation (the fp32 reference misses its own
+  float64-rope version by KL 6.6e-4); long-context acceptance = selection parity with near-tie gap evidence.
 - Image tokens: Engram DEAD / gate-off for embd inputs is hashed as DEAD but the gate is not forced to 0 yet; vision not ported.
 - Multi-sequence batches (n_seq_max > 1) and rollback snapshots (n_rs_seq > 0) are wired like V4 but not parity-tested.
 - No ubatch shares a token across sequences (asserts, as the PLE path).
