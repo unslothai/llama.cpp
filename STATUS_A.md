@@ -65,6 +65,18 @@ the random-token t1025; fa1 vs ub512 7.4e-3 / 3.2e-3. Attribution: the full mode
 kernels (MMQ / MMVQ, q8_1 activations) differ from CPU there. Released V4-Flash (UD-IQ1_S) on the same text: ub7 vs
 ub512 KL mean 3.4e-2, 0.4 at t6. So the graph is batch-invariant; the CUDA spread is kernel numerics. Which side is
 closer to the truth is for C's full-model MATCHED oracle (prompts: outputs/dsv41_full/bf16_ub512/tokens).
+Full-model gate vs C's official MATCHED (TP4 model.py, outputs/dsv41_full/official/refs; `scripts/dsv41/gate_full.py`),
+KL mean (top-1), with native-vs-MATCHED for scale:
+| prompt | ub512 | ub7 | ub1 | fa1 | native |
+|---|---|---|---|---|---|
+| wiki1100 (real text) | 6.1e-3 (0.977) | 9.9e-3 (0.976) | 6.2e-3 (0.983) | 6.3e-3 (0.982) | 2.6e-2 |
+| long17k (real, > pool) | 2.8e-3 (0.987) | 3.3e-3 (0.987) | - | 3.0e-3 (0.987) | 1.5e-2 |
+| t3001 (random ids) | 1.5e-2 (0.901) | - | - | 1.7e-2 (0.905) | 3.7e-2 |
+| c1600 / t1025 / t100 (random ids) | 1.9e-2 / 2.3e-2 / 1.5e-1 | - / 5.7e-2 / - | - / - / 2.1e-1 | | 4.9e-2 / 9.4e-2 / 2.1e-1 |
+llama.cpp (BF16 dense + MXFP4 experts, CUDA) is 2.5-5x closer to MATCHED than the official native kernels on every
+prompt but t100 ub1 (equal); real text sits at the bf16 / q8-activation floor (C: bf16 floor 5e-3 on fixtures).
+Random-id prompts are an out-of-distribution, chaotic regime where native itself is 0.05-0.2 away. First 12 wiki
+tokens: CPU and CUDA llama are equally close to MATCHED at the sensitive positions (t6: 0.2 / 0.1; native 0.9).
 
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
