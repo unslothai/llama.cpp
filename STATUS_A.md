@@ -31,6 +31,21 @@ Branch `dsv41` in `$W/wt_dsv41` (off llama.cpp_pinset fd55cb98f). Contract for b
 - CUDA graphs on vs off (B10 A/B): identical results, no hang under the 1200 s watchdog (timeout -k 15 => SIGKILL).
 - FA on (F16 attention) is an acceptance config, not a parity config (see older numbers below).
 
+## Gate on agent C's fixtures (the parity oracle from now on; temp/dsv41_fixtures, refs/<p>/matched.npy)
+Build: `temp/wt_dsv41_gate` = dsv41 + B's dsv41-mxfp8 (MXFP8 Engram), tools `temp/dsv41_tools/gate_cpu/`. GGUF: B's
+`<fx>-F32.gguf` with MXFP4 experts dequantized to F32 (`models/dsv41/c_fx/<fx>-F32X.gguf`, scripts/dsv41/experts_to_f32.py;
+with MXFP4 experts the CPU matmul quantizes activations to q8_0 and the gate fails at ~1e-3, as C found). Runner
+`scripts/dsv41/gate_c.sh`. CPU, F32 KV, FA off. Gate KL(matched || llama) mean < 1e-3: PASS on every fixture.
+| fixture | prompts | KL mean (range) | worst p99 | top-1 min |
+|---|---|---|---|---|
+| fx_base (Engram 1, 6; MXFP8 tables) | t100..t3001, c1600, sp1600 | 9e-12 .. 2.3e-5 | 8.5e-5 | 1.0000 |
+| fx_noengram | same | 9e-12 .. 1.3e-5 | 8.9e-5 | 0.9987 |
+| fx_engram0 (Engram on layer 0) | same | 9e-12 .. 2.7e-5 | 1.6e-4 | 0.9987 |
+| fx_long (real 2048-block pool) | t2001 / sp20001 (ub 4096) | 1.2e-5 / 5.1e-4 | 1.1e-2 | 0.9861 |
+| fx_base ub 7 / ub 1 | t129, t1027, sp1600 / t129, t700 | identical to one-shot | | 1.0000 |
+llama.cpp vs matched is the same size as matched_f32 vs matched_f64 (the fp32 floor). sp20001 is the long-context
+near-tie regime characterised above. CUDA on these fixtures not yet run.
+
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
 2. MATCHED oracle: the fixture ref/ IS the matched reference (shim act_quant / fp4_act_quant = identity); every gate above is
