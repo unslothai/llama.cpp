@@ -97,6 +97,7 @@
 #define cudaStreamFireAndForget musaStreamFireAndForget
 #define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamPerThread musaStreamPerThread
+#define cudaStreamQuery musaStreamQuery
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStreamWaitEvent musaStreamWaitEvent
 #define cudaStream_t musaStream_t
