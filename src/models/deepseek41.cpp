@@ -435,6 +435,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
     const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
 
+    const int32_t rd = ratio != 0 ? llama_dsv41_kv_read_layer(model, il, cparams.offload_kqv) : -1;
+
     if (ratio != 0) {
         GGML_ASSERT(hparams.dsv41_kv_src[il] >= 0 && (int64_t) comp_state->get_ratio() == ratio);
 
@@ -472,7 +474,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ik = rope(ik, ci.state_write_pos, n_idx_embd - n_embd_head_rope);
                 comp = rope(comp, ci.state_write_pos, n_embd_head_nope);
 
-                ggml_build_forward_expand(gf, comp_ctx->cpy_k(ctx0, ggml_concat(ctx0, comp, ik, 0), ci.state_write_idxs, il));
+                ggml_tensor * row = ggml_concat(ctx0, comp, ik, 0);
+                ggml_build_forward_expand(gf, comp_ctx->cpy_k(ctx0, row, ci.state_write_idxs, il));
+                comp_row_of[il] = row;
             }
 
             if (ci.state_snapshot_src_idxs && ci.state_snapshot_dst_idxs) {
@@ -484,6 +488,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_build_forward_expand(gf, comp_state->cpy_kv   (ctx0, ggml_get_rows(ctx0, state_kv,    ci.state_persist_src_idxs), ci.state_persist_dst_idxs, il));
             ggml_build_forward_expand(gf, comp_state->cpy_score(ctx0, ggml_get_rows(ctx0, state_score, ci.state_persist_src_idxs), ci.state_persist_dst_idxs, il));
         }
+
+        if (rd == il && hparams.dsv41_kv_src[il] != il && comp_row_of[hparams.dsv41_kv_src[il]]) {
+            // first consumer on this device: append the source's new rows to the local mirror
+            ggml_build_forward_expand(gf, comp_ctx->cpy_k(ctx0, comp_row_of[hparams.dsv41_kv_src[il]], ci.state_write_idxs, il));
+        }
     }
 
     ggml_tensor * out = nullptr;
@@ -493,7 +502,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     } else {
         const int64_t n_comp = ci.kq_mask->ne[0];
 
-        ggml_tensor * comp_all = comp_ctx->get_k(ctx0, hparams.dsv41_kv_src[il]);
+        ggml_tensor * comp_all = comp_ctx->get_k(ctx0, rd);
         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
         const int64_t n_stream = comp_all->ne[3];
 
@@ -653,6 +662,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     const auto & model = static_cast<const llama_model_deepseek41 &>(model_base);
 
     topk_of.assign(n_layer, nullptr);
+    comp_row_of.assign(n_layer, nullptr);
 
     ggml_tensor * cur;
 

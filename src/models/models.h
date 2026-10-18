@@ -1485,6 +1485,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 int il);
 
         std::vector<ggml_tensor *> topk_of; // top-k of each index source layer
+        std::vector<ggml_tensor *> comp_row_of; // [n_layer] new compressed rows of each kv source (for mirrors)
         ggml_tensor * cand_sel    = nullptr; // candidate blocks of the candidate source layer
         int64_t       cand_n_comp = 0;       // compressed rows the candidate source scored
     };

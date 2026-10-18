@@ -15,6 +15,29 @@
 #include <sstream>
 #include <stdexcept>
 
+int32_t llama_dsv41_kv_read_layer(const llama_model & model, int32_t il, bool offload) {
+    const auto & hp = model.hparams;
+    const int32_t src = hp.dsv41_kv_src[il];
+    // LLAMA_DSV41_KV_MIRROR=0: no mirrors, consumers read the source cache across devices
+    static const bool mirror = [] {
+        const char * e = getenv("LLAMA_DSV41_KV_MIRROR");
+        return !(e && atoi(e) == 0);
+    }();
+    if (src < 0 || src == il || !offload || !mirror) {
+        return src;
+    }
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (model.dev_layer(src) == dev) {
+        return src;
+    }
+    for (int32_t j = src + 1; j < il; ++j) {
+        if (hp.dsv41_kv_src[j] == src && model.dev_layer(j) == dev) {
+            return j;
+        }
+    }
+    return il;
+}
+
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
@@ -333,12 +356,24 @@ static void dsv4_state_read_tensor_streams(
     }
 }
 
+// serialized compressed-KV layers: all except per-device mirrors (kv_src[il] != il), refilled from their source on read
+static std::vector<uint32_t> dsv4_k_cache_state_layers(const llama_kv_cache * kv, const std::vector<int32_t> & kv_src) {
+    std::vector<uint32_t> res;
+    for (uint32_t il : kv->get_layer_ids()) {
+        if (kv_src[il] == (int32_t) il) {
+            res.push_back(il);
+        }
+    }
+    return res;
+}
+
 static void dsv4_state_write_k_cache(
         llama_io_write_i    & io,
         const llama_kv_cache * kv,
         llama_seq_id          seq_id,
         llama_state_seq_flags flags,
-        uint32_t              n_rows) {
+        uint32_t              n_rows,
+        const std::vector<int32_t> & kv_src) {
     GGML_UNUSED(flags);
 
     uint32_t s0;
@@ -347,7 +382,8 @@ static void dsv4_state_write_k_cache(
 
     const uint32_t version = DSV4_K_CACHE_STATE_VER;
     const uint32_t kv_size = kv->get_size();
-    const auto layer_ids = kv->get_layer_ids();
+    // mirrors are never serialized, so the state format does not depend on the split
+    const auto layer_ids = dsv4_k_cache_state_layers(kv, kv_src);
     const uint32_t n_layer = layer_ids.size();
 
     if (n_rows > kv_size) {
@@ -369,7 +405,8 @@ static void dsv4_state_read_k_cache(
         llama_io_read_i  & io,
         llama_kv_cache   * kv,
         llama_seq_id       seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        const std::vector<int32_t> & kv_src) {
     GGML_UNUSED(flags);
 
     uint32_t version;
@@ -399,7 +436,7 @@ static void dsv4_state_read_k_cache(
     uint32_t s0;
     dsv4_state_dst_stream_range(kv->get_n_stream(), seq_id, ns, s0);
 
-    const auto layer_ids = kv->get_layer_ids();
+    const auto layer_ids = dsv4_k_cache_state_layers(kv, kv_src);
     if (n_layer_ref != layer_ids.size()) {
         throw std::runtime_error("DSV4 K-cache layer count mismatch");
     }
@@ -412,6 +449,31 @@ static void dsv4_state_read_k_cache(
         }
 
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
+    }
+
+    // refill the mirrors from their source rows just read
+    std::vector<uint8_t> buf;
+    for (uint32_t il : kv->get_layer_ids()) {
+        const int32_t src = kv_src[il];
+        if (src == (int32_t) il) {
+            continue;
+        }
+        ggml_tensor * t_src = kv->get_k_storage(src);
+        ggml_tensor * t_dst = kv->get_k_storage(il);
+        GGML_ASSERT(t_src->type == t_dst->type && t_src->ne[0] == t_dst->ne[0]);
+
+        const size_t row_size      = ggml_row_size(t_src->type, t_src->ne[0]);
+        const size_t stream_stride = (size_t) kv_size*row_size;
+        const size_t size          = (size_t) n_rows_ref*row_size;
+        if (size == 0) {
+            continue;
+        }
+        buf.resize(size);
+        for (uint32_t s = 0; s < ns; ++s) {
+            const size_t offset = (size_t) (s0 + s)*stream_stride;
+            ggml_backend_tensor_get(t_src, buf.data(), offset, size);
+            ggml_backend_tensor_set(t_dst, buf.data(), offset, size);
+        }
     }
 }
 
@@ -1295,7 +1357,20 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid.rope_type          = LLAMA_ROPE_TYPE_NEOX;
     dsv4_make_k_only(hparams_lid);
 
+    // compressed-KV storage: kv sources and mirrors; compressor state: kv sources only
     const auto is_comp_owner = [&](int32_t il, uint32_t ratio) {
+        if (model.hparams.dsv4_compress_ratios[il] != ratio) {
+            return false;
+        }
+        return !is_v41 || llama_dsv41_kv_read_layer(model, il, offload) == il;
+    };
+
+    comp_kv_src.resize(model.hparams.n_layer());
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        comp_kv_src[il] = is_v41 && model.hparams.dsv41_kv_src[il] >= 0 ? model.hparams.dsv41_kv_src[il] : (int32_t) il;
+    }
+
+    const auto is_state_owner = [&](int32_t il, uint32_t ratio) {
         if (model.hparams.dsv4_compress_ratios[il] != ratio) {
             return false;
         }
@@ -1316,6 +1391,14 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         }
 
         return is_comp_owner(il, ratio_hca);
+    };
+
+    const layer_filter_cb filter_csa_state = [&](int32_t il) {
+        return (!filter || filter(il)) && is_state_owner(il, ratio_csa);
+    };
+
+    const layer_filter_cb filter_hca_state = [&](int32_t il) {
+        return (!filter || filter(il)) && is_state_owner(il, ratio_hca);
     };
 
     const layer_filter_cb filter_lid = [&](int32_t il) {
@@ -1355,13 +1438,13 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
             model, offload, unified_compressed, n_seq_max, ratio_csa, csa_state_size,
-            csa_state_embd, n_rs_seq, "csa", filter_csa);
+            csa_state_embd, n_rs_seq, "csa", filter_csa_state);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
             model, offload, unified_compressed, n_seq_max, ratio_hca, ratio_hca,
-            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
+            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca_state);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
@@ -1720,9 +1803,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const uint32_t n_rows_lid = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_max, lid_state->get_ratio(), kv_lid->get_size()) : kv_lid->get_size();
 
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
+        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa, comp_kv_src);
+        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca, comp_kv_src);
+        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid, comp_kv_src);
     }
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
@@ -1760,9 +1843,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (!partial_only) {
         clear_compressed(seq_id, true);
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, comp_kv_src);
+        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, comp_kv_src);
+        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, comp_kv_src);
     }
 
     csa_state->state_read(io, seq_id, flags);
