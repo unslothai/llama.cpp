@@ -285,8 +285,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        // Key on the arch the kernels were compiled for, as get_mmvq_mmid_max_batch_for_device does:
-        // a P100 running 50-virtual PTX has __launch_bounds__ from the pascal_older table.
+        // Match get_mmvq_mmid_max_batch_for_device: key on the compiled arch, e.g. a P100 running 50-virtual PTX uses the pascal_older bounds.
         const int arch = ggml_cuda_highest_compiled_arch(cc);
         if (arch == GGML_CUDA_CC_PASCAL || arch == GGML_CUDA_CC_VOLTA || arch >= GGML_CUDA_CC_ADA_LOVELACE) {
             return MMVQ_MAX_BATCH_SIZE;
