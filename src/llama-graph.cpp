@@ -2154,9 +2154,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
-        if (arch == LLM_ARCH_DEEPSEEK41) {
+        if (arch == LLM_ARCH_DEEPSEEK41 && !ggml_is_quantized(gate_inp->type)) {
             // F32 router: keep the logits off TF32 on CUDA (top-6 of 384 is near-tie sensitive; with TF32 the routing
             // depended on the ubatch size, 4..16-token batches being the worst)
+            // skipped for quantized routers (third-party GGUFs): a quantized src0 with PREC_F32 asserts in MMQ
             ggml_prec_set_src(logits, GGML_PREC_F32, 1);
         }
         cb(logits, "ffn_moe_logits", il);

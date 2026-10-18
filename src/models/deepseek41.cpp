@@ -473,8 +473,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_hc_mixes(
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
-    // F32 weights (model.py hc_pre runs in fp32): no TF32 rounding on CUDA, else the mixes depend on the ubatch size
-    ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+    // F32 weights (model.py hc_pre runs in fp32): no TF32 rounding on CUDA, else the mixes depend on the ubatch size.
+    // Skipped for quantized weights: third-party GGUFs quantize hc_*_fn, and a quantized src0 with PREC_F32 asserts in MMQ.
+    if (!ggml_is_quantized(hc_fn->type)) {
+        ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+    }
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * pre = dsv41_view_2d(ctx0, mixes, hc, nt, 0);
@@ -747,7 +750,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ggml_tensor * kq = ggml_mul_mat(ctx0,
                         ggml_permute(ctx0, ik, 0, 2, 1, 3),  // [d, n_comp, 1, ns]
                         ggml_permute(ctx0, iq, 0, 2, 1, 3)); // [d, nt/ns, n_ih, ns] -> [n_comp, nt/ns, n_ih, ns]
-                ggml_prec_set_src(kq, GGML_PREC_F32, 1); // F32 index keys: no TF32 rounding of the near-tie scores
+                if (!ggml_is_quantized(ik->type)) {
+                    ggml_prec_set_src(kq, GGML_PREC_F32, 1); // F32 index keys: no TF32 rounding of the near-tie scores
+                }
                 kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));        // [n_ih, nt/ns, n_comp, ns]
                 ggml_tensor * score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), iw)); // [1, nt/ns, n_comp, ns]
                 score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));  // [n_comp, nt/ns, 1, ns]
