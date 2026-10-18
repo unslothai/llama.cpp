@@ -7921,6 +7921,38 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
+// DeepSeek V4.1: extra message keys (encoding.py golden cases 3 and 4) and "\n\n" around media markers
+static void test_deepseek_v4_1_message_fields() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja");
+    auto render = [&](const char * messages_json, bool add_generation_prompt) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
+        inputs.add_generation_prompt = add_generation_prompt;
+        inputs.chat_template_kwargs["thinking_mode"] = "\"chat\"";
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+    };
+
+    assert_equals(std::string("<｜begin▁of▁sentence｜><｜User｜>q<｜Assistant｜></think><｜action｜>"),
+                  render(R"([{"role": "user", "content": "q", "task": "action"}])", false));
+
+    {
+        auto prompt = render(R"([
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b", "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]},
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "namespace": "ns", "function": {"name": "f", "arguments": {"x": 1}}}]}
+        ])", false);
+        assert_contains(prompt, "<｜System｜>b\n\n## Tools");
+        assert_contains(prompt, "{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}");
+        assert_contains(prompt, "<｜DSML｜ invoke name=\"ns::f\">");
+    }
+
+    assert_equals(std::string("<｜begin▁of▁sentence｜><｜User｜>a\n\n<__media__>\n\nb<｜Assistant｜></think>"),
+                  render(R"([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "media_marker", "text": "<__media__>"}, {"type": "text", "text": "b"}]}])", true));
+}
+
 static void test_prompt_parts() {
     LOG_DBG("%s\n", __func__);
     const std::string tmpl_src =
@@ -8271,6 +8303,7 @@ int main(int argc, char ** argv) {
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
+        test_deepseek_v4_1_message_fields();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_prompt_parts();
