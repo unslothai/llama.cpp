@@ -7223,6 +7223,33 @@ struct test_top_k : public test_case {
     }
 };
 
+// top_k with fewer than k positive values and the rest exactly 0: the cut falls inside a long run of ties
+struct test_top_k_zero_ties : public test_top_k {
+    test_top_k_zero_ties(std::array<int64_t, 4> ne, int k)
+        : test_top_k(GGML_TYPE_F32, ne, k, true) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",zero_ties=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0], 0.0f);
+                const int64_t n_pos = std::min<int64_t>(k / 2, t->ne[0]);
+                for (int64_t i = 0; i < n_pos; i++) {
+                    data[i] = 1.0f + dist(rng);
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
 // top_k over rows like log-probabilities: distinct negative values, fewer
 // than k +inf (none for k = 1, so the expected indices are unique) and many
 // -inf (masked tokens)
@@ -11540,6 +11567,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // exact ties at the cut (radix path, chunked gather)
+    for (int64_t ncols : {5000, 16384, 65536, 300001}) {
+        for (int64_t nrows : {1, 7, 64}) {
+            test_cases.emplace_back(new test_top_k_zero_ties({ncols, nrows, 1, 1}, 512));
+        }
+    }
+    test_cases.emplace_back(new test_top_k_zero_ties({4500, 512, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k_zero_ties({20000, 3, 1, 1}, 1024));
 
     // rows that CUDA processes in several chunks (bitonic, radix)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 500,  40000, 1, 1 }, 16));
