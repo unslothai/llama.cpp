@@ -53,33 +53,66 @@ struct tensor_data_params {
     float  stdev;
 };
 
+// fills the values of one tensor, the name carries whatever the property needs
+typedef void (*tensor_filler)(std::vector<float> & dst, const char * name, const tensor_data_params & params);
+
+// a normal draw keyed on a name, so that tensors which share a draw ask for the same key
+static void fill_normal(std::vector<float> & dst, const char * key, const tensor_data_params & params) {
+    std::mt19937 gen(params.seed ^ std::hash<std::string>{}(key));
+    std::normal_distribution<float> dis(0.0f, params.stdev);
+    for (float & v : dst) {
+        v = dis(gen);
+    }
+}
+
+// Mamba A must be negative (state decay)
+static void fill_ssm_a(std::vector<float> & dst, const char * name, const tensor_data_params & params) {
+    fill_normal(dst, name, params);
+    for (float & v : dst) {
+        v = -fabsf(v);
+    }
+}
+
+// a norm preserving residual gate holds alpha^2 + beta^2 == 1, and the conversion resolves both from one raw weight
+// the alpha and the beta of a block share that weight, so the key drops the suffix and keeps the block
+static void fill_resid_gate(std::vector<float> & dst, const char * name, const tensor_data_params & params) {
+    const char * suffix = strstr(name, "_resid_");
+    const bool is_beta = strstr(suffix, "_resid_beta") != nullptr;
+    fill_normal(dst, std::string(name, suffix - name).c_str(), params);
+    for (float & v : dst) {
+        const float beta = 1.0f / (1.0f + expf(-v));
+        v = is_beta ? beta : sqrtf(1.0f - beta*beta);
+    }
+}
+
+// a tensor whose values hold a property of their own, matched on a substring of its name, first match wins
+static const struct { const char * match; tensor_filler fill; } TENSOR_FILLERS[] = {
+    { "ssm_a",   fill_ssm_a      },
+    { "_resid_", fill_resid_gate },
+};
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const tensor_data_params & params = *(const tensor_data_params *) userdata;
-    size_t seed = params.seed;
-    std::hash<std::string> hasher;
-    seed ^= hasher(tensor->name);
-    std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, params.stdev);
 
-    // TODO: refactor per-tensor initialization logic in a cleaner way
-
-    // note: Mamba A must be negative (state decay)
-    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
-    const int64_t ne = ggml_nelements(tensor);
-    if (tensor->type == GGML_TYPE_F32) {
-        std::vector<float> tmp(ne);
-        for (int64_t i = 0; i < ne; i++) {
-            float val = dis(gen);
-            tmp[i] = is_ssm_a ? -fabsf(val) : val;
+    tensor_filler fill = fill_normal;
+    for (const auto & filler : TENSOR_FILLERS) {
+        if (strstr(tensor->name, filler.match) != nullptr) {
+            fill = filler.fill;
+            break;
         }
+    }
+
+    std::vector<float> tmp(ggml_nelements(tensor));
+    fill(tmp, tensor->name, params);
+
+    if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(ne);
-        for (int64_t i = 0; i < ne; i++) {
-            float val = dis(gen);
-            tmp[i] = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(val) : val);
+        std::vector<ggml_fp16_t> tmp16(tmp.size());
+        for (size_t i = 0; i < tmp.size(); i++) {
+            tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
-        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+        ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
     } else {
         GGML_ABORT("fatal error");
     }
@@ -191,7 +224,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
-    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER) {
+    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER ||
+            arch == LLM_ARCH_KOLIBRI1) {
         n_head_kv = 2; // GQA coverage
     }
     if (arch == LLM_ARCH_BEAM) {
@@ -322,7 +356,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
-            arch == LLM_ARCH_MAPLE) {
+            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_MAPLE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -340,6 +374,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_MOE_LATENT_SIZE,         n_embd/2);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+    }
+
+    if (arch == LLM_ARCH_KOLIBRI1) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
@@ -801,6 +839,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_MUSE_SPARK:
+        case LLM_ARCH_KOLIBRI1:
             return true;
         default:
             return false;
