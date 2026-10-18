@@ -366,7 +366,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * value = ggml_cont(ctx0, ggml_view_3d(ctx0, kv, n_embd, 1,  nt, ggml_row_size(kv->type, n_embd), kv->nb[1],
             ggml_row_size(kv->type, hc*n_embd)));
 
-    ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, x, norm_rms_eps), ggml_rms_norm(ctx0, key, norm_rms_eps)), layer.engram_gate);
+    // quantized copy has no binary-op kernel
+    ggml_tensor * egate = ggml_is_quantized(layer.engram_gate->type) ? ggml_cast(ctx0, layer.engram_gate, GGML_TYPE_F32) : layer.engram_gate;
+    ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, x, norm_rms_eps), ggml_rms_norm(ctx0, key, norm_rms_eps)), egate);
     dot = ggml_scale(ctx0, ggml_sum_rows(ctx0, dot), 1.0f/sqrtf((float) n_embd));
     cb(dot, "engram_dot", il);
 
@@ -497,8 +499,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
         if (hparams.dsv41_topk_src[il] == il) {
-            ggml_tensor * ik = ggml_cont(ctx0, ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
-                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head)));
+            ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
+                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
+            // CUDA has no same-type copy of quantized views
+            ik = ggml_is_quantized(ik->type) ? ggml_cast(ctx0, ik, GGML_TYPE_F32) : ggml_cont(ctx0, ik);
 
             ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
             iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
@@ -587,7 +591,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         }
         GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
 
-        GGML_ASSERT(!inp_attn->self_k_rot && "DeepSeek-V4.1: rotated (quantized) KV cache is not supported yet");
+        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
+        ggml_tensor * k_rot = inp_attn->self_k_rot;
+        if (k_rot) {
+            q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
+            kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+        }
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
@@ -595,7 +604,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_tensor * raw_k  = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
                 comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
-        comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
+        if (k_rot) {
+            // compressed rows are stored unrotated: rotate in F32, then cast to the cache type to concat with the window
+            comp_k = comp_k->type != GGML_TYPE_F32 ? ggml_cast(ctx0, comp_k, GGML_TYPE_F32) : ggml_cont(ctx0, comp_k);
+            comp_k = llama_mul_mat_hadamard(ctx0, comp_k, k_rot);
+            if (comp_k->type != raw_k->type) {
+                comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
+            }
+        } else if (ggml_is_quantized(comp_k->type)) {
+            // LLAMA_ATTN_ROT_DISABLE=1: go through F32 for the same reason
+            comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
+        } else {
+            comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
+        }
+        cb(comp_k, "comp_k", il);
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
         ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
@@ -603,6 +625,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         cb(kq_mask, "comp_kq_mask", il);
 
         out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
         cb(out, "attn_comp", il);
     }
 
