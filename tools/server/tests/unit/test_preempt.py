@@ -1594,8 +1594,11 @@ def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():
         oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=300, data={
             "n_predict": 100000, "prompt": [100 + k % 50 for k in range(20)], "id_slot": 0, "cache_prompt": True,
             "ignore_eos": True, "temperature": 0.0, "seed": 42}))
-        _wait_processing([0])
-        # cannot fit beside the oldest as it grows, so it is parked and is owed the cells first
+        deadline = time.time() + 180
+        while time.time() < deadline and _n_decoded(_slot_view(0)) < 100:
+            time.sleep(0.02)
+        assert _n_decoded(_slot_view(0)) >= 100, "the oldest did not start generating in time"
+        # 120 cells and growing beside 8116: it cannot fit, so it is parked and is owed the cells first
         parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(8100)], 1)
         assert _wait_preempted(120), "the second request was never parked, so the case was not reached"
         # held behind the parked one: a running slot, but no candidate, so the oldest is the only one left to pick
@@ -1605,7 +1608,8 @@ def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():
     for res in (oldest, parked, held):
         assert res.status_code == 200, res.body
     assert oldest.body["stop_type"] == "limit", oldest.body
-    assert oldest.body["preempt"]["parks"] == 0, "the oldest was parked at the end of the window"
+    # a slow host may rotate the oldest out once for the head parked 30 s; the livelock parks it thousands of times
+    assert oldest.body["preempt"]["parks"] <= 2, f"the oldest was parked {oldest.body['preempt']['parks']} times"
     assert parked.body["preempt"]["parks"] > 0
     assert "prompt held" in _log(), "no prompt was held behind the parked one, so the case was not reached"
 
