@@ -320,6 +320,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "VllmD3Model": "vllm_d3",
     "DeepseekOCR2ForCausalLM": "deepseek",
     "DeepseekOCRForCausalLM": "deepseek",
+    "DeepseekV41ForCausalLM": "deepseek41",
     "DeepseekV4ForCausalLM": "deepseek",
     "Dots3NoteForCausalLM": "dots3",
     "Dots3NoteForConditionalGeneration": "dots3",

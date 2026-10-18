@@ -6435,6 +6435,7 @@ class VisionProjectorType:
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
     DEEPSEEK4V = "deepseek4v"
+    DEEPSEEK41V = "deepseek41v"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"
