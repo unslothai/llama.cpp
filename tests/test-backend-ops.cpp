@@ -9787,6 +9787,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // rows shorter than a CUDA block
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_I32}) {
+        for (int n : {1, 3, 4, 8, 64, 65}) {
+            for (bool v : {false, true}) {
+                for (bool vs0 : {false, true}) {
+                    test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, v, vs0));
+                }
+            }
+        }
+        // src0 views with unaligned rows: not the vectorized copy (short rows: flat kernel, long rows: per-row kernels)
+        for (int n : {4, 8, 16, 64, 256}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, false, true, 1));
+        }
+        // long rows, enough of them for the vectorized copy (n = 258 is not a multiple of the vector width)
+        for (int n : {256, 258}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, false));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -11030,8 +11048,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
-    // repeated expert ids within a row
-    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+    // repeated expert ids within a row (IQ1_M: the cuBLAS fallback, host sort up to n = 33, device sort at n = 64)
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ1_M}) {
         for (int n : {9, 16, 33, 64}) {
             test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
         }
@@ -11074,6 +11092,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // many experts with several column tiles over the batch, few tokens per expert: empty and partial tiles
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (bool b : {false, true}) {
+            for (int m : {320, 512}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 6, b, m, 300, 256));
+            }
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, b, 128, 512, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, b, 128, 300, 256));
+        }
+    }
+    // several k iterations per tile, tile count not a multiple of the SM count: stream-k fixup with empty tiles
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, 128, 128, 2048));
+        }
+    }
+    // too many experts for the counting sort and too many used for the single-warp kernel: host fallback
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 1024, true, 16, 4, 16));
 
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
@@ -12223,6 +12264,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // prompt-sized MoE: gate/up (broadcast src1) and down, many experts with few tokens each
+    for (int bs : {512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, true,   512, bs, 2048)); // qwen3.6-35b-a3b
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, false, 2048, bs,  512));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, true,   640, bs, 2560)); // 512 experts, 10 used
+        }
+        // down projection of 640 columns: types with 32-value blocks
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs,  640));
+        }
+    }
+
+    // short rows gathered for many tokens (router weights, sparse attention block selection)
+    for (int n : {1, 4, 16}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, n, 512, 512, 2048, 1, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 512, 512, 2048, 1, false));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 256, 8, 2048, 1, false));
 
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
