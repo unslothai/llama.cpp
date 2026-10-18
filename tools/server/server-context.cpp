@@ -4472,11 +4472,27 @@ private:
             }
         }
 
-        server_slot * victim = nullptr;
+        const auto pick = [&](const server_slot * exempt) {
+            server_slot * res = nullptr;
 
-        for (auto & slot : slots) {
-            if (&slot != oldest && preempt_victim_eligible(slot, nullptr, true) && (!victim || slot.task->id > victim->task->id)) {
-                victim = &slot;
+            for (auto & slot : slots) {
+                if (&slot != exempt && preempt_victim_eligible(slot, nullptr, true) && (!res || slot.task->id > res->task->id)) {
+                    res = &slot;
+                }
+            }
+
+            return res;
+        };
+
+        server_slot * victim = pick(oldest);
+
+        // [TAG_PREEMPT] Beside n_cmpl > 1 slots the oldest may be the only slot that can be parked; parking it lets them finish. A held one would not take the cells, so it does not count.
+        if (!victim && oldest) {
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && !slot.preempt_is_out() && preempt_is_family(slot) && !preempt_held(slot)) {
+                    victim = pick(nullptr);
+                    break;
+                }
             }
         }
 
