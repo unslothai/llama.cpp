@@ -143,7 +143,7 @@ struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
     struct token {
-        int32_t id_slot; // global slot id, used to attribute stats
+        int32_t id_slot;
         int32_t seq_id;  // sequence id inside the context of the slot's pipeline group
         llama_token token;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos; // only pos[0] is used for text tokens
@@ -1748,7 +1748,7 @@ private:
                 return;
             }
             if (groups.empty()) {
-                return; // no model loaded
+                return;
             }
             update_slots(*groups[0]);
         });
@@ -3694,7 +3694,6 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
-            // note: each group drives its own loop, so the shared task loop need not keep spinning
         }
 
         try {
