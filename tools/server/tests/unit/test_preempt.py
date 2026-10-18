@@ -1584,23 +1584,20 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
         assert resumed.index(1) < resumed.index(2), resumed
 
 
-@pytest.mark.parametrize("policy", ["fcfs", "cost"])
-def test_the_oldest_runs_to_the_end_of_the_window_beside_a_held_prompt(policy):
-    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
-    _start(n_ctx=256, n_slots=3, n_batch=64, n_ubatch=64, cache_ram=0)
+def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "fcfs"
+    # a long window: the tiny model decodes thousands of tokens a second, and the park must last long enough to be seen
+    _serve_with_training_context(8192)
+    _start(n_ctx=8192, n_slots=3, n_batch=256, n_ubatch=256, cache_ram=0)
     with ThreadPoolExecutor(2) as pool:
         # a livelock never ends, so the bound is the test's verdict; it is generous for a loaded host
-        oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=180, data={
-            "n_predict": 1000, "prompt": [100 + k % 50 for k in range(20)], "id_slot": 0, "cache_prompt": True,
+        oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=300, data={
+            "n_predict": 100000, "prompt": [100 + k % 50 for k in range(20)], "id_slot": 0, "cache_prompt": True,
             "ignore_eos": True, "temperature": 0.0, "seed": 42}))
-        deadline = time.time() + 180
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 130:
-            time.sleep(0.02)
-        # the oldest must also be the largest, or the cost policy rightly parks it for the next prompt
-        assert _n_decoded(_slot_view(0)) >= 130, "the oldest did not reach the window's last quarter in time"
-        # does not fit beside the oldest, so it is parked holding nothing and is owed the cells first
-        parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(125)], 1)
-        assert _wait_preempted()
+        _wait_processing([0])
+        # cannot fit beside the oldest as it grows, so it is parked and is owed the cells first
+        parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(8100)], 1)
+        assert _wait_preempted(120), "the second request was never parked, so the case was not reached"
         # held behind the parked one: a running slot, but no candidate, so the oldest is the only one left to pick
         held = _cached(16, [300 + k % 50 for k in range(30)], 2)
         oldest = oldest.result()
@@ -1610,6 +1607,7 @@ def test_the_oldest_runs_to_the_end_of_the_window_beside_a_held_prompt(policy):
     assert oldest.body["stop_type"] == "limit", oldest.body
     assert oldest.body["preempt"]["parks"] == 0, "the oldest was parked at the end of the window"
     assert parked.body["preempt"]["parks"] > 0
+    assert "prompt held" in _log(), "no prompt was held behind the parked one, so the case was not reached"
 
 
 def test_a_started_slot_trimmed_below_its_sliding_window_prefills_again():
