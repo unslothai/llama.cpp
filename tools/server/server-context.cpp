@@ -426,8 +426,7 @@ struct server_slot {
 
         int n_text = 0;
 
-        // prompt tokens feed only the penalty and DRY history here (grammar and reasoning budget skip
-        // non-generated tokens), so penalize_prompt = false starts that history at the first generated token
+        // prompt tokens feed only the penalty and DRY history here (grammar and reasoning budget skip non-generated tokens), so penalize_prompt = false starts that history at the first generated token
         const int n_accept = task->params.sampling.penalize_prompt ? (int) prompt.tokens.size() : 0;
 
         for (int i = 0; i < n_accept; i++) {

@@ -634,8 +634,7 @@ def test_logit_bias(tokenize, openai_style):
 def test_penalize_prompt():
     global server
     server.start()
-    # the greedy continuation " do" is already in the prompt ("The dog"), so a prompt-wide
-    # presence penalty moves it, while penalize_prompt = false leaves the first token alone
+    # the greedy continuation " do" is already in the prompt ("The dog"), so a prompt-wide presence penalty moves it, while penalize_prompt = false leaves the first token alone
     prompt = "Once upon a time, there was a little dog. The dog was very happy. The"
     def first_token(**extra):
         res = server.make_request("POST", "/completion", data={
