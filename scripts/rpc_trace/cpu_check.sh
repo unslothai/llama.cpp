@@ -1,11 +1,9 @@
 #!/bin/bash
 # CPU-only smoke test: layers split over two rpc-servers, run with the trace off and on, checking
 # the text is identical and that merge.py accepts the result.
-# pipefail matters here: the completions run as `curl | parser`, and without it the status of a
-# failed request is thrown away and two empty output files compare equal, so the test would report
-# PASS without ever generating a token. errexit is deliberately not set, because the teardown deals
-# in `kill` and `grep -q` calls that are expected to fail; every step that can fail is checked by
-# hand instead.
+# pipefail: completions run as `curl | parser`, and without it a failed request leaves two empty
+# outputs that compare equal. No errexit: the teardown's `kill` and `grep -q` are expected to fail,
+# so every step that can fail is checked by hand.
 set -u
 set -o pipefail
 

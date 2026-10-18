@@ -1213,11 +1213,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
             child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
         }
 
-        // GGML_RPC_TRACE names one file, and ggml_trace_open() opens it with "wb". base_env is a
-        // copy of our own environment, so without this every child would open the router's exact
-        // path: loading a model truncates the router's trace, and two children running at once
-        // interleave through independent file offsets, so the file is unusable and the damage is
-        // silent. Each child gets its own path keyed by port (unique among live children).
+        // ggml_trace_open() opens GGML_RPC_TRACE with "wb", and base_env copies our environment, so
+        // every child would truncate the router's trace and interleave with its siblings. Give each
+        // child its own path keyed by port (unique among live children).
         {
             static const std::string tr_prefix = "GGML_RPC_TRACE=";
 

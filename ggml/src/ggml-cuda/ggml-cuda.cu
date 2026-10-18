@@ -6083,10 +6083,8 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
                 continue;
             }
 
-            // Taking ggml_time_us() here dates the anchor to this poll rather than to when it
-            // actually completed, and every mark is reported as anchor_us + elapsed(anchor, mark),
-            // so the whole device timeline shifts forward by however long the anchor had already
-            // been complete. So tie it to wall time through a probe, synchronized only when the
+            // ggml_time_us() here would date the anchor to this poll, not its completion, shifting the
+            // device's whole timeline. Tie it to wall time through a probe, synchronized only when the
             // stream is already idle (it then drains nothing).
             if (cudaStreamQuery(d.stream) == cudaSuccess) {
                 ggml_cuda_set_device(d.device);
