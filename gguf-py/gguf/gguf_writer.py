@@ -1077,6 +1077,75 @@ class GGUFWriter:
     def add_attention_compress_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), value)
 
+    # deepseek41: cross-layer KV / indexer sharing and two-level candidate selection
+    def add_attention_kv_source_layers(self, layers: Sequence[int]) -> None:
+        self.add_key_value(Keys.Attention.KV_SOURCE_LAYERS.format(arch=self.arch), list(layers), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    def add_indexer_source_layers(self, layers: Sequence[int]) -> None:
+        self.add_key_value(Keys.Attention.Indexer.SOURCE_LAYERS.format(arch=self.arch), list(layers), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    def add_indexer_candidate_source_layer(self, layer: int) -> None:
+        self.add_int32(Keys.Attention.Indexer.CANDIDATE_SOURCE_LAYER.format(arch=self.arch), layer)
+
+    def add_indexer_candidate_top_k_blocks(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_TOP_K_BLOCKS.format(arch=self.arch), value)
+
+    def add_indexer_candidate_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), value)
+
+    # deepseek41 engram
+    def add_engram_layers(self, layers: Sequence[int]) -> None:
+        self.add_key_value(Keys.Engram.LAYERS.format(arch=self.arch), list(layers), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    def add_engram_num_embeddings(self, values: Sequence[int]) -> None:
+        self.add_key_value(Keys.Engram.NUM_EMBEDDINGS.format(arch=self.arch), list(values), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    def add_engram_max_ngram_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.MAX_NGRAM_SIZE.format(arch=self.arch), value)
+
+    def add_engram_vocab_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.VOCAB_SIZE.format(arch=self.arch), value)
+
+    def add_engram_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_COUNT.format(arch=self.arch), value)
+
+    def add_engram_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.HEAD_DIM.format(arch=self.arch), value)
+
+    def add_engram_pad_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.PAD_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_engram_compressed_vocab_size(self, value: int) -> None:
+        self.add_uint32(Keys.Engram.COMPRESSED_VOCAB_SIZE.format(arch=self.arch), value)
+
+    def add_engram_token_map(self, values: Sequence[int]) -> None:
+        self.add_key_value(Keys.Engram.TOKEN_MAP.format(arch=self.arch), list(values), GGUFValueType.ARRAY, GGUFValueType.INT32)
+
+    def add_engram_multipliers(self, values: Sequence[int]) -> None:
+        self.add_key_value(Keys.Engram.MULTIPLIERS.format(arch=self.arch), list(values), GGUFValueType.ARRAY, GGUFValueType.UINT64)
+
+    def add_engram_primes(self, values: Sequence[int]) -> None:
+        self.add_key_value(Keys.Engram.PRIMES.format(arch=self.arch), list(values), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    # deepseek41 DSpark draft head
+    def add_dspark_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_dspark_noise_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.NOISE_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_dspark_target_layers(self, layers: Sequence[int]) -> None:
+        self.add_key_value(Keys.DSpark.TARGET_LAYERS.format(arch=self.arch), list(layers), GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
+    def add_dspark_markov_rank(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.MARKOV_RANK.format(arch=self.arch), value)
+
+    def add_dspark_expert_count(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.EXPERT_COUNT.format(arch=self.arch), value)
+
+    def add_dspark_expert_used_count(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.EXPERT_USED_COUNT.format(arch=self.arch), value)
+
     def add_hyper_connection_count(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.COUNT.format(arch=self.arch), count)
 
@@ -1091,6 +1160,9 @@ class GGUFWriter:
 
     def add_hyper_connection_low_rank(self, value: int) -> None:
         self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)
+
+    def add_hyper_connection_single_pass(self, value: bool) -> None:
+        self.add_bool(Keys.HyperConnection.SINGLE_PASS.format(arch=self.arch), value)
 
     def add_ple_layers(self, values: Sequence[int]) -> None:
         self.add_array(Keys.PerLayerEmbedding.LAYERS.format(arch=self.arch), values)

@@ -436,7 +436,8 @@ extern "C" {
         GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
         GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
         GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
-        GGML_TYPE_COUNT   = 67,
+        GGML_TYPE_MXFP8   = 67, // fork-local, MXFP8 E4M3 (32 elements, E8M0 scale)
+        GGML_TYPE_COUNT   = 68,
     };
 
     // [TAG_GGML_PREC]

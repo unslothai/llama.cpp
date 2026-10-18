@@ -1965,6 +1965,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+
+    // [TAG_GGML_PREC] src1 requested at GGML_PREC_F32 with F32 weights: keep both operands in F32, i.e. no TF32
+    // rounding (the MMF tensor-core path and cuBLAS tensor-op math both round to a 10-bit mantissa). Small batches use
+    // the F32 matrix-vector kernel, larger ones cuBLAS SGEMM with the default (non-TF32) math mode.
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32) {
+        const int cc_f32        = ggml_cuda_info().devices[ctx.device].cc;
+        const int warp_size_f32 = ggml_cuda_info().devices[ctx.device].warp_size;
+        if (!bad_padding_clear && ne11 <= MMVF_MAX_BATCH_SIZE &&
+                ggml_cuda_should_use_mmvf(src0->type, cc_f32, warp_size_f32, src0->ne, src0->nb, /*ne11 =*/ 1)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+        return;
+    }
+
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
@@ -5648,6 +5667,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_MXFP8:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:

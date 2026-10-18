@@ -605,6 +605,14 @@ struct llama_layer {
     struct ggml_tensor * indexer_kpool_gate = nullptr;
     struct ggml_tensor * indexer_kpool_ape  = nullptr;
 
+    // deepseek41
+    struct ggml_tensor * engram_embd      = nullptr; // [head_dim, n_rows], host-resident gather table
+    struct ggml_tensor * engram_kv        = nullptr; // [n_hash_cols*head_dim, n_embd*(hc+1)]
+    struct ggml_tensor * engram_gate      = nullptr; // [n_embd, hc], q_weight*k_weight folded
+    struct ggml_tensor * dspark_main_proj = nullptr;
+    struct ggml_tensor * dspark_main_norm = nullptr;
+    struct ggml_tensor * dspark_norm      = nullptr;
+
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;

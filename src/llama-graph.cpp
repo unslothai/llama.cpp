@@ -1968,7 +1968,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2187,6 +2187,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
+        if (arch == LLM_ARCH_DEEPSEEK41 && !ggml_is_quantized(gate_inp->type)) {
+            // F32 router: keep the logits off TF32 on CUDA (top-6 of 384 is near-tie sensitive; with TF32 the routing
+            // depended on the ubatch size, 4..16-token batches being the worst)
+            // skipped for quantized routers (third-party GGUFs): a quantized src0 with PREC_F32 asserts in MMQ
+            ggml_prec_set_src(logits, GGML_PREC_F32, 1);
+        }
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
@@ -2298,8 +2304,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // reference: weights / (sum + 1e-20), not the F16-floor clamp (model.py Gate.forward)
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else {
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -2389,7 +2400,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2971,6 +2982,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
         ggml_prec_set_acc(kq, GGML_PREC_F32);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // with an F32 KV cache: no TF32 rounding of K / Q on CUDA (no-op for F16 / quantized caches)
+            ggml_prec_set_src(kq, GGML_PREC_F32, 1);
+        }
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -3010,6 +3025,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            ggml_prec_set_src(kqv, GGML_PREC_F32, 1);
+        }
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA

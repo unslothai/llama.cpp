@@ -8,6 +8,7 @@
 #include "llama-hparams.h"
 #include "llama-model.h"
 #include "llama-vocab.h"
+#include "models/models.h"
 
 #include <cstdint>
 #include <string>
@@ -337,6 +338,49 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
+
+    if (model->arch == LLM_ARCH_DEEPSEEK41) {
+        const auto * m41 = dynamic_cast<const llama_model_deepseek41 *>(model);
+        GGML_ASSERT(m41 != nullptr);
+        std::vector<uint32_t> kv_src;
+        std::vector<uint32_t> idx_src;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.dsv41_kv_src[il] == (int32_t) il) {
+                kv_src.push_back(il);
+            }
+            if (hparams.dsv41_topk_src[il] == (int32_t) il) {
+                idx_src.push_back(il);
+            }
+        }
+        add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYERS,      kv_src);
+        add_kv(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS, idx_src);
+        if (hparams.dsv41_cand_src >= 0) {
+            add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_cand_src);
+            add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_cand_topk_blocks);
+            add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_cand_block_size);
+        }
+        if (!m41->engram_layers.empty()) {
+            const size_t n_cols = m41->engram_n_cols();
+            int32_t pad_id = 0; // any raw id whose compressed id is the pad's
+            for (size_t i = 0; i < m41->engram_token_map.size(); ++i) {
+                if (m41->engram_token_map[i] == m41->engram_pad_cid) {
+                    pad_id = (int32_t) i;
+                    break;
+                }
+            }
+            std::vector<uint32_t> primes(m41->engram_primes.begin(), m41->engram_primes.end());
+            GGML_ASSERT(primes.size() == n_cols*m41->engram_layers.size());
+            add_kv(LLM_KV_ENGRAM_LAYERS,           std::vector<uint32_t>(m41->engram_layers.begin(), m41->engram_layers.end()));
+            add_kv(LLM_KV_ENGRAM_NUM_EMBEDDINGS,   m41->engram_n_rows);
+            add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,   m41->engram_max_ngram);
+            add_kv(LLM_KV_ENGRAM_HEAD_COUNT,       m41->engram_n_head);
+            add_kv(LLM_KV_ENGRAM_HEAD_DIM,         m41->engram_head_dim);
+            add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID,     (uint32_t) pad_id);
+            add_kv(LLM_KV_ENGRAM_TOKEN_MAP,        m41->engram_token_map);
+            add_kv(LLM_KV_ENGRAM_MULTIPLIERS,      m41->engram_mult);
+            add_kv(LLM_KV_ENGRAM_PRIMES,           primes);
+        }
+    }
 
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {
