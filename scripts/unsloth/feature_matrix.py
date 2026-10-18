@@ -157,6 +157,9 @@ def probe_penalize_prompt(check: dict, b: Path, gpu: bool) -> str:
 
     server = b / "llama-server"
     if not server.exists():
+        # Only the CPU gate builds without it; a --gpu (full build) run that lacks it proved nothing.
+        if gpu:
+            raise Unproven("llama-server is missing from this full build")
         raise NeedsServer("needs llama-server, which this build did not produce")
     tmp = Path(tempfile.mkdtemp(prefix="fm_pp_", dir=b))
     rc, out = run([str(b / "test-llama-archs"), "-a", "llama", "-s", "1234", "-o", str(tmp)], b, gpu)
