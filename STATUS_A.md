@@ -77,6 +77,9 @@ llama.cpp (BF16 dense + MXFP4 experts, CUDA) is 2.5-5x closer to MATCHED than th
 prompt but t100 ub1 (equal); real text sits at the bf16 / q8-activation floor (C: bf16 floor 5e-3 on fixtures).
 Random-id prompts are an out-of-distribution, chaotic regime where native itself is 0.05-0.2 away. First 12 wiki
 tokens: CPU and CUDA llama are equally close to MATCHED at the sensitive positions (t6: 0.2 / 0.1; native 0.9).
+CUDA kernel check for the small-batch question: test-backend-ops vs CPU, MUL_MAT_ID mxfp4/bf16 81/81 OK and MUL_MAT
+type_a mxfp4/bf16 303/303 OK (0 failures). Open: CUDA long17k is not run-to-run reproducible (C: first divergence at
+rows 1639 / 13451), so ub7-vs-ub512 deltas on the full model are inside run-to-run noise until that is pinned down.
 
 ## Critique fold-in (plans/dsv41_support.md "Critique fold-in")
 1. No per-head q RMS norm: the graph has none; "V4 per-head q norm" is seeded bug #6 and FAILS (KL 4e-3..2).
