@@ -1033,7 +1033,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    // llama_model_n_embd_out() is hc_mult*n_embd (the MTP / DSpark heads read the flat HC state through it), and
+    // embedding extraction / pooling copy n_embd_out floats per row: an n_embd-wide result_norm here read past the
+    // tensor end (GGML_ASSERT in ggml_backend_tensor_get). Embedding contexts therefore return the flat HC state
+    // [hc_mult*n_embd] per token (pooled as usual); logits are unaffected.
+    res->t_embd = cparams.embeddings ? flat : cur;
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
