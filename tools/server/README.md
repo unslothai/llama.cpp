@@ -136,6 +136,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--repeat-penalty N` | penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled)<br/>(env: LLAMA_ARG_REPEAT_PENALTY) |
 | `--presence-penalty N` | repeat alpha presence penalty (default: 0.00, 0.0 = disabled)<br/>(env: LLAMA_ARG_PRESENCE_PENALTY) |
 | `--frequency-penalty N` | repeat alpha frequency penalty (default: 0.00, 0.0 = disabled)<br/>(env: LLAMA_ARG_FREQUENCY_PENALTY) |
+| `--penalize-prompt, --no-penalize-prompt` | whether prompt tokens count towards the repeat, presence, frequency and DRY penalties (default: enabled)<br/>(env: LLAMA_ARG_PENALIZE_PROMPT) |
 | `--dry-multiplier N` | set DRY sampling multiplier (default: 0.00, 0.0 = disabled) |
 | `--dry-base N` | set DRY sampling base value (default: 1.75) |
 | `--dry-allowed-length N` | set allowed length for DRY sampling (default: 2) |
@@ -548,6 +549,8 @@ These words will not be included in the completion, so make sure to add them to 
 `presence_penalty`: Repeat alpha presence penalty. Default: `0.0`, which is disabled.
 
 `frequency_penalty`: Repeat alpha frequency penalty. Default: `0.0`, which is disabled.
+
+`penalize_prompt`: Whether prompt tokens count towards the `repeat_penalty`, `presence_penalty`, `frequency_penalty` and DRY history. When `false`, only generated tokens are penalized, and `repeat_last_n` / `dry_penalty_last_n` count generated tokens only. Default: `true`
 
 `dry_multiplier`: Set the DRY (Don't Repeat Yourself) repetition penalty multiplier. Default: `0.0`, which is disabled.
 
