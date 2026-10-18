@@ -168,6 +168,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
         engram_layers.assign(e_layers.begin(), e_layers.end());
         hparams.dsv41_tok_hist = true; // state save/restore must carry the n-gram history
+        hparams.dsv41_hist_len = engram_max_ngram > 0 ? (uint32_t) engram_max_ngram - 1 : 0;
         engram_pad_cid = engram_token_map[pad_id];
         engram_primes.assign(primes.begin(), primes.end());
         engram_offsets.resize(primes.size());
@@ -379,9 +380,9 @@ private:
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {
-        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "DeepSeek-V4.1 Engram n-grams do not support tokens shared by multiple sequences");
-        }
+        // a token shared by several sequences (n_seq_id > 1) reads the history of its first sequence:
+        // llama_kv_cache_dsv4::init_batch rejected the batch unless every sequence of the token has the same
+        // predecessors, so the first one is representative
         // predecessors come from the raw window cells, which already hold this ubatch
         mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
         for (size_t e = 0; e < engram_ids.size(); ++e) {

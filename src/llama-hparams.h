@@ -330,6 +330,7 @@ struct llama_hparams {
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src; // index-source layer whose top-k this layer attends with, -1 = none
     int32_t  dsv41_cand_src         = -1; // candidate_source_layer, -1 = two-level selection off
     bool     dsv41_tok_hist         = false; // Engram: KV cells keep (and serialize) token ids for the n-gram history
+    uint32_t dsv41_hist_len         = 0;     // Engram: number of predecessor tokens an n-gram hash reads (max_ngram - 1)
     uint32_t dsv41_cand_topk_blocks = 0;
     uint32_t dsv41_cand_block_size  = 0;
 
