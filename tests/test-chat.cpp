@@ -7951,6 +7951,37 @@ static void test_deepseek_v4_1_message_fields() {
 
     assert_equals(std::string("<｜begin▁of▁sentence｜><｜User｜>a\n\n<__media__>\n\nb<｜Assistant｜></think>"),
                   render(R"([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "media_marker", "text": "<__media__>"}, {"type": "text", "text": "b"}]}])", true));
+
+    // OpenAI reasoning_effort values never fail
+    for (const auto & [effort, budget] : std::vector<std::pair<std::string, std::string>>{
+             { "minimal", "50" }, { "low", "50" }, { "medium", "75" }, { "high", "75" }, { "xhigh", "100" }, { "max", "100" } }) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        assert_contains(prompt, "<｜System｜>Reasoning Effort: " + budget + " (range 1-100");
+    }
+
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(R"([
+            {"role": "system", "content": "s", "tools": [{"type": "function", "function": {"name": "get_time",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]},
+            {"role": "user", "content": "q"}
+        ])"));
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["thinking_mode"] = "\"chat\"";
+        inputs.enable_thinking = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        common_chat_session session(tmpls.get(), nullptr, inputs, {});
+        const auto & msg = session.finish(common_chat_input(std::string(
+            "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_time\">\n"
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>")));
+        assert_equals(size_t(1), msg.tool_calls.size());
+        assert_equals(std::string("get_time"), msg.tool_calls[0].name);
+        assert_equals(std::string("{\"city\":\"Tokyo\"}"), msg.tool_calls[0].arguments);
+    }
 }
 
 static void test_prompt_parts() {

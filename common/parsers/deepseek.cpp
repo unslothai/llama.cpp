@@ -1,4 +1,5 @@
 #include "parsers.h"
+#include "log.h"
 
 // The DeepSeek V4 reference implementation renders consecutive tool results into a single
 // user block, ordered by the tool call order of the preceding assistant message (matched
@@ -83,7 +84,22 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
     }
 
-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    // V4.1 can declare tools on a system message instead of top-level "tools": parse calls to those too.
+    json tools = inputs.tools;
+    if (is_v41 && !(tools.is_array() && !tools.empty()) && inputs.messages.is_array()) {
+        for (const auto & msg : inputs.messages) {
+            if (msg.value("role", "") == "system" && msg.contains("tools") && msg.at("tools").is_array()) {
+                if (!tools.is_array()) {
+                    tools = json::array();
+                }
+                for (const auto & tool : msg.at("tools")) {
+                    tools.push_back(tool);
+                }
+            }
+        }
+    }
+
+    auto has_tools           = tools.is_array() && !tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
@@ -91,6 +107,27 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     std::optional<json> additional_context;
     if (is_v4 && has_response_format) {
         additional_context = json{ { "response_format", inputs.json_schema } };
+    }
+    // V4.1 raises on anything but low/high/max or 1-100: map minimal -> low, xhigh -> max, medium -> default
+    if (is_v41 && inputs.extra_context.is_object() && inputs.extra_context.contains("reasoning_effort") &&
+        inputs.extra_context.at("reasoning_effort").is_string()) {
+        const std::string effort = inputs.extra_context.at("reasoning_effort").get<std::string>();
+        json mapped;
+        if (effort == "minimal") {
+            mapped = "low";
+        } else if (effort == "xhigh") {
+            mapped = "max";
+        } else if (effort == "medium") {
+            mapped = nullptr;
+        }
+        if (effort == "minimal" || effort == "xhigh" || effort == "medium") {
+            LOG_DBG("%s: DeepSeek V4.1 reasoning_effort '%s' -> %s\n", __func__, effort.c_str(),
+                    mapped.is_null() ? "unset (template default)" : mapped.get<std::string>().c_str());
+            if (!additional_context.has_value()) {
+                additional_context = json::object();
+            }
+            (*additional_context)["reasoning_effort"] = mapped;
+        }
     }
 
     const std::string DSML         = "｜DSML｜";
@@ -155,7 +192,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         // build tool call section first since we might need it in reasoning
         auto tool_choice = p.choice();
         if (has_tool_calls) {
-            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
+            foreach_function(tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
 
