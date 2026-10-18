@@ -2060,9 +2060,20 @@ private:
                 continue;
             }
 
+            // the task thread notifies cv when it releases this group, so a launched slot is seen
+            // at once; the timeout is only a backstop
             std::unique_lock<std::mutex> lk(grp.mtx);
-            grp.cv.wait_for(lk, std::chrono::milliseconds(5),
-                    [&] { return groups_stop.load(std::memory_order_relaxed); });
+            grp.cv.wait_for(lk, std::chrono::milliseconds(5), [&] {
+                if (groups_stop.load(std::memory_order_relaxed)) {
+                    return true;
+                }
+                for (auto * slot : grp.slots) {
+                    if (slot->is_processing()) {
+                        return true;
+                    }
+                }
+                return false;
+            });
         }
     }
 
@@ -2144,12 +2155,36 @@ private:
             }
         }
 
+        // with pipeline groups, only the least loaded groups that still have a free slot are
+        // candidates, so light or uneven load still spreads across every group
+        std::vector<char> group_ok(groups.size(), 1);
+        if (n_groups > 1 && task.id_slot == -1) {
+            std::vector<int> n_busy(groups.size(), 0);
+            std::vector<int> n_free(groups.size(), 0);
+            for (const server_slot & slot : slots) {
+                (slot.is_processing() ? n_busy : n_free)[slot.id_group]++;
+            }
+            int n_min = -1;
+            for (size_t g = 0; g < groups.size(); ++g) {
+                if (n_free[g] > 0 && (n_min < 0 || n_busy[g] < n_min)) {
+                    n_min = n_busy[g];
+                }
+            }
+            for (size_t g = 0; g < groups.size(); ++g) {
+                group_ok[g] = n_free[g] > 0 && n_busy[g] == n_min;
+            }
+        }
+
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
+                    continue;
+                }
+
+                if (!group_ok[slot.id_group]) {
                     continue;
                 }
 
@@ -2202,7 +2237,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || !group_ok[slot.id_group]) {
                     continue;
                 }
 
@@ -3754,6 +3789,16 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
+            // a long prompt is decoded over many chunks with this group's lock held in between;
+            // give a waiting task thread its turn, or it (and every task queued behind it) waits
+            // for the whole prompt
+            if (n_groups > 1 && off > 0 && grp.n_pause_req > 0) {
+                grp.cv.wait(lk, [&] { return groups_stop.load(std::memory_order_relaxed) || grp.n_pause_req == 0; });
+                if (groups_stop.load(std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
