@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Callable, Iterable, TYPE_CHECKING
@@ -117,8 +118,9 @@ def _e8m0_check(scale_u8: np.ndarray, name: str) -> None:
 @ModelBase.register("DeepseekV41ForCausalLM")
 class DeepseekV41Model(DeepseekV4Model):
     """DeepSeek-V4.1 text model, lossless: FP8 (e4m3, 32x32 ue8m0 blocks) linears dequantized to BF16 (F32 with
-    --outtype f32), routed experts copied bit-exact as MXFP4, Engram tables (e4m3 rows, one e8m0 scale per 32) as
-    BF16 (F32 with --outtype f32), router and Engram gate F32. DSpark (mtp.*) and the vision tower are not converted.
+    --outtype f32), routed experts copied bit-exact as MXFP4, Engram tables (e4m3 rows, one e8m0 scale per 32) copied
+    bit-exact as MXFP8 (DSV41_ENGRAM_TYPE=bf16: the exact BF16 lookup, F32 with --outtype f32), router and Engram gate
+    F32. DSpark (mtp.*) and the vision tower are not converted.
     The Engram tables of all layers are written as one per_layer_token_embd (rows concatenated in layer order) with
     the PLE keys of qwen4exp: absolute head offsets and bucket counts, so the runtime can read it lazily."""
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
@@ -130,6 +132,7 @@ class DeepseekV41Model(DeepseekV4Model):
         super().__init__(*args, **kwargs)
         self.hparams.setdefault("num_hash_layers", 0)  # no hash-routed layers in V4.1
         self._f32 = self.ftype == gguf.LlamaFileType.ALL_F32
+        self._engram_mxfp8 = os.environ.get("DSV41_ENGRAM_TYPE", "mxfp8").lower() != "bf16"
         qc = self.hparams.get("quantization_config") or {}
         self._fp8_block = tuple(qc.get("weight_block_size") or (32, 32))
         if qc.get("scale_fmt", "ue8m0") != "ue8m0":
@@ -225,7 +228,7 @@ class DeepseekV41Model(DeepseekV4Model):
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
-        # official lookup e4m3 * 2^(e8m0 - 127), then BF16 (exact); all layers concatenated into per_layer_token_embd
+        # official lookup e4m3 * 2^(e8m0 - 127): stored as the source MXFP8 blocks (bit-exact) or as exact BF16
         parts, dim = [], None
         for bid in layer_ids:
             wn, sn = f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"
@@ -236,6 +239,25 @@ class DeepseekV41Model(DeepseekV4Model):
                 raise ValueError(f"{wn}: {rows} rows, config says {self.hparams['engram_num_embeddings'][len(parts)]}")
             dim = d
             parts.append((wn, sn, rows, self._tensor_part(wn), self._tensor_part(sn)))
+        assert dim is not None
+        name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
+        n_rows = sum(p[2] for p in parts)
+
+        if self._engram_mxfp8:
+            def blocks() -> Iterable[np.ndarray]:
+                from safetensors import safe_open
+                for wn, sn, rows, wpart, spart in parts:
+                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                        for r0 in range(0, rows, 1 << 18):
+                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32).numpy()
+                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1).numpy()
+                            if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
+                                raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
+                            yield np.concatenate([e, q], axis=1)
+            data = _StreamedBytes((n_rows, dim // 32 * 33), blocks)
+            self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+            return
 
         def chunks() -> Iterable[np.ndarray]:
             from safetensors import safe_open
@@ -248,10 +270,9 @@ class DeepseekV41Model(DeepseekV4Model):
                         _e8m0_check(e.numpy(), sn)
                         v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
                         yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
-        assert dim is not None
         qt = gguf.GGMLQuantizationType.F32 if self._f32 else gguf.GGMLQuantizationType.BF16
-        data = _StreamedBytes((sum(p[2] for p in parts), dim * (4 if self._f32 else 2)), chunks)
-        self.gguf_writer.add_tensor(self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD), data, raw_dtype=qt)
+        data = _StreamedBytes((n_rows, dim * (4 if self._f32 else 2)), chunks)
+        self.gguf_writer.add_tensor(name, data, raw_dtype=qt)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if not self._dsv4_mxfp4_generated:
