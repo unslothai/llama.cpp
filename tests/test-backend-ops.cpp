@@ -5192,6 +5192,36 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
     return false;
 }
 
+// MUL_MAT at GGML_PREC_F32 ([TAG_GGML_PREC]): F32 weights must not be rounded (e.g. TF32) at any batch size
+struct test_mul_mat_prec_f32 : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t bs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, bs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-10; // TF32 inputs give ~1e-7
+    }
+
+    test_mul_mat_prec_f32(int64_t m = 128, int64_t n = 7, int64_t k = 1024, int64_t bs = 1)
+        : m(m), n(n), k(k), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, bs);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, bs);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_prec_set_src(out, GGML_PREC_F32, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -10764,6 +10794,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+
+    // no TF32 at any batch size (mmvf / mmf / cuBLAS ranges), incl. a batched shape
+    for (int64_t n : {1, 3, 4, 7, 8, 9, 16, 17, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(384, n, 5120, 1));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(256, n, 512, 4));
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
