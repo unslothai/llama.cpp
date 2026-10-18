@@ -1150,7 +1150,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+            // dsv41_tok_hist: embd cells must record LLAMA_TOKEN_NULL (DEAD for Engram), never a stale id
+            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0 || hparams.dsv41_tok_hist) {
                 llama_kv_cell_ext ext;
 
                 if (ubatch.is_pos_2d()) {
@@ -1907,6 +1908,14 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
             res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
         }
     }
+}
+
+llama_token llama_kv_cache::seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+    if (!has_cell_ext() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p < 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    return v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
 }
 
 size_t llama_kv_cache::total_size() const {
