@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <string>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -737,6 +738,75 @@ llama_mmap::ranges llama_mmap::page_runs(ranges rs, size_t limit, size_t page_si
     }
 
     return res;
+}
+
+#ifdef __linux__
+// the number at the start of path, false if missing, unreadable or not a number ("max")
+static bool llama_read_u64(const std::string & path, unsigned long long & v) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fscanf(f, "%llu", &v) == 1;
+    fclose(f);
+    return ok;
+}
+#endif
+
+size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * root) {
+#ifdef __linux__
+    // v2 "0::/path": the tightest of memory.max and memory.high, less memory.current
+    // v1 "N:..,memory,..:/path": memory.limit_in_bytes less memory.usage_in_bytes, under the memory mount
+    // each less the same reserve as the host budget, max(2 GiB, limit/16); over the cgroup and its ancestors, as the limits
+    // are hierarchical. in a container the mount root is the container's cgroup and the paths above it are not there, so
+    // the missing files are skipped: what cannot be read leaves the budget as it is
+    FILE * f = fopen(self, "r");
+    if (!f) {
+        return budget;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        const char * c1 = strchr(line, ':');
+        const char * c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) {
+            continue;
+        }
+        const std::string ctrls = "," + std::string(c1 + 1, c2) + ",";
+        std::string path(c2 + 1);
+        path.erase(path.find_last_not_of("\r\n") + 1);
+        const bool v2 = ctrls == ",," && strncmp(line, "0:", 2) == 0;
+        const bool v1 = ctrls.find(",memory,") != std::string::npos;
+        if ((!v1 && !v2) || path.empty() || path[0] != '/' || path.find("/..") != std::string::npos) {
+            continue;
+        }
+        const std::string base = std::string(root) + (v1 ? "/memory" : "");
+        const char * used_name = v1 ? "/memory.usage_in_bytes" : "/memory.current";
+        const char * lim_names[2] = { v1 ? "/memory.limit_in_bytes" : "/memory.max", v1 ? nullptr : "/memory.high" };
+        for (;;) {
+            const std::string dir = base + (path == "/" ? "" : path);
+            unsigned long long used = 0;
+            if (llama_read_u64(dir + used_name, used)) {
+                for (const char * name : lim_names) {
+                    unsigned long long lim = 0;
+                    if (name && llama_read_u64(dir + name, lim)) {
+                        const unsigned long long reserve = std::max(2ull << 30, lim/16);
+                        const unsigned long long left = lim > used && lim - used > reserve ? lim - used - reserve : 0;
+                        budget = (size_t) std::min<unsigned long long>(budget, left);
+                    }
+                }
+            }
+            if (path == "/") {
+                break;
+            }
+            path.erase(std::max<size_t>(path.find_last_of('/'), 1));
+        }
+    }
+    fclose(f);
+#else
+    GGML_UNUSED(self);
+    GGML_UNUSED(root);
+#endif
+    return budget;
 }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)

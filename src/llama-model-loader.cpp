@@ -1412,7 +1412,8 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 #ifdef __linux__
-// bytes that can be populated without pushing the system into reclaim: MemAvailable minus max(2 GiB, MemTotal/16), 0 if unknown
+// bytes that can be populated without pushing the system into reclaim: MemAvailable minus max(2 GiB, MemTotal/16), 0 if unknown,
+// and no more than the cgroup's memory limits leave (a container's limit is usually far below the host's MemAvailable)
 static size_t llama_populate_budget() {
     size_t avail = 0;
     size_t total = 0;
@@ -1429,7 +1430,7 @@ static size_t llama_populate_budget() {
         fclose(f);
     }
     const size_t headroom = std::max(2*GiB, total/16);
-    return avail > headroom ? avail - headroom : 0;
+    return llama_mmap::cgroup_budget(avail > headroom ? avail - headroom : 0);
 }
 #endif
 
