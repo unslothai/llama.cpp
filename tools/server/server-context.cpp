@@ -4391,6 +4391,12 @@ private:
 
         slot.prompt.tokens.keep_first(n_keep);
         slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+        // [TAG_PREEMPT] A sliding window holds only the newest cells: cut below them, nothing of the prefix is left, and the reuse check aborts on an empty sequence that claims tokens.
+        if (n_keep > 0 && llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) == -1) {
+            slot.prompt.tokens.clear();
+            slot.mem.seq_rm(slot.id, -1, -1);
+        }
     }
 
     // `recompute`: no victim fits the host budget, so pick again and drop cells instead of copying. `n_deficit`: a single victim covering it is preferred over several smaller ones.
@@ -4455,12 +4461,21 @@ private:
         return victim;
     }
 
-    // [TAG_PREEMPT] The most recently arrived resident, with no exemption: the oldest always runs. Copied if the budget holds it, else dropped.
+    // [TAG_PREEMPT] The most recently arrived resident, never the oldest, which always runs. Copied if the budget holds it, else dropped.
     server_slot * preempt_pick_victim_fcfs(bool * recompute) {
+        // [TAG_PREEMPT] Beside held prompts the oldest can be the only eligible slot; parked, it is resumed first, so it would ping-pong at the window's end instead of finishing.
+        const server_slot * oldest = nullptr;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && slot.task && (!oldest || slot.task->id < oldest->task->id)) {
+                oldest = &slot;
+            }
+        }
+
         server_slot * victim = nullptr;
 
         for (auto & slot : slots) {
-            if (preempt_victim_eligible(slot, nullptr, true) && (!victim || slot.task->id > victim->task->id)) {
+            if (&slot != oldest && preempt_victim_eligible(slot, nullptr, true) && (!victim || slot.task->id > victim->task->id)) {
                 victim = &slot;
             }
         }
