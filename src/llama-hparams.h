@@ -332,6 +332,14 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // deepseek41: cross-layer sharing of the compressed KV / index K and of the indexer top-k
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_src;   // layer whose compressed KV (and index K) this layer reads, -1 = none
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src; // index-source layer whose top-k this layer attends with, -1 = none
+    int32_t  dsv41_cand_src         = -1;    // candidate_source_layer, -1 = two-level selection off
+    uint32_t dsv41_cand_topk_blocks = 0;
+    uint32_t dsv41_cand_block_size  = 0;
+    bool     dsv41_tok_hist         = false; // Engram: KV cells keep (and serialize) token ids for the n-gram history
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 
