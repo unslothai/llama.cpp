@@ -751,15 +751,44 @@ static bool llama_read_u64(const std::string & path, unsigned long long & v) {
     fclose(f);
     return ok;
 }
+
+// a cgroup mount whose root is a subtree (a container without a cgroup namespace) still shows the host path in
+// /proc/self/cgroup: strip the mount root so the path is relative to the mount point, else it is left as it is
+static std::string llama_cgroup_mount_relative(const std::string & path, const char * mountinfo, const std::string & mnt, bool v2) {
+    FILE * f = fopen(mountinfo, "r");
+    if (!f) {
+        return path;
+    }
+    std::string res = path;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        // "id parent maj:min root mount-point options [optional...] - fstype source super-options"
+        char mroot[4096];
+        char mpoint[4096];
+        char fstype[64];
+        const char * sep = strstr(line, " - ");
+        if (!sep || sscanf(line, "%*s %*s %*s %4095s %4095s", mroot, mpoint) != 2 ||
+                sscanf(sep + 3, "%63s", fstype) != 1 || strcmp(fstype, v2 ? "cgroup2" : "cgroup") != 0 || mnt != mpoint) {
+            continue;
+        }
+        const std::string r = mroot;
+        if (r != "/" && path.compare(0, r.size(), r) == 0 && (path.size() == r.size() || path[r.size()] == '/')) {
+            res = path.size() == r.size() ? "/" : path.substr(r.size());
+        }
+        break;
+    }
+    fclose(f);
+    return res;
+}
 #endif
 
-size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * root) {
+size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * root, const char * mountinfo) {
 #ifdef __linux__
     // v2 "0::/path": the tightest of memory.max and memory.high, less memory.current
     // v1 "N:..,memory,..:/path": memory.limit_in_bytes less memory.usage_in_bytes, under the memory mount
     // each less the same reserve as the host budget, max(2 GiB, limit/16); over the cgroup and its ancestors, as the limits
-    // are hierarchical. in a container the mount root is the container's cgroup and the paths above it are not there, so
-    // the missing files are skipped: what cannot be read leaves the budget as it is
+    // are hierarchical. a path under a subtree mount is made relative to it (mountinfo), and the cgroups above the mount
+    // root are not there, so the missing files are skipped: what cannot be read leaves the budget as it is
     FILE * f = fopen(self, "r");
     if (!f) {
         return budget;
@@ -780,6 +809,7 @@ size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * 
             continue;
         }
         const std::string base = std::string(root) + (v1 ? "/memory" : "");
+        path = llama_cgroup_mount_relative(path, mountinfo, base, v2);
         const char * used_name = v1 ? "/memory.usage_in_bytes" : "/memory.current";
         const char * lim_names[2] = { v1 ? "/memory.limit_in_bytes" : "/memory.max", v1 ? nullptr : "/memory.high" };
         for (;;) {
@@ -805,6 +835,7 @@ size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * 
 #else
     GGML_UNUSED(self);
     GGML_UNUSED(root);
+    GGML_UNUSED(mountinfo);
 #endif
     return budget;
 }

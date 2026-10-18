@@ -1443,7 +1443,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     const char * populate_env = getenv("LLAMA_MMAP_POPULATE");
     const bool populate_enabled = !populate_env || strcmp(populate_env, "0") != 0;
     size_t populate_left = 0;
-    bool   populate_init = false;
+    // sampled before any file is mapped: the files without lazy ranges are populated in full by MAP_POPULATE, and once
+    // mapped their pages are charged to the cgroup (memory.current) yet still counted in MemAvailable as page cache, so
+    // each is reserved exactly once here
+    if (populate_enabled && prefetch && use_mmap && !no_alloc && lazy.any()) {
+        populate_left = llama_populate_budget();
+        for (uint32_t i = 0; i < files.size(); i++) {
+            if (lazy.for_file(i).empty()) {
+                populate_left -= std::min(populate_left, files[i]->size());
+            }
+        }
+    }
     const char * func = __func__;
 
     auto populate = [&](uint32_t idx, llama_mmap & mapping) {
@@ -1467,17 +1477,6 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         size_t need = 0;
         for (const auto & r : rs) {
             need += r.second - r.first;
-        }
-        if (!populate_init) {
-            populate_left = llama_populate_budget();
-            // the files without lazy ranges are populated in full by MAP_POPULATE, before or after this one;
-            // the earlier ones are not reflected in MemAvailable either, which counts their page cache as available
-            for (uint32_t i = 0; i < files.size(); i++) {
-                if (lazy.for_file(i).empty()) {
-                    populate_left -= std::min(populate_left, files[i]->size());
-                }
-            }
-            populate_init = true;
         }
         if (need > populate_left) {
             LLAMA_LOG_INFO("%s: file %u: not populating %.2f MiB of tensor data, over the RAM budget of %.2f MiB\n",

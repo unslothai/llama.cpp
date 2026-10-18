@@ -66,7 +66,8 @@ struct llama_mmap {
     static ranges page_runs(ranges rs, size_t limit, size_t page_size);
 
     // budget lowered to what the memory limits of this process's cgroup and its ancestors leave (Linux, else unchanged)
-    static size_t cgroup_budget(size_t budget, const char * self = "/proc/self/cgroup", const char * root = "/sys/fs/cgroup");
+    static size_t cgroup_budget(size_t budget, const char * self = "/proc/self/cgroup", const char * root = "/sys/fs/cgroup",
+            const char * mountinfo = "/proc/self/mountinfo");
 
     static const bool SUPPORTED;
 

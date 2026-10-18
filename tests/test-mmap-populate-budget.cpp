@@ -26,9 +26,24 @@ static void check(const char * name, size_t got, size_t want) {
 }
 
 int main() {
+    // page_runs: empty and inverted ranges dropped, rounded out to pages, clamped to the file, merged
+    check("page_runs_empty", llama_mmap::page_runs({}, 16384, 4096).size(), 0);
+    {
+        const llama_mmap::ranges runs = llama_mmap::page_runs(
+            { { 5000, 3000 }, { 1000, 1000 }, { 100, 200 }, { 4096, 5000 }, { 6000, 8192 }, { 20000, 30000 } }, 16384, 4096);
+        check("page_runs_merged_count", runs.size(), 1);
+        check("page_runs_merged_first", runs.empty() ? 1 : runs[0].first, 0);
+        check("page_runs_merged_last",  runs.empty() ? 0 : runs[0].second, 8192);
+    }
+    {
+        const llama_mmap::ranges runs = llama_mmap::page_runs({ { 8193, 20000 }, { 0, 1 } }, 10000, 4096);
+        check("page_runs_clamp_count", runs.size(), 2);
+        check("page_runs_clamp_first", runs.size() < 2 ? 1 : runs[1].first, 8192);
+        check("page_runs_clamp_last",  runs.size() < 2 ? 0 : runs[1].second, 10000);
+    }
 #ifndef __linux__
     printf("SKIP: Linux only\n");
-    return 0;
+    return n_fail ? 1 : 0;
 #else
     const fs::path base = fs::absolute("test-mmap-populate-budget.d");
     fs::remove_all(base);
@@ -89,6 +104,36 @@ int main() {
     // v2 without cgroupns: the host path does not exist in the container, its cgroup is the mount root
     v2("v2_bind", "", G4.c_str(), "max", G1.c_str());
     run("v2_bind", "0::/system.slice/docker-1234.scope\n", 1*GiB);
+
+    // a subtree mount without cgroupns: mountinfo maps the host path to the mount point, so a tighter child cgroup
+    // inside the container is found (4 GiB, 1 GiB used: 1 GiB) instead of only the mount root (32 GiB: 29 GiB)
+    auto run_mounted = [&](const char * name, const std::string & self, const std::string & mnt_root,
+            const std::string & mnt_suffix, const char * fstype, size_t want) {
+        const fs::path dir = base / name;
+        put(dir / "self", self);
+        put(dir / "mountinfo",
+                "22 1 0:21 / /proc rw,nosuid - proc proc rw\n"
+                "30 25 0:26 " + mnt_root + " " + (dir / "root").string() + mnt_suffix + " rw,nosuid shared:9 - " + fstype +
+                " cgroup rw,memory\n");
+        check(name, llama_mmap::cgroup_budget(HOST, (dir / "self").c_str(), (dir / "root").c_str(),
+                (dir / "mountinfo").c_str()), want);
+    };
+    v2("v2_subtree", "",       G32.c_str(), "max", G1.c_str());
+    v2("v2_subtree", "worker", G4.c_str(),  "max", G1.c_str());
+    run_mounted("v2_subtree", "0::/system.slice/docker-1234.scope/worker\n", "/system.slice/docker-1234.scope", "",
+            "cgroup2", 1*GiB);
+    // the process in the mount root itself
+    v2("v2_subtree_root", "", G4.c_str(), "max", G1.c_str());
+    run_mounted("v2_subtree_root", "0::/system.slice/docker-1234.scope\n", "/system.slice/docker-1234.scope", "",
+            "cgroup2", 1*GiB);
+    // a mount root that is not a prefix of the path (on a component boundary): the path is left as it is
+    v2("v2_subtree_other", "",       G32.c_str(), "max", G1.c_str());
+    v2("v2_subtree_other", "worker", G4.c_str(),  "max", G1.c_str());
+    run_mounted("v2_subtree_other", "0::/system.slice/docker-12345.scope/worker\n", "/system.slice/docker-1234.scope",
+            "", "cgroup2", 29*GiB);
+    v1("v1_subtree", "",       G32, G1);
+    v1("v1_subtree", "worker", G4,  G1);
+    run_mounted("v1_subtree", "3:memory:/docker/x/worker\n", "/docker/x", "/memory", "cgroup", 1*GiB);
 
     // v1: memory.limit_in_bytes = 4 GiB, 1 GiB used, other controllers listed first
     v1("v1_leaf", "docker/x", G4, G1);
