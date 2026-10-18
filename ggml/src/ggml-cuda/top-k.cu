@@ -200,12 +200,63 @@ static __global__ void top_k_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
+        }
+    }
+}
+
+// Elements equal to the k-th key fill the last `rank` slots, taking the lowest column indices first. With the atomic
+// slot order used for the greater elements, which of several tied elements made the cut changed from run to run
+// (exactly tied scores are common, e.g. masked or ReLU-zeroed rows), so the selected set was not reproducible.
+// One block per row scans the columns in order with a block-wide prefix count, stopping once the slots are full.
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_gather_equal(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const top_k_radix_state * __restrict__ states,
+        int ncols,
+        int k) {
+    static_assert(BLOCK_SIZE % WARP_SIZE == 0, "BLOCK_SIZE must be a multiple of WARP_SIZE");
+    constexpr int NWARPS = BLOCK_SIZE / WARP_SIZE;
+    __shared__ int warp_sums[NWARPS];
+
+    const int row  = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const top_k_radix_state state = states[row];
+
+    int base = 0;
+    for (int64_t col0 = 0; col0 < ncols && base < state.rank; col0 += BLOCK_SIZE) {
+        const int64_t col = col0 + tid;
+        const int eq = col < ncols && top_k_float_to_ordered(row_src[col]) == state.prefix;
+
+        // inclusive prefix count within the warp, then across warps
+        int incl = eq;
+#pragma unroll
+        for (int off = 1; off < WARP_SIZE; off *= 2) {
+            const int y = __shfl_up_sync(0xFFFFFFFF, incl, off, WARP_SIZE);
+            if (lane >= off) {
+                incl += y;
             }
         }
+        if (lane == WARP_SIZE - 1) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        int warp_off = 0;
+        int total    = 0;
+        for (int w = 0; w < NWARPS; ++w) {
+            warp_off += w < warp ? warp_sums[w] : 0;
+            total    += warp_sums[w];
+        }
+        const int pos = base + warp_off + incl - eq;
+        if (eq && pos < state.rank) {
+            row_dst[k - state.rank + pos] = col;
+        }
+        base += total;
+        __syncthreads();
     }
 }
 
@@ -244,6 +295,8 @@ static void top_k_radix_cuda(
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                 src, dst, states, ncols, k, blocks_per_row);
+        top_k_radix_gather_equal<BLOCK_SIZE>
+            <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
