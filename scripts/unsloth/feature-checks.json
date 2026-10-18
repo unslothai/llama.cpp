@@ -65,7 +65,7 @@
       ]
     },
     "muse-spark": { "owner": null, "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
-    "beam": { "owner": "ggml-org#30670", "checks": [ { "kind": "arch", "arch": "beam" } ] },
+    "beam": { "owner": null, "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": null,
       "checks": [
@@ -106,6 +106,12 @@
       "owner": "unslothai#176",
       "checks": [
         { "kind": "mtmd", "projector": "*" }
+      ]
+    },
+    "penalize-prompt": {
+      "owner": "unslothai#283",
+      "checks": [
+        { "kind": "penalize-prompt", "field": "penalize_prompt" }
       ]
     }
   },

@@ -172,6 +172,16 @@ real.chmod(0o755)
 rc, rep, out = run(d, m, "--gpu")
 check("output cut off once is retried and passes", rc == 0 and rep["ok"], out)
 
+# --- 11. no llama-server in the build: deferred on the CPU gate only -------
+d, m = build(checks=[{"kind": "penalize-prompt", "field": "penalize_prompt"}])
+rc, rep, out = run(d, m)
+check("a CPU build without llama-server defers the server probe",
+      rc == 0 and rep["deferred"] == 1 and not rep["features"][0]["results"], out)
+check("and names what is missing", "needs llama-server" in json.dumps(rep), rep)
+rc, rep, out = run(d, m, "--gpu")
+check("a full (--gpu) build without llama-server is a failure, not a deferral",
+      rc == 1 and rep["deferred"] == 0 and "missing from this full build" in json.dumps(rep), out)
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)

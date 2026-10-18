@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -134,7 +135,98 @@ def probe_mtmd(check: dict, b: Path, gpu: bool) -> str:
     return f"projector registry intact over {m.group(1)} assertions"
 
 
-PROBES = {"arch": probe_arch, "backend-op": probe_backend_op, "mtmd": probe_mtmd}
+class NeedsServer(NeedsGPU):
+    """Deferred like NeedsGPU: the CPU gate builds no llama-server, so a server
+    probe there has nothing to run. The full build has it."""
+
+
+def probe_penalize_prompt(check: dict, b: Path, gpu: bool) -> str:
+    """penalize_prompt = false keeps prompt tokens out of the penalty history.
+
+    Offline: test-llama-archs writes a synthetic llama GGUF and llama-server
+    decodes token-id prompts with it. Greedy decoding finds a context whose
+    next token is already in that context; a presence penalty of 100 must move
+    it with the default request, and must not with penalize_prompt = false.
+    A tree without the field ignores it and fails the second half.
+    """
+    import os
+    import socket
+    import tempfile
+    import time
+    import urllib.request
+
+    server = b / "llama-server"
+    if not server.exists():
+        # Only the CPU gate builds without it; a --gpu (full build) run that lacks it proved nothing.
+        if gpu:
+            raise Unproven("llama-server is missing from this full build")
+        raise NeedsServer("needs llama-server, which this build did not produce")
+    tmp = Path(tempfile.mkdtemp(prefix="fm_pp_", dir=b))
+    rc, out = run([str(b / "test-llama-archs"), "-a", "llama", "-s", "1234", "-o", str(tmp)], b, gpu)
+    model = tmp / "llama-dense.gguf"
+    if rc != 0 or not model.exists():
+        raise Unproven(f"test-llama-archs -o did not write {model.name} (rc {rc})")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = None if gpu else dict(os.environ, CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
+    log = open(tmp / "server.log", "w")
+    proc = subprocess.Popen([str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
+                             "-c", "256", "-np", "1", "-t", "4", "--no-webui"], stdout=log, stderr=subprocess.STDOUT, env=env)
+
+    def post(body: dict) -> dict:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+
+    try:
+        for _ in range(240):
+            if proc.poll() is not None:
+                raise Unproven(f"llama-server exited {proc.returncode} on the synthetic model")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except OSError:
+                pass
+            time.sleep(0.5)
+        else:
+            raise Unproven("llama-server did not become healthy in 120 s")
+        greedy = dict(n_predict=1, top_k=1, temperature=0.0, return_tokens=True)
+        prompt = list(range(1, 9))
+        gen = post(dict(greedy, prompt=prompt, n_predict=48))["tokens"]
+        k = next((i for i, t in enumerate(gen) if t in prompt + gen[:i]), None)
+        if k is None:
+            raise Unproven("greedy decode of the synthetic model never repeated a context token")
+        ctx, want = prompt + gen[:k], gen[k]
+        plain = post(dict(greedy, prompt=ctx))
+        on = post(dict(greedy, prompt=ctx, presence_penalty=100.0))
+        off = post(dict(greedy, prompt=ctx, presence_penalty=100.0, penalize_prompt=False))
+    except OSError as e:
+        raise Unproven(f"request to llama-server failed: {e}")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    if plain["tokens"] != [want]:
+        raise Unproven(f"greedy is not deterministic: {plain['tokens']} != [{want}]")
+    if on["tokens"] == [want]:
+        raise Unproven("presence_penalty 100 did not move a token that is in the prompt")
+    if off["tokens"] != [want]:
+        raise Unproven(f"penalize_prompt = false still penalized the prompt: {off['tokens']} != [{want}]")
+    if off.get("generation_settings", {}).get("penalize_prompt") is not False:
+        raise Unproven("generation_settings does not echo penalize_prompt = false")
+    return (f"prompt token {want} kept with penalize_prompt false, moved to {on['tokens'][0]} "
+            "by the default prompt-wide presence penalty")
+
+
+PROBES = {"arch": probe_arch, "backend-op": probe_backend_op, "mtmd": probe_mtmd,
+          "penalize-prompt": probe_penalize_prompt}
 
 
 def main() -> int:
@@ -161,7 +253,7 @@ def main() -> int:
                  "results": [], "problems": [], "deferred": []}
         for check in feat["checks"]:
             kind = check["kind"]
-            label = f"{kind}:{check.get('arch') or check.get('op') or check.get('projector')}"
+            label = f"{kind}:{check.get('arch') or check.get('op') or check.get('projector') or check.get('field')}"
             try:
                 if kind not in PROBES:
                     raise Unproven(f"unknown check kind {kind!r}")
