@@ -17,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <cctype>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -1220,9 +1221,23 @@ void server_models::load(const std::string & name, const load_options & opts) {
         {
             static const std::string tr_prefix = "GGML_RPC_TRACE=";
 
+            // Windows environment names are case-insensitive: getenv() also finds ggml_rpc_trace
+            const auto is_trace = [](const std::string & e) {
+                if (e.size() < tr_prefix.size()) {
+                    return false;
+                }
+#ifdef _WIN32
+                return std::equal(tr_prefix.begin(), tr_prefix.end(), e.begin(), [](char a, char b) {
+                    return std::toupper((unsigned char) a) == std::toupper((unsigned char) b);
+                });
+#else
+                return e.compare(0, tr_prefix.size(), tr_prefix) == 0;
+#endif
+            };
+
             std::string base_trace;
             for (const auto & e : child_env) {
-                if (e.rfind(tr_prefix, 0) == 0) {
+                if (is_trace(e)) {
                     base_trace = e.substr(tr_prefix.size());
                     break; // getenv() would return this first entry, so match it
                 }
@@ -1246,7 +1261,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
                 }
 
                 child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
-                                    [](const std::string & e) { return e.rfind(tr_prefix, 0) == 0; }),
+                                    is_trace),
                                 child_env.end());
                 child_env.push_back(tr_prefix + stem + "." + safe_name + "." +
                                     std::to_string(inst.meta.port) + ext);

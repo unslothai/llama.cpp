@@ -109,29 +109,31 @@ def report(files, client, out):
 
     pre_all = union([iv for g in groups for iv in pre[g]])
     dec_all = union([iv for g in groups for iv in dec[g]])
-    t_pre_end = max((b for _, b in pre_all), default=w0)
+    # A continuously batched server admits prompts while others decode, so the phases interleave:
+    # "prefill" is any time a prompt chunk is in an iteration, "decode" the decode-only rest.
+    dec_only = [x for a, c in gaps(pre_all, w0, w1) for x in clip(dec_all, a, c)]
 
-    phases = [("whole window", w0, w1),
-              ("prefill phase", w0, t_pre_end),
-              ("decode phase", t_pre_end, w1)]
+    phases = [("whole window", [(w0, w1)]),
+              ("prefill phase", [tuple(iv) for iv in pre_all]),
+              ("decode phase", dec_only)]
 
-    out.write("window %.3f s, %d groups, prefill ends %.3f s in "
+    out.write("window %.3f s, %d groups, prefill %.3f s, decode-only %.3f s "
               "(%.1f%% of the window)\n" % (
-                  (w1 - w0) / 1e6, len(groups), (t_pre_end - w0) / 1e6,
-                  100.0 * (t_pre_end - w0) / max(w1 - w0, 1)))
+                  (w1 - w0) / 1e6, len(groups), union_len(pre_all) / 1e6,
+                  union_len(dec_only) / 1e6, 100.0 * union_len(dec_only) / max(w1 - w0, 1)))
     out.write("prefill iterations %d, decode iterations %d\n\n" % (
         sum(len(pre[g]) for g in groups), sum(len(dec[g]) for g in groups)))
 
-    for pname, p0, p1 in phases:
-        span = p1 - p0
+    for pname, wins in phases:
+        span = sum(p1 - p0 for p0, p1 in wins)
         if span <= 0:
             continue
         out.write("=== %s: %.3f s\n" % (pname, span / 1e6))
         for dev in ("local", "peer"):
             other = "peer" if dev == "local" else "local"
-            b = clip(busy[dev], p0, p1)
+            b = [x for p0, p1 in wins for x in clip(busy[dev], p0, p1)]
             ob = Index([(a, c, None) for a, c in busy[other]])
-            idle = gaps(b, p0, p1)
+            idle = [x for p0, p1 in wins for x in gaps(b, p0, p1)]
             t_busy = union_len(b)
             t_idle = union_len(idle)
 
@@ -176,7 +178,7 @@ def report(files, client, out):
                 out.write("        neither computing, by host phase: %s\n"
                           % ", ".join("%s %.2f%%" % (k, 100.0 * v / span)
                                       for k, v in top if v > 0))
-            n_steps = sum(len(clip(dec[g] + pre[g], p0, p1)) for g in groups)
+            n_steps = sum(len(clip(dec[g] + pre[g], p0, p1)) for g in groups for p0, p1 in wins)
             if n_steps:
                 out.write("        per group-step in this phase: idle %.2f ms "
                           "(%.2f ms while %s computes, %.2f ms with neither)\n"
@@ -185,18 +187,23 @@ def report(files, client, out):
         out.write("\n")
 
     out.write("=== group offset in the decode phase\n")
+    dec_span = max(union_len(dec_only), 1)
+
+    def in_decode(ivs):
+        return [x for p0, p1 in dec_only for x in clip(ivs, p0, p1)]
+
     for g in groups:
-        d = clip(dec[g], t_pre_end, w1)
+        d = in_decode(dec[g])
         out.write("  group %d: %d decode iterations, median %.1f ms, "
                   "covering %.1f%% of the decode phase\n"
-                  % (g, len(d), _med([b - a for a, b in d]) / 1000.0,
-                     100.0 * union_len(d) / max(w1 - t_pre_end, 1)))
+                  % (g, len(dec[g]), _med([b - a for a, b in dec[g]]) / 1000.0,
+                     100.0 * union_len(d) / dec_span))
     if len(groups) == 2:
-        a = clip(dec[groups[0]], t_pre_end, w1)
-        b = clip(dec[groups[1]], t_pre_end, w1)
+        a = in_decode(dec[groups[0]])
+        b = in_decode(dec[groups[1]])
         both = union_len(a) + union_len(b) - union_len(a + b)
         out.write("  the two groups are inside an iteration at the same time for %.1f%% "
-                  "of the decode phase\n" % (100.0 * both / max(w1 - t_pre_end, 1)))
+                  "of the decode phase\n" % (100.0 * both / dec_span))
 
 
 def _med(xs):
