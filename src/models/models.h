@@ -1488,6 +1488,13 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::vector<ggml_tensor *> comp_row_of; // [n_layer] new compressed rows of each kv source (for mirrors)
         ggml_tensor * cand_sel    = nullptr; // candidate blocks of the candidate source layer
         int64_t       cand_n_comp = 0;       // compressed rows the candidate source scored
+
+        // sparse path (LLAMA_DSV41_SPARSE=0 disables): fused indexer, FA bounded to window + top-k, decode gather
+        bool sparse = true;
+        // gather path, shared by layers with the same top-k: selected K rows per (storage layer, top-k source) and
+        // the mask per top-k source (one input copy per split)
+        std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
+        std::map<int32_t, ggml_tensor *> gather_mask_of;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
