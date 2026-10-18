@@ -1323,8 +1323,11 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // a pooled context computes the logits only without embeddings, so the toggle changes the graph shape
-    if (cparams.embeddings != value && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+    // a pooled context computes the logits only without embeddings, so the toggle changes the graph shape.
+    // with pooling NONE the reserved graph (all tokens output) can also differ from the generation graph:
+    // llama-server --embeddings --pooling none segfaulted in ggml_gallocr on the first /completion (any arch),
+    // so re-reserve on every toggle
+    if (cparams.embeddings != value) {
         sched_need_reserve = true;
     }
 

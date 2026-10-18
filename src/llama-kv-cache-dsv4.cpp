@@ -1379,11 +1379,77 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     clear_compressed(-1, true);
 }
 
+// DeepSeek-V4.1 Engram hashes the n-gram ending at each token, so a token that belongs to several sequences
+// (llama-batched shares the prompt that way) has one well-defined input only if all of its sequences agree on
+// its predecessors. Predecessors come from the same batch first, then from the cached cells. Returns false (and
+// logs) for the first ambiguous token.
+static bool dsv41_shared_history_ok(const llama_batch & batch, const llama_kv_cache * kv, uint32_t n_hist) {
+    if (n_hist == 0 || !batch.token || !batch.n_seq_id) {
+        return true;
+    }
+
+    bool any_shared = false;
+    for (int32_t i = 0; i < batch.n_tokens && !any_shared; ++i) {
+        any_shared = batch.n_seq_id[i] > 1;
+    }
+    if (!any_shared) {
+        return true;
+    }
+
+    std::map<std::pair<llama_seq_id, llama_pos>, llama_token> in_batch;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+            in_batch[{ batch.seq_id[i][s], batch.pos[i] }] = batch.token[i];
+        }
+    }
+
+    const auto tok_at = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
+        // largest position <= p of this sequence, batch first (the batch continues the cache)
+        auto it = in_batch.upper_bound({ seq_id, p });
+        if (it != in_batch.begin()) {
+            --it;
+            if (it->first.first == seq_id) {
+                return it->second;
+            }
+        }
+        return kv ? kv->seq_pos_tok_le(seq_id, p) : LLAMA_TOKEN_NULL;
+    };
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] <= 1) {
+            continue;
+        }
+        for (uint32_t d = 1; d <= n_hist; ++d) {
+            const llama_pos p = batch.pos[i] - (llama_pos) d;
+            if (p < 0) {
+                break;
+            }
+            const llama_token t0 = tok_at(batch.seq_id[i][0], p);
+            for (int32_t s = 1; s < batch.n_seq_id[i]; ++s) {
+                const llama_token ts = tok_at(batch.seq_id[i][s], p);
+                if (ts != t0) {
+                    LLAMA_LOG_ERROR("%s: token %d at pos %d is shared by seq %d and seq %d, whose Engram n-gram histories "
+                            "differ at pos %d (%d vs %d); decode such tokens per sequence\n", __func__,
+                            i, batch.pos[i], batch.seq_id[i][0], batch.seq_id[i][s], p, t0, ts);
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    if (hparams_raw.dsv41_tok_hist &&
+        !dsv41_shared_history_ok(balloc.get_batch(), kv_raw->get_swa(), hparams_raw.dsv41_hist_len)) {
+        return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
     const bool raw_per_seq  = kv_raw->get_base()->get_n_stream() != 1;
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
