@@ -1586,20 +1586,21 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
 
 def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "fcfs"
-    # a long window: the tiny model decodes thousands of tokens a second, and the park must last long enough to be seen
-    _serve_with_training_context(8192)
-    _start(n_ctx=8192, n_slots=3, n_batch=256, n_ubatch=256, cache_ram=0)
+    # a long window: the tiny model decodes thousands of tokens a second, and the park must last long enough to be seen;
+    # not longer, since a loaded CI runner prefills and decodes it hundreds of times slower
+    _serve_with_training_context(4096)
+    _start(n_ctx=4096, n_slots=3, n_batch=256, n_ubatch=256, cache_ram=0)
     with ThreadPoolExecutor(2) as pool:
         # a livelock never ends, so the bound is the test's verdict; it is generous for a loaded host
-        oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=300, data={
+        oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=600, data={
             "n_predict": 100000, "prompt": [100 + k % 50 for k in range(20)], "id_slot": 0, "cache_prompt": True,
             "ignore_eos": True, "temperature": 0.0, "seed": 42}))
         deadline = time.time() + 180
         while time.time() < deadline and _n_decoded(_slot_view(0)) < 100:
             time.sleep(0.02)
         assert _n_decoded(_slot_view(0)) >= 100, "the oldest did not start generating in time"
-        # 120 cells and growing beside 8116: it cannot fit, so it is parked and is owed the cells first
-        parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(8100)], 1)
+        # 120 cells and growing beside 4016: it cannot fit, so it is parked and is owed the cells first
+        parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(4000)], 1)
         assert _wait_preempted(120), "the second request was never parked, so the case was not reached"
         # held behind the parked one: a running slot, but no candidate, so the oldest is the only one left to pick
         held = _cached(16, [300 + k % 50 for k in range(30)], 2)
