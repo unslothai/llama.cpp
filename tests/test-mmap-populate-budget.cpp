@@ -131,6 +131,27 @@ int main() {
     v2("v2_subtree_other", "worker", G4.c_str(),  "max", G1.c_str());
     run_mounted("v2_subtree_other", "0::/system.slice/docker-12345.scope/worker\n", "/system.slice/docker-1234.scope",
             "", "cgroup2", 29*GiB);
+    // mountinfo octal-escapes its path fields: a systemd "\x2d" in the mount root is "\134x2d" there, while
+    // /proc/self/cgroup has it raw
+    v2("v2_subtree_esc", "",       G32.c_str(), "max", G1.c_str());
+    v2("v2_subtree_esc", "worker", G4.c_str(),  "max", G1.c_str());
+    run_mounted("v2_subtree_esc", "0::/system.slice/a\\x2db.scope/worker\n", "/system.slice/a\\134x2db.scope", "",
+            "cgroup2", 1*GiB);
+    // and a space in the mount point is "\040"
+    {
+        const fs::path dir  = base / "v2_mnt_space";
+        const fs::path root = dir / "cg root";
+        put(root / "memory.max", G32);
+        put(root / "memory.current", G1);
+        put(root / "worker" / "memory.max", G4);
+        put(root / "worker" / "memory.current", G1);
+        put(dir / "self", "0::/docker/x/worker\n");
+        std::string mp = root.string();
+        mp.replace(mp.find(' '), 1, "\\040");
+        put(dir / "mountinfo", "30 25 0:26 /docker/x " + mp + " rw shared:9 - cgroup2 cgroup rw\n");
+        check("v2_mnt_space", llama_mmap::cgroup_budget(HOST, (dir / "self").c_str(), root.c_str(),
+                (dir / "mountinfo").c_str()), 1*GiB);
+    }
     v1("v1_subtree", "",       G32, G1);
     v1("v1_subtree", "worker", G4,  G1);
     run_mounted("v1_subtree", "3:memory:/docker/x/worker\n", "/docker/x", "/memory", "cgroup", 1*GiB);

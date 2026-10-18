@@ -752,6 +752,23 @@ static bool llama_read_u64(const std::string & path, unsigned long long & v) {
     return ok;
 }
 
+// mountinfo octal-escapes space, tab, newline and backslash in its path fields (a systemd "\x2d" name included)
+static std::string llama_mountinfo_unescape(const char * s) {
+    std::string res;
+    for (; *s; s++) {
+        if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' && s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+            const char c = (char) ((s[1] - '0')*64 + (s[2] - '0')*8 + (s[3] - '0'));
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\\') {
+                res += c;
+                s += 3;
+                continue;
+            }
+        }
+        res += *s;
+    }
+    return res;
+}
+
 // a cgroup mount whose root is a subtree (a container without a cgroup namespace) still shows the host path in
 // /proc/self/cgroup: strip the mount root so the path is relative to the mount point, else it is left as it is
 static std::string llama_cgroup_mount_relative(const std::string & path, const char * mountinfo, const std::string & mnt, bool v2) {
@@ -768,10 +785,10 @@ static std::string llama_cgroup_mount_relative(const std::string & path, const c
         char fstype[64];
         const char * sep = strstr(line, " - ");
         if (!sep || sscanf(line, "%*s %*s %*s %4095s %4095s", mroot, mpoint) != 2 ||
-                sscanf(sep + 3, "%63s", fstype) != 1 || strcmp(fstype, v2 ? "cgroup2" : "cgroup") != 0 || mnt != mpoint) {
+                sscanf(sep + 3, "%63s", fstype) != 1 || strcmp(fstype, v2 ? "cgroup2" : "cgroup") != 0 || mnt != llama_mountinfo_unescape(mpoint)) {
             continue;
         }
-        const std::string r = mroot;
+        const std::string r = llama_mountinfo_unescape(mroot);
         if (r != "/" && path.compare(0, r.size(), r) == 0 && (path.size() == r.size() || path[r.size()] == '/')) {
             res = path.size() == r.size() ? "/" : path.substr(r.size());
         }
