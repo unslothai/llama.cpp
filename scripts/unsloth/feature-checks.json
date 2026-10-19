@@ -113,6 +113,14 @@
       "checks": [
         { "kind": "penalize-prompt", "field": "penalize_prompt" }
       ]
+    },
+    "deepseek41": {
+      "owner": "unslothai#298",
+      "checks": [
+        { "kind": "arch",       "arch": "deepseek41" },
+        { "kind": "backend-op", "op": "GET_ROWS", "params": "type=mxfp8" },
+        { "kind": "mtmd",       "projector": "deepseek41v" }
+      ]
     }
   },
   "unchecked": {
