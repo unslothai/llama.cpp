@@ -485,7 +485,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
-        // Engram on layers 1 and 3: 2..3-grams, 2 heads, 64-wide rows, both tables in one per_layer_token_embd
         std::vector<int32_t> token_map(n_vocab);
         for (uint32_t i = 0; i < n_vocab; ++i) {
             token_map[i] = (int32_t) (i % 61);

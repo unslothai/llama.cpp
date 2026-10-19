@@ -31,7 +31,7 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
-    bool     is_overlap()     const; // overlapped (V4 CSA) pooling: state holds 2*ratio rows of 2x width
+    bool     is_overlap()     const; // V4 CSA: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;

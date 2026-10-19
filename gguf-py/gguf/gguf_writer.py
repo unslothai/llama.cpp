@@ -1077,7 +1077,7 @@ class GGUFWriter:
     def add_attention_compress_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), value)
 
-    # deepseek41: cross-layer KV / indexer sharing and two-level candidate selection
+    # deepseek41
     def add_attention_kv_source_layers(self, layers: Sequence[int]) -> None:
         self.add_key_value(Keys.Attention.KV_SOURCE_LAYERS.format(arch=self.arch), list(layers), GGUFValueType.ARRAY, GGUFValueType.UINT32)
 
@@ -1093,7 +1093,6 @@ class GGUFWriter:
     def add_indexer_candidate_block_size(self, value: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), value)
 
-    # deepseek41 engram (the table layout is written with the add_ple_* keys)
     def add_engram_pad_token_id(self, value: int) -> None:
         self.add_uint32(Keys.Engram.PAD_TOKEN_ID.format(arch=self.arch), value)
 

@@ -1267,10 +1267,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
             nullptr, filter_raw, reuse, nullptr);
 
-    // V4: CSA = overlapped ratio-4 pooling (+ its own indexer compressor, "lid"), HCA = ratio-128 pooling.
-    // V4.1: CSA slot = ratio-2 pooling, HCA slot = ratio-1 projection, no overlap, no "lid": the index K is derived from
-    // the compressed latent and stored next to it in the same row ([kv | index K]), and only the KV source layers own
-    // rows (consumers read the source layer's cache).
+    // V4.1: CSA slot = ratio 2, HCA slot = ratio 1, no overlap and no indexer compressor; the index K is stored
+    // next to the compressed KV ([kv | index K]) and only the KV source layers own rows
     const bool is_v41 = model.arch == LLM_ARCH_DEEPSEEK41;
     const uint32_t ratio_csa = is_v41 ? 2u : DSV4_CSA_RATIO;
     const uint32_t ratio_hca = is_v41 ? 1u : DSV4_HCA_RATIO;
@@ -1352,7 +1350,6 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
-    // overlapped pooling keeps 2*ratio rows of 2x width; plain pooling keeps ratio rows of head width
     const uint32_t csa_state_size = is_v41 ? ratio_csa : 2*ratio_csa;
     const uint32_t csa_state_embd = is_v41 ? model.hparams.n_embd_head_k() : 2*model.hparams.n_embd_head_k();
 

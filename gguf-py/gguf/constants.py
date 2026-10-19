@@ -251,9 +251,9 @@ class Keys:
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
 
-    class Engram:  # deepseek41 hashed n-gram memory; the table layout uses the PerLayerEmbedding keys
-        PAD_TOKEN_ID          = "{arch}.engram.pad_token_id"           # u32, raw token id filling missing history
-        TOKEN_MAP             = "{arch}.engram.token_map"              # i32[n_vocab], raw id -> compressed id
+    class Engram:  # deepseek41; the table uses the PerLayerEmbedding keys
+        PAD_TOKEN_ID          = "{arch}.engram.pad_token_id"
+        TOKEN_MAP             = "{arch}.engram.token_map"
 
     class PerLayerEmbedding:
         LAYERS             = "{arch}.ple.layers"

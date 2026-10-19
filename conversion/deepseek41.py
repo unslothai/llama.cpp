@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
-
 from typing import Callable, Iterable, TYPE_CHECKING
 
 import numpy as np
 import torch
-from sympy import isprime
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -17,9 +16,14 @@ from .base import LazyTorchTensor, ModelBase, TextModel, gguf
 from .deepseek import DeepseekV4Model
 
 
-# Engram hash constants, ported from inference/engram.py of deepseek-ai/DeepSeek-V4.1-Flash-1017. They are written to
-# the GGUF so that the runtime never recomputes them (the compressed token map needs the HF tokenizers normalizers,
-# the multipliers numpy's PCG64 stream).
+# Engram hash constants from inference/engram.py, stored in the GGUF: the token map needs the HF tokenizers
+# normalizers and the multipliers numpy's PCG64 stream, neither of which the runtime has.
+
+def _is_prime(n: int) -> bool:
+    if n < 2 or n % 2 == 0:
+        return n == 2
+    return all(n % d for d in range(3, math.isqrt(n) + 1, 2))
+
 
 def engram_primes(n_layers: int, max_ngram_size: int, n_heads: int, vocab_size: int) -> list[list[list[int]]]:
     """EngramLayout.from_args: [layer][ngram order 2..max][head] bucket moduli, never reused across layers."""
@@ -31,7 +35,7 @@ def engram_primes(n_layers: int, max_ngram_size: int, n_heads: int, vocab_size: 
             sizes, cur = [], vocab_size - 1
             for _ in range(n_heads):
                 cand = cur + 1
-                while not isprime(cand) or cand in seen:
+                while not _is_prime(cand) or cand in seen:
                     cand += 1
                 cur = cand
                 seen.add(cur)
@@ -133,10 +137,8 @@ class DeepseekV41Model(DeepseekV4Model):
         if self.hparams.get("gate_temp", 1.0) != 1.0:
             raise ValueError("gate_temp != 1 is not supported (the router logits would need dividing by it)")
 
-        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja"
-        if template_path.is_file():
-            self.gguf_writer.remove_key(gguf.Keys.Tokenizer.CHAT_TEMPLATE)  # replaces the V4 template
-            self.gguf_writer.add_chat_template(template_path.read_text(encoding="utf-8"))
+        # V4.1 does not use the DeepSeek-V4 template; a template shipped with the model is still added by set_vocab
+        self.gguf_writer.remove_key(gguf.Keys.Tokenizer.CHAT_TEMPLATE)
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         # num_hidden_layers lives in text_config, which is merged only after indexing; MTP stages are skipped anyway
@@ -170,7 +172,7 @@ class DeepseekV41Model(DeepseekV4Model):
             token_map, cvocab = engram_compressed_token_map(self.dir_model)
             if cvocab != hp["engram_compressed_vocab_size"] or len(token_map) != hp["vocab_size"]:
                 raise ValueError(f"compressed token map ({len(token_map)} -> {cvocab}) does not match the config")
-            # head offsets are absolute rows of the concatenated table: layer base + exclusive cumsum of its primes
+            # absolute row offsets into the concatenated table
             sizes = [p for layer in primes for per in layer for p in per]
             offsets = [sum(sizes[:i]) for i in range(len(sizes))]
             w.add_key_value(gguf.Keys.PerLayerEmbedding.LAYERS.format(arch=w.arch), layer_ids,
@@ -185,7 +187,6 @@ class DeepseekV41Model(DeepseekV4Model):
             w.add_engram_token_map(token_map)
 
     def dequant_model(self):
-        # V4.1 uses 32x32 FP8 blocks; the Engram tables are FP8 too but are converted row-wise in generate_extra_tensors
         bo, bi = self._fp8_block
 
         def dequant(weight: Tensor, scale: Tensor) -> Tensor:
@@ -196,7 +197,7 @@ class DeepseekV41Model(DeepseekV4Model):
         for name in [n for n in self.model_tensors if n.endswith(".scale") and not self._ENGRAM_EMBED_RE.match(n)]:
             weight_name = name.removesuffix(".scale") + ".weight"
             if weight_name not in self.model_tensors or self.model_tensors[weight_name]().dtype not in self._float8_dtypes():
-                continue  # MXFP4 experts are repacked in generate_extra_tensors
+                continue
             w, s = self.model_tensors[weight_name], self.model_tensors.pop(name)
             out_f, in_f = w().shape
             if tuple(s().shape) != (-(-out_f // bo), -(-in_f // bi)):
@@ -213,7 +214,6 @@ class DeepseekV41Model(DeepseekV4Model):
             return self.dir_model / json.load(f)["weight_map"][name]
 
     def _write_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR) -> None:
-        # stacked [n_expert, rows, blocks*17] MXFP4 tensor, repacked (bit-exact) one expert at a time at write time
         names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(self.hparams["n_routed_experts"])]
         pairs = [(self.model_tensors.pop(n + ".weight"), self.model_tensors.pop(n + ".scale")) for n in names]
         rows, packed_cols = pairs[0][0]().shape
@@ -225,8 +225,7 @@ class DeepseekV41Model(DeepseekV4Model):
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
-        # official lookup: e4m3 row * 2^(e8m0 - 127) per 32 elements, then BF16; precomputed exactly, streamed in
-        # chunks; the layer tables are concatenated row-wise into one per_layer_token_embd
+        # official lookup e4m3 * 2^(e8m0 - 127), then BF16 (exact); all layers concatenated into per_layer_token_embd
         parts, dim = [], None
         for bid in layer_ids:
             wn, sn = f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"

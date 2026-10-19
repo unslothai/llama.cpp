@@ -5,7 +5,6 @@
 #include "llama-model-loader.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
-#include <algorithm>
 #include <cmath>
 #include <map>
 
@@ -1321,7 +1320,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** comb,
                 int il) const;
 
-        // returns the pre weights [hc, n_tokens] and fills the post / comb weights; f32_src: F32 matmul inputs
+        // returns the pre weights and fills post / comb
         ggml_tensor * build_hc_mixes(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1446,32 +1445,25 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
-// DeepSeek-V4.1: DeepSeek-V4 graph pieces plus Engram, single-pass mHC, ratio-1/2 compressors with cross-layer
-// KV / index-K / top-k sharing and two-level candidate selection
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // Engram n-gram hash constants (host side; ggml has no int64 mul/xor/mod). The tables of all Engram layers are
-    // one per_layer_token_embd: each (layer, order, head) bucket range starts at its absolute row offset.
-    std::vector<int32_t>  engram_layers;    // backbone layer ids
+    // Engram hash constants, hashed on the host (ggml has no int64 mul/xor/mod)
+    std::vector<int32_t>  engram_layers;
     uint32_t engram_max_ngram = 0;
-    uint32_t engram_n_head    = 0;          // heads per n-gram order
+    uint32_t engram_n_head    = 0;
     uint32_t engram_head_dim  = 0;
-    uint32_t engram_pad_id    = 0;          // raw token id filling missing history
-    std::vector<int32_t>  engram_token_map; // raw id -> compressed id
-    std::vector<uint64_t> engram_mult;      // [n_engram][max_ngram]
-    std::vector<uint64_t> engram_primes;    // [n_engram][(max_ngram-1)*n_head] bucket counts
-    std::vector<uint64_t> engram_offsets;   // [n_engram][(max_ngram-1)*n_head] first row in per_layer_token_embd
+    uint32_t engram_pad_id    = 0;
+    std::vector<int32_t>  engram_token_map;
+    std::vector<uint64_t> engram_mult;
+    std::vector<uint64_t> engram_primes;
+    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in per_layer_token_embd
 
-    int engram_index(int il) const {
-        const auto it = std::find(engram_layers.begin(), engram_layers.end(), il);
-        return it == engram_layers.end() ? -1 : (int) (it - engram_layers.begin());
-    }
+    int engram_index(int il) const;
     uint32_t engram_n_cols() const { return (engram_max_ngram - 1)*engram_n_head; }
 
-    // hash ids of every token of a ubatch for engram layer e: out[i*n_cols + c]
     void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
 
     struct graph : public llama_model_deepseek4::graph {
@@ -1491,8 +1483,8 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * cand_pin,
                 int il);
 
-        std::vector<ggml_tensor *> topk_of; // [n_layer] top-k of each index source (layers run in order)
-        ggml_tensor * cand_sel    = nullptr; // candidate blocks picked by the candidate source layer, I32 [k_b, n_tok, 1, ns]
+        std::vector<ggml_tensor *> topk_of; // top-k of each index source layer
+        ggml_tensor * cand_sel    = nullptr; // candidate blocks of the candidate source layer
         int64_t       cand_n_comp = 0;       // compressed rows the candidate source scored
     };
 
