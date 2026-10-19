@@ -5,7 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Callable, Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -224,7 +224,7 @@ class DeepseekV41Model(DeepseekV4Model):
         def chunks() -> Iterable[np.ndarray]:
             for w, s in pairs:
                 yield self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(w()), LazyTorchTensor.to_eager(s()))
-        data = _StreamedBytes((len(pairs), rows, packed_cols * 2 // 32 * 17), chunks)
+        data = cast(np.ndarray, _StreamedBytes((len(pairs), rows, packed_cols * 2 // 32 * 17), chunks))
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
@@ -255,7 +255,7 @@ class DeepseekV41Model(DeepseekV4Model):
                             if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
                                 raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
                             yield np.concatenate([e, q], axis=1)
-            data = _StreamedBytes((n_rows, dim // 32 * 33), blocks)
+            data = cast(np.ndarray, _StreamedBytes((n_rows, dim // 32 * 33), blocks))
             self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
             return
 
@@ -271,7 +271,7 @@ class DeepseekV41Model(DeepseekV4Model):
                         v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
                         yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
         qt = gguf.GGMLQuantizationType.F32 if self._f32 else gguf.GGMLQuantizationType.BF16
-        data = _StreamedBytes((n_rows, dim * (4 if self._f32 else 2)), chunks)
+        data = cast(np.ndarray, _StreamedBytes((n_rows, dim * (4 if self._f32 else 2)), chunks))
         self.gguf_writer.add_tensor(name, data, raw_dtype=qt)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
