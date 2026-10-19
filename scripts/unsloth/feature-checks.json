@@ -65,7 +65,7 @@
       ]
     },
     "muse-spark": { "owner": null, "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
-    "beam": { "owner": "ggml-org#30670", "checks": [ { "kind": "arch", "arch": "beam" } ] },
+    "beam": { "owner": null, "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": null,
       "checks": [
@@ -107,6 +107,20 @@
       "checks": [
         { "kind": "mtmd", "projector": "*" }
       ]
+    },
+    "penalize-prompt": {
+      "owner": "unslothai#283",
+      "checks": [
+        { "kind": "penalize-prompt", "field": "penalize_prompt" }
+      ]
+    },
+    "deepseek41": {
+      "owner": "unslothai#298",
+      "checks": [
+        { "kind": "arch",       "arch": "deepseek41" },
+        { "kind": "backend-op", "op": "GET_ROWS", "params": "type=mxfp8" },
+        { "kind": "mtmd",       "projector": "deepseek41v" }
+      ]
     }
   },
   "unchecked": {
@@ -119,6 +133,7 @@
     "unslothai#251": "--moe-cache-mib auto sizes the ggml-org#29887 MoE expert cache from the fit; it only acts when a MoE model spills on a single GPU, the flag is off by default, and no runner in the pipeline has a GPU",
     "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
+    "unslothai#287": "MUL_MAT_ID MMVQ batch cap keyed on the compiled arch; it only differs when a build lacks the device's own arch (a P100 on cuda12-legacy), needs a CUDA host, and no runner in the pipeline has one",
     "unslothai#269": "server-side KV preemption (--preempt-ram, --preempt-async), preemption notices and opt-in exact concurrency (LLAMA_EXACT_CONCURRENCY); the server parks and restores slots and pins per-sequence output, which no arch, backend-op or mtmd probe can observe. Covered by the server preemption tests (tools/server/tests/unit/test_preempt.py, test_preempt_notify.py), which need a CUDA host for the exact path"
   }
 }
