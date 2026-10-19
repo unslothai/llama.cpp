@@ -107,6 +107,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
         engram_layers.assign(e_layers.begin(), e_layers.end());
         hparams.dsv41_tok_hist = true;
+        hparams.dsv41_hist_len = engram_max_ngram > 0 ? (uint32_t) engram_max_ngram - 1 : 0;
     }
 }
 
@@ -230,7 +231,8 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
     std::vector<uint64_t> toks(n_gram);
     for (int64_t i = 0; i < ubatch.n_tokens; ++i) {
         // shift 0 is the token itself; once a shift is blocked (sequence start or dead token) every longer one is too
-        int64_t c = cid(ubatch.token[i]);
+        const bool is_embd = !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
+        int64_t c = is_embd ? DSV41_ENGRAM_DEAD : cid(ubatch.token[i]);
         bool blocked = c == DSV41_ENGRAM_DEAD;
         toks[0] = blocked ? pad : c;
         for (int64_t s = 1; s < n_gram; ++s) {
@@ -261,6 +263,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids;
+    ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
 
@@ -295,6 +298,16 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // embedding (image) tokens are hashed DEAD and get no Engram contribution (gate 0)
+    if (engram_keep && engram_keep->buffer) {
+        std::vector<float> keep(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[i]);
+            keep[i] = is_embd ? 0.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(engram_keep, keep.data(), 0, keep.size()*sizeof(float));
+    }
+
     if (cand_pin && cand_pin->buffer) {
         const auto & plan = cand_plan(*ubatch);
         const int64_t n_blk = cand_pin->ne[0];
@@ -319,6 +332,10 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
     for (auto * t : engram_ids) {
         res &= t->ne[0] == (int64_t) model.engram_n_cols()*params.ubatch.n_tokens;
     }
+    res &= (engram_keep != nullptr) == (!engram_ids.empty() && params.ubatch.embd != nullptr);
+    if (engram_keep) {
+        res &= engram_keep->ne[2] == (int64_t) params.ubatch.n_tokens;
+    }
     if (cand_pin) {
         const auto & plan = cand_plan(params.ubatch);
         const int64_t bs = model.hparams.dsv41_cand_block_size;
@@ -332,6 +349,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
         const llama_model_deepseek41 & model,
         ggml_tensor * x,
         ggml_tensor * ids,
+        ggml_tensor * keep,
         int il) const {
     const auto & layer = model.layers[il];
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -348,7 +366,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * value = ggml_cont(ctx0, ggml_view_3d(ctx0, kv, n_embd, 1,  nt, ggml_row_size(kv->type, n_embd), kv->nb[1],
             ggml_row_size(kv->type, hc*n_embd)));
 
-    ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, x, norm_rms_eps), ggml_rms_norm(ctx0, key, norm_rms_eps)), layer.engram_gate);
+    // quantized copy has no binary-op kernel
+    ggml_tensor * egate = ggml_is_quantized(layer.engram_gate->type) ? ggml_cast(ctx0, layer.engram_gate, GGML_TYPE_F32) : layer.engram_gate;
+    ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, x, norm_rms_eps), ggml_rms_norm(ctx0, key, norm_rms_eps)), egate);
     dot = ggml_scale(ctx0, ggml_sum_rows(ctx0, dot), 1.0f/sqrtf((float) n_embd));
     cb(dot, "engram_dot", il);
 
@@ -356,6 +376,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
     ggml_tensor * sign = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_neg(ctx0, dot)), -2.0f, 1.0f);
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, mag, sign));
+    if (keep) {
+        gate = ggml_mul(ctx0, gate, keep);
+    }
     cb(gate, "engram_gate", il);
 
     return ggml_add(ctx0, x, ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate));
@@ -476,8 +499,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
         if (hparams.dsv41_topk_src[il] == il) {
-            ggml_tensor * ik = ggml_cont(ctx0, ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
-                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head)));
+            ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
+                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
+            // CUDA has no same-type copy of quantized views
+            ik = ggml_is_quantized(ik->type) ? ggml_cast(ctx0, ik, GGML_TYPE_F32) : ggml_cont(ctx0, ik);
 
             ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
             iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
@@ -566,9 +591,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         }
         GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
 
-        if (inp_attn->self_k_rot) {
-            // thrown at the first graph reserve, so context creation fails cleanly
-            throw std::runtime_error("DeepSeek-V4.1: a quantized (rotated) KV cache is not supported yet");
+        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
+        ggml_tensor * k_rot = inp_attn->self_k_rot;
+        if (k_rot) {
+            q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
+            kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
         }
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
@@ -577,7 +604,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_tensor * raw_k  = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
                 comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
-        comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
+        if (k_rot) {
+            // compressed rows are stored unrotated: rotate in F32, then cast to the cache type to concat with the window
+            comp_k = comp_k->type != GGML_TYPE_F32 ? ggml_cast(ctx0, comp_k, GGML_TYPE_F32) : ggml_cont(ctx0, comp_k);
+            comp_k = llama_mul_mat_hadamard(ctx0, comp_k, k_rot);
+            if (comp_k->type != raw_k->type) {
+                comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
+            }
+        } else if (ggml_is_quantized(comp_k->type)) {
+            // LLAMA_ATTN_ROT_DISABLE=1: go through F32 for the same reason
+            comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
+        } else {
+            comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
+        }
+        cb(comp_k, "comp_k", il);
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
         ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
@@ -585,6 +625,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         cb(kq_mask, "comp_kq_mask", il);
 
         out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
         cb(out, "attn_comp", il);
     }
 
@@ -627,6 +670,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_set_name(ids, ("engram_ids-" + std::to_string(model.engram_layers[e])).c_str());
         inp41->engram_ids.push_back(ids);
     }
+    ggml_tensor * engram_keep = nullptr;
+    if (!model.engram_layers.empty() && ubatch.token && ubatch.embd) {
+        engram_keep = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
+        ggml_set_input(engram_keep);
+        ggml_set_name(engram_keep, "engram_keep");
+        inp41->engram_keep = engram_keep;
+    }
     ggml_tensor * cand_pin = nullptr;
     if (hparams.dsv41_cand_src >= 0) {
         inp41->cand_csa = hparams.dsv4_compress_ratios[hparams.dsv41_cand_src] == 2;
@@ -654,7 +704,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         const int e = model.engram_index(il);
         if (e >= 0 && !inp41_ptr->engram_ids.empty()) {
-            inpL = build_engram(model, inpL, inp41_ptr->engram_ids[e], il);
+            inpL = build_engram(model, inpL, inp41_ptr->engram_ids[e], engram_keep, il);
             cb(inpL, "engram_out", il);
         }
 
