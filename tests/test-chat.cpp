@@ -961,6 +961,7 @@ const common_chat_msg message_user{
     /* .reasoning_content = */ "",
     /* .tool_name = */ "",
     /* .tool_call_id = */ "",
+    /* .extra_json = */ "",
 };
 
 const common_chat_msg message_user_parts{
@@ -977,6 +978,7 @@ const common_chat_msg message_user_parts{
     "",
     /* .tool_name = */ "",
     /* .tool_call_id = */ "",
+    /* .extra_json = */ "",
 };
 
 static common_chat_msg simple_assist_msg(const std::string & content,
