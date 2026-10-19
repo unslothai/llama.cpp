@@ -239,7 +239,7 @@ jobs:
         # kill), shared by every remaining step and not replenished. Evicting
         # spends that window on housekeeping; the save is what actually needs
         # it, and a 2 GB cache is not quick to write.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CCACHE_LAUNCHER != '' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
@@ -253,7 +253,9 @@ jobs:
         # the CANCELLATION path, not the failure path, so !cancelled() would
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
-        if: ${{ always() }}
+        # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
+        # save would only re-upload the restored entry under a new key.
+        if: ${{ always() && env.CCACHE_LAUNCHER != '' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
@@ -313,6 +315,10 @@ jobs:
             cpu-windows-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
+          # Force the action's ccache 4.13 binary. Its default (`detect`) skips the install when any
+          # ccache is already on PATH, and windows-2025 images ship Strawberry Perl's 4.9.1, which
+          # Configure ccache below rejects (< 4.10), so those legs built uncached every run.
+          install: binary
           max-size: 2G
           save: false
 
@@ -472,7 +478,7 @@ jobs:
         # kill), shared by every remaining step and not replenished. Evicting
         # spends that window on housekeeping; the save is what actually needs
         # it, and a 2 GB cache is not quick to write.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CCACHE_LAUNCHER != '' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
@@ -486,7 +492,9 @@ jobs:
         # the CANCELLATION path, not the failure path, so !cancelled() would
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
-        if: ${{ always() }}
+        # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
+        # save would only re-upload the restored entry under a new key.
+        if: ${{ always() && env.CCACHE_LAUNCHER != '' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
