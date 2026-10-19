@@ -204,6 +204,10 @@ jobs:
             cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}
           append-timestamp: false
           variant: ccache
+          # Force the action's ccache 4.13 binary. Its default (`detect`) skips the install when any
+          # ccache is already on PATH, and windows-2025 images ship Strawberry Perl's 4.9.1, which
+          # Configure ccache below rejects (< 4.10), so those legs built uncached every run.
+          install: binary
           max-size: 3G
           save: false
 
@@ -398,12 +402,14 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CCACHE_LAUNCHER != '' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
       - name: Save ccache
-        if: ${{ always() }}
+        # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
+        # save would only re-upload the restored entry under a new key.
+        if: ${{ always() && env.CCACHE_LAUNCHER != '' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
