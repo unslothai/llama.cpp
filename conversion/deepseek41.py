@@ -140,8 +140,10 @@ class DeepseekV41Model(DeepseekV4Model):
         if self.hparams.get("gate_temp", 1.0) != 1.0:
             raise ValueError("gate_temp != 1 is not supported (the router logits would need dividing by it)")
 
-        # V4.1 does not use the DeepSeek-V4 template; a template shipped with the model is still added by set_vocab
-        self.gguf_writer.remove_key(gguf.Keys.Tokenizer.CHAT_TEMPLATE)
+        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja"
+        if template_path.is_file():
+            self.gguf_writer.remove_key(gguf.Keys.Tokenizer.CHAT_TEMPLATE)
+            self.gguf_writer.add_chat_template(template_path.read_text(encoding="utf-8"))
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         # num_hidden_layers lives in text_config, which is merged only after indexing; MTP stages are skipped anyway
