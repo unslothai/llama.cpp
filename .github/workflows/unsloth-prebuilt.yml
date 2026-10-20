@@ -507,13 +507,16 @@ jobs:
           WIN_CUDA_MATRIX: ${{ steps.m.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
-          # Warm shards are DISABLED (every profile 0); the caching fixes do not depend on them.
-          # To re-enable, the sizing measured on run 34168016006:
-          #   SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" and .arch == "x64" then 3 else 2 end'
-          #   WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 2 end'
-          # (staging run 34205486511: cuda12-older cold leg 100 -> 64 min Windows, 53 -> 43 Linux).
-          SHARDS='0'
-          WIN_SHARDS='0'
+          # Sized for ~60 concurrent runners per run: 38 shard jobs (Linux 18, Windows 20) next to
+          # ~28 other legs, a few queueing until the 4-14 min CPU/Vulkan/macOS legs free runners.
+          # Cold night 2026-10-19 (pin #298 edited ggml.h, 7% hits): Windows portable 164/153 min,
+          # Linux portable 141/118, older/newer 68-106. A 1/N slice of the ggml-cuda objects per
+          # shard puts every CUDA leg near 45-60 min cold, under ROCm windows/gfx110X (76 min),
+          # which then sets the wall time. Max 4: the build job has four shard restore steps.
+          # Staging run 34205486511 measured 2 shards: cuda12-older 100 -> 64 min Windows, 53 -> 43 Linux.
+          # Legacy stays 0 (21/33 min, two PTX-only arches).
+          SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then (if .arch == "x64" then 4 else 2 end) else 2 end'
+          WIN_SHARDS='if .klass == "legacy" then 0 elif .klass == "portable" then 4 else 3 end'
           expand_warm() { # $1 = shard rule
             jq -c ".include | [.[] | . as \$r | ($1) as \$k | select(\$k > 0) | range(\$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
           }
@@ -661,7 +664,7 @@ jobs:
       - name: Prune
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
+        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
   build-rocm:
     name: ROCm
@@ -1383,7 +1386,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
+        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.
