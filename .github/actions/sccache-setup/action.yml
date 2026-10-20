@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+name: sccache setup
+description: >-
+  Install a pinned sccache, restore its local cache from the Actions cache and export
+  COMPILER_LAUNCHER for the CMake configure. The calling job prints stats and saves the
+  cache (see the "sccache stats" / "Save sccache" steps in the CUDA children).
+
+  Why sccache on some legs: it splits every nvcc call into cudafe++ / cicc / ptxas / host
+  steps and caches each one. A header edit that leaves a kernel's PTX unchanged (a new type
+  enum, a struct field, declarations: the usual shape of a pin or a common.cuh bump) reruns
+  cicc but hits ptxas, where ccache recompiles the whole TU. Measured on ggml-cuda, cuda13
+  portable arch list, pin #298's header shape: 310 s vs 443 s (974/1015 ptxas hits).
+  It does NOT share work between profiles: nvcc passes -D__CUDA_ARCH_LIST__ into every
+  step and ggml-cuda/common.cuh expands it, so cicc input differs per arch list.
+
+inputs:
+  key-prefix:
+    description: Cache key prefix, e.g. sccache-cuda-13.3-x64-cuda13-portable. Must start with sccache- (prune_ccache.sh).
+    required: true
+  tag:
+    description: Release tag being built; the exact-key half of the restore.
+    required: true
+  cache-size:
+    description: SCCACHE_CACHE_SIZE. sccache evicts LRU at this size; entries are ~3x ccache's.
+    required: false
+    default: 6G
+
+runs:
+  using: composite
+  steps:
+    # Pinned and checksummed: this binary wraps every compiler call of a release build.
+    # No fallback to an unpinned copy. A failed install builds this leg uncached instead
+    # (empty COMPILER_LAUNCHER): a cache tool must never cost a release.
+    - name: Install sccache
+      shell: bash
+      run: |
+        set -uo pipefail
+        ver=v0.18.0
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)   triple=x86_64-unknown-linux-musl; sum=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89; exe=sccache ;;
+          Windows-X64) triple=x86_64-pc-windows-msvc;    sum=1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b; exe=sccache.exe ;;
+          *) echo "::warning::no pinned sccache for ${{ runner.os }}-${{ runner.arch }}; building uncached"
+             echo "COMPILER_LAUNCHER=" >> "$GITHUB_ENV"; exit 0 ;;
+        esac
+        name="sccache-$ver-$triple"
+        # Relative paths from RUNNER_TEMP: Git Bash's GNU tar reads "D:\..." as host:path.
+        cd "$RUNNER_TEMP"
+        dest="$RUNNER_TEMP/sccache"
+        mkdir -p sccache
+        ok=0
+        for attempt in 1 2 3; do
+          if curl -fsSL --retry 3 -o "$name.tar.gz" \
+               "https://github.com/mozilla/sccache/releases/download/$ver/$name.tar.gz" \
+             && echo "$sum  $name.tar.gz" | sha256sum -c - \
+             && tar -xzf "$name.tar.gz" -C sccache --strip-components=1 \
+             && "./sccache/$exe" --version; then
+            ok=1; break
+          fi
+          sleep $(( attempt * 10 ))
+        done
+        if [ "$ok" = 1 ]; then
+          echo "$dest" >> "$GITHUB_PATH"
+          echo "COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+        else
+          echo "::warning::sccache $ver install failed; building this leg uncached"
+          echo "- sccache install failed; this leg built without a cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "COMPILER_LAUNCHER=" >> "$GITHUB_ENV"
+        fi
+
+    - name: Restore sccache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ github.workspace }}/.sccache
+        key: ${{ inputs.key-prefix }}-${{ inputs.tag }}-
+        restore-keys: |
+          ${{ inputs.key-prefix }}-
+
+    # Local disk storage only. The GitHub Actions cache backend (SCCACHE_GHA_ENABLED) stores
+    # one entry per compile step and would hit the 200 uploads/minute repo limit with several
+    # legs running; throttled lookups count as silent misses. The whole directory is saved
+    # as one entry by the calling job instead, like the ccache legs.
+    - name: Configure sccache
+      shell: bash
+      run: |
+        {
+          echo "SCCACHE_DIR=${{ github.workspace }}/.sccache"
+          echo "SCCACHE_CACHE_SIZE=${{ inputs.cache-size }}"
+          echo "SCCACHE_IDLE_TIMEOUT=0"
+          echo "SCCACHE_ERROR_LOG=${{ runner.temp }}/sccache-error.log"
+        } >> "$GITHUB_ENV"

@@ -30,6 +30,10 @@ inputs:
     description: ccache max_size for this profile (portable holds the most objects).
     required: false
     default: 4G
+  cacher:
+    description: ccache (default) or sccache (pilot legs; see .github/actions/sccache-setup).
+    required: false
+    default: ccache
 
 runs:
   using: composite
@@ -110,9 +114,12 @@ runs:
       run: nvcc --version
 
     # ccache 4.13 from the action's binary (apt ships 4.5.1); save: false because the calling job
-    # saves under its own key. Not sccache: measured 2026-09-08, no faster on the churn rebuild,
-    # 111 s vs 1 s warm, and 0% per-arch sharing (nvcc passes __CUDA_ARCH_LIST__ into every preprocess).
+    # saves under its own key. sccache (cacher: sccache) measured 2026-09-08 with 0% per-arch
+    # sharing (nvcc passes __CUDA_ARCH_LIST__ into every preprocess), re-measured 2026-10-19: no
+    # sharing still, but 30% faster after a header edit that leaves PTX unchanged; piloted on
+    # cuda13-portable, see .github/actions/sccache-setup.
     - name: ccache
+      if: inputs.cacher != 'sccache'
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
         key: cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
@@ -125,6 +132,7 @@ runs:
         save: false
 
     - name: Configure ccache
+      if: inputs.cacher != 'sccache'
       shell: bash
       # compiler_check=content: the toolkit is re-extracted every run, so mtime identity misses a
       # byte-identical nvcc. Sloppiness is the documented safe set; level 6 fits more under max_size.
@@ -134,6 +142,14 @@ runs:
         ccache --set-config=compression_level=6
         ccache -p | grep -E "compiler_check|sloppiness|compression|max_size|cache_dir"
         ccache -z
+        echo "COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+
+    - name: sccache
+      if: inputs.cacher == 'sccache'
+      uses: ./tooling/.github/actions/sccache-setup
+      with:
+        key-prefix: sccache-cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
+        tag: ${{ inputs.tag }}
 
     - name: Configure
       shell: bash
@@ -161,6 +177,6 @@ runs:
           -DCMAKE_INSTALL_RPATH='$ORIGIN' \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
           -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          -DCMAKE_C_COMPILER_LAUNCHER="$COMPILER_LAUNCHER" \
+          -DCMAKE_CXX_COMPILER_LAUNCHER="$COMPILER_LAUNCHER" \
+          -DCMAKE_CUDA_COMPILER_LAUNCHER="$COMPILER_LAUNCHER"

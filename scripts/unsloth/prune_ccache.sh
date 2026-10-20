@@ -10,13 +10,14 @@
 #
 # Runs after `resolve` and again after publish. One generation per prefix is safe at run start
 # because the prefix restore only returns the newest entry; peak usage during a run is
-# old + new. Keys that are not ccache-* are reported, never touched.
+# old + new. ccache-* and sccache-* (the sccache pilot legs) are pruned alike; every other key is
+# reported, never touched.
 #
 # Usage: prune_ccache.sh [--keep N] [--limit-gb N] [--dry-run]
 #   GH_TOKEN with actions:write on GITHUB_REPOSITORY; writes GITHUB_STEP_SUMMARY if set.
 set -euo pipefail
 
-KEEP=1; LIMIT_GB=75; DRY=0
+KEEP=1; LIMIT_GB=100; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP="$2"; shift 2 ;;
@@ -35,10 +36,10 @@ gh api --paginate "repos/$repo/actions/caches?per_page=100" \
 
 gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
 total=$(awk -F'\t' '{s+=$3} END {printf "%d", s+0}' "$all")
-cc_total=$(awk -F'\t' '$6 ~ /^ccache-/ {s+=$3} END {printf "%d", s+0}' "$all")
-sc_total=$(awk -F'\t' '$6 !~ /^ccache-/ {s+=$3} END {printf "%d", s+0}' "$all")
-sc_count=$(awk -F'\t' '$6 !~ /^ccache-/' "$all" | grep -c . || true)
-echo "$(grep -c . "$all" || true) caches, $(gib "$total") GiB total: ccache $(gib "$cc_total") GiB, other (sccache etc.) $(gib "$sc_total") GiB in $sc_count entries"
+cc_total=$(awk -F'\t' '$6 ~ /^s?ccache-/ {s+=$3} END {printf "%d", s+0}' "$all")
+sc_total=$(awk -F'\t' '$6 !~ /^s?ccache-/ {s+=$3} END {printf "%d", s+0}' "$all")
+sc_count=$(awk -F'\t' '$6 !~ /^s?ccache-/' "$all" | grep -c . || true)
+echo "$(grep -c . "$all" || true) caches, $(gib "$total") GiB total: ccache + sccache $(gib "$cc_total") GiB, other $(gib "$sc_total") GiB in $sc_count entries"
 
 # Group by restore prefix: the key minus -<tag>- and -<run id>-<attempt>. The ROCm toolchain
 # version stays in because the restore prefix has it: a rocm_version=latest dispatch before the
@@ -47,7 +48,7 @@ echo "$(grep -c . "$all" || true) caches, $(gib "$total") GiB total: ccache $(gi
 grouped="$tmp/grouped.tsv"; : > "$grouped"
 while IFS=$'\t' read -r id created size ref ver key; do
   [ -z "${id:-}" ] && continue
-  case "$key" in ccache-*) ;; *) continue ;; esac
+  case "$key" in ccache-*|sccache-*) ;; *) continue ;; esac
   pre="$(printf '%s' "$key" | sed -E 's/-[0-9]+-[0-9]+$//; s/-b[0-9]+(-mix-[0-9a-f]+)?-?$//')"
   [ "$pre" = "$key" ] && continue
   printf '%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" >> "$grouped"
@@ -71,7 +72,7 @@ done < "$grouped"
 
 after=$(( total - freed ))
 verb="pruned"; [ "$DRY" = 1 ] && verb="would prune"
-echo "$verb $deleted superseded ccache generations, $(gib "$freed") GiB; $(gib "$after") GiB of $LIMIT_GB GB remains"
+echo "$verb $deleted superseded ccache/sccache generations, $(gib "$freed") GiB; $(gib "$after") GiB of $LIMIT_GB GB remains"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     echo "### ccache budget"
@@ -79,10 +80,10 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "| metric | value |"
     echo "| --- | --- |"
     echo "| kept per prefix | $KEEP |"
-    echo "| ccache generations $verb | $deleted |"
+    echo "| ccache/sccache generations $verb | $deleted |"
     echo "| freed | $(gib "$freed") GiB |"
-    echo "| ccache after | $(gib $(( cc_total - freed ))) GiB |"
-    echo "| sccache and other entries | $(gib "$sc_total") GiB in $sc_count |"
+    echo "| ccache + sccache after | $(gib $(( cc_total - freed ))) GiB |"
+    echo "| other entries | $(gib "$sc_total") GiB in $sc_count |"
     echo "| cache total after | $(gib "$after") GiB of $LIMIT_GB GB |"
   } >> "$GITHUB_STEP_SUMMARY"
 fi

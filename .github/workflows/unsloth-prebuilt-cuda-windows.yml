@@ -240,6 +240,9 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    env:
+      # sccache pilot (2026-10): cuda13-portable only; see unsloth-prebuilt-cuda.yml.
+      CACHER: ${{ matrix.profile == 'cuda13-portable' && 'sccache' || 'ccache' }}
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
@@ -255,9 +258,10 @@ jobs:
           archs: ${{ matrix.archs }}
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
+          cacher: ${{ env.CACHER }}
 
       - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
+        if: ${{ matrix.shards >= 1 && env.CACHER == 'ccache' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/0
@@ -266,7 +270,7 @@ jobs:
             ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
             ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 1
-        if: ${{ matrix.shards >= 2 }}
+        if: ${{ matrix.shards >= 2 && env.CACHER == 'ccache' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/1
@@ -275,7 +279,7 @@ jobs:
             ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
             ccache-shard1-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 2
-        if: ${{ matrix.shards >= 3 }}
+        if: ${{ matrix.shards >= 3 && env.CACHER == 'ccache' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/2
@@ -284,7 +288,7 @@ jobs:
             ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
             ccache-shard2-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 3
-        if: ${{ matrix.shards >= 4 }}
+        if: ${{ matrix.shards >= 4 && env.CACHER == 'ccache' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/3
@@ -294,7 +298,7 @@ jobs:
             ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
-        if: ${{ matrix.shards >= 1 }}
+        if: ${{ matrix.shards >= 1 && env.CACHER == 'ccache' }}
         run: |
           if (Test-Path shards) {
             Get-ChildItem -Directory shards | ForEach-Object {
@@ -314,7 +318,19 @@ jobs:
           # 4 vCPU / 16 GB GitHub-hosted runners (measured over a 1s sampler),
           # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
           # is ~2 physical cores + HT), so 3 is the sweet spot.
-          cmake --build build --config Release -j 3
+          $log = Join-Path $env:RUNNER_TEMP 'build.log'
+          cmake --build build --config Release -j 3 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          # Any failure on an sccache leg rebuilds uncached; see the Linux CUDA child.
+          if ($rc -ne 0 -and $env:CACHER -eq 'sccache') {
+            Select-String -Path $log -Pattern 'sccache' | Select-Object -Last 20 | ForEach-Object { $_.Line }
+            Write-Output "::warning::build failed on the sccache leg; rebuilding without a compiler launcher"
+            cmake -S . -B build -DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER=
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            cmake --build build --config Release -j 3
+            $rc = $LASTEXITCODE
+          }
+          exit $rc
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the Linux CUDA child for
@@ -341,7 +357,7 @@ jobs:
           exit 0
 
       - name: ccache stats
-        if: ${{ always() }}
+        if: ${{ always() && env.CACHER == 'ccache' }}
         shell: bash
         run: |
           ccache -s -v
@@ -352,6 +368,23 @@ jobs:
             ccache -s
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # See the Linux CUDA child for how to read the per-language counts.
+      - name: sccache stats
+        if: ${{ always() && env.CACHER == 'sccache' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats
+          {
+            echo "### sccache windows x64/${{ matrix.profile }}"
+            echo ""
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          sccache --stop-server || true
+          [ -s "$RUNNER_TEMP/sccache-error.log" ] && tail -50 "$RUNNER_TEMP/sccache-error.log" || true
 
       # Authenticode-sign before packaging. The Studio installer downloads these
       # zips after its own signed installer has run, so nothing downstream signs
@@ -409,7 +442,7 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CACHER == 'ccache' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
@@ -423,8 +456,16 @@ jobs:
         # the CANCELLATION path, not the failure path, so !cancelled() would
         # skip the save on the single most expensive case -- a leg that
         # compiled for hours and then hit the cap.
-        if: ${{ always() }}
+        if: ${{ always() && env.CACHER == 'ccache' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
           key: ccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # See Save sccache in the Linux CUDA child.
+      - name: Save sccache
+        if: ${{ always() && env.CACHER == 'sccache' && env.COMPILER_LAUNCHER == 'sccache' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -661,7 +661,7 @@ jobs:
       - name: Prune
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
+        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
   build-rocm:
     name: ROCm
@@ -1383,7 +1383,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 75
+        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
   # Without this a failed scheduled run is silent: GitHub emails only whoever
   # last touched the cron file, which is how three nightlies failed unnoticed.
