@@ -64,10 +64,13 @@ on:
 
 permissions:
   contents: read
+  # build polls the jobs API for its warm shards.
+  actions: read
 
 jobs:
   warm:
-    name: warm x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    # windows- prefix: build finds its shards by name, and the Linux child has x64 rows too.
+    name: warm windows-x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
     if: ${{ inputs.warm_matrix != '' }}
     runs-on: ${{ matrix.runner }}
     # Best effort; no signing environment, shards ship nothing.
@@ -201,8 +204,7 @@ jobs:
 
   build:
     name: x64/${{ matrix.profile }}
-    needs: warm
-    if: ${{ !cancelled() }}
+    # No `needs: warm`; see the Linux CUDA child. Compiles slice 0 while the warm jobs run.
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -256,15 +258,31 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      # Slice 0 of N, the same round-robin deal as the warm jobs (awk NR % N == shard).
+      - name: Compile slice 0 of ${{ matrix.shards }}
+        if: ${{ matrix.shards >= 2 }}
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build -t targets all \
+            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.obj:' | cut -d: -f1 | sort \
+            | awk -v k="${{ matrix.shards }}" 'NR % k == 0' > shard.txt
+          echo "$(wc -l < shard.txt) CUDA objects in slice 0"
+          xargs -a shard.txt ninja -C build -j 3
+
+      # A late or failed shard only means this job compiles its slice in the full build below.
+      - name: Wait for the warm shards
+        if: ${{ matrix.shards >= 2 }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash tooling/scripts/unsloth/wait_for_jobs.sh \
+            --match " / warm windows-x64/${{ matrix.profile }} " \
+            --expect $(( ${{ matrix.shards }} - 1 )) --deadline-min 160 --poll 60 || true
+
+      # One restore per warm shard (slices 1..3); a shard that never saved is just a miss.
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -294,7 +312,7 @@ jobs:
             ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
-        if: ${{ matrix.shards >= 1 }}
+        if: ${{ matrix.shards >= 2 }}
         run: |
           if (Test-Path shards) {
             Get-ChildItem -Directory shards | ForEach-Object {
