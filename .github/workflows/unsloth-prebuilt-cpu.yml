@@ -4,9 +4,11 @@
 name: "Unsloth prebuilt: CPU"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the CPU-only bundles for
-# Linux + Windows, each on x64 and arm64 (one matrix entry per arch). Every
-# matrix entry uploads a single app-*.{tar.gz|zip} artifact for the parent's
-# assemble step to pick up.
+# Linux + Windows, each on x64 and arm64 (one matrix entry per arch), and the
+# Linux Vulkan bundles: each Linux job builds CPU, then Vulkan on the same runner
+# with a fresh tree and its own cache (same image, both builds short; one runner
+# instead of two). Every bundle is a single app-*.{tar.gz|zip} artifact for the
+# parent's assemble step to pick up.
 #
 # The Linux build mirrors oobabooga/llama-cpp-binaries' build-wheels-cpu.yml
 # (GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS + GGML_RPC, no GPU backend). The
@@ -63,7 +65,7 @@ permissions:
 
 jobs:
   build-linux:
-    name: linux/${{ matrix.arch }}
+    name: linux/${{ matrix.arch }} + Vulkan
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -260,6 +262,231 @@ jobs:
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── Vulkan bundle, same runner ──
+      # The CPU and Vulkan recipes share this runner image (and the clang toolchain on arm64,
+      # still on PATH from the CPU half), and each finishes in under 15 minutes, so one runner
+      # builds both: a runner freed for the long CUDA legs. Fresh tree and cache, the same
+      # paths as the CPU half, so neither bundle changes.
+      - name: Fresh source and ccache for the Vulkan build
+        id: vulkan
+        shell: bash
+        run: |
+          set -eux
+          rm -rf "${GITHUB_WORKSPACE:?}/src" "${GITHUB_WORKSPACE:?}/dist" "${GITHUB_WORKSPACE:?}/.ccache"
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Install Vulkan SDK + build dependencies
+        run: |
+          set -eux
+          if [ "${{ matrix.arch }}" = x64 ]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
+          fi
+
+      - name: ccache (Vulkan)
+        # Best-effort; see the verification in Configure ccache below.
+        continue-on-error: true
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-linux-${{ matrix.arch }}
+          append-timestamp: false
+          variant: ccache
+          # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
+          install: binary
+          max-size: 2G
+          save: false
+
+      - name: Configure ccache (Vulkan)
+        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
+        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
+        # archive". A cache accelerator must never fail a release build. So verify ccache
+        # POSITIVELY here and, when it is missing or older than the options below require,
+        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
+        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
+        # would quietly change cache semantics rather than announce itself.
+        run: |
+          set -uo pipefail
+          need=4.10
+          have="$(ccache --version 2>/dev/null | head -1 | awk '{print $3}')"
+          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" = "$need" ]; then
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            echo "CCACHE_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "::warning::ccache unusable (found '${have:-none}', need >= $need); building without a cache"
+          echo "- ccache unusable (found \`${have:-none}\`); this leg built without a cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "CCACHE_LAUNCHER=" >> "$GITHUB_ENV"
+
+      # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
+      # the current backend and it has no glslc package. Install matching pinned
+      # headers and build the shader compiler shipped with the LunarG SDK.
+      - name: Install Vulkan headers (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          package="$RUNNER_TEMP/vulkan-headers.deb"
+          staging="$RUNNER_TEMP/vulkan-headers"
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 \
+            "https://packages.lunarg.com/vulkan/pool/main/v/vulkan-headers/vulkan-headers_1.4.313.0~rc1-1lunarg22.04-1_all.deb" \
+            -o "$package"
+          echo "587b2d8e79416b394170ab61557c98765570cd153730f819a917866d78f45e1a  $package" | sha256sum -c -
+          dpkg-deb -x "$package" "$staging"
+          sudo cp -a "$staging/usr/." /usr/local/
+
+      - name: Build glslc (arm64) (Vulkan)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          archive="$RUNNER_TEMP/shaderc.tar.gz"
+          source="$RUNNER_TEMP/shaderc"
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 \
+            "https://packages.lunarg.com/vulkan/pool/main/s/shaderc/shaderc_2025.2~rc1-1lunarg22.04.orig.tar.gz" \
+            -o "$archive"
+          echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
+          mkdir -p "$source"
+          tar -xzf "$archive" -C "$source"
+          # ENABLE_PCH=OFF: glslang builds a clang precompiled header, and ccache
+          # hands the cached .pch back on the next run. Clang validates a PCH by
+          # the mtime of every system header it saw, so the first run after the
+          # runner image reinstalls linux-libc-dev fails with "has been modified
+          # since the precompiled header was built" (run 34459747884). Without the
+          # PCH every object is an ordinary ccache hit and the build is unchanged.
+          cmake -S "$source" -B "$source/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DENABLE_PCH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+          cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
+          sudo install -m 0755 "$source/build/glslc/glslc" /usr/local/bin/glslc
+          glslc --version
+
+      - name: Configure (Vulkan)
+        working-directory: src
+        run: |
+          set -eux
+          # Build recipe mirrors llama-cpp-binaries' Vulkan wheel: the CPU recipe
+          # (backend-DL + all CPU variants + RPC) plus GGML_VULKAN. RPATH=$ORIGIN
+          # so the bundle's sibling .so files resolve from the binary's own dir.
+          # LLAMA_FATAL_WARNINGS below is -Werror. The arm64 image compiles with
+          # clang-19 against GCC 12's libstdc++, where std::stable_sort still
+          # reaches the deprecated get_temporary_buffer; GCC buries that in a
+          # system header, clang reports it at our instantiation. That failed
+          # this leg on 08-27 over a deprecation in code we do not own, so that
+          # one diagnostic is off. Every other warning stays fatal.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_RPC=ON \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+
+      - name: Build (Vulkan)
+        working-directory: src
+        run: |
+          set -eux
+          # Backend modules (CPU variants, Vulkan, RPC) build as ggml
+          # dependencies, so every tool pulls them in.
+          cmake --build build --config Release -j "$(nproc)"
+          strip build/bin/llama-* || true
+
+      - name: Bundle OpenMP runtime (arm64) (Vulkan)
+        if: matrix.arch == 'arm64'
+        run: cp /usr/lib/llvm-19/lib/libomp.so.5 src/build/bin/
+
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the CUDA child for the
+      # rationale. The bundle tars all of build/bin, so anything produced here
+      # is shipped automatically.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only) (Vulkan)
+        working-directory: src
+        run: |
+          set -u
+          if [ ! -d examples/diffusion-gemma-server ]; then
+            echo "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          fi
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON \
+            || { echo "reconfigure for examples failed; skipping DiffusionGemma binaries"; exit 0; }
+          if cmake --build build --config Release -j "$(nproc)" \
+              --target llama-diffusion-gemma-visual-server llama-diffusion-cli; then
+            strip build/bin/llama-diffusion-gemma-visual-server build/bin/llama-diffusion-cli || true
+            echo "built DiffusionGemma binaries"
+          else
+            echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          fi
+          exit 0
+
+      - name: Package bundle (tar.gz) (Vulkan)
+        run: |
+          set -eux
+          ASSET="app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz"
+          cp src/LICENSE src/build/bin/
+          mkdir -p dist
+          (cd src/build/bin && tar -czf "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -la dist
+
+      - name: Upload bundle artifact (Vulkan)
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan
+          path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz
+          if-no-files-found: error
+
+      - name: Evict stale ccache files (Vulkan)
+        # !cancelled(), unlike the save below: on a timeout the job gets a
+        # single ~5 minute teardown window (measured ~4m50s after process
+        # kill), shared by every remaining step and not replenished. Evicting
+        # spends that window on housekeeping; the save is what actually needs
+        # it, and a 2 GB cache is not quick to write.
+        if: ${{ !cancelled() && steps.vulkan.outcome == 'success' && env.CCACHE_LAUNCHER != '' }}
+        continue-on-error: true
+        run: ccache --evict-older-than 7d
+
+      - name: Save ccache (Vulkan)
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
+        # save would only re-upload the restored entry under a new key.
+        # Only once the Vulkan half has its own cache dir: otherwise this would save the CPU
+        # half's cache under the Vulkan key.
+        if: ${{ always() && steps.vulkan.outcome == 'success' && env.CCACHE_LAUNCHER != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-windows:
     name: windows/${{ matrix.arch }}

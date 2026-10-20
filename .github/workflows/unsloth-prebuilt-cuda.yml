@@ -67,7 +67,18 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.warm_matrix) }}
     steps:
+      # Only when the image comes up short: staging run 39413142954 started with 86 GB free on x64
+      # and 108 GB on arm64, against the 26 GB the action frees, and the action cost 1.5-3 min a
+      # job. The ccache stats step logs `df` after the build, so the real peak stays visible.
+      - name: Check free disk space
+        id: disk
+        run: |
+          avail="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          echo "free on /: ${avail} GB"
+          if [ "${avail:-0}" -lt 50 ]; then echo "low=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Free disk space
+        if: ${{ steps.disk.outputs.low == 'true' }}
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           tool-cache: true
@@ -159,15 +170,28 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # Every object of `all` (host too), dealt round-robin; the build compiles whatever a
-          # shard did not reach.
-          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" > shard.txt
+          # Every object of `all` (host too), dealt by measured cost (round-robin until a profile has
+          # costs); the build compiles whatever a shard did not reach.
+          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
           echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
           xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
-        run: ccache -s -v
+        run: |
+          ccache -s -v
+          df -h /
+
+      # Real compile times of this slice, for the leg to fold into the costs the next run deals by
+      # (scripts/unsloth/slice_costs.sh). Written into the cache dir, so the delta below carries
+      # it; any copy merged in from an earlier delta goes first.
+      - name: Record this slice's compile times
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build ".ccache/slice-costs.d/shard${{ matrix.shard }}.tsv"
 
       # Only what this job added or rewrote, tree layout preserved: never a 4 GB copy of the generation.
       - name: Export the shard delta
@@ -201,7 +225,18 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
+      # Only when the image comes up short: staging run 39413142954 started with 86 GB free on x64
+      # and 108 GB on arm64, against the 26 GB the action frees, and the action cost 1.5-3 min a
+      # job. The ccache stats step logs `df` after the build, so the real peak stays visible.
+      - name: Check free disk space
+        id: disk
+        run: |
+          avail="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          echo "free on /: ${avail} GB"
+          if [ "${avail:-0}" -lt 50 ]; then echo "low=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Free disk space
+        if: ${{ steps.disk.outputs.low == 'true' }}
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           tool-cache: true
@@ -233,7 +268,7 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" > shard.txt
+          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
           echo "$(wc -l < shard.txt) objects in slice 0 ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
           xargs -a shard.txt -d '\n' ninja -C build -j 3
 
@@ -302,6 +337,20 @@ jobs:
           cmake --build build --config Release -j 3
           strip build/bin/llama-* || true
 
+      # This build's timings plus the warm shards' (merged in with their deltas) become the costs
+      # the next run deals its slices by. Every leg records them, sliced or not, so a profile
+      # whose slice count goes up is balanced from its first run. Never fails the leg.
+      - name: Record slice costs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build "$RUNNER_TEMP/slice-costs-leg.tsv"
+          bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+            "$RUNNER_TEMP/slice-costs-leg.tsv" .ccache/slice-costs.d/*.tsv
+          rm -rf .ccache/slice-costs.d
+
       # The DiffusionGemma visual server + cli are example targets that exist
       # only when the source tree carries ggml-org/llama.cpp#24423 (a mix build).
       # Build them best-effort and NEVER fail the job: the full tool bundle
@@ -331,6 +380,7 @@ jobs:
         if: ${{ always() }}
         run: |
           ccache -s -v
+          df -h /
           {
             echo "### ccache ${{ matrix.arch }}/${{ matrix.profile }}"
             echo ""

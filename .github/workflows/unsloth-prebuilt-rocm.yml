@@ -483,7 +483,7 @@ jobs:
       shell: cmd
       run: |
         call "%RUNNER_TEMP%\rocm-env.cmd"
-        "C:\Program Files\Git\bin\bash.exe" tooling/scripts/unsloth/slice_objects.sh llama.cpp/build ${{ matrix.slice || 0 }} ${{ matrix.slices || 1 }} > slice.txt
+        "C:\Program Files\Git\bin\bash.exe" tooling/scripts/unsloth/slice_objects.sh llama.cpp/build ${{ matrix.slice || 0 }} ${{ matrix.slices || 1 }} .ccache/slice-costs.tsv > slice.txt
         if errorlevel 1 exit /b 1
         "C:\Program Files\Git\bin\bash.exe" -c "echo $(wc -l < slice.txt) objects in this slice; xargs -a slice.txt -d '\n' ninja -C llama.cpp/build -j $NUMBER_OF_PROCESSORS"
 
@@ -491,6 +491,16 @@ jobs:
       if: ${{ always() && (matrix.slice || 0) > 0 }}
       continue-on-error: true
       run: ccache --show-stats -v
+
+    # This slice's real compile times, carried by the delta below (scripts/unsloth/slice_costs.sh).
+    - name: Record this slice's compile times
+      if: ${{ always() && (matrix.slice || 0) > 0 }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+        bash tooling/scripts/unsloth/slice_costs.sh export llama.cpp/build ".ccache/slice-costs.d/shard${{ matrix.slice }}.tsv"
 
     - name: Export the shard delta
       if: ${{ always() && (matrix.slice || 0) > 0 }}
@@ -565,6 +575,20 @@ jobs:
         call "%RUNNER_TEMP%\rocm-env.cmd"
         cd llama.cpp\build
         cmake --build . -j %NUMBER_OF_PROCESSORS%
+
+    # Costs the next run deals its slices by: this build plus the warm shards' timings. Every
+    # Windows leg records them, sliced or not. Never fails the leg.
+    - name: Record slice costs
+      if: ${{ !cancelled() && (matrix.slice || 0) == 0 }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        bash tooling/scripts/unsloth/slice_costs.sh export llama.cpp/build slice-costs-leg.tsv
+        bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+          slice-costs-leg.tsv .ccache/slice-costs.d/*.tsv
+        rm -rf .ccache/slice-costs.d
 
     - name: Copy ROCm core DLLs to build directory
       if: ${{ (matrix.slice || 0) == 0 }}

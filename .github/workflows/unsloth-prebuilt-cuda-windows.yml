@@ -169,13 +169,23 @@ jobs:
         run: |
           set -euo pipefail
           # Every object of `all` (host too); see the Linux CUDA child.
-          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" > shard.txt
+          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
           echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
           xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
         run: ccache -s -v
+
+      # This slice's real compile times, carried by the delta below; see the Linux CUDA child.
+      - name: Record this slice's compile times
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build ".ccache/slice-costs.d/shard${{ matrix.shard }}.tsv"
 
       - name: Export the shard delta
         if: ${{ always() }}
@@ -267,7 +277,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" > shard.txt
+          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
           echo "$(wc -l < shard.txt) objects in slice 0 ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
           xargs -a shard.txt -d '\n' ninja -C build -j 3
 
@@ -333,6 +343,19 @@ jobs:
           # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
           # is ~2 physical cores + HT), so 3 is the sweet spot.
           cmake --build build --config Release -j 3
+
+      # Costs for the next run's slices; see the Linux CUDA child. Never fails the leg.
+      - name: Record slice costs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build slice-costs-leg.tsv
+          bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+            slice-costs-leg.tsv .ccache/slice-costs.d/*.tsv
+          rm -rf .ccache/slice-costs.d
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the Linux CUDA child for
