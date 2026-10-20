@@ -116,6 +116,7 @@ jobs:
       cuda_warm_matrix: ${{ steps.warm.outputs.cuda_warm_matrix }}
       win_cuda_warm_matrix: ${{ steps.warm.outputs.win_cuda_warm_matrix }}
       rocm_matrix: ${{ steps.m.outputs.rocm_matrix }}
+      rocm_win_matrix: ${{ steps.m.outputs.rocm_win_matrix }}
       rocm_cutoff: ${{ steps.m.outputs.rocm_cutoff }}
       macos_matrix: ${{ steps.m.outputs.macos_matrix }}
     env:
@@ -463,6 +464,9 @@ jobs:
 
           [ -n "$GFX" ] || { echo "refusing empty gfx_target (would publish a CUDA-only release labeled CUDA + ROCm)" >&2; exit 1; }
           ROCM_MATRIX="$(jq -cn --arg g "$GFX" '{gfx_target: ($g | split(",") | map(gsub("^\\s+|\\s+$"; "")))}')"
+          # Windows rows carry slices: gfx110X and gfx103X (76 / 65 min cold, the slowest ROCm legs)
+          # are dealt into 2, slice 0 being the leg and slice 1 a warm shard (see the CUDA budget).
+          ROCM_WIN_MATRIX="$(jq -c '{include: [.gfx_target[] as $g | (if ($g == "gfx110X" or $g == "gfx103X") then 2 else 1 end) as $n | range($n) as $s | {gfx_target: $g, slice: $s, slices: $n}]}' <<<"$ROCM_MATRIX")"
 
           # One weekly cutoff for the whole run, before fan-out. See the ROCm child for why it is the Saturday before.
           # Each leg reads its own clock otherwise, so a run crossing the SF Sat-to-Sun boundary would mix two toolchains in one release.
@@ -491,6 +495,7 @@ jobs:
             echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
             echo "win_cuda_matrix={\"include\":$WIN_CUDA_INCLUDE}"
             echo "rocm_matrix=$ROCM_MATRIX"
+            echo "rocm_win_matrix=$ROCM_WIN_MATRIX"
             echo "rocm_cutoff=$ROCM_CUTOFF"
             echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
           } >> "$GITHUB_OUTPUT"
@@ -510,16 +515,18 @@ jobs:
           # The rule is N, the number of slices a profile's ggml-cuda objects are dealt into. The
           # build job compiles slice 0 and the warm jobs slices 1..N-1, all started together (no
           # `needs:`) so the run is queued at once for the CI janitor; build waits for its shards.
-          # Every job live at once: ~24 non-CUDA legs, 4 waiters (assemble, reclaim, alert, prune
-          # briefly), 16 CUDA builds and 21 warm jobs, ~65 against ~60 runners; the 4-14 min
-          # CPU/Vulkan/macOS legs free the overflow within minutes.
-          # Cold night 2026-10-19 (pin #298 edited ggml.h, 7% hits): Windows portable 164/153 min,
-          # Linux portable 141/118, older/newer 68-106. N=4 puts portable near 55 min cold and N=2
-          # older/newer near 60, about ROCm windows/gfx110X (76 min), which then sets the wall time.
+          # Every job of a run starts at once, so the job count IS the peak runner count; keep it at
+          # 60 or fewer. Budget: CUDA Linux 16 (8 legs + 8 warm), CUDA Windows 15 (7 + 8), CUDA
+          # Windows ARM64 1, ROCm Windows 9 (7 + gfx110X/gfx103X warm), ROCm Linux 7, CPU 4,
+          # Vulkan 4, macOS 2, assemble + finalize 2 = 60. Slices cover every object (host too).
+          # Allocation from the cold night of 2026-10-19 (7% hits) by giving each spare slot to the
+          # slowest leg: portable N=3 and older/newer N=2 land every CUDA leg at ~45-60 min, ROCm
+          # windows gfx110X/gfx103X N=2 at ~45/40 (was 164 min for the slowest leg, 215 for the run).
           # Max 4: the build job restores slices 1..3. Staging run 34205486511 measured N=2:
-          # cuda12-older 100 -> 64 min Windows, 53 -> 43 Linux. Legacy N=1 (21/33 min, PTX-only).
-          SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then (if .arch == "x64" then 4 else 2 end) else 2 end'
-          WIN_SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then 4 else 2 end'
+          # cuda12-older 100 -> 64 min Windows, 53 -> 43 Linux. Legacy N=1 (21/33 min, PTX-only);
+          # Linux arm64 portable N=1 (51 min, under the slowest sliced legs).
+          SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then (if .arch == "x64" then 3 else 1 end) else 2 end'
+          WIN_SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then 3 else 2 end'
           expand_warm() { # $1 = slice rule; warm jobs take slices 1..N-1, the build takes 0
             jq -c ".include | [.[] | . as \$r | ($1) as \$k | select(\$k > 1) | range(1; \$k) as \$s | \$r + {shards: \$k, shard: \$s}]"
           }
@@ -659,27 +666,13 @@ jobs:
 
   # First of two ccache prunes (see scripts/unsloth/prune_ccache.sh): one generation per prefix
   # at run start so old + new fit under the limit. Never gates the waiter, which excludes it by name.
-  prune-ccache:
-    name: Prune superseded ccache generations
-    needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    continue-on-error: true
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Checkout build tooling (this repo)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
-      - name: Prune
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
-
   build-rocm:
     name: ROCm
     needs: resolve
+    # actions: read for the sliced Windows legs' wait on their warm shards.
+    permissions:
+      contents: read
+      actions: read
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
     with:
@@ -687,6 +680,7 @@ jobs:
       repo: ${{ needs.resolve.outputs.repo }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       matrix: ${{ needs.resolve.outputs.rocm_matrix }}
+      windows_matrix: ${{ needs.resolve.outputs.rocm_win_matrix }}
       operating_systems: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
       rocm_version: ${{ github.event.inputs.rocm_version || 'weekly' }}
       rocm_cutoff: ${{ needs.resolve.outputs.rocm_cutoff }}
@@ -774,9 +768,10 @@ jobs:
           # them must be represented or we are not looking at a complete run.
           PREFIXES=('CUDA / ' 'CUDA Windows / ' 'CUDA Windows ARM64 / ' 'ROCm / ' 'macOS / ' 'CPU / ' 'Vulkan / ')
           SELF='Assemble metadata + publish'
+          # The housekeeping job (prune, reclaim, report) starts with the run and waits for this
+          # one; counting it here would deadlock. ALERT and PRUNE name jobs it absorbed.
+          RECLAIM='Finalize: prune, reclaim, report'
           ALERT='Report pipeline health'
-          # reclaim starts with the run and waits for this job; counting it here would deadlock.
-          RECLAIM='Reclaim artifact storage'
           # Best-effort jobs that never gate a publish: the start-of-run ccache prune and the
           # CUDA warm shards ("CUDA / warm x64/cuda12-portable 0/3").
           PRUNE='Prune superseded ccache generations'
@@ -1227,8 +1222,11 @@ jobs:
   # The payloads are equivalent -- the resolve guard pins every publish run to
   # the full default matrix, and the tag encodes base plus pr-set hash -- so the
   # assets match whichever run wrote them.
+  # One job for the run's housekeeping, so it costs one runner of the 60 (see the budget in
+  # resolve): the start-of-run ccache prune, then the reclaim and the health report once every
+  # other job has finished.
   reclaim:
-    name: Reclaim artifact storage
+    name: 'Finalize: prune, reclaim, report'
     # Started with the build legs and waits for every other job of the run (wait_for_jobs.sh) instead
     # of `needs:`-ing them, so it is queued with the run and one CI janitor pass covers it.
     # Every build leg, not just assemble: assemble needs only resolve, so one failing leg fails it
@@ -1249,15 +1247,24 @@ jobs:
     # Mostly waiting: the run's other jobs end by assemble's 350-minute cap.
     timeout-minutes: 360
     permissions:
-      actions: write   # delete this run's artifacts (and read the jobs list)
+      actions: write   # prune caches, delete this run's artifacts, read the jobs list
       contents: read   # read the release asset list
+      issues: write    # the health report
     steps:
-      - name: Checkout the wait script
+      # Scripts, and the prebuilt-alert composite action.
+      - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
-          path: waiter
-          sparse-checkout: scripts/unsloth
           persist-credentials: false
+
+      # First of two prunes (the second follows a publish below): one generation per prefix, so
+      # the caches this run saves land under the repo limit. Was its own job.
+      - name: Prune superseded ccache generations
+        if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
       # published = assemble's "Publish GitHub release" step succeeded. A wait that times out
       # leaves it `unknown`, and every delete below is skipped: deleting while a leg still runs
@@ -1268,14 +1275,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          if bash waiter/scripts/unsloth/wait_for_jobs.sh --exclude 'Reclaim artifact storage' \
-               --exclude 'Report pipeline health' --deadline-min 335 --poll 120; then
+          if bash scripts/unsloth/wait_for_jobs.sh --exclude 'Finalize: prune, reclaim, report' --deadline-min 335 --poll 120 \
+               --out "$RUNNER_TEMP/jobs.tsv"; then
             step="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100&filter=latest" \
               --jq '.jobs[] | select(.name == "Assemble metadata + publish") | .steps[] | select(.name == "Publish GitHub release") | .conclusion' | head -1)"
             if [ "$step" = success ]; then published=true; else published=false; fi
           else
+            rc=$?
             published=unknown
           fi
+          echo "wait_rc=${rc:-0}" >> "$GITHUB_OUTPUT"
           echo "published=$published"
           echo "published=$published" >> "$GITHUB_OUTPUT"
 
@@ -1413,13 +1422,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Nothing above needed a checkout; read-only clone, no token left behind.
-      - name: Checkout build tooling (this repo)
-        if: ${{ steps.wait.outputs.published == 'true' }}
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
-        with:
-          path: tooling
-          persist-credentials: false
-
       # ── Keep the ccache budget inside the repo limit ──
       #
       # Second prune (the first follows `resolve`). Published runs only: a cancelled run's
@@ -1430,40 +1432,24 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tooling/scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
+        run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
-  # Without this a failed scheduled run is silent: GitHub emails only whoever
-  # last touched the cron file, which is how three nightlies failed unnoticed.
-  # Runs on publish-intent runs only, so subset test dispatches stay quiet.
-  alert:
-    name: Report pipeline health
-    # Started with the build legs and waits for the rest of the run (see reclaim), so it is queued
-    # with the run and one CI janitor pass covers it.
-    needs: [resolve]
-    if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    steps:
-      - name: Checkout (for the composite action)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
-        with: { persist-credentials: false }
-
+      # Health report. Without this a failed scheduled run is silent: GitHub emails only whoever
+      # last touched the cron file, which is how three nightlies failed unnoticed. Publish-intent
+      # runs only, so subset test dispatches stay quiet. Reads the job list the wait wrote.
       - name: Summarise run
         id: s
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
         env:
           GH_TOKEN: ${{ github.token }}
+          WAIT_RC: ${{ steps.wait.outputs.wait_rc }}
         run: |
           set -uo pipefail
-          # Every job of the run but this one and reclaim, from the jobs API instead of `needs`.
-          # Warm shards and the start-of-run prune are best effort and never gate a publish,
-          # the same exclusions as the assemble waiter and unsloth-prebuilt-retry.yml.
+          # Every job of the run but this one, from the jobs API instead of `needs`. Warm shards
+          # are best effort and never gate a publish, the same exclusion as the assemble waiter
+          # and unsloth-prebuilt-retry.yml.
           jobs="$RUNNER_TEMP/jobs.tsv"
-          bash scripts/unsloth/wait_for_jobs.sh --exclude 'Report pipeline health' \
-            --exclude 'Reclaim artifact storage' --deadline-min 345 --poll 120 --out "$jobs"
-          wait_rc=$?
+          wait_rc="${WAIT_RC:-1}"
           FAILED="$(awk -F'\t' 'NF && index($1, " / warm ") == 0 && $1 != "Prune superseded ccache generations" \
                      && ($2 != "completed" || ($3 != "success" && $3 != "skipped")) \
                      { printf "%s%s (%s)", sep, $1, ($2 == "completed" ? $3 : $2); sep = ", " }' "$jobs" 2>/dev/null)"
@@ -1502,6 +1488,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Alert
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.publish) }}
         uses: ./.github/actions/prebuilt-alert
         with:
           status: ${{ steps.s.outputs.status }}
