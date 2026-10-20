@@ -241,8 +241,8 @@ jobs:
       run:
         shell: pwsh
     env:
-      # sccache pilot (2026-10): cuda13-portable only; see unsloth-prebuilt-cuda.yml.
-      CACHER: ${{ matrix.profile == 'cuda13-portable' && 'sccache' || 'ccache' }}
+      # sccache for every CUDA leg; see unsloth-prebuilt-cuda.yml.
+      CACHER: sccache
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0

@@ -195,9 +195,10 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}
     env:
-      # sccache pilot (2026-10): x64 cuda13-portable only, every other leg stays on ccache so a
-      # header-edit night compares the two directly. See .github/actions/sccache-setup.
-      CACHER: ${{ (matrix.profile == 'cuda13-portable' && matrix.arch == 'x64') && 'sccache' || 'ccache' }}
+      # sccache for every CUDA leg (see .github/actions/sccache-setup); `ccache` here restores the
+      # old path in one line. The warm shards still compile through ccache, so re-enabling them
+      # needs this set back to ccache.
+      CACHER: sccache
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1

@@ -92,6 +92,8 @@ env:
   KLASS: portable
   RANK: '60'
   CUDA: '13.4'
+  # sccache like the other CUDA legs (.github/actions/sccache-setup); `ccache` restores the old path.
+  CACHER: sccache
   ARCHS: '120 121'
 
 jobs:
@@ -195,6 +197,7 @@ jobs:
           Get-ChildItem $libs | Select-Object -ExpandProperty Name
 
       - name: ccache
+        if: env.CACHER == 'ccache'
         # Best-effort; see the verification in Configure ccache below.
         continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
@@ -212,6 +215,7 @@ jobs:
           save: false
 
       - name: Configure ccache
+        if: env.CACHER == 'ccache'
         # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
         # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
         # archive". A cache accelerator must never fail a release build. So verify ccache
@@ -236,6 +240,15 @@ jobs:
             "CCACHE_LAUNCHER=" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           }
 
+      - name: sccache
+        if: env.CACHER == 'sccache'
+        uses: ./tooling/.github/actions/sccache-setup
+        with:
+          key-prefix: sccache-cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}
+          tag: ${{ inputs.tag }}
+          # Two archs, ggml-cuda only (ccache dir ~0.4 GB).
+          cache-size: 2G
+
       # GGML_CPU=OFF: the CPU backend, the server and the tools come from the
       # arm64 CPU bundle, which is built with clang (upstream's proven Windows
       # arm64 CPU toolchain) rather than cross MSVC. GGML_BACKEND_DL=ON is what
@@ -243,6 +256,8 @@ jobs:
       # registry, a C ABI, so the two compilers never share a C++ interface.
       - name: Configure
         working-directory: src
+        env:
+          LAUNCHER: ${{ env.CACHER == 'sccache' && env.COMPILER_LAUNCHER || env.CCACHE_LAUNCHER }}
         run: |
           $archs = "${{ env.ARCHS }}".Replace(' ', ';')
           cmake -S . -B build -G Ninja `
@@ -258,9 +273,9 @@ jobs:
             -DLLAMA_BUILD_TOOLS=OFF `
             -DLLAMA_BUILD_SERVER=OFF `
             -DCMAKE_CUDA_ARCHITECTURES="$archs" `
-            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+            -DCMAKE_C_COMPILER_LAUNCHER="$env:LAUNCHER" `
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$env:LAUNCHER" `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER="$env:LAUNCHER"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build ggml-cuda
@@ -268,8 +283,19 @@ jobs:
         run: |
           # -j 3 for the same reason as the x64 legs: 4 vCPU / 16 GB runners,
           # and nvcc peaks around 3 GB of host RSS per translation unit.
-          cmake --build build --config Release -j 3 --target ggml-cuda
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $log = Join-Path $env:RUNNER_TEMP 'build.log'
+          cmake --build build --config Release -j 3 --target ggml-cuda | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          # Any failure on an sccache leg rebuilds uncached; see the Linux CUDA child.
+          if ($rc -ne 0 -and $env:CACHER -eq 'sccache') {
+            Select-String -Path $log -Pattern 'sccache' | Select-Object -Last 20 | ForEach-Object { $_.Line }
+            Write-Output "::warning::build failed on the sccache leg; rebuilding without a compiler launcher"
+            cmake -S . -B build -DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER=
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            cmake --build build --config Release -j 3 --target ggml-cuda
+            $rc = $LASTEXITCODE
+          }
+          exit $rc
 
       # Nothing downstream would notice an x64 ggml-cuda.dll until a user's ARM64
       # host refused to load it, so check the PE machine field here.
@@ -288,7 +314,7 @@ jobs:
           if ($machine -ne 0xAA64) { throw "ggml-cuda.dll is not an ARM64 image (machine 0x$('{0:X4}' -f $machine))" }
 
       - name: ccache stats
-        if: ${{ always() }}
+        if: ${{ always() && env.CACHER == 'ccache' }}
         shell: bash
         run: |
           ccache -s -v
@@ -299,6 +325,23 @@ jobs:
             ccache -s
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # See the Linux CUDA child for how to read the per-language counts.
+      - name: sccache stats
+        if: ${{ always() && env.CACHER == 'sccache' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats
+          {
+            echo "### sccache windows arm64/${PROFILE}"
+            echo ""
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          sccache --stop-server || true
+          [ -s "$RUNNER_TEMP/sccache-error.log" ] && tail -50 "$RUNNER_TEMP/sccache-error.log" || true
 
       # Sign only what this leg built. Everything else in the finished bundle
       # was signed by the CPU leg that produced it, and re-signing a signed
@@ -402,15 +445,23 @@ jobs:
           if-no-files-found: error
 
       - name: Evict stale ccache files
-        if: ${{ !cancelled() && env.CCACHE_LAUNCHER != '' }}
+        if: ${{ !cancelled() && env.CACHER == 'ccache' && env.CCACHE_LAUNCHER != '' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
       - name: Save ccache
         # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
         # save would only re-upload the restored entry under a new key.
-        if: ${{ always() && env.CCACHE_LAUNCHER != '' }}
+        if: ${{ always() && env.CACHER == 'ccache' && env.CCACHE_LAUNCHER != '' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
           key: ccache-cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # See Save sccache in the Linux CUDA child.
+      - name: Save sccache
+        if: ${{ always() && env.CACHER == 'sccache' && env.COMPILER_LAUNCHER == 'sccache' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

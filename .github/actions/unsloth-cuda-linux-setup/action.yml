@@ -150,6 +150,8 @@ runs:
       with:
         key-prefix: sccache-cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
         tag: ${{ inputs.tag }}
+        # ~3.3x the ccache dir (CI ccache: legacy 0.2-0.3 GB, older/newer ~1 GB, portable ~1.5 GB).
+        cache-size: ${{ contains(inputs.profile, 'legacy') && '1G' || (contains(inputs.profile, 'portable') && (inputs.arch == 'arm64' && '3G' || '5G') || '3G') }}
 
     - name: Configure
       shell: bash

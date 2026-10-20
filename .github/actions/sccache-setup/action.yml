@@ -6,11 +6,13 @@ description: >-
   COMPILER_LAUNCHER for the CMake configure. The calling job prints stats and saves the
   cache (see the "sccache stats" / "Save sccache" steps in the CUDA children).
 
-  Why sccache on some legs: it splits every nvcc call into cudafe++ / cicc / ptxas / host
+  Used by every CUDA leg; CPU, Vulkan, ROCm and macOS stay on ccache (no nvcc, so nothing to
+  decompose). Why sccache for CUDA: it splits every nvcc call into cudafe++ / cicc / ptxas / host
   steps and caches each one. A header edit that leaves a kernel's PTX unchanged (a new type
   enum, a struct field, declarations: the usual shape of a pin or a common.cuh bump) reruns
   cicc but hits ptxas, where ccache recompiles the whole TU. Measured on ggml-cuda, cuda13
-  portable arch list, pin #298's header shape: 310 s vs 443 s (974/1015 ptxas hits).
+  portable arch list: pin #298's header shape 310 s vs 443 s (974/1015 ptxas hits), upstream
+  common.cuh commit bed0a85660 414 s vs 585 s (949/1008).
   It does NOT share work between profiles: nvcc passes -D__CUDA_ARCH_LIST__ into every
   step and ggml-cuda/common.cuh expands it, so cicc input differs per arch list.
 
@@ -22,9 +24,12 @@ inputs:
     description: Release tag being built; the exact-key half of the restore.
     required: true
   cache-size:
-    description: SCCACHE_CACHE_SIZE. sccache evicts LRU at this size; entries are ~3x ccache's.
+    description: >-
+      SCCACHE_CACHE_SIZE. sccache evicts LRU at this size (no age eviction), so the saved dir
+      settles at the cap: keep it near one night's objects. All CUDA legs at their caps total
+      ~51 GB, and a run briefly holds old + new generations until the post-publish prune.
     required: false
-    default: 6G
+    default: 3G
 
 runs:
   using: composite
@@ -38,8 +43,9 @@ runs:
         set -uo pipefail
         ver=v0.18.0
         case "${{ runner.os }}-${{ runner.arch }}" in
-          Linux-X64)   triple=x86_64-unknown-linux-musl; sum=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89; exe=sccache ;;
-          Windows-X64) triple=x86_64-pc-windows-msvc;    sum=1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b; exe=sccache.exe ;;
+          Linux-X64)   triple=x86_64-unknown-linux-musl;  sum=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89; exe=sccache ;;
+          Linux-ARM64) triple=aarch64-unknown-linux-musl; sum=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a; exe=sccache ;;
+          Windows-X64) triple=x86_64-pc-windows-msvc;     sum=1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b; exe=sccache.exe ;;
           *) echo "::warning::no pinned sccache for ${{ runner.os }}-${{ runner.arch }}; building uncached"
              echo "COMPILER_LAUNCHER=" >> "$GITHUB_ENV"; exit 0 ;;
         esac
