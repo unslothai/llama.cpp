@@ -98,6 +98,20 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
+      # Taken before the earlier deltas are merged: a hit this job gets from one of them is
+      # then exported too, since the build leg restores only this run's deltas and lacks it
+      # whenever the previous leg did not save (a cancelled or failed night).
+      - name: Snapshot the restored cache
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $snap = @{}
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+          "$($snap.Count) files snapshotted"
+
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -148,17 +162,6 @@ jobs:
           }
           ccache -z
           exit 0
-
-      - name: Snapshot the restored cache
-        run: |
-          $src = "${{ github.workspace }}\.ccache"
-          $snap = @{}
-          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
-            $rel = $_.FullName.Substring($src.Length + 1)
-            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
-          }
-          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
-          "$($snap.Count) files snapshotted"
 
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src

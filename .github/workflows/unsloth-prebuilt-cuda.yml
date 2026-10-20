@@ -93,6 +93,18 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
+      # Path + size, manifests by hash (the one file ccache rewrites in place). Not mtimes:
+      # ccache touches every hit, so on a warm night everything looks newer.
+      # Taken before the earlier deltas are merged: a hit this job gets from one of them is
+      # then exported too, since the build leg restores only this run's deltas and lacks it
+      # whenever the previous leg did not save (a cancelled or failed night).
+      - name: Snapshot the restored cache
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
+
       # Previous deltas are restored too (tagless fallback), so a retry compiles only what changed since them.
       - name: Restore warm shard 0
         if: ${{ matrix.shards >= 1 }}
@@ -142,15 +154,6 @@ jobs:
           done
           rm -rf shards
           ccache -z
-
-      # Path + size, manifests by hash (the one file ccache rewrites in place). Not mtimes:
-      # ccache touches every hit, so on a warm night everything looks newer.
-      - name: Snapshot the restored cache
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}/.ccache"
-          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
-          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
 
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
