@@ -168,7 +168,7 @@ jobs:
           # Every object of `all` (host too); see the Linux CUDA child.
           bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" > shard.txt
           echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
-          xargs -a shard.txt ninja -C build -j 3
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
@@ -266,7 +266,7 @@ jobs:
           set -euo pipefail
           bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" > shard.txt
           echo "$(wc -l < shard.txt) objects in slice 0 ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
-          xargs -a shard.txt ninja -C build -j 3
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       # A late or failed shard only means this job compiles its slice in the full build below.
       - name: Wait for the warm shards
