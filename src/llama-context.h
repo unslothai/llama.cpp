@@ -60,6 +60,10 @@ struct llama_context {
 
     void synchronize();
 
+    // synchronize only if work was queued since the last synchronize(): the output getters call this, so reading
+    // the outputs of several sequences after one decode costs a single synchronization
+    void synchronize_outputs();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -439,6 +443,9 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+
+    // set when backend work (graph compute, async output copies) may be in flight, cleared by synchronize()
+    bool sync_pending = true;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
