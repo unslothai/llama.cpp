@@ -156,6 +156,7 @@ runs:
           -DLLAMA_BUILD_TOOLS=ON `
           -DLLAMA_BUILD_SERVER=ON `
           -DLLAMA_BUILD_BORINGSSL=ON `
+          -DBORINGSSL_GIT=https://github.com/google/boringssl.git `
           -DCMAKE_CUDA_ARCHITECTURES="$archs" `
           -DCMAKE_C_COMPILER_LAUNCHER=ccache `
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `

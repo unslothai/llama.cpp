@@ -64,10 +64,12 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   warm:
-    name: warm x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    # windows- prefix: build finds its shards by name, and the Linux child has x64 rows too.
+    name: warm windows-x64/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
     if: ${{ inputs.warm_matrix != '' }}
     runs-on: ${{ matrix.runner }}
     # Best effort; no signing environment, shards ship nothing.
@@ -95,15 +97,18 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      # Before the earlier deltas merge, so hits served from them are exported too.
+      - name: Snapshot the restored cache
+        run: |
+          $src = "${{ github.workspace }}\.ccache"
+          $snap = @{}
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+          "$($snap.Count) files snapshotted"
+
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -146,31 +151,27 @@ jobs:
           ccache -z
           exit 0
 
-      - name: Snapshot the restored cache
-        run: |
-          $src = "${{ github.workspace }}\.ccache"
-          $snap = @{}
-          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
-            $rel = $_.FullName.Substring($src.Length + 1)
-            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
-          }
-          $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
-          "$($snap.Count) files snapshotted"
-
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
         shell: bash
         run: |
           set -euo pipefail
-          ninja -C build -t targets all \
-            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.obj:' | cut -d: -f1 | sort \
-            | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
-          echo "$(wc -l < shard.txt) CUDA objects in this shard"
-          xargs -a shard.txt ninja -C build -j 3
+          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
+          echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
         run: ccache -s -v
+
+      - name: Record this slice's compile times
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build ".ccache/slice-costs.d/shard${{ matrix.shard }}.tsv"
 
       - name: Export the shard delta
         if: ${{ always() }}
@@ -201,8 +202,7 @@ jobs:
 
   build:
     name: x64/${{ matrix.profile }}
-    needs: warm
-    if: ${{ !cancelled() }}
+    # No `needs: warm`: queued with the run, compiles slice 0 while the warm jobs run.
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -256,15 +256,27 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
+      - name: Compile slice 0 of ${{ matrix.shards }}
+        if: ${{ matrix.shards >= 2 }}
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
+          echo "$(wc -l < shard.txt) objects in slice 0 ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
+
+      # A late or failed shard only means this job compiles its slice in the full build below.
+      - name: Wait for the warm shards
+        if: ${{ matrix.shards >= 2 }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash tooling/scripts/unsloth/wait_for_jobs.sh \
+            --match " / warm windows-x64/${{ matrix.profile }} " \
+            --expect $(( ${{ matrix.shards }} - 1 )) --deadline-min 160 --poll 60 || true
+
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -294,7 +306,7 @@ jobs:
             ccache-shard3-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
-        if: ${{ matrix.shards >= 1 }}
+        if: ${{ matrix.shards >= 2 }}
         run: |
           if (Test-Path shards) {
             Get-ChildItem -Directory shards | ForEach-Object {
@@ -315,6 +327,18 @@ jobs:
           # so 3 parallel TUs leave ~13 GB free. -j 4 adds no speed (the runner
           # is ~2 physical cores + HT), so 3 is the sweet spot.
           cmake --build build --config Release -j 3
+
+      - name: Record slice costs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build slice-costs-leg.tsv
+          bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+            slice-costs-leg.tsv .ccache/slice-costs.d/*.tsv
+          rm -rf .ccache/slice-costs.d
 
       # DiffusionGemma binaries (example targets present only in #24423 mix
       # builds): best-effort, never fail the job. See the Linux CUDA child for

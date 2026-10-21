@@ -16,7 +16,7 @@
 #   GH_TOKEN with actions:write on GITHUB_REPOSITORY; writes GITHUB_STEP_SUMMARY if set.
 set -euo pipefail
 
-KEEP=1; LIMIT_GB=75; DRY=0
+KEEP=1; LIMIT_GB=100; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP="$2"; shift 2 ;;
