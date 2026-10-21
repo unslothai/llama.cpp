@@ -38,6 +38,11 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// the input tokens of the output rows of the sequence in the current ubatch, in ubatch order
+// called before backend_set_input; several rows per sequence come from draft verification, where the sampler of
+// row g must see the history the CPU sampler has after accepting the tokens of rows 1..g
+void llama_sampler_backend_set_rows(llama_sampler * sampler, const llama_token * tokens, uint32_t n_rows);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

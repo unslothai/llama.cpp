@@ -141,17 +141,31 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
+        // the backend samplers mask the candidates they drop with -INF where the CPU samplers remove them:
+        // keep only the candidates the backend kept, so the CPU samplers that follow see what they would on the CPU
         if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
             cur.resize(sampled_probs_count);
+            size_t n = 0;
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+                if (sampled_logits[i] != -INFINITY) {
+                    cur[n++] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+                }
+            }
+            if (n > 0) {
+                cur.resize(n);
             }
         } else if (sampled_logits) {
             const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
             cur.resize(sampled_logits_count);
+            size_t n = 0;
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+                if (sampled_logits[i] != -INFINITY) {
+                    cur[n++] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+                }
+            }
+            if (n > 0) {
+                cur.resize(n);
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);

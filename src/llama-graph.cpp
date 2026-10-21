@@ -1341,6 +1341,16 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 
         auto & sampler = samplers[seq_id];
 
+        // the input tokens of this sequence's output rows, in the order build_sampling assigns them to chains
+        std::vector<llama_token> rows_tokens;
+        for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
+            if (ubatch->output[i] && ubatch->seq_id[i][0] == seq_id) {
+                rows_tokens.push_back(ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL);
+            }
+        }
+
+        llama_sampler_backend_set_rows(sampler, rows_tokens.data(), (uint32_t) rows_tokens.size());
+
         if (sampler->iface->backend_set_input) {
             sampler->iface->backend_set_input(sampler);
         }
