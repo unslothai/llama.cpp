@@ -500,6 +500,14 @@ struct ggml_gallocr {
     // not share memory with a later tensor, an input must be allocated before the first node runs
     uint8_t * lifetime_bits;
     size_t    n_lifetime_bits;
+    uint64_t  lifetime_shape; // ggml_gallocr_graph_shape of the graph the plan was made for
+};
+
+enum ggml_gallocr_lifetime_bit {
+    GGML_GALLOCR_LIFETIME_PRESENT        = 1,
+    GGML_GALLOCR_LIFETIME_INPUT          = 2,
+    GGML_GALLOCR_LIFETIME_OUTPUT         = 4,
+    GGML_GALLOCR_LIFETIME_VIEW_OF_OUTPUT = 8,
 };
 
 // the tensor flags ggml_gallocr_alloc_graph_impl reads when it decides a lifetime: inputs are allocated
@@ -508,24 +516,47 @@ static uint8_t ggml_gallocr_lifetime_bits(const struct ggml_tensor * t) {
     if (t == NULL) {
         return 0;
     }
-    uint8_t bits = 1; // present
+    uint8_t bits = GGML_GALLOCR_LIFETIME_PRESENT;
     if (t->flags & GGML_TENSOR_FLAG_INPUT) {
-        bits |= 2;
+        bits |= GGML_GALLOCR_LIFETIME_INPUT;
     }
     if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
-        bits |= 4;
+        bits |= GGML_GALLOCR_LIFETIME_OUTPUT;
     }
     if (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-        bits |= 8;
+        bits |= GGML_GALLOCR_LIFETIME_VIEW_OF_OUTPUT;
     }
     return bits;
+}
+
+// a signature of the graph's structure that does not depend on the tensor sizes (they change with the number of
+// tokens): the op and type of every node and leaf and the op of every source; two graphs with the same signature
+// are the same graph built again, so a slot of one is the same tensor in the other
+static uint64_t ggml_gallocr_graph_shape(const struct ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a
+#define GGML_GALLOCR_MIX(v) do { h ^= (uint64_t) (v); h *= 1099511628211ULL; } while (0)
+    GGML_GALLOCR_MIX(graph->n_nodes);
+    GGML_GALLOCR_MIX(graph->n_leafs);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        GGML_GALLOCR_MIX(node->op);
+        GGML_GALLOCR_MIX(node->type);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            GGML_GALLOCR_MIX(node->src[j] ? (int) node->src[j]->op + 1 : 0);
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        GGML_GALLOCR_MIX(graph->leafs[i]->type);
+    }
+#undef GGML_GALLOCR_MIX
+    return h;
 }
 
 // a plan made with lifetime bits `planned` is valid for a tensor with bits `cur` when the same slot holds a tensor
 // (or none) and every flag of `cur` was already set at planning time: dropping an input or output flag only means
 // the plan allocates the tensor earlier or keeps it longer than needed
 static bool ggml_gallocr_lifetime_covered(uint8_t planned, uint8_t cur) {
-    return ((planned ^ cur) & 1) == 0 && (cur & ~planned) == 0;
+    return ((planned ^ cur) & GGML_GALLOCR_LIFETIME_PRESENT) == 0 && (cur & ~planned) == 0;
 }
 
 static size_t ggml_gallocr_n_lifetime_bits(const struct ggml_cgraph * graph) {
@@ -884,8 +915,10 @@ static bool ggml_gallocr_reserve_n_impl(
     // the sequences of one decode split across ubatches, see ggml_gallocr_needs_realloc)
     struct ggml_tensor ** union_outputs = NULL;
     size_t n_union_outputs = 0;
-    if (galloc->lifetime_bits != NULL && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs &&
-            galloc->n_lifetime_bits == ggml_gallocr_n_lifetime_bits(graph)) {
+    const uint64_t graph_shape = ggml_gallocr_graph_shape(graph);
+    if (galloc->lifetime_bits != NULL && galloc->n_lifetime_bits > 0 && galloc->n_nodes == graph->n_nodes &&
+            galloc->n_leafs == graph->n_leafs && galloc->n_lifetime_bits == ggml_gallocr_n_lifetime_bits(graph) &&
+            galloc->lifetime_shape == graph_shape) {
         union_outputs = malloc(sizeof(struct ggml_tensor *) * galloc->n_lifetime_bits);
         GGML_ASSERT(union_outputs != NULL);
         size_t k = 0;
@@ -895,7 +928,8 @@ static bool ggml_gallocr_reserve_n_impl(
             for (int j = -1; j < (is_node ? GGML_MAX_SRC : 0); j++) {
                 struct ggml_tensor * ts = j < 0 ? t : t->src[j];
                 const uint8_t planned = galloc->lifetime_bits[k++];
-                if (ts != NULL && (planned & 1) && (planned & 4) && !(ts->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                if (ts != NULL && (planned & GGML_GALLOCR_LIFETIME_PRESENT) && (planned & GGML_GALLOCR_LIFETIME_OUTPUT) &&
+                        !(ts->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                     ts->flags |= GGML_TENSOR_FLAG_OUTPUT;
                     union_outputs[n_union_outputs++] = ts;
                 }
@@ -987,6 +1021,7 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(graph->leafs[i]);
         }
         GGML_ASSERT(k == n_bits);
+        galloc->lifetime_shape = graph_shape;
     }
 
     // the outputs kept from the previous plan are recorded in the plan, the graph gets its own flags back
