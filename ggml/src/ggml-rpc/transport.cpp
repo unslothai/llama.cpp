@@ -31,7 +31,15 @@
 #  include <openssl/ssl.h>
 #  include <openssl/x509.h>
 #  include <cctype>
+#  include <cerrno>
+#  include <chrono>
 #  include <fstream>
+#  ifndef _WIN32
+#    include <fcntl.h>
+#    include <poll.h>
+#    include <pthread.h>
+#    include <signal.h>
+#  endif
 #endif // GGML_RPC_TLS
 
 #ifdef GGML_RPC_RDMA
@@ -143,7 +151,7 @@ struct socket_t::impl {
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
-    void update_caps(const uint8_t * remote_caps);
+    bool update_caps(const uint8_t * remote_caps);
 
     // TCP: small writes of one message (command byte, size, payload) are held here and leave in a
     // single send at flush(), which every message ends with, instead of one tiny segment each.
@@ -179,6 +187,7 @@ struct socket_t::impl {
     // one TLS record per message: the small writes of a message are held and leave together at flush()
     static constexpr size_t TLS_COALESCE_MAX = 64 * 1024;
     SSL *                ssl = nullptr;
+    bool                 tls_broken = false; // a read or write failed: no close_notify on a dead session
     std::vector<uint8_t> tls_out;
     bool tls_write(const void * data, size_t size);
     bool tls_send(const void * data, size_t size);
@@ -186,6 +195,10 @@ struct socket_t::impl {
     bool tls_recv(void * data, size_t size);
 #endif // GGML_RPC_TLS
 };
+
+#ifdef GGML_RPC_TLS
+static void tls_close_notify(SSL * ssl, sockfd_t fd);
+#endif // GGML_RPC_TLS
 
 socket_t::impl::~impl() {
     if (!use_rdma && !pending.empty()) {
@@ -196,6 +209,9 @@ socket_t::impl::~impl() {
 #endif // GGML_RPC_RDMA
 #ifdef GGML_RPC_TLS
     if (ssl) {
+        if (!tls_broken && tls_out.empty()) {
+            tls_close_notify(ssl, fd);
+        }
         SSL_free(ssl);
         ssl = nullptr;
     }
@@ -739,15 +755,18 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
 #endif // GGML_RPC_RDMA
 }
 
-void socket_t::impl::update_caps(const uint8_t * remote_caps) {
+bool socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #ifdef GGML_RPC_TLS
     if (ssl) {
         (void)remote_caps;
-        return;
+        return tls_flush();
     }
 #endif // GGML_RPC_TLS
-    // the caps just written go over TCP: send them before the transport may switch to RDMA
-    tcp_flush();
+    // the caps just written go over TCP: send them before the transport may switch to RDMA, and
+    // report a failed send, which queued writes only surface here
+    if (!tcp_flush()) {
+        return false;
+    }
 #ifdef GGML_RPC_RDMA
     // a peer that has no RDMA advertises all-zero caps and takes no further part
     // in the negotiation, so drop to TCP without reporting a failure
@@ -760,7 +779,7 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
             LOG_WARN("[%s] peer does not support RDMA, continuing with TCP\n", __func__);
         }
         rdma.reset();
-        return;
+        return true;
     }
 #  ifdef GGML_RPC_RDMA_APPLE
     bool activated = rdma->activate(remote_caps);
@@ -778,6 +797,7 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #else
     (void)remote_caps;
 #endif // GGML_RPC_RDMA
+    return true;
 }
 
 bool socket_t::impl::flush() {
@@ -816,7 +836,7 @@ void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
 
-void socket_t::update_caps(const uint8_t * remote_caps) {
+bool socket_t::update_caps(const uint8_t * remote_caps) {
     return pimpl->update_caps(remote_caps);
 }
 
@@ -1054,6 +1074,92 @@ static void tls_set_timeouts(sockfd_t fd, int seconds) {
 #endif
 }
 
+static bool tls_set_nonblocking(sockfd_t fd, bool on) {
+#ifdef _WIN32
+    u_long mode = on ? 1 : 0;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return false;
+    }
+    return fcntl(fd, F_SETFL, on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) == 0;
+#endif
+}
+
+// The whole handshake runs against one wall-clock deadline: a per-receive timeout alone lets a peer
+// trickle a fragment before each one expires and hold the (single) accept loop indefinitely.
+static bool tls_handshake(SSL * ssl, sockfd_t fd, bool server, int seconds) {
+    if (!tls_set_nonblocking(fd, true)) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    bool       ok       = false;
+    for (;;) {
+        const int r = server ? SSL_accept(ssl) : SSL_connect(ssl);
+        if (r == 1) {
+            ok = true;
+            break;
+        }
+        const int err = SSL_get_error(ssl, r);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            break;
+        }
+        const long long left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            LOG_ERROR("TLS: handshake did not finish within %d s\n", seconds);
+            break;
+        }
+#ifdef _WIN32
+        WSAPOLLFD pfd = {};
+        pfd.fd        = fd;
+        pfd.events    = err == SSL_ERROR_WANT_READ ? POLLRDNORM : POLLWRNORM;
+        if (WSAPoll(&pfd, 1, (int) left) < 0) {
+            break;
+        }
+#else
+        struct pollfd pfd = {};
+        pfd.fd            = fd;
+        pfd.events        = err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+        if (poll(&pfd, 1, (int) left) < 0 && errno != EINTR) {
+            break;
+        }
+#endif
+    }
+    if (!tls_set_nonblocking(fd, false)) {
+        return false;
+    }
+    return ok;
+}
+
+// An orderly end of a healthy session: without close_notify the peer sees every disconnect as a
+// truncated stream. Bounded (send timeout), and a peer that already reset the connection must not
+// stop this process with SIGPIPE.
+static void tls_close_notify(SSL * ssl, sockfd_t fd) {
+    tls_set_timeouts(fd, 1);
+#ifdef _WIN32
+    SSL_shutdown(ssl);
+#else
+    sigset_t pipe_set;
+    sigset_t old_set;
+    sigset_t pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigpending(&pending);
+    const bool was_pending = sigismember(&pending, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set);
+    SSL_shutdown(ssl);
+    sigpending(&pending);
+    if (!was_pending && sigismember(&pending, SIGPIPE)) {
+        int sig = 0;
+        sigwait(&pipe_set, &sig); // consume the SIGPIPE this write raised
+    }
+    pthread_sigmask(SIG_SETMASK, &old_set, nullptr);
+#endif
+    ERR_clear_error();
+}
+
 struct tls_server_state {
     std::mutex  mu;
     SSL_CTX *   ctx = nullptr;
@@ -1090,6 +1196,7 @@ bool socket_t::impl::tls_write(const void * data, size_t size) {
     while (size > 0) {
         const int n = SSL_write(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
         if (n <= 0) {
+            tls_broken = true;
             tls_log_errors("TLS: write failed");
             return false;
         }
@@ -1126,6 +1233,7 @@ bool socket_t::impl::tls_recv(void * data, size_t size) {
     while (size > 0) {
         const int n = SSL_read(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
         if (n <= 0) {
+            tls_broken = true;
             if (SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN) {
                 LOG_WARN("TLS: peer closed the connection\n");
             } else {
@@ -1163,8 +1271,7 @@ bool socket_t::tls_connect(const std::string & server_fingerprint) {
         SSL_free(ssl);
         return false;
     }
-    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
-    if (SSL_connect(ssl) != 1) {
+    if (!tls_handshake(ssl, pimpl->fd, false, TLS_HANDSHAKE_TIMEOUT_S)) {
         tls_log_errors("TLS: handshake with the server failed");
         SSL_free(ssl);
         return false;
@@ -1175,7 +1282,6 @@ bool socket_t::tls_connect(const std::string & server_fingerprint) {
         SSL_free(ssl);
         return false;
     }
-    tls_set_timeouts(pimpl->fd, 0);
     pimpl->ssl = ssl;
     return true;
 }
@@ -1197,8 +1303,7 @@ bool socket_t::tls_accept(std::string & client_fingerprint) {
         SSL_free(ssl);
         return false;
     }
-    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
-    if (SSL_accept(ssl) != 1) {
+    if (!tls_handshake(ssl, pimpl->fd, true, TLS_HANDSHAKE_TIMEOUT_S)) {
         tls_log_errors("TLS: handshake with the client failed");
         SSL_free(ssl);
         return false;
@@ -1209,7 +1314,6 @@ bool socket_t::tls_accept(std::string & client_fingerprint) {
         SSL_free(ssl);
         return false;
     }
-    tls_set_timeouts(pimpl->fd, 0);
     pimpl->ssl = ssl;
     return true;
 }

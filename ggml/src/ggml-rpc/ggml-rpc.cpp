@@ -454,7 +454,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    sock->update_caps(response.conn_caps);
+    if (!sock->update_caps(response.conn_caps)) {
+        LOG_ERROR("[%s] could not complete the transport negotiation\n", __func__);
+        return false;
+    }
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
     return true;
@@ -2280,7 +2283,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peer = nullptr;
             return true;
         }
-        state.peer->update_caps(remote_caps);
+        if (!state.peer->update_caps(remote_caps)) {
+            state.peer = nullptr;
+            return true;
+        }
     } else {
         const std::string host(request.host, strnlen(request.host, sizeof(request.host)));
         // rank 0 may not be listening yet, retry for a few seconds
@@ -2300,7 +2306,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peer = nullptr;
             return true;
         }
-        state.peer->update_caps(remote_caps);
+        if (!state.peer->update_caps(remote_caps)) {
+            state.peer = nullptr;
+            return true;
+        }
     }
     state.rank  = request.rank;
     state.world = request.world;
@@ -2497,7 +2506,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 
     // Activate transport upgrade using client's caps
-    sock->update_caps(req.conn_caps);
+    if (!sock->update_caps(req.conn_caps)) {
+        return;
+    }
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {

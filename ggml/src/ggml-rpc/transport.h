@@ -24,7 +24,8 @@ struct socket_t {
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);
-    void update_caps(const uint8_t * remote_caps);
+    // false when the caps could not be sent: the negotiation must not go on
+    bool update_caps(const uint8_t * remote_caps);
     const char * transport_name() const;
 
     // Mutual TLS 1.3 on an already connected TCP socket (GGML_RPC_TLS builds; false otherwise).
