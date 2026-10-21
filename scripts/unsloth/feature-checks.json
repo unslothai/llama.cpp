@@ -88,6 +88,13 @@
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxxs" }
       ]
     },
+    "iq1m-mmq": {
+      "owner": "unslothai#304",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT",    "params": "type_a=iq1_m,type_b=f32,m=129," },
+        { "kind": "backend-op", "op": "MUL_MAT_ID", "params": "type_a=iq1_m,type_b=f32,n_mats=(256|512)," }
+      ]
+    },
     "qwen4exp-mtp": {
       "owner": "unslothai#240",
       "checks": [
