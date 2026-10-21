@@ -1988,7 +1988,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
-// GGML_SCHED_ASYNC_INPUTS: unset = CUDA-family backends (their host-to-device copies are DMA transfers either way),
+// GGML_SCHED_ASYNC_INPUTS: unset = the CUDA backend only (its host-to-device copies are DMA transfers either way;
+// other backends, e.g. Vulkan with host-visible device memory, may copy inputs with a plain memcpy today),
 // 0 = never, 1 = every backend that implements set_tensor_async
 static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
     if (backend->iface.set_tensor_async == NULL || backend->device == NULL) {
@@ -2003,7 +2004,7 @@ static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
     const char * name = reg ? ggml_backend_reg_name(reg) : NULL;
-    return name != NULL && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0);
+    return name != NULL && strcmp(name, "CUDA") == 0;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
