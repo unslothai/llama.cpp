@@ -3,16 +3,17 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 # Wait inside a running job for other jobs of this run. Prebuilt jobs all start after `resolve`
 # (one CI janitor pass covers the run), so consumers wait here instead of on `needs:`.
-# Usage: wait_for_jobs.sh [--match S] [--exclude S]... [--expect N] [--deadline-min M] [--poll S]
-#        [--out FILE]   (FILE gets name<TAB>status<TAB>conclusion; needs GH_TOKEN with actions:read)
-# Exit 0 when all matching jobs completed, 3 at the deadline, 4 after 10 API failures in a row.
+# Usage: wait_for_jobs.sh [--match S] [--exclude S]... [--require S]... [--expect N] [--deadline-min M]
+#        [--poll S] [--out FILE]   (FILE gets name<TAB>status<TAB>conclusion; needs GH_TOKEN with actions:read)
+# --require: a job whose name contains S must exist (startup race). Exit 0 when all matching jobs completed, 3 at the deadline, 4 after 10 API failures in a row.
 set -uo pipefail
 
-MATCH=""; EXCLUDES=(); EXPECT=0; DEADLINE_MIN=330; POLL=60; OUT=""
+MATCH=""; EXCLUDES=(); REQUIRES=(); EXPECT=0; DEADLINE_MIN=330; POLL=60; OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --match) MATCH="$2"; shift 2 ;;
     --exclude) EXCLUDES+=("$2"); shift 2 ;;
+    --require) REQUIRES+=("$2"); shift 2 ;;
     --expect) EXPECT="$2"; shift 2 ;;
     --deadline-min) DEADLINE_MIN="$2"; shift 2 ;;
     --poll) POLL="$2"; shift 2 ;;
@@ -47,17 +48,21 @@ while :; do
     { for (i = 1; i <= n; i++) if (X[i] != "" && index($1, X[i]) > 0) next; print }')"
   total="$(printf '%s\n' "$sel" | grep -c . || true)"
   pending="$(printf '%s\n' "$sel" | awk -F'\t' 'NF && $2 != "completed"' | grep -c . || true)"
-  if [ "$total" -ge "$EXPECT" ] && [ "$pending" -eq 0 ]; then
+  missing=0
+  for r in "${REQUIRES[@]+"${REQUIRES[@]}"}"; do
+    printf '%s\n' "$sel" | awk -F'\t' -v r="$r" 'index($1, r) { f = 1 } END { exit !f }' || missing=$(( missing + 1 ))
+  done
+  if [ "$total" -ge "$EXPECT" ] && [ "$pending" -eq 0 ] && [ "$missing" -eq 0 ]; then
     echo "all $total matching job(s) completed"
     printf '%s\n' "$sel" | awk -F'\t' 'NF { printf "  %-70s %s\n", $1, $3 }'
     [ -n "$OUT" ] && printf '%s\n' "$sel" > "$OUT"
     exit 0
   fi
   if [ "$(date +%s)" -gt "$deadline" ]; then
-    echo "::warning::waited ${DEADLINE_MIN} min; ${pending} of ${total} matching job(s) still running (expected >= ${EXPECT})"
+    echo "::warning::waited ${DEADLINE_MIN} min; ${pending} of ${total} matching job(s) still running (expected >= ${EXPECT}, ${missing} required missing)"
     [ -n "$OUT" ] && printf '%s\n' "$sel" > "$OUT"
     exit 3
   fi
-  echo "$(date -u +%H:%M:%S) waiting: ${pending} of ${total} matching job(s) running (expected >= ${EXPECT})"
+  echo "$(date -u +%H:%M:%S) waiting: ${pending} of ${total} matching job(s) running (expected >= ${EXPECT}, ${missing} required missing)"
   sleep "$POLL"
 done
