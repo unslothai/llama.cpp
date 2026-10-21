@@ -1209,13 +1209,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
             child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
         }
 
-        // ggml_trace_open() opens GGML_RPC_TRACE with "wb", and base_env copies our environment, so
-        // every child would truncate the router's trace and interleave with its siblings. Give each
-        // child its own path keyed by port (unique among live children).
+        // per-child trace path keyed by port, else each child truncates the router's "wb" trace
         {
             static const std::string tr_prefix = "GGML_RPC_TRACE=";
 
-            // Windows environment names are case-insensitive: getenv() also finds ggml_rpc_trace
+            // Windows env names are case-insensitive
             const auto is_trace = [](const std::string & e) {
                 if (e.size() < tr_prefix.size()) {
                     return false;
@@ -1238,8 +1236,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
 
             if (!base_trace.empty()) {
-                // insert before the extension, if the last path component has one, so that the
-                // children of trace.jsonl are trace.<name>.<port>.jsonl and not trace.jsonl.<...>
+                // trace.jsonl -> trace.<name>.<port>.jsonl
                 std::string stem = base_trace;
                 std::string ext;
                 const size_t slash = base_trace.find_last_of("/\\");

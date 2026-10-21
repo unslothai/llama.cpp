@@ -950,8 +950,7 @@ struct server_trace_scope {
     int64_t      t0;
     int          n0;
     int          n1;
-    // -1 leaves both fields out. Two counts, not a phase flag: continuous batching mixes one slot's
-    // prompt with other slots' generation, and speculative decode looks like a small prefill.
+    // -1 omits; two counts, not a phase flag, since continuous batching mixes prompt and generation
     int          n_prompt = -1;
     int          n_decode = -1;
 
@@ -3738,8 +3737,7 @@ private:
         }
 
         if (ggml_trace_flag) {
-            // Counted from the batch that was actually built, not from slot states before
-            // pre_decode(): a slot in a prompt state may not have been admitted to this batch.
+            // from the built batch: a prompt-state slot may not have been admitted
             int n_prompt = 0;
             for (const auto & tok : batch.tokens) {
                 n_prompt += tok.is_prompt ? 1 : 0;

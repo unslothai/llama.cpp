@@ -52,8 +52,7 @@ def phase_windows(client):
         drafted = any(e["t0"] <= d["t0"] and d["t1"] <= e["t1"] for d in drafts.get(g, []))
         steps.append((g, e, rate, drafted))
 
-    # the widest batch any drafting step submitted is the draft width, so a step that reuses a
-    # partial draft and therefore does not draft again is still recognised as generation
+    # widest drafting batch = draft width, so partial-draft reuse still counts as generation
     width = defaultdict(lambda: 1)
     for g, _, rate, drafted in steps:
         if drafted:
@@ -98,7 +97,6 @@ def report(files, client, out):
     w0 = min(a for a, _ in all_iters)
     w1 = max(b for _, b in all_iters)
 
-    # server/iteration is excluded: as the parent span it would win every attribution
     host = {}
     for e in client.events:
         if e.get("ph") in ("server", "sched", "llama") and e.get("n") != "iteration":
@@ -109,8 +107,7 @@ def report(files, client, out):
 
     pre_all = union([iv for g in groups for iv in pre[g]])
     dec_all = union([iv for g in groups for iv in dec[g]])
-    # A continuously batched server admits prompts while others decode, so the phases interleave:
-    # "prefill" is any time a prompt chunk is in an iteration, "decode" the decode-only rest.
+    # phases interleave: "prefill" = any iteration with a prompt chunk, "decode" = the rest
     dec_only = [x for a, c in gaps(pre_all, w0, w1) for x in clip(dec_all, a, c)]
 
     phases = [("whole window", [(w0, w1)]),

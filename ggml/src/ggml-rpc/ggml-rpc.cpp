@@ -79,7 +79,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
-    // clock alignment, sent once per connection after HELLO and only while tracing is on (8.1)
+    // once per connection after HELLO, only while tracing (8.1)
     RPC_CMD_TRACE_SYNC,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
@@ -329,7 +329,6 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
     return hash;
 }
 
-// one trace record per command served, filled in by the message helpers below
 struct rpc_server_trace {
     bool     active    = false;
     uint8_t  cmd       = 0;
@@ -458,7 +457,6 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return recv_rpc_rsp(sock, output, output_size);
 }
 
-// counted in the trace, so its byte totals match what the link actually moved
 static const size_t RPC_CMD_HEADER_BYTES = 1 + sizeof(uint64_t);
 static const size_t RPC_RSP_HEADER_BYTES = sizeof(uint64_t);
 
@@ -596,7 +594,6 @@ private:
         size_t                        output_size;
         std::promise<void>            completion;
 
-        // trace only: stamped by the queuing thread, emitted by the worker that sends it
         int64_t  t_enq        = 0;
         int      group        = -1;
         uint64_t uid          = 0;
@@ -670,7 +667,6 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     GGML_ASSERT(queue.push(msg));
 }
 
-// the worker sends on behalf of the queuing thread, so the event takes that thread's group and subject
 void rpc_dispatcher::send_traced(rpc_msg & msg) {
     const int64_t t_send0 = ggml_trace_time_us();
     bool ok = send_rpc_cmd(sock, msg.cmd, msg.input.get(), msg.input_size);
@@ -774,7 +770,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     ggml_trace_open(nullptr, "rpc-client");
-    // TRACE_SYNC arrived in 8.1: an 8.0 server passes the HELLO check, then drops the connection on it
+    // an 8.0 server passes HELLO but drops the connection on TRACE_SYNC
     if (ggml_trace_flag && server_minor >= 1) {
         rpc_trace_sync(sock, endpoint);
     }
@@ -2305,8 +2301,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (ggml_trace_flag) {
         tls_srv.n_nodes = (int) n_nodes;
         tls_srv.device  = (int) device;
-        // the device index goes into the name: the GPU event carries only the name and the tag, and
-        // the merge tool keys its per-device rows by name
+        // device index in the name: merge.py keys per-device rows by name
         char gpu_span[32];
         snprintf(gpu_span, sizeof(gpu_span), "GRAPH_COMPUTE dev%u", device);
         tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
@@ -2917,7 +2912,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
         if (ggml_trace_flag && tls_srv.active) {
             if (tls_srv.t_exec1 == 0) {
-                // a command with no reply
                 tls_srv.t_exec1 = ggml_trace_time_us();
             }
             ggml_trace_eventf("rpc.server", rpc_cmd_name((enum rpc_cmd) cmd),
@@ -2936,7 +2930,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
     if (ggml_trace_flag) {
         ggml_trace_gpu_flush();
-        // the peer idles from here until it is killed, so nothing else would flush this tail
+        // peer idles until killed: nothing else would flush this tail
         ggml_trace_flush();
     }
 }

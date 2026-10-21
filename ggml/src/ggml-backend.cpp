@@ -2170,7 +2170,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         ggml_backend_synchronize(sched->backends[i]);
     }
     if (ggml_trace_flag) {
-        // everything is idle here, the only safe point to collect completed GPU spans
+        // only idle point: safe to collect completed GPU spans
         ggml_trace_gpu_flush();
     }
     if (!sched->is_alloc) {

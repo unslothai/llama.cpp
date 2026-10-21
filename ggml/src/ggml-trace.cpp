@@ -51,16 +51,13 @@ std::atomic<int> g_next_tid{0};
 
 thread_local int          tls_tid     = -1;
 thread_local int          tls_group   = -1;
-// owned copy: callers pass tensor and message names that die before the next event reads them
+// owned copy: caller names die before the next event reads them
 thread_local char         tls_subject[GGML_MAX_NAME] = {};
 thread_local uint64_t     tls_uid     = 0;
 thread_local std::string  tls_line;
 
-// A traced process is usually killed with a signal, and neither ggml-rpc-server nor the capture
-// scripts install a handler, so nothing runs ggml_trace_close() or the static destructors: whatever
-// is still in the stdio buffer is lost. So the flush is bounded in time as well as in records.
-// A signal handler that closed the trace is WRONG: fflush/fclose are not async-signal-safe and a
-// signal arriving while emit() holds this mutex would deadlock.
+// flush bounded in time too: traced processes are killed by signal, losing the stdio buffer.
+// A closing signal handler is WRONG: fflush/fclose are not async-signal-safe (deadlock on this mutex).
 const int64_t TRACE_FLUSH_EVERY    = 128;
 const int64_t TRACE_FLUSH_EVERY_US = 100 * 1000;
 
@@ -312,7 +309,6 @@ void ggml_trace_eventf(const char * phase, const char * name, int64_t t0, int64_
     ggml_trace_event(phase, name, t0, t1, fields);
 }
 
-// GPU spans: hooks come from the backend registry, so ggml-base links no GPU runtime.
 typedef void (*ggml_trace_gpu_mark_t)(ggml_backend_t backend, uint64_t tag, int kind);
 typedef int  (*ggml_trace_gpu_poll_t)(uint64_t * tags, int * kinds, int64_t * t_us, int max);
 
@@ -320,7 +316,6 @@ namespace {
 
 struct trace_gpu_state {
     std::mutex                                mutex;
-    // per registry: handing a backend to another registry's mark function would be fatal
     std::unordered_set<const void *>          probed;
     std::unordered_set<const void *>          supported;
     ggml_trace_gpu_mark_t                     mark   = nullptr;

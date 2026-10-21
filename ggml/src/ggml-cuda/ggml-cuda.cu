@@ -5994,15 +5994,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// Tracer GPU marks, reached through ggml_backend_reg_get_proc_address so no caller links CUDA.
 struct ggml_cuda_trace_mark {
     uint64_t    tag;
     int         kind;
     cudaEvent_t event;
 };
 
-// elapsed time is only defined between events of the same device, so each device needs its own
-// anchor and its own queues (one shared anchor silently dropped every other device's marks).
+// per-device anchor: elapsed time is only defined between events of the same device
 struct ggml_cuda_trace_device {
     std::vector<ggml_cuda_trace_mark> pending;
     std::vector<cudaEvent_t>          spare;
@@ -6031,7 +6029,6 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
     std::lock_guard<std::mutex> lock(st.mutex);
 
     ggml_cuda_trace_device & d = st.devs[cuda_ctx->device];
-    // events belong to the current device, which another backend may have switched
     ggml_cuda_set_device(cuda_ctx->device);
 
     if (d.anchor == nullptr) {
@@ -6039,8 +6036,7 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
             d.anchor = nullptr;
             return;
         }
-        // every later mark is reported as anchor_us + elapsed(anchor, mark). Never wait on the
-        // anchor: synchronizing drains queued work and changes the execution being traced.
+        // never wait on the anchor: syncing would drain queued work and perturb the trace
         cudaEventRecord(d.anchor, cuda_ctx->stream());
         d.stream = cuda_ctx->stream();
         d.device = cuda_ctx->device;
@@ -6064,7 +6060,6 @@ extern "C" void ggml_backend_cuda_trace_mark(ggml_backend_t backend, uint64_t ta
     d.pending.push_back({ tag, kind, event });
 }
 
-// never waits: returns the marks already completed, so the caller loops until it gets < `max`.
 extern "C" GGML_BACKEND_API int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max);
 extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_t * t_us, int max) {
     ggml_cuda_trace_state & st = ggml_cuda_trace();
@@ -6077,15 +6072,12 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
         if (d.anchor == nullptr) {
             continue;
         }
-        // recorded before any mark on this stream, so marks stay pending until the anchor completes
         if (!d.anchor_fixed) {
             if (cudaEventQuery(d.anchor) != cudaSuccess) {
                 continue;
             }
 
-            // ggml_time_us() here would date the anchor to this poll, not its completion, shifting the
-            // device's whole timeline. Tie it to wall time through a probe, synchronized only when the
-            // stream is already idle (it then drains nothing).
+            // ggml_time_us() here would date the anchor to this poll; probe-sync only when the stream is idle
             if (cudaStreamQuery(d.stream) == cudaSuccess) {
                 ggml_cuda_set_device(d.device);
 
@@ -6110,7 +6102,7 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
             }
 
             if (!d.anchor_fixed) {
-                // freeze even this approximation: refining it later would step one device's timeline
+                // freeze: refining later would step this device's timeline
                 d.anchor_us    = ggml_time_us();
                 d.anchor_fixed = true;
             }

@@ -85,8 +85,7 @@ def load(paths):
 
     client = clients[0]
 
-    # keyed by the whole endpoint: two peers on one host differ only in the port, and a host name is
-    # not an identity at all once the peers are addressed by IP or by a DNS alias
+    # keyed by the whole endpoint: peers on one host differ only by port
     by_ep = defaultdict(list)
     for rec in client.offsets:
         by_ep[rec.get("peer", "")].append(rec)
@@ -94,15 +93,13 @@ def load(paths):
     taken = {}                 # id(file) -> offset samples
     left = dict(by_ep)
 
-    # 1. the peer's own record of the clock exchange, unambiguous when present
     for ep, recs in list(left.items()):
         owners = [f for f in servers if any(served_the_sync(f, r) for r in recs)]
         if len(owners) == 1:
             taken.setdefault(id(owners[0]), []).extend(r.get("offset_us", 0) for r in recs)
             del left[ep]
 
-    # 2. host name, only when the header carries one and it picks out a single endpoint. An empty
-    #    host (Windows writes none) must never prefix-match.
+    # empty host (Windows) must never prefix-match
     for f in servers:
         if id(f) in taken or not f.host:
             continue
@@ -113,7 +110,6 @@ def load(paths):
         if len(hits) == 1 and not rivals:
             taken[id(f)] = [r.get("offset_us", 0) for r in left.pop(hits[0])]
 
-    # 3. one peer and one endpoint left over: they can only belong together
     rest = [f for f in servers if id(f) not in taken]
     if len(rest) == 1 and len(left) == 1:
         taken[id(rest[0])] = [r.get("offset_us", 0) for r in left.popitem()[1]]
@@ -126,7 +122,6 @@ def load(paths):
                 "(no TRACE_SYNC span in it matches a clock exchange, and its header host %r does "
                 "not identify it)\n" % (f.path, f.host))
             continue
-        # median over the connections, so one delayed reply does not move the alignment
         cand = sorted(cand)
         f.offset_us = cand[len(cand) // 2]
 
@@ -234,7 +229,6 @@ def chrome_trace(files, client):
                     out.append({"ph": "X", "pid": pid, "tid": tid, "cat": cat + ".phase",
                                 "name": name, "ts": a, "dur": b - a})
 
-    # nested slices must not start before their parent
     out.sort(key=lambda e: (e.get("ts", -1), -e.get("dur", 0)))
     return {"traceEvents": out, "displayTimeUnit": "ms"}
 

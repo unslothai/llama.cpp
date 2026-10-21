@@ -1,5 +1,4 @@
-// Event tracer for the RPC backend and llama.cpp. Off unless GGML_RPC_TRACE (or rpc-server
-// --trace) names a file; scripts/rpc_trace/merge.py aligns the JSON lines each process writes.
+// RPC/llama event tracer, on when GGML_RPC_TRACE (or rpc-server --trace) names a file.
 
 #pragma once
 
@@ -15,10 +14,9 @@ extern "C" {
 
     GGML_API int ggml_trace_flag;
 
-    // `path` NULL means GGML_RPC_TRACE; the first call with a usable path wins
+    // NULL path = GGML_RPC_TRACE; first usable path wins
     GGML_API int  ggml_trace_open(const char * path, const char * role);
     GGML_API void ggml_trace_close(void);
-    // write out buffered records now, e.g. before going idle where no later record would flush them
     GGML_API void ggml_trace_flush(void);
 
     GGML_API int64_t ggml_trace_time_us(void);
@@ -28,7 +26,6 @@ extern "C" {
     GGML_API void ggml_trace_set_group(int group);
     GGML_API int  ggml_trace_get_group(void);
 
-    // names the tensor or graph the next RPC commands belong to; `name` is copied (GGML_MAX_NAME)
     GGML_API void ggml_trace_set_subject(const char * name, uint64_t uid);
     GGML_API const char * ggml_trace_get_subject(uint64_t * uid);
 
@@ -41,7 +38,7 @@ extern "C" {
     // t1 client sends, t2 peer receives, t3 peer replies, t4 client receives (microseconds).
     GGML_API void ggml_trace_clock_offset(const char * peer, int64_t t1, int64_t t2, int64_t t3, int64_t t4);
 
-    // bracket a submit with compute-stream events; begin returns 0 without hooks, none ever wait
+    // begin returns 0 without hooks; never waits
     GGML_API uint64_t ggml_trace_gpu_begin(ggml_backend_t backend, const char * name);
     GGML_API void     ggml_trace_gpu_end  (ggml_backend_t backend, uint64_t tag);
     GGML_API void     ggml_trace_gpu_flush(void);

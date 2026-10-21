@@ -1,9 +1,6 @@
 #!/bin/bash
-# CPU-only smoke test: layers split over two rpc-servers, run with the trace off and on, checking
-# the text is identical and that merge.py accepts the result.
-# pipefail: completions run as `curl | parser`, and without it a failed request leaves two empty
-# outputs that compare equal. No errexit: the teardown's `kill` and `grep -q` are expected to fail,
-# so every step that can fail is checked by hand.
+# CPU smoke test: two rpc-servers, trace off vs on must give identical text; merge.py must accept it.
+# pipefail so a failed `curl | parser` cannot leave two equal empty outputs; no errexit (teardown fails).
 set -u
 set -o pipefail
 
@@ -44,7 +41,6 @@ complete() {
     head -c 400 "$body" >&2; echo >&2
     return 1
   fi
-  # a reply without a usable "content" is a failure too, not an empty line in the output file
   python3 -c '
 import json, sys
 try:
@@ -90,8 +86,6 @@ cell() {
   for p in "${PROMPTS[@]}"; do
     if complete "$tag" "$p"; then ok=$((ok + 1)); else rc=1; fi
   done
-  # the point of the test is comparing generated text, so a missing response is a failure and must
-  # not be allowed to leave an empty file that would compare equal to another empty file
   if [ $ok -ne ${#PROMPTS[@]} ]; then
     echo "$tag: only $ok of ${#PROMPTS[@]} completions were recorded" >&2
     rc=1
@@ -128,7 +122,6 @@ fi
 unset GGML_RPC_TRACE
 
 echo
-# belt and braces: never compare two files that hold nothing
 for f in "$OUT/off.out.txt" "$OUT/on.out.txt"; do
   if [ ! -s "$f" ]; then echo "no generated text in $f, nothing was compared: FAIL"; exit 1; fi
 done
