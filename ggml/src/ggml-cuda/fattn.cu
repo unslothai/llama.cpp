@@ -497,13 +497,18 @@ static void ggml_cuda_flash_attn_ext_mma_q_switch_D(ggml_backend_cuda_context & 
             ggml_cuda_flash_attn_ext_mma_q_switch_ncols2<512, 512, type_K, type_V>(ctx, dst, ncols2);
             return;
         case 576:
-            if (ncols2 == 16) {
-                ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512, 16, type_K, type_V>(ctx, dst);
-            } else {
-                GGML_ASSERT(ncols2 == 4);
-                ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512,  4, type_K, type_V>(ctx, dst);
+            // V is a view of K, so K and V have the same type (see ggml_cuda_flash_attn_ext_mma_q_get_ncols2).
+            // Do not instantiate kernels for the other combinations, there are no instances for them:
+            if constexpr (type_K == type_V) {
+                if (ncols2 == 16) {
+                    ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512, 16, type_K, type_V>(ctx, dst);
+                } else {
+                    GGML_ASSERT(ncols2 == 4);
+                    ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512,  4, type_K, type_V>(ctx, dst);
+                }
+                return;
             }
-            return;
+            break;
         default:
             break;
     }
