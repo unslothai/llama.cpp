@@ -97,8 +97,7 @@ jobs:
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
       # Path + size, manifests by hash; not mtimes (ccache touches every hit).
-      # Before the earlier deltas merge, so hits served from them are exported too: the leg restores
-      # only this run's deltas and lacks them after a night whose leg did not save.
+      # Before the earlier deltas merge, so hits served from them are exported too.
       - name: Snapshot the restored cache
         run: |
           set -euo pipefail

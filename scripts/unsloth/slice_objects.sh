@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# Print slice K of N of the objects `all` compiles (host objects too: they miss after a core-header
-# edit). With a costs file (slice_costs.sh) objects go longest first to the least-loaded slice, else
-# round-robin. Every job of a leg must pass the same costs file or slices overlap/miss (only a
-# slowdown: the leg builds whatever is left). Forward slashes: xargs eats MSVC/nvcc backslashes.
+# Print slice K of N of the objects `all` compiles: longest first to the least-loaded slice with a costs
+# file (every job of a leg must pass the same one), else round-robin. Forward slashes: xargs eats backslashes.
 # Usage: slice_objects.sh <build dir> <K> <N> [costs.tsv]   (0 <= K < N)
 set -euo pipefail
 dir="${1:?build dir}"; k="${2:?slice}"; n="${3:?slices}"; costs="${4:-}"

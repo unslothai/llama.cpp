@@ -511,11 +511,8 @@ jobs:
           WIN_CUDA_MATRIX: ${{ steps.m.outputs.win_cuda_matrix }}
         run: |
           set -euo pipefail
-          # N = slices per profile: the build compiles slice 0, warm jobs 1..N-1 (max 4: the build
-          # restores 1..3). Every job starts at once, so job count = peak runners; keep it at 60:
-          # CUDA Linux 16, CUDA Windows 17, CUDA Windows ARM64 1, ROCm Windows 9, ROCm Linux 7, CPU 4
-          # (the Linux jobs also build Vulkan), Vulkan 2, macOS 2, assemble + finalize 2. Spare slots
-          # go to the slowest cold legs (measurements in unslothai/llama.cpp#302).
+          # N = slices per profile (max 4: the build restores 1..3). Every job starts at once, so the run's
+          # job count is its peak runners: keep the total at 60 (breakdown in unslothai/llama.cpp#302).
           SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then (if .arch == "x64" then 3 else 1 end) else 2 end'
           WIN_SHARDS='if .klass == "legacy" then 1 elif .klass == "portable" then 4 else 2 end'
           expand_warm() { # $1 = slice rule; warm jobs take slices 1..N-1, the build takes 0
@@ -1242,8 +1239,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/unsloth/prune_ccache.sh --keep 1 --limit-gb 100
 
-      # published = assemble's publish step succeeded; a timed-out wait leaves `unknown` and skips
-      # every delete (deleting under a running leg is the 08-27 failure).
+      # A timed-out wait leaves published=unknown, which skips every delete (the 08-27 failure).
       - name: Wait for every other job of this run
         id: wait
         env:

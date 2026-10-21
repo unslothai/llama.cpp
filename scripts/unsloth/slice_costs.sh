@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# Per-object compile ms for slice_objects.sh, kept in the ccache dir so a leg and its warm jobs
-# read the same file. Warm jobs export their slice into slice-costs.d/; the leg merges all into
-# slice-costs.tsv. Only a timing over HIT_MS (a real compile, not a ccache hit) replaces a cost, and
-# objects missing from the timings (a failed build) keep theirs.
+# Per-object compile ms for slice_objects.sh, kept in the ccache dir so a leg and its warm jobs read the
+# same file. Only a timing over HIT_MS (a real compile, not a ccache hit) replaces a cost.
 # Usage: slice_costs.sh export <build dir> <out.tsv> | merge <costs.tsv> <timings.tsv>...
 set -euo pipefail
 HIT_MS="${HIT_MS:-3000}"

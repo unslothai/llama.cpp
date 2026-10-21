@@ -97,7 +97,7 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # Before the earlier deltas merge, so hits served from them are exported too (see the Linux child).
+      # Before the earlier deltas merge, so hits served from them are exported too.
       - name: Snapshot the restored cache
         run: |
           $src = "${{ github.workspace }}\.ccache"

@@ -287,7 +287,6 @@ jobs:
           fi
 
       - name: ccache (Vulkan)
-        # Best-effort; see the verification in Configure ccache below.
         continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
@@ -296,19 +295,13 @@ jobs:
             vulkan-linux-${{ matrix.arch }}
           append-timestamp: false
           variant: ccache
-          # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
           install: binary
           max-size: 2G
           save: false
 
       - name: Configure ccache (Vulkan)
-        # The install step above is best-effort: on 09-18 its binary download returned 92 bytes
-        # instead of a tarball and two healthy legs died on "tar: This does not look like a tar
-        # archive". A cache accelerator must never fail a release build. So verify ccache
-        # POSITIVELY here and, when it is missing or older than the options below require,
-        # export an empty CCACHE_LAUNCHER so cmake builds this leg uncached instead of failing.
-        # No apt fallback on purpose: ubuntu-22.04 ships 4.5.1, which rejects these options and
-        # would quietly change cache semantics rather than announce itself.
+        # Verify ccache positively; missing or too old -> empty CCACHE_LAUNCHER, uncached build (09-18 bad
+        # download). No apt fallback: 22.04's 4.5.1 rejects these options.
         run: |
           set -uo pipefail
           need=4.10
@@ -324,9 +317,7 @@ jobs:
           echo "- ccache unusable (found \`${have:-none}\`); this leg built without a cache" >> "$GITHUB_STEP_SUMMARY"
           echo "CCACHE_LAUNCHER=" >> "$GITHUB_ENV"
 
-      # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
-      # the current backend and it has no glslc package. Install matching pinned
-      # headers and build the shader compiler shipped with the LunarG SDK.
+      # 22.04's arm64 Vulkan headers are too old and it has no glslc: pinned headers + the SDK's shaderc.
       - name: Install Vulkan headers (arm64)
         if: matrix.arch == 'arm64'
         run: |
@@ -352,12 +343,7 @@ jobs:
           echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
           mkdir -p "$source"
           tar -xzf "$archive" -C "$source"
-          # ENABLE_PCH=OFF: glslang builds a clang precompiled header, and ccache
-          # hands the cached .pch back on the next run. Clang validates a PCH by
-          # the mtime of every system header it saw, so the first run after the
-          # runner image reinstalls linux-libc-dev fails with "has been modified
-          # since the precompiled header was built" (run 34459747884). Without the
-          # PCH every object is an ordinary ccache hit and the build is unchanged.
+          # ENABLE_PCH=OFF: a ccache'd clang .pch fails after an image updates system headers (run 34459747884).
           cmake -S "$source" -B "$source/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSHADERC_SKIP_TESTS=ON \
@@ -374,15 +360,8 @@ jobs:
         working-directory: src
         run: |
           set -eux
-          # Build recipe mirrors llama-cpp-binaries' Vulkan wheel: the CPU recipe
-          # (backend-DL + all CPU variants + RPC) plus GGML_VULKAN. RPATH=$ORIGIN
-          # so the bundle's sibling .so files resolve from the binary's own dir.
-          # LLAMA_FATAL_WARNINGS below is -Werror. The arm64 image compiles with
-          # clang-19 against GCC 12's libstdc++, where std::stable_sort still
-          # reaches the deprecated get_temporary_buffer; GCC buries that in a
-          # system header, clang reports it at our instantiation. That failed
-          # this leg on 08-27 over a deprecation in code we do not own, so that
-          # one diagnostic is off. Every other warning stays fatal.
+          # Llama-cpp-binaries Vulkan wheel recipe. -Wno-deprecated-declarations: clang-19 + GCC 12 libstdc++
+          # flags get_temporary_buffer in std::stable_sort (failed 08-27); every other warning stays fatal.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_NATIVE=OFF \
@@ -406,8 +385,6 @@ jobs:
         working-directory: src
         run: |
           set -eux
-          # Backend modules (CPU variants, Vulkan, RPC) build as ggml
-          # dependencies, so every tool pulls them in.
           cmake --build build --config Release -j "$(nproc)"
           strip build/bin/llama-* || true
 
@@ -415,10 +392,7 @@ jobs:
         if: matrix.arch == 'arm64'
         run: cp /usr/lib/llvm-19/lib/libomp.so.5 src/build/bin/
 
-      # DiffusionGemma binaries (example targets present only in #24423 mix
-      # builds): best-effort, never fail the job. See the CUDA child for the
-      # rationale. The bundle tars all of build/bin, so anything produced here
-      # is shipped automatically.
+      # Best-effort DiffusionGemma targets (#24423 mix builds); see the CUDA child.
       - name: Build DiffusionGemma binaries (best-effort; mix builds only) (Vulkan)
         working-directory: src
         run: |
@@ -456,29 +430,14 @@ jobs:
           overwrite: true
 
       - name: Evict stale ccache files (Vulkan)
-        # !cancelled(), unlike the save below: on a timeout the job gets a
-        # single ~5 minute teardown window (measured ~4m50s after process
-        # kill), shared by every remaining step and not replenished. Evicting
-        # spends that window on housekeeping; the save is what actually needs
-        # it, and a 2 GB cache is not quick to write.
+        # !cancelled(), as for the CPU half: the timeout teardown window is for the save.
         if: ${{ !cancelled() && steps.vulkan.outcome == 'success' && env.CCACHE_LAUNCHER != '' }}
         continue-on-error: true
         run: ccache --evict-older-than 7d
 
       - name: Save ccache (Vulkan)
-        # Save even when the build failed: the objects compiled before the
-        # failure are still worth keeping, and a job that saves nothing leaves
-        # a hole in the cache lineage that widens the next run's tag gap.
-        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
-        #
-        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
-        # the CANCELLATION path, not the failure path, so !cancelled() would
-        # skip the save on the single most expensive case -- a leg that
-        # compiled for hours and then hit the cap.
-        # Skipped when Configure ccache turned the cache off: nothing compiled through it, so the
-        # save would only re-upload the restored entry under a new key.
-        # Only once the Vulkan half has its own cache dir: otherwise this would save the CPU
-        # half's cache under the Vulkan key.
+        # always(), as for the CPU half: save partial builds and timeout cancellations too.
+        # Skipped when ccache was off; only once the Vulkan half has its own cache dir.
         if: ${{ always() && steps.vulkan.outcome == 'success' && env.CCACHE_LAUNCHER != '' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
