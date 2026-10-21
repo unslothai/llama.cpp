@@ -448,9 +448,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
-    // [TAG_PREEMPT] The timeout is a deadline: send() wakes all waiters for every result, and wait_for() restarted the wait on each wakeup.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
-
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
