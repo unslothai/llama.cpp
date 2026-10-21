@@ -8517,6 +8517,43 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// mask of a unified KV cache shared by several sequences: each query only sees the cells of its own sequence,
+// the cells of the sequences are interleaved in chunks, and the cells past the last used one are empty
+struct test_flash_attn_ext_multi_seq : public test_flash_attn_ext {
+    static constexpr int n_seq = 4;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",n_seq=" + std::to_string(n_seq);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16);
+
+        const int64_t n_kv   = m->ne[0];
+        const int64_t n_used = n_kv - n_kv/8;
+        const int64_t chunk  = 37;
+
+        std::vector<float>       data_f32(ggml_nelements(m));
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(m));
+        for (int64_t i3 = 0; i3 < m->ne[3]; i3++) {
+            for (int64_t i1 = 0; i1 < m->ne[1]; i1++) {
+                const int64_t seq = (i1 + i3) % n_seq;
+                for (int64_t i0 = 0; i0 < n_kv; i0++) {
+                    const bool visible = i0 < n_used && (i0/chunk) % n_seq == seq;
+                    data_f32[(i3*m->ne[1] + i1)*n_kv + i0] = visible ? 0.0f : -INFINITY;
+                }
+            }
+        }
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f32.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11634,6 +11671,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // small batches (multi-sequence decode) with quantized K/V, which the CUDA MMA kernel dequantizes while loading:
+    for (int hs : { 64, 128, 256, 512, }) {
+        for (int nr2 : { 1, 2, 4, 6, 8, }) {
+            for (int kv : { 113, 512, 1024, }) {
+                for (int nb : { 1, 2, 3, 4, 5, 8, 9, 16, 17, }) {
+                    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    }
+                }
+            }
+        }
+    }
+    for (int hs : { 128, 256, 512, }) {
+        for (int nr2 : { 2, 8, }) {
+            for (int nb : { 3, 4, 8, 16, }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 8, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 2, {nr2, 2},  512, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, false, false, 0,  0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, true,  false, 8,  0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 4, true,  true,  0,  0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1},  512, 3, true,  false, 0, 10, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 6, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 5, true,  true,  0,  0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 7, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, 4, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128, 2, {2, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
@@ -12016,6 +12087,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // multi-sequence decode with quantized K/V: Llama-3-8B, Qwen3-0.6B, Qwen3.5-35B-A3B, Gemma 4 (SWA and global)
+    for (auto [hs, nh, gqa] : { std::array<int, 3>{128, 8, 4}, {128, 8, 2}, {128, 2, 8}, {256, 8, 2}, {256, 2, 8}, {512, 2, 8} }) {
+        for (int64_t kv : {4096, 16384}) {
+            for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                for (int64_t nb : {1, 2, 4, 8, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
