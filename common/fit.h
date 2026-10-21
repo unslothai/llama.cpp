@@ -14,11 +14,13 @@ enum common_params_fit_status {
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+//   - backend_sampling adds the backend sampler of the speculative decoder to the measured draft graph
 struct common_fit_extra_model {
     const char * path_model;
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    bool backend_sampling; // the speculative decoder offloads draft sampling to the backend
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
