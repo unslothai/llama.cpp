@@ -2625,6 +2625,19 @@ static void test_synthetic_parity(const test_params & params) {
             llama_sampler_chain_add(c, llama_sampler_init_top_k(3));
             llama_sampler_chain_add(c, llama_sampler_init_min_p(0.001f, 1));
             llama_sampler_chain_add(c, llama_sampler_init_logit_bias(6, 3, lb)); } },
+        // one live candidate and a negative exponent: the entropy is 0 and the dynamic temperature infinite; the
+        // CPU leaves the row as it is (an unused infinite temperature must not turn the row into NaN)
+        { "dynatemp_one_cand_neg_exp", { ninf, 3, ninf }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.0f, 1.0f, -1.0f)); } },
+        // a fully masked row passes dynamic temperature unchanged (no NaN from the softmax of -INF)
+        { "dynatemp_all_masked", { ninf, ninf, ninf, ninf }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.5f, 0.5f, 1.0f)); } },
+        // greedy on a fully masked row (CUDA argmax returns -1 there)
+        { "greedy_all_masked", { ninf, ninf, ninf, ninf }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(-1.0f, 0.5f, 1.0f)); } },
+        // duplicate biases add up to 0: both sides add the merged sum once, the greedy order stays
+        { "logit_bias_dup_cancel", { 0.1f, 0.099999f, 0.0f, -1.0f }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 0, 100.0f }, { 0, -100.0f } };
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 2, lb));
+            llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f)); } },
         { "greedy_top_k", { 0, 3, 1, 4, 2 }, [](llama_sampler * c) {
             llama_sampler_chain_add(c, llama_sampler_init_top_k(4));
             llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f));
@@ -2666,6 +2679,9 @@ static void test_synthetic_parity(const test_params & params) {
                 continue;
             }
             bool ok = rc.finite.size() == rb.finite.size() && rb.n_dims == 1;
+            for (const auto & [id, l] : rb.finite) {
+                ok = ok && !std::isnan(l);
+            }
             for (const auto & [id, l] : rc.finite) {
                 const auto it = rb.finite.find(id);
                 ok = ok && it != rb.finite.end() && fabsf(it->second - l) <= 1e-4f*std::max(1.0f, fabsf(l));
@@ -2922,8 +2938,9 @@ static void test_multi_output_ubatch_split(const test_params & params) {
             float d = 0.0f;
             for (int i = 0; i < n_vocab; ++i) {
                 const float expected = (float) (exp(logits[i] - m)/z);
-                // a NaN probability is a wrong row (std::max would keep d and skip it)
-                d = std::isfinite(probs[i]) && probs[i] >= 0.0f ? std::max(d, fabsf(expected - probs[i])) : INFINITY;
+                // a NaN probability, on either side, is a wrong row (std::max would keep d and skip it)
+                const bool valid = std::isfinite(expected) && std::isfinite(probs[i]) && probs[i] >= 0.0f && probs[i] <= 1.0f + 1e-5f;
+                d = valid ? std::max(d, fabsf(expected - probs[i])) : INFINITY;
             }
             if (!(d < 1e-4f)) {
                 if (n_bad < 4) {
