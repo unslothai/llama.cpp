@@ -364,10 +364,12 @@ static int ggml_cuda_flash_attn_ext_mma_q_get_ncols2(const int cc, const ggml_te
             return V->ne[0] == K->ne[0] && ncols2_gqa > 1 ? ncols2_gqa : 0;
         case 192: // MiMo-V2
             return V->ne[0] == 128 ? (gqa_ratio % 16 == 0 ? 16 : 8) : 0;
-        case 320: // Mistral Small 4
-            return V->ne[0] == 256 ? 32 : 0;
-        case 576: // DeepSeek MLA
-            return V->ne[0] == 512 ? ggml_cuda_flash_attn_ext_mma_f16_get_ncols2_dkq576(cc, dst) : 0;
+        case 576:
+            // DeepSeek MLA: one K/V head, V is a view of K (the kernel uses the K strides for V), so K and V have the same type.
+            // The converted view is small next to the attention, the in-kernel loads only pay off up to GQA 16 on Ampere or newer
+            // (Turing: slower at 16 queries). Mistral Small 4 (DKQ 320, GQA 32) and larger GQA ratios keep the conversion.
+            return V->ne[0] == 512 && K->type == V->type && ampere_mma_available(cc) && gqa_ratio <= 16 ?
+                ggml_cuda_flash_attn_ext_mma_f16_get_ncols2_dkq576(cc, dst) : 0;
         default:
             return 0;
     }
@@ -491,17 +493,11 @@ static void ggml_cuda_flash_attn_ext_mma_q_switch_D(ggml_backend_cuda_context & 
         case 256:
             ggml_cuda_flash_attn_ext_mma_q_switch_ncols2<256, 256, type_K, type_V>(ctx, dst, ncols2);
             return;
-        case 320:
-            GGML_ASSERT(ncols2 == 32);
-            ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<320, 256, 32, type_K, type_V>(ctx, dst);
-            return;
         case 512:
             ggml_cuda_flash_attn_ext_mma_q_switch_ncols2<512, 512, type_K, type_V>(ctx, dst, ncols2);
             return;
         case 576:
-            if (ncols2 == 32) {
-                ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512, 32, type_K, type_V>(ctx, dst);
-            } else if (ncols2 == 16) {
+            if (ncols2 == 16) {
                 ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<576, 512, 16, type_K, type_V>(ctx, dst);
             } else {
                 GGML_ASSERT(ncols2 == 4);
