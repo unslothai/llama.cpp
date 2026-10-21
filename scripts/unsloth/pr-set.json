@@ -19,7 +19,7 @@
   ],
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/dd7f73b19deb9e79dd441904cf0158af459cd034",
-    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/534c32182487ee3277908a91dd02f6d8e8ac7ed4",
+    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/e1b89cfa035866efdc2857318f438609584395f5",
     "https://github.com/unslothai/llama.cpp/pull/70/commits/883f2c9ba78f3847148454adf025da29385fff3e",
     "https://github.com/unslothai/llama.cpp/pull/61/commits/05a66933fc06f6b2eda2288caf506e09f400ed2b",
     "https://github.com/unslothai/llama.cpp/pull/95/commits/496a8a646f19b244b5e2eaf4cf64f920ed31c1a3",
@@ -33,10 +33,13 @@
     "https://github.com/unslothai/llama.cpp/pull/243/commits/43521db754e98eaa2b20362ae994b006588ac588",
     "https://github.com/unslothai/llama.cpp/pull/251/commits/d466df9211feb3e37d8163ebc6d17bc1be8af189",
     "https://github.com/unslothai/llama.cpp/pull/270/commits/7968eda613e427ad5ccbab61df43246a9a82c53a",
-    "https://github.com/unslothai/llama.cpp/pull/264/commits/5bb68456bc34238cedb50c8683495c6d6f924177",
-    "https://github.com/unslothai/llama.cpp/pull/266/commits/88035b0f74d0fd076df2012a957950fee0c4615f",
+    "https://github.com/unslothai/llama.cpp/pull/264/commits/194170f8ca17e122d342ea1818a3da781a52975d",
+    "https://github.com/unslothai/llama.cpp/pull/266/commits/1eae0b577c80c818dcf638373ec3ab63147f8447",
     "https://github.com/unslothai/llama.cpp/pull/283/commits/644ca7d817b8a591c61dee2e17778b43b1ecf3eb",
     "https://github.com/unslothai/llama.cpp/pull/287/commits/22fb037b1b84513e141d724bb9403ecb48925e32",
-    "https://github.com/unslothai/llama.cpp/pull/298/commits/9d907b7cfe0e41b03272e952a57b933c9fa08757"
+    "https://github.com/unslothai/llama.cpp/pull/298/commits/d1781c3ea6ab7c75c635a8fea60d2b3f4937c645",
+    "https://github.com/unslothai/llama.cpp/pull/304/commits/64b2a7e7bdddc0c00de67418b4b056cad60666d6",
+    "https://github.com/unslothai/llama.cpp/pull/311/commits/819e95b316743cd2ed7bb54b68f52f5ca1ea820a",
+    "https://github.com/unslothai/llama.cpp/pull/314/commits/08f367a2a56a7b4405b106eb23a227a910571786"
   ]
 }
