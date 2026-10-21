@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2080,8 +2081,67 @@ struct parity_stats {
     int n_draws    = 0;
     int n_equal    = 0;
     int n_set_diff = 0;
+    int n_tied     = 0; // mismatches tolerated as provable near-ties of the running sum (parity_near_tie)
     float max_p_diff = 0.0f;
 };
+
+// The CPU dist sampler picks the first candidate whose running sum (double) reaches u * total, the backend one
+// does the same on an fp32 cumulative sum, whose error over n terms is bounded by n * FLT_EPSILON * total. A
+// different token is a provable near-tie only if u * total lies within that bound of the CPU cumulative interval
+// of both tokens (so it sits on the boundary between them, with at most that much mass in between) and both
+// tokens' probabilities agree within the same bound. u is replayed from the seed: one draw of
+// std::uniform_real_distribution<double> on std::mt19937 per sample, as llama_sampler_dist_apply does. Any other
+// mismatch, or one where the replayed u does not fall in the CPU token's interval, is not tolerated.
+static bool parity_near_tie(const char * name, int seq, uint32_t row, common_sampler * cpu, common_sampler * gpu,
+                            llama_token tc, llama_token tg, double u) {
+    const auto * cp = common_sampler_get_candidates(cpu, false);
+    const auto * gp = common_sampler_get_candidates(gpu, false);
+
+    double total = 0.0;
+    for (size_t i = 0; i < cp->size; ++i) {
+        total += cp->data[i].p;
+    }
+    const double eps = (double) cp->size * FLT_EPSILON * total;
+
+    // CPU cumulative interval [lo, hi) of a token, in the order the CPU accumulated
+    auto interval = [&](llama_token t, double & lo, double & hi, float & p) {
+        double c = 0.0;
+        for (size_t i = 0; i < cp->size; ++i) {
+            if (cp->data[i].id == t) {
+                lo = c; hi = c + cp->data[i].p; p = cp->data[i].p;
+                return true;
+            }
+            c += cp->data[i].p;
+        }
+        return false;
+    };
+    auto gpu_p = [&](llama_token t, float & p) {
+        for (size_t i = 0; i < gp->size; ++i) {
+            if (gp->data[i].id == t) {
+                p = gp->data[i].p;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto dist_to = [](double x, double lo, double hi) { return x < lo ? lo - x : x > hi ? x - hi : 0.0; };
+
+    double lc = 0, hc = 0, lg = 0, hg = 0;
+    float  pcc = 0, pcg = 0, pgc = 0, pgg = 0;
+    if (!interval(tc, lc, hc, pcc) || !interval(tg, lg, hg, pcg) || !gpu_p(tc, pgc) || !gpu_p(tg, pgg)) {
+        printf("  near-tie %s seq %d row %u: token missing from a candidate list, not tolerated\n", name, seq, row);
+        return false;
+    }
+    const double ut = u * total;
+    const double dc = dist_to(ut, lc, hc);
+    const double dg = dist_to(ut, lg, hg);
+    const bool ok = dc <= eps && dg <= eps && fabs((double) pcc - pgc) <= eps && fabs((double) pcg - pgg) <= eps;
+    printf("  near-tie %s seq %d row %u: u*total %.9f cpu tok %d [%.9f, %.9f) gpu tok %d [%.9f, %.9f) "
+           "dist %.2e / %.2e p diff %.2e / %.2e eps %.3e (%zu cand) %s\n",
+           name, seq, row, ut, tc, lc, hc, tg, lg, hg, dc, dg, fabs((double) pcc - pgc), fabs((double) pcg - pgg),
+           eps, cp->size, ok ? "tolerated" : "NOT tolerated");
+    return ok;
+}
 
 static std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & prompt, bool add_special = true) {
     std::vector<llama_token> tokens(256);
@@ -2165,6 +2225,8 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
         uint32_t seed;
         common_sampler * cpu = nullptr;
         common_sampler * gpu = nullptr;
+        bool has_dist = false;
+        std::mt19937 rng; // replays the CPU dist sampler's draws
     };
     std::vector<seq_info> seqs;
     for (size_t ip = 0; ip < prompts.size(); ++ip) {
@@ -2178,6 +2240,8 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
         common_params_sampling sp = parity_base_params();
         pc.setup(sp);
         sp.seed = si.seed;
+        si.has_dist = !pc.greedy && sp.temp > 0.0f && sp.mirostat == 0;
+        si.rng.seed(si.seed);
         sp.backend_sampling = false;
         si.cpu = common_sampler_init(params.model.get(), sp);
         sp.backend_sampling = true;
@@ -2212,11 +2276,16 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
     for (size_t i = 0; i < seqs.size(); ++i) {
         const llama_token tc = common_sampler_sample(seqs[i].cpu, ctx_cpu.ctx.get(), idx[i]);
         const llama_token tg = common_sampler_sample(seqs[i].gpu, ctx_gpu.ctx.get(), idx[i]);
+        const double u = std::uniform_real_distribution<double>(0.0, 1.0)(seqs[i].rng);
         st.n_draws++;
         st.n_equal += tc == tg;
         if (tc != tg && st.n_draws - st.n_equal <= 3) {
             const float * lg = llama_get_logits_ith(ctx_cpu.ctx.get(), idx[i]);
             printf("  %s: seq %zu cpu %d gpu %d logits %.6f %.6f\n", pc.name.c_str(), i, tc, tg, lg[tc], lg[tg]);
+        }
+        if (tc != tg && seqs[i].has_dist &&
+            parity_near_tie(pc.name.c_str(), (int) i, 0, seqs[i].cpu, seqs[i].gpu, tc, tg, u)) {
+            st.n_tied++;
         }
         compare_candidates(pc, seqs[i].cpu, seqs[i].gpu, st);
     }
@@ -2245,6 +2314,8 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
         common_sampler * cpu = nullptr;
         common_sampler * gpu = nullptr;
         std::vector<int32_t> idx;
+        bool has_dist = false;
+        std::mt19937 rng; // replays the CPU dist sampler's draws
     };
     std::vector<seq_info> seqs;
     for (int s = 0; s < n_seeds; ++s) {
@@ -2256,6 +2327,8 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
         common_params_sampling sp = parity_base_params();
         pc.setup(sp);
         sp.seed = si.seed;
+        si.has_dist = !pc.greedy && sp.temp > 0.0f && sp.mirostat == 0;
+        si.rng.seed(si.seed);
         sp.backend_sampling = false;
         si.cpu = common_sampler_init(params.model.get(), sp);
         sp.backend_sampling = true;
@@ -2297,10 +2370,15 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
         for (uint32_t j = 0; j < n_rows; ++j) {
             const llama_token tc = common_sampler_sample(si.cpu, ctx_cpu.ctx.get(), si.idx[j]);
             const llama_token tg = common_sampler_sample(si.gpu, ctx_gpu.ctx.get(), si.idx[j]);
+            const double u = std::uniform_real_distribution<double>(0.0, 1.0)(si.rng);
             st.n_draws++;
             st.n_equal += tc == tg;
             if (tc != tg && st.n_draws - st.n_equal <= 3) {
                 printf("  %s: seq %d row %u cpu %d gpu %d\n", pc.name.c_str(), si.seq_id, j, tc, tg);
+            }
+            if (tc != tg && si.has_dist &&
+                parity_near_tie(pc.name.c_str(), si.seq_id, j, si.cpu, si.gpu, tc, tg, u)) {
+                st.n_tied++;
             }
             {
                 const int before = st.n_set_diff; const float mb = st.max_p_diff; st.max_p_diff = 0;
@@ -2391,15 +2469,17 @@ static void test_cpu_parity(const test_params & params) {
 
     int n_draws = 0;
     int n_fail  = 0;
+    int n_tied  = 0;
     for (const auto & pc : parity_cases(vocab)) {
         const parity_stats st = run_parity_single(params, pc, n_seeds);
-        const bool ok = st.n_equal == st.n_draws && st.n_set_diff == 0 && st.max_p_diff < 1e-4f;
-        printf("parity %-16s draws %4d equal %4d set_diff %d max_p_diff %.2e %s\n",
-                pc.name.c_str(), st.n_draws, st.n_equal, st.n_set_diff, st.max_p_diff, ok ? "OK" : "FAIL");
+        const bool ok = st.n_equal + st.n_tied == st.n_draws && st.n_set_diff == 0 && st.max_p_diff < 1e-4f;
+        printf("parity %-16s draws %4d equal %4d ties %d set_diff %d max_p_diff %.2e %s\n",
+                pc.name.c_str(), st.n_draws, st.n_equal, st.n_tied, st.n_set_diff, st.max_p_diff, ok ? "OK" : "FAIL");
         n_draws += st.n_draws;
         n_fail  += ok ? 0 : 1;
+        n_tied  += st.n_tied;
     }
-    printf("parity single-output: %d draws, %d failing cases\n", n_draws, n_fail);
+    printf("parity single-output: %d draws, %d tolerated near-ties, %d failing cases\n", n_draws, n_tied, n_fail);
     GGML_ASSERT(n_fail == 0);
 
     printf("backend CPU parity test PASSED\n");
@@ -2411,18 +2491,20 @@ static void test_cpu_parity_multi_output(const test_params & params) {
 
     int n_draws = 0;
     int n_fail  = 0;
+    int n_tied  = 0;
     for (const auto & pc : parity_cases(vocab)) {
         // n_ubatch 8 splits a sequence's rows across ubatches
         for (uint32_t n_ubatch : { 512u, 8u }) {
             const parity_stats st = run_parity_multi(params, pc, n_seeds, n_ubatch);
-            const bool ok = st.n_equal == st.n_draws && st.n_set_diff == 0 && st.max_p_diff < 1e-4f;
-            printf("parity-multi %-16s ubatch %3u draws %4d equal %4d set_diff %d max_p_diff %.2e %s\n",
-                    pc.name.c_str(), n_ubatch, st.n_draws, st.n_equal, st.n_set_diff, st.max_p_diff, ok ? "OK" : "FAIL");
+            const bool ok = st.n_equal + st.n_tied == st.n_draws && st.n_set_diff == 0 && st.max_p_diff < 1e-4f;
+            printf("parity-multi %-16s ubatch %3u draws %4d equal %4d ties %d set_diff %d max_p_diff %.2e %s\n",
+                    pc.name.c_str(), n_ubatch, st.n_draws, st.n_equal, st.n_tied, st.n_set_diff, st.max_p_diff, ok ? "OK" : "FAIL");
             n_draws += st.n_draws;
             n_fail  += ok ? 0 : 1;
+            n_tied  += st.n_tied;
         }
     }
-    printf("parity multi-output: %d draws, %d failing cases\n", n_draws, n_fail);
+    printf("parity multi-output: %d draws, %d tolerated near-ties, %d failing cases\n", n_draws, n_tied, n_fail);
     GGML_ASSERT(n_fail == 0);
 
     printf("backend CPU parity multi-output test PASSED\n");
