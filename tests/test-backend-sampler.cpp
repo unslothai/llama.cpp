@@ -2086,8 +2086,11 @@ struct parity_stats {
 };
 
 // The CPU dist sampler picks the first candidate whose running sum (double) reaches u * total, the backend one
-// does the same on an fp32 cumulative sum, whose error over n terms is bounded by n * FLT_EPSILON * total. A
-// different token is a provable near-tie only if u * total lies within that bound of the CPU cumulative interval
+// does the same on an fp32 cumulative sum. Its expected error over n terms is about sqrt(n) * FLT_EPSILON * total
+// (rounding errors of a sum of n floats add like a random walk); the worst-case n * FLT_EPSILON * total bound is far
+// too loose here (3e-2 at a 248k vocabulary) and tolerated draws of a deliberately broken sampler (dist picking
+// index + 1) whose token had less mass than the bound. A different token is a near-tie only if u * total lies within
+// sqrt(n) * FLT_EPSILON * total of the CPU cumulative interval
 // of both tokens (so it sits on the boundary between them, with at most that much mass in between) and both
 // tokens' probabilities agree within the same bound. u is replayed from the seed: one draw of
 // std::uniform_real_distribution<double> on std::mt19937 per sample, as llama_sampler_dist_apply does. Any other
@@ -2101,7 +2104,7 @@ static bool parity_near_tie(const char * name, int seq, uint32_t row, common_sam
     for (size_t i = 0; i < cp->size; ++i) {
         total += cp->data[i].p;
     }
-    const double eps = (double) cp->size * FLT_EPSILON * total;
+    const double eps = sqrt((double) cp->size) * FLT_EPSILON * total;
 
     // CPU cumulative interval [lo, hi) of a token, in the order the CPU accumulated
     auto interval = [&](llama_token t, double & lo, double & hi, float & p) {
