@@ -2428,6 +2428,87 @@ static void test_cpu_parity_multi_output(const test_params & params) {
     printf("backend CPU parity multi-output test PASSED\n");
 }
 
+// Draft verification rows of several sequences split across ubatches: every row's sampled probabilities must be
+// the softmax of its own logits. The graph has the same shape in every ubatch and only the chains of the rows a
+// ubatch samples are active; when the allocator kept a plan made for other active chains, a later tensor
+// overwrote the results of an active chain before they were read back.
+static void test_multi_output_ubatch_split(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The quick brown fox jumps over the lazy dog. The quick brown fox");
+    const std::vector<llama_token> draft  = tokenize_prompt(vocab, " jumps over the lazy dog. The", false);
+    const uint32_t n_rows = (uint32_t) draft.size() + 1;
+
+    const int n_seqs = 2;
+    std::vector<llama_sampler_seq_config> no_configs;
+
+    for (uint32_t n_ubatch : { 512u, 8u }) {
+        // a chain is initialised for one context only
+        std::vector<llama_sampler_ptr> chains;
+        std::vector<llama_sampler_seq_config> configs;
+        for (int s = 0; s < n_seqs; ++s) {
+            chains.emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            llama_sampler_chain_add(chains.back().get(), llama_sampler_init_dist(1000 + s));
+            configs.push_back({ s, chains.back().get() });
+        }
+
+        test_context ctx_cpu(params, no_configs, n_seqs, 0, n_ubatch, n_rows);
+        test_context ctx_gpu(params, configs,    n_seqs, 0, n_ubatch, n_rows);
+
+        common_batch batch_cpu(ctx_cpu.ctx.get());
+        common_batch batch_gpu(ctx_gpu.ctx.get());
+        std::vector<int32_t> idx;
+        for (int s = 0; s < n_seqs; ++s) {
+            llama_pos pos = 0;
+            for (size_t i = 0; i < prompt.size(); ++i, ++pos) {
+                const bool out = i + 1 == prompt.size();
+                batch_cpu.add(prompt[i], pos, s, out);
+                batch_gpu.add(prompt[i], pos, s, out);
+                if (out) {
+                    idx.push_back(batch_cpu.size() - 1);
+                }
+            }
+            for (llama_token t : draft) {
+                batch_cpu.add(t, pos, s, true);
+                batch_gpu.add(t, pos, s, true);
+                idx.push_back(batch_cpu.size() - 1);
+                ++pos;
+            }
+        }
+        GGML_ASSERT(llama_process(ctx_cpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_cpu.get()) == 0);
+        GGML_ASSERT(llama_process(ctx_gpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_gpu.get()) == 0);
+        llama_synchronize(ctx_gpu.ctx.get());
+
+        int n_bad = 0;
+        float max_diff = 0.0f;
+        for (size_t r = 0; r < idx.size(); ++r) {
+            const float * logits = llama_get_logits_ith(ctx_cpu.ctx.get(), idx[r]);
+            const float * probs  = llama_get_sampled_probs_ith(ctx_gpu.ctx.get(), idx[r]);
+            GGML_ASSERT(logits && probs);
+            GGML_ASSERT(llama_get_sampled_probs_count_ith(ctx_gpu.ctx.get(), idx[r]) == (uint32_t) n_vocab);
+            double m = -INFINITY, z = 0.0;
+            for (int i = 0; i < n_vocab; ++i) { m = std::max(m, (double) logits[i]); }
+            for (int i = 0; i < n_vocab; ++i) { z += exp(logits[i] - m); }
+            float d = 0.0f;
+            for (int i = 0; i < n_vocab; ++i) {
+                d = std::max(d, fabsf((float) (exp(logits[i] - m)/z) - probs[i]));
+            }
+            if (!(d < 1e-4f)) {
+                if (n_bad < 4) {
+                    printf("  ubatch %u: row %zu (batch index %d): sampled probs differ from the softmax by %g\n", n_ubatch, r, idx[r], d);
+                }
+                ++n_bad;
+            }
+            max_diff = std::max(max_diff, std::isnan(d) ? INFINITY : d);
+        }
+        printf("multi-output ubatch split: n_ubatch %u, %zu rows, %d wrong, max diff %g\n", n_ubatch, idx.size(), n_bad, max_diff);
+        GGML_ASSERT(n_bad == 0);
+    }
+
+    printf("backend multi-output ubatch split test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2460,6 +2541,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_dist_transaction",       test_multi_output_dist_transaction,    true },
     { "test_multi_output_sampling_chain",         test_multi_output_sampling_chain,      true },
     { "test_multi_output_cpu_suffix",             test_multi_output_cpu_suffix,          true },
+    { "test_multi_output_ubatch_split",           test_multi_output_ubatch_split,        true },
     // GPU vs CPU parity of whole chains, per sampler and edge value
     { "test_cpu_parity",                          test_cpu_parity,                       true },
     { "test_cpu_parity_multi_output",             test_cpu_parity_multi_output,          true },
