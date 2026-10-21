@@ -1325,31 +1325,23 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
-    // set the inputs only for the active samplers in the current ubatch
-    std::unordered_set<llama_seq_id> active_samplers;
+    // set the inputs only for the active samplers in the current ubatch; one pass collects, per sequence, the
+    // input tokens of its output rows in the order build_sampling assigns them to chains
+    std::map<llama_seq_id, std::vector<llama_token>> active_samplers;
     for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
         if (ubatch->output[i]) {
-            llama_seq_id seq_id = ubatch->seq_id[i][0];
-            active_samplers.insert(seq_id);
+            // an embedding row has no token id (a mixed batch stores a placeholder there)
+            const bool token_row = ubatch->token != nullptr && (!ubatch->is_mixed() || !ubatch->type[i]);
+            active_samplers[ubatch->seq_id[i][0]].push_back(token_row ? ubatch->token[i] : LLAMA_TOKEN_NULL);
         }
     }
 
-    for (auto seq_id : active_samplers) {
+    for (auto & [seq_id, rows_tokens] : active_samplers) {
         if (samplers.find(seq_id) == samplers.end()) {
             continue;
         }
 
         auto & sampler = samplers[seq_id];
-
-        // the input tokens of this sequence's output rows, in the order build_sampling assigns them to chains
-        std::vector<llama_token> rows_tokens;
-        for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
-            if (ubatch->output[i] && ubatch->seq_id[i][0] == seq_id) {
-                // an embedding row has no token id (a mixed batch stores a placeholder there)
-                const bool token_row = ubatch->token != nullptr && (!ubatch->is_mixed() || !ubatch->type[i]);
-                rows_tokens.push_back(token_row ? ubatch->token[i] : LLAMA_TOKEN_NULL);
-            }
-        }
 
         llama_sampler_backend_set_rows(sampler, rows_tokens.data(), (uint32_t) rows_tokens.size());
 

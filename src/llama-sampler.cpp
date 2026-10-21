@@ -741,8 +741,12 @@ static bool llama_sampler_chain_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    for (auto & entry : chain->samplers) {
-        llama_sampler_penalties_set_draft_rows(entry.ptr, chain->params.backend_draft_rows);
+    // a chain that declares draft rows declares them for the samplers of its nested chains too (a nested chain's
+    // own backend_init does not turn them off again)
+    if (chain->params.backend_draft_rows) {
+        for (auto & entry : chain->samplers) {
+            llama_sampler_penalties_set_draft_rows(entry.ptr, true);
+        }
     }
 
     GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
@@ -1099,7 +1103,10 @@ static struct ggml_tensor * llama_sampler_backend_argmax_first(
 
     logits = ggml_reshape_1d(ctx, logits, n);
 
+    // ggml_argmax can return -1 when no logit exceeds its start value (a row of -INF on CUDA): clamp it into the
+    // row before the gather; with every logit equal, every candidate is a maximum and the first one wins below
     struct ggml_tensor * max_idx = ggml_argmax(ctx, logits);
+    max_idx = ggml_cast(ctx, ggml_clamp(ctx, ggml_cast(ctx, max_idx, GGML_TYPE_F32), 0.0f, (float) (n - 1)), GGML_TYPE_I32);
     struct ggml_tensor * max_val = ggml_get_rows(ctx, ggml_reshape_2d(ctx, logits, 1, n), max_idx);
 
     // is_max = 1 - step(max - logit); score = is_max * (n - i): the first maximum has the largest score
@@ -2393,13 +2400,23 @@ static void llama_sampler_temp_ext_backend_apply(
     struct ggml_tensor * n_cand    = ggml_scale_bias(ctx, ggml_sum(ctx, is_masked), -1.0f, (float) logits->ne[0]);
     ggml_set_name(n_cand, "temp_ext_n_cand");
 
-    // max_entropy = log(n_cand); one candidate is left unchanged by the CPU sampler, any temperature gives
-    // it probability 1 here, guard the 0/0
-    struct ggml_tensor * max_entropy = ggml_clamp(ctx, ggml_log(ctx, n_cand), 1e-30f, INFINITY);
+    const int64_t n = logits->ne[0];
+
+    // has_entropy = step(n_cand - 1.5): two candidates or more. With one candidate or none (a fully masked row)
+    // the CPU sampler returns before anything, so the logits are passed through below; the entropy is computed
+    // on a row of zeros instead, so that nothing on the way is NaN (the softmax of a row of -INF is)
+    struct ggml_tensor * has_entropy = ggml_step(ctx, ggml_scale_bias(ctx, n_cand, 1.0f, -1.5f));
+    struct ggml_tensor * ent_rows    = ggml_concat(ctx,
+            ggml_reshape_2d(ctx, ggml_fill(ctx, logits, 0.0f), n, 1), ggml_reshape_2d(ctx, logits, n, 1), 1);
+    struct ggml_tensor * ent_logits  = ggml_reshape_1d(ctx,
+            ggml_get_rows(ctx, ent_rows, ggml_cast(ctx, has_entropy, GGML_TYPE_I32)), n);
+
+    // max_entropy = log(n_cand), n_cand >= 2 where it is used
+    struct ggml_tensor * max_entropy = ggml_log(ctx, ggml_clamp(ctx, n_cand, 2.0f, INFINITY));
     ggml_set_name(max_entropy, "temp_ext_max_entropy");
 
     // Calculate the probabilities.
-    struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
+    struct ggml_tensor * probs = ggml_soft_max(ctx, ent_logits);
     ggml_set_name(probs, "temp_ext_softmax_probs");
 
     // entropy = -sum(p * log(p)) over p > 0 (p = 0 contributes 0: clamp only inside the log)
@@ -2432,22 +2449,17 @@ static void llama_sampler_temp_ext_backend_apply(
         dyn_temp = ggml_scale_bias(ctx, pow_entropy, max_temp - min_temp, min_temp);
     }
 
-    // a zero temperature is greedy on the CPU: it only happens when the entropy is 0, i.e. one candidate holds
-    // all the probability in f32, and dividing by a tiny temperature keeps exactly that; keep -INF / inf finite
     // as llama_sampler_temp_impl: a positive temperature divides the logits (any size, no clamp), a temperature
-    // <= 0 is greedy (the first maximum is kept, the rest is -INF); one candidate (or none) left: the CPU sampler
-    // returns before scaling, the logits stay as they are
-    // has_entropy = step(n_cand - 1.5) is 1 for two candidates or more, positive = step(dyn_temp)
-    struct ggml_tensor * has_entropy = ggml_step(ctx, ggml_scale_bias(ctx, n_cand, 1.0f, -1.5f));
-    struct ggml_tensor * positive    = ggml_step(ctx, dyn_temp);
-    // greedy = has_entropy * (1 - positive); the scaled branch divides by 1 where it is not used
-    struct ggml_tensor * greedy      = ggml_mul(ctx, has_entropy, ggml_scale_bias(ctx, positive, -1.0f, 1.0f));
-    struct ggml_tensor * scale_by    = ggml_add(ctx, ggml_mul(ctx, dyn_temp, ggml_mul(ctx, has_entropy, positive)),
-                                                ggml_scale_bias(ctx, ggml_mul(ctx, has_entropy, positive), -1.0f, 1.0f));
-    ggml_set_name(scale_by, "temp_ext_dyn_temp");
+    // <= 0 is greedy (the first maximum is kept, the rest is -INF); one candidate or none: unchanged.
+    // The three results are computed and one row is selected exactly (no arithmetic gate: an unused infinite or
+    // zero temperature would turn into NaN as inf * 0); row = has_entropy ? (positive ? 0 : 1) : 2
+    struct ggml_tensor * positive = ggml_step(ctx, dyn_temp);
+    struct ggml_tensor * pick     = ggml_add(ctx,
+            ggml_mul(ctx, has_entropy, ggml_scale_bias(ctx, positive, -1.0f, 1.0f)),
+            ggml_scale_bias(ctx, has_entropy, -2.0f, 2.0f));
+    ggml_set_name(dyn_temp, "temp_ext_dyn_temp");
 
-    const int64_t n = logits->ne[0];
-    struct ggml_tensor * scaled = ggml_div(ctx, logits, scale_by);
+    struct ggml_tensor * scaled = ggml_div(ctx, logits, dyn_temp);
 
     struct ggml_tensor * max_idx = llama_sampler_backend_argmax_first(ctx, logits);
     struct ggml_tensor * pos     = ggml_arange(ctx, 0.0f, (float) n, 1.0f);
@@ -2456,9 +2468,10 @@ static void llama_sampler_temp_ext_backend_apply(
             ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, pos, ggml_cast(ctx, max_idx, GGML_TYPE_F32)))), -1.0f, 1.0f);
     struct ggml_tensor * greedy_logits = ggml_add(ctx, logits, ggml_log(ctx, keep));
 
-    // select greedy_logits (row 1) or scaled (row 0), exactly
-    struct ggml_tensor * alternatives = ggml_concat(ctx, ggml_reshape_2d(ctx, scaled, n, 1), ggml_reshape_2d(ctx, greedy_logits, n, 1), 1);
-    data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, alternatives, ggml_cast(ctx, greedy, GGML_TYPE_I32)), n);
+    struct ggml_tensor * alternatives = ggml_concat(ctx,
+            ggml_concat(ctx, ggml_reshape_2d(ctx, scaled, n, 1), ggml_reshape_2d(ctx, greedy_logits, n, 1), 1),
+            ggml_reshape_2d(ctx, logits, n, 1), 1);
+    data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, alternatives, ggml_cast(ctx, pick, GGML_TYPE_I32)), n);
     ggml_set_name(data->logits, "temp_ext_scaled_logits");
 
     // the CPU sampler leaves the candidates sorted by descending probability (llama_sampler_softmax_impl)
@@ -4150,7 +4163,20 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
 
     // the biases per token for the backend: the CPU sampler adds every entry, so a token listed several times
     // gets the sum (ggml_set_rows with a repeated index would keep only one of them)
-    std::vector<llama_logit_bias> merged() const {
+    // computed once (logit_bias is const): the CPU sampler uses the same merged biases, adding a token's sum
+    // once, so both sides round the same way
+    mutable std::vector<llama_logit_bias> merged_cache = {};
+    mutable bool                          merged_done  = false;
+
+    const std::vector<llama_logit_bias> & merged() const {
+        if (!merged_done) {
+            merged_cache = merge();
+            merged_done  = true;
+        }
+        return merged_cache;
+    }
+
+    std::vector<llama_logit_bias> merge() const {
         std::vector<llama_logit_bias> res;
         std::unordered_map<llama_token, size_t> pos;
         for (const auto & lb : logit_bias) {
@@ -4184,7 +4210,8 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     ctx->to_search.clear();
 
     // update the candidates that have not been shuffled in the vocabulary (i.e. idx == id)
-    for (const auto & lb : ctx->logit_bias) {
+    // (each token once, with the sum of its biases, as the backend sampler)
+    for (const auto & lb : ctx->merged()) {
         if (lb.token >= 0 && cur_p->size > (size_t) lb.token && cur_p->data[lb.token].id == lb.token) {
             cur_p->data[lb.token].logit += lb.bias;
         } else {
@@ -4277,7 +4304,7 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
 
     GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
 
-    const auto merged = sctx->merged();
+    const auto & merged = sctx->merged();
     const size_t n = merged.size();
 
     GGML_ASSERT((int64_t) n == ggml_nelements(sctx->inp_logit_idxs));
@@ -4303,18 +4330,16 @@ static bool llama_sampler_logit_bias_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft,
         uint32_t                     n_outputs_max_per_seq) {
-    GGML_UNUSED(buft);
     GGML_UNUSED(n_outputs_max_per_seq);
 
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
 
-    sctx->init(true);
+    // the same device check as the other backend samplers (fill, set_rows, get_rows)
+    const bool res = llama_sampler_backend_support(smpl, buft);
 
-    if (sctx->logit_bias.empty()) {
-        return true;
-    }
+    sctx->init(res);
 
-    return true;
+    return res;
 }
 
 static struct llama_sampler_i llama_sampler_logit_bias_i = {
@@ -4709,7 +4734,15 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
 }
 
 static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, bool draft_rows) {
-    if (smpl != nullptr && smpl->iface == &llama_sampler_penalties_i) {
+    if (smpl == nullptr) {
+        return;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) smpl->ctx;
+        for (auto & entry : chain->samplers) {
+            llama_sampler_penalties_set_draft_rows(entry.ptr, draft_rows);
+        }
+    } else if (smpl->iface == &llama_sampler_penalties_i) {
         ((llama_sampler_penalties *) smpl->ctx)->draft_rows = draft_rows;
     }
 }

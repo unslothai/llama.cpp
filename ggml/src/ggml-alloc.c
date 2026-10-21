@@ -500,6 +500,7 @@ struct ggml_gallocr {
     // not share memory with a later tensor, an input must be allocated before the first node runs
     uint8_t * lifetime_bits;
     size_t    n_lifetime_bits;
+    size_t    lifetime_bits_cap; // allocated entries of lifetime_bits
     uint64_t  lifetime_shape; // ggml_gallocr_graph_shape of the graph the plan was made for
 };
 
@@ -1003,10 +1004,11 @@ static bool ggml_gallocr_reserve_n_impl(
     // remember the flags this plan was made with
     {
         const size_t n_bits = ggml_gallocr_n_lifetime_bits(graph);
-        if (galloc->n_lifetime_bits < n_bits) {
+        if (galloc->lifetime_bits_cap < n_bits) {
             free(galloc->lifetime_bits);
             galloc->lifetime_bits = malloc(n_bits);
             GGML_ASSERT(galloc->lifetime_bits != NULL);
+            galloc->lifetime_bits_cap = n_bits;
         }
         galloc->n_lifetime_bits = n_bits;
         size_t k = 0;
