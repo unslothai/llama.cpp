@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# lint:workflow_triggers-allow-workflow_run
+# Justified: this workflow has NO actions/checkout step at all, so no code from any ref
+# is fetched or executed, and it reads no artifact from the run that triggered it. It
+# holds no secrets. Its one privilege, `actions: write`, is used only to POST a rerun of
+# a run in this same repository, and the workflow it watches is schedule and dispatch
+# only, so the triggering run is never fork-controlled. The guard below restricts it
+# further to a single retry of attempt 1.
+
+name: Unsloth prebuilt retry
+
+# Re-runs a nightly that stopped for a reason outside the build itself.
+#
+# Two causes so far, both of which leave a finished build set unpublished:
+#
+#   Cancelled with nothing failing. On 08-05 all 40 builds passed and the
+#   publish job was cancelled 15s in, with no failing job, no superseding run
+#   and nothing in the workflow that cancels. Every artifact was still there;
+#   one rerun published the release.
+#
+#   A runner that dies mid-build. On 08-07 39 of 40 builds passed and
+#   `CUDA Windows / x64/cuda12-portable` failed after 78 minutes of nvcc with
+#   no compile error in its log, which simply stopped 46 minutes before the
+#   job ended. GitHub's own annotation was "The hosted runner lost
+#   communication with the server". assemble is `needs:` every build, so it
+#   skipped and no release was cut.
+#
+# Without this the pipeline sits on a finished build set until a human
+# notices, which is the silent no-publish the alerting exists to catch,
+# reached one step later.
+
+on:
+  workflow_run:
+    workflows: ['Unsloth prebuilt (full release)']
+    types: [completed]
+
+permissions:
+  contents: read
+  # write covers the rerun POST and the job-log read the transient-failure
+  # test needs; those logs are where a bad download shows up.
+  actions: write
+  # The runner-loss test reads each failed job's annotation, which lives on
+  # the check run rather than in the job log.
+  checks: read
+
+jobs:
+  retry:
+    name: Rerun an externally broken run once
+    # run_attempt caps this at one retry: the rerun fires this workflow again
+    # as attempt 2, which no longer matches. A hand-cancelled workflow_dispatch
+    # is someone stopping their own build, so leave it stopped -- but only when
+    # it was cancelled. A dispatched run that FAILED on infrastructure is no
+    # different from a scheduled one, and excluding the whole event left run
+    # 35343257137 dead after a bad ccache download took out two of 44 legs.
+    if: >-
+      (github.event.workflow_run.conclusion == 'cancelled'
+        || github.event.workflow_run.conclusion == 'failure')
+      && github.event.workflow_run.run_attempt == 1
+      && !(github.event.workflow_run.conclusion == 'cancelled'
+           && github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Rerun the run when nothing about the build actually failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -uo pipefail
+
+          JOBS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+                    --jq '.jobs[] | [.id, .conclusion, .name] | @tsv')"
+
+          # A rerun of a run where nothing succeeded buys nothing: there is no
+          # salvageable work, and whatever stopped it will stop it again.
+          if ! cut -f2 <<<"$JOBS" | grep -qx 'success'; then
+            echo "not retrying ${RUN_ID}: nothing succeeded, so there is no work to salvage" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Best-effort jobs never decide a retry: the start-of-run ccache prune
+          # and the CUDA warm shards run with continue-on-error, which the jobs
+          # API still reports as "failure". The names track unsloth-prebuilt.yml
+          # and its CUDA children; the assemble waiter excludes the same two.
+          FAILED="$(awk -F'\t' '$2 == "failure" && $3 != "Prune superseded ccache generations" && index($3, " / warm ") == 0' <<<"$JOBS")"
+
+          # assemble waits on the build matrix from inside the job, so a leg
+          # that dies fails assemble too. Alongside another failure that is a
+          # consequence, not a cause; read it only when it failed alone.
+          # The name tracks assemble's `name:` in unsloth-prebuilt.yml.
+          INDEPENDENT="$(awk -F'\t' 'NF && $3 != "Assemble metadata + publish"' <<<"$FAILED")"
+          if [ -n "$INDEPENDENT" ]; then
+            FAILED="$INDEPENDENT"
+          fi
+
+          # A cancellation that follows a real failure is a build problem to
+          # read, not to repeat.
+          if [ "$CONCLUSION" = cancelled ] && [ -n "$FAILED" ]; then
+            echo "not retrying ${RUN_ID}: it has a failed job, so the cancel is a consequence" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # For an outright failure, retry only when every failed job died of
+          # something positively identified as infrastructure. A compile error
+          # repeats identically and must be read, not rerun. Anything we cannot
+          # name fails closed and the run stays put.
+          #
+          # Two recognised classes. Runner loss, which only appears as a check
+          # annotation. And a transient network failure in an install or fetch
+          # step, which only appears in the log: on 09-18 the ccache action
+          # downloaded 92 bytes instead of a tarball and killed two of 44 legs.
+          #
+          # "This does not look like a tar archive" is deliberately NOT in the
+          # list. A corrupt archive is not provably transient and could be a
+          # truncated or tampered asset, so it is not something to retry into.
+          # The ccache step is now best-effort in the children instead, which
+          # is the right place to absorb it.
+          # PUBLISH_DEFERRED_WAITER_DEADLINE is the assemble waiter hitting GitHub's per-job
+          # ceiling while the build matrix was still going. That is not a build problem and
+          # a rerun is the entire fix: the legs have finished by then, so the reran waiter
+          # sees them all green immediately and publishes. Before this, run 34538187859 had
+          # all 42 builds pass and published nothing, because macOS/arm64 sat in the runner
+          # queue for 6h25m and the waiter had already exited.
+          INFRA_LOG='PUBLISH_DEFERRED_WAITER_DEADLINE|Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
+
+          if [ "$CONCLUSION" = failure ]; then
+            if [ -z "$FAILED" ]; then
+              echo "not retrying ${RUN_ID}: it concluded failure with no failed job, so there is nothing to rerun" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            while IFS=$'\t' read -r JOB_ID _ JOB_NAME; do
+              [ -n "${JOB_ID:-}" ] || continue
+              NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs/${JOB_ID}/annotations" \
+                         --jq '.[].message' 2>/dev/null)"
+              if grep -qF 'lost communication with the server' <<<"$NOTES"; then
+                echo "runner loss: ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              # Logs are only readable for a few days; a 410 here simply means
+              # we cannot identify the cause, which fails closed as it should.
+              LOG="$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)"
+              if MATCH="$(grep -oE "$INFRA_LOG" <<<"$LOG" | head -1)" && [ -n "$MATCH" ]; then
+                echo "transient infrastructure (\`${MATCH}\`): ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              echo "not retrying ${RUN_ID}: \`${JOB_NAME}\` failed for a reason we cannot identify as infrastructure, so read it rather than repeat it" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            done <<<"$FAILED"
+          fi
+
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
+            echo "rerunning ${CONCLUSION} jobs of ${RUN_URL}" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not rerun ${RUN_URL}; rerun it by hand" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
