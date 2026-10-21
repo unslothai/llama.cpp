@@ -447,6 +447,12 @@ private:
     // set when backend work (graph compute, async output copies) may be in flight, cleared by synchronize()
     bool sync_pending = true;
 
+    // sets sync_pending when it goes out of scope (every return path of decode / encode)
+    struct sync_pending_rearm {
+        bool & flag;
+        ~sync_pending_rearm() { flag = true; }
+    };
+
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 

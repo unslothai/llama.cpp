@@ -1587,8 +1587,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
-    // outputs are copied asynchronously during the call
+    // outputs are copied asynchronously during the call; re-armed on every return as well, because a synchronize()
+    // inside the call (eval callback, output buffer reallocation) clears the flag before the output copies are queued
     sync_pending = true;
+    sync_pending_rearm rearm { sync_pending };
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1829,8 +1831,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    // outputs are copied asynchronously during the call
+    // outputs are copied asynchronously during the call; re-armed on every return as well, because a synchronize()
+    // inside the call (eval callback, output buffer reallocation) clears the flag before the output copies are queued
     sync_pending = true;
+    sync_pending_rearm rearm { sync_pending };
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2765,6 +2769,10 @@ ggml_status llama_context::graph_compute(
     sync_pending = true;
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+    // an eval callback may have called llama_synchronize(); the graph's output copies are still queued after this
+    sync_pending = true;
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
