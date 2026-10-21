@@ -447,7 +447,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
+        // drafters (DFlash, EAGLE3) read one n_embd row per token: the mean of the hc streams, as in deepseek4
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * mean = ggml_view_2d(ctx0, res_hc, n_embd, res_hc->ne[2], res_hc->nb[2], 0);
+            for (int64_t s = 1; s < hc; ++s) {
+                mean = ggml_add(ctx0, mean, ggml_view_2d(ctx0, res_hc, n_embd, res_hc->ne[2], res_hc->nb[2], s*res_hc->nb[1]));
+            }
+            res->t_layer_inp[il] = ggml_scale(ctx0, mean, 1.0f/hc);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
