@@ -2215,7 +2215,8 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
         st.n_draws++;
         st.n_equal += tc == tg;
         if (tc != tg && st.n_draws - st.n_equal <= 3) {
-            printf("  %s: seq %zu cpu %d gpu %d\n", pc.name.c_str(), i, tc, tg);
+            const float * lg = llama_get_logits_ith(ctx_cpu.ctx.get(), idx[i]);
+            printf("  %s: seq %zu cpu %d gpu %d logits %.6f %.6f\n", pc.name.c_str(), i, tc, tg, lg[tc], lg[tg]);
         }
         compare_candidates(pc, seqs[i].cpu, seqs[i].gpu, st);
     }
@@ -2354,6 +2355,8 @@ static std::vector<parity_case> parity_cases(const llama_vocab * vocab) {
         // top-k past the candidates (aborted the server)
         { "top_k>n_vocab", [](sp_t & sp) { sp.top_k = 1000000; sp.top_p = 0.9f; } },
         { "top_k=140000",  [](sp_t & sp) { sp.top_k = 140000;  sp.top_p = 0.9f; } },
+        { "full_nofilter_k",  [](sp_t & sp) { sp.top_k = 1000000; } },
+        { "full_nofilter",    [](sp_t & sp) { sp.top_k = 0; } },
         { "temp0>top_k",   [](sp_t & sp) { sp.temp = 0.0f; sp.top_k = 40; sp.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE, COMMON_SAMPLER_TYPE_TOP_K }; sp.n_probs = 1; } },
         // top-k without top-p: dist over the top-k order (was unsorted, seed not reproducible)
         { "top_k_only",  [](sp_t & sp) { sp.top_k = 40; } },
