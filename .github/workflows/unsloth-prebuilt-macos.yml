@@ -124,6 +124,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git \
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON \
             -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"

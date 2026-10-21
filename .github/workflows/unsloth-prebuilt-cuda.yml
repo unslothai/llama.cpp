@@ -7,12 +7,9 @@ name: "Unsloth prebuilt: CUDA"
 # the parent's `resolve` job filtered into `matrix`. Each entry uploads a
 # single app-*.tar.gz artifact for the parent's assemble step to pick up.
 #
-# Two jobs per profile since 2026-09. `warm` shards (N per profile from the parent, 0 = skipped)
-# each restore the newest ccache generation, compile a 1/N slice of the ggml-cuda objects and save
-# only what the compile added or rewrote; `build` merges the deltas over the generation
-# newest-file-wins (slices are disjoint) and runs the full build. Shards are best effort: a dead
-# one costs compile time, never a release. A base bump touching ggml-cuda/common.cuh invalidates
-# every CUDA object; parallel shards are the only lever without larger runners.
+# N slices per profile (`shards`): `build` compiles slice 0, `warm` jobs slices 1..N-1 and save a
+# ccache delta. All start right after `resolve` (one janitor pass covers the run); `build` waits for
+# its warm jobs, merges the deltas and runs the full build. A late or dead shard only costs time.
 
 on:
   workflow_call:
@@ -47,10 +44,12 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   warm:
-    name: warm ${{ matrix.arch }}/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
+    # linux- prefix: build finds its shards by name, and the Windows child has x64 rows too.
+    name: warm linux-${{ matrix.arch }}/${{ matrix.profile }} ${{ matrix.shard }}/${{ matrix.shards }}
     # An empty string, not an empty include list: with the `if` false the strategy is never
     # evaluated, while fromJSON('{"include":[]}') fails the job instead of skipping it.
     if: ${{ inputs.warm_matrix != '' }}
@@ -62,7 +61,16 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.warm_matrix) }}
     steps:
+      # Only when short: today's images start with far more free space than a leg uses (df is logged).
+      - name: Check free disk space
+        id: disk
+        run: |
+          avail="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          echo "free on /: ${avail} GB"
+          if [ "${avail:-0}" -lt 50 ]; then echo "low=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Free disk space
+        if: ${{ steps.disk.outputs.low == 'true' }}
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           tool-cache: true
@@ -88,16 +96,16 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
+      # Path + size, manifests by hash; not mtimes (ccache touches every hit).
+      # Before the earlier deltas merge, so hits served from them are exported too.
+      - name: Snapshot the restored cache
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/.ccache"
+          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
+          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
+
       # Previous deltas are restored too (tagless fallback), so a retry compiles only what changed since them.
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -138,29 +146,27 @@ jobs:
           rm -rf shards
           ccache -z
 
-      # Path + size, manifests by hash (the one file ccache rewrites in place). Not mtimes:
-      # ccache touches every hit, so on a warm night everything looks newer.
-      - name: Snapshot the restored cache
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}/.ccache"
-          find . -type f -printf '%p\t%s\n' | sort > "${{ github.workspace }}/shard.before"
-          find . -type f -name '*M' -print0 | xargs -0 -r sha256sum | sort > "${{ github.workspace }}/shard.before.m"
-
       - name: Compile shard ${{ matrix.shard }} of ${{ matrix.shards }}
         working-directory: src
         run: |
           set -euo pipefail
-          # Stable order, dealt round-robin; the build compiles whatever a shard did not reach.
-          ninja -C build -t targets all \
-            | grep -E 'ggml-cuda\.dir[/\\].*\.cu\.o:' | cut -d: -f1 | sort \
-            | awk -v s="${{ matrix.shard }}" -v k="${{ matrix.shards }}" 'NR % k == s' > shard.txt
-          echo "$(wc -l < shard.txt) CUDA objects in this shard"
-          xargs -a shard.txt ninja -C build -j 3
+          bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
+          echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
 
       - name: ccache stats
         if: ${{ always() }}
-        run: ccache -s -v
+        run: |
+          ccache -s -v
+          df -h /
+
+      - name: Record this slice's compile times
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build ".ccache/slice-costs.d/shard${{ matrix.shard }}.tsv"
 
       # Only what this job added or rewrote, tree layout preserved: never a 4 GB copy of the generation.
       - name: Export the shard delta
@@ -187,15 +193,21 @@ jobs:
 
   build:
     name: ${{ matrix.arch }}/${{ matrix.profile }}
-    # Runs whatever the shards did (fewer hits at worst); only a cancelled run stops here.
-    needs: warm
-    if: ${{ !cancelled() }}
+    # No `needs: warm`: queued with the run, compiles slice 0 while the warm jobs run.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
+      - name: Check free disk space
+        id: disk
+        run: |
+          avail="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          echo "free on /: ${avail} GB"
+          if [ "${avail:-0}" -lt 50 ]; then echo "low=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Free disk space
+        if: ${{ steps.disk.outputs.low == 'true' }}
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           tool-cache: true
@@ -221,16 +233,25 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # One restore per possible shard (max four); a shard that never saved is just a miss.
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+      - name: Compile slice 0 of ${{ matrix.shards }}
+        if: ${{ matrix.shards >= 2 }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          bash ../tooling/scripts/unsloth/slice_objects.sh build 0 "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
+          echo "$(wc -l < shard.txt) objects in slice 0 ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
+          xargs -a shard.txt -d '\n' ninja -C build -j 3
+
+      # A late or failed shard only means this job compiles its slice in the full build below.
+      - name: Wait for the warm shards
+        if: ${{ matrix.shards >= 2 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash tooling/scripts/unsloth/wait_for_jobs.sh \
+            --match " / warm linux-${{ matrix.arch }}/${{ matrix.profile }} " \
+            --expect $(( ${{ matrix.shards }} - 1 )) --deadline-min 160 --poll 60 || true
+
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -260,7 +281,7 @@ jobs:
             ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
-        if: ${{ matrix.shards >= 1 }}
+        if: ${{ matrix.shards >= 2 }}
         run: |
           set -euo pipefail
           for d in shards/*/; do
@@ -284,6 +305,17 @@ jobs:
           # -j 2 with nvcc --threads 2 measured within 5%, not worth the flag.
           cmake --build build --config Release -j 3
           strip build/bin/llama-* || true
+
+      - name: Record slice costs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bash tooling/scripts/unsloth/slice_costs.sh export src/build "$RUNNER_TEMP/slice-costs-leg.tsv"
+          bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+            "$RUNNER_TEMP/slice-costs-leg.tsv" .ccache/slice-costs.d/*.tsv
+          rm -rf .ccache/slice-costs.d
 
       # The DiffusionGemma visual server + cli are example targets that exist
       # only when the source tree carries ggml-org/llama.cpp#24423 (a mix build).
@@ -314,6 +346,7 @@ jobs:
         if: ${{ always() }}
         run: |
           ccache -s -v
+          df -h /
           {
             echo "### ccache ${{ matrix.arch }}/${{ matrix.profile }}"
             echo ""

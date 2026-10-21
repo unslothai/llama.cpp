@@ -43,6 +43,11 @@ on:
         description: 'gfx_target matrix JSON ({"gfx_target":[...]}), built by parent'
         required: true
         type: string
+      windows_matrix:
+        description: 'Windows rows with slices ({"include":[{gfx_target, slice, slices}]}); empty = matrix, unsliced'
+        required: false
+        default: ''
+        type: string
       operating_systems:
         description: 'OSes to build for (comma-separated: windows,ubuntu)'
         required: false
@@ -78,11 +83,17 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build-windows:
-    name: windows/${{ matrix.gfx_target }}
+    # Rows with slice > 0 are warm shards: compile slice K, save the delta, stop. The slice-0 row is
+    # the leg. " / warm " in the name keeps shards out of the assemble waiter, alert and retry.
+    name: ${{ (matrix.slice || 0) > 0 && format('warm windows/{0} {1}/{2}', matrix.gfx_target, matrix.slice, matrix.slices) || format('windows/{0}', matrix.gfx_target) }}
     runs-on: windows-2022
+    continue-on-error: ${{ (matrix.slice || 0) > 0 }}
+    # Warm rows end well before finalize's 335-minute wait, like the CUDA warm jobs; legs keep GitHub's 360.
+    timeout-minutes: ${{ (matrix.slice || 0) > 0 && 150 || 360 }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
     # it there is no place to hang a required reviewer, so anyone who can
@@ -96,10 +107,18 @@ jobs:
     environment: release-signing
     if: contains(inputs.operating_systems, 'windows')
     strategy:
-      matrix: ${{ fromJson(inputs.matrix) }}
+      matrix: ${{ fromJson(inputs.windows_matrix || inputs.matrix) }}
       fail-fast: false
 
     steps:
+    # slice_objects.sh and wait_for_jobs.sh only.
+    - name: Checkout build scripts
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      with:
+        path: tooling
+        sparse-checkout: scripts/unsloth
+        persist-credentials: false
+
     - name: Clean up existing directories (safety precaution)
       run: |
         # Remove existing llama.cpp directory if it exists
@@ -362,7 +381,7 @@ jobs:
         mkdir -p llama.cpp
         tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C llama.cpp --strip-components=1
 
-    - name: Build Llama.cpp + ROCm
+    - name: Configure Llama.cpp + ROCm
       shell: cmd
       run: |
 
@@ -401,6 +420,12 @@ jobs:
         set /p VS_PATH=<vs_path.txt
         call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
 
+        REM The same environment for the later compile steps (slice and full build).
+        > "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PATH=C:\opt\rocm
+        >> "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PLATFORM=amd
+        >> "%RUNNER_TEMP%\rocm-env.cmd" echo set PATH=C:\opt\rocm\lib\llvm\bin;C:\opt\rocm\bin;%%PATH%%
+        >> "%RUNNER_TEMP%\rocm-env.cmd" echo call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
         REM Create build directory
         cd llama.cpp
         mkdir build
@@ -427,17 +452,141 @@ jobs:
           -DGGML_RPC=ON ^
           -DGGML_HIP_ROCWMMA_FATTN=OFF ^
           -DLLAMA_BUILD_BORINGSSL=ON ^
+          -DBORINGSSL_GIT=https://github.com/google/boringssl.git ^
           -DGGML_NATIVE=OFF ^
           -DGGML_STATIC=OFF ^
           -DGGML_BACKEND_DL=ON ^
           -DGGML_CPU_ALL_VARIANTS=ON ^
           -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} ^
           -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+        if errorlevel 1 exit /b 1
 
-        REM Build the project
+    - name: Snapshot the restored cache
+      if: ${{ (matrix.slice || 0) > 0 }}
+      run: |
+        $src = "${{ github.workspace }}\.ccache"
+        $snap = @{}
+        if (Test-Path -LiteralPath $src) {
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $snap[$rel] = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+          }
+        }
+        $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
+        "$($snap.Count) files snapshotted"
+
+    # Git Bash by full path: a bare `bash` here can be the WSL launcher. ninja comes from vcvars.
+    - name: Compile slice ${{ matrix.slice || 0 }} of ${{ matrix.slices || 1 }}
+      if: ${{ (matrix.slices || 1) > 1 }}
+      shell: cmd
+      run: |
+        call "%RUNNER_TEMP%\rocm-env.cmd"
+        "C:\Program Files\Git\bin\bash.exe" tooling/scripts/unsloth/slice_objects.sh llama.cpp/build ${{ matrix.slice || 0 }} ${{ matrix.slices || 1 }} .ccache/slice-costs.tsv > slice.txt
+        if errorlevel 1 exit /b 1
+        "C:\Program Files\Git\bin\bash.exe" -c "echo $(wc -l < slice.txt) objects in this slice; xargs -a slice.txt -d '\n' ninja -C llama.cpp/build -j $NUMBER_OF_PROCESSORS"
+
+    - name: ccache stats (shard)
+      if: ${{ always() && (matrix.slice || 0) > 0 }}
+      continue-on-error: true
+      run: ccache --show-stats -v
+
+    - name: Record this slice's compile times
+      if: ${{ always() && (matrix.slice || 0) > 0 }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf .ccache/slice-costs.d && mkdir -p .ccache/slice-costs.d
+        bash tooling/scripts/unsloth/slice_costs.sh export llama.cpp/build ".ccache/slice-costs.d/shard${{ matrix.slice }}.tsv"
+
+    - name: Export the shard delta
+      if: ${{ always() && (matrix.slice || 0) > 0 }}
+      run: |
+        $src = "${{ github.workspace }}\.ccache"
+        $dst = "${{ github.workspace }}\shards\${{ matrix.slice }}"
+        $before = @{}
+        (Get-Content -LiteralPath "${{ github.workspace }}\shard.before.json" -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $before[$_.Name] = $_.Value }
+        New-Item -ItemType Directory -Force -Path $dst | Out-Null
+        $n = 0; $bytes = 0
+        if (Test-Path -LiteralPath $src) {
+          Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length + 1)
+            $now = if ($_.Name.EndsWith('M')) { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } else { [string]$_.Length }
+            if ($before.ContainsKey($rel) -and $before[$rel] -eq $now) { return }
+            $to = Join-Path $dst $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $to
+            $n++; $bytes += $_.Length
+          }
+        }
+        "{0} files, {1:N0} MB" -f $n, ($bytes / 1MB)
+
+    - name: Save shard ccache
+      if: ${{ always() && (matrix.slice || 0) > 0 }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: shards/${{ matrix.slice }}
+        # Shard index ahead of the target so the generation prefix restore never picks a shard.
+        key: ccache-rocm-shard${{ matrix.slice }}-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # A late or failed shard only means this leg compiles that slice in the full build below.
+    - name: Wait for the warm shards
+      if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) > 1 }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        bash tooling/scripts/unsloth/wait_for_jobs.sh --match " / warm windows/${{ matrix.gfx_target }} " \
+          --expect $(( ${{ matrix.slices || 1 }} - 1 )) --deadline-min 120 --poll 60 || true
+
+    - name: Restore warm shard 1
+      if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) >= 2 }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: shards/1
+        key: ccache-rocm-shard1-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+    - name: Restore warm shard 2
+      if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) >= 3 }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: shards/2
+        key: ccache-rocm-shard2-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+
+    - name: Merge warm shards into the ccache
+      if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) >= 2 }}
+      run: |
+        if (Test-Path shards) {
+          Get-ChildItem -Directory shards | ForEach-Object {
+            "merging $($_.FullName) ($((Get-ChildItem -LiteralPath $_.FullName -Recurse -File).Count) files)"
+            robocopy $_.FullName "${{ github.workspace }}\.ccache" /E /XO /NFL /NDL /NJH /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+          }
+          Remove-Item -Recurse -Force shards
+        }
+        exit 0
+
+    - name: Build Llama.cpp + ROCm
+      if: ${{ (matrix.slice || 0) == 0 }}
+      shell: cmd
+      run: |
+        call "%RUNNER_TEMP%\rocm-env.cmd"
+        cd llama.cpp\build
         cmake --build . -j %NUMBER_OF_PROCESSORS%
 
+    - name: Record slice costs
+      if: ${{ !cancelled() && (matrix.slice || 0) == 0 }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        bash tooling/scripts/unsloth/slice_costs.sh export llama.cpp/build slice-costs-leg.tsv
+        bash tooling/scripts/unsloth/slice_costs.sh merge .ccache/slice-costs.tsv \
+          slice-costs-leg.tsv .ccache/slice-costs.d/*.tsv
+        rm -rf .ccache/slice-costs.d
+
     - name: Copy ROCm core DLLs to build directory
+      if: ${{ (matrix.slice || 0) == 0 }}
       run: |
         $rocmVersion = if ($env:DETECTED_ROCM_VERSION) { $env:DETECTED_ROCM_VERSION } else { "${{ inputs.rocm_version }}" }
         $buildBinPath = "llama.cpp\build\bin"
@@ -515,6 +664,7 @@ jobs:
 
     # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
     - name: Fetch kpack tooling
+      if: ${{ (matrix.slice || 0) == 0 }}
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       with:
         path: kpack-tooling
@@ -523,11 +673,13 @@ jobs:
 
     # rocBLAS / hipBLASLt keep their own kernels in ../.kpack, outside a flat bundle (unslothai/unsloth#13663).
     - name: Ship the rocBLAS kernel packs
+      if: ${{ (matrix.slice || 0) == 0 }}
       run: |
         python kpack-tooling\scripts\unsloth\relocate_kpack.py --bundle llama.cpp\build\bin --kpack-src C:\opt\rocm\.kpack --archs "$env:MAPPED_TARGET"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Check the bundle carries every ROCm DLL it imports
+      if: ${{ (matrix.slice || 0) == 0 }}
       run: |
         python -m pip install --quiet --disable-pip-version-check pefile
         @'
@@ -554,6 +706,7 @@ jobs:
         '@ | python -
 
     - name: List build artifacts (including ROCm files)
+      if: ${{ (matrix.slice || 0) == 0 }}
       run: |
         cd llama.cpp\build\bin
         Write-Host "Final build artifacts (including ROCm core files):"
@@ -564,6 +717,7 @@ jobs:
     # .github into a subdirectory: a checkout at the workspace root would
     # clean the extracted source tree out from under the build.
     - name: Fetch signing tooling
+      if: ${{ (matrix.slice || 0) == 0 }}
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       with:
         path: signing-tooling
@@ -577,6 +731,7 @@ jobs:
     # Image dialog (status 0xc0e90002), so the whole tree is signed, not just
     # the launcher executables.
     - name: Sign Windows binaries
+      if: ${{ (matrix.slice || 0) == 0 }}
       id: sign_windows
       uses: ./signing-tooling/.github/actions/sign-windows
       with:
@@ -588,6 +743,7 @@ jobs:
         azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
 
     - name: Package bundle (zip)
+      if: ${{ (matrix.slice || 0) == 0 }}
       shell: bash
       run: |
         set -eux
@@ -600,11 +756,12 @@ jobs:
     # runtimes in afterwards, and only the archive shows what actually ships.
     # Skipped on forks, which have no signing credentials and build unsigned.
     - name: Verify every binary in the bundle is signed
-      if: ${{ steps.sign_windows.outputs.signed == 'true' }}
+      if: ${{ (steps.sign_windows.outputs.signed == 'true') && (matrix.slice || 0) == 0 }}
       shell: pwsh
       run: signing-tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip'
 
     - name: Upload bundle artifact
+      if: ${{ (matrix.slice || 0) == 0 }}
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
       with:
         name: app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}
@@ -615,6 +772,7 @@ jobs:
     # the hit rate: a non-zero "unsupported source language" would mean the
     # device TUs are falling through to the real compiler uncached.
     - name: ccache stats
+      if: ${{ (matrix.slice || 0) == 0 }}
       continue-on-error: true
       run: ccache --show-stats -v
 
@@ -624,7 +782,7 @@ jobs:
       # kill), shared by every remaining step and not replenished. Evicting
       # spends that window on housekeeping; the save is what actually needs
       # it, and a 2 GB cache is not quick to write.
-      if: ${{ !cancelled() }}
+      if: ${{ (!cancelled()) && (matrix.slice || 0) == 0 }}
       continue-on-error: true
       run: ccache --evict-older-than 7d
 
@@ -638,7 +796,7 @@ jobs:
       # the CANCELLATION path, not the failure path, so !cancelled() would
       # skip the save on the single most expensive case -- a leg that
       # compiled for hours and then hit the cap.
-      if: ${{ always() }}
+      if: ${{ (always()) && (matrix.slice || 0) == 0 }}
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ github.workspace }}\.ccache
@@ -887,6 +1045,7 @@ jobs:
           -DGGML_RPC=ON \
           -DGGML_HIP_ROCWMMA_FATTN=OFF \
           -DLLAMA_BUILD_BORINGSSL=ON \
+          -DBORINGSSL_GIT=https://github.com/google/boringssl.git \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
           -DGGML_BACKEND_DL=ON \

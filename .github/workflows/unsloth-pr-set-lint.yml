@@ -21,6 +21,8 @@ on:
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
+      - scripts/unsloth/slice_*.sh
+      - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
@@ -37,6 +39,8 @@ on:
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
+      - scripts/unsloth/slice_*.sh
+      - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
@@ -148,7 +152,8 @@ jobs:
                    scripts/unsloth/test_pin_contract.py \
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py \
-                   scripts/unsloth/test_relocate_kpack.py; do
+                   scripts/unsloth/test_relocate_kpack.py \
+                   scripts/unsloth/test_slicing.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
             echo "::endgroup::"
