@@ -109,15 +109,6 @@ jobs:
           $snap | ConvertTo-Json -Compress | Set-Content -LiteralPath "${{ github.workspace }}\shard.before.json"
           "$($snap.Count) files snapshotted"
 
-      - name: Restore warm shard 0
-        if: ${{ matrix.shards >= 1 }}
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: shards/0
-          key: ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-          restore-keys: |
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard0-cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}-
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0

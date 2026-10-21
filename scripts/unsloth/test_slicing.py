@@ -120,7 +120,12 @@ with tempfile.TemporaryDirectory(prefix="slice_") as t:
     check("merge: hit timing keeps the old cost", got.get("heavy.o") == "60000", str(got))
     check("merge: a real compile replaces the cost", got.get("light.o") == "9000", str(got))
     check("merge: a new object takes its only timing", got.get("new.o") == "90", str(got))
-    check("merge: objects absent from this build drop out", "gone.o" not in got, str(got))
+    check("merge: objects absent from the timings keep their cost", got.get("gone.o") == "40000", str(got))
+    empty = t / "empty_timings.tsv"
+    empty.write_text("")
+    before = c.read_text()
+    run([sc, "merge", c, empty], env)
+    check("merge: a failed build (no timings) leaves the costs intact", c.read_text() == before)
     fresh = t / "fresh.tsv"
     run([sc, "merge", fresh, t / "leg.tsv"], env)
     check("merge into a missing costs file", fresh.exists() and len(fresh.read_text().splitlines()) == 3)

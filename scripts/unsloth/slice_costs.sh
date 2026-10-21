@@ -3,7 +3,8 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 # Per-object compile ms for slice_objects.sh, kept in the ccache dir so a leg and its warm jobs
 # read the same file. Warm jobs export their slice into slice-costs.d/; the leg merges all into
-# slice-costs.tsv. Only a timing over HIT_MS (a real compile, not a ccache hit) replaces a cost.
+# slice-costs.tsv. Only a timing over HIT_MS (a real compile, not a ccache hit) replaces a cost, and
+# objects missing from the timings (a failed build) keep theirs.
 # Usage: slice_costs.sh export <build dir> <out.tsv> | merge <costs.tsv> <timings.tsv>...
 set -euo pipefail
 HIT_MS="${HIT_MS:-3000}"
@@ -31,7 +32,8 @@ case "${1:-}" in
         if (v > hit && (!($2 in real) || v > real[$2])) real[$2] = v
         if (!($2 in any) || v > any[$2]) any[$2] = v
       }
-      END { for (o in seen) printf "%d\t%s\n", (o in real) ? real[o] : ((o in prev) ? prev[o] : any[o]), o }
+      END { for (o in prev) if (!(o in seen)) printf "%d\t%s\n", prev[o], o
+            for (o in seen) printf "%d\t%s\n", (o in real) ? real[o] : ((o in prev) ? prev[o] : any[o]), o }
     ' "$old" "$@" | LC_ALL=C sort -t "$tab" -k2,2 > "$costs.tmp"
     mv "$costs.tmp" "$costs"
     echo "slice costs: $(grep -c . "$costs" || true) objects in $costs" >&2
