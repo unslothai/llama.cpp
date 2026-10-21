@@ -50,8 +50,7 @@ bool rpc_transport_init();
 void rpc_transport_shutdown();
 
 bool rpc_tls_supported();
-// load the server certificate, key and CA once, for the server started next; the allowlist path is
-// re-read on every accept
-bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file);
-// hand the prepared configuration to the server starting now (nullptr: plain TCP); clears it
-std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take();
+// one server's certificate, key and CA, loaded once (nullptr on failure); the allowlist path is re-read on
+// every accept
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_config_load(const char * cert, const char * key,
+                                                                  const char * ca, const char * allow_file);

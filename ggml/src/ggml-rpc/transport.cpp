@@ -1165,9 +1165,7 @@ static void tls_close_notify(SSL * ssl, sockfd_t fd) {
     ERR_clear_error();
 }
 
-// One listening server's certificate, CA and allowlist. rpc_tls_server_configure() prepares the
-// configuration for the server started next, which takes it: a later configure never changes a
-// server that is already listening.
+// One listening server's certificate, CA and allowlist, owned by that server.
 struct rpc_tls_server_config {
     SSL_CTX *   ctx = nullptr;
     std::string allow_file;
@@ -1177,16 +1175,6 @@ struct rpc_tls_server_config {
         }
     }
 };
-
-struct tls_pending_state {
-    std::mutex                             mu;
-    std::shared_ptr<rpc_tls_server_config> next;
-};
-
-static tls_pending_state & tls_pending() {
-    static tls_pending_state st;
-    return st;
-}
 
 static bool tls_allowed(const std::string & allow_file, const std::string & fp) {
     std::ifstream in(allow_file);
@@ -1333,33 +1321,25 @@ bool rpc_tls_supported() {
     return true;
 }
 
-bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file) {
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_config_load(const char * cert, const char * key,
+                                                                  const char * ca, const char * allow_file) {
     if (!cert || !key || !ca || !allow_file) {
         LOG_ERROR("TLS: the server needs a certificate, a key, a CA and an allowlist\n");
-        return false;
+        return nullptr;
     }
     SSL_CTX * ctx = tls_ctx_new(true, cert, key, ca);
     if (!ctx) {
-        return false;
+        return nullptr;
     }
     if (!std::ifstream(allow_file)) {
         LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file);
         SSL_CTX_free(ctx);
-        return false;
+        return nullptr;
     }
     auto config        = std::make_shared<rpc_tls_server_config>();
     config->ctx        = ctx;
     config->allow_file = allow_file;
-    tls_pending_state &         st = tls_pending();
-    std::lock_guard<std::mutex> lock(st.mu);
-    st.next = std::move(config);
-    return true;
-}
-
-std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take() {
-    tls_pending_state &         st = tls_pending();
-    std::lock_guard<std::mutex> lock(st.mu);
-    return std::move(st.next);
+    return config;
 }
 
 #else // !GGML_RPC_TLS
@@ -1379,13 +1359,12 @@ bool rpc_tls_supported() {
     return false;
 }
 
-bool rpc_tls_server_configure(const char *, const char *, const char *, const char *) {
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_config_load(const char *, const char *, const char *,
+                                                                  const char *) {
     LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
-    return false;
-}
-
-std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take() {
     return nullptr;
 }
+
+
 
 #endif // GGML_RPC_TLS

@@ -2798,15 +2798,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-bool ggml_backend_rpc_server_set_tls(const char * cert, const char * key, const char * ca, const char * allow_file) {
-    return rpc_tls_server_configure(cert, key, ca, allow_file);
-}
-
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+// tls_config: this server's own TLS setup, or nullptr for plain TCP
+static bool rpc_start_server(const char * endpoint, const char * cache_dir, size_t n_threads, size_t n_devices,
+                             ggml_backend_dev_t * devices, const std::shared_ptr<rpc_tls_server_config> & tls_config) {
     if (n_devices == 0 || devices == nullptr) {
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
-        return;
+        return false;
     }
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
@@ -2825,7 +2822,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
-            return;
+            return false;
         }
         backends.push_back(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -2840,12 +2837,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
-        return;
+        return false;
     }
 
-    // this server's own TLS configuration: a later ggml_backend_rpc_server_set_tls() is for the next one
-    const std::shared_ptr<rpc_tls_server_config> tls_config = rpc_tls_server_take();
-    const bool                                   tls        = tls_config != nullptr;
+    const bool tls = tls_config != nullptr;
     if (tls) {
         LOG_INFO("  transport      : TLS 1.3 (mutual, client allowlist)\n");
     } else {
@@ -2857,18 +2852,18 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     }
     if (!rpc_transport_init()) {
         LOG_ERROR("Failed to initialize RPC transport\n");
-        return;
+        return false;
     }
     auto server_socket = socket_t::create_server(host.c_str(), port);
     if (server_socket == nullptr) {
         LOG_ERROR("Failed to create server socket\n");
-        return;
+        return false;
     }
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
             LOG_ERROR("Failed to accept client connection\n");
-            return;
+            return false;
         }
         if (tls) {
             std::string fingerprint;
@@ -2887,6 +2882,24 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+    return false;
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, nullptr);
+}
+
+bool ggml_backend_rpc_start_server_tls(const char * endpoint, const char * cache_dir,
+                                       size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                       const char * cert, const char * key, const char * ca,
+                                       const char * allow_file) {
+    // loaded here and handed to this server alone, so servers started concurrently never share it
+    std::shared_ptr<rpc_tls_server_config> tls_config = rpc_tls_server_config_load(cert, key, ca, allow_file);
+    if (!tls_config) {
+        return false;
+    }
+    return rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, tls_config);
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
@@ -3165,8 +3178,8 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_rpc_start_server;
     }
 #ifdef GGML_RPC_TLS
-    if (std::strcmp(name, "ggml_backend_rpc_server_set_tls") == 0) {
-        return (void *)ggml_backend_rpc_server_set_tls;
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_tls") == 0) {
+        return (void *)ggml_backend_rpc_start_server_tls;
     }
 #endif // GGML_RPC_TLS
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {

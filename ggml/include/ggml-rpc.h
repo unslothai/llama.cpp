@@ -27,11 +27,16 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
-// Mutual TLS 1.3 for the server started next (GGML_RPC_TLS builds; returns false otherwise): clients must
+// ggml_backend_rpc_start_server with mutual TLS 1.3 for this server only (GGML_RPC_TLS builds): clients must
 // present a certificate that chains to `ca` and whose SHA-256 fingerprint is listed in `allow_file`
 // (one hex digest per line, re-read on every connection). Clients use "tls://<server fingerprint>@host:port"
 // endpoints with GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA set.
-GGML_BACKEND_API bool ggml_backend_rpc_server_set_tls(const char * cert, const char * key, const char * ca, const char * allow_file);
+// Returns false at once when the certificate, key, CA or allowlist cannot be loaded; otherwise serves, and
+// returns false only if the server stops.
+GGML_BACKEND_API bool ggml_backend_rpc_start_server_tls(const char * endpoint, const char * cache_dir,
+                                                        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                        const char * cert, const char * key, const char * ca,
+                                                        const char * allow_file);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

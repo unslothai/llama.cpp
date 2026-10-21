@@ -103,12 +103,12 @@ struct rpc_server_params {
     std::string              tls_allow;
 };
 
-typedef bool (*rpc_server_set_tls_t)(const char * cert, const char * key, const char * ca, const char * allow_file);
+typedef decltype(ggml_backend_rpc_start_server_tls) * rpc_start_server_tls_t;
 
 // present only in builds with the TLS transport (GGML_RPC_TLS)
-static rpc_server_set_tls_t get_set_tls_fn() {
+static rpc_start_server_tls_t get_start_tls_fn() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
-    return reg ? (rpc_server_set_tls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_tls") : nullptr;
+    return reg ? (rpc_start_server_tls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server_tls") : nullptr;
 }
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -120,7 +120,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
-    if (get_set_tls_fn()) {
+    if (get_start_tls_fn()) {
         fprintf(stderr, "  --tls-cert FILE                  mutual TLS 1.3: server certificate (PEM)\n");
         fprintf(stderr, "  --tls-key FILE                   mutual TLS 1.3: server private key (PEM)\n");
         fprintf(stderr, "  --tls-ca FILE                    mutual TLS 1.3: CA that client certificates must chain to\n");
@@ -252,13 +252,8 @@ int main(int argc, char * argv[]) {
             fprintf(stderr, "error: --tls-cert, --tls-key, --tls-ca and --tls-allow are required together\n");
             return 1;
         }
-        auto set_tls_fn = get_set_tls_fn();
-        if (!set_tls_fn) {
+        if (!get_start_tls_fn()) {
             fprintf(stderr, "error: this build has no TLS transport (build with -DGGML_RPC_TLS=ON)\n");
-            return 1;
-        }
-        if (!set_tls_fn(params.tls_cert.c_str(), params.tls_key.c_str(), params.tls_ca.c_str(), params.tls_allow.c_str())) {
-            fprintf(stderr, "error: cannot set up TLS\n");
             return 1;
         }
     }
@@ -305,6 +300,13 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
+    if (tls) {
+        // returns only when the TLS setup fails or the server stops
+        get_start_tls_fn()(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
+                           params.tls_cert.c_str(), params.tls_key.c_str(), params.tls_ca.c_str(), params.tls_allow.c_str());
+        fprintf(stderr, "error: the TLS server could not start or stopped\n");
+        return 1;
+    }
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;
 }

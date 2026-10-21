@@ -1,7 +1,8 @@
 // Byte-exact SET_TENSOR / GET_TENSOR through one RPC endpoint (plain "host:port" or "tls://<fp>@host:port").
 // usage: test-rpc-tls <endpoint> [MiB]   (exit 0 = round trip exact; a refused TLS peer aborts non-zero)
 //        test-rpc-tls --two-servers <certA> <keyA> <certB> <keyB> <ca> <allow> <portA> <portB>
-//        (two TLS servers in one process, each configured just before it starts; runs until killed)
+//        (two TLS servers started at the same time in one process, each with its own certificate; runs
+//        until killed)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -22,16 +23,16 @@ static int two_servers(char ** a) {
         fprintf(stderr, "no CPU device\n");
         return 1;
     }
+    // both at once, no pause between them: each server's TLS setup is bound to its own start call
     for (int i = 0; i < 2; i++) {
-        if (!ggml_backend_rpc_server_set_tls(a[2 * i], a[2 * i + 1], a[4], a[5])) {
-            return 1;
-        }
         const std::string endpoint = std::string("127.0.0.1:") + a[6 + i];
-        std::thread([endpoint, cpu]() mutable {
-            ggml_backend_rpc_start_server(endpoint.c_str(), nullptr, 1, 1, &cpu);
+        const std::string cert = a[2 * i], key = a[2 * i + 1], ca = a[4], allow = a[5];
+        std::thread([=]() mutable {
+            if (!ggml_backend_rpc_start_server_tls(endpoint.c_str(), nullptr, 1, 1, &cpu, cert.c_str(), key.c_str(),
+                                                   ca.c_str(), allow.c_str())) {
+                fprintf(stderr, "server %s did not start\n", endpoint.c_str());
+            }
         }).detach();
-        // the server takes its configuration as it starts; only then configure the next one
-        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(60));
