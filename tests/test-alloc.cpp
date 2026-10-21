@@ -1106,6 +1106,43 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+// The plan of a graph depends on which tensors are outputs (never freed, never reused) and not only on the sizes:
+// the same graph shape planned while an intermediate was not an output lets a later tensor take its memory,
+// so once that intermediate becomes an output the plan must be recomputed (the backend sampler marks only the
+// chains of the rows a step samples as outputs, with an unchanged graph shape). A plan made while it was an
+// output stays valid when it no longer is one, and is kept (no new plan every time the outputs shrink).
+static void test_plan_follows_output_flags() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const bool mid_is_output = pass % 2 == 1;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * in  = make_input_with_size(ctx, 64);
+        ggml_tensor * a   = ggml_scale(ctx, in, 2.0f);
+        ggml_tensor * b   = ggml_scale(ctx, a,  2.0f); // can take a's memory unless a is an output
+        ggml_tensor * c   = ggml_scale(ctx, b,  2.0f);
+        if (mid_is_output) {
+            ggml_set_output(a);
+        }
+        ggml_set_output(c);
+        ggml_build_forward_expand(graph, c);
+        assign_names(ctx);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        if (mid_is_output) {
+            GGML_ASSERT(!memory_overlap(a, b));
+            GGML_ASSERT(!memory_overlap(a, c));
+        }
+        if (pass == 2) {
+            // the plan of pass 1 (a is an output) covers this graph and is kept
+            GGML_ASSERT(!memory_overlap(a, b));
+        }
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1139,5 +1176,6 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_plan_follows_output_flags", test_plan_follows_output_flags);
     return 0;
 }
