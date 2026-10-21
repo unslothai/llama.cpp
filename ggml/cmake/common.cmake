@@ -119,4 +119,35 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
     endforeach()
 
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
+    set(GGML_CUDA_FA_COMBINATIONS ${FA_COMBINATIONS} PARENT_SCOPE)
+endfunction()
+
+# Determines which FlashAttention MMA template instances for quantized K/V to compile (CUDA only), returns them in OUT_SRCS.
+# Each file holds one K type, its V types are compiled for the K-V combinations in GGML_CUDA_FA_QUANTS.
+function(ggml_cuda_fattn_mma_q_instances DIR FA_COMBINATIONS OUT_SRCS)
+    set(FA_MMA_Q_TYPES f16 q4_0 q4_1 q5_0 q5_1 q8_0)
+
+    set(TYPES_K "")
+    foreach (COMBINATION IN LISTS FA_COMBINATIONS)
+        if (NOT COMBINATION MATCHES "^([a-z0-9_]+)-([a-z0-9_]+)$")
+            message(FATAL_ERROR "bad FlashAttention K-V type combination \"${COMBINATION}\"")
+        endif()
+        set(TYPE_K ${CMAKE_MATCH_1})
+        set(TYPE_V ${CMAKE_MATCH_2})
+        if (TYPE_K IN_LIST FA_MMA_Q_TYPES AND TYPE_V IN_LIST FA_MMA_Q_TYPES AND NOT COMBINATION STREQUAL "f16-f16")
+            list(APPEND TYPES_K ${TYPE_K})
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES TYPES_K)
+
+    set(SRCS "")
+    foreach (TYPE_K IN LISTS TYPES_K)
+        file(GLOB SRCS_K "${DIR}/template-instances/fattn-mma-q-instance-${TYPE_K}-*.cu")
+        if (NOT SRCS_K)
+            message(FATAL_ERROR "no FlashAttention MMA template instances for K type \"${TYPE_K}\"")
+        endif()
+        list(APPEND SRCS ${SRCS_K})
+    endforeach()
+
+    set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
 endfunction()
