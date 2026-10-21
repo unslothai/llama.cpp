@@ -1252,9 +1252,13 @@ jobs:
           set -uo pipefail
           if bash scripts/unsloth/wait_for_jobs.sh --exclude 'Finalize: prune, reclaim, report' --deadline-min 335 --poll 120 \
                --out "$RUNNER_TEMP/jobs.tsv"; then
-            step="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100&filter=latest" \
-              --jq '.jobs[] | select(.name == "Assemble metadata + publish") | .steps[] | select(.name == "Publish GitHub release") | .conclusion' | head -1)"
-            if [ "$step" = success ]; then published=true; else published=false; fi
+            # A failed lookup is `unknown`, never `false`: false takes the unpublished delete path.
+            if steps="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100&filter=latest" \
+                  --jq '.jobs[] | select(.name == "Assemble metadata + publish") | .steps[] | select(.name == "Publish GitHub release") | .conclusion')"; then
+              if [ "$(printf '%s\n' "$steps" | head -1)" = success ]; then published=true; else published=false; fi
+            else
+              published=unknown
+            fi
           else
             rc=$?
             published=unknown

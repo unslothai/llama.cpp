@@ -231,6 +231,8 @@ jobs:
           name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz
           if-no-files-found: error
+          # A rerun of this job (e.g. after a Vulkan failure) re-uploads; artifacts persist across attempts.
+          overwrite: true
 
       - name: Evict stale ccache files
         # !cancelled(), unlike the save below: on a timeout the job gets a
@@ -451,6 +453,7 @@ jobs:
           name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan
           path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz
           if-no-files-found: error
+          overwrite: true
 
       - name: Evict stale ccache files (Vulkan)
         # !cancelled(), unlike the save below: on a timeout the job gets a
