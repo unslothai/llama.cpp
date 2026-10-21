@@ -11672,37 +11672,74 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // small batches (multi-sequence decode) with quantized K/V, which the CUDA MMA kernel dequantizes while loading:
-    for (int hs : { 64, 128, 256, 512, }) {
+    const std::array<ggml_type, 2> types_KV_small_batch[] = {
+        {GGML_TYPE_F16,  GGML_TYPE_F16},  {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0},
+        {GGML_TYPE_Q4_1, GGML_TYPE_Q4_1}, {GGML_TYPE_Q5_0, GGML_TYPE_Q5_0}, {GGML_TYPE_Q5_1, GGML_TYPE_Q5_1},
+        {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_F16,  GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_F16},
+    };
+    for (int hs : { 64, 96, 128, 256, 512, }) {
         for (int nr2 : { 1, 2, 4, 6, 8, }) {
             for (int kv : { 113, 512, 1024, }) {
                 for (int nb : { 1, 2, 3, 4, 5, 8, 9, 16, 17, }) {
-                    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
-                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    for (const auto & [type_K, type_V] : types_KV_small_batch) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
                     }
                 }
             }
         }
     }
-    for (int hs : { 128, 256, 512, }) {
+    for (int hs : { 64, 96, 128, 256, 512, }) {
         for (int nr2 : { 2, 8, }) {
             for (int nb : { 3, 4, 8, 16, }) {
-                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
-                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 8, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
-                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 2, {nr2, 2},  512, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                for (const auto & [type_K, type_V] : types_KV_small_batch) {
+                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 8, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                    test_cases.emplace_back(new test_flash_attn_ext_multi_seq(hs, hs, 2, {nr2, 2},  512, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
                 }
             }
         }
     }
+    // MLA (V is a view of K): DeepSeek / Kimi (GQA 16, 64, 128), GLM 4.7 Flash (GQA 20), Mistral Small 4 (320/256, GQA 32),
+    // DeepSeek V4 (512/512, K == V, GQA 64, sinks); MiMo-V2 (192/128, GQA 8 and 16):
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, }) {
+        for (int nb : { 1, 2, 3, 4, 5, 8, 16, 17, }) {
+            for (int nr2 : { 16, 20, 64, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {128, 1},   512, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, { 16, 1},   113, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+            test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, { 32, 1},   512, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 64, 1},  1024, nb, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+            test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {  8, 1},   512, nb, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(192, 128, 2, { 16, 1},  1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+        // GLM 4.7 Flash with a long context selects ncols2 == 32 on Turing:
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 16640, 3, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+        // sparse attention (n_kv_max hint), the kernel gathers the K/V rows:
+        for (int nb : { 1, 3, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 256));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, nb, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true,  512));
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true,  256));
+        }
+    }
+    for (const auto & [type_K, type_V] : types_KV_small_batch) {
+        if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
+            continue;
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, false, false, 0,  0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, true,  false, 8,  0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 4, true,  true,  0,  0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1},  512, 3, true,  false, 0, 10, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {2, 1},  512, 5, true,  false, 0, 30, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 6, true,  false, 0,  0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 5, true,  true,  0,  0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 2, {8, 1}, 1024, 4, true,  true,  0,  0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext( 96,  96, 2, {1, 1},  512, 9, true,  false, 0,  0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 7, true,  false, 0,  0, GGML_PREC_F32, type_K, type_V, {0, 1, 2, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128, 2, {2, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 2, {8, 1}, 1024, 3, true, true,  0, 0, GGML_PREC_F32, type_K, type_V));
+    }
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, false, false, 0,  0, GGML_PREC_F32, type_KV, type_KV));
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 4, true,  false, 8,  0, GGML_PREC_F32, type_KV, type_KV));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 4, true,  true,  0,  0, GGML_PREC_F32, type_KV, type_KV));
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1},  512, 3, true,  false, 0, 10, GGML_PREC_F32, type_KV, type_KV));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 6, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
-        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 5, true,  true,  0,  0, GGML_PREC_F32, type_KV, type_KV));
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 7, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, false));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, 4, true,  false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
-        test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128, 2, {2, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
@@ -12089,11 +12126,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // multi-sequence decode with quantized K/V: Llama-3-8B, Qwen3-0.6B, Qwen3.5-35B-A3B, Gemma 4 (SWA and global)
-    for (auto [hs, nh, gqa] : { std::array<int, 3>{128, 8, 4}, {128, 8, 2}, {128, 2, 8}, {256, 8, 2}, {256, 2, 8}, {512, 2, 8} }) {
+    for (auto [hs, nh, gqa] : { std::array<int, 3>{128, 8, 4}, {128, 8, 2}, {128, 2, 8}, {256, 8, 2}, {256, 2, 8}, {512, 2, 8}, {64, 8, 8}, {64, 8, 4}, {96, 32, 1} }) {
         for (int64_t kv : {4096, 16384}) {
             for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
                 for (int64_t nb : {1, 2, 4, 8, 16}) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+    }
+
+    // multi-sequence decode with quantized K/V, MLA: DeepSeek V2 Lite / V3 (V is a view of K)
+    for (int gqa : {16, 128}) {
+        for (int64_t kv : {4096, 16384}) {
+            for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                for (int64_t nb : {1, 2, 4, 8, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true));
                 }
             }
         }
