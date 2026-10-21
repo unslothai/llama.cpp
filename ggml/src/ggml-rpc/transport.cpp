@@ -16,11 +16,23 @@
 #  include <netinet/tcp.h>
 #  include <netdb.h>
 #  include <unistd.h>
+#  include <sys/uio.h>
 #endif
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
+
+#ifdef GGML_RPC_TLS
+#  include <openssl/err.h>
+#  include <openssl/evp.h>
+#  include <openssl/ssl.h>
+#  include <openssl/x509.h>
+#  include <cctype>
+#  include <fstream>
+#endif // GGML_RPC_TLS
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -133,6 +145,15 @@ struct socket_t::impl {
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
+    // TCP: small writes of one message (command byte, size, payload) are held here and leave in a
+    // single send at flush(), which every message ends with, instead of one tiny segment each.
+    // The bytes on the wire are unchanged, only how they are split into syscalls.
+    bool tcp_send(const void * data, size_t size);
+    bool tcp_send2(const void * a, size_t na, const void * b, size_t nb);
+    bool tcp_flush();
+    static constexpr size_t TCP_COALESCE_MAX = 64 * 1024;
+    std::vector<uint8_t> pending;
+
 #ifdef GGML_RPC_RDMA
     std::optional<rdma_gid_t> rdma_build_target_gid();
 
@@ -153,12 +174,32 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+
+#ifdef GGML_RPC_TLS
+    // one TLS record per message: the small writes of a message are held and leave together at flush()
+    static constexpr size_t TLS_COALESCE_MAX = 64 * 1024;
+    SSL *                ssl = nullptr;
+    std::vector<uint8_t> tls_out;
+    bool tls_write(const void * data, size_t size);
+    bool tls_send(const void * data, size_t size);
+    bool tls_flush();
+    bool tls_recv(void * data, size_t size);
+#endif // GGML_RPC_TLS
 };
 
 socket_t::impl::~impl() {
+    if (!use_rdma && !pending.empty()) {
+        tcp_flush();
+    }
 #ifdef GGML_RPC_RDMA
     rdma.reset();
 #endif // GGML_RPC_RDMA
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        SSL_free(ssl);
+        ssl = nullptr;
+    }
+#endif // GGML_RPC_TLS
     LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
 #ifdef _WIN32
     if (fd != INVALID_SOCKET) closesocket(this->fd);
@@ -531,17 +572,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
 #endif // GGML_RPC_RDMA
 
-bool socket_t::impl::send_data(const void * data, size_t size) {
-    LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
-#ifdef GGML_RPC_RDMA_APPLE
-    if (use_rdma) {
-        return rdma->send(data, size);
-    }
-#elif defined(GGML_RPC_RDMA)
-    if (use_rdma) {
-        return rdma_send(data, size);
-    }
-#endif
+bool socket_t::impl::tcp_send(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
@@ -556,8 +587,92 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
+// Send a then b with as few syscalls as possible and without copying b (a large payload).
+bool socket_t::impl::tcp_send2(const void * a, size_t na, const void * b, size_t nb) {
+    if (nb > MAX_CHUNK_SIZE) {
+        return tcp_send(a, na) && tcp_send(b, nb);
+    }
+#ifdef _WIN32
+    WSABUF bufs[2];
+    bufs[0].buf = (CHAR *)a;
+    bufs[0].len = (ULONG)na;
+    bufs[1].buf = (CHAR *)b;
+    bufs[1].len = (ULONG)nb;
+    DWORD n = 0;
+    if (WSASend(fd, bufs, 2, &n, 0, nullptr, nullptr) != 0) {
+        LOG_ERROR("send failed (bytes_sent=0, size_to_send=%zu)\n", na + nb);
+        return false;
+    }
+    size_t sent = (size_t)n;
+#else
+    struct iovec iov[2];
+    iov[0].iov_base = const_cast<void *>(a);
+    iov[0].iov_len  = na;
+    iov[1].iov_base = const_cast<void *>(b);
+    iov[1].iov_len  = nb;
+    struct msghdr msg = {};
+    msg.msg_iov    = iov;
+    msg.msg_iovlen = 2;
+    ssize_t n = sendmsg(fd, &msg, 0);
+    if (n < 0) {
+        LOG_ERROR("send failed (bytes_sent=0, size_to_send=%zu)\n", na + nb);
+        return false;
+    }
+    size_t sent = (size_t)n;
+#endif
+    // a partial send finishes with plain sends of whatever is left of a, then of b
+    if (sent < na) {
+        return tcp_send((const char *)a + sent, na - sent) && tcp_send(b, nb);
+    }
+    sent -= na;
+    return sent >= nb || tcp_send((const char *)b + sent, nb - sent);
+}
+
+bool socket_t::impl::tcp_flush() {
+    if (pending.empty()) {
+        return true;
+    }
+    bool ok = tcp_send(pending.data(), pending.size());
+    pending.clear();
+    return ok;
+}
+
+bool socket_t::impl::send_data(const void * data, size_t size) {
+    LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        return tls_send(data, size);
+    }
+#endif // GGML_RPC_TLS
+#ifdef GGML_RPC_RDMA_APPLE
+    if (use_rdma) {
+        return rdma->send(data, size);
+    }
+#elif defined(GGML_RPC_RDMA)
+    if (use_rdma) {
+        return rdma_send(data, size);
+    }
+#endif
+    if (pending.size() + size <= TCP_COALESCE_MAX) {
+        const uint8_t * p = (const uint8_t *)data;
+        pending.insert(pending.end(), p, p + size);
+        return true;
+    }
+    if (pending.empty()) {
+        return tcp_send(data, size);
+    }
+    bool ok = tcp_send2(pending.data(), pending.size(), data, size);
+    pending.clear();
+    return ok;
+}
+
 bool socket_t::impl::recv_data(void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        return tls_recv(data, size);
+    }
+#endif // GGML_RPC_TLS
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->recv(data, size);
@@ -567,6 +682,10 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         return rdma_recv(data, size);
     }
 #endif
+    // never wait for a reply while part of our own request is still held back
+    if (!pending.empty() && !tcp_flush()) {
+        return false;
+    }
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
@@ -587,6 +706,11 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
 
 void socket_t::impl::get_caps(uint8_t * local_caps) {
     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        return; // no RDMA under TLS: every byte stays inside the authenticated channel
+    }
+#endif // GGML_RPC_TLS
 #ifdef GGML_RPC_RDMA
     if (std::getenv("GGML_RPC_NO_RDMA")) {
         return;
@@ -616,6 +740,14 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
 }
 
 void socket_t::impl::update_caps(const uint8_t * remote_caps) {
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        (void)remote_caps;
+        return;
+    }
+#endif // GGML_RPC_TLS
+    // the caps just written go over TCP: send them before the transport may switch to RDMA
+    tcp_flush();
 #ifdef GGML_RPC_RDMA
     // a peer that has no RDMA advertises all-zero caps and takes no further part
     // in the negotiation, so drop to TCP without reporting a failure
@@ -649,12 +781,17 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 }
 
 bool socket_t::impl::flush() {
+#ifdef GGML_RPC_TLS
+    if (ssl) {
+        return tls_flush();
+    }
+#endif // GGML_RPC_TLS
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->flush();
     }
 #endif
-    return true;
+    return tcp_flush();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -684,7 +821,18 @@ void socket_t::update_caps(const uint8_t * remote_caps) {
 }
 
 const char * socket_t::transport_name() const {
+    if (is_tls()) {
+        return "TLS";
+    }
     return pimpl->use_rdma ? "RDMA" : "TCP";
+}
+
+bool socket_t::is_tls() const {
+#ifdef GGML_RPC_TLS
+    return pimpl->ssl != nullptr;
+#else
+    return false;
+#endif // GGML_RPC_TLS
 }
 
 static bool is_valid_fd(sockfd_t sockfd) {
@@ -807,3 +955,321 @@ void rpc_transport_shutdown() {
     g_rpc_transport_wsa_started = false;
 #endif
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// Mutual TLS 1.3. Identity is the SHA-256 fingerprint of the peer's leaf certificate (DER), on top of a
+// chain that must verify against the configured CA; host names play no part.
+
+#ifdef GGML_RPC_TLS
+
+static constexpr int    TLS_HANDSHAKE_TIMEOUT_S = 10;
+static constexpr size_t TLS_WRITE_CHUNK         = 16u * 1024u * 1024u;
+
+static void tls_log_errors(const char * what) {
+    unsigned long e;
+    bool any = false;
+    while ((e = ERR_get_error()) != 0) {
+        char buf[256];
+        ERR_error_string_n(e, buf, sizeof(buf));
+        LOG_ERROR("%s: %s\n", what, buf);
+        any = true;
+    }
+    if (!any) {
+        LOG_ERROR("%s\n", what);
+    }
+}
+
+static std::string tls_normalize_fp(const std::string & in) {
+    std::string out;
+    for (char c : in) {
+        if (std::isxdigit((unsigned char) c)) {
+            out += (char) std::tolower((unsigned char) c);
+        }
+    }
+    return out;
+}
+
+static std::string tls_peer_fingerprint(SSL * ssl) {
+#if defined(OPENSSL_IS_BORINGSSL) || OPENSSL_VERSION_NUMBER < 0x30000000L
+    X509 * cert = SSL_get_peer_certificate(ssl);
+#else
+    X509 * cert = SSL_get1_peer_certificate(ssl);
+#endif
+    if (!cert) {
+        return "";
+    }
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int  n = 0;
+    const bool    ok = X509_digest(cert, EVP_sha256(), md, &n) == 1;
+    X509_free(cert);
+    if (!ok) {
+        return "";
+    }
+    static const char * hex = "0123456789abcdef";
+    std::string fp;
+    for (unsigned int i = 0; i < n; i++) {
+        fp += hex[md[i] >> 4];
+        fp += hex[md[i] & 15];
+    }
+    return fp;
+}
+
+static SSL_CTX * tls_ctx_new(bool server, const char * cert, const char * key, const char * ca) {
+    SSL_CTX * ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
+    if (!ctx) {
+        tls_log_errors("TLS: cannot create context");
+        return nullptr;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+#ifndef OPENSSL_IS_BORINGSSL
+    SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384");
+    SSL_CTX_set_num_tickets(ctx, 0);
+#endif
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ctx) != 1 ||
+        SSL_CTX_load_verify_locations(ctx, ca, nullptr) != 1) {
+        tls_log_errors("TLS: cannot load certificate, key or CA");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    return ctx;
+}
+
+// bound the handshake so a silent peer cannot hold the (single) accept loop
+static void tls_set_timeouts(sockfd_t fd, int seconds) {
+#ifdef _WIN32
+    DWORD ms = (DWORD) seconds * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &ms, sizeof(ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &ms, sizeof(ms));
+#else
+    struct timeval tv;
+    tv.tv_sec  = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+struct tls_server_state {
+    std::mutex  mu;
+    SSL_CTX *   ctx = nullptr;
+    std::string allow_file;
+};
+
+static tls_server_state & tls_server() {
+    static tls_server_state st;
+    return st;
+}
+
+static bool tls_allowed(const std::string & allow_file, const std::string & fp) {
+    std::ifstream in(allow_file);
+    if (!in) {
+        LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file.c_str());
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            line.resize(hash);
+        }
+        const std::string entry = tls_normalize_fp(line);
+        if (!entry.empty() && entry == fp) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool socket_t::impl::tls_write(const void * data, size_t size) {
+    const char * p = (const char *) data;
+    while (size > 0) {
+        const int n = SSL_write(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
+        if (n <= 0) {
+            tls_log_errors("TLS: write failed");
+            return false;
+        }
+        p += n;
+        size -= (size_t) n;
+    }
+    return true;
+}
+
+bool socket_t::impl::tls_send(const void * data, size_t size) {
+    if (tls_out.size() + size <= TLS_COALESCE_MAX) {
+        const uint8_t * p = (const uint8_t *) data;
+        tls_out.insert(tls_out.end(), p, p + size);
+        return true;
+    }
+    return tls_flush() && tls_write(data, size);
+}
+
+bool socket_t::impl::tls_flush() {
+    if (tls_out.empty()) {
+        return true;
+    }
+    const bool ok = tls_write(tls_out.data(), tls_out.size());
+    tls_out.clear();
+    return ok;
+}
+
+bool socket_t::impl::tls_recv(void * data, size_t size) {
+    // never wait for a reply while part of our own request is still held back
+    if (!tls_flush()) {
+        return false;
+    }
+    char * p = (char *) data;
+    while (size > 0) {
+        const int n = SSL_read(ssl, p, (int) std::min(size, TLS_WRITE_CHUNK));
+        if (n <= 0) {
+            if (SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN) {
+                LOG_WARN("TLS: peer closed the connection\n");
+            } else {
+                tls_log_errors("TLS: read failed");
+            }
+            return false;
+        }
+        p += n;
+        size -= (size_t) n;
+    }
+    return true;
+}
+
+bool socket_t::tls_connect(const std::string & server_fingerprint) {
+    const char * cert = std::getenv("GGML_RPC_TLS_CERT");
+    const char * key  = std::getenv("GGML_RPC_TLS_KEY");
+    const char * ca   = std::getenv("GGML_RPC_TLS_CA");
+    if (!cert || !key || !ca) {
+        LOG_ERROR("TLS: a tls:// endpoint needs GGML_RPC_TLS_CERT, GGML_RPC_TLS_KEY and GGML_RPC_TLS_CA\n");
+        return false;
+    }
+    const std::string want = tls_normalize_fp(server_fingerprint);
+    if (want.size() != 64) {
+        LOG_ERROR("TLS: the endpoint fingerprint must be a SHA-256 hex digest (64 hex digits)\n");
+        return false;
+    }
+    SSL_CTX * ctx = tls_ctx_new(false, cert, key, ca);
+    if (!ctx) {
+        return false;
+    }
+    SSL * ssl = SSL_new(ctx);
+    SSL_CTX_free(ctx); // the SSL keeps its own reference
+    if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
+        tls_log_errors("TLS: cannot create session");
+        SSL_free(ssl);
+        return false;
+    }
+    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
+    if (SSL_connect(ssl) != 1) {
+        tls_log_errors("TLS: handshake with the server failed");
+        SSL_free(ssl);
+        return false;
+    }
+    const std::string got = tls_peer_fingerprint(ssl);
+    if (got != want) {
+        LOG_ERROR("TLS: server certificate %s is not the pinned %s\n", got.c_str(), want.c_str());
+        SSL_free(ssl);
+        return false;
+    }
+    tls_set_timeouts(pimpl->fd, 0);
+    pimpl->ssl = ssl;
+    return true;
+}
+
+bool socket_t::tls_accept(std::string & client_fingerprint) {
+    tls_server_state & st = tls_server();
+    SSL *              ssl = nullptr;
+    std::string        allow_file;
+    {
+        std::lock_guard<std::mutex> lock(st.mu);
+        if (!st.ctx) {
+            return false;
+        }
+        ssl        = SSL_new(st.ctx);
+        allow_file = st.allow_file;
+    }
+    if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
+        tls_log_errors("TLS: cannot create session");
+        SSL_free(ssl);
+        return false;
+    }
+    tls_set_timeouts(pimpl->fd, TLS_HANDSHAKE_TIMEOUT_S);
+    if (SSL_accept(ssl) != 1) {
+        tls_log_errors("TLS: handshake with the client failed");
+        SSL_free(ssl);
+        return false;
+    }
+    client_fingerprint = tls_peer_fingerprint(ssl);
+    if (client_fingerprint.empty() || !tls_allowed(allow_file, client_fingerprint)) {
+        LOG_WARN("TLS: client certificate %s is not in the allowlist\n", client_fingerprint.c_str());
+        SSL_free(ssl);
+        return false;
+    }
+    tls_set_timeouts(pimpl->fd, 0);
+    pimpl->ssl = ssl;
+    return true;
+}
+
+bool rpc_tls_supported() {
+    return true;
+}
+
+bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file) {
+    if (!cert || !key || !ca || !allow_file) {
+        LOG_ERROR("TLS: the server needs a certificate, a key, a CA and an allowlist\n");
+        return false;
+    }
+    SSL_CTX * ctx = tls_ctx_new(true, cert, key, ca);
+    if (!ctx) {
+        return false;
+    }
+    if (!std::ifstream(allow_file)) {
+        LOG_ERROR("TLS: cannot read allowlist %s\n", allow_file);
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    tls_server_state &          st = tls_server();
+    std::lock_guard<std::mutex> lock(st.mu);
+    if (st.ctx) {
+        SSL_CTX_free(st.ctx);
+    }
+    st.ctx        = ctx;
+    st.allow_file = allow_file;
+    return true;
+}
+
+bool rpc_tls_server_enabled() {
+    tls_server_state &          st = tls_server();
+    std::lock_guard<std::mutex> lock(st.mu);
+    return st.ctx != nullptr;
+}
+
+#else // !GGML_RPC_TLS
+
+bool socket_t::tls_connect(const std::string &) {
+    LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
+    return false;
+}
+
+bool socket_t::tls_accept(std::string &) {
+    return false;
+}
+
+bool rpc_tls_supported() {
+    return false;
+}
+
+bool rpc_tls_server_configure(const char *, const char *, const char *, const char *) {
+    LOG_ERROR("TLS: this build has no TLS support (GGML_RPC_TLS=OFF)\n");
+    return false;
+}
+
+bool rpc_tls_server_enabled() {
+    return false;
+}
+
+#endif // GGML_RPC_TLS
