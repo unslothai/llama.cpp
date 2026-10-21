@@ -92,6 +92,8 @@ jobs:
     name: ${{ (matrix.slice || 0) > 0 && format('warm windows/{0} {1}/{2}', matrix.gfx_target, matrix.slice, matrix.slices) || format('windows/{0}', matrix.gfx_target) }}
     runs-on: windows-2022
     continue-on-error: ${{ (matrix.slice || 0) > 0 }}
+    # Warm rows end well before finalize's 335-minute wait, like the CUDA warm jobs; legs keep GitHub's 360.
+    timeout-minutes: ${{ (matrix.slice || 0) > 0 && 150 || 360 }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
     # it there is no place to hang a required reviewer, so anyone who can
