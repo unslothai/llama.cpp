@@ -948,14 +948,10 @@ struct server_group {
 
     llama_context * ctx = nullptr;
 
-    // groups after the first are made by llama_init_from_model(), which does not attach the pool
-    // common_init_from_params() builds for group 0. Declared after ctx so it outlives the
-    // llama_free() above groups.clear().
+    // llama_init_from_model() does not attach a pool to groups > 0; must outlive groups.clear()
     std::unique_ptr<common_threadpools> threadpools;
 
-    // common_speculative_init_result never attaches a pool, so without this the draft context ignores
-    // --cpu-mask-draft, --prio, --poll and --cpu-strict. Declared before spec_init so it is destroyed
-    // after the draft context it is attached to.
+    // the draft context gets no pool otherwise; declared before spec_init so it outlives it
     std::unique_ptr<common_threadpools> threadpools_dft;
 
     server_batch batch;
@@ -1288,13 +1284,9 @@ private:
                 params_ctx.n_ctx = std::min(params_ctx.n_ctx, n_seq_per_group * params_ctx.kv_unified_per_slot);
             }
 
-            // n_ctx is deliberately NOT divided, in either KV mode: -c is what the user asked every
-            // request to be able to reach, and splitting the server into groups is an internal
-            // arrangement that should not quietly redefine it.
+            // n_ctx is deliberately NOT divided: -c is what every request must be able to reach
 
-            // common_init_from_params fits ONE context and fixes the model placement from that
-            // estimate, but the n_groups - 1 other contexts are created afterwards, once placement
-            // can no longer change.
+            // the fitter sizes ONE context; the other n_groups - 1 are created after placement is fixed
             if (params_ctx.fit_params) {
                 reserve_extra_group_memory(params_ctx, has_draft, spec_mtp);
             }
@@ -1895,8 +1887,7 @@ private:
                 added[id]                        += n_extra * per_group;
             };
 
-            // mem holds one entry per device plus a host entry at the back, while fit_params_target
-            // is indexed by device alone (common/fit.cpp builds margins over the nd devices).
+            // mem has a trailing host entry; fit_params_target is indexed by device only
             if (devs_tgt.empty()) {
                 if (!mem.empty()) {
                     charge(0, mem.back());
@@ -1905,8 +1896,7 @@ private:
             }
 
             for (size_t j = 0; j + 1 < mem.size() && j < devs.size(); ++j) {
-                // by device identity, not position: --device-draft may order devices differently, and by
-                // position a draft allocation would be billed to another device's margin.
+                // match by device identity: --device-draft may order devices differently
                 for (size_t id = 0; id < devs_tgt.size(); ++id) {
                     if (devs[j] == devs_tgt[id]) {
                         charge(id, mem[j]);
@@ -1930,8 +1920,7 @@ private:
         }
     }
 
-    // holds every group's lock so slot state is stable; wait_for() then drops the others and
-    // waits out one group's decode. A no-op with a single group.
+    // holds every group's lock; wait_for() drops the others and waits out one group's decode
     struct engine_guard {
         server_context_impl * srv = nullptr;
         std::vector<std::unique_lock<std::mutex>> lks;
@@ -1974,9 +1963,7 @@ private:
                 return;
             }
 
-            // a preceding wait_for() released every other group, and waiting on an unowned
-            // unique_lock is undefined. drop what is left and retake all of them in group order,
-            // the same order the constructor uses, so two guards still cannot deadlock.
+            // wait_for() released the others; retake all in group order so guards cannot deadlock
             for (size_t g = 0; g < srv->groups.size(); ++g) {
                 release(g);
             }
@@ -2948,10 +2935,7 @@ private:
 
         SRV_TRC("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
 
-        // to be called in case of failure to release all launched slots. only this group's slots:
-        // the parent and its children are guaranteed to share a group, and wait_for() released
-        // every other group's lock, so a global scan would read state and task while their workers
-        // write them
+        // on failure, release launched slots of this group only: other groups' locks are released
         auto release_slots = [this, id_parent, &parent_slot]() {
             for (auto * slot : groups[parent_slot.id_group]->slots) {
                 if (slot->is_processing() && (
@@ -3731,9 +3715,7 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            // a long prompt is decoded over many chunks with this group's lock held in between;
-            // give a waiting task thread its turn, or it (and every task queued behind it) waits
-            // for the whole prompt
+            // let a waiting task thread in between chunks of a long prompt
             if (n_groups > 1 && off > 0 && grp.n_pause_req > 0) {
                 grp.cv.wait(lk, [&] { return groups_stop.load(std::memory_order_relaxed) || grp.n_pause_req == 0; });
                 if (groups_stop.load(std::memory_order_relaxed)) {
@@ -4734,8 +4716,7 @@ private:
             } window(&grp, &lk);
 
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            // sync even with no output to read: ~decode_window clears busy, and a task thread that
-            // takes the guard must not touch ctx while the decode is still in flight
+            // sync even with no output: ~decode_window clears busy, ctx must not be mid-decode
             if (ret == 0) {
                 llama_synchronize(ctx_tgt);
             }
