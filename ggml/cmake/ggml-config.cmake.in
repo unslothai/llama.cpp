@@ -85,6 +85,12 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
 
+    # the RPC TLS transport links the system OpenSSL privately; a static ggml-rpc needs it at link time
+    if (GGML_RPC AND GGML_RPC_TLS)
+        find_dependency(OpenSSL)
+        set(GGML_RPC_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:OpenSSL::SSL> $<LINK_ONLY:OpenSSL::Crypto>)
+    endif()
+
     if (GGML_HIP)
         find_dependency(hip)
         find_dependency(hipblas)

@@ -97,7 +97,19 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    std::string              tls_cert;
+    std::string              tls_key;
+    std::string              tls_ca;
+    std::string              tls_allow;
 };
+
+typedef decltype(ggml_backend_rpc_start_server_tls) * rpc_start_server_tls_t;
+
+// present only in builds with the TLS transport (GGML_RPC_TLS)
+static rpc_start_server_tls_t get_start_tls_fn() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    return reg ? (rpc_start_server_tls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server_tls") : nullptr;
+}
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
@@ -108,6 +120,12 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    if (get_start_tls_fn()) {
+        fprintf(stderr, "  --tls-cert FILE                  mutual TLS 1.3: server certificate (PEM)\n");
+        fprintf(stderr, "  --tls-key FILE                   mutual TLS 1.3: server private key (PEM)\n");
+        fprintf(stderr, "  --tls-ca FILE                    mutual TLS 1.3: CA that client certificates must chain to\n");
+        fprintf(stderr, "  --tls-allow FILE                 mutual TLS 1.3: allowed client SHA-256 fingerprints, re-read per connection\n");
+    }
     fprintf(stderr, "\n");
 }
 
@@ -155,6 +173,13 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--tls-cert" || arg == "--tls-key" || arg == "--tls-ca" || arg == "--tls-allow") {
+            if (++i >= argc) {
+                return false;
+            }
+            std::string & dst = arg == "--tls-cert" ? params.tls_cert : arg == "--tls-key" ? params.tls_key
+                              : arg == "--tls-ca"   ? params.tls_ca   : params.tls_allow;
+            dst = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -221,7 +246,19 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    if (params.host != "127.0.0.1") {
+    const bool tls = !params.tls_cert.empty() || !params.tls_key.empty() || !params.tls_ca.empty() || !params.tls_allow.empty();
+    if (tls) {
+        if (params.tls_cert.empty() || params.tls_key.empty() || params.tls_ca.empty() || params.tls_allow.empty()) {
+            fprintf(stderr, "error: --tls-cert, --tls-key, --tls-ca and --tls-allow are required together\n");
+            return 1;
+        }
+        if (!get_start_tls_fn()) {
+            fprintf(stderr, "error: this build has no TLS transport (build with -DGGML_RPC_TLS=ON)\n");
+            return 1;
+        }
+    }
+
+    if (params.host != "127.0.0.1" && !tls) {
         fprintf(stderr, "\n");
         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
@@ -263,6 +300,13 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
+    if (tls) {
+        // returns only when the TLS setup fails or the server stops
+        get_start_tls_fn()(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
+                           params.tls_cert.c_str(), params.tls_key.c_str(), params.tls_ca.c_str(), params.tls_allow.c_str());
+        fprintf(stderr, "error: the TLS server could not start or stopped\n");
+        return 1;
+    }
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;
 }

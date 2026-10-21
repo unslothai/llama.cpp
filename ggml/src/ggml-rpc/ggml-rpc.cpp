@@ -355,14 +355,33 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
     return sock->recv_data(input.data(), size);
 }
 
-static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
+// "host:port", or "tls://<server sha-256 fingerprint>@host:port" for a mutual TLS connection
+static constexpr const char * RPC_TLS_SCHEME = "tls://";
+
+static bool is_tls_endpoint(const std::string & endpoint) {
+    return endpoint.rfind(RPC_TLS_SCHEME, 0) == 0;
+}
+
+static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port, std::string * tls_fingerprint = nullptr) {
+    std::string rest = endpoint;
+    if (is_tls_endpoint(rest)) {
+        rest = rest.substr(strlen(RPC_TLS_SCHEME));
+        const size_t at = rest.find('@');
+        if (at == std::string::npos || at == 0) {
+            return false;
+        }
+        if (tls_fingerprint) {
+            *tls_fingerprint = rest.substr(0, at);
+        }
+        rest = rest.substr(at + 1);
+    }
+    size_t pos = rest.find(':');
     if (pos == std::string::npos) {
         return false;
     }
-    host = endpoint.substr(0, pos);
+    host = rest.substr(0, pos);
     try {
-        port = std::stoi(endpoint.substr(pos + 1));
+        port = std::stoi(rest.substr(pos + 1));
     } catch (...) {
         return false;
     }
@@ -435,7 +454,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    sock->update_caps(response.conn_caps);
+    if (!sock->update_caps(response.conn_caps)) {
+        LOG_ERROR("[%s] could not complete the transport negotiation\n", __func__);
+        return false;
+    }
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
     return true;
@@ -638,7 +660,8 @@ void rpc_dispatcher::busy_spin_release() {
 void rpc_dispatcher::start(const std::string & endpoint) {
     std::string host;
     int port;
-    if (!parse_endpoint(endpoint, host, port)) {
+    std::string tls_fingerprint;
+    if (!parse_endpoint(endpoint, host, port, &tls_fingerprint)) {
         GGML_ABORT("Failed to parse endpoint: %s\n", endpoint.c_str());
     }
     if (!rpc_transport_init()) {
@@ -648,6 +671,9 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+    }
+    if (is_tls_endpoint(endpoint) && !sock->tls_connect(tls_fingerprint)) {
+        GGML_ABORT("TLS connection to %s failed\n", endpoint.c_str());
     }
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
@@ -1410,7 +1436,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
-    bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
+    bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response, bool tls);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
     bool comm_free(const rpc_msg_comm_free_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -2221,8 +2247,13 @@ void rpc_server::sync_all_backends() {
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
 // so it gets the same transport upgrades (e.g. RDMA).
-bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
+bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response, bool tls) {
     response.ok = 0;
+    if (tls) {
+        // the pairwise peer link would be a plaintext socket outside the authenticated channel
+        LOG_WARN("[%s] refused: no pairwise peer links on a TLS server\n", __func__);
+        return true;
+    }
     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
         return true;
     }
@@ -2252,7 +2283,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peer = nullptr;
             return true;
         }
-        state.peer->update_caps(remote_caps);
+        if (!state.peer->update_caps(remote_caps)) {
+            state.peer = nullptr;
+            return true;
+        }
     } else {
         const std::string host(request.host, strnlen(request.host, sizeof(request.host)));
         // rank 0 may not be listening yet, retry for a few seconds
@@ -2272,7 +2306,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peer = nullptr;
             return true;
         }
-        state.peer->update_caps(remote_caps);
+        if (!state.peer->update_caps(remote_caps)) {
+            state.peer = nullptr;
+            return true;
+        }
     }
     state.rank  = request.rank;
     state.world = request.world;
@@ -2469,7 +2506,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 
     // Activate transport upgrade using client's caps
-    sock->update_caps(req.conn_caps);
+    if (!sock->update_caps(req.conn_caps)) {
+        return;
+    }
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
@@ -2709,7 +2748,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_comm_init_rsp response;
-                if (!server.comm_init(request, response)) {
+                if (!server.comm_init(request, response, sock->is_tls())) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
@@ -2759,11 +2798,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+// tls_config: this server's own TLS setup, or nullptr for plain TCP
+static bool rpc_start_server(const char * endpoint, const char * cache_dir, size_t n_threads, size_t n_devices,
+                             ggml_backend_dev_t * devices, const std::shared_ptr<rpc_tls_server_config> & tls_config) {
     if (n_devices == 0 || devices == nullptr) {
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
-        return;
+        return false;
     }
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
@@ -2782,7 +2822,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
-            return;
+            return false;
         }
         backends.push_back(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -2797,30 +2837,44 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
-        return;
+        return false;
     }
 
+    const bool tls = tls_config != nullptr;
+    if (tls) {
+        LOG_INFO("  transport      : TLS 1.3 (mutual, client allowlist)\n");
+    } else {
 #ifdef GGML_RPC_RDMA
-    LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+        LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
-    LOG_INFO("  transport      : TCP\n");
+        LOG_INFO("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA
+    }
     if (!rpc_transport_init()) {
         LOG_ERROR("Failed to initialize RPC transport\n");
-        return;
+        return false;
     }
     auto server_socket = socket_t::create_server(host.c_str(), port);
     if (server_socket == nullptr) {
         LOG_ERROR("Failed to create server socket\n");
-        return;
+        return false;
     }
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
             LOG_ERROR("Failed to accept client connection\n");
-            return;
+            return false;
         }
-        LOG_INFO("Accepted client connection\n");
+        if (tls) {
+            std::string fingerprint;
+            if (!client_socket->tls_accept(*tls_config, fingerprint)) {
+                LOG_WARN("Refused client connection (TLS)\n");
+                continue;
+            }
+            LOG_INFO("Accepted TLS client %s\n", fingerprint.c_str());
+        } else {
+            LOG_INFO("Accepted client connection\n");
+        }
         rpc_serve_client(backends, cache_dir, client_socket);
         LOG_INFO("Client connection closed\n");
     }
@@ -2828,6 +2882,24 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+    return false;
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, nullptr);
+}
+
+bool ggml_backend_rpc_start_server_tls(const char * endpoint, const char * cache_dir,
+                                       size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                       const char * cert, const char * key, const char * ca,
+                                       const char * allow_file) {
+    // loaded here and handed to this server alone, so servers started concurrently never share it
+    std::shared_ptr<rpc_tls_server_config> tls_config = rpc_tls_server_config_load(cert, key, ca, allow_file);
+    if (!tls_config) {
+        return false;
+    }
+    return rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, tls_config);
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
@@ -3001,6 +3073,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
             return nullptr;
         }
         ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
+        if (is_tls_endpoint(rpc_ctx->endpoint)) {
+            return nullptr; // peer links between servers would bypass TLS
+        }
         // one rank per endpoint: a server processes its socket sequentially, so a second
         // COMM_INIT on the same connection would deadlock behind the first
         for (const auto & rank : ranks) {
@@ -3102,6 +3177,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+#ifdef GGML_RPC_TLS
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_tls") == 0) {
+        return (void *)ggml_backend_rpc_start_server_tls;
+    }
+#endif // GGML_RPC_TLS
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;
     }
