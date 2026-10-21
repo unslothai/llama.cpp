@@ -32,6 +32,7 @@ struct test_args {
 
 struct test_params {
     llama_model_ptr model;
+    std::string device = "auto";
 };
 
 static llama_model_ptr load_model(const test_args & args) {
@@ -91,15 +92,17 @@ struct test_context {
             int32_t n_seq_max = -1,
             uint32_t n_outputs_max = 0,
             uint32_t n_ubatch = 0,
-            uint32_t n_outputs_max_per_seq = 1) {
+            uint32_t n_outputs_max_per_seq = 1,
+            uint32_t n_tokens_max = 512) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
         GGML_ASSERT(!ctx);
 
         llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx = 512;
-        cparams.n_batch = 512;
+        // every test batch fits: the parity tests put all their sequences in one batch
+        cparams.n_ctx   = std::max<uint32_t>(512, n_tokens_max);
+        cparams.n_batch = std::max<uint32_t>(512, n_tokens_max);
         if (n_ubatch > 0) {
             cparams.n_ubatch = n_ubatch;
         }
@@ -2137,6 +2140,11 @@ static bool parity_near_tie(const char * name, int seq, uint32_t row, common_sam
         printf("  near-tie %s seq %d row %u: token missing from a candidate list, not tolerated\n", name, seq, row);
         return false;
     }
+    // a candidate without probability is never a tie: its interval is empty, whatever its position
+    if (pcc <= 0.0f || pcg <= 0.0f || pgc <= 0.0f || pgg <= 0.0f) {
+        printf("  near-tie %s seq %d row %u: a token without probability, not tolerated\n", name, seq, row);
+        return false;
+    }
     const double ut = u * total;
     const double dc = dist_to(ut, lc, hc);
     const double dg = dist_to(ut, lg, hg);
@@ -2273,8 +2281,12 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
     }
 
     std::vector<llama_sampler_seq_config> no_configs;
-    test_context ctx_cpu(params, no_configs, (int32_t) seqs.size());
-    test_context ctx_gpu(params, configs,    (int32_t) seqs.size());
+    uint32_t n_tokens = 0;
+    for (const auto & si : seqs) {
+        n_tokens += (uint32_t) si.tokens.size();
+    }
+    test_context ctx_cpu(params, no_configs, (int32_t) seqs.size(), 0, 0, 1, n_tokens);
+    test_context ctx_gpu(params, configs,    (int32_t) seqs.size(), 0, 0, 1, n_tokens);
 
     common_batch batch_cpu(ctx_cpu.ctx.get());
     common_batch batch_gpu(ctx_gpu.ctx.get());
@@ -2350,6 +2362,7 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
         sp.backend_sampling = false;
         si.cpu = common_sampler_init(params.model.get(), sp);
         sp.backend_sampling = true;
+        sp.backend_draft_rows = true; // the rows are verified as a draft, as the server does
         si.gpu = common_sampler_init(params.model.get(), sp);
         for (llama_token t : prompt) {
             common_sampler_accept(si.cpu, t, false);
@@ -2359,8 +2372,9 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
     }
 
     std::vector<llama_sampler_seq_config> no_configs;
-    test_context ctx_cpu(params, no_configs, (int32_t) seqs.size(), 0, n_ubatch, n_rows);
-    test_context ctx_gpu(params, configs,    (int32_t) seqs.size(), 0, n_ubatch, n_rows);
+    const uint32_t n_tokens = (uint32_t) seqs.size() * (uint32_t) (prompt.size() + n_rows - 1);
+    test_context ctx_cpu(params, no_configs, (int32_t) seqs.size(), 0, n_ubatch, n_rows, n_tokens);
+    test_context ctx_gpu(params, configs,    (int32_t) seqs.size(), 0, n_ubatch, n_rows, n_tokens);
 
     common_batch batch_cpu(ctx_cpu.ctx.get());
     common_batch batch_gpu(ctx_gpu.ctx.get());
@@ -2508,7 +2522,13 @@ static synth_candidates synth_run_backend(llama_sampler * chain, const std::vect
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     GGML_ASSERT(backend != nullptr);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-    GGML_ASSERT(chain->iface->backend_init(chain, buft, 1) && "every sampler of a synthetic case runs on the backend");
+    if (!chain->iface->backend_init(chain, buft, 1)) {
+        // a device without every op of the chain: the case is skipped there, the CPU backend still runs it
+        ggml_backend_free(backend);
+        synth_candidates res;
+        res.n_dims = 0;
+        return res;
+    }
 
     const size_t n_graph = 4096;
     ggml_init_params ip = { ggml_tensor_overhead()*n_graph + ggml_graph_overhead_custom(n_graph, false), nullptr, true };
@@ -2567,8 +2587,6 @@ static synth_candidates synth_run_backend(llama_sampler * chain, const std::vect
 }
 
 static void test_synthetic_parity(const test_params & params) {
-    GGML_UNUSED(params);
-
     struct synth_case {
         const char * name;
         std::vector<float> logits;
@@ -2592,15 +2610,40 @@ static void test_synthetic_parity(const test_params & params) {
             const llama_logit_bias lb[] = { { 3, 10.0f }, { 3, -100.0f } };
             llama_sampler_chain_add(c, llama_sampler_init_top_k(2));
             llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 2, lb)); } },
+        // a computed dynamic temperature of 0 is greedy (only the first maximum is left), not a tiny temperature
+        { "dynatemp_zero_temp", { 1, 1000, -1000, 3 }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.0f, 1.0f, 1.0f)); } },
+        // a tiny positive dynamic temperature divides as on the CPU (no clamp)
+        { "dynatemp_tiny_temp", { 0, 1e-30f, 2e-30f, 3e-30f }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(1e-30f, 1e-31f, 1.0f)); } },
+        // candidate ids stay 1-D through reordering samplers (a 2-D layout aborted the next gather)
+        { "min_p_top_k_top_k", { 8, 7, 6, 5, 4, 3, 2, 1 }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_min_p(0.3f, 3));
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(2));
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(2)); } },
+        { "temp_ext_top_k_min_p_bias", { 6, 5, 4, 3, 2, 1 }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 0, 1.0f }, { 1, 1.0f }, { 2, 1.0f } };
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(1.0f, 0.1f, 1.0f));
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(3));
+            llama_sampler_chain_add(c, llama_sampler_init_min_p(0.001f, 1));
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(6, 3, lb)); } },
+        { "greedy_top_k", { 0, 3, 1, 4, 2 }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(4));
+            llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f));
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(1)); } },
+        // top-p where the running sum rounds to p exactly: both sides stop at the same candidate
+        { "top_p_boundary", { 0, 1e-9f, 2e-9f, 3e-9f, 4e-9f, 5e-9f, 6e-9f, 7e-9f, 8e-9f, 9e-9f }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_top_p(0.3f, 1)); } },
         // top-k exports 1-D logits like every other backend sampler
         { "top_k_temp", { 0, 3, 1, 2, 5 }, [](llama_sampler * c) {
             llama_sampler_chain_add(c, llama_sampler_init_top_k(3));
             llama_sampler_chain_add(c, llama_sampler_init_temp(0.5f)); } },
     };
 
+    // the device the test was asked for (--device cpu: the CPU backend only), and always the CPU backend
     std::vector<ggml_backend_dev_t> devs;
-    if (auto * d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
-        devs.push_back(d);
+    if (params.device != "cpu") {
+        if (auto * d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+            devs.push_back(d);
+        }
     }
     devs.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
 
@@ -2613,6 +2656,15 @@ static void test_synthetic_parity(const test_params & params) {
             sc.build(c_bk);
             const synth_candidates rc = synth_run_cpu(c_cpu, sc.logits);
             const synth_candidates rb = synth_run_backend(c_bk, sc.logits, dev);
+            if (rb.n_dims == 0) {
+                printf("synthetic %-26s %-6s SKIP (the device does not support every op of the chain)\n", sc.name, ggml_backend_dev_name(dev));
+                llama_sampler_free(c_cpu);
+                llama_sampler_free(c_bk);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    n_fail++; // the CPU backend runs every op
+                }
+                continue;
+            }
             bool ok = rc.finite.size() == rb.finite.size() && rb.n_dims == 1;
             for (const auto & [id, l] : rc.finite) {
                 const auto it = rb.finite.find(id);
@@ -2704,6 +2756,58 @@ static void test_all_masked_row(const test_params & params) {
     llama_sampler_free(ref);
     common_sampler_free(gpu);
     printf("backend all-masked row test PASSED\n");
+}
+
+// several outputs of one sequence that are not a draft (the caller accepted the whole prompt and samples one of
+// its rows): without backend_draft_rows the penalties use the history the caller accepted, as the CPU sampler
+static void test_multi_output_prompt_penalties(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "the the the the the the the the");
+    const uint32_t n_rows = (uint32_t) prompt.size();
+
+    common_params_sampling sp = parity_base_params();
+    sp.top_k = 40;
+    sp.penalty_present = 2.0f;
+    sp.penalty_freq    = 0.5f;
+    sp.seed = 11;
+    sp.backend_sampling = false;
+    common_sampler * cpu = common_sampler_init(params.model.get(), sp);
+    sp.backend_sampling = true;
+    common_sampler * gpu = common_sampler_init(params.model.get(), sp);
+    for (llama_token t : prompt) {
+        common_sampler_accept(cpu, t, false);
+        common_sampler_accept(gpu, t, false);
+    }
+
+    std::vector<llama_sampler_seq_config> no_configs;
+    std::vector<llama_sampler_seq_config> configs = { { 0, common_sampler_get(gpu) } };
+    test_context ctx_cpu(params, no_configs, 1, 0, 0, n_rows);
+    test_context ctx_gpu(params, configs,    1, 0, 0, n_rows);
+
+    common_batch batch_cpu(ctx_cpu.ctx.get());
+    common_batch batch_gpu(ctx_gpu.ctx.get());
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        batch_cpu.add(prompt[i], (llama_pos) i, 0, true);
+        batch_gpu.add(prompt[i], (llama_pos) i, 0, true);
+    }
+    GGML_ASSERT(llama_process(ctx_cpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_cpu.get()) == 0);
+    GGML_ASSERT(llama_process(ctx_gpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_gpu.get()) == 0);
+
+    // only the last row is sampled
+    const int32_t idx = (int32_t) prompt.size() - 1;
+    const llama_token tc = common_sampler_sample(cpu, ctx_cpu.ctx.get(), idx);
+    const llama_token tg = common_sampler_sample(gpu, ctx_gpu.ctx.get(), idx);
+    parity_case pc = { "prompt_rows", [](common_params_sampling &) {} };
+    parity_stats st;
+    compare_candidates(pc, cpu, gpu, st);
+    // the candidates and their probabilities come from the chain before dist: they do not depend on the draw (the
+    // backend dist takes draw g for row g, so the tokens are not compared)
+    printf("multi-output prompt penalties: cpu %d gpu %d set_diff %d max_p_diff %.2e\n", tc, tg, st.n_set_diff, st.max_p_diff);
+    GGML_ASSERT(st.n_set_diff == 0 && st.max_p_diff < 1e-4f);
+
+    common_sampler_free(cpu);
+    common_sampler_free(gpu);
+    printf("backend multi-output prompt penalties test PASSED\n");
 }
 
 static void test_cpu_parity(const test_params & params) {
@@ -2817,7 +2921,9 @@ static void test_multi_output_ubatch_split(const test_params & params) {
             for (int i = 0; i < n_vocab; ++i) { z += exp(logits[i] - m); }
             float d = 0.0f;
             for (int i = 0; i < n_vocab; ++i) {
-                d = std::max(d, fabsf((float) (exp(logits[i] - m)/z) - probs[i]));
+                const float expected = (float) (exp(logits[i] - m)/z);
+                // a NaN probability is a wrong row (std::max would keep d and skip it)
+                d = std::isfinite(probs[i]) && probs[i] >= 0.0f ? std::max(d, fabsf(expected - probs[i])) : INFINITY;
             }
             if (!(d < 1e-4f)) {
                 if (n_bad < 4) {
@@ -2869,6 +2975,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_ubatch_split",           test_multi_output_ubatch_split,        true },
     // GPU vs CPU parity of whole chains, per sampler and edge value
     { "test_synthetic_parity",                    test_synthetic_parity,                 true },
+    { "test_multi_output_prompt_penalties",       test_multi_output_prompt_penalties,    true },
     { "test_all_masked_row",                      test_all_masked_row,                   true },
     { "test_cpu_parity",                          test_cpu_parity,                       true },
     { "test_cpu_parity_multi_output",             test_cpu_parity_multi_output,          true },
@@ -3010,8 +3117,15 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
+    llama_model_ptr model = load_model(args);
+    if (!model) {
+        fprintf(stderr, "Error: failed to load model '%s'\n", args.model.c_str());
+        return EXIT_FAILURE;
+    }
+
     test_params params = {
-        /*.model =*/ load_model(args),
+        /*.model  =*/ std::move(model),
+        /*.device =*/ args.device,
     };
 
     const std::vector<const backend_test_case *> tests = collect_tests_to_run(args.test);
