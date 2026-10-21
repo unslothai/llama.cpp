@@ -878,6 +878,32 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 
+    // a new plan for a graph with the same tensor slots as the previous plan keeps the outputs that plan covered
+    // (they are marked as outputs while planning): the plan grows to the union of the outputs seen and then holds,
+    // where a plan of only the current outputs would be made again every time the outputs alternate (the rows of
+    // the sequences of one decode split across ubatches, see ggml_gallocr_needs_realloc)
+    struct ggml_tensor ** union_outputs = NULL;
+    size_t n_union_outputs = 0;
+    if (galloc->lifetime_bits != NULL && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs &&
+            galloc->n_lifetime_bits == ggml_gallocr_n_lifetime_bits(graph)) {
+        union_outputs = malloc(sizeof(struct ggml_tensor *) * galloc->n_lifetime_bits);
+        GGML_ASSERT(union_outputs != NULL);
+        size_t k = 0;
+        for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
+            const bool is_node = i < graph->n_nodes;
+            struct ggml_tensor * t = is_node ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+            for (int j = -1; j < (is_node ? GGML_MAX_SRC : 0); j++) {
+                struct ggml_tensor * ts = j < 0 ? t : t->src[j];
+                const uint8_t planned = galloc->lifetime_bits[k++];
+                if (ts != NULL && (planned & 1) && (planned & 4) && !(ts->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    ts->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                    union_outputs[n_union_outputs++] = ts;
+                }
+            }
+        }
+        GGML_ASSERT(k == galloc->n_lifetime_bits);
+    }
+
     // reset allocators
     for (int i = 0; i < galloc->n_buffers; i++) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
@@ -962,6 +988,12 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         GGML_ASSERT(k == n_bits);
     }
+
+    // the outputs kept from the previous plan are recorded in the plan, the graph gets its own flags back
+    for (size_t i = 0; i < n_union_outputs; i++) {
+        union_outputs[i]->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    }
+    free(union_outputs);
 
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {

@@ -1143,6 +1143,43 @@ static void test_plan_follows_output_flags() {
     }
 }
 
+// The outputs of a graph of one shape can alternate (the rows of the sequences of one decode split across ubatches):
+// the plan made again when a tensor becomes an output keeps the outputs the previous plan covered, so it converges to
+// their union and is not made again on every alternation (a plan of only the current outputs would let c take b's
+// memory while a is the output, and be made again each time)
+static void test_plan_keeps_union_of_outputs() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    for (int pass = 0; pass < 6; ++pass) {
+        const bool a_is_output = pass % 2 == 0;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * in = make_input_with_size(ctx, 64);
+        ggml_tensor * a  = ggml_scale(ctx, in, 2.0f);
+        ggml_tensor * b  = ggml_scale(ctx, a,  2.0f);
+        ggml_tensor * c  = ggml_scale(ctx, b,  2.0f); // can take b's memory unless b is an output
+        ggml_tensor * d  = ggml_scale(ctx, c,  2.0f);
+        ggml_set_output(a_is_output ? a : b);
+        ggml_set_output(d);
+        ggml_build_forward_expand(graph, d);
+        assign_names(ctx);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        // a is an output now, or was one in the plan kept from pass 0 on
+        GGML_ASSERT(!memory_overlap(a, b));
+        GGML_ASSERT(!memory_overlap(a, c));
+        if (!a_is_output || pass >= 2) {
+            // b is an output now, or was one in a plan that is kept from pass 1 on
+            GGML_ASSERT(!memory_overlap(b, c));
+            GGML_ASSERT(!memory_overlap(b, d));
+        }
+        // the graph keeps its own flags
+        GGML_ASSERT(((b->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) == !a_is_output);
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1177,5 +1214,6 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
     run("test_plan_follows_output_flags", test_plan_follows_output_flags);
+    run("test_plan_keeps_union_of_outputs", test_plan_keeps_union_of_outputs);
     return 0;
 }
