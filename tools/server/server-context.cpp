@@ -1936,9 +1936,10 @@ private:
             try {
                 // the server outputs several rows of a sequence only to verify a draft of token ids, sampled with
                 // common_sampler_sample_and_accept_n(_rejection): the backend penalties may follow those rows
-                common_params_sampling sparams = task.params.sampling;
-                sparams.backend_draft_rows = slot.can_speculate();
-                slot.smpl.reset(common_sampler_init(model_tgt, sparams));
+                // (set on the task's own params: common_sampler_init can turn backend_sampling off there, e.g. for a
+                // grammar, and the code below reads it back to decide whether the slot gets a backend sampler)
+                task.params.sampling.backend_draft_rows = slot.can_speculate();
+                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
