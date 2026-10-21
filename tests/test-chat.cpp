@@ -6705,6 +6705,46 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Reflection Beam (Harmony with XML tool calls)
+    {
+        auto tst = peg_tester("models/templates/reflection-Beam-1.0-501B-A23B.jinja", detailed_debug);
+
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|constrain|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // empty analysis closed with <|constrain|><|constrain|> instead of <|end|><|start|>
+        tst.test("<|channel|>analysis<|message|><|constrain|><|constrain|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|constrain|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // a stray <|constrain|> at the start of the analysis stays reasoning
+        tst.test("<|channel|>analysis<|message|><|constrain|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("<|constrain|>I'm\nthinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        // partial analysis ending in <|constrain|> is still reasoning while streaming
+        tst.test("<|channel|>analysis<|message|>I'm\nthinking<|constrain|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect_reasoning("I'm\nthinking")
+            .run();
+    }
+
     // GPT-OSS format tests
     {
         auto tst = peg_tester("models/templates/openai-gpt-oss-120b.jinja", detailed_debug);
