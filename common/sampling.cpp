@@ -214,7 +214,8 @@ struct common_sampler * common_sampler_init(
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
-    lparams.no_perf = params.no_perf;
+    lparams.no_perf            = params.no_perf;
+    lparams.backend_draft_rows = params.backend_draft_rows;
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;

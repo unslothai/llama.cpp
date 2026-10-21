@@ -1345,7 +1345,9 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
         std::vector<llama_token> rows_tokens;
         for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
             if (ubatch->output[i] && ubatch->seq_id[i][0] == seq_id) {
-                rows_tokens.push_back(ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL);
+                // an embedding row has no token id (a mixed batch stores a placeholder there)
+                const bool token_row = ubatch->token != nullptr && (!ubatch->is_mixed() || !ubatch->type[i]);
+                rows_tokens.push_back(token_row ? ubatch->token[i] : LLAMA_TOKEN_NULL);
             }
         }
 

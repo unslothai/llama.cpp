@@ -1934,7 +1934,11 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                // the server outputs several rows of a sequence only to verify a draft of token ids, sampled with
+                // common_sampler_sample_and_accept_n(_rejection): the backend penalties may follow those rows
+                common_params_sampling sparams = task.params.sampling;
+                sparams.backend_draft_rows = slot.can_speculate();
+                slot.smpl.reset(common_sampler_init(model_tgt, sparams));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
