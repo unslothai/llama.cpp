@@ -1401,6 +1401,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_sampling_chains.clear();
 
     params = {};
 
@@ -4150,6 +4151,12 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                if (t != nullptr) {
+                    res->t_sampling_chains.push_back(t);
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

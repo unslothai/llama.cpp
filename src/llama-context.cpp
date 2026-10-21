@@ -2666,6 +2666,16 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
+    // the reserve plans the worst case of the sampling outputs: a decode outputs the results of the chains of the
+    // rows it samples, which can be any of them (the reserve ubatch has fewer rows than n_seqs*n_outputs_max_per_seq
+    // when n_ubatch is small), and a plan made with every chain's results as outputs covers all of them, so the
+    // allocator does not plan again when the sampled rows change (ggml_gallocr_needs_realloc)
+    if (gf) {
+        for (ggml_tensor * t : res->t_sampling_chains) {
+            ggml_set_output(t);
+        }
+    }
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
