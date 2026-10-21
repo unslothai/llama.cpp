@@ -8501,6 +8501,22 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// large Q values, so the online softmax has to rescale the partial results
+struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+    static constexpr int q_range = 20;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",q_range=" + std::to_string(q_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
+    }
+};
+
 // mask of a unified KV cache shared by several sequences: each query only sees the cells of its own sequence,
 // the cells of the sequences are interleaved in chunks, and the cells past the last used one are empty
 struct test_flash_attn_ext_multi_seq : public test_flash_attn_ext {
@@ -8535,22 +8551,6 @@ struct test_flash_attn_ext_multi_seq : public test_flash_attn_ext {
         }
         ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f32.size());
         ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
-    }
-};
-
-// large Q values, so the online softmax has to rescale the partial results
-struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
-    static constexpr int q_range = 20;
-
-    using test_flash_attn_ext::test_flash_attn_ext;
-
-    std::string vars() override {
-        return test_flash_attn_ext::vars() + ",q_range=" + std::to_string(q_range);
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        test_flash_attn_ext::initialize_tensors(ctx);
-        init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
     }
 };
 
