@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cctype>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1840,9 +1842,12 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         !ggml_backend_sched_is_host_weight(input) && input->data != NULL && ggml_nbytes(input) > 0) {
         ggml_backend_buffer_t input_buf = input->view_src ? input->view_src->buffer : input->buffer;
         ggml_backend_buffer_t cpy_buf   = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+        // input_cpy has the layout of input (ggml_dup_tensor_layout), so copying the ggml_nbytes span from input->data
+        // is the copy ggml_backend_tensor_copy makes, also for non-contiguous views; any other layout takes that path
         if (input_buf != NULL && ggml_backend_buffer_is_host(input_buf) && cpy_buf != NULL &&
-            ggml_backend_buffer_get_type(cpy_buf) == ggml_backend_get_default_buffer_type(split_backend)) {
-            if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+            ggml_backend_buffer_get_type(cpy_buf) == ggml_backend_get_default_buffer_type(split_backend) &&
+            ggml_are_same_layout(input, input_cpy)) {
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && input_backend != NULL) {
                 // an intermediate produced by another backend into host memory (partial offload, pinned host
                 // buffers): wait for its producer as the copy below does (a no-op for the CPU backend)
                 ggml_backend_synchronize(input_backend);
@@ -2006,9 +2011,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 // previous graph may still read. Only the ggml-cuda backends are known to do this (cudaMemcpyAsync / hipMemcpyAsync /
 // musaMemcpyAsync on the backend stream), so no other backend is ever enabled.
 // GGML_SCHED_ASYNC_INPUTS: unset = CUDA only (ROCm and MUSA share the code but were not measured),
-// 0 = never, 1 = CUDA, ROCm and MUSA
+// 0 / false / off / no = never, 1 / true / on / yes = CUDA, ROCm and MUSA (case-insensitive; other values: the default)
+static int ggml_backend_sched_parse_bool_env(const char * name) {
+    const char * env = getenv(name);
+    if (env == NULL) {
+        return -1;
+    }
+    std::string v(env);
+    for (char & c : v) {
+        c = (char) tolower((unsigned char) c);
+    }
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        return 1;
+    }
+    if (v == "0" || v == "false" || v == "off" || v == "no") {
+        return 0;
+    }
+    GGML_LOG_WARN("%s: ignoring unrecognized value %s=%s\n", __func__, name, env);
+    return -1;
+}
+
 static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
-    if (backend->iface.set_tensor_async == NULL || backend->device == NULL) {
+    if (backend == NULL || backend->iface.set_tensor_async == NULL || backend->device == NULL) {
         return false;
     }
     if (ggml_backend_dev_type(backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -2021,9 +2045,9 @@ static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
     }
     const bool is_cuda        = strcmp(name, "CUDA") == 0;
     const bool is_cuda_family = is_cuda || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
-    const char * env = getenv("GGML_SCHED_ASYNC_INPUTS");
-    if (env != NULL) {
-        return atoi(env) != 0 && is_cuda_family;
+    const int env = ggml_backend_sched_parse_bool_env("GGML_SCHED_ASYNC_INPUTS");
+    if (env >= 0) {
+        return env == 1 && is_cuda_family;
     }
     return is_cuda;
 }
