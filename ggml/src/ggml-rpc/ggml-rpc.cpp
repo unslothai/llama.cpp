@@ -1436,7 +1436,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
-    bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
+    bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response, bool tls);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
     bool comm_free(const rpc_msg_comm_free_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -2247,9 +2247,9 @@ void rpc_server::sync_all_backends() {
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
 // so it gets the same transport upgrades (e.g. RDMA).
-bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
+bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response, bool tls) {
     response.ok = 0;
-    if (rpc_tls_server_enabled()) {
+    if (tls) {
         // the pairwise peer link would be a plaintext socket outside the authenticated channel
         LOG_WARN("[%s] refused: no pairwise peer links on a TLS server\n", __func__);
         return true;
@@ -2748,7 +2748,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_comm_init_rsp response;
-                if (!server.comm_init(request, response)) {
+                if (!server.comm_init(request, response, sock->is_tls())) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
@@ -2843,7 +2843,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         return;
     }
 
-    const bool tls = rpc_tls_server_enabled();
+    // this server's own TLS configuration: a later ggml_backend_rpc_server_set_tls() is for the next one
+    const std::shared_ptr<rpc_tls_server_config> tls_config = rpc_tls_server_take();
+    const bool                                   tls        = tls_config != nullptr;
     if (tls) {
         LOG_INFO("  transport      : TLS 1.3 (mutual, client allowlist)\n");
     } else {
@@ -2870,7 +2872,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         if (tls) {
             std::string fingerprint;
-            if (!client_socket->tls_accept(fingerprint)) {
+            if (!client_socket->tls_accept(*tls_config, fingerprint)) {
                 LOG_WARN("Refused client connection (TLS)\n");
                 continue;
             }

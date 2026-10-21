@@ -94,4 +94,14 @@ run refused "revoked (allowlist emptied)"          client "tls://$S@127.0.0.1:$p
 fp client > "$dir/allow"
 run ok      "re-allowed, server still serving"     client "tls://$S@127.0.0.1:$port"
 run ok      "plain server unaffected"              client "127.0.0.1:$((port + 1))"
+
+# two TLS servers in one process: configuring the second must not change the first one's certificate
+leaf serverB caA
+"$client" --two-servers "$dir/server.crt" "$dir/server.key" "$dir/serverB.crt" "$dir/serverB.key" \
+    "$dir/caA.crt" "$dir/allow" $((port + 2)) $((port + 3)) > "$dir/two_servers.log" 2>&1 &
+pids+=($!)
+wait_port $((port + 2)) && wait_port $((port + 3)) || { echo "FAIL two servers did not start"; cat "$dir/two_servers.log"; fail=1; }
+sleep 1
+run ok      "first of two servers keeps its own certificate"  client "tls://$S@127.0.0.1:$((port + 2))"
+run ok      "second of two servers uses its own certificate"  client "tls://$(fp serverB)@127.0.0.1:$((port + 3))"
 exit $fail

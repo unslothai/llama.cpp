@@ -1,5 +1,7 @@
 // Byte-exact SET_TENSOR / GET_TENSOR through one RPC endpoint (plain "host:port" or "tls://<fp>@host:port").
 // usage: test-rpc-tls <endpoint> [MiB]   (exit 0 = round trip exact; a refused TLS peer aborts non-zero)
+//        test-rpc-tls --two-servers <certA> <keyA> <certB> <keyB> <ca> <allow> <portA> <portB>
+//        (two TLS servers in one process, each configured just before it starts; runs until killed)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -7,9 +9,34 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
+
+static int two_servers(char ** a) {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu) {
+        fprintf(stderr, "no CPU device\n");
+        return 1;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!ggml_backend_rpc_server_set_tls(a[2 * i], a[2 * i + 1], a[4], a[5])) {
+            return 1;
+        }
+        const std::string endpoint = std::string("127.0.0.1:") + a[6 + i];
+        std::thread([endpoint, cpu]() mutable {
+            ggml_backend_rpc_start_server(endpoint.c_str(), nullptr, 1, 1, &cpu);
+        }).detach();
+        // the server takes its configuration as it starts; only then configure the next one
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+    }
+}
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -17,6 +44,13 @@ int main(int argc, char ** argv) {
         return 2;
     }
     ggml_backend_load_all();
+    if (strcmp(argv[1], "--two-servers") == 0) {
+        if (argc < 10) {
+            fprintf(stderr, "usage: %s --two-servers certA keyA certB keyB ca allow portA portB\n", argv[0]);
+            return 2;
+        }
+        return two_servers(argv + 2);
+    }
     const char * endpoint = argv[1];
     const size_t mib      = argc > 2 ? (size_t) atoi(argv[2]) : 64;
     const int64_t n       = (int64_t) (mib * 1024 * 1024 / sizeof(float));

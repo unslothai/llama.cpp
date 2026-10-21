@@ -1040,8 +1040,13 @@ static SSL_CTX * tls_ctx_new(bool server, const char * cert, const char * key, c
         tls_log_errors("TLS: cannot create context");
         return nullptr;
     }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    // TLS 1.3 or nothing: a library that cannot pin both bounds would otherwise negotiate older versions
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1 ||
+        SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1) {
+        tls_log_errors("TLS: this TLS library cannot enforce TLS 1.3");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
 #ifndef OPENSSL_IS_BORINGSSL
     SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384");
@@ -1160,14 +1165,26 @@ static void tls_close_notify(SSL * ssl, sockfd_t fd) {
     ERR_clear_error();
 }
 
-struct tls_server_state {
-    std::mutex  mu;
+// One listening server's certificate, CA and allowlist. rpc_tls_server_configure() prepares the
+// configuration for the server started next, which takes it: a later configure never changes a
+// server that is already listening.
+struct rpc_tls_server_config {
     SSL_CTX *   ctx = nullptr;
     std::string allow_file;
+    ~rpc_tls_server_config() {
+        if (ctx) {
+            SSL_CTX_free(ctx);
+        }
+    }
 };
 
-static tls_server_state & tls_server() {
-    static tls_server_state st;
+struct tls_pending_state {
+    std::mutex                             mu;
+    std::shared_ptr<rpc_tls_server_config> next;
+};
+
+static tls_pending_state & tls_pending() {
+    static tls_pending_state st;
     return st;
 }
 
@@ -1286,18 +1303,12 @@ bool socket_t::tls_connect(const std::string & server_fingerprint) {
     return true;
 }
 
-bool socket_t::tls_accept(std::string & client_fingerprint) {
-    tls_server_state & st = tls_server();
-    SSL *              ssl = nullptr;
-    std::string        allow_file;
-    {
-        std::lock_guard<std::mutex> lock(st.mu);
-        if (!st.ctx) {
-            return false;
-        }
-        ssl        = SSL_new(st.ctx);
-        allow_file = st.allow_file;
+bool socket_t::tls_accept(const rpc_tls_server_config & config, std::string & client_fingerprint) {
+    if (!config.ctx) {
+        return false;
     }
+    SSL *               ssl        = SSL_new(config.ctx);
+    const std::string & allow_file = config.allow_file;
     if (!ssl || SSL_set_fd(ssl, (int) pimpl->fd) != 1) {
         tls_log_errors("TLS: cannot create session");
         SSL_free(ssl);
@@ -1336,20 +1347,19 @@ bool rpc_tls_server_configure(const char * cert, const char * key, const char * 
         SSL_CTX_free(ctx);
         return false;
     }
-    tls_server_state &          st = tls_server();
+    auto config        = std::make_shared<rpc_tls_server_config>();
+    config->ctx        = ctx;
+    config->allow_file = allow_file;
+    tls_pending_state &         st = tls_pending();
     std::lock_guard<std::mutex> lock(st.mu);
-    if (st.ctx) {
-        SSL_CTX_free(st.ctx);
-    }
-    st.ctx        = ctx;
-    st.allow_file = allow_file;
+    st.next = std::move(config);
     return true;
 }
 
-bool rpc_tls_server_enabled() {
-    tls_server_state &          st = tls_server();
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take() {
+    tls_pending_state &         st = tls_pending();
     std::lock_guard<std::mutex> lock(st.mu);
-    return st.ctx != nullptr;
+    return std::move(st.next);
 }
 
 #else // !GGML_RPC_TLS
@@ -1359,7 +1369,9 @@ bool socket_t::tls_connect(const std::string &) {
     return false;
 }
 
-bool socket_t::tls_accept(std::string &) {
+struct rpc_tls_server_config {};
+
+bool socket_t::tls_accept(const rpc_tls_server_config &, std::string &) {
     return false;
 }
 
@@ -1372,8 +1384,8 @@ bool rpc_tls_server_configure(const char *, const char *, const char *, const ch
     return false;
 }
 
-bool rpc_tls_server_enabled() {
-    return false;
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take() {
+    return nullptr;
 }
 
 #endif // GGML_RPC_TLS

@@ -7,6 +7,7 @@
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
+struct rpc_tls_server_config; // one TLS server's certificate, CA and allowlist
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
@@ -30,10 +31,10 @@ struct socket_t {
 
     // Mutual TLS 1.3 on an already connected TCP socket (GGML_RPC_TLS builds; false otherwise).
     // Client: verifies the server chain against GGML_RPC_TLS_CA and pins its leaf SHA-256 fingerprint,
-    // presenting GGML_RPC_TLS_CERT / GGML_RPC_TLS_KEY. Server: uses the rpc_tls_server_configure() setup
+    // presenting GGML_RPC_TLS_CERT / GGML_RPC_TLS_KEY. Server: uses its listener's configuration
     // and admits only client leaves whose fingerprint is in the allowlist file, re-read per connection.
     bool tls_connect(const std::string & server_fingerprint);
-    bool tls_accept(std::string & client_fingerprint);
+    bool tls_accept(const rpc_tls_server_config & config, std::string & client_fingerprint);
     bool is_tls() const;
 
     static socket_ptr create_server(const char * host, int port);
@@ -49,6 +50,8 @@ bool rpc_transport_init();
 void rpc_transport_shutdown();
 
 bool rpc_tls_supported();
-// load the server certificate, key and CA once; the allowlist path is re-read on every accept
+// load the server certificate, key and CA once, for the server started next; the allowlist path is
+// re-read on every accept
 bool rpc_tls_server_configure(const char * cert, const char * key, const char * ca, const char * allow_file);
-bool rpc_tls_server_enabled();
+// hand the prepared configuration to the server starting now (nullptr: plain TCP); clears it
+std::shared_ptr<rpc_tls_server_config> rpc_tls_server_take();
