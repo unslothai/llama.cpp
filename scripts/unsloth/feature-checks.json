@@ -65,6 +65,7 @@
       ]
     },
     "muse-spark": { "owner": null, "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
+    "flint": { "owner": "unslothai#314", "checks": [ { "kind": "arch", "arch": "flint" } ] },
     "beam": { "owner": null, "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": null,
