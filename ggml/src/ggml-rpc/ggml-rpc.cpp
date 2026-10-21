@@ -497,7 +497,6 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
-    // teardown-only commands: a lost peer is reported, not aborted on
     bool try_send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
@@ -509,7 +508,6 @@ public:
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
 
-    // false with `error` set when the peer cannot be reached or the handshake fails
     bool start(const std::string & endpoint, std::string & error);
     void work();
 
@@ -1389,7 +1387,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     auto request = std::make_shared<rpc_msg_get_device_memory_req>();
     request->device = device;
     rpc_msg_get_device_memory_rsp response;
-    // informational, also queried at teardown when the peer may be gone: report 0 instead of aborting
+    // also queried at teardown when the peer may be gone: report 0, never abort
     auto dispatcher = get_dispatcher(endpoint, false);
     if (dispatcher == nullptr || !dispatcher->try_send(RPC_CMD_GET_DEVICE_MEMORY, request, sizeof(*request), &response, sizeof(response))) {
         GGML_LOG_ERROR("%s: failed to query device memory of %s, reporting 0\n", __func__, endpoint);

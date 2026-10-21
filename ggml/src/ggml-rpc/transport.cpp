@@ -754,7 +754,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
-    // owns sockfd from here, so every failure below closes it (callers may now retry a lost peer)
+    // owns sockfd so every failure below closes it
     auto owner = std::make_unique<impl>(sockfd);
     if (!set_no_delay(sockfd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
