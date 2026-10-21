@@ -1842,6 +1842,11 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_buffer_t cpy_buf   = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
         if (input_buf != NULL && ggml_backend_buffer_is_host(input_buf) && cpy_buf != NULL &&
             ggml_backend_buffer_get_type(cpy_buf) == ggml_backend_get_default_buffer_type(split_backend)) {
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                // an intermediate produced by another backend into host memory (partial offload, pinned host
+                // buffers): wait for its producer as the copy below does (a no-op for the CPU backend)
+                ggml_backend_synchronize(input_backend);
+            }
             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
             return true;
         }
@@ -1915,7 +1920,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                host_read_pending |= ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                // host weights never take the async host path, so this cannot add a pending host read
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
 
@@ -1936,6 +1942,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                // the caller may overwrite or free the host data of the queued input copies once this returns
+                if (input_event != NULL) {
+                    ggml_backend_event_synchronize(input_event);
+                }
                 return ec;
             }
         } else {
@@ -1958,6 +1968,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    if (input_event != NULL) {
+                        ggml_backend_event_synchronize(input_event);
+                    }
                     return ec;
                 }
 
@@ -1988,9 +2001,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
-// GGML_SCHED_ASYNC_INPUTS: unset = the CUDA backend only (its host-to-device copies are DMA transfers either way;
-// other backends, e.g. Vulkan with host-visible device memory, may copy inputs with a plain memcpy today),
-// 0 = never, 1 = every backend that implements set_tensor_async
+// The async input path needs a set_tensor_async that is ordered after the work already queued on the backend: with no
+// wait before the copy, a write that lands immediately (e.g. Hexagon's, a plain memcpy) would overwrite an input that the
+// previous graph may still read. Only the ggml-cuda backends are known to do this (cudaMemcpyAsync / hipMemcpyAsync /
+// musaMemcpyAsync on the backend stream), so no other backend is ever enabled.
+// GGML_SCHED_ASYNC_INPUTS: unset = CUDA only (ROCm and MUSA share the code but were not measured),
+// 0 = never, 1 = CUDA, ROCm and MUSA
 static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
     if (backend->iface.set_tensor_async == NULL || backend->device == NULL) {
         return false;
@@ -1998,13 +2014,18 @@ static bool ggml_backend_sched_async_inputs_default(ggml_backend_t backend) {
     if (ggml_backend_dev_type(backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         return false;
     }
-    const char * env = getenv("GGML_SCHED_ASYNC_INPUTS");
-    if (env != NULL) {
-        return atoi(env) != 0;
-    }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
     const char * name = reg ? ggml_backend_reg_name(reg) : NULL;
-    return name != NULL && strcmp(name, "CUDA") == 0;
+    if (name == NULL) {
+        return false;
+    }
+    const bool is_cuda        = strcmp(name, "CUDA") == 0;
+    const bool is_cuda_family = is_cuda || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
+    const char * env = getenv("GGML_SCHED_ASYNC_INPUTS");
+    if (env != NULL) {
+        return atoi(env) != 0 && is_cuda_family;
+    }
+    return is_cuda;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
