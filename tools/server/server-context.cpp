@@ -4795,6 +4795,11 @@ private:
             return false;  // n_cmpl > 1 slots share one sequence
         }
 
+        // TTS and realtime transcription slots feed their own decode loop, not a token prompt a resume could replay
+        if (slot.task && (slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_TRANSCRIBE_RT)) {
+            return false;
+        }
+
         // A started slot about to be rejected gets its own 4xx; a park notice would turn it into 200 plus an in-stream error.
         if (slot.state == SLOT_STATE_STARTED) {
             std::string msg;
