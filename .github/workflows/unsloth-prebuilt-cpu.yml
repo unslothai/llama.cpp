@@ -590,6 +590,7 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=${{ matrix.cpu_variants }} ^

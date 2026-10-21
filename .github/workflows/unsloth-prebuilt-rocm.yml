@@ -454,6 +454,7 @@ jobs:
           -DGGML_RPC=ON ^
           -DGGML_HIP_ROCWMMA_FATTN=OFF ^
           -DLLAMA_BUILD_BORINGSSL=ON ^
+          -DBORINGSSL_GIT=https://github.com/google/boringssl.git ^
           -DGGML_NATIVE=OFF ^
           -DGGML_STATIC=OFF ^
           -DGGML_BACKEND_DL=ON ^
@@ -1050,6 +1051,7 @@ jobs:
           -DGGML_RPC=ON \
           -DGGML_HIP_ROCWMMA_FATTN=OFF \
           -DLLAMA_BUILD_BORINGSSL=ON \
+          -DBORINGSSL_GIT=https://github.com/google/boringssl.git \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
           -DGGML_BACKEND_DL=ON \

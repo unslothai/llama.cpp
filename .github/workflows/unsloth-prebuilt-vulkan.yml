@@ -181,6 +181,7 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git `
             -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
             -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
@@ -397,6 +398,7 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git `
             -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} `
             -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
 
