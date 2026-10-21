@@ -65,6 +65,7 @@
       ]
     },
     "muse-spark": { "owner": null, "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
+    "flint": { "owner": "unslothai#314", "checks": [ { "kind": "arch", "arch": "flint" } ] },
     "beam": { "owner": null, "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": null,
@@ -86,6 +87,13 @@
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xs" },
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxs" },
         { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxxs" }
+      ]
+    },
+    "iq1m-mmq": {
+      "owner": "unslothai#304",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT",    "params": "type_a=iq1_m,type_b=f32,m=129," },
+        { "kind": "backend-op", "op": "MUL_MAT_ID", "params": "type_a=iq1_m,type_b=f32,n_mats=(256|512)," }
       ]
     },
     "qwen4exp-mtp": {
@@ -139,6 +147,7 @@
     "unslothai#251": "--moe-cache-mib auto sizes the ggml-org#29887 MoE expert cache from the fit; it only acts when a MoE model spills on a single GPU, the flag is off by default, and no runner in the pipeline has a GPU",
     "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
-    "unslothai#287": "MUL_MAT_ID MMVQ batch cap keyed on the compiled arch; it only differs when a build lacks the device's own arch (a P100 on cuda12-legacy), needs a CUDA host, and no runner in the pipeline has one"
+    "unslothai#287": "MUL_MAT_ID MMVQ batch cap keyed on the compiled arch; it only differs when a build lacks the device's own arch (a P100 on cuda12-legacy), needs a CUDA host, and no runner in the pipeline has one",
+    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe"
   }
 }
