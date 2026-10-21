@@ -83,18 +83,14 @@ on:
 
 permissions:
   contents: read
-  # The sliced Windows legs poll the jobs API for their warm shards.
   actions: read
 
 jobs:
   build-windows:
-    # Rows with slice > 0 are warm shards (windows_matrix from the parent): they compile slice K
-    # of the build's objects into ccache, save the delta and stop. The slice-0 row is the real
-    # leg: it compiles slice 0, waits for its shards, merges their deltas and runs the full
-    # build. " / warm " in a shard's name keeps it out of the assemble waiter, alert and retry.
+    # Rows with slice > 0 are warm shards: compile slice K, save the delta, stop. The slice-0 row is
+    # the leg. " / warm " in the name keeps shards out of the assemble waiter, alert and retry.
     name: ${{ (matrix.slice || 0) > 0 && format('warm windows/{0} {1}/{2}', matrix.gfx_target, matrix.slice, matrix.slices) || format('windows/{0}', matrix.gfx_target) }}
     runs-on: windows-2022
-    # Shards are best effort: a dead one costs the leg compile time, never a release.
     continue-on-error: ${{ (matrix.slice || 0) > 0 }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -463,7 +459,6 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
         if errorlevel 1 exit /b 1
 
-    # Path + size, manifests by hash: the same delta rule as the CUDA Windows warm shards.
     - name: Snapshot the restored cache
       if: ${{ (matrix.slice || 0) > 0 }}
       run: |
@@ -493,7 +488,6 @@ jobs:
       continue-on-error: true
       run: ccache --show-stats -v
 
-    # This slice's real compile times, carried by the delta below (scripts/unsloth/slice_costs.sh).
     - name: Record this slice's compile times
       if: ${{ always() && (matrix.slice || 0) > 0 }}
       continue-on-error: true
@@ -577,8 +571,6 @@ jobs:
         cd llama.cpp\build
         cmake --build . -j %NUMBER_OF_PROCESSORS%
 
-    # Costs the next run deals its slices by: this build plus the warm shards' timings. Every
-    # Windows leg records them, sliced or not. Never fails the leg.
     - name: Record slice costs
       if: ${{ !cancelled() && (matrix.slice || 0) == 0 }}
       continue-on-error: true

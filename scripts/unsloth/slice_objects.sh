@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# Print slice K of N of the objects a configured ninja build compiles for `all`.
-#
-# Every object, not just ggml-cuda/ggml-hip: after a core-header edit the CPU variants, llama,
-# common and the tools miss too (6-7 min of a cold CUDA leg), and slicing them leaves the
-# merging job little but hits and the link. Objects come from the compile commands of `all`
-# (-o for gcc/clang/nvcc, /Fo for MSVC), so nothing outside the real build is compiled.
-# With a costs file (slice_costs.sh: per-object compile ms from earlier builds) the objects are
-# dealt longest first, each to the least-loaded slice, so every slice gets about total/N of work;
-# objects without a cost count as the mean. Without one, sorted and dealt round-robin
-# (line % N == K): the heavy template instances sit together and spread across slices. Every job
-# of a leg must pass the same costs file (they restore the same ccache generation) to get
-# disjoint slices; a mismatch only means the leg compiles what a shard missed.
-# Paths are printed with forward slashes: MSVC and nvcc on Windows write backslashes, which
-# xargs and shells eat as escapes, and ninja canonicalises either form to the same target.
-#
+# Print slice K of N of the objects `all` compiles (host objects too: they miss after a core-header
+# edit). With a costs file (slice_costs.sh) objects go longest first to the least-loaded slice, else
+# round-robin. Every job of a leg must pass the same costs file or slices overlap/miss (only a
+# slowdown: the leg builds whatever is left). Forward slashes: xargs eats MSVC/nvcc backslashes.
 # Usage: slice_objects.sh <build dir> <K> <N> [costs.tsv]   (0 <= K < N)
 set -euo pipefail
 dir="${1:?build dir}"; k="${2:?slice}"; n="${3:?slices}"; costs="${4:-}"

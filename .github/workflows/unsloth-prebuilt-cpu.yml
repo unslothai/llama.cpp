@@ -3,12 +3,9 @@
 
 name: "Unsloth prebuilt: CPU"
 
-# Reusable child of unsloth-prebuilt.yml. Builds the CPU-only bundles for
-# Linux + Windows, each on x64 and arm64 (one matrix entry per arch), and the
-# Linux Vulkan bundles: each Linux job builds CPU, then Vulkan on the same runner
-# with a fresh tree and its own cache (same image, both builds short; one runner
-# instead of two). Every bundle is a single app-*.{tar.gz|zip} artifact for the
-# parent's assemble step to pick up.
+# Reusable child of unsloth-prebuilt.yml. Builds the CPU-only bundles for Linux + Windows on x64
+# and arm64, plus the Linux Vulkan bundles (each Linux job builds CPU, then Vulkan on the same
+# runner). Every bundle is one app-*.{tar.gz|zip} artifact for assemble.
 #
 # The Linux build mirrors oobabooga/llama-cpp-binaries' build-wheels-cpu.yml
 # (GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS + GGML_RPC, no GPU backend). The
@@ -263,11 +260,8 @@ jobs:
           path: ${{ github.workspace }}/.ccache
           key: ccache-cpu-linux-${{ matrix.arch }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # ── Vulkan bundle, same runner ──
-      # The CPU and Vulkan recipes share this runner image (and the clang toolchain on arm64,
-      # still on PATH from the CPU half), and each finishes in under 15 minutes, so one runner
-      # builds both: a runner freed for the long CUDA legs. Fresh tree and cache, the same
-      # paths as the CPU half, so neither bundle changes.
+      # Vulkan on the same runner (same image; arm64 clang still set from the CPU half). Fresh tree
+      # and cache at the same paths, so neither bundle changes.
       - name: Fresh source and ccache for the Vulkan build
         id: vulkan
         shell: bash

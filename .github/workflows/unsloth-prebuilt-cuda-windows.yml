@@ -64,7 +64,6 @@ on:
 
 permissions:
   contents: read
-  # build polls the jobs API for its warm shards.
   actions: read
 
 jobs:
@@ -98,9 +97,7 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # Taken before the earlier deltas are merged: a hit this job gets from one of them is
-      # then exported too, since the build leg restores only this run's deltas and lacks it
-      # whenever the previous leg did not save (a cancelled or failed night).
+      # Before the earlier deltas merge, so hits served from them are exported too (see the Linux child).
       - name: Snapshot the restored cache
         run: |
           $src = "${{ github.workspace }}\.ccache"
@@ -168,7 +165,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Every object of `all` (host too); see the Linux CUDA child.
           bash ../tooling/scripts/unsloth/slice_objects.sh build "${{ matrix.shard }}" "${{ matrix.shards }}" ../.ccache/slice-costs.tsv > shard.txt
           echo "$(wc -l < shard.txt) objects in this shard ($(grep -c 'ggml-cuda' shard.txt || true) CUDA)"
           xargs -a shard.txt -d '\n' ninja -C build -j 3
@@ -177,7 +173,6 @@ jobs:
         if: ${{ always() }}
         run: ccache -s -v
 
-      # This slice's real compile times, carried by the delta below; see the Linux CUDA child.
       - name: Record this slice's compile times
         if: ${{ always() }}
         continue-on-error: true
@@ -216,7 +211,7 @@ jobs:
 
   build:
     name: x64/${{ matrix.profile }}
-    # No `needs: warm`; see the Linux CUDA child. Compiles slice 0 while the warm jobs run.
+    # No `needs: warm`: queued with the run, compiles slice 0 while the warm jobs run.
     runs-on: ${{ matrix.runner }}
     # Every Azure Trusted Signing secret in this workflow is read by this job
     # and no other. Naming an environment is what makes them gateable: without
@@ -270,7 +265,6 @@ jobs:
           profile: ${{ matrix.profile }}
           max-size: ${{ matrix.klass == 'portable' && '4G' || '3G' }}
 
-      # Slice 0 of N, the same deal as the warm jobs (scripts/unsloth/slice_objects.sh).
       - name: Compile slice 0 of ${{ matrix.shards }}
         if: ${{ matrix.shards >= 2 }}
         working-directory: src
@@ -292,7 +286,6 @@ jobs:
             --match " / warm windows-x64/${{ matrix.profile }} " \
             --expect $(( ${{ matrix.shards }} - 1 )) --deadline-min 160 --poll 60 || true
 
-      # One restore per warm shard (slices 1..3); a shard that never saved is just a miss.
       - name: Restore warm shard 1
         if: ${{ matrix.shards >= 2 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -344,7 +337,6 @@ jobs:
           # is ~2 physical cores + HT), so 3 is the sweet spot.
           cmake --build build --config Release -j 3
 
-      # Costs for the next run's slices; see the Linux CUDA child. Never fails the leg.
       - name: Record slice costs
         if: ${{ !cancelled() }}
         continue-on-error: true

@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# Spin-wait inside a running job until other jobs of this run have finished.
-#
-# Every prebuilt job is created right after `resolve` instead of behind `needs:`, so the whole
-# run is queued at once and one CI janitor pass covers it (unslothai/* share a busy runner pool;
-# a job GitHub creates hours in sees that queue fresh). The jobs that consume other jobs' output
-# (the CUDA build merging its warm shards, reclaim, alert) start with everything else and wait
-# here instead.
-#
-# Usage: wait_for_jobs.sh [--match SUBSTR] [--exclude SUBSTR]... [--expect N]
-#                         [--deadline-min M] [--poll S] [--out FILE]
-#   --match    only jobs whose name contains SUBSTR (default: every job)
-#   --exclude  drop jobs whose name contains SUBSTR (repeatable; give your own job's name)
-#   --expect   keep waiting until at least N matching records exist
-#   --out      write "name<TAB>status<TAB>conclusion" of the matching jobs when done
-# Exit 0 once every matching job is completed, 3 on the deadline, 4 if the jobs API failed
-# 10 times running. Callers choose whether a timeout is fatal.
-# Needs GH_TOKEN with actions:read, GITHUB_REPOSITORY and GITHUB_RUN_ID.
+# Wait inside a running job for other jobs of this run. Prebuilt jobs all start after `resolve`
+# (one CI janitor pass covers the run), so consumers wait here instead of on `needs:`.
+# Usage: wait_for_jobs.sh [--match S] [--exclude S]... [--expect N] [--deadline-min M] [--poll S]
+#        [--out FILE]   (FILE gets name<TAB>status<TAB>conclusion; needs GH_TOKEN with actions:read)
+# Exit 0 when all matching jobs completed, 3 at the deadline, 4 after 10 API failures in a row.
 set -uo pipefail
 
 MATCH=""; EXCLUDES=(); EXPECT=0; DEADLINE_MIN=330; POLL=60; OUT=""

@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# Per-object compile times for slice_objects.sh, kept in the ccache dir so they travel with it.
-#
-# A leg and its warm jobs restore the same ccache generation, so they read the same costs file
-# and deal identical slices. Each warm job exports the timings of the slice it compiled into its
-# delta (slice-costs.d/); the leg folds those and its own build into slice-costs.tsv before the
-# cache is saved, so the next run is balanced by what each object really cost.
-#
-# A ccache hit is not a compile time: an entry is replaced only by a timing over HIT_MS, and an
-# object that only ever hit keeps its last real cost. Objects absent from this build drop out.
-#
-# Usage: slice_costs.sh export <build dir> <out.tsv>
-#        slice_costs.sh merge  <costs.tsv> <timings.tsv>...
-# Files are "<ms>\t<object>", objects relative to the build dir with forward slashes.
+# Per-object compile ms for slice_objects.sh, kept in the ccache dir so a leg and its warm jobs
+# read the same file. Warm jobs export their slice into slice-costs.d/; the leg merges all into
+# slice-costs.tsv. Only a timing over HIT_MS (a real compile, not a ccache hit) replaces a cost.
+# Usage: slice_costs.sh export <build dir> <out.tsv> | merge <costs.tsv> <timings.tsv>...
 set -euo pipefail
 HIT_MS="${HIT_MS:-3000}"
 tab="$(printf '\t')"
@@ -23,7 +14,7 @@ case "${1:-}" in
     dir="${2:?build dir}"; out="${3:?output file}"
     log="$dir/.ninja_log"
     [ -f "$log" ] || { echo "no $log; nothing to export" >&2; : > "$out"; exit 0; }
-    # .ninja_log v5+: start_ms end_ms mtime output hash. The last record for an output wins.
+    # .ninja_log: start_ms end_ms mtime output hash; the last record wins.
     awk -F'\t' '!/^#/ && NF >= 4 { p = $4; gsub(/\\/, "/", p); if (p ~ /\.(o|obj)$/) t[p] = $2 - $1 }
                 END { for (p in t) printf "%d\t%s\n", t[p], p }' "$log" \
       | LC_ALL=C sort -t "$tab" -k2,2 > "$out"
