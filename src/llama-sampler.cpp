@@ -927,26 +927,21 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     auto & cur = *cur_ptr;
 
     // the backend samplers mask the candidates they drop with -INF where the CPU samplers remove them:
-    // keep only the candidates the backend kept, so the CPU samplers that follow see what they would on the CPU
-    if (sampled_probs) {
-        const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
-        cur.resize(sampled_probs_count);
+    // keep only the candidates the backend kept, so the CPU samplers that follow see what they would on the CPU;
+    // a row the backend masked entirely keeps all of this row's candidates, as they are
+    if (sampled_probs || sampled_logits) {
+        const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
+        cur.resize(count);
         size_t n = 0;
-        for (uint32_t i = 0; i < sampled_probs_count; ++i) {
-            if (sampled_logits[i] != -INFINITY) {
-                cur[n++] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
-            }
-        }
-        if (n > 0) {
-            cur.resize(n);
-        }
-    } else if (sampled_logits) {
-        const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
-        cur.resize(sampled_logits_count);
-        size_t n = 0;
-        for (uint32_t i = 0; i < sampled_logits_count; i++) {
-            if (sampled_logits[i] != -INFINITY) {
-                cur[n++] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+        for (uint32_t i = 0; i < count; ++i) {
+            const llama_token_data td = {
+                /* .id    = */ sampled_ids    ? sampled_ids[i]    : (llama_token) i,
+                /* .logit = */ sampled_logits ? sampled_logits[i] : logf(sampled_probs[i]),
+                /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
+            };
+            cur[i] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
+            if (td.logit != -INFINITY) {
+                cur[n++] = td;
             }
         }
         if (n > 0) {
@@ -1174,14 +1169,14 @@ struct llama_sampler_dist : public llama_sampler_backend {
 
     // draws of the current transaction: the output row g of the sequence in this decode uses draws[g], whatever
     // ubatch the row lands in, so the draws match the CPU sampler that samples the rows one after the other
-    std::vector<float> draws;
+    std::vector<float> draws = {};
     uint32_t n_rows_seen = 0; // rows of the sequence in the previous ubatches of this decode
     uint32_t row_offset  = 0; // first row of the current ubatch
 
     // inputs for the current sampling graph: one uniform per chain, chain j reads element j
     ggml_tensor * inp_uniform = nullptr;
     uint32_t      n_applied   = 0;
-    std::vector<float> host_uniforms;
+    std::vector<float> host_uniforms = {};
 
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniform, n_applied and backend_transactional belong to the current sampling graph
@@ -1283,6 +1278,9 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     ctx->rng_backend = ctx->rng;
     ctx->n_backend_draws_generated = 0;
     ctx->n_backend_draws_committed = 0;
+    ctx->draws.clear();
+    ctx->n_rows_seen = 0;
+    ctx->row_offset  = 0;
 }
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
@@ -1590,7 +1588,7 @@ static void llama_sampler_top_k_backend_apply(
         data->candidates = top_k;
     }
 
-    data->logits = ggml_get_rows(ctx, ggml_reshape_2d(ctx, top_logits, 1, k), order);
+    data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, top_logits, 1, k), order), k);
     ggml_set_name(data->logits, "top_k_rows");
 
     GGML_UNUSED(gf);
@@ -1976,6 +1974,13 @@ static void llama_sampler_min_p_backend_apply(
             data->candidates = perm;
         }
         data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, data->logits, 1, n), perm), n);
+
+        // in the fallback the CPU keeps exactly the n_min best (sorted) candidates: the threshold lowered to the
+        // n_min-th logit would also keep every candidate tied with it, so drop the ranks >= n_min
+        struct ggml_tensor * past_min  = ggml_step(ctx, ggml_scale_bias(ctx, ident, 1.0f, 0.5f - (float) n_min));
+        struct ggml_tensor * keep_rank = ggml_scale_bias(ctx, ggml_mul(ctx, past_min, f), -1.0f, 1.0f);
+        data->logits = ggml_add(ctx, data->logits, ggml_log(ctx, keep_rank));
+        ggml_set_name(data->logits, "min_p_logits_ranked");
     }
 
     GGML_UNUSED(gf);
@@ -2255,13 +2260,20 @@ static void llama_sampler_temp_ext_apply(struct llama_sampler * smpl, llama_toke
 
         float exponent_val = ctx->exponent;
 
+        // the candidates that can still be sampled: an earlier sampler may have masked some with -INF without
+        // removing them (logit bias, grammar), and the backend sampler counts the same ones
+        size_t n_live = 0;
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            n_live += cur_p->data[i].logit != -INFINITY;
+        }
+
         // no need to do anything if there is only one (or zero) candidates
-        if (cur_p->size <= 1) {
+        if (n_live <= 1) {
             return;
         }
 
         // Calculate maximum possible entropy
-        float max_entropy = -logf(1.0f / cur_p->size);
+        float max_entropy = -logf(1.0f / n_live);
 
         llama_sampler_softmax_impl(cur_p, true);
 
@@ -2361,6 +2373,12 @@ static void llama_sampler_temp_ext_backend_apply(
     const float min_temp = std::max(0.0f, sctx->temp - sctx->delta);
     const float max_temp = sctx->temp + sctx->delta;
 
+    // the whole range is <= 0: every dynamic temperature is <= 0, which the CPU sampler treats as greedy
+    if (max_temp <= 0.0f) {
+        llama_sampler_backend_temp_sampling(ctx, gf, data, 0.0f);
+        return;
+    }
+
     // the CPU sampler sees only the candidates earlier samplers kept; here the dropped ones are -INF,
     // so count the finite ones for the maximum entropy (step(-x - FLT_MAX) is 1 only for x = -INF)
     struct ggml_tensor * is_masked = ggml_step(ctx, ggml_scale_bias(ctx, logits, -1.0f, -FLT_MAX));
@@ -2409,6 +2427,11 @@ static void llama_sampler_temp_ext_backend_apply(
     // a zero temperature is greedy on the CPU: it only happens when the entropy is 0, i.e. one candidate holds
     // all the probability in f32, and dividing by a tiny temperature keeps exactly that; keep -INF / inf finite
     dyn_temp = ggml_clamp(ctx, dyn_temp, 1e-20f, 1e30f);
+
+    // one candidate (or none) left: the CPU sampler returns before scaling, keep the logits as they are
+    // (dyn_temp = 1; has_entropy = step(n_cand - 1.5) is 1 for two candidates or more)
+    struct ggml_tensor * has_entropy = ggml_step(ctx, ggml_scale_bias(ctx, n_cand, 1.0f, -1.5f));
+    dyn_temp = ggml_add(ctx, ggml_mul(ctx, dyn_temp, has_entropy), ggml_scale_bias(ctx, has_entropy, -1.0f, 1.0f));
     ggml_set_name(dyn_temp, "temp_ext_dyn_temp");
 
     // Scale the logits by the dynamic temperature
@@ -3137,6 +3160,8 @@ static void llama_sampler_penalties_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
     ctx->prev.clear();
     ctx->token_count.clear();
+    ctx->rows_tokens.clear();
+    ctx->row_offset = 0;
 }
 
 static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_sampler * smpl) {
@@ -3152,8 +3177,9 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
     {
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
-        result_ctx->prev        = ctx->prev;
-        result_ctx->token_count = ctx->token_count;
+        // the same state as the dist clone: history, row tokens of the current decode, chains per sequence
+        result_ctx->copy_state(*ctx);
+        result_ctx->n_chains = ctx->n_chains;
     }
 
     return result;
@@ -4139,9 +4165,9 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     // search for the remaining candidates that were not found in the previous step
     for (size_t i = 0; i < cur_p->size; ++i) {
         for (const auto & lb : ctx->to_search) {
+            // no break: a token listed several times gets the sum of its biases, as in the direct path above
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
-                break;
             }
         }
     }

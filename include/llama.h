@@ -371,6 +371,12 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+                                        // with backend samplers, the output rows of a sequence in one decode are
+                                        // verification rows: row g is sampled after the caller accepted the input
+                                        // tokens of rows 1..g into the sampler (common_sampler_sample_and_accept_n);
+                                        // the dist draws (row g takes draw g) and the penalty history of row g
+                                        // follow that order. Rows that are not sampled that way (several prompt
+                                        // outputs of which only one is sampled) need 1 here or no backend sampler
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 

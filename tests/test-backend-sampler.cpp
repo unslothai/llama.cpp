@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
@@ -2176,6 +2178,18 @@ static void compare_candidates(
     auto * cp = common_sampler_get_candidates(cpu, false);
     auto * gp = common_sampler_get_candidates(gpu, false);
 
+    // both lists must hold probabilities, the same check on each side (a NaN would pass p <= 0 tests)
+    for (const auto * cands : { cp, gp }) {
+        for (size_t i = 0; i < cands->size; ++i) {
+            const float p = cands->data[i].p;
+            if (!std::isfinite(p) || p < 0.0f || p > 1.0f + 1e-5f) {
+                st.n_set_diff++;
+                st.max_p_diff = INFINITY;
+                return;
+            }
+        }
+    }
+
     // the CPU array keeps what the chain kept; the backend one, once compacted, too (p > 0 for both)
     std::unordered_map<llama_token, float> cmap;
     for (size_t i = 0; i < cp->size; ++i) {
@@ -2183,13 +2197,11 @@ static void compare_candidates(
             cmap[cp->data[i].id] = cp->data[i].p;
         }
     }
-    size_t n_g = 0;
     bool set_diff = false;
     for (size_t i = 0; i < gp->size; ++i) {
         if (gp->data[i].p <= 0.0f) {
             continue;
         }
-        ++n_g;
         const auto it = cmap.find(gp->data[i].id);
         if (it == cmap.end()) {
             // a candidate the CPU dropped: only acceptable if its probability is negligible (rounding at a cut)
@@ -2199,13 +2211,16 @@ static void compare_candidates(
         }
         st.max_p_diff = std::max(st.max_p_diff, fabsf(it->second - gp->data[i].p));
     }
-    if (n_g != cmap.size()) {
-        for (const auto & [id, p] : cmap) {
-            bool found = false;
-            for (size_t i = 0; i < gp->size && !found; ++i) {
-                found = gp->data[i].id == id && gp->data[i].p > 0.0f;
+    // every CPU candidate must be on the backend side too, also when both lists have the same size
+    {
+        std::unordered_map<llama_token, float> gmap;
+        for (size_t i = 0; i < gp->size; ++i) {
+            if (gp->data[i].p > 0.0f) {
+                gmap[gp->data[i].id] = gp->data[i].p;
             }
-            if (!found) {
+        }
+        for (const auto & [id, p] : cmap) {
+            if (gmap.find(id) == gmap.end()) {
                 set_diff = set_diff || p > 1e-6f;
                 st.max_p_diff = std::max(st.max_p_diff, p);
             }
@@ -2223,13 +2238,13 @@ static parity_stats run_parity_single(const test_params & params, const parity_c
     };
 
     struct seq_info {
-        llama_seq_id seq_id;
-        std::vector<llama_token> tokens;
-        uint32_t seed;
+        llama_seq_id seq_id = 0;
+        std::vector<llama_token> tokens = {};
+        uint32_t seed = 0;
         common_sampler * cpu = nullptr;
         common_sampler * gpu = nullptr;
         bool has_dist = false;
-        std::mt19937 rng; // replays the CPU dist sampler's draws
+        std::mt19937 rng = {}; // replays the CPU dist sampler's draws
     };
     std::vector<seq_info> seqs;
     for (size_t ip = 0; ip < prompts.size(); ++ip) {
@@ -2312,13 +2327,13 @@ static parity_stats run_parity_multi(const test_params & params, const parity_ca
     GGML_ASSERT(n_rows >= 3);
 
     struct seq_info {
-        llama_seq_id seq_id;
-        uint32_t seed;
+        llama_seq_id seq_id = 0;
+        uint32_t seed = 0;
         common_sampler * cpu = nullptr;
         common_sampler * gpu = nullptr;
-        std::vector<int32_t> idx;
+        std::vector<int32_t> idx = {};
         bool has_dist = false;
-        std::mt19937 rng; // replays the CPU dist sampler's draws
+        std::mt19937 rng = {}; // replays the CPU dist sampler's draws
     };
     std::vector<seq_info> seqs;
     for (int s = 0; s < n_seeds; ++s) {
@@ -2464,6 +2479,231 @@ static std::vector<parity_case> parity_cases(const llama_vocab * vocab) {
                                             sp.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P, COMMON_SAMPLER_TYPE_TYPICAL_P, COMMON_SAMPLER_TYPE_TEMPERATURE }; } },
     };
     return cases;
+}
+
+// A backend sampler chain on given logits, computed on one backend device, against the same chain on the CPU
+// (llama_sampler_apply): cases that need exact logits (ties, a single candidate, -INF entries) a model rarely gives.
+struct synth_candidates {
+    std::map<llama_token, float> finite; // id -> logit of the candidates that are not -INF
+    int n_dims = 1;                      // of the exported logits
+};
+
+static synth_candidates synth_run_cpu(llama_sampler * chain, const std::vector<float> & logits) {
+    std::vector<llama_token_data> cur;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        cur.push_back({ (llama_token) i, logits[i], 0.0f });
+    }
+    llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(chain, &arr);
+    synth_candidates res;
+    for (size_t i = 0; i < arr.size; ++i) {
+        if (arr.data[i].logit != -INFINITY) {
+            res.finite[arr.data[i].id] = arr.data[i].logit;
+        }
+    }
+    return res;
+}
+
+static synth_candidates synth_run_backend(llama_sampler * chain, const std::vector<float> & logits, ggml_backend_dev_t dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    GGML_ASSERT(backend != nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    GGML_ASSERT(chain->iface->backend_init(chain, buft, 1) && "every sampler of a synthetic case runs on the backend");
+
+    const size_t n_graph = 4096;
+    ggml_init_params ip = { ggml_tensor_overhead()*n_graph + ggml_graph_overhead_custom(n_graph, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_graph, false);
+
+    ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) logits.size());
+    ggml_set_input(inp);
+    if (chain->iface->backend_reset) {
+        chain->iface->backend_reset(chain);
+    }
+    llama_sampler_data data = { inp, nullptr, nullptr, nullptr };
+    chain->iface->backend_apply(chain, ctx, gf, &data);
+
+    synth_candidates res;
+    res.n_dims = ggml_n_dims(data.logits);
+    ggml_tensor * out_logits = ggml_cont(ctx, ggml_reshape_1d(ctx, data.logits, ggml_nelements(data.logits)));
+    ggml_set_output(out_logits);
+    ggml_build_forward_expand(gf, out_logits);
+    ggml_tensor * out_ids = nullptr;
+    if (data.candidates) {
+        out_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, data.candidates, ggml_nelements(data.candidates)));
+        ggml_set_output(out_ids);
+        ggml_build_forward_expand(gf, out_ids);
+    }
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(buft);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    ggml_backend_tensor_set(inp, logits.data(), 0, logits.size()*sizeof(float));
+    if (chain->iface->backend_set_input) {
+        chain->iface->backend_set_input(chain);
+    }
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<float>   lg(ggml_nelements(out_logits));
+    std::vector<int32_t> ids(lg.size());
+    ggml_backend_tensor_get(out_logits, lg.data(), 0, lg.size()*sizeof(float));
+    if (out_ids) {
+        GGML_ASSERT(ggml_nelements(out_ids) == (int64_t) lg.size());
+        ggml_backend_tensor_get(out_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+    } else {
+        for (size_t i = 0; i < ids.size(); ++i) {
+            ids[i] = (int32_t) i;
+        }
+    }
+    for (size_t i = 0; i < lg.size(); ++i) {
+        if (lg[i] != -INFINITY) {
+            res.finite[ids[i]] = lg[i];
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return res;
+}
+
+static void test_synthetic_parity(const test_params & params) {
+    GGML_UNUSED(params);
+
+    struct synth_case {
+        const char * name;
+        std::vector<float> logits;
+        std::function<void(llama_sampler *)> build;
+    };
+    const float ninf = -INFINITY;
+    const std::vector<synth_case> cases = {
+        // min-p fallback with a tie at the cut: the CPU keeps exactly min_keep candidates
+        { "min_p_keep_tie", { 2, 1, 1, 0 }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_min_p(1.0f, 2)); } },
+        // dynamic temperature whose whole range is <= 0 is greedy on the CPU (the first maximum)
+        { "dynatemp_neg_range", { 4, 4, 2, 1 }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(-1.0f, 0.5f, 1.0f)); } },
+        // one candidate left: the CPU leaves its logit as it is
+        { "dynatemp_one_cand", { 3, ninf, ninf, ninf }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.5f, 0.5f, 1.0f)); } },
+        // a -INF candidate is not a candidate for the maximum entropy, on both sides
+        { "dynatemp_masked", { 1, 4, 2, 3 }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 0, -INFINITY } };
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 1, lb));
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, 1.5f)); } },
+        // duplicate biases after a reordering sampler: summed on both sides
+        { "logit_bias_dup_reordered", { 0, -1, 1, 2 }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 3, 10.0f }, { 3, -100.0f } };
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(2));
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 2, lb)); } },
+        // top-k exports 1-D logits like every other backend sampler
+        { "top_k_temp", { 0, 3, 1, 2, 5 }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_top_k(3));
+            llama_sampler_chain_add(c, llama_sampler_init_temp(0.5f)); } },
+    };
+
+    std::vector<ggml_backend_dev_t> devs;
+    if (auto * d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+        devs.push_back(d);
+    }
+    devs.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+
+    int n_fail = 0;
+    for (auto * dev : devs) {
+        for (const auto & sc : cases) {
+            llama_sampler * c_cpu = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler * c_bk  = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            sc.build(c_cpu);
+            sc.build(c_bk);
+            const synth_candidates rc = synth_run_cpu(c_cpu, sc.logits);
+            const synth_candidates rb = synth_run_backend(c_bk, sc.logits, dev);
+            bool ok = rc.finite.size() == rb.finite.size() && rb.n_dims == 1;
+            for (const auto & [id, l] : rc.finite) {
+                const auto it = rb.finite.find(id);
+                ok = ok && it != rb.finite.end() && fabsf(it->second - l) <= 1e-4f*std::max(1.0f, fabsf(l));
+            }
+            printf("synthetic %-26s %-6s cpu %zu cand, backend %zu cand (dims %d) %s\n", sc.name, ggml_backend_dev_name(dev),
+                    rc.finite.size(), rb.finite.size(), rb.n_dims, ok ? "OK" : "FAIL");
+            if (!ok) {
+                for (const auto & [id, l] : rc.finite) { printf("    cpu %d %.6g\n", id, l); }
+                for (const auto & [id, l] : rb.finite) { printf("    bk  %d %.6g\n", id, l); }
+            }
+            n_fail += ok ? 0 : 1;
+            llama_sampler_free(c_cpu);
+            llama_sampler_free(c_bk);
+        }
+    }
+    printf("synthetic parity: %d failing cases\n", n_fail);
+    GGML_ASSERT(n_fail == 0);
+    printf("backend synthetic parity test PASSED\n");
+}
+
+// a backend prefix that masks every candidate of a row: the CPU samplers that follow get this row's candidates as
+// they are (all -INF), the same as without a backend, never an empty, default (token 0) or previous row
+static void test_all_masked_row(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_logit_bias> all_inf;
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        all_inf.push_back({ t, -INFINITY });
+    }
+
+    // common_sampler path: logit bias (backend) masks everything, XTC (CPU only) follows
+    common_params_sampling sp = parity_base_params();
+    sp.logit_bias = all_inf;
+    sp.xtc_probability = 1.0f;
+    sp.xtc_threshold   = 0.0f;
+    sp.seed = 7;
+    sp.backend_sampling = true;
+    common_sampler * gpu = common_sampler_init(params.model.get(), sp);
+
+    // the same chain directly through llama_sampler_sample
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, (int32_t) all_inf.size(), all_inf.data()));
+    llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.0f, 0, 7));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(7));
+    llama_sampler_ptr chain_owner(chain);
+
+    std::vector<llama_sampler_seq_config> configs = { { 0, common_sampler_get(gpu) }, { 1, chain } };
+    test_context tctx(params, configs, 2);
+
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The capital of France is");
+    common_batch batch(tctx.ctx.get());
+    for (llama_seq_id s = 0; s < 2; ++s) {
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            batch.add(prompt[i], (llama_pos) i, s, i + 1 == prompt.size());
+        }
+    }
+    GGML_ASSERT(llama_process(tctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    const int32_t idx0 = (int32_t) prompt.size() - 1;
+    const int32_t idx1 = 2*(int32_t) prompt.size() - 1;
+
+    (void) common_sampler_sample(gpu, tctx.ctx.get(), idx0);
+    const auto * cp = common_sampler_get_candidates(gpu, false);
+    std::unordered_set<llama_token> ids;
+    bool all_inf_logits = true;
+    for (size_t i = 0; i < cp->size; ++i) {
+        ids.insert(cp->data[i].id);
+        all_inf_logits = all_inf_logits && cp->data[i].logit == -INFINITY;
+    }
+    printf("all-masked row (common_sampler): %zu candidates, %zu distinct ids, all -INF: %d\n", cp->size, ids.size(), all_inf_logits);
+    GGML_ASSERT(cp->size == (size_t) n_vocab && ids.size() == (size_t) n_vocab && all_inf_logits);
+
+    // CPU reference of the same chain on the same (all -INF) candidates: the token the CPU samplers pick
+    llama_sampler * ref = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(ref, llama_sampler_init_xtc(1.0f, 0.0f, 0, 7));
+    llama_sampler_chain_add(ref, llama_sampler_init_dist(7));
+    std::vector<llama_token_data> cur;
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        cur.push_back({ t, -INFINITY, 0.0f });
+    }
+    llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(ref, &arr);
+    const llama_token t_ref = arr.data[arr.selected].id;
+    const llama_token t_bk  = llama_sampler_sample(chain, tctx.ctx.get(), idx1);
+    printf("all-masked row (llama_sampler_sample): token %d, CPU reference %d\n", t_bk, t_ref);
+    GGML_ASSERT(t_bk == t_ref);
+
+    llama_sampler_free(ref);
+    common_sampler_free(gpu);
+    printf("backend all-masked row test PASSED\n");
 }
 
 static void test_cpu_parity(const test_params & params) {
@@ -2628,6 +2868,8 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_cpu_suffix",             test_multi_output_cpu_suffix,          true },
     { "test_multi_output_ubatch_split",           test_multi_output_ubatch_split,        true },
     // GPU vs CPU parity of whole chains, per sampler and edge value
+    { "test_synthetic_parity",                    test_synthetic_parity,                 true },
+    { "test_all_masked_row",                      test_all_masked_row,                   true },
     { "test_cpu_parity",                          test_cpu_parity,                       true },
     { "test_cpu_parity_multi_output",             test_cpu_parity_multi_output,          true },
 };
