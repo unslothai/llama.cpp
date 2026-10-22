@@ -1,6 +1,7 @@
 
 #include "common.h"
 
+#include <cstdint>
 #include <cstdio>
 
 #undef NDEBUG
@@ -35,6 +36,11 @@ int main() {
 
     assert(common_exact_batch_geometry(512, 512, 0, &n_min));
     assert(n_min == 512);
+
+    // a decode width near INT32_MAX cannot wrap the sum into an accepted geometry
+    assert(!common_exact_batch_geometry(512, 512, INT32_MAX, &n_min));
+    assert(n_min == INT32_MAX);
+    assert(!common_exact_batch_geometry(INT32_MAX, 512, INT32_MAX - 1));
 
     const uint32_t width = llama_exact_decode_width();
     assert(!llama_set_exact_decode_width((uint32_t) INT32_MAX + 1));

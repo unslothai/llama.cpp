@@ -1462,13 +1462,14 @@ bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, 
     // an unset ubatch is the whole batch, and a ubatch never exceeds it
     const int n_ub = std::min(n_batch, n_ubatch <= 0 ? n_batch : n_ubatch);
 
-    const int n_min = n_ub + std::max(0, n_decode_width);
+    // summed in 64 bits: a width near INT32_MAX must not wrap into an accepted geometry
+    const int64_t n_min = int64_t(n_ub) + std::max(0, n_decode_width);
 
     if (n_batch_min) {
-        *n_batch_min = n_min;
+        *n_batch_min = (int) std::min<int64_t>(n_min, INT32_MAX);
     }
 
-    return n_batch >= n_min;
+    return n_min <= INT32_MAX && n_batch >= n_min;
 }
 
 // [TAG_EXACT_CONCURRENCY] the refusals that need the loaded model, run before a context exists
