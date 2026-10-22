@@ -124,9 +124,15 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t flags; // was padding, so an older server reports 0
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
+
+// inverted so that an older server, which reports 0, keeps the hash-first upload.
+// Bits 0 and 1 of this byte are already used by other optional server features
+// (trace clock sync, peer transfers); a server with those sets them, so they must not
+// be read as "no cache".
+#define RPC_SRV_FLAG_NO_CACHE (1 << 2)
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
@@ -366,15 +372,21 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+// request_data = input followed by payload, sent from the caller's memory so no staging copy is needed
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size,
+                         const void * payload = nullptr, size_t payload_size = 0) {
     uint8_t cmd_byte = cmd;
+    uint64_t request_size = input_size + payload_size;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
+    if (!sock->send_data(&request_size, sizeof(request_size))) {
         return false;
     }
     if (!sock->send_data(input, input_size)) {
+        return false;
+    }
+    if (payload_size > 0 && !sock->send_data(payload, payload_size)) {
         return false;
     }
     return sock->flush();
@@ -415,7 +427,7 @@ static inline void rpc_cpu_relax() {
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & srv_flags) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -430,6 +442,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    srv_flags = response.flags;
     sock->update_caps(response.conn_caps);
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
@@ -504,6 +517,9 @@ public:
     void busy_spin_acquire();
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+    // blocking, so the payload is sent straight from the caller's memory
+    void send_with_payload(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size);
+    bool server_has_cache() const { return !(srv_flags & RPC_SRV_FLAG_NO_CACHE); }
 
     void start(const std::string & endpoint);
     void work();
@@ -517,6 +533,8 @@ private:
         size_t                        input_size;
         void                        * output;
         size_t                        output_size;
+        const void                  * payload      = nullptr;
+        size_t                        payload_size = 0;
         std::promise<void>            completion;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
@@ -529,6 +547,7 @@ private:
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
     rpc_msg_queue    queue;
     socket_ptr       sock;
+    uint8_t          srv_flags = 0;
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
@@ -621,6 +640,19 @@ void rpc_dispatcher::synchronize() {
     msg->completion.get_future().wait();
 }
 
+void rpc_dispatcher::send_with_payload(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    msg->payload = payload;
+    msg->payload_size = payload_size;
+    GGML_ASSERT(queue.push(msg));
+    msg->completion.get_future().wait();
+}
+
 void rpc_dispatcher::busy_spin_acquire() {
     busy_spin_users.fetch_add(1, std::memory_order_relaxed);
 }
@@ -644,7 +676,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, srv_flags)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -671,7 +703,10 @@ void rpc_dispatcher::work() {
             LOG_DBG2("[%s] %s (in: %zu, out: %zu)\n", __func__, rpc_cmd_name(msg_ptr->cmd), msg_ptr->input_size, msg_ptr->output_size);
             const bool trace = rpc_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
-            if (msg_ptr->output) {
+            if (msg_ptr->payload_size > 0) {
+                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->payload, msg_ptr->payload_size);
+                RPC_STATUS_ASSERT(status);
+            } else if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
             } else {
@@ -834,8 +869,9 @@ static std::shared_ptr<uint8_t> serialize_set_tensor(const rpc_tensor & rpc_tens
 // compute-buffer inputs (the activations ggml_backend_sched copies between backends) must not
 // take this path, otherwise with `rpc-server -c` every ubatch above the threshold is written
 // to the cache directory and later served from there.
-static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
-    return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+// a server without a cache can never answer a hash with a hit, so hashing for it is pure cost
+static bool rpc_use_hash_cache(const rpc_dispatcher & dispatcher, const ggml_tensor * tensor, size_t size) {
+    return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && dispatcher.server_has_cache();
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -843,7 +879,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %zu\n", __func__, tensor->name, offset, size);
-    if (rpc_use_hash_cache(tensor, size)) {
+    if (rpc_use_hash_cache(*ctx->dispatcher, tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -858,9 +894,13 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         // the server has no cache entry for this tensor - ask it to save one
         cache_flag = 1;
     }
-    size_t input_size;
-    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    // same wire bytes as serialize_set_tensor, but the data goes out from the caller's memory
+    auto header = std::make_shared<std::array<uint8_t, sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset)>>();
+    uint8_t * p = header->data();
+    memcpy(p, &rpc_tensor, sizeof(rpc_tensor)); p += sizeof(rpc_tensor);
+    memcpy(p, &cache_flag, sizeof(cache_flag)); p += sizeof(cache_flag);
+    memcpy(p, &offset,     sizeof(offset));
+    ctx->dispatcher->send_with_payload(RPC_CMD_SET_TENSOR, header, header->size(), data, size);
 }
 
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
@@ -1133,7 +1173,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %zu\n", __func__, tensor->name, offset, size);
-    if (rpc_use_hash_cache(tensor, size)) {
+    if (rpc_use_hash_cache(*ctx->dispatcher, tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1432,6 +1472,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.flags = cache_dir == nullptr ? RPC_SRV_FLAG_NO_CACHE : 0;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
