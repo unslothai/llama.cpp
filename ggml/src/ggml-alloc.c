@@ -494,8 +494,10 @@ struct ggml_gallocr {
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 
-    // the flags the plan's tensor lifetimes were computed from, one entry per tensor slot in plan order
-    // (each node followed by its GGML_MAX_SRC sources, then the leafs), see ggml_gallocr_lifetime_bits
+    // the flags the plan's tensor lifetimes were computed from, one entry per node and then per leaf in plan order,
+    // see ggml_gallocr_lifetime_bits (a source is a node or a leaf of the same graph, or a tensor allocated outside
+    // it: its flags are the ones of its own entry; which tensor a source slot points to may change, e.g. with
+    // ggml_build_forward_select, without changing the lifetimes)
     // the node sizes alone do not tell whether a plan still holds: a tensor that became an output must
     // not share memory with a later tensor, an input must be allocated before the first node runs
     uint8_t * lifetime_bits;
@@ -561,7 +563,7 @@ static bool ggml_gallocr_lifetime_covered(uint8_t planned, uint8_t cur) {
 }
 
 static size_t ggml_gallocr_n_lifetime_bits(const struct ggml_cgraph * graph) {
-    return (size_t) graph->n_nodes*(1 + GGML_MAX_SRC) + (size_t) graph->n_leafs;
+    return (size_t) graph->n_nodes + (size_t) graph->n_leafs;
 }
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -924,16 +926,11 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(union_outputs != NULL);
         size_t k = 0;
         for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
-            const bool is_node = i < graph->n_nodes;
-            struct ggml_tensor * t = is_node ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
-            for (int j = -1; j < (is_node ? GGML_MAX_SRC : 0); j++) {
-                struct ggml_tensor * ts = j < 0 ? t : t->src[j];
-                const uint8_t planned = galloc->lifetime_bits[k++];
-                if (ts != NULL && (planned & GGML_GALLOCR_LIFETIME_PRESENT) && (planned & GGML_GALLOCR_LIFETIME_OUTPUT) &&
-                        !(ts->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                    ts->flags |= GGML_TENSOR_FLAG_OUTPUT;
-                    union_outputs[n_union_outputs++] = ts;
-                }
+            struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+            const uint8_t planned = galloc->lifetime_bits[k++];
+            if ((planned & GGML_GALLOCR_LIFETIME_OUTPUT) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                t->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                union_outputs[n_union_outputs++] = t;
             }
         }
         GGML_ASSERT(k == galloc->n_lifetime_bits);
@@ -1013,11 +1010,7 @@ static bool ggml_gallocr_reserve_n_impl(
         galloc->n_lifetime_bits = n_bits;
         size_t k = 0;
         for (int i = 0; i < graph->n_nodes; i++) {
-            struct ggml_tensor * node = graph->nodes[i];
-            galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(node);
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(node->src[j]);
-            }
+            galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(graph->nodes[i]);
         }
         for (int i = 0; i < graph->n_leafs; i++) {
             galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(graph->leafs[i]);
@@ -1163,12 +1156,8 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         const uint8_t * bits = galloc->lifetime_bits;
         for (int i = 0; i < graph->n_nodes; i++) {
             const struct ggml_tensor * node = graph->nodes[i];
-            bool covered = ggml_gallocr_lifetime_covered(*bits++, ggml_gallocr_lifetime_bits(node));
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                covered = ggml_gallocr_lifetime_covered(*bits++, ggml_gallocr_lifetime_bits(node->src[j])) && covered;
-            }
-            if (!covered) {
-                GGML_LOG_DEBUG("%s: node %s (or one of its sources) became an input or output since the plan\n", __func__, node->name);
+            if (!ggml_gallocr_lifetime_covered(*bits++, ggml_gallocr_lifetime_bits(node))) {
+                GGML_LOG_DEBUG("%s: node %s became an input or output since the plan\n", __func__, node->name);
                 return true;
             }
         }
