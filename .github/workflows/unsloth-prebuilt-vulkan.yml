@@ -1,0 +1,409 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth prebuilt: Vulkan"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the Vulkan bundles for
+# Linux x64/arm64 + Windows x64. Each matrix entry uploads a single
+# app-*.{tar.gz|zip} artifact for the parent's assemble step to pick up.
+#
+# Mirrors oobabooga/llama-cpp-binaries' build-wheels-vulkan.yml build recipe
+# (the CPU recipe plus GGML_VULKAN=ON and a Vulkan SDK install), adapted to
+# this repo's conventions: app-<tag>-<platform>-<arch>-vulkan archives packaged
+# straight from build/bin like the ROCm/macOS children (no embedded
+# UNSLOTH_PREBUILT_INFO.json -- assemble_metadata.py derives the manifest entry
+# from the filename), MSVC + BoringSSL on Windows, $ORIGIN RPATH on Linux.
+#
+# The Vulkan loader (libvulkan.so.1 / vulkan-1.dll) is a system/driver library
+# resolved by the OS at runtime, so -- like llama-cpp-binaries -- it is not
+# bundled; only ggml's own libggml-vulkan backend module ships in the archive.
+# Both Linux legs use ubuntu-22.04 to keep a glibc 2.35 / GLIBCXX <= 3.4.30
+# floor. The arm64 leg supplies newer header-only SDK pieces at build time.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Upstream llama.cpp release tag (b####), resolved by parent'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name): ggml-org/llama.cpp for plain builds, or this repo for mix tags'
+        required: false
+        default: 'ggml-org/llama.cpp'
+        type: string
+      source_artifact:
+        description: 'Workflow artifact (app-source-*) holding the stamped source tree; set by resolve for every build'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # LunarG SDK version used by ggml-org's Windows release build.
+  VULKAN_VERSION: 1.4.357.0
+
+jobs:
+  build-linux:
+    name: linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+    steps:
+      # The parent's resolve job built the source tree (upstream base + any mix
+      # PRs, with the build number/commit and Unsloth fingerprint baked
+      # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
+      # instead of cloning -- no .git needed, the build number is already baked.
+      - name: Download source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Install Vulkan SDK + build dependencies
+        run: |
+          set -eux
+          if [ "${{ matrix.arch }}" = x64 ]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
+          fi
+
+      # Match the CPU arm64 leg so the bundle retains Jammy's loader and
+      # libstdc++ floors. Jammy's gcc cannot target armv9.2-a+sme.
+      - name: Toolchain (clang 19 on arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y libomp-19-dev
+          {
+            echo "CC=clang-19"
+            echo "CXX=clang++-19"
+          } >> "$GITHUB_ENV"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-linux-${{ matrix.arch }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      # Ubuntu 22.04 has an arm64 Vulkan loader, but its headers are too old for
+      # the current backend and it has no glslc package. Install matching pinned
+      # headers and build the shader compiler shipped with the LunarG SDK.
+      - name: Install Vulkan headers (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          package="$RUNNER_TEMP/vulkan-headers.deb"
+          staging="$RUNNER_TEMP/vulkan-headers"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/v/vulkan-headers/vulkan-headers_1.4.313.0~rc1-1lunarg22.04-1_all.deb" \
+            -o "$package"
+          echo "587b2d8e79416b394170ab61557c98765570cd153730f819a917866d78f45e1a  $package" | sha256sum -c -
+          dpkg-deb -x "$package" "$staging"
+          sudo cp -a "$staging/usr/." /usr/local/
+
+      - name: Build glslc (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          archive="$RUNNER_TEMP/shaderc.tar.gz"
+          source="$RUNNER_TEMP/shaderc"
+          curl -fsSL \
+            "https://packages.lunarg.com/vulkan/pool/main/s/shaderc/shaderc_2025.2~rc1-1lunarg22.04.orig.tar.gz" \
+            -o "$archive"
+          echo "59c0c478f2f40a076e610587d099e39ed059cb7319fe464f8ba1bd07c6bf02c5  $archive" | sha256sum -c -
+          mkdir -p "$source"
+          tar -xzf "$archive" -C "$source"
+          cmake -S "$source" -B "$source/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build "$source/build" --target glslc_exe -j "$(nproc)"
+          sudo install -m 0755 "$source/build/glslc/glslc" /usr/local/bin/glslc
+          glslc --version
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -eux
+          # Build recipe mirrors llama-cpp-binaries' Vulkan wheel: the CPU recipe
+          # (backend-DL + all CPU variants + RPC) plus GGML_VULKAN. RPATH=$ORIGIN
+          # so the bundle's sibling .so files resolve from the binary's own dir.
+          # LLAMA_FATAL_WARNINGS below is -Werror. The arm64 image compiles with
+          # clang-19 against GCC 12's libstdc++, where std::stable_sort still
+          # reaches the deprecated get_temporary_buffer; GCC buries that in a
+          # system header, clang reports it at our instantiation. That failed
+          # this leg on 08-27 over a deprecation in code we do not own, so that
+          # one diagnostic is off. Every other warning stays fatal.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_RPC=ON \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -eux
+          # Backend modules (CPU variants, Vulkan, RPC) build as ggml
+          # dependencies, so every tool pulls them in.
+          cmake --build build --config Release -j "$(nproc)"
+          strip build/bin/llama-* || true
+
+      - name: Bundle OpenMP runtime (arm64)
+        if: matrix.arch == 'arm64'
+        run: cp /usr/lib/llvm-19/lib/libomp.so.5 src/build/bin/
+
+      # DiffusionGemma binaries (example targets present only in #24423 mix
+      # builds): best-effort, never fail the job. See the CUDA child for the
+      # rationale. The bundle tars all of build/bin, so anything produced here
+      # is shipped automatically.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          set -u
+          if [ ! -d examples/diffusion-gemma-server ]; then
+            echo "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          fi
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON \
+            || { echo "reconfigure for examples failed; skipping DiffusionGemma binaries"; exit 0; }
+          if cmake --build build --config Release -j "$(nproc)" \
+              --target llama-diffusion-gemma-visual-server llama-diffusion-cli; then
+            strip build/bin/llama-diffusion-gemma-visual-server build/bin/llama-diffusion-cli || true
+            echo "built DiffusionGemma binaries"
+          else
+            echo "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          fi
+          exit 0
+
+      - name: Package bundle (tar.gz)
+        run: |
+          set -eux
+          ASSET="app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz"
+          cp src/LICENSE src/build/bin/
+          mkdir -p dist
+          (cd src/build/bin && tar -czf "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -la dist
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan
+          path: dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-vulkan.tar.gz
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        # !cancelled(), unlike the save below: on a timeout the job gets a
+        # single ~5 minute teardown window (measured ~4m50s after process
+        # kill), shared by every remaining step and not replenished. Evicting
+        # spends that window on housekeeping; the save is what actually needs
+        # it, and a 2 GB cache is not quick to write.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-vulkan-linux-${{ matrix.arch }}-${{ inputs.tag }}-
+
+  build-windows:
+    name: windows/x64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # The parent's resolve job built the source tree (upstream base + any mix
+      # PRs, with the build number/commit and Unsloth fingerprint baked
+      # into cmake/build-info.cmake) and uploaded it as an artifact; extract it
+      # instead of cloning -- no .git needed, the build number is already baked.
+      - name: Download source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: ${{ inputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/llama.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: vulkan-windows-x64-${{ inputs.tag }}
+          restore-keys: |
+            vulkan-windows-x64
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Configure
+        working-directory: src
+        run: |
+          # Same recipe as Linux plus BoringSSL (statically linked, no system
+          # OpenSSL on the runner). No RPATH -- Windows loads sibling DLLs from
+          # the binary's directory. CMAKE_PREFIX_PATH points at the Vulkan SDK
+          # so CMake finds its SPIRV-Headers config (set via env, not -D, so the
+          # backslashes survive); mirrors llama-cpp-binaries' Vulkan wheel.
+          # GGML_OPENMP=OFF keeps this MSVC bundle self-contained: a default-ON
+          # MSVC build would link vcomp140.dll (not shipped). Upstream sidesteps
+          # this by building its Windows Vulkan artifact with GGML_CPU=OFF (no
+          # OpenMP at all); we ship a full bundle, so we disable OpenMP instead
+          # (the CPU backend is a GPU-offload fallback and uses ggml's threadpool).
+          $env:CMAKE_PREFIX_PATH = $env:VULKAN_SDK
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_OPENMP=OFF `
+            -DGGML_RPC=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build --config Release -j 3
+
+      # DiffusionGemma binaries (#24423 mix builds only): best-effort, never
+      # fail the job. See the CUDA child for the rationale.
+      - name: Build DiffusionGemma binaries (best-effort; mix builds only)
+        working-directory: src
+        run: |
+          if (-not (Test-Path "examples/diffusion-gemma-server")) {
+            Write-Host "no DiffusionGemma sources in this tree; skipping"
+            exit 0
+          }
+          cmake -S . -B build -DLLAMA_BUILD_EXAMPLES=ON
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "reconfigure for examples failed; skipping DiffusionGemma binaries"
+            exit 0
+          }
+          cmake --build build --config Release -j 3 `
+            --target llama-diffusion-gemma-visual-server llama-diffusion-cli
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "warning: DiffusionGemma binaries failed to build; bundle will omit them"
+          } else {
+            Write-Host "built DiffusionGemma binaries"
+          }
+          exit 0
+
+      - name: Package bundle (zip)
+        shell: bash
+        run: |
+          set -eux
+          ASSET="app-${{ inputs.tag }}-windows-x64-vulkan.zip"
+          cp src/LICENSE src/build/bin/
+          mkdir -p dist
+          (cd src/build/bin && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -la dist
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: app-${{ inputs.tag }}-windows-x64-vulkan
+          path: dist/app-${{ inputs.tag }}-windows-x64-vulkan.zip
+          if-no-files-found: error
+
+      - name: Evict stale ccache files
+        # !cancelled(), unlike the save below: on a timeout the job gets a
+        # single ~5 minute teardown window (measured ~4m50s after process
+        # kill), shared by every remaining step and not replenished. Evicting
+        # spends that window on housekeeping; the save is what actually needs
+        # it, and a 2 GB cache is not quick to write.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        # Save even when the build failed: the objects compiled before the
+        # failure are still worth keeping, and a job that saves nothing leaves
+        # a hole in the cache lineage that widens the next run's tag gap.
+        # Measured: gap 7 -> 68% hit rate, gap 13 -> 6%.
+        #
+        # always(), not !cancelled(): a timeout-minutes expiry puts the job on
+        # the CANCELLATION path, not the failure path, so !cancelled() would
+        # skip the save on the single most expensive case -- a leg that
+        # compiled for hours and then hit the cap.
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-vulkan-windows-x64-${{ inputs.tag }}-

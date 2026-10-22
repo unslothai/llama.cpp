@@ -111,6 +111,9 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // independent contexts over one model, each with its own slots; call before load_model()
+    void set_pipeline_groups(int n_groups);
 };
 
 

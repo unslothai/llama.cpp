@@ -590,6 +590,8 @@ void server_model_meta::update_caps(const common_params & base) {
     architecture = server_model_architecture_json(inp_image, inp_audio, false, output_modalities);
 }
 
+int server_get_pipeline_groups();
+
 //
 // server_models
 //
@@ -1196,6 +1198,15 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        // --pipeline-groups is stripped from base_preset, so pass it explicitly; drop any inherited
+        // LLAMA_ARG_PIPELINE_GROUPS first, since getenv() returns the first duplicate
+        {
+            static const std::string pg_prefix = "LLAMA_ARG_PIPELINE_GROUPS=";
+            child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                                [](const std::string & e) { return e.rfind(pg_prefix, 0) == 0; }),
+                            child_env.end());
+            child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;

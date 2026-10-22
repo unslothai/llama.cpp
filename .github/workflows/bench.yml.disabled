@@ -162,7 +162,7 @@ jobs:
             tools/server/bench/*.log
 
       - name: Commit status
-        uses: Sibz/github-status-action@v1
+        uses: Sibz/github-status-action@faaa4d96fecf273bd762985e0e7f9f933c774918  # v1
         with:
           authToken: ${{secrets.GITHUB_TOKEN}}
           sha: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
@@ -172,7 +172,7 @@ jobs:
           state: 'success'
 
       - name: Upload benchmark images
-        uses: devicons/public-upload-to-imgur@v2.2.2
+        uses: devicons/public-upload-to-imgur@352cf5f2805c692539a96cfe49a09669e6fca88e  # v2.2.2
         continue-on-error: true # Important as it looks unstable: 503
         id: imgur_step
         with:
@@ -221,7 +221,7 @@ jobs:
           echo "IMAGE_3=${{ fromJSON(steps.imgur_step.outputs.imgur_urls)[3] }}" >> $GITHUB_ENV
 
       - name: Comment PR
-        uses: mshick/add-pr-comment@v2
+        uses: mshick/add-pr-comment@b8f338c590a895d50bcbfa6c5859251edc8952fc  # v2
         id: comment_pr
         if: ${{ github.event.pull_request != '' && matrix.pr_comment_enabled == 'true' }}
         with:

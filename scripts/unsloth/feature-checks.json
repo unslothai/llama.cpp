@@ -1,0 +1,104 @@
+{
+  "_doc": [
+    "The test that proves each shipped feature works. Read by feature_matrix.py.",
+    "",
+    "Keyed by FEATURE, with the pin that currently carries it, and NOT the other",
+    "way round. When upstream absorbs a feature the pin is deleted, and deleting",
+    "the check with it would put the blind spot back somewhere else: the feature",
+    "is still in the release, it just arrives through the base tag now. So an",
+    "entry outlives its `owner`, and `owner` becomes null rather than the entry",
+    "being removed.",
+    "",
+    "This is the half that cannot be derived. pin_contract.py reads a pin's own",
+    "diff and proves the merge kept it, which needs no upkeep but can only ever",
+    "prove the MERGE lost nothing -- a regression inside the pin regenerates a",
+    "smaller contract that passes. What a feature has to DO is a human sentence.",
+    "",
+    "Every pin in pr-set.json must appear in `features` or in `unchecked`. The",
+    "lint enforces that, so adding a pin forces a decision instead of a silence.",
+    "`unchecked` is a recorded reason, not a hole.",
+    "",
+    "kinds:",
+    "  arch        test-llama-archs -a <arch>          builds a synthetic model of",
+    "                                                  the architecture, decodes 128",
+    "                                                  tokens on every device and",
+    "                                                  compares against CPU",
+    "  backend-op  test-backend-ops test -o <OP>       runs the op against the CPU",
+    "                                                  reference implementation",
+    "  mtmd        test-mtmd-impl                      projector registry, no model",
+    "",
+    "A probe that exits 0 having run nothing is a failure, not a pass: both",
+    "harnesses do exactly that for an excluded arch or a misspelled op name.",
+    "feature_matrix.py rejects skip markers and requires a non-zero case count.",
+    "",
+    "No runner in the prebuild pipeline has a GPU, so the nightly runs this on",
+    "CPU and every backend-op check is DEFERRED there: named and counted, never",
+    "reported as passing. The kernels are exactly where a merge goes wrong",
+    "silently, so before accepting a carry PR that touches one, build it on a",
+    "GPU box and run:",
+    "",
+    "    python3 scripts/unsloth/feature_matrix.py --build-dir build --gpu",
+    "",
+    "and paste the output into the PR. That is the only place those checks run."
+  ],
+  "schema": 1,
+  "features": {
+    "inkling": {
+      "owner": "ggml-org#25731",
+      "checks": [
+        { "kind": "arch",       "arch": "inkling" },
+        { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
+        { "kind": "mtmd",       "projector": "inkling" }
+      ]
+    },
+    "glm5next": {
+      "owner": "ggml-org#27754",
+      "checks": [
+        { "kind": "arch",       "arch": "glm5next" },
+        { "kind": "backend-op", "op": "LIGHTNING_INDEXER" }
+      ]
+    },
+    "diffusion-gemma": {
+      "owner": "ggml-org#24423",
+      "checks": [
+        { "kind": "arch", "arch": "diffusion-gemma" }
+      ]
+    },
+    "kimi-k3": {
+      "owner": "unslothai#70",
+      "checks": [
+        { "kind": "arch", "arch": "kimi-k3" },
+        { "kind": "mtmd", "projector": "kimik3" }
+      ]
+    },
+    "iq1-narrow-grids": {
+      "owner": "unslothai#61",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xs" },
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxs" },
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=iq1_xxxs" }
+      ]
+    },
+    "qwen4exp-mtp": {
+      "owner": "unslothai#144",
+      "checks": [
+        { "kind": "arch",       "arch": "qwen4exp" },
+        { "kind": "backend-op", "op": "TOPK_QSA" }
+      ]
+    },
+    "projector-registry": {
+      "owner": "unslothai#176",
+      "checks": [
+        { "kind": "mtmd", "projector": "*" }
+      ]
+    }
+  },
+  "unchecked": {
+    "unslothai#95": "sampling penalties indexed by token id; behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
+    "unslothai#137": "batched readahead for lazily read gather tables; a throughput change with no observable output difference",
+    "unslothai#149": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 env parsing; needs a CUDA or HIP host, and no runner in the pipeline has one",
+    "unslothai#152": "per-run mmap of a context's tensors; a memory-layout change with no observable output difference",
+    "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
+    "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host"
+  }
+}
