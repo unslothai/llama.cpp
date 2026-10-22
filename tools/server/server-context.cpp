@@ -1395,8 +1395,7 @@ private:
                     return false;
                 }
 
-                // params_dft, not params_ctx: the draft has its own cpu params and this is the only
-                // place they can reach the draft context
+                // params_dft, not params_ctx: the only place the draft's cpu params reach its context
                 grp.threadpools_dft = std::make_unique<common_threadpools>();
                 grp.threadpools_dft->init(grp.ctx_dft, params_dft);
 
@@ -1963,7 +1962,7 @@ private:
                 return;
             }
 
-            // wait_for() released the others; retake all in group order so guards cannot deadlock
+            // wait_for() released the others; retake all in group order
             for (size_t g = 0; g < srv->groups.size(); ++g) {
                 release(g);
             }
@@ -2014,8 +2013,7 @@ private:
                 continue;
             }
 
-            // the task thread notifies cv when it releases this group, so a launched slot is seen
-            // at once; the timeout is only a backstop
+            // the task thread notifies cv on release; the timeout is only a backstop
             std::unique_lock<std::mutex> lk(grp.mtx);
             grp.cv.wait_for(lk, std::chrono::milliseconds(5), [&] {
                 if (groups_stop.load(std::memory_order_relaxed)) {
@@ -2109,8 +2107,7 @@ private:
             }
         }
 
-        // with pipeline groups, only the least loaded groups that still have a free slot are
-        // candidates, so light or uneven load still spreads across every group
+        // pipeline groups: only the least loaded groups with a free slot are candidates, to spread load
         std::vector<char> group_ok(groups.size(), 1);
         if (n_groups > 1 && task.id_slot == -1) {
             std::vector<int> n_busy(groups.size(), 0);
@@ -3294,8 +3291,7 @@ private:
 
                     guard.wait_for(slot->id_group);
 
-                    // wait_for() let the group finish its decode, which may have released this slot; only its
-                    // group is still locked, so re-check this slot rather than search them all again
+                    // wait_for() may have released this slot; only its group is locked, so re-check just this slot
                     if (!slot->is_processing() || !slot->task ||
                         slot->task->params.oaicompat_cmpl_id != task.params.control_cmpl_id) {
                         res->success = false;
