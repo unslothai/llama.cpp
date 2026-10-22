@@ -6000,6 +6000,9 @@ struct ggml_cuda_trace_mark {
     cudaEvent_t event;
 };
 
+// re-anchor an idle device at most this often (float ms elapsed times keep ~4 us precision over a minute)
+#define GGML_CUDA_TRACE_REANCHOR_US 60000000LL
+
 // per-device anchor: elapsed time is only defined between events of the same device
 struct ggml_cuda_trace_device {
     std::vector<ggml_cuda_trace_mark> pending;
@@ -6125,6 +6128,29 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
             }
         }
         d.pending.resize(keep);
+
+        // elapsed times are float milliseconds: far from the anchor they lose precision (~250 us after an hour),
+        // so move the anchor up while nothing pending refers to the old one and the stream is idle
+        if (d.anchor_fixed && d.pending.empty() && ggml_time_us() - d.anchor_us > GGML_CUDA_TRACE_REANCHOR_US &&
+            cudaStreamQuery(d.stream) == cudaSuccess) {
+            ggml_cuda_set_device(d.device);
+            cudaEvent_t fresh = nullptr;
+            if (!d.spare.empty()) {
+                fresh = d.spare.back();
+                d.spare.pop_back();
+            } else if (cudaEventCreate(&fresh) != cudaSuccess) {
+                fresh = nullptr;
+            }
+            if (fresh != nullptr) {
+                if (cudaEventRecord(fresh, d.stream) == cudaSuccess && cudaEventSynchronize(fresh) == cudaSuccess) {
+                    d.spare.push_back(d.anchor);
+                    d.anchor    = fresh;
+                    d.anchor_us = ggml_time_us();
+                } else {
+                    d.spare.push_back(fresh);
+                }
+            }
+        }
     }
 
     return n;

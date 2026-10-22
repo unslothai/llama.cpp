@@ -692,7 +692,8 @@ void rpc_dispatcher::send_traced(rpc_msg & msg) {
         ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_recv1 ? t_recv1 : ggml_trace_time_us(),
                           "\"t_send0\":%lld,\"t_send1\":%lld,\"t_wait\":%lld,\"t_recv0\":%lld,\"t_recv1\":%lld,"
                           "\"bytes_out\":%zu,\"bytes_in\":%zu,\"reply\":1,\"ok\":%d",
-                          (long long) t_send0, (long long) t_send1, (long long) t_send1,
+                          // t_wait..t_recv0 is the wait for the reply's first byte (remote execution included)
+                          (long long) t_send0, (long long) t_send1, (long long) (t_recv0 ? t_recv0 : t_send1),
                           (long long) t_recv0, (long long) t_recv1,
                           bytes_out, msg.output_size + RPC_RSP_HEADER_BYTES, ok ? 1 : 0);
     } else if (msg.n_nodes >= 0) {
@@ -2310,7 +2311,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         tls_srv.device  = (int) device;
         // device index in the name: merge.py keys per-device rows by name
         char gpu_span[32];
-        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_COMPUTE dev%u", device);
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH dev%u", device); // same row as GRAPH_RECOMPUTE
         tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
     }
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
@@ -2339,7 +2340,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         tls_srv.n_nodes = graph->n_nodes;
         tls_srv.device  = (int) device;
         char gpu_span[32];
-        snprintf(gpu_span, sizeof(gpu_span), "GRAPH_RECOMPUTE dev%u", device);
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH dev%u", device); // same row as GRAPH_COMPUTE
         tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
     }
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
