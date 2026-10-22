@@ -135,6 +135,9 @@ public:
 
     bool shares_cells() const override { return get_n_stream() == 1; }  // one stream: every sequence draws on the same cells
 
+    // [TAG_PREEMPT] counted from the cells of every stream, in blocks of alloc_granularity()
+    int32_t n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const override;
+
     // [TAG_EXACT_CONCURRENCY] the page size under exact mode, 1 otherwise
     uint32_t alloc_granularity() const override;
 

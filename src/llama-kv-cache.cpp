@@ -1536,6 +1536,56 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+int32_t llama_kv_cache::n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const {
+    const uint32_t g = alloc_granularity();
+
+    int64_t n_used    = 0;
+    int64_t n_reclaim = 0;
+
+    for (const auto & cells : v_cells) {
+        // a block counts once one of its cells is live, and is reclaimable when every live cell in it is
+        int64_t block      = -1;
+        bool    block_free = true;
+
+        auto flush = [&]() {
+            if (block >= 0) {
+                n_used += g;
+                n_reclaim += block_free ? g : 0;
+            }
+        };
+
+        const uint32_t n = cells.used_max_p1();
+
+        for (uint32_t i = 0; i < n; ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+
+            if ((int64_t) (i / g) != block) {
+                flush();
+                block      = i / g;
+                block_free = true;
+            }
+
+            if (n_reclaimable && block_free) {
+                int n_in_free = 0;
+                for (size_t j = 0; j < n_seq_free; ++j) {
+                    n_in_free += seq_free[j] >= 0 && seq_free[j] < LLAMA_MAX_SEQ && cells.seq_has(i, seq_free[j]);
+                }
+                block_free = n_in_free == cells.seq_count(i);
+            }
+        }
+
+        flush();
+    }
+
+    if (n_reclaimable) {
+        *n_reclaimable = (int32_t) n_reclaim;
+    }
+
+    return (int32_t) n_used;
+}
+
 uint32_t llama_kv_cache::alloc_granularity() const {
     // [TAG_EXACT_CONCURRENCY] Each page belongs to one (sequence, page) pair, so n tokens hold round_up(n, exact_page_size) cells.
     return exact_pages ? exact_page_size : 1;

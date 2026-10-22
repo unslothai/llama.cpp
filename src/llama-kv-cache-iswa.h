@@ -67,6 +67,8 @@ public:
 
     bool shares_cells() const override { return kv_base->shares_cells(); }
 
+    int32_t n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const override { return kv_base->n_cells_used(seq_free, n_seq_free, n_reclaimable); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

@@ -154,6 +154,11 @@ bool llama_memory_hybrid::shares_cells() const {
     return mem_attn->shares_cells();
 }
 
+int32_t llama_memory_hybrid::n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const {
+    // the cells a caller plans capacity for are the attention half's
+    return mem_attn->n_cells_used(seq_free, n_seq_free, n_reclaimable);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

@@ -828,6 +828,16 @@ extern "C" {
     // false for a recurrent state, a cache with a stream per sequence, or one that keeps its own streams per sequence whatever the unified flag says
     LLAMA_API bool llama_memory_shares_cells(llama_memory_t mem);
 
+    // [TAG_PREEMPT] cells held by at least one sequence, read from the cells themselves: a cell several sequences share counts once,
+    // and a block (llama_memory_alloc_granularity()) with one live cell counts in full
+    // n_reclaimable, if not NULL, receives how many of them are held only by sequences in seq_free (freed if those sequences were removed)
+    // returns -1 when the memory cannot tell (a recurrent state, or a cache that keeps per-sequence streams of its own)
+    LLAMA_API int32_t llama_memory_n_cells_used(
+            llama_memory_t   mem,
+      const llama_seq_id   * seq_free,
+                    size_t   n_seq_free,
+                   int32_t * n_reclaimable);
+
     // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
     // takes the context because the update is a graph; returns true when one was run
     LLAMA_API bool llama_memory_update(struct llama_context * ctx);

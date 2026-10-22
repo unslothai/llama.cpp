@@ -62,6 +62,8 @@ public:
 
     bool shares_cells() const override;
 
+    int32_t n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

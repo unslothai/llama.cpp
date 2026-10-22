@@ -5279,6 +5279,14 @@ bool llama_memory_shares_cells(llama_memory_t mem) {
     return mem->shares_cells();
 }
 
+int32_t llama_memory_n_cells_used(llama_memory_t mem, const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->n_cells_used(seq_free, n_seq_free, n_reclaimable);
+}
+
 bool llama_memory_update(llama_context * ctx) {
     if (!ctx) {
         return false;
