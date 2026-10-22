@@ -322,6 +322,16 @@ struct server_task {
         return id_parent != -1;
     }
 
+    // [TAG_PREEMPT] Whether a slot running this task may be picked to park: TTS and realtime transcription feed their own decode loop,
+    // not a token prompt a resume could replay, and n_cmpl > 1 tasks share one sequence. Every victim and rotation selector asks this.
+    bool preempt_resumable() const {
+        if (is_parent() || is_child()) {
+            return false;
+        }
+
+        return type != SERVER_TASK_TYPE_TTS && type != SERVER_TASK_TYPE_TRANSCRIBE_RT;
+    }
+
     // embedding and rerank tasks always process their whole prompt, their state is never reused
     bool is_stateless() const {
         return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;

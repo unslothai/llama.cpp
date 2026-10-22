@@ -374,6 +374,9 @@ if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
     llama_build_and_test(test-server-decision-exact.cpp)
     target_link_libraries(test-server-decision-exact PRIVATE server-context mtmd)
     target_include_directories(test-server-decision-exact PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    llama_build_and_test(test-server-preempt-kind.cpp)
+    target_link_libraries(test-server-preempt-kind PRIVATE server-context mtmd)
+    target_include_directories(test-server-preempt-kind PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
 endif()
 
 # GGUF model data fetcher library for tests that need real model metadata

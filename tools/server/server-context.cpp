@@ -4775,6 +4775,11 @@ private:
         return res;
     }
 
+    // [TAG_PREEMPT] The one check every victim and rotation selector applies, and preempt_park() enforces: see server_task::preempt_resumable().
+    static bool preempt_parkable(const server_slot & slot) {
+        return slot.task && slot.task->preempt_resumable();
+    }
+
     bool preempt_victim_eligible(server_slot & slot, const server_slot * exempt, bool recompute) {
         // Before the batch is built every slot is at a token boundary; a slot holding no cells is still worth parking.
         if (slot.state != SLOT_STATE_GENERATING &&
@@ -4791,12 +4796,7 @@ private:
             return false;
         }
 
-        if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
-            return false;  // n_cmpl > 1 slots share one sequence
-        }
-
-        // TTS and realtime transcription slots feed their own decode loop, not a token prompt a resume could replay
-        if (slot.task && (slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_TRANSCRIBE_RT)) {
+        if (!preempt_parkable(slot)) {
             return false;
         }
 
@@ -5011,6 +5011,11 @@ private:
 
     // [TAG_PREEMPT] Sync parks finish here, async ones are counted by update_preempt_copies() when they land. The notice is sent with the save, since the slot is already detached and silent.
     bool preempt_park(server_slot & slot, int64_t t_start, bool recompute = false) {
+        if (!preempt_parkable(slot)) {
+            SLT_WRN(slot, "%s", "not parked: this slot cannot be resumed by replaying its prompt\n");
+            return false;
+        }
+
         slot.t_preempt_copy_us = t_start;
 
         preempt_maybe_out = true;
@@ -5317,7 +5322,7 @@ private:
                                 continue;
                             }
 
-                            if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+                            if (!preempt_parkable(slot)) {
                                 continue;
                             }
 
@@ -5472,7 +5477,7 @@ private:
 
         if (preempt_test_every > 0) {
             for (auto & slot : slots) {
-                if (slot.state != SLOT_STATE_GENERATING ||
+                if (slot.state != SLOT_STATE_GENERATING || !preempt_parkable(slot) ||
                     (int32_t) slot.stats.n_gen < (slot.n_preempt + 1) * preempt_test_every) {
                     continue;
                 }
