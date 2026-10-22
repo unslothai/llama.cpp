@@ -2631,6 +2631,19 @@ static void test_synthetic_parity(const test_params & params) {
             llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.7f, 0.5f, 1.0f));
             llama_sampler_chain_add(c, llama_sampler_init_logit_bias(8, 2, lb));
             llama_sampler_chain_add(c, llama_sampler_init_top_p(0.7f, 2)); } },
+        // an infinite temperature (dynamic, entropy 0 with a negative exponent; or plain) after a -INF logit bias:
+        // the masked candidate stays at -INF (no -INF / INF = NaN), the others become equal
+        { "dynatemp_inf_bias", { 100, 1, 0 }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 2, -INFINITY } };
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(3, 1, lb));
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, -2.0f)); } },
+        { "temp_inf_bias", { 3, 1, 0 }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 2, -INFINITY } };
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(3, 1, lb));
+            llama_sampler_chain_add(c, llama_sampler_init_temp(INFINITY)); } },
+        // min-p above 1 keeps only min_keep candidates; a min_keep past the vocabulary keeps them all
+        { "min_p_min_keep_max", { 1, 2, 3, 0.5f }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_min_p(1.1f, SIZE_MAX)); } },
         // dynamic temperature over a large vocabulary
         { "dynatemp_150k", big, [](llama_sampler * c) {
             llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, 1.5f)); } },
@@ -2932,6 +2945,88 @@ static void test_masking_bias_cpu_suffix(const test_params & params) {
     printf("backend masking bias CPU suffix test PASSED\n");
 }
 
+// a sampler from outside llama.cpp that masks with -INF and keeps the candidates on the CPU (here: tokens 10..12 get
+// the logits 0.3, 0.2, 0.1, every other token -INF), followed by a CPU sampler that depends on the number of
+// candidates (XTC with min_keep 3): llama.cpp cannot know that it only masks, so its chain must run on the CPU
+static void llama_sampler_mask3_apply(struct llama_sampler *, llama_token_data_array * cur_p) {
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const llama_token id = cur_p->data[i].id;
+        cur_p->data[i].logit = id >= 10 && id <= 12 ? 1.3f - 0.1f*id : -INFINITY;
+    }
+}
+
+static bool llama_sampler_mask3_backend_init(struct llama_sampler *, ggml_backend_buffer_type_t, uint32_t) {
+    return true;
+}
+
+static void llama_sampler_mask3_backend_apply(struct llama_sampler *, struct ggml_context * ctx, struct ggml_cgraph *,
+        struct llama_sampler_data * data) {
+    const int64_t n = ggml_nelements(data->logits);
+    ggml_tensor * idx  = ggml_arange(ctx, 0.0f, (float) n, 1.0f);
+    ggml_tensor * keep = ggml_mul(ctx, ggml_step(ctx, ggml_scale_bias(ctx, idx, 1.0f, -9.5f)),
+                                       ggml_step(ctx, ggml_scale_bias(ctx, idx, -1.0f, 12.5f)));
+    // the same as the CPU: 1.3 - 0.1 * id on the kept tokens, -INF elsewhere (the candidates stay)
+    ggml_tensor * target = ggml_scale_bias(ctx, idx, -0.1f, 1.3f);
+    data->logits = ggml_add(ctx, target, ggml_log(ctx, keep));
+}
+
+static struct llama_sampler_i llama_sampler_mask3_i = {
+    /* .name              = */ [](const struct llama_sampler *) { return "mask3"; },
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_mask3_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ nullptr,
+    /* .free              = */ nullptr,
+    /* .backend_init      = */ llama_sampler_mask3_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_mask3_backend_apply,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+};
+
+static void test_custom_masking_cpu_suffix(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The capital of France is");
+
+    auto make_chain = [](uint32_t seed) {
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init(&llama_sampler_mask3_i, nullptr));
+        llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.2f, 3, seed));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+        return chain;
+    };
+
+    int n_diff = 0;
+    for (uint32_t seed = 1; seed <= 8; ++seed) {
+        llama_sampler * cpu = make_chain(seed);
+        llama_sampler * gpu = make_chain(seed);
+        {
+        std::vector<llama_sampler_seq_config> no_configs;
+        std::vector<llama_sampler_seq_config> configs = { { 0, gpu } };
+        test_context ctx_cpu(params, no_configs, 1);
+        test_context ctx_gpu(params, configs,    1);
+        common_batch batch_cpu(ctx_cpu.ctx.get());
+        common_batch batch_gpu(ctx_gpu.ctx.get());
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            batch_cpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+            batch_gpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+        }
+        GGML_ASSERT(llama_process(ctx_cpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_cpu.get()) == 0);
+        GGML_ASSERT(llama_process(ctx_gpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_gpu.get()) == 0);
+
+        const int32_t idx = (int32_t) prompt.size() - 1;
+        const llama_token tc = llama_sampler_sample(cpu, ctx_cpu.ctx.get(), idx);
+        const llama_token tg = llama_sampler_sample(gpu, ctx_gpu.ctx.get(), idx);
+        printf("custom masking sampler + CPU suffix, seed %u: cpu %d gpu %d\n", seed, tc, tg);
+        n_diff += tc != tg;
+        }
+        llama_sampler_free(cpu);
+        llama_sampler_free(gpu);
+    }
+    GGML_ASSERT(n_diff == 0);
+    printf("backend custom masking sampler CPU suffix test PASSED\n");
+}
+
 // a nested chain with backend penalties and a CPU-only sampler after them runs on the CPU as a whole: its
 // penalties must run there (draft rows declared, several outputs per sequence)
 static void test_nested_chain_cpu_fallback(const test_params & params) {
@@ -3160,6 +3255,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_synthetic_parity",                    test_synthetic_parity,                 true },
     { "test_multi_output_prompt_penalties",       test_multi_output_prompt_penalties,    true },
     { "test_masking_bias_cpu_suffix",             test_masking_bias_cpu_suffix,          true },
+    { "test_custom_masking_cpu_suffix",           test_custom_masking_cpu_suffix,        true },
     { "test_nested_chain_cpu_fallback",           test_nested_chain_cpu_fallback,        true },
     { "test_all_masked_row",                      test_all_masked_row,                   true },
     { "test_cpu_parity",                          test_cpu_parity,                       true },
