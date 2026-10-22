@@ -934,7 +934,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
