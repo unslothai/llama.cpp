@@ -1238,11 +1238,60 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     // same key as llama_model_chat_template(model, nullptr)
     info.has_chat_tmpl = gguf_find_key(gguf_ctx.get(), "tokenizer.chat_template") >= 0;
 
+    const int64_t exp_id = gguf_find_key(gguf_ctx.get(), (arch + ".expert_count").c_str());
+    if (exp_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), exp_id) == GGUF_TYPE_UINT32) {
+        info.n_expert = gguf_get_val_u32(gguf_ctx.get(), exp_id);
+    }
+
     return info;
+}
+
+// whether the tensor overrides (--cpu-moe, --n-cpu-moe, -ot) put the experts of some layer in a host buffer
+// the loader applies the first override whose pattern matches the tensor name, so match a representative expert name
+static bool common_overrides_put_experts_on_host(const std::vector<llama_model_tensor_buft_override> & overrides) {
+    std::vector<std::regex> patterns;
+    std::vector<bool>       on_host;
+    for (const auto & ovr : overrides) {
+        if (ovr.pattern == nullptr) {
+            break;
+        }
+        try {
+            patterns.emplace_back(ovr.pattern);
+        } catch (const std::regex_error &) {
+            continue; // the loader rejects an invalid pattern anyway
+        }
+        on_host.push_back(ovr.buft != nullptr && ggml_backend_buft_is_host(ovr.buft));
+    }
+    for (int il = 0; il < 512; ++il) {
+        const std::string name = "blk." + std::to_string(il) + ".ffn_down_exps.weight";
+        for (size_t i = 0; i < patterns.size(); ++i) {
+            if (std::regex_search(name, patterns[i])) {
+                if (on_host[i]) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    return false;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // a MoE ubatch reads (and, for experts in host memory, uploads) the weights of nearly every expert, so a prompt
+    // costs one pass over all experts per ubatch: without -ub, MoE models use the logical batch
+    // except with a draft/MTP model and the experts on the GPU: the draft context follows this ubatch, so its compute buffers grow too
+    if (!params.n_ubatch_set && params.n_ubatch < params.n_batch &&
+        (!(has_draft || spec_mtp) || common_overrides_put_experts_on_host(params.tensor_buft_overrides)) &&
+        common_get_gguf_info(params.model.path).n_expert > 0) {
+        params.n_ubatch = std::min(params.n_batch, 4096);
+        COM_INF("MoE model, n_ubatch = %d (set -ub to override)\n", params.n_ubatch);
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1251,10 +1300,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-
         common_params params_dft = common_base_params_to_speculative(params);
 
         auto mparams_dft = common_model_params_to_llama(params_dft);

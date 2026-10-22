@@ -1677,9 +1677,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
-        string_format("physical maximum batch size (default: %d)", params.n_ubatch),
+        string_format("physical maximum batch size (default: %d, MoE models: n_batch up to 4096)", params.n_ubatch),
         [](common_params & params, int value) {
-            params.n_ubatch = value;
+            params.n_ubatch     = value;
+            params.n_ubatch_set = true;
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
