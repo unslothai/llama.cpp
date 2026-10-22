@@ -152,6 +152,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
             return false;
         }
+        // 2D weights only: the packed buffer holds a single slice; a batched src1 is folded into M
+        if (ggml_nrows(src0) != src0->ne[1]) {
+            return false;
+        }
         if (!src0->buffer || src0->buffer->buft != ggml_backend_amx_buffer_type()) {
             return false;
         }
