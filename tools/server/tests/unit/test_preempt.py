@@ -109,6 +109,33 @@ def _complete_all(n_predict: int, prompts=(_PROMPT_A, _PROMPT_B), timeout: float
     return parallel_function_calls([(_complete, (n_predict, prompt, -1, 0.0, None, timeout)) for prompt in prompts])
 
 
+def _server_progress():
+    """What every slot has prefilled and decoded so far: it changes while the server is working, however slow the host."""
+    return tuple((s["id"], s.get("id_task"), s.get("n_prompt_tokens_processed", 0), s.get("n_prompt_tokens", 0),
+                  s.get("next_token", [{}])[0].get("n_decoded", 0), s.get("n_preempt", 0))
+                 for s in server.make_request("GET", "/slots").body)
+
+
+def _await(cond, what: str, alive=None, stall: float = 120.0, poll: float = 0.02) -> None:
+    """Wait for cond() as long as the server keeps making progress, so a slow runner is only slower: fail if the request
+    it depends on ends first (alive() false) or nothing has moved for `stall` seconds, never on a wall-clock deadline."""
+    last, t_last, t_check = None, time.time(), 0.0
+    while not cond():
+        if alive is not None and not alive():
+            if cond():
+                return
+            pytest.fail(f"{what}: the request it waits on ended first")  # ty: ignore[invalid-argument-type]
+        now = time.time()
+        if now - t_check >= 0.5:
+            t_check = now
+            cur = _server_progress()
+            if cur != last:
+                last, t_last = cur, now
+            elif now - t_last > stall:
+                pytest.fail(f"{what}: the server made no progress for {stall:.0f} s")  # ty: ignore[invalid-argument-type]
+        time.sleep(poll)
+
+
 def _wait_processing(slot_ids, timeout: float = 30.0):
     """Return once every one of these slots is processing; a request that ended first is a failure, not a hang."""
     deadline = time.time() + timeout
@@ -140,14 +167,19 @@ def _complete_together(n_predict: int, n_prompt, timeout: float = DEFAULT_REQUES
 
 
 def _wait_preempted(timeout: float = 30.0) -> bool:
-    """True once some slot is parked: its cells are in host RAM and it wants them back."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    """True once some slot is parked: its cells are in host RAM and it wants them back. False once the server has gone
+    `timeout` seconds without progress and without parking: a slow host only takes longer."""
+    last, t_last = None, time.time()
+    while True:
         slots = server.make_request("GET", "/slots").body
         if any(s["is_preempted"] for s in slots):
             return True
+        cur = _server_progress()
+        if cur != last:
+            last, t_last = cur, time.time()
+        elif time.time() - t_last > timeout:
+            return False
         time.sleep(0.005)
-    return False
 
 
 def _prompt_of(n_tokens: int, text: str) -> list:
@@ -376,10 +408,8 @@ def test_a_parked_head_that_needs_the_whole_pool_is_rotated_in(policy):
     leader = threading.Thread(target=lead, daemon=True)
     leader.start()
     try:
-        deadline = time.time() + 60
-        while time.time() < deadline and _n_decoded(_slot_view(0)) <= 40:
-            time.sleep(0.005)
-        res = _raw_completion(1, head, 1, timeout=60)
+        _await(lambda: _n_decoded(_slot_view(0)) > 40, "the leader decoding 40 tokens", alive=leader.is_alive, poll=0.005)
+        res = _raw_completion(1, head, 1, timeout=600)
     finally:
         stop.set()
         leader.join(30)
@@ -435,12 +465,8 @@ def test_a_resident_that_cannot_be_swapped_out_is_rotated_by_recompute(policy):
     t.start()
 
     try:
-        for _ in range(3000):
-            if "slot context shift" in _log():
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("the resident never reached the end of the pool")  # ty: ignore[invalid-argument-type]
+        _await(lambda: "slot context shift" in open(server.log_path, errors="replace").read(),
+               "the resident reaching the end of the pool", alive=t.is_alive, poll=0.05)
 
         waiting = server.make_request("POST", "/completion", data={
             "n_predict": 8, "prompt": _prompt_of(1800, _PROMPT_C),
@@ -472,14 +498,10 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
         except Exception:
             pass
 
-    for _ in range(600):
-        res = server.make_request("GET", "/slots")
-        assert res.status_code == 200
-        if all(not slot["is_processing"] for slot in res.body):
-            break
-        time.sleep(0.2)
-    else:
-        pytest.fail("a slot never came back after a cancel during a copy")  # ty: ignore[invalid-argument-type]
+    _await(lambda: all(not s["is_processing"] for s in server.make_request("GET", "/slots").body),
+           "every slot coming back after a cancel during a copy", poll=0.2)
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
     for slot in res.body:
         assert slot["is_preempted"] is False
         assert slot["is_transferring"] is False
@@ -828,13 +850,8 @@ def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone(
         t.start()
 
     try:
-        for _ in range(600):
-            slots = server.make_request("GET", "/slots").body
-            if sum(1 for s in slots if s["is_processing"] and s["n_prompt_tokens"] > 0) >= 3:
-                break
-            time.sleep(0.1)
-        else:
-            pytest.fail("the decoders never started")  # ty: ignore[invalid-argument-type]
+        _await(lambda: sum(1 for s in server.make_request("GET", "/slots").body if s["is_processing"] and s["n_prompt_tokens"] > 0) >= 3,
+               "the decoders starting", poll=0.1)
         time.sleep(1.0)
 
         beside = prefill(50000)
@@ -855,8 +872,8 @@ def test_slots_reports_a_transferring_slot_apart_from_a_parked_one():
     t.start()
     seen_parked = seen_transferring = False
     try:
-        deadline = time.time() + 120
-        while time.time() < deadline and not (seen_parked and seen_transferring):
+        # polled for as long as the requests run, however long that is on this host
+        while t.is_alive() and not (seen_parked and seen_transferring):
             res = server.make_request("GET", "/slots")
             assert res.status_code == 200
             for slot in res.body:
@@ -866,7 +883,7 @@ def test_slots_reports_a_transferring_slot_apart_from_a_parked_one():
                     assert slot["n_prompt_tokens"] > 0, "a slot with a copy in flight still holds its cells"
                 seen_parked = seen_parked or slot["is_preempted"]
     finally:
-        t.join(180)
+        t.join(1800)
 
     assert len(done) == 2, done
     for res in done:
@@ -1064,8 +1081,7 @@ def test_slots_reports_the_recomputes_of_the_current_task():
 
     seen = 0
     try:
-        deadline = time.time() + 180
-        while time.time() < deadline and seen == 0 and t.is_alive():
+        while seen == 0 and t.is_alive():
             res = server.make_request("GET", "/slots")
             assert res.status_code == 200
             for slot in res.body:
@@ -1073,7 +1089,7 @@ def test_slots_reports_the_recomputes_of_the_current_task():
                 seen = max(seen, slot["n_recompute"])
             time.sleep(0.02)
     finally:
-        t.join(180)
+        t.join(1800)
 
     assert seen > 0, "no slot ever reported a recompute park"
     assert done and done[0].status_code == 200, done
@@ -1161,14 +1177,8 @@ def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     t = threading.Thread(target=lambda: resident.append(_complete(1900, _PROMPT_A)), daemon=True)
     t.start()
 
-    deadline = time.time() + 90
-    while t.is_alive() and time.time() < deadline:
-        slots = server.make_request("GET", "/slots").body
-        if any(slot.get("n_prompt_tokens", 0) >= 1600 for slot in slots):
-            break
-        time.sleep(0.005)
-    else:
-        pytest.fail("the resident never grew into the pool")  # ty: ignore[invalid-argument-type]
+    _await(lambda: any(s.get("n_prompt_tokens", 0) >= 1600 for s in server.make_request("GET", "/slots").body),
+           "the resident growing into the pool", alive=t.is_alive, poll=0.005)
 
     n_prompt = 500
     n_predict = 8
@@ -1271,12 +1281,13 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
         w.start()
 
     try:
-        deadline = time.time() + 60
-        while time.time() < deadline and len(shorts) < 6:
-            time.sleep(0.01)
+        _await(lambda: len(shorts) >= 6, "the short-request stream starting", poll=0.01)
+        # overtaken, the head waits until the stream stops: give it a span many short requests long, as slow as the host is
+        t_first_short = max((r.body["timings"]["prompt_ms"] + r.body["timings"]["predicted_ms"]) / 1e3 for _, r in list(shorts))
+        t_stream_max = max(t_stream_max, 30 * t_first_short)
         t_head = time.time()
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(_raw_completion, n_head, head_prompt, 3, t_stream_max + 180)
+            fut = pool.submit(_raw_completion, n_head, head_prompt, 3, t_stream_max + 600)
             while not fut.done() and time.time() - t_head < t_stream_max:
                 time.sleep(0.05)
             stopped_early = not fut.done()
@@ -1321,10 +1332,10 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head(polic
         done[name] = (time.time(), res)
 
     a = threading.Thread(target=run, args=("a", 16000, _prompt_of(64, _PROMPT_A), 0))
+    t_a = time.time()
     a.start()
-    deadline = time.time() + 300
-    while time.time() < deadline and _n_decoded(_slot_view(0)) < 2000:
-        time.sleep(0.01)
+    _await(lambda: _n_decoded(_slot_view(0)) >= 2000, "the resident decoding 2000 tokens", alive=a.is_alive, poll=0.01)
+    t_per_token = (time.time() - t_a) / 2000
     b = threading.Thread(target=run, args=("b", 8000, _prompt_of(1500, _PROMPT_B), 1))
     b.start()
     a.join(1800)
@@ -1340,7 +1351,9 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head(polic
     assert "slot context shift" not in text
     waits = [float(w) for w in re.findall(r"id +1 \| task \d+ \| resumed after ([\d.]+) s", text)]
     assert waits, "the second request was never parked"
-    assert max(waits) < 90.0, f"the parked request waited {waits} s behind a resident that ends by itself"
+    # waiting for the resident to end would take its remaining 14000 tokens; a rotation takes a small part of that, on any host
+    t_bound = max(90.0, 0.5 * 14000 * t_per_token)
+    assert max(waits) < t_bound, f"the parked request waited {waits} s behind a resident that ends by itself (bound {t_bound:.0f} s)"
 
 
 def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():
@@ -1353,12 +1366,8 @@ def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small
 
     with ThreadPoolExecutor(4) as pool:
         residents = [pool.submit(_raw_completion, 300, p, i) for i, p in enumerate(small + [medium])]
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            slots = server.make_request("GET", "/slots").body
-            if all(_n_decoded(s) > 0 for s in slots if s["id"] < 3):
-                break
-            time.sleep(0.002)
+        _await(lambda: all(_n_decoded(s) > 0 for s in server.make_request("GET", "/slots").body if s["id"] < 3),
+               "the three residents decoding", alive=lambda: not all(r.done() for r in residents), poll=0.002)
         last = pool.submit(_raw_completion, 8, leader, 3)
         results = [r.result() for r in residents] + [last.result()]
 
@@ -1588,9 +1597,8 @@ def test_two_n_2_requests_that_do_not_fit_together_end_only_one():
     _start(n_ctx=1024, n_slots=4, n_batch=128, n_ubatch=128)
     with ThreadPoolExecutor(2) as pool:
         first = pool.submit(_oai_n, [100 + k % 50 for k in range(200)], 2, 250)
-        deadline = time.time() + 30
-        while time.time() < deadline and sum(s["is_processing"] for s in server.make_request("GET", "/slots").body) < 2:
-            time.sleep(0.005)
+        _await(lambda: sum(s["is_processing"] for s in server.make_request("GET", "/slots").body) >= 2,
+               "the first family on its two slots", alive=lambda: not first.done(), poll=0.005)
         second = pool.submit(_oai_n, [200 + k % 50 for k in range(200)], 2, 250)
         results = [first.result(), second.result()]
     assert sorted(r.status_code for r in results) == [200, 500], [r.body for r in results]
@@ -1604,11 +1612,9 @@ def test_an_n_2_prompt_that_parked_an_older_request_is_not_held_behind_it(policy
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = policy
     _start(n_ctx=1024, n_slots=3, n_batch=128, cache_ram=0)
     with ThreadPoolExecutor(1) as pool:
-        single = pool.submit(_raw_completion, 300, [100 + k % 50 for k in range(600)], 0, 90)
-        deadline = time.time() + 60
-        while time.time() < deadline and _n_decoded(_slot_view(0)) <= 4:
-            time.sleep(0.002)
-        family = _oai_n([200 + k % 50 for k in range(800)], 2, 1, timeout=90)
+        single = pool.submit(_raw_completion, 300, [100 + k % 50 for k in range(600)], 0, 900)
+        _await(lambda: _n_decoded(_slot_view(0)) > 4, "the single request decoding", alive=lambda: not single.done(), poll=0.002)
+        family = _oai_n([200 + k % 50 for k in range(800)], 2, 1, timeout=900)
         single = single.result()
     assert single.status_code == 200, single.body
     assert single.body["timings"]["predicted_n"] == 300
@@ -1624,9 +1630,7 @@ def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generati
     assert _cached(1, earlier, 1).status_code == 200
     with ThreadPoolExecutor(1) as pool:
         older = pool.submit(_cached, 600, [100 + k % 50 for k in range(40)], 0)
-        deadline = time.time() + 60
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 280:
-            time.sleep(0.002)
+        _await(lambda: _n_decoded(_slot_view(0)) >= 280, "the older request decoding 280 tokens", alive=lambda: not older.done(), poll=0.002)
         newer = _cached(4, earlier + [300 + k % 50 for k in range(300)], 1)
         older = older.result()
     for res, n_predict in ((older, 600), (newer, 4)):
@@ -1645,9 +1649,7 @@ def test_the_policy_decides_whether_the_newest_or_the_cheapest_slot_is_parked(po
     assert _cached(1, [300 + k % 50 for k in range(150)], 2).status_code == 200
     with ThreadPoolExecutor(1) as pool:
         older = pool.submit(_cached, 600, [100 + k % 50 for k in range(40)], 0)
-        deadline = time.time() + 60
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 20:
-            time.sleep(0.005)
+        _await(lambda: _n_decoded(_slot_view(0)) >= 20, "the older request decoding 20 tokens", alive=lambda: not older.done(), poll=0.005)
         newer = _cached(500, [200 + k % 50 for k in range(300)], 1)
         older = older.result()
     for res, n_predict in ((older, 600), (newer, 500)):
@@ -1697,10 +1699,7 @@ def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():
         oldest = pool.submit(lambda: server.make_request("POST", "/completion", timeout=600, data={
             "n_predict": 100000, "prompt": [100 + k % 50 for k in range(20)], "id_slot": 0, "cache_prompt": True,
             "ignore_eos": True, "temperature": 0.0, "seed": 42}))
-        deadline = time.time() + 180
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 100:
-            time.sleep(0.02)
-        assert _n_decoded(_slot_view(0)) >= 100, "the oldest did not start generating in time"
+        _await(lambda: _n_decoded(_slot_view(0)) >= 100, "the oldest generating 100 tokens", alive=lambda: not oldest.done())
         # 120 cells and growing beside 4016: it cannot fit, so it is parked and is owed the cells first
         parked = pool.submit(_cached, 16, [200 + k % 50 for k in range(4000)], 1)
         assert _wait_preempted(120), "the second request was never parked, so the case was not reached"
@@ -1727,10 +1726,7 @@ def test_a_started_slot_trimmed_below_its_sliding_window_prefills_again():
     assert _cached(1, stale, 1).status_code == 200
     with ThreadPoolExecutor(1) as pool:
         busy = pool.submit(_cached, 400, [300 + k % 50 for k in range(40)], 0)
-        deadline = time.time() + 180
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 230:
-            time.sleep(0.02)
-        assert _n_decoded(_slot_view(0)) >= 230, "the busy slot did not fill the pool in time"
+        _await(lambda: _n_decoded(_slot_view(0)) >= 230, "the busy slot filling the pool", alive=lambda: not busy.done())
         # 40 tokens in common, far below the 32 newest cells the window kept of the stale 200
         res = _cached(16, stale[:40] + [400 + k % 50 for k in range(60)], 1)
         busy = busy.result()
@@ -1774,9 +1770,7 @@ def test_a_prompt_dropped_in_its_prefill_waits_until_it_fits_whole(policy):
     assert server.make_request("GET", "/props").body["preempt"]["policy"] == policy
     with ThreadPoolExecutor(1) as pool:
         older = pool.submit(_cached, 1500, [100 + k % 50 for k in range(1500)], 0)
-        deadline = time.time() + 120
-        while time.time() < deadline and _n_decoded(_slot_view(0)) < 100:
-            time.sleep(0.005)
+        _await(lambda: _n_decoded(_slot_view(0)) >= 100, "the older request decoding 100 tokens", alive=lambda: not older.done(), poll=0.005)
         newer = _cached(4, [200 + k % 50 for k in range(2500)], 1)
         older = older.result()
     for res, n_predict in ((older, 1500), (newer, 4)):

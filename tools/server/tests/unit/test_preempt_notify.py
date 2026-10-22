@@ -22,6 +22,7 @@ def create_server():
     server = ServerPreset.tinyllama2()
     server.n_slots = 2
     server.kv_unified = True
+    server.server_slots = True  # _await() reads progress from /slots
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "8192"
     server.temperature = 0.0
     server.seed = 42
@@ -59,6 +60,36 @@ def _log() -> str:
         last = size
         time.sleep(0.1)
     return open(server.log_path, errors="replace").read()
+
+
+def _slots() -> list:
+    return requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
+
+
+def _server_progress():
+    """What every slot has prefilled and decoded so far: it changes while the server is working, however slow the host."""
+    return tuple((s["id"], s.get("id_task"), s.get("n_prompt_tokens_processed", 0), s.get("n_prompt_tokens", 0),
+                  s.get("next_token", [{}])[0].get("n_decoded", 0), s.get("n_preempt", 0)) for s in _slots())
+
+
+def _await(cond, what: str, alive=None, stall: float = 120.0, poll: float = 0.02) -> None:
+    """Wait for cond() as long as the server keeps making progress (as in test_preempt.py): fail if the request it depends
+    on ends first or nothing has moved for `stall` seconds, never on a wall-clock deadline."""
+    last, t_last, t_check = None, time.time(), 0.0
+    while not cond():
+        if alive is not None and not alive():
+            if cond():
+                return
+            pytest.fail(f"{what}: the request it waits on ended first")  # ty: ignore[invalid-argument-type]
+        now = time.time()
+        if now - t_check >= 0.5:
+            t_check = now
+            cur = _server_progress()
+            if cur != last:
+                last, t_last = cur, now
+            elif now - t_last > stall:
+                pytest.fail(f"{what}: the server made no progress for {stall:.0f} s")  # ty: ignore[invalid-argument-type]
+        time.sleep(poll)
 
 
 def _post(path: str, data: dict):
@@ -99,7 +130,7 @@ def _behind_a_resident(payload: dict) -> tuple[int, str, list[str]]:
     t = threading.Thread(target=_resident)
     t.start()
     try:
-        assert started.wait(60)
+        _await(started.is_set, "the resident streaming its first token", alive=t.is_alive)
         res = _post("/completion", payload)
         if res.status_code != 200:
             return res.status_code, res.text, []
@@ -112,7 +143,7 @@ def _behind_a_resident(payload: dict) -> tuple[int, str, list[str]]:
         assert alive, "the resident had finished before this request was told anything"
         return 200, "", lines
     finally:
-        t.join(120)
+        t.join(1800)
 
 
 def _content(datas: list[str]) -> str:
@@ -181,14 +212,7 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
     t = threading.Thread(target=_resident, daemon=True)
     t.start()
 
-    deadline = time.time() + 90
-    while t.is_alive() and time.time() < deadline:
-        slots = requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
-        if any(slot.get("n_prompt_tokens", 0) >= 1400 for slot in slots):
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("the resident never grew into the pool")  # ty: ignore[invalid-argument-type]
+    _await(lambda: any(s.get("n_prompt_tokens", 0) >= 1400 for s in _slots()), "the resident growing into the pool", alive=t.is_alive)
 
     res = _post(path, _prefill_payload(path, " ".join([_PROMPT_B] * 31), 8))
     assert res.status_code == 200
@@ -199,7 +223,7 @@ def test_a_park_during_prompt_processing_opens_the_stream_with_the_notice(path):
         line = raw.decode("utf-8")
         if line:
             seen.append((time.time() - t0, line))
-    t.join(120)
+    t.join(1800)
 
     text = _log()
     assert "preempted:" in text, "nothing was parked while the prompt was being processed"
