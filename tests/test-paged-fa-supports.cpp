@@ -16,6 +16,7 @@ struct paged_shape {
     int64_t      mask_rows;  // mask rows, one per query at least
     int64_t      mask_cols;  // mask columns, one per K cell at least
     bool         valid;
+    int64_t      mask_planes = 1;  // the paged kernel reads one mask plane for every head
 };
 
 static bool supports(ggml_backend_dev_t dev, const paged_shape & s) {
@@ -29,7 +30,7 @@ static bool supports(ggml_backend_dev_t dev, const paged_shape & s) {
     ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, s.n_tokens, 8, 1);
     ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, s.n_kv,     2, 1);
     ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, s.n_kv,     2, 1);
-    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, s.mask_cols, s.mask_rows, 1, 1);
+    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, s.mask_cols, s.mask_rows, s.mask_planes, 1);
 
     ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(256.0f), 0.0f, 0.0f);
     ggml_prec_set_acc(op, GGML_PREC_F32);
@@ -54,6 +55,8 @@ int main() {
         { "cells not a whole number of pages",   1000,  4, 4,  4, 1000, false },
         { "mask with fewer rows than queries",   1024,  4, 5,  3, 1024, false },
         { "mask narrower than the cells",        1024,  4, 5,  4,  768, false },
+        { "a mask plane per head",               1024,  4, 5,  4, 1024, false, 8 },
+        { "a mask plane per K/V head",           1024,  4, 5,  4, 1024, false, 2 },
     };
 
     int rc = 0;

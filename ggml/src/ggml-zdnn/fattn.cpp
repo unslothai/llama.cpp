@@ -21,7 +21,8 @@ bool ggml_zdnn_supports_flash_attn_ext(const ggml_backend_zdnn_device_context * 
     memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
 
     // sinks, alibi, softcap and sparse k/v sets are not implemented
-    if (op->src[4] != nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
+    // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
+    if (op->src[4] != nullptr || op->src[5] != nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
         return false;
     }
 

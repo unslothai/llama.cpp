@@ -760,7 +760,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 // [TAG_EXACT_CONCURRENCY] The shapes the paged kernel can run: one-column F16 vector kernel, whole 256-cell pages, a table row of
-// [count, page IDs...] per query and a mask row per query covering every cell. supports_op answers with this and the launch asserts it.
+// [count, page IDs...] per query and a mask row per query covering every cell, shared by every head. supports_op answers with this and the launch asserts it.
 static bool ggml_cuda_fattn_paged_shape_ok(const ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
@@ -776,7 +776,7 @@ static bool ggml_cuda_fattn_paged_shape_ok(const ggml_tensor * dst) {
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
         Q->ne[3] == 1 && Q->ne[2] % K->ne[2] == 0 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1] &&
+        mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&  // one mask plane: the vector kernel has no per-head mask offset
         pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) &&
         pages->ne[0] == 1 + K->ne[1]/FATTN_KQ_STRIDE && pages->ne[1] == Q->ne[1] &&
         softcap == 0.0f;
