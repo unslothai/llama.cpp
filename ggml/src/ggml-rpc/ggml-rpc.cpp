@@ -134,11 +134,17 @@ struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+// optional features a server advertises in rpc_msg_hello_rsp::features (servers without them send 0, so
+// adding one needs no version bump and older clients keep connecting)
+enum rpc_hello_feature : uint8_t {
+    RPC_HELLO_FEATURE_TRACE = 1 << 0, // RPC_CMD_TRACE_SYNC
+};
+
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t features; // rpc_hello_feature bits
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -489,7 +495,7 @@ static inline void rpc_cpu_relax() {
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server_minor) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * server_features) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -504,7 +510,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, int * server
         return false;
     }
 
-    *server_minor = response.minor;
+    *server_features = response.features;
     sock->update_caps(response.conn_caps);
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
@@ -765,13 +771,13 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    int server_minor = 0;
-    if (!negotiate_hello(sock, &server_minor)) {
+    uint8_t server_features = 0;
+    if (!negotiate_hello(sock, &server_features)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     ggml_trace_open(nullptr, "rpc-client");
-    // an 8.0 server passes HELLO but drops the connection on TRACE_SYNC
-    if (ggml_trace_flag && server_minor >= 1) {
+    // a server without the tracer passes HELLO but drops the connection on TRACE_SYNC
+    if (ggml_trace_flag && (server_features & RPC_HELLO_FEATURE_TRACE)) {
         rpc_trace_sync(sock, endpoint);
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1576,6 +1582,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.features = RPC_HELLO_FEATURE_TRACE;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
