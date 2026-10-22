@@ -2328,17 +2328,18 @@ static void llama_sampler_temp_ext_apply(struct llama_sampler * smpl, llama_toke
 
         llama_sampler_softmax_impl(cur_p, true);
 
-        // Calculate entropy of the softmax probabilities
-        float entropy = 0.0f;
+        // Calculate entropy of the softmax probabilities (accumulated in double: a sequential f32 sum over a large
+        // vocabulary drifts, see llama_sampler_softmax_impl)
+        double entropy = 0.0;
         for (size_t i = 0; i < cur_p->size; ++i) {
             float prob = cur_p->data[i].p;
             if (prob > 0.0f) { // Ensure no log(0)
-                entropy -= prob * logf(prob);
+                entropy -= (double) prob * logf(prob);
             }
         }
 
         // Normalize the entropy (max_entropy cannot be 0 here because we checked cur_p->size != 1 above)
-        float normalized_entropy = entropy / max_entropy;
+        float normalized_entropy = (float) (entropy / max_entropy);
 
         // Map the normalized entropy to the desired temperature range using the power function
         float dyn_temp = min_temp + (max_temp - min_temp) * powf(normalized_entropy, exponent_val);
@@ -2418,6 +2419,10 @@ static void llama_sampler_temp_ext_backend_apply(
         return;
     }
 
+    // the CPU sampler sorts the candidates (llama_sampler_softmax_impl) before it scales them: sort here too, so
+    // candidates that end up equal after the scaling (an infinite temperature) keep the CPU's order
+    llama_sampler_backend_sort_desc(ctx, data);
+
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
     // Calculate min_temp, max_temp.
@@ -2495,7 +2500,11 @@ static void llama_sampler_temp_ext_backend_apply(
             ggml_scale_bias(ctx, has_entropy, -2.0f, 2.0f));
     ggml_set_name(dyn_temp, "temp_ext_dyn_temp");
 
-    struct ggml_tensor * scaled = ggml_div(ctx, logits, dyn_temp);
+    // a candidate an earlier sampler masked stays -INF also for an infinite temperature (-INF / INF is NaN):
+    // divide the finite part (-INF clamped to -FLT_MAX) and add the mask back
+    struct ggml_tensor * mask_bias = ggml_log(ctx, ggml_scale_bias(ctx, is_masked, -1.0f, 1.0f));
+    struct ggml_tensor * scaled = ggml_add(ctx,
+            ggml_div(ctx, ggml_clamp(ctx, logits, -FLT_MAX, FLT_MAX), dyn_temp), mask_bias);
 
     struct ggml_tensor * max_idx = llama_sampler_backend_argmax_first(ctx, logits);
     struct ggml_tensor * pos     = ggml_arange(ctx, 0.0f, (float) n, 1.0f);
@@ -2509,9 +2518,6 @@ static void llama_sampler_temp_ext_backend_apply(
             ggml_reshape_2d(ctx, logits, n, 1), 1);
     data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, alternatives, ggml_cast(ctx, pick, GGML_TYPE_I32)), n);
     ggml_set_name(data->logits, "temp_ext_scaled_logits");
-
-    // the CPU sampler leaves the candidates sorted by descending probability (llama_sampler_softmax_impl)
-    llama_sampler_backend_sort_desc(ctx, data);
 }
 
 static struct llama_sampler_i llama_sampler_temp_ext_i = {
@@ -4242,6 +4248,9 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     if (ctx->logit_bias.empty()) {
         return;
     }
+
+    // biases change the order of the candidates: an array an earlier sampler sorted is not sorted anymore
+    cur_p->sorted = false;
 
     ctx->to_search.clear();
 
