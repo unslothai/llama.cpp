@@ -643,6 +643,10 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    // llama-connect params
+    bool        server_connect      = false;
+    std::string server_connect_code = "";
+
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
@@ -971,6 +975,8 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_VLLM_D3, // same as pplx-decider, non-causal attention
     COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
     COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_GRANITE_SWITCH, // same as openjev, run by the decision aLoRA of granite switch
+    COMMON_DECISION_TYPE_H2O_LIGHTNING, // same as openjev, the labels are read after an answer prefill
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 
