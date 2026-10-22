@@ -289,8 +289,6 @@ llama_model_minimax_01::graph::graph(const llama_model & model, const llm_graph_
             ggml_tensor * slope_rate = ggml_scale(ctx0, slopes, slope_scale);
             cb(slope_rate, "slope_rate", il);
 
-            cur = ggml_reshape_4d(ctx0, cur, cur->ne[0], n_seq_tokens, 1, n_seqs);
-
             ggml_tensor * QKVcur = build_lora_mm(model.layers[il].wqkv, cur);
             cb(QKVcur, "QKVcur", il);
 
@@ -396,7 +394,7 @@ llama_model_minimax_01::graph::graph(const llama_model & model, const llm_graph_
             qkv = ggml_cont(ctx0, ggml_permute(ctx0, qkv, 0, 2, 1, 3));
             cb(qkv, "qkv_permuted", il);
 
-            qkv = ggml_reshape_4d(ctx0, qkv, qkv->ne[0]*qkv->ne[1], qkv->ne[2], 1, qkv->ne[3]);
+            qkv = ggml_reshape_2d(ctx0, qkv, qkv->ne[0]*qkv->ne[1], qkv->ne[2]*qkv->ne[3]);
 
             // norm
             ggml_tensor * qkv_norm = build_norm(qkv,
@@ -413,9 +411,6 @@ llama_model_minimax_01::graph::graph(const llama_model & model, const llm_graph_
             cur = ggml_mul(ctx0, g, qkv_norm);
 
             cur = build_lora_mm(model.layers[il].wo, cur);
-            cb(cur, "attn_out", il);
-
-            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens*n_seqs);
             cb(cur, "attn_out", il);
         }
 
