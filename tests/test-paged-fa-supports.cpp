@@ -66,8 +66,8 @@ int main() {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
 
-        // only the CUDA backend reads the page table; the others are kept off this path by llama_exact_backend_name()
-        if (strcmp(reg_name, "CUDA") != 0) {
+        // only the CUDA backend (also built as ROCm and MUSA) reads the page table; the others are kept off this path by llama_exact_backend_reg()
+        if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
             continue;
         }
 

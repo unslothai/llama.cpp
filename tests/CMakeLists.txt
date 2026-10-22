@@ -338,13 +338,19 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool; skips itself where the mode cannot run
-llama_build_and_test(test-exact-pages.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-exact-pages PROPERTIES FIXTURES_REQUIRED test-download-model)
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool, and a non-layer weight on the host refused; both skip themselves where the mode
+# cannot run. Exact mode needs 256-wide K/V heads, which the generic test model does not have, so they run only against LLAMA_TEST_EXACT_MODEL.
+set(LLAMA_TEST_EXACT_MODEL "" CACHE FILEPATH "a model with 256-wide K/V heads for the exact-concurrency model tests")
+llama_build(test-exact-pages.cpp)
+llama_build(test-exact-weights.cpp)
+if (LLAMA_TEST_EXACT_MODEL)
+    llama_test(test-exact-pages   LABEL "model" ARGS -m "${LLAMA_TEST_EXACT_MODEL}")
+    llama_test(test-exact-weights LABEL "model" ARGS -m "${LLAMA_TEST_EXACT_MODEL}")
+endif()
 
-# [TAG_EXACT_CONCURRENCY] a non-layer weight on the host is refused; skips itself where the mode cannot run
-llama_build_and_test(test-exact-weights.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-exact-weights PROPERTIES FIXTURES_REQUIRED test-download-model)
+# [TAG_PREEMPT] the occupancy the server's planner reads: shared cells counted once, and the cells only given sequences hold
+llama_build_and_test(test-memory-cells-used.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-memory-cells-used PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)

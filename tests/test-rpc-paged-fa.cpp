@@ -31,12 +31,20 @@ static bool port_open(int port) {
     return ok;
 }
 
+// client exit codes: setup failures are not the server's answer, so they never count as a refusal
+enum {
+    CLIENT_OK          = 0,
+    CLIENT_NO_BACKEND  = 10,
+    CLIENT_NO_BUFFER   = 11,
+    CLIENT_REFUSED     = 20,  // the server answered the compute with a failure
+};
+
 [[noreturn]] static void send_graph(const std::string & endpoint, bool paged) {
     alarm(120);
 
     ggml_backend_t backend = ggml_backend_rpc_init(endpoint.c_str(), 0);
     if (!backend) {
-        _exit(10);
+        _exit(CLIENT_NO_BACKEND);
     }
 
     ggml_init_params params = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -59,11 +67,14 @@ static bool port_open(int port) {
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) {
-        _exit(11);
+        _exit(CLIENT_NO_BUFFER);
     }
     ggml_backend_buffer_clear(buf, 0);
 
-    ggml_backend_graph_compute(backend, gf);
+    // everything above is setup; from here a failure or a dropped connection is the server's answer
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        _exit(CLIENT_REFUSED);
+    }
 
     std::vector<float> res(ggml_nelements(out));
     ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
@@ -154,6 +165,9 @@ int main() {
             rc = 1;
         } else if (paged == 0) {
             fprintf(stderr, "the RPC server computed a FLASH_ATTN_EXT that carries a page table\n");
+            rc = 1;
+        } else if (paged == CLIENT_NO_BACKEND || paged == CLIENT_NO_BUFFER) {
+            fprintf(stderr, "the paged client failed in its own setup (%d) before the server saw the graph, so this test proves nothing\n", paged);
             rc = 1;
         } else {
             printf("ok, the RPC server refused the paged graph and kept serving\n");

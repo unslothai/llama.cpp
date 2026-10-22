@@ -66,7 +66,12 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx = llama_init->context();
 
-    if (llama_init->model() == nullptr || ctx == nullptr) {
+    if (llama_init->model() == nullptr) {
+        fprintf(stderr, "%s : the model did not load\n", __func__);
+        return 1;
+    }
+
+    if (ctx == nullptr) {
         printf("%s : skipped, this build and model cannot run exact concurrency\n", __func__);
         return 0;
     }

@@ -319,10 +319,7 @@ def test_a_late_prompt_and_a_generating_slot_both_finish(planner):
     n_predict_a = 230
     n_predict_b = 90
     assert 8 + n_predict_a + n_b + n_predict_b > 256
-    results = parallel_function_calls([
-        (_complete, (n_predict_a, "Hi how are you")),
-        (_complete, (n_predict_b, _prompt_of(n_b, _PROMPT_C), -1, 0.02)),
-    ])
+    results = _complete_overlapping((n_predict_a, n_predict_b), (8, n_b))
 
     text = _log()
     assert "Context size has been exceeded" not in text
@@ -766,6 +763,32 @@ def _ubatch_widths(text: str) -> list:
             res.append(int(line.split("=")[-1]))
             pending = False
     return res
+
+
+def test_exact_concurrency_reuses_no_cached_prefix():
+    """A cached prefix was computed in other ubatches than a cold prompt's; under exact concurrency it is recomputed, so the output does not depend on what ran before."""
+    path = os.environ.get("LLAMA_SERVER_TEST_EXACT_MODEL")
+    if not path:
+        pytest.skip("set LLAMA_SERVER_TEST_EXACT_MODEL to a gguf exact concurrency accepts")  # ty: ignore[too-many-positional-arguments]
+    server.model_file = path
+    server.model_hf_repo = server.model_hf_file = None
+    os.environ["LLAMA_EXACT_CONCURRENCY"] = "1"
+    _start(n_ctx=2048, n_slots=4, n_batch=128, n_ubatch=64, fa="on", n_gpu_layer=99, cache_ram=0)
+
+    def run(prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "n_predict": 1, "id_slot": 0, "cache_prompt": True,
+            "temperature": 0.0, "seed": 42, "n_probs": 8,
+        })
+        assert res.status_code == 200, res.body
+        return res.body
+
+    prompt = list(range(1000, 1064))
+    cold = run(prompt)
+    run(prompt[:16])
+    warm = run(prompt)
+    assert warm["timings"]["cache_n"] == 0, warm["timings"]
+    assert warm["completion_probabilities"] == cold["completion_probabilities"]
 
 
 def test_exact_concurrency_prefills_a_prompt_in_the_ubatches_it_would_get_alone():
