@@ -1180,6 +1180,42 @@ static void test_plan_keeps_union_of_outputs() {
     }
 }
 
+// A graph built with ggml_build_forward_select (llama's input embeddings: the token rows or the raw embeddings) has
+// the same nodes and leafs whichever alternative is selected, only the source of the consumer changes: from a
+// computed tensor to an input leaf. That input leaf is an input in every plan, so a plan made for one alternative
+// holds for the other and must not be made again (GGML_SCHED_NO_REALLOC treats that as an error). A multi-buffer
+// gallocr cannot re-plan by itself, so ggml_gallocr_alloc_graph returns false when it judges the plan stale.
+static void test_plan_holds_for_selected_source() {
+    dummy_backend              backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int idx = pass % 2;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * tok  = make_input_with_size(ctx, 64);
+        ggml_tensor * embd = make_input_with_size(ctx, 64);
+        ggml_tensor * rows = ggml_scale(ctx, tok, 2.0f);
+        ggml_tensor * alts[2] = { rows, embd };
+        ggml_tensor * sel = ggml_build_forward_select(graph, alts, 2, idx);
+        ggml_tensor * out = ggml_scale(ctx, sel, 2.0f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        assign_names(ctx);
+
+        if (pass == 0) {
+            std::vector<int> node_ids(graph->n_nodes, 0);
+            std::vector<int> leaf_ids(graph->n_leafs, 0);
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_ids.data(), leaf_ids.data()));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(!memory_overlap(tok, embd));
+        GGML_ASSERT(!memory_overlap(embd, out));
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1215,5 +1251,6 @@ int main() {
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
     run("test_plan_follows_output_flags", test_plan_follows_output_flags);
     run("test_plan_keeps_union_of_outputs", test_plan_keeps_union_of_outputs);
+    run("test_plan_holds_for_selected_source", test_plan_holds_for_selected_source);
     return 0;
 }
