@@ -647,10 +647,12 @@ struct server_slot {
 
     // Take the slot out of the next step; the draft is a prediction, so it is dropped with the cells.
     void preempt_detach() {
-        spec_draft.clear();
+        // [TAG_PREEMPT] Accepted tokens waiting for a replay after a checkpoint restore are output already decided: keep them, the cells are at the checkpoint.
+        if (!spec_is_replay) {
+            spec_draft.clear();
+            spec_ckpt.clear();
+        }
         spec_i_batch.clear();
-        spec_ckpt.clear();
-        spec_is_replay = false;
 
         i_batch = -1;
     }
@@ -3413,6 +3415,9 @@ private:
                 prompt_cache->update();
             }
 
+            // [TAG_PREEMPT] copy_prompt_to() replaces it once the parent's prompt is in; until then those cells could neither be used nor parked
+            slot->prompt_clear();
+
             int id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
                 SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
@@ -4363,8 +4368,14 @@ private:
         }
     }
 
+    // The batch builder reuses a cached prefix only for a stateful task, and never under exact concurrency, where the cached cells
+    // were computed in other ubatches than a cold prompt's and would make the output depend on what ran before.
+    static bool slot_reuses_prefix(const server_task & task) {
+        return task.params.cache_prompt && !task.is_stateless() && !common_exact_concurrency();
+    }
+
     size_t preempt_n_keep(const server_slot & slot) const {
-        if (!slot.task->params.cache_prompt) {
+        if (!slot_reuses_prefix(*slot.task)) {
             return 0;
         }
 
@@ -4441,7 +4452,31 @@ private:
         return task.family_n_shared > 0 ? task.family_n_shared : task.n_tokens();
     }
 
+    // [TAG_PREEMPT] Occupancy read from the KV cells themselves: a cell several sequences share counts once, whoever's task tree it came from.
+    // With n_idle, also the cells only idle slots hold, which purging them would free. -1 when the memory cannot tell; the estimates below are the fallback.
+    int32_t preempt_kv_cells(int32_t * n_idle) const {
+        llama_memory_t mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+        if (!mem) {
+            return -1;
+        }
+
+        std::vector<llama_seq_id> idle;
+        if (n_idle) {
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    idle.push_back(slot.id);
+                }
+            }
+        }
+
+        return llama_memory_n_cells_used(mem, idle.data(), idle.size(), n_idle);
+    }
+
     int32_t preempt_kv_used() const {
+        if (const int32_t n = preempt_kv_cells(nullptr); n >= 0) {
+            return n;
+        }
+
         int32_t res = 0;
 
         // n_cmpl > 1 siblings share the prompt's cells via seq_cp, so charge them once.
@@ -4513,6 +4548,10 @@ private:
     }
 
     int32_t preempt_n_idle_cells() const {
+        if (int32_t n_idle = 0; preempt_kv_cells(&n_idle) >= 0) {
+            return n_idle;
+        }
+
         int32_t res = 0;
 
         for (const auto & slot : slots) {
@@ -5795,8 +5834,8 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
 
-        // [TAG_PREEMPT_ASYNC] A --cache-reuse shift is found inside pre_decode(), after the wait above.
-        preempt_wait_for_shift();
+        // [TAG_PREEMPT_ASYNC] A --cache-reuse shift is found inside pre_decode(), after the wait above; apply it to the draft too, or a KV-full park saves a draft state with the shift still pending.
+        preempt_apply_shift();
 
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
@@ -6235,7 +6274,7 @@ private:
                             // the decision size is checked in slot_prompt_rejected; its first position bounds the reuse below
                             const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                            if (slot_reuses_prefix(*slot.task)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
