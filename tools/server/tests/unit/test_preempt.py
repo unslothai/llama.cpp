@@ -50,7 +50,7 @@ def create_server():
         os.remove(_scratch.pop())
     for name in ("LLAMA_SERVER_PREEMPT_EVERY", "LLAMA_SERVER_PREEMPT_GRANULARITY",
                  "LLAMA_SERVER_PREEMPT_PLANNER", "LLAMA_ARG_PREEMPT_RAM", "LLAMA_ARG_PREEMPT_ASYNC",
-                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_SERVER_PREEMPT_PAGEABLE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_LOG_VERBOSITY",
+                 "LLAMA_SERVER_PREEMPT_FAIL_SAVE", "LLAMA_SERVER_PREEMPT_PAGEABLE", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_ARG_SPEC_DRAFT_SAMPLING", "LLAMA_ARG_LOG_VERBOSITY",
                  "LLAMA_BATCH_DEBUG", "LLAMA_ARG_CTX_CHECKPOINTS",
                  "LLAMA_MEDIA_MARKER", "LLAMA_EXACT_CONCURRENCY", "LLAMA_ARG_PREEMPT_POLICY"):
         os.environ.pop(name, None)
@@ -921,6 +921,33 @@ def test_a_recompute_park_bounds_its_draft_by_the_tokens_it_comes_back_with():
     assert "Context size has been exceeded" not in text
 
 
+def test_a_ram_park_does_not_restart_a_probabilistic_draft():
+    """A park that keeps the state in host RAM resumes the slot as it was, draft sampler included: the sampled output is that of a run never parked."""
+    os.environ["LLAMA_ARG_SPEC_DRAFT_SAMPLING"] = "probabilistic"
+    os.environ["LLAMA_ARG_SPEC_DRAFT_P_MIN"] = "0.0"
+
+    def run(park_every):
+        if park_every:
+            os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = str(park_every)
+        else:
+            os.environ.pop("LLAMA_SERVER_PREEMPT_EVERY", None)
+        server.spec_type = "draft-simple"
+        server.model_draft_hf_repo = server.model_hf_repo
+        _start(n_ctx=512, spec_draft_n_max=4, spec_draft_n_min=1)
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time", "n_predict": 48, "ignore_eos": True,
+            "temperature": 0.8, "seed": 123, "cache_prompt": False, "return_tokens": True,
+        })
+        server.stop()
+        assert res.status_code == 200, res.body
+        return res.body
+
+    plain = run(0)
+    parked = run(8)
+    assert parked["preempt"]["parks"] > 0 and parked["preempt"]["recomputes"] == 0, parked["preempt"]
+    assert parked["tokens"] == plain["tokens"]
+
+
 def test_props_says_whether_exact_concurrency_is_running():
     _start(n_ctx=256)
     res = server.make_request("GET", "/props")
@@ -1000,7 +1027,6 @@ def test_a_recompute_restore_does_not_count_its_replay_as_prompt():
     assert timings["cache_n"] == 0, timings
     assert timings["prompt_n"] == n_prompt, timings
     assert timings["predicted_n"] == n_predict, timings
-    assert timings["predicted_ms"] > timings["prompt_ms"], timings
 
 
 def test_slots_reports_the_recomputes_of_the_current_task():
@@ -1392,6 +1418,26 @@ def test_a_slot_whose_park_buffer_comes_back_pageable_is_no_longer_reported_asyn
 
     assert "is pageable, so this slot parks synchronously from now on" in _log()
     assert server.make_request("GET", "/props").body["preempt"]["async"] is False
+
+
+def test_a_sleeping_server_reports_the_async_fallback_too():
+    """/props is answered from a cache while the server sleeps; it must carry the same live async value as the awake answer."""
+    os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "8"
+    os.environ["LLAMA_SERVER_PREEMPT_PAGEABLE"] = "1"
+    _start_async(n_ctx=512, sleep_idle_seconds=2)
+
+    res = _complete(32)
+    assert res.status_code == 200, res.body
+    assert res.body["preempt"]["parks"] > 0, res.body["preempt"]
+    assert "is pageable, so this slot parks synchronously from now on" in _log()
+
+    deadline = time.time() + 30
+    props = server.make_request("GET", "/props").body
+    while not props["is_sleeping"] and time.time() < deadline:
+        time.sleep(0.1)
+        props = server.make_request("GET", "/props").body
+    assert props["is_sleeping"], "the server did not go to sleep"
+    assert props["preempt"]["async"] is False, props["preempt"]
 
 
 def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():

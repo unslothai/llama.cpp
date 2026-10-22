@@ -1613,8 +1613,10 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
         }
 
         parent.n_tokens_shared = n_shared;
+        parent.family_n_shared = n_shared;
         for (size_t j = i + 1; j < end; j++) {
             tasks[j].id_parent = parent.id;
+            tasks[j].family_n_shared = n_shared;
             parent.child_tasks.push_back(std::move(tasks[j]));
         }
         groups.push_back(std::move(parent));

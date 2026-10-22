@@ -167,6 +167,9 @@ struct server_task {
     // if set on a parent, the children have their own prompt and only share its first n_tokens_shared tokens
     int32_t n_tokens_shared = 0;
 
+    // [TAG_PREEMPT] the same figure on every member of the group, so the planner can count a member's own cells after the parent is gone
+    int32_t family_n_shared = 0;
+
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;

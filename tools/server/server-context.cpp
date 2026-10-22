@@ -667,9 +667,7 @@ struct server_slot {
 
         preempt_mark_resumed();
 
-        if (state == SLOT_STATE_GENERATING && can_speculate()) {
-            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
-        }
+        // the per-sequence speculative state stayed live while parked; begin() would reset the draft sampler's random stream
 
         return true;
     }
@@ -780,6 +778,13 @@ struct server_slot {
 
         const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        // a state always has its header, so 0 is the size query's error return: nothing can be saved, so the cells stay
+        if (size_tgt == 0 || (ctx_dft && size_dft == 0)) {
+            SLT_ERR(*this, "%s", "could not size the sequence state, so it is not parked to host memory\n");
+            preempt_state_free();
+            return false;
+        }
 
         if (preempt_is_async()) {
             if (!preempt_buf_reserve(preempt_cpy_tgt.get(), size_tgt, preempt_grow) ||
@@ -4432,14 +4437,8 @@ private:
     }
 
     // [TAG_PREEMPT] Prompt tokens a family member shares with the one charged first: n_cmpl > 1 clones share all of it, a decision group only its parent's first n_tokens_shared.
-    int32_t preempt_family_n_shared(int family, const server_task & task) const {
-        for (const auto & other : slots) {
-            if (other.task && other.task->id == family && other.task->n_tokens_shared > 0) {
-                return other.task->n_tokens_shared;
-            }
-        }
-
-        return task.n_tokens();
+    static int32_t preempt_family_n_shared(const server_task & task) {
+        return task.family_n_shared > 0 ? task.family_n_shared : task.n_tokens();
     }
 
     int32_t preempt_kv_used() const {
@@ -4460,11 +4459,14 @@ private:
                 continue;
             }
 
-            if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
-                const int family = slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
+            // [TAG_PREEMPT] A finished member's cached prompt still shares the family's cells, so an idle slot counts as the member it last served.
+            const server_task * member = slot.task ? slot.task.get() : (!slot.is_processing() ? slot.task_prev.get() : nullptr);
+
+            if (member && (member->is_parent() || member->is_child())) {
+                const int family = member->is_parent() ? member->id : member->id_parent;
 
                 if (std::find(charged.begin(), charged.end(), family) != charged.end()) {
-                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - preempt_family_n_shared(family, *slot.task)));
+                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - preempt_family_n_shared(*member)));
                     continue;
                 }
 
@@ -9568,6 +9570,10 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     if (is_sleeping) {
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
+        // [TAG_PREEMPT_ASYNC] as the awake handler: a slot may have fallen back to synchronous parks since load
+        if (cached_props["preempt"].contains("async")) {
+            cached_props["preempt"]["async"] = ctx_server.preempt_async_live.load();
+        }
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;
