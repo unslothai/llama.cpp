@@ -285,8 +285,11 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
         return;
     }
 
+    // a masked candidate stays masked: -INF / INF (an infinite temperature, e.g. a dynamic one) is NaN
     for (size_t i = 0; i < cur_p->size; ++i) {
-        cur_p->data[i].logit /= temp;
+        if (cur_p->data[i].logit != -INFINITY) {
+            cur_p->data[i].logit /= temp;
+        }
     }
 }
 
@@ -1799,7 +1802,8 @@ static void llama_sampler_top_p_backend_apply(
     // as the CPU sampler: keep up to and including the first candidate that reaches p, and at least min_keep
     // (and at least one) candidates, at most all of them
     struct ggml_tensor * n_keep = ggml_scale_bias(ctx, ggml_sum(ctx, below), 1.0f, 1.0f);
-    n_keep = ggml_clamp(ctx, n_keep, (float) std::min<int64_t>(std::max<size_t>(sctx->min_keep, 1), n), (float) n);
+    // clamp min_keep as size_t: a value past INT64_MAX (SIZE_MAX) would turn negative as int64_t
+    n_keep = ggml_clamp(ctx, n_keep, (float) std::min<size_t>(std::max<size_t>(sctx->min_keep, 1), (size_t) n), (float) n);
     ggml_set_name(n_keep, "top_p_n_keep");
 
     // keep the first n_keep candidates: position < n_keep
@@ -1968,7 +1972,8 @@ static void llama_sampler_min_p_backend_apply(
     // the CPU sampler keeps at least max(min_keep, 1) candidates: the best ones, whatever their probability
     // (p >= 1 rounds the threshold to the max logit or above it), so lower the threshold to the logit of the
     // n_min-th best candidate when that is lower
-    const int64_t n_min = std::min<int64_t>(std::max<size_t>(sctx->min_keep, 1), n);
+    // clamp min_keep as size_t: a value past INT64_MAX (SIZE_MAX) would turn negative as int64_t
+    const int64_t n_min = (int64_t) std::min<size_t>(std::max<size_t>(sctx->min_keep, 1), (size_t) n);
 
     const bool may_sort = n_min > 1 || sctx->p > 1.0f;
 
@@ -2232,6 +2237,14 @@ static void llama_sampler_backend_temp_sampling(
         struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
         data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, logits_rows, max_idx), 1);
 
+        return;
+    }
+
+    if (std::isinf(temp)) {
+        // as the CPU sampler: every finite logit becomes 0 and a masked one stays -INF (-INF * 0 would be NaN)
+        struct ggml_tensor * is_masked = ggml_step(ctx, ggml_scale_bias(ctx, data->logits, -1.0f, -FLT_MAX));
+        struct ggml_tensor * mask_bias = ggml_log(ctx, ggml_scale_bias(ctx, is_masked, -1.0f, 1.0f));
+        data->logits = ggml_add(ctx, ggml_scale(ctx, ggml_clamp(ctx, data->logits, -FLT_MAX, FLT_MAX), 0.0f), mask_bias);
         return;
     }
 
@@ -4812,7 +4825,19 @@ static bool llama_sampler_masks_without_removing(const struct llama_sampler * sm
         const auto * ctx = (const llama_sampler_temp_ext *) smpl->ctx;
         return ctx->delta <= 0.0f ? ctx->temp <= 0.0f : ctx->temp - ctx->delta <= 0.0f;
     }
-    return false;
+    // the other built-in backend samplers either remove what they mask on the CPU too (top-k, top-p, min-p),
+    // only shift logits (penalties) or select (greedy, dist); a sampler implemented outside llama.cpp may set
+    // logits to -INF and keep the candidates, so it is treated as masking
+    if (smpl->iface == &llama_sampler_empty_i  ||
+        smpl->iface == &llama_sampler_greedy_i ||
+        smpl->iface == &llama_sampler_dist_i   ||
+        smpl->iface == &llama_sampler_top_k_i  ||
+        smpl->iface == &llama_sampler_top_p_i  ||
+        smpl->iface == &llama_sampler_min_p_i  ||
+        smpl->iface == &llama_sampler_penalties_i) {
+        return false;
+    }
+    return true;
 }
 
 static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, bool draft_rows) {
