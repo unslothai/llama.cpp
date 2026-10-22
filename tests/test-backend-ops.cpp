@@ -5192,6 +5192,36 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
     return false;
 }
 
+// MUL_MAT at GGML_PREC_F32 ([TAG_GGML_PREC]): F32 weights must not be rounded (e.g. TF32) at any batch size
+struct test_mul_mat_prec_f32 : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t bs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, bs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-10; // TF32 inputs give ~1e-7
+    }
+
+    test_mul_mat_prec_f32(int64_t m = 128, int64_t n = 7, int64_t k = 1024, int64_t bs = 1)
+        : m(m), n(n), k(k), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, bs);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, bs);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_prec_set_src(out, GGML_PREC_F32, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -7185,6 +7215,33 @@ struct test_top_k : public test_case {
                     } else {
                         data[i] = i;
                     }
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
+// top_k with fewer than k positive values and the rest exactly 0: the cut falls inside a long run of ties
+struct test_top_k_zero_ties : public test_top_k {
+    test_top_k_zero_ties(std::array<int64_t, 4> ne, int k)
+        : test_top_k(GGML_TYPE_F32, ne, k, true) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",zero_ties=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0], 0.0f);
+                const int64_t n_pos = std::min<int64_t>(k / 2, t->ne[0]);
+                for (int64_t i = 0; i < n_pos; i++) {
+                    data[i] = 1.0f + dist(rng);
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -10765,6 +10822,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // no TF32 at any batch size (mmvf / mmf / cuBLAS ranges), incl. a batched shape
+    for (int64_t n : {1, 3, 4, 7, 8, 9, 16, 17, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(384, n, 5120, 1));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(256, n, 512, 4));
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
@@ -11504,6 +11567,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // exact ties at the cut (radix path, chunked gather)
+    for (int64_t ncols : {5000, 16384, 65536, 300001}) {
+        for (int64_t nrows : {1, 7, 64}) {
+            test_cases.emplace_back(new test_top_k_zero_ties({ncols, nrows, 1, 1}, 512));
+        }
+    }
+    test_cases.emplace_back(new test_top_k_zero_ties({4500, 512, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k_zero_ties({20000, 3, 1, 1}, 1024));
 
     // rows that CUDA processes in several chunks (bitonic, radix)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 500,  40000, 1, 1 }, 16));
