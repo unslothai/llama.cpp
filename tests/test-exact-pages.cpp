@@ -71,9 +71,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the test runs only when a model was named for it, so a context that cannot be made is a failure, never a pass
     if (ctx == nullptr) {
-        printf("%s : skipped, this build and model cannot run exact concurrency\n", __func__);
-        return 0;
+        fprintf(stderr, "%s : FAIL, no exact-concurrency context for this build and model (needs CUDA and 256-wide K/V heads)\n", __func__);
+        return 1;
     }
 
     llama_memory_t mem = llama_get_memory(ctx);
@@ -119,6 +120,19 @@ int main(int argc, char ** argv) {
     if (!decode_range(ctx, 0, 600, 655)) {
         fprintf(stderr, "%s : failed to continue sequence 0 after a removal that removed nothing\n", __func__);
         return 1;
+    }
+
+    {
+        // 656 tokens hold 3 pages; the occupancy-only count (block skip) must agree with the count that also sizes reclaim
+        const llama_seq_id s0[] = { 0, 0 };
+        int32_t reclaim = -1;
+        const int32_t n_fast = llama_memory_n_cells_used(mem, nullptr, 0, nullptr);
+        const int32_t n_full = llama_memory_n_cells_used(mem, s0, 2, &reclaim);
+        if (n_fast != 3*(int32_t) PAGE || n_full != n_fast || reclaim != n_fast) {
+            fprintf(stderr, "%s : cells used %d (occupancy only) / %d (with reclaim %d), expected %u for 656 tokens\n",
+                    __func__, n_fast, n_full, reclaim, 3*PAGE);
+            return 1;
+        }
     }
 
     const bool holes = llama_memory_seq_rm(mem, 0, 1, 511);

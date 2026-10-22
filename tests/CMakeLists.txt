@@ -338,8 +338,8 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool, and a non-layer weight on the host refused; both skip themselves where the mode
-# cannot run. Exact mode needs 256-wide K/V heads, which the generic test model does not have, so they run only against LLAMA_TEST_EXACT_MODEL.
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool, and a non-layer weight on the host refused. Exact mode needs CUDA and 256-wide
+# K/V heads, which the generic test model does not have, so they run only against LLAMA_TEST_EXACT_MODEL, and fail if no exact context can be made.
 set(LLAMA_TEST_EXACT_MODEL "" CACHE FILEPATH "a model with 256-wide K/V heads for the exact-concurrency model tests")
 llama_build(test-exact-pages.cpp)
 llama_build(test-exact-weights.cpp)

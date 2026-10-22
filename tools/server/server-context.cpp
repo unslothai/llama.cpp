@@ -645,6 +645,18 @@ struct server_slot {
                (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
     }
 
+    // [TAG_PREEMPT] RAM a park adds beyond what it holds, per buffer: spare target capacity cannot take the draft's state.
+    size_t preempt_state_extra() const {
+        const size_t need_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t need_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        const size_t held_tgt = preempt_is_async() ? llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()) : preempt_state_tgt.size();
+        const size_t held_dft = preempt_is_async() ? (preempt_cpy_dft ? llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()) : 0)
+                                                   : preempt_state_dft.size();
+
+        return (need_tgt > held_tgt ? need_tgt - held_tgt : 0) + (need_dft > held_dft ? need_dft - held_dft : 0);
+    }
+
     // Take the slot out of the next step; the draft is a prediction, so it is dropped with the cells.
     void preempt_detach() {
         // [TAG_PREEMPT] Accepted tokens waiting for a replay after a checkpoint restore are output already decided: keep them, the cells are at the checkpoint.
@@ -4256,7 +4268,10 @@ private:
         }
 
         // A recompute park emptied the prompt, so bound the draft by preempt_tokens; reading the empty prompt once failed a fitting sequence as impossible.
-        const int32_t n_tokens = std::max(slot.prompt.n_tokens(), slot.preempt_n_input());
+        // A generating slot reads its own prompt: a context shift made it shorter than the task's, and the task's would undercharge the draft.
+        const bool    generating   = slot.state == SLOT_STATE_GENERATING || (slot.preempt_is_out() && slot.state_before_preempt == SLOT_STATE_GENERATING);
+        const bool    n_from_input = slot.preempt_recompute || slot.preempt_reprefill || !generating;
+        const int32_t n_tokens     = n_from_input ? std::max(slot.prompt.n_tokens(), slot.preempt_n_input()) : slot.prompt.n_tokens();
 
         res = std::min(res, slot.n_ctx - n_tokens - 2);
 
@@ -4336,8 +4351,7 @@ private:
             return false;
         }
 
-        const size_t need  = slot.preempt_state_required();
-        const size_t extra = need > held ? need - held : 0;
+        const size_t extra = slot.preempt_state_extra();
 
         preempt_reclaim_idle_ram(budget, extra, slot);
 
@@ -5840,7 +5854,15 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
 
         // [TAG_PREEMPT_ASYNC] A --cache-reuse shift is found inside pre_decode(), after the wait above; apply it to the draft too, or a KV-full park saves a draft state with the shift still pending.
-        preempt_apply_shift();
+        try {
+            preempt_apply_shift();
+        } catch (const std::exception & e) {
+            SRV_ERR("preempt_apply_shift() failed: %s\n", e.what());
+            abort_all_slots("preempt_apply_shift() failed: " + std::string(e.what()));
+
+            // the batch holds positions the shift did not move, skip now to avoid UB
+            return;
+        }
 
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);

@@ -62,10 +62,11 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     llama_backend_init();
 
+    // without the plain context the refusal below would pass for any reason, so this fails rather than skips
     if (!context_ok(path, nullptr)) {
-        printf("%s : skipped, this build and model cannot run exact concurrency\n", __func__);
+        fprintf(stderr, "%s : FAIL, no exact-concurrency context for this build and model (needs CUDA and 256-wide K/V heads)\n", __func__);
         llama_backend_free();
-        return 0;
+        return 1;
     }
 
     const llama_model_tensor_buft_override host_norm[] = {

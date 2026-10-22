@@ -92,6 +92,15 @@ int main(int argc, char ** argv) {
     llama_memory_n_cells_used(mem, all, 3, &reclaim);
     bad += check("reclaimable if every sequence went", reclaim, 190);
 
+    // an id given twice is still one owner: the prefix shared with seq 2 stays, seq 0's own cells go
+    const llama_seq_id s00[]  = { 0, 0 };
+    const llama_seq_id s001[] = { 0, 0, 1 };
+    llama_memory_n_cells_used(mem, s00, 2, &reclaim);
+    bad += check("reclaimable if seq 0 (given twice) went: its own 20", reclaim, 20);
+
+    llama_memory_n_cells_used(mem, s001, 3, &reclaim);
+    bad += check("reclaimable if seqs 0 (twice) and 1 went: 20 + 30", reclaim, 50);
+
     // removing seq 0 frees only its own cells: the copied prefix is still held by 1 and 2
     llama_memory_seq_rm(mem, 0, -1, -1);
     bad += check("used after seq 0 is removed: 100 + 30 + 40", llama_memory_n_cells_used(mem, nullptr, 0, nullptr), 170);

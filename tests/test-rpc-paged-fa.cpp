@@ -39,6 +39,10 @@ enum {
     CLIENT_REFUSED     = 20,  // the server answered the compute with a failure
 };
 
+static void on_server_dropped(int) {
+    _exit(CLIENT_REFUSED);
+}
+
 [[noreturn]] static void send_graph(const std::string & endpoint, bool paged) {
     alarm(120);
 
@@ -71,7 +75,11 @@ enum {
     }
     ggml_backend_buffer_clear(buf, 0);
 
-    // everything above is setup; from here a failure or a dropped connection is the server's answer
+    // everything above is setup; from here a failure or a dropped connection is the server's answer.
+    // The client aborts (or takes SIGPIPE) when the server closes on it, so only these two, armed here, mean a refusal.
+    signal(SIGABRT, on_server_dropped);
+    signal(SIGPIPE, on_server_dropped);
+
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         _exit(CLIENT_REFUSED);
     }
@@ -166,8 +174,9 @@ int main() {
         } else if (paged == 0) {
             fprintf(stderr, "the RPC server computed a FLASH_ATTN_EXT that carries a page table\n");
             rc = 1;
-        } else if (paged == CLIENT_NO_BACKEND || paged == CLIENT_NO_BUFFER) {
-            fprintf(stderr, "the paged client failed in its own setup (%d) before the server saw the graph, so this test proves nothing\n", paged);
+        } else if (paged != CLIENT_REFUSED) {
+            // a setup failure, a signal before the compute, or the client's own timeout: not the server's answer
+            fprintf(stderr, "the paged client ended with %d, not a refusal from the server, so this test proves nothing\n", paged);
             rc = 1;
         } else {
             printf("ok, the RPC server refused the paged graph and kept serving\n");

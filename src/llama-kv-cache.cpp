@@ -1539,10 +1539,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 int32_t llama_kv_cache::n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const {
     const uint32_t g = alloc_granularity();
 
+    // a set, so an id given twice is one owner
+    llama_kv_cells::seq_set_t free_set;
+    for (size_t j = 0; n_reclaimable && j < n_seq_free; ++j) {
+        if (seq_free[j] >= 0 && seq_free[j] < LLAMA_MAX_SEQ) {
+            free_set.set(seq_free[j]);
+        }
+    }
+
     int64_t n_used    = 0;
     int64_t n_reclaim = 0;
 
     for (const auto & cells : v_cells) {
+        // occupancy alone, one cell per block: the cells keep the count
+        if (!n_reclaimable && g == 1) {
+            n_used += cells.get_used();
+            continue;
+        }
+
         // a block counts once one of its cells is live, and is reclaimable when every live cell in it is
         int64_t block      = -1;
         bool    block_free = true;
@@ -1556,7 +1570,7 @@ int32_t llama_kv_cache::n_cells_used(const llama_seq_id * seq_free, size_t n_seq
 
         const uint32_t n = cells.used_max_p1();
 
-        for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t i = cells.used_min(); i < n; ++i) {
             if (cells.is_empty(i)) {
                 continue;
             }
@@ -1568,11 +1582,12 @@ int32_t llama_kv_cache::n_cells_used(const llama_seq_id * seq_free, size_t n_seq
             }
 
             if (n_reclaimable && block_free) {
-                int n_in_free = 0;
-                for (size_t j = 0; j < n_seq_free; ++j) {
-                    n_in_free += seq_free[j] >= 0 && seq_free[j] < LLAMA_MAX_SEQ && cells.seq_has(i, seq_free[j]);
-                }
-                block_free = n_in_free == cells.seq_count(i);
+                block_free = (cells.seq_get_all(i) & ~free_set).none();
+            }
+
+            // the block is decided: skip the rest of it
+            if (!n_reclaimable || !block_free) {
+                i = (uint32_t) (block + 1) * g - 1;
             }
         }
 
