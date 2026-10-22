@@ -76,6 +76,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
+        // [TAG_EXACT_CONCURRENCY] as llama_memory_hybrid::init_batch: refused before the attention half asserts on it
+        if (llama_exact_concurrency() && balloc.has_shared_tokens()) {
+            LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                    "give every token exactly one sequence id\n", __func__);
+            break;
+        }
+
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
@@ -96,7 +103,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // [TAG_EXACT_CONCURRENCY] as llama_memory_hybrid::init_batch: the recurrent half is not invariant to the ubatch shape, so a prompt gets a ubatch of its own
+                const uint32_t isolate = llama_exact_concurrency() ? llama_exact_decode_tokens() : 0;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, isolate);
             }
 
             if (ubatch.n_tokens == 0) {

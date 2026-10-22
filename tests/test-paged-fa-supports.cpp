@@ -72,6 +72,14 @@ int main() {
         }
 
         if (!supports(dev, shapes[0])) {
+#if defined(LLAMA_TEST_PAGED_FA_ENABLED)
+            // the build compiled the flash attention kernels for CUDA / ROCm, so refusing a valid paged shape is the failure, not a reason to skip
+            if (strcmp(reg_name, "MUSA") != 0) {
+                fprintf(stderr, "%s: FAIL, refuses the valid paged shape '%s' in a build with flash attention\n", ggml_backend_dev_name(dev), shapes[0].name);
+                rc = 1;
+                continue;
+            }
+#endif
             printf("%s: no paged flash attention in this build, skipped\n", ggml_backend_dev_name(dev));
             continue;
         }
@@ -87,7 +95,7 @@ int main() {
         }
     }
 
-    if (n_checked == 0) {
+    if (n_checked == 0 && rc == 0) {
         printf("no CUDA device with paged flash attention, nothing to check\n");
     } else {
         printf("%s\n", rc == 0 ? "ok: supports_op accepts exactly the paged shapes the kernel launches" :

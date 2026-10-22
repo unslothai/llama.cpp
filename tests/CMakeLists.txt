@@ -327,6 +327,10 @@ llama_build_and_test(test-event-query.cpp LINK ggml)
 
 # [TAG_EXACT_CONCURRENCY] a paged FLASH_ATTN_EXT is claimed only in the shapes the paged kernel launches
 llama_build_and_test(test-paged-fa-supports.cpp LINK ggml)
+if (GGML_CUDA_FA AND (GGML_CUDA OR GGML_HIP))
+    # the paged kernel is compiled in, so the test expects it rather than skipping when a valid shape is refused
+    target_compile_definitions(test-paged-fa-supports PRIVATE LLAMA_TEST_PAGED_FA_ENABLED)
+endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

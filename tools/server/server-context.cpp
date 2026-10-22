@@ -572,8 +572,9 @@ struct server_slot {
 
     // [TAG_PREEMPT_ASYNC] Grow pinned buffers by 1.5x so a slightly longer re-park does not re-pin.
     static size_t preempt_grown_capacity(size_t held, size_t need) {
+        // the buffers never shrink: a smaller state leaves the capacity where it was
         if (need <= held || held == 0) {
-            return need;
+            return std::max(held, need);
         }
 
         const size_t step = 64u << 10;
@@ -607,7 +608,8 @@ struct server_slot {
 
         size_t res = preempt_grown_capacity(llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()), size_tgt);
 
-        if (size_dft > 0 && preempt_cpy_dft) {
+        // a draft buffer is held whether or not this park fills it
+        if (preempt_cpy_dft) {
             res += preempt_grown_capacity(llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()), size_dft);
         }
 
@@ -2327,6 +2329,13 @@ private:
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
         if (decision.type != COMMON_DECISION_TYPE_NONE && !params_base.cache_ram_explicit) {
             SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
+            params_base.cache_ram_mib    = 0;
+            params_base.cache_idle_slots = false;
+        }
+
+        // [TAG_EXACT_CONCURRENCY] Exact mode prefills every prompt in full (slot_reuses_prefix()), so a state restored from RAM would be thrown away
+        if (common_exact_concurrency() && (params_base.cache_ram_mib != 0 || params_base.cache_idle_slots)) {
+            SRV_INF("%s", "exact concurrency: prompt cache disabled, prompts are always prefilled in full\n");
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
         }
@@ -4468,14 +4477,28 @@ private:
 
     // [TAG_PREEMPT] Occupancy read from the KV cells themselves: a cell several sequences share counts once, whoever's task tree it came from.
     // With n_idle, also the cells only idle slots hold, which purging them would free. -1 when the memory cannot tell; the estimates below are the fallback.
-    int32_t preempt_kv_cells(int32_t * n_idle) const {
+    // The memory whose cells the planner can read, or null: LLAMA_SERVER_PREEMPT_GRANULARITY (test knob) plans in blocks the memory does not have.
+    llama_memory_t preempt_kv_mem() const {
         llama_memory_t mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
-        if (!mem) {
+
+        return mem && (uint32_t) preempt_alloc_granularity == llama_memory_alloc_granularity(mem) ? mem : nullptr;
+    }
+
+    // [TAG_PREEMPT] Cells freed if these sequences all went: a prefix one of them shares with a sequence that stays is not counted. -1 if unknown.
+    int32_t preempt_kv_reclaim(const std::vector<llama_seq_id> & seqs) const {
+        llama_memory_t mem = preempt_kv_mem();
+        int32_t        res = -1;
+
+        if (!mem || llama_memory_n_cells_used(mem, seqs.data(), seqs.size(), &res) < 0) {
             return -1;
         }
 
-        // LLAMA_SERVER_PREEMPT_GRANULARITY (test knob) plans in blocks the memory does not have, so its cells cannot be read in them
-        if ((uint32_t) preempt_alloc_granularity != llama_memory_alloc_granularity(mem)) {
+        return res;
+    }
+
+    int32_t preempt_kv_cells(int32_t * n_idle) const {
+        llama_memory_t mem = preempt_kv_mem();
+        if (!mem) {
             return -1;
         }
 
@@ -4551,6 +4574,12 @@ private:
 
         for (const auto & slot : slots) {
             if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
+                continue;
+            }
+
+            // [TAG_PREEMPT] A held prompt does not grow before the head has had its turn: charge only the cells it sits on, as preempt_kv_reserve() does.
+            if (preempt_held(slot)) {
+                res += preempt_n_cells(slot.prompt.n_tokens());
                 continue;
             }
 
@@ -4831,10 +4860,19 @@ private:
         return false;
     }
 
+    // Cells a park of this slot releases; a prefix it shares with another sequence stays.
+    int32_t preempt_n_freed_cells(const server_slot & slot) const {
+        if (const int32_t n = preempt_kv_reclaim({ slot.id }); n >= 0) {
+            return n;
+        }
+
+        return preempt_n_cells(slot.prompt.n_tokens());
+    }
+
     int32_t preempt_n_freed(const server_slot & slot) const {
         const int32_t n_cur = slot.prompt.n_tokens();
 
-        int32_t res = preempt_n_cells(n_cur);
+        int32_t res = preempt_n_freed_cells(slot);
 
         if (slot.state == SLOT_STATE_GENERATING) {
             res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
@@ -5392,6 +5430,11 @@ private:
                     auto rotate_pick = [&](bool with_recompute) {
                         n_freed_all = 0;
 
+                        // [TAG_PREEMPT] A prefix two candidates share is freed only if both go, so all of them are read together.
+                        std::vector<llama_seq_id> seqs_all;
+                        int32_t                   n_steps_all = 0;
+                        int32_t                   n_pick      = 0;
+
                         for (auto & slot : slots) {
                             // [TAG_PREEMPT] Residents that have had their service since resuming, and held prompts sitting on cells.
                             const bool held = preempt_held(slot) && slot.prompt.n_tokens() > 0;
@@ -5420,9 +5463,10 @@ private:
                             }
 
                             const int32_t n_freed = preempt_n_freed(slot);
-                            const int32_t n_pick  = pick ? preempt_n_freed(*pick) : 0;
 
                             n_freed_all += n_freed;
+                            n_steps_all += n_freed - preempt_n_freed_cells(slot);
+                            seqs_all.push_back(slot.id);
 
                             const bool enough = room_after(n_freed);
 
@@ -5431,7 +5475,12 @@ private:
                                 (enough == pick_enough && (enough ? n_freed < n_pick : n_freed > n_pick))) {
                                 pick        = &slot;
                                 pick_enough = enough;
+                                n_pick      = n_freed;
                             }
+                        }
+
+                        if (const int32_t n = seqs_all.empty() ? -1 : preempt_kv_reclaim(seqs_all); n >= 0) {
+                            n_freed_all = n + n_steps_all;
                         }
                     };
 
@@ -7058,10 +7107,18 @@ private:
 
             int32_t n = 0;
 
+            std::vector<llama_seq_id> seqs;
+
             for (const auto & other : slots) {
                 if (running(other) && preempt_is_family(other) && family_of(other) == family_of(slot)) {
                     n += other.prompt.n_tokens();
+                    seqs.push_back(other.id);
                 }
+            }
+
+            // [TAG_PREEMPT] The members share their prompt's cells, so the sum of their prompts counts it once per member; read what ending them frees.
+            if (const int32_t n_freed = preempt_kv_reclaim(seqs); n_freed >= 0) {
+                n = n_freed;
             }
 
             if (family < 0 || n > n_cells) {

@@ -69,7 +69,7 @@ def _start_async(**kwargs):
     """As _start, on the asynchronous park path; a backend that cannot copy off-thread skips the test."""
     os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1"
     _start(n_gpu_layer=99, **kwargs)
-    _require_async(_log())
+    _require_async()
 
 
 def _log() -> str:
@@ -85,8 +85,21 @@ def _log() -> str:
     return open(server.log_path, errors="replace").read()
 
 
-def _require_async(text: str):
-    if _ASYNC_BANNER not in text:
+def _startup_log() -> str:
+    """The server log up to its last startup line: the log is written by its own thread, so it can lag the server being up,
+    and a capability banner missing from a lagging log is not a missing capability."""
+    deadline = time.time() + 60.0
+    while True:
+        text = open(server.log_path, errors="replace").read()
+        if "listening on " in text:
+            return text
+        if time.time() > deadline:
+            pytest.fail("the server log never reached its last startup line")  # ty: ignore[invalid-argument-type]
+        time.sleep(0.05)
+
+
+def _require_async():
+    if _ASYNC_BANNER not in _startup_log():
         pytest.skip("this backend cannot copy asynchronously, the async park path is not exercised")  # ty: ignore[too-many-positional-arguments]
 
 
@@ -225,7 +238,7 @@ def test_forced_parks_do_not_change_the_output(mode):
         os.environ["LLAMA_ARG_PREEMPT_ASYNC"] = "1" if mode == "async" else "0"
     _start(n_ctx=512)
     if mode == "async":
-        _require_async(_log())
+        _require_async()
     reference = _complete(64)
     assert reference.status_code == 200
     server.stop()
@@ -744,7 +757,8 @@ def test_exact_concurrency_refuses_an_mrope_model_with_a_projector():
         proc = subprocess.run([
             os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server"),
             "--model", path, "--mmproj", mmproj, "--host", "127.0.0.1", "--port", str(server.server_port),
-            "-c", "512", "--parallel", "2", "--kv-unified", "-fa", "on", "-ngl", "99", "--no-warmup", "--no-webui",
+            # a batch that holds a whole ubatch, so the batch geometry check passes and the M-RoPE one is what refuses
+            "-c", "512", "-b", "512", "-ub", "128", "--parallel", "2", "--kv-unified", "-fa", "on", "-ngl", "99", "--no-warmup", "--no-webui",
         ], env={**os.environ, "LLAMA_EXACT_CONCURRENCY": "1"}, capture_output=True, text=True, timeout=900)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
