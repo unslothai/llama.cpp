@@ -839,14 +839,18 @@ extern "C" {
                    int32_t * n_reclaimable);
 
     // [TAG_PREEMPT] run the in-place update a seq_add() recorded, which llama_decode() would otherwise run at the start of the next batch
-    // takes the context because the update is a graph; returns true when one was run
-    LLAMA_API bool llama_memory_update(struct llama_context * ctx);
+    // takes the context because the update is a graph; returns 1 when one was run, 0 when none was due, and -1 when one is still due
+    // after the call (the update failed): the shifted positions do not match their K yet, so the cells must not be saved or dropped
+    LLAMA_API int32_t llama_memory_update(struct llama_context * ctx);
 
     // [TAG_EXACT_CONCURRENCY] the most tokens one sequence contributes to a decode step: 1, or 1 plus the draft length. Never lowered; false when a column bound cannot cover it.
     LLAMA_API bool     llama_set_exact_decode_tokens(uint32_t n_tokens);
     LLAMA_API uint32_t llama_exact_decode_tokens(void);
 
     // [TAG_EXACT_CONCURRENCY] the widest decode ubatch this process can build, in columns; never lowered, and false when GGML_CUDA_BATCH_INVARIANT_MAX_COLS is below it
+    // The width is process-wide and picks the kernels of every context: results are invariant to concurrency at a fixed width, so create every
+    // context (each raises it to fit its n_seq_max) before decoding; a context created later with a wider n_seq_max changes the numerics of
+    // contexts already decoding. Setting GGML_CUDA_BATCH_INVARIANT_MAX_COLS pins the policy instead.
     LLAMA_API bool     llama_set_exact_decode_width(uint32_t n_cols);
     LLAMA_API uint32_t llama_exact_decode_width(void);
 

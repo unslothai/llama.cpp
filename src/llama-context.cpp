@@ -546,6 +546,12 @@ llama_context::llama_context(
             LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set and this context has a KV cache, so it cannot be created with non-causal attention\n", __func__);
             throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
         }
+
+        // [TAG_EXACT_CONCURRENCY] without a memory, decode() runs encode(), which packs the sequences of a batch into one ubatch with no isolation
+        if (llama_exact_concurrency() && !memory) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model has no sequence memory (an encoder); its batches are not isolated per sequence\n", __func__);
+            throw std::runtime_error("exact concurrency: a context without sequence memory is not supported");
+        }
     }
 
     // init backends
@@ -4356,6 +4362,11 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    // refused before the destination is opened, so an existing file is not truncated
+    if (seq_id == -1) {
+        state_write_check();
+    }
+
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -4436,6 +4447,11 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [TAG_EXACT_CONCURRENCY] seq_id -1 is the whole cache, which cannot be restored in this mode either
+    if (seq_id == -1) {
+        state_write_check();
+    }
+
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -5287,12 +5303,23 @@ int32_t llama_memory_n_cells_used(llama_memory_t mem, const llama_seq_id * seq_f
     return mem->n_cells_used(seq_free, n_seq_free, n_reclaimable);
 }
 
-bool llama_memory_update(llama_context * ctx) {
+int32_t llama_memory_update(llama_context * ctx) {
     if (!ctx) {
-        return false;
+        return 0;
     }
 
-    return ctx->memory_update(false);
+    const bool ran = ctx->memory_update(false);
+
+    // memory_update() logs a failed K-shift and returns, leaving the shift recorded; ask the memory whether one is still due
+    if (llama_memory_t mem = ctx->get_memory()) {
+        const auto mctx = mem->init_update(ctx, false);
+
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) {
+            return -1;
+        }
+    }
+
+    return ran ? 1 : 0;
 }
 
 // llama state API

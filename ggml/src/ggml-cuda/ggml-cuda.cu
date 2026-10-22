@@ -2001,7 +2001,9 @@ int ggml_cuda_batch_invariant() {
     return mode;
 }
 
-// [TAG_EXACT_CONCURRENCY] the widest decode ubatch the caller says it can build, 0 if it never said
+// [TAG_EXACT_CONCURRENCY] the widest decode ubatch the caller says it can build, 0 if it never said. By design it is process-wide and only
+// grows: a context created later with a wider n_seq_max moves the column bound for every context, so their numerics change with it (see
+// llama_set_exact_decode_width in llama.h); GGML_CUDA_BATCH_INVARIANT_MAX_COLS pins the bound.
 static std::atomic<int> g_exact_decode_width{0};
 
 void ggml_backend_cuda_set_exact_decode_width(int n_cols) {

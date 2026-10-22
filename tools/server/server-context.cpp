@@ -4409,6 +4409,15 @@ private:
 
         size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
 
+        // the bounds the batch builder applies to n_past: a decision group's children start from the shared prefix, and a decision's first position is evaluated
+        if (slot.task->n_tokens_shared > 0) {
+            n_keep = std::min(n_keep, (size_t) slot.task->n_tokens_shared);
+        }
+
+        if (const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1; n_decision_first >= 0) {
+            n_keep = std::min(n_keep, (size_t) n_decision_first);
+        }
+
         if (slot.alora_invocation_start > 0) {
             n_keep = std::min(n_keep, (size_t) (slot.alora_invocation_start - 1));
         }
@@ -4562,15 +4571,17 @@ private:
             return -1;
         }
 
-        const int32_t n_cur = std::max(slot.prompt.n_tokens(), slot.state == SLOT_STATE_GENERATING ? 0 : slot.preempt_n_input());
+        // a generating slot, also one parked in RAM, reads its own prompt: a context shift made it shorter than the task's
+        const bool    generating = slot.state == SLOT_STATE_GENERATING || (slot.preempt_is_out() && slot.state_before_preempt == SLOT_STATE_GENERATING);
+        const int32_t n_cur      = std::max(slot.prompt.n_tokens(), !generating || slot.preempt_recompute || slot.preempt_reprefill ? slot.preempt_n_input() : 0);
 
         // n_predict may be INT32_MAX: sum in 64 bits before clamping
         return preempt_n_cells((int32_t) std::min<int64_t>(slot.n_ctx, int64_t(n_cur) + slot.n_remaining() + 1));
     }
 
-    // Cells the residents hold once each reaches its output limit; -1 if one has no limit, or shares cells with a sibling.
-    int32_t preempt_kv_projected() const {
-        int32_t res = 0;
+    // Cells the residents hold once each reaches its output limit; -1 if one has no limit, or shares cells with a sibling. 64 bits: many slots of a large context overflow 32.
+    int64_t preempt_kv_projected() const {
+        int64_t res = 0;
 
         for (const auto & slot : slots) {
             if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
@@ -5268,10 +5279,9 @@ private:
 
         preempt_wait_for_shift();
 
-        llama_memory_update(ctx_tgt);
-
-        if (ctx_dft) {
-            llama_memory_update(ctx_dft);
+        // a shift that did not complete stays recorded: a park now would save moved positions with unshifted K and drop the pending deltas
+        if (llama_memory_update(ctx_tgt) < 0 || (ctx_dft && llama_memory_update(ctx_dft) < 0)) {
+            throw std::runtime_error("the KV cache shift did not complete");
         }
     }
 
@@ -5381,11 +5391,11 @@ private:
                 const int32_t margin   = occupied == 0 ? 0 : preempt_n_margin(1);
 
                 // [TAG_PREEMPT] With every resident bounded, also wait until all of them can reach their output limit beside it, or the growth parks someone again.
-                const int32_t projected = occupied == 0 ? 0 : preempt_kv_projected();
+                const int64_t projected = occupied == 0 ? 0 : preempt_kv_projected();
 
                 for (auto * slot : parked) {
                     if (occupied + preempt_n_need(*slot) + margin <= n_cells &&
-                        (projected < 0 || preempt_n_final(*slot) < 0 || projected + preempt_n_final(*slot) + margin <= n_cells)) {
+                        (projected < 0 || preempt_n_final(*slot) < 0 || projected + preempt_n_final(*slot) + margin <= (int64_t) n_cells)) {
                         best = slot;
                         break;
                     }

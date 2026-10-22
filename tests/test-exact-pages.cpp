@@ -230,6 +230,24 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s : a whole-context state was restored\n", __func__);
             return 1;
         }
+
+        // seq_id -1 is the whole cache on the per-sequence API too: no state, and no file, since it could not be restored
+        if (llama_state_seq_get_size(ctx, -1) != 0 || llama_state_seq_get_data(ctx, whole.data(), whole.size(), -1) != 0) {
+            fprintf(stderr, "%s : a whole-cache state was saved through the per-sequence API\n", __func__);
+            return 1;
+        }
+
+        const char * seq_file = "test-exact-pages.seq";
+        std::remove(seq_file);
+
+        if (llama_state_seq_save_file(ctx, seq_file, -1, &tok, 1) != 0 || (f = fopen(seq_file, "rb")) != nullptr) {
+            if (f) {
+                fclose(f);
+            }
+            std::remove(seq_file);
+            fprintf(stderr, "%s : a whole-cache sequence file was written\n", __func__);
+            return 1;
+        }
     }
 
     printf("%s : ok, page ownership survived a no-op removal, holes and a full removal, and a negative restored position and a whole-context save and restore were refused\n", __func__);
