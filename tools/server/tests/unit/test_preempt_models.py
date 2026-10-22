@@ -1,4 +1,6 @@
 import os
+import re
+import tempfile
 import pytest
 from utils import *
 
@@ -42,6 +44,60 @@ def test_a_non_causal_decision_longer_than_the_ubatch_is_refused_and_the_server_
     assert res.status_code == 500
     assert "too large to process" in res.body["error"]["message"]
     assert server.make_request("GET", "/health").status_code == 200
+
+
+def _decision(state: str):
+    return server.make_request("POST", "/v1/systemone", data={
+        "state": state,
+        "questions": {"q": {
+            "type": "choice",
+            "instructions": "Is this a greeting?",
+            "criteria": {"yes": "a greeting", "no": "something else"},
+        }},
+    })
+
+
+def _decision_n_tokens(words: int) -> int:
+    """Input tokens of a decision whose state is `words` words, read from the refusal of one longer than the ubatch (= the context here)."""
+    res = _decision("Hello " * words)
+    assert res.status_code != 200, "this state should not fit the context"
+    m = re.search(r"input \((\d+) tokens\) is (?:too large to process|larger than the max context size)", res.body["error"]["message"])
+    assert m, res.body
+    return int(m.group(1))
+
+
+def test_a_decision_as_long_as_the_context_resumes_after_a_park():
+    """Admission takes a non-causal prompt of exactly n_ctx tokens, so a parked one must fit the pool again on resume."""
+    global server
+    server = ServerPreset.tinyopenjev()
+    server.n_threads = 2
+    server.override_kvs = ["qwen35.attention.causal=bool:false"]
+    n_ctx = 256
+    server.n_ctx = n_ctx
+    server.n_slots = 2
+    server.kv_unified = True
+    server.n_batch = n_ctx
+    server.n_ubatch = n_ctx
+    server.cache_ram = 0
+    fd, server.log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "32"
+    server.start(timeout_seconds=START_TIMEOUT)
+
+    # the state that makes the input exactly n_ctx tokens: one word is one token here
+    a, b = 2 * n_ctx, 2 * n_ctx + 20
+    n_a, n_b = _decision_n_tokens(a), _decision_n_tokens(b)
+    assert n_b - n_a == b - a, f"one word is not one token: {n_a} -> {n_b}"
+    words = a - (n_a - n_ctx)
+    assert _decision_n_tokens(words + 1) == n_ctx + 1
+
+    results = parallel_function_calls([(_decision, ("Hello " * words,)) for _ in range(12)])
+    for res in results:
+        assert res.status_code == 200, res.body
+
+    text = open(server.log_path, errors="replace").read()
+    assert "preempted" in text, "no decision was parked, so the resume was not exercised"
+    assert "cannot fit the pool" not in text
 
 
 def _final_bodies():

@@ -4363,6 +4363,11 @@ private:
             return 0;
         }
 
+        // [TAG_PREEMPT] Cache reuse shifts chunks from beyond the common prefix back in, so the whole cached prompt is kept for it to search.
+        if (slot.task->params.n_cache_reuse > 0 && llama_memory_can_shift(llama_get_memory(ctx_tgt)) && !slot.prompt.tokens.has_mtmd) {
+            return slot.prompt.tokens.size();
+        }
+
         size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
 
         if (slot.alora_invocation_start > 0) {
@@ -4418,11 +4423,23 @@ private:
             const int32_t n_mtmd = preempt_n_mtmd_pending(slot, res);
             const int32_t n_left = slot.preempt_n_input() - res;
 
-            res += n_mtmd > 0 ? n_mtmd : std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
+            // a prompt held in full needs no further cell: a non-causal one may be exactly n_ctx long, as admission allows
+            res += n_mtmd > 0 ? n_mtmd : std::max(0, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
         }
 
         // [TAG_EXACT_CONCURRENCY] A restore takes fresh pages and its tail page counts in full; undercounting admits a resume find_slot cannot satisfy.
         return preempt_n_cells(res);
+    }
+
+    // [TAG_PREEMPT] Prompt tokens a family member shares with the one charged first: n_cmpl > 1 clones share all of it, a decision group only its parent's first n_tokens_shared.
+    int32_t preempt_family_n_shared(int family, const server_task & task) const {
+        for (const auto & other : slots) {
+            if (other.task && other.task->id == family && other.task->n_tokens_shared > 0) {
+                return other.task->n_tokens_shared;
+            }
+        }
+
+        return task.n_tokens();
     }
 
     int32_t preempt_kv_used() const {
@@ -4447,7 +4464,7 @@ private:
                 const int family = slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
 
                 if (std::find(charged.begin(), charged.end(), family) != charged.end()) {
-                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - slot.task->n_tokens()));
+                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - preempt_family_n_shared(family, *slot.task)));
                     continue;
                 }
 
@@ -4468,7 +4485,8 @@ private:
 
         const int32_t n_cur = std::max(slot.prompt.n_tokens(), slot.state == SLOT_STATE_GENERATING ? 0 : slot.preempt_n_input());
 
-        return preempt_n_cells(std::min(slot.n_ctx, n_cur + slot.n_remaining() + 1));
+        // n_predict may be INT32_MAX: sum in 64 bits before clamping
+        return preempt_n_cells((int32_t) std::min<int64_t>(slot.n_ctx, int64_t(n_cur) + slot.n_remaining() + 1));
     }
 
     // Cells the residents hold once each reaches its output limit; -1 if one has no limit, or shares cells with a sibling.

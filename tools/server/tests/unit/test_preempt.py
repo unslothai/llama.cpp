@@ -1174,6 +1174,26 @@ def _serve_with_training_context(n_ctx_train: int):
     server.model_hf_repo = server.model_hf_file = None
 
 
+def test_a_started_prompt_keeps_the_chunks_cache_reuse_shifts_in():
+    """Trimming a started slot to its common prefix ahead of the batch builder must not discard what --cache-reuse would shift back in."""
+    os.environ["LLAMA_ARG_PREEMPT_RAM"] = "64"
+    _start(n_ctx=512, n_batch=64, n_ubatch=32, cache_ram=0)
+
+    def run(prompt, id_slot, n_cache_reuse=0):
+        res = server.make_request("POST", "/completion", data={
+            "n_predict": 1, "prompt": prompt, "id_slot": id_slot, "cache_prompt": True,
+            "n_cache_reuse": n_cache_reuse, "temperature": 0.0, "seed": 42,
+        })
+        assert res.status_code == 200, res.body
+        return res.body["timings"]
+
+    run([1] * 50 + [2] * 50 + [3] * 200, 0)
+    run([4] * 180, 1)
+    timings = run([1] * 50 + [3] * 200, 0, n_cache_reuse=50)
+
+    assert timings["cache_n"] > 200, f"the reusable chunk was trimmed away: {timings}"
+
+
 def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     os.environ["LLAMA_SERVER_PREEMPT_EVERY"] = "48"
@@ -1230,7 +1250,12 @@ def test_a_parked_head_is_not_overtaken_by_a_stream_of_short_requests():
     assert "prompt held:" in text, "no prompt was held back for the head"
     waits = [float(w) for w in re.findall(r"id +3 \| task \d+ \| resumed after ([\d.]+) s", text)]
     assert waits, "the head was never parked and resumed"
-    assert max(waits) < 10.0, f"the head waited {waits} s behind requests that came after it"
+    # overtaken by the stream, the head would wait until the stream stopped (t_stream_max); waiting its turn, a few short requests' worth
+    t_short = max(
+        (res.body["timings"]["prompt_ms"] + res.body["timings"]["predicted_ms"]) / 1e3 for _, res in shorts
+    )
+    t_bound = max(10.0, 3 * t_short)
+    assert max(waits) < t_bound, f"the head waited {waits} s behind requests that came after it (bound {t_bound:.1f} s, a short request took up to {t_short:.1f} s)"
 
 
 @pytest.mark.slow
