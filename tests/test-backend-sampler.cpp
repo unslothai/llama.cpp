@@ -2982,6 +2982,7 @@ static struct llama_sampler_i llama_sampler_mask3_i = {
     /* .backend_apply     = */ llama_sampler_mask3_backend_apply,
     /* .backend_set_input = */ nullptr,
     /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
 };
 
 static void test_custom_masking_cpu_suffix(const test_params & params) {
