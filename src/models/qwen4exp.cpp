@@ -308,6 +308,20 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// DFlash drafters read the layer inputs as [n_embd, T] rows, so collapse the streams
+static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+
+    ggml_tensor * acc = ggml_view_2d(ctx, x, n_embd, nt, x->nb[2], 0);
+    for (int64_t s = 1; s < hc; ++s) {
+        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, n_embd, nt, x->nb[2], s*x->nb[1]));
+    }
+
+    return ggml_scale(ctx, acc, 1.0f / (float) hc);
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -447,7 +461,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
@@ -813,6 +831,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
+    // keep the kq_mask cells of the live picked pools and the tail, -inf elsewhere
+    if (cparams.fused_top_k_mask) {
+        GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
+
+        ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs, il);
+        cb(sel, "indexer_sel", il);
+
+        return sel;
+    }
+
     // the top blocks, then the incomplete tail with n_kv for missing cells
     ggml_tensor * sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
             ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens)); // [kpool, n_top_pool*n_tokens]
@@ -1131,13 +1159,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
-
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 
     return cur;
 }
