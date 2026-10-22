@@ -67,7 +67,6 @@ def endpoint_host(endpoint):
 
 
 def served_the_sync(f, rec):
-    """did peer `f` answer this clock exchange?"""
     t2, t3 = rec.get("t2"), rec.get("t3")
     if t2 is None or t3 is None:
         return False

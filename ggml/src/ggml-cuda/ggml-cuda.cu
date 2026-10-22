@@ -6129,8 +6129,7 @@ extern "C" int ggml_backend_cuda_trace_poll(uint64_t * tags, int * kinds, int64_
         }
         d.pending.resize(keep);
 
-        // elapsed times are float milliseconds: far from the anchor they lose precision (~250 us after an hour),
-        // so move the anchor up while nothing pending refers to the old one and the stream is idle
+        // float-ms elapsed times lose precision far from the anchor: move it up once idle and unreferenced
         if (d.anchor_fixed && d.pending.empty() && ggml_time_us() - d.anchor_us > GGML_CUDA_TRACE_REANCHOR_US &&
             cudaStreamQuery(d.stream) == cudaSuccess) {
             ggml_cuda_set_device(d.device);

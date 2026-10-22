@@ -1965,7 +1965,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (ggml_trace_flag) {
-            // note: the submit is asynchronous, so t1 is when the work was queued, not finished
+            // async submit: t1 = queued, not finished
             ggml_trace_eventf("sched", "split", t_split0, ggml_trace_time_us(),
                               "\"split\":%d,\"n_splits\":%d,\"backend\":\"%s\",\"n_inputs\":%d,"
                               "\"n_nodes\":%d,\"inputs_us\":%lld,\"gpu_tag\":%llu",
