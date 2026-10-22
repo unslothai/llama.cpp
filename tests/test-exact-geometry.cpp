@@ -2,6 +2,7 @@
 #include "common.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 
 #undef NDEBUG
@@ -45,6 +46,33 @@ int main() {
     const uint32_t width = llama_exact_decode_width();
     assert(!llama_set_exact_decode_width((uint32_t) INT32_MAX + 1));
     assert(llama_exact_decode_width() == width);
+
+    // a draft context splits each batch at its own ubatch size, so a draft ubatch other than the target's moves with what else is in the batch
+    {
+#ifdef _WIN32
+        _putenv_s("LLAMA_EXACT_CONCURRENCY", "1");
+#else
+        setenv("LLAMA_EXACT_CONCURRENCY", "1", 1);
+#endif
+        assert(common_exact_concurrency());
+
+        common_params p;
+        p.n_ctx      = 2048;
+        p.n_batch    = 512;
+        p.n_ubatch   = 128;
+        p.n_parallel = 2;
+        p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+        p.speculative.draft.mparams.path = "draft.gguf";
+
+        p.speculative.draft.n_ubatch = 100;
+        assert(!common_exact_concurrency_init(p));
+
+        p.speculative.draft.n_ubatch = 128;
+        assert(common_exact_concurrency_init(p));
+
+        p.speculative.draft.n_ubatch = 0;  // the target's
+        assert(common_exact_concurrency_init(p));
+    }
 
     printf("%s: all tests passed\n", __func__);
 

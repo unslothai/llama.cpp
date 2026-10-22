@@ -1502,6 +1502,17 @@ bool common_exact_concurrency_init(const common_params & params) {
         }
     }
 
+    // [TAG_EXACT_CONCURRENCY] A draft context splits each batch at its own ubatch size; any other size than the target's moves its splits with what else is in the batch.
+    const bool has_draft_ctx = params.speculative.has_dft() ||
+        std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const int  n_ubatch_tgt  = params.n_ubatch <= 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
+
+    if (has_draft_ctx && params.speculative.draft.n_ubatch > 0 && params.speculative.draft.n_ubatch != n_ubatch_tgt) {
+        COM_ERR("LLAMA_EXACT_CONCURRENCY needs the draft context to split a batch where the target does: --spec-draft-n-ubatch %d differs from the target's ubatch of %d; drop it or set it to %d\n",
+                params.speculative.draft.n_ubatch, n_ubatch_tgt, n_ubatch_tgt);
+        return false;
+    }
+
     const int n_cols = common_exact_decode_width(params);
 
     if (n_cols < 0) {
