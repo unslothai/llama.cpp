@@ -71,11 +71,14 @@ static bool port_open(int port) {
     _exit(0);
 }
 
+// a client that could not be started: distinct from every exit status and signal, so it is never read as a refusal
+static const int CLIENT_NOT_RUN = -1000;
+
 static int run_client(const std::string & endpoint, bool paged) {
     const pid_t pid = fork();
     if (pid < 0) {
         perror("fork the RPC client");
-        return -1;
+        return CLIENT_NOT_RUN;
     }
     if (pid == 0) {
         send_graph(endpoint, paged);
@@ -85,8 +88,31 @@ static int run_client(const std::string & endpoint, bool paged) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
 }
 
+// a port the kernel just handed out, so a parallel run or another listener does not answer for the server
+static int free_port() {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = 0;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    int port = -1;
+    if (bind(fd, (sockaddr *) &addr, sizeof(addr)) == 0 && getsockname(fd, (sockaddr *) &addr, &len) == 0) {
+        port = ntohs(addr.sin_port);
+    }
+    close(fd);
+    return port;
+}
+
 int main() {
-    const int port = 41000 + getpid() % 9000;
+    const int port = free_port();
+    if (port <= 0) {
+        perror("find a free port");
+        return 1;
+    }
     const std::string endpoint = "127.0.0.1:" + std::to_string(port);
 
     const pid_t server = fork();
@@ -120,7 +146,10 @@ int main() {
 
         printf("unpaged: %d, paged: %d, unpaged after: %d\n", plain, paged, after);
 
-        if (plain != 0 || after != 0) {
+        if (plain == CLIENT_NOT_RUN || paged == CLIENT_NOT_RUN || after == CLIENT_NOT_RUN) {
+            fprintf(stderr, "a client could not be started, so this test proves nothing\n");
+            rc = 1;
+        } else if (plain != 0 || after != 0) {
             fprintf(stderr, "an unpaged graph failed over RPC, so this test proves nothing\n");
             rc = 1;
         } else if (paged == 0) {
