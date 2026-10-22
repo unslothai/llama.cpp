@@ -218,8 +218,9 @@ class DeepseekV41Model(DeepseekV4Model):
         with open(index, "r", encoding="utf-8") as f:
             return self.dir_model / json.load(f)["weight_map"][name]
 
-    def _write_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR) -> None:
-        names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(self.hparams["n_routed_experts"])]
+    def _write_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR, n_expert: int | None = None) -> None:
+        n_expert = self.hparams["n_routed_experts"] if n_expert is None else n_expert
+        names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(n_expert)]
         pairs = [(self.model_tensors.pop(n + ".weight"), self.model_tensors.pop(n + ".scale")) for n in names]
         rows, packed_cols = pairs[0][0]().shape
 
@@ -314,3 +315,131 @@ class DeepseekV41Model(DeepseekV4Model):
         if n_dims >= 2 and (name in self._dsv4_fp8_dequantized or name in self._dsv4_bf16_tensors):
             return gguf.GGMLQuantizationType.F32 if self._f32 else gguf.GGMLQuantizationType.BF16
         return False
+
+
+class DeepseekV41DSparkModel(DeepseekV41Model):
+    """DeepSeek-V4.1 DSpark speculative draft (mtp.0..2 of the checkpoint) as a DFLASH GGUF (`--dspark`).
+
+    Layout = the V4 DSpark draft (conversion/deepseek.py DeepseekV4DSparkModel) with V4.1's differences flagged by
+    `dflash.hyper_connection.single_pass`: stages blk.0..2 (MXFP4 experts bit-exact, dense BF16), mtp.0.main_proj /
+    main_norm -> fc / enc.output_norm, mtp.2.norm -> output_norm, markov_head.embed / head -> markov_w1 / markov_w2,
+    confidence_head.proj -> conf_proj (F32), no hc_head. Token embeddings and the lm head are the target's (shared at
+    runtime through ctx_other). target_layers are the V4.1 ids as-is: the draft reads the attention input of those
+    layers, which is what llama_set_embeddings_layer_inp extracts.
+    """
+    model_arch = gguf.MODEL_ARCH.DFLASH
+    mtp_only = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hp = self.hparams
+        self._n_main = hp["num_hidden_layers"]
+        self._n_stage = hp["num_nextn_predict_layers"]
+        if self._n_stage <= 0 or "dspark_block_size" not in hp:
+            raise ValueError("DeepSeek-V4.1 DSpark export needs num_nextn_predict_layers > 0 and the dspark_* config")
+        # stages keep main-model block ids (mtp.M -> layers.n_main+M); format_tensor_name() maps them back
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self._n_stage)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        hp = {**self.hparams, **self.hparams.get("text_config", {})}  # text_config is merged only after indexing
+        type(self)._dsv4_main_layers = hp["num_hidden_layers"]
+        type(self)._dsv4_nextn_layers = hp.get("num_nextn_predict_layers", 0)
+        return TextModel.index_tensors(self, remote_hf_model_id=remote_hf_model_id)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        m = re.match(r"mtp\.(\d+)\.(.+)$", name)
+        if m is None:
+            return None  # shared with the target at runtime
+        stage, rest = int(m.group(1)), m.group(2)
+        assert cls._dsv4_main_layers is not None
+        if stage >= cls._dsv4_nextn_layers:
+            raise ValueError(f"Unexpected DSpark stage {stage}")
+        if rest.startswith(("markov_head.", "confidence_head.")):
+            return f"dspark.{rest}", gen
+        return f"layers.{cls._dsv4_main_layers + stage}.{rest}", gen
+
+    def format_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
+        if bid is not None and bid >= self._n_main:
+            bid -= self._n_main
+        return super().format_tensor_name(key, bid, suffix)
+
+    def set_vocab(self):
+        super().set_vocab()
+        self.gguf_writer.add_mask_token_id(self.hparams["dspark_noise_token_id"])
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        n = self._n_stage
+        w = self.gguf_writer
+        w.add_block_count(n)
+        w.add_context_length(hp["max_position_embeddings"])
+        w.add_embedding_length(hp["hidden_size"])
+        w.add_feed_forward_length(hp["moe_intermediate_size"])
+        w.add_head_count(hp["num_attention_heads"])
+        w.add_head_count_kv(1)
+        w.add_key_length(hp["head_dim"])
+        w.add_value_length(hp["head_dim"])
+        w.add_rope_dimension_count(hp["qk_rope_head_dim"])
+        # compress-ratio-0 layers: plain rope at rope_theta, no YaRN
+        w.add_rope_freq_base(float(hp["rope_theta"]))
+        w.add_layer_norm_rms_eps(hp["rms_norm_eps"])
+        w.add_q_lora_rank(hp["q_lora_rank"])
+        w.add_sliding_window(hp["sliding_window"])
+        w.add_expert_count(hp["dspark_n_routed_experts"])
+        w.add_expert_used_count(hp["dspark_num_experts_per_tok"])
+        w.add_expert_feed_forward_length(hp["moe_intermediate_size"])
+        w.add_expert_shared_count(hp["n_shared_experts"])
+        w.add_expert_weights_scale(hp["routed_scaling_factor"])
+        w.add_expert_weights_norm(hp["norm_topk_prob"])
+        w.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRTSOFTPLUS)
+        w.add_swiglu_clamp_exp([hp["swiglu_limit"]] * n)
+        w.add_swiglu_clamp_shexp([hp["swiglu_limit"]] * n)
+        w.add_attention_output_group_count(hp["o_groups"])
+        w.add_attention_output_lora_rank(hp["o_lora_rank"])
+        w.add_attention_compress_ratios([0] * n)
+        w.add_hyper_connection_count(hp["hc_mult"])
+        w.add_hyper_connection_sinkhorn_iterations(hp["hc_sinkhorn_iters"])
+        w.add_hyper_connection_epsilon(hp["hc_eps"])
+        w.add_hyper_connection_single_pass(True)
+        w.add_block_size(hp["dspark_block_size"])
+        w.add_target_layers(hp["dspark_target_layer_ids"])
+        w.add_sample_from_anchor(True)
+        w.add_has_confidence_head(True)
+        w.add_file_type(self.ftype)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # no Engram tables in the draft
+        if not self._dsv4_mxfp4_generated:
+            n_expert = self.hparams["dspark_n_routed_experts"]
+            for bid in range(self._n_main, self._n_main + self._n_stage):
+                self._write_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP, n_expert)
+                self._write_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP, n_expert)
+                self._write_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP, n_expert)
+            self._dsv4_mxfp4_generated = True
+        return ()
+
+    _DSPARK_ROOT: dict[str, gguf.MODEL_TENSOR] = {
+        "main_proj.weight": gguf.MODEL_TENSOR.FC,
+        "main_norm.weight": gguf.MODEL_TENSOR.ENC_OUTPUT_NORM,
+        "norm.weight": gguf.MODEL_TENSOR.OUTPUT_NORM,
+        "dspark.markov_head.embed.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_W1,
+        "dspark.markov_head.head.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_W2,
+        "dspark.confidence_head.proj.weight": gguf.MODEL_TENSOR.DSPARK_CONF_PROJ,
+    }
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".ffn.gate.bias_vl"):
+            return []
+        if name in self._DSPARK_ROOT:
+            return [(self.format_tensor_name(self._DSPARK_ROOT[name], None), data_torch)]
+        m = re.match(r"layers\.\d+\.(main_proj\.weight|main_norm\.weight|norm\.weight)$", name)
+        if m is not None:
+            return [(self.format_tensor_name(self._DSPARK_ROOT[m.group(1)], None), data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if new_name == "conf_proj.weight":
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)

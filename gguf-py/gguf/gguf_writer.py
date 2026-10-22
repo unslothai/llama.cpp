@@ -1114,6 +1114,9 @@ class GGUFWriter:
     def add_hyper_connection_low_rank(self, value: int) -> None:
         self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)
 
+    def add_hyper_connection_single_pass(self, value: bool) -> None:
+        self.add_bool(Keys.HyperConnection.SINGLE_PASS.format(arch=self.arch), value)
+
     def add_ple_layers(self, values: Sequence[int]) -> None:
         self.add_array(Keys.PerLayerEmbedding.LAYERS.format(arch=self.arch), values)
 

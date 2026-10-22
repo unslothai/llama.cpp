@@ -250,6 +250,8 @@ class Keys:
         MAGNITUDE            = "{arch}.hyper_connection.magnitude"
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
+        # single-pass mHC: each sublayer collapses with the previous pre-mix (DeepSeek-V4.1)
+        SINGLE_PASS          = "{arch}.hyper_connection.single_pass"
 
     class Engram:  # deepseek41; the table uses the PerLayerEmbedding keys
         PAD_TOKEN_ID          = "{arch}.engram.pad_token_id"

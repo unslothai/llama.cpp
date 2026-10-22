@@ -211,6 +211,10 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        throw std::runtime_error("DeepSeek-V4.1 has no MTP graph: its DSpark draft is a separate DFLASH GGUF "
+                "(convert_hf_to_gguf.py --dspark), used with --spec-type draft-dspark");
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -843,6 +847,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             cb(inpL, "engram_out", il);
         }
 
+        // DSpark target features: mean over the hc copies of the layer input
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = build_hc_mean(inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
@@ -923,7 +934,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
