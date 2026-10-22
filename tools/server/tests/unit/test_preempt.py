@@ -581,10 +581,15 @@ def test_a_budget_that_holds_no_sequence_parks_by_dropping_the_cells(planner):
     os.environ["LLAMA_ARG_PREEMPT_RAM"] = "1"
     if planner == "off":
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
+    # Two generations that overflow the pool together, each longer than the ~1500 tokens the 1 MiB budget holds when they do.
+    # With 4000 each in 6144 cells they overflow unless the second starts ~1900 tokens after the first (2000 in 3840 allowed
+    # only ~180, which a slow client exceeded), and the shorter one then holds over 2100 tokens, so the park drops its cells.
+    # A longer training context lets one slot take 4000 tokens.
     # One batch for the re-prefill: this prompt in 32-token batches hangs the CUDA build with graphs on, also on master.
-    _start(n_ctx=3840, n_batch=2048)
+    _serve_with_training_context(8192)
+    _start(n_ctx=6144, n_batch=4096)
 
-    n_predict = 2000
+    n_predict = 4000
     if planner == "on":
         results = parallel_function_calls([(_stream_completion, (n_predict, p)) for p in (_PROMPT_A, _PROMPT_B)])
         for comments, final in results:
@@ -593,7 +598,10 @@ def test_a_budget_that_holds_no_sequence_parks_by_dropping_the_cells(planner):
         comments = [c for cs, _ in results for c in cs]
         assert ": preempted" in comments and ": resumed" in comments, comments
     else:
-        _assert_completed(_complete_all(n_predict), n_predict)
+        # one request with both prompts: queued at once, whatever the client's speed
+        res = _complete_together(n_predict, (8, 8))
+        assert res.status_code == 200, res.body
+        assert [r["tokens_predicted"] for r in res.body] == [n_predict, n_predict], res.body
 
     text = _log()
     assert "Context size has been exceeded" not in text
