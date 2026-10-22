@@ -17,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <cctype>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -1206,6 +1207,56 @@ void server_models::load(const std::string & name, const load_options & opts) {
                                 [](const std::string & e) { return e.rfind(pg_prefix, 0) == 0; }),
                             child_env.end());
             child_env.push_back(pg_prefix + std::to_string(server_get_pipeline_groups()));
+        }
+
+        // per-child trace path keyed by port, else each child truncates the router's "wb" trace
+        {
+            static const std::string tr_prefix = "GGML_RPC_TRACE=";
+
+            // Windows env names are case-insensitive
+            const auto is_trace = [](const std::string & e) {
+                if (e.size() < tr_prefix.size()) {
+                    return false;
+                }
+#ifdef _WIN32
+                return std::equal(tr_prefix.begin(), tr_prefix.end(), e.begin(), [](char a, char b) {
+                    return std::toupper((unsigned char) a) == std::toupper((unsigned char) b);
+                });
+#else
+                return e.compare(0, tr_prefix.size(), tr_prefix) == 0;
+#endif
+            };
+
+            std::string base_trace;
+            for (const auto & e : child_env) {
+                if (is_trace(e)) {
+                    base_trace = e.substr(tr_prefix.size());
+                    break; // getenv() would return this first entry, so match it
+                }
+            }
+
+            if (!base_trace.empty()) {
+                // trace.jsonl -> trace.<name>.<port>.jsonl
+                std::string stem = base_trace;
+                std::string ext;
+                const size_t slash = base_trace.find_last_of("/\\");
+                const size_t dot   = base_trace.find_last_of('.');
+                if (dot != std::string::npos && (slash == std::string::npos || dot > slash + 1)) {
+                    stem = base_trace.substr(0, dot);
+                    ext  = base_trace.substr(dot);
+                }
+
+                std::string safe_name;
+                for (const char c : name) {
+                    safe_name += (std::isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
+                }
+
+                child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                                    is_trace),
+                                child_env.end());
+                child_env.push_back(tr_prefix + stem + "." + safe_name + "." +
+                                    std::to_string(inst.meta.port) + ext);
+            }
         }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {

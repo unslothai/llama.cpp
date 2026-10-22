@@ -18,6 +18,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "ggml-trace.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -942,6 +944,34 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
     }
     return true;
 }
+
+struct server_trace_scope {
+    const char * name;
+    int64_t      t0;
+    int          n0;
+    int          n1;
+    // -1 omits; two counts, not a phase flag, since continuous batching mixes prompt and generation
+    int          n_prompt = -1;
+    int          n_decode = -1;
+
+    server_trace_scope(const char * name, int n0, int n1) :
+        name(name), t0(ggml_trace_flag ? ggml_trace_time_us() : 0), n0(n0), n1(n1) {}
+
+    ~server_trace_scope() {
+        if (ggml_trace_flag) {
+            if (n_prompt < 0) {
+                ggml_trace_eventf("server", name, t0, ggml_trace_time_us(), "\"n0\":%d,\"n1\":%d", n0, n1);
+            } else {
+                ggml_trace_eventf("server", name, t0, ggml_trace_time_us(),
+                                  "\"n0\":%d,\"n1\":%d,\"prompt\":%d,\"decode\":%d",
+                                  n0, n1, n_prompt, n_decode);
+            }
+        }
+    }
+
+    server_trace_scope(const server_trace_scope &) = delete;
+    server_trace_scope & operator=(const server_trace_scope &) = delete;
+};
 
 struct server_group {
     int id = 0;
@@ -2004,6 +2034,8 @@ private:
     };
 
     void group_loop(server_group & grp) {
+        ggml_trace_set_group(grp.id);
+
         while (true) {
             if (groups_stop.load(std::memory_order_relaxed)) {
                 return;
@@ -3686,7 +3718,20 @@ private:
             }
         }
 
+        if (ggml_trace_flag) {
+            ggml_trace_set_group(grp.id);
+        }
+
+        int n_slots_processing = 0;
+        if (ggml_trace_flag) {
+            for (auto * slot : grp.slots) {
+                n_slots_processing += slot->is_processing() ? 1 : 0;
+            }
+        }
+        server_trace_scope span_iter("iteration", grp.id, n_slots_processing);
+
         try {
+            server_trace_scope span_build("batch_build", grp.id, n_slots_processing);
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode(grp);
         } catch (const std::exception & e) {
@@ -3695,6 +3740,16 @@ private:
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return true;
+        }
+
+        if (ggml_trace_flag) {
+            // from the built batch: a prompt-state slot may not have been admitted
+            int n_prompt = 0;
+            for (const auto & tok : batch.tokens) {
+                n_prompt += tok.is_prompt ? 1 : 0;
+            }
+            span_iter.n_prompt = n_prompt;
+            span_iter.n_decode = (int) batch.tokens.size() - n_prompt;
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -4721,15 +4776,23 @@ private:
                 }
             } window(&grp, &lk);
 
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            {
+                server_trace_scope span("submit", grp.id, batch.view.size());
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            }
             // sync even with no output: ~decode_window clears busy, ctx must not be mid-decode
             if (ret == 0) {
+                server_trace_scope span("synchronize", grp.id, batch.view.size());
                 llama_synchronize(ctx_tgt);
             }
         } else {
             queue_tasks.yield_to_queue([&]() {
-                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                {
+                    server_trace_scope span("submit", grp.id, batch.view.size());
+                    ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                }
                 if (ret == 0 && has_output) {
+                    server_trace_scope span("synchronize", grp.id, batch.view.size());
                     llama_synchronize(ctx_tgt);
                 }
             });
@@ -4839,6 +4902,8 @@ private:
     }
 
     void post_decode(server_group & grp, int32_t n_batch_tokens, int32_t off) {
+        server_trace_scope span_post("post_decode", grp.id, n_batch_tokens);
+
         auto * ctx_tgt = grp.ctx;
         auto & batch   = grp.batch;
         auto & slots   = grp.slots;
@@ -4922,6 +4987,7 @@ private:
 
             llama_token id;
             {
+                server_trace_scope span("sampling", grp.id, slot.id);
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -4952,13 +5018,17 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
+            {
+                server_trace_scope span("result_send", grp.id, slot.id);
 
-                return;
+                if (!process_token(result, slot)) {
+                    // release slot because of stop condition
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+
+                    return;
+                }
             }
 
             slot.print_timings_tg();

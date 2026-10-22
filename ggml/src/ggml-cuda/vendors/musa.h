@@ -54,7 +54,10 @@
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
+#define cudaEventCreate musaEventCreate
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
+#define cudaEventElapsedTime musaEventElapsedTime
+#define cudaEventQuery musaEventQuery
 #define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
@@ -94,6 +97,7 @@
 #define cudaStreamFireAndForget musaStreamFireAndForget
 #define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamPerThread musaStreamPerThread
+#define cudaStreamQuery musaStreamQuery
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStreamWaitEvent musaStreamWaitEvent
 #define cudaStream_t musaStream_t

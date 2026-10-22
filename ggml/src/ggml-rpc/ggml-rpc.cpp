@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 #include "transport.h"
 #include "log.h"
+#include "ggml-trace.h"
 
 #include <array>
 #include <chrono>
@@ -78,6 +79,8 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    // once per connection after HELLO, only while tracing (8.1)
+    RPC_CMD_TRACE_SYNC,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -104,6 +107,12 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_DEVICE_COUNT:      return "DEVICE_COUNT";
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
+        case RPC_CMD_SET_TENSOR_2D:     return "SET_TENSOR_2D";
+        case RPC_CMD_GET_TENSOR_2D:     return "GET_TENSOR_2D";
+        case RPC_CMD_COMM_INIT:         return "COMM_INIT";
+        case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+        case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+        case RPC_CMD_TRACE_SYNC:        return "TRACE_SYNC";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
@@ -116,15 +125,26 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
 
+struct rpc_msg_trace_sync_rsp {
+    int64_t t2;
+    int64_t t3;
+};
+
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+};
+
+// optional features a server advertises in rpc_msg_hello_rsp::features (servers without them send 0, so
+// adding one needs no version bump and older clients keep connecting)
+enum rpc_hello_feature : uint8_t {
+    RPC_HELLO_FEATURE_TRACE = 1 << 0, // RPC_CMD_TRACE_SYNC
 };
 
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t features; // rpc_hello_feature bits
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -315,14 +335,50 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
     return hash;
 }
 
+struct rpc_server_trace {
+    bool     active    = false;
+    uint8_t  cmd       = 0;
+    int64_t  t_wait0   = 0;
+    int64_t  t_recv0   = 0;
+    int64_t  t_recv1   = 0;
+    int64_t  t_exec0   = 0;
+    int64_t  t_exec1   = 0;
+    int64_t  t_send0   = 0;
+    int64_t  t_send1   = 0;
+    size_t   bytes_in  = 0;
+    size_t   bytes_out = 0;
+    uint64_t gpu_tag   = 0;
+    int      n_nodes   = -1;
+    int      device    = -1;
+};
+
+static thread_local rpc_server_trace tls_srv;
+
+static void rpc_trace_recv_done(size_t size) {
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_recv1  = ggml_trace_time_us();
+        tls_srv.t_exec0  = tls_srv.t_recv1;
+        tls_srv.bytes_in = size + sizeof(uint64_t) + 1;
+    }
+}
+
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_exec1   = ggml_trace_time_us();
+        tls_srv.t_send0   = tls_srv.t_exec1;
+        tls_srv.bytes_out = msg_size + sizeof(uint64_t);
+    }
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
     if (!sock->send_data(msg, msg_size)) {
         return false;
     }
-    return sock->flush();
+    const bool ok = sock->flush();
+    if (ggml_trace_flag && tls_srv.active) {
+        tls_srv.t_send1 = ggml_trace_time_us();
+    }
+    return ok;
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -333,7 +389,9 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     if (size != msg_size) {
         return false;
     }
-    return sock->recv_data(msg, msg_size);
+    const bool ok = sock->recv_data(msg, msg_size);
+    rpc_trace_recv_done(msg_size);
+    return ok;
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
@@ -347,7 +405,9 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
         LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
         return false;
     }
-    return sock->recv_data(input.data(), size);
+    const bool ok = sock->recv_data(input.data(), size);
+    rpc_trace_recv_done(size);
+    return ok;
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
@@ -382,21 +442,41 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
-        return false;
-    }
+static bool recv_rpc_rsp(socket_ptr sock, void * output, size_t output_size, int64_t * t_recv0 = nullptr) {
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
     }
+    if (t_recv0) {
+        *t_recv0 = ggml_trace_time_us();
+    }
     if (out_size != output_size) {
         return false;
     }
-    if (!sock->recv_data(output, output_size)) {
+    return sock->recv_data(output, output_size);
+}
+
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
-    return true;
+    return recv_rpc_rsp(sock, output, output_size);
+}
+
+static const size_t RPC_CMD_HEADER_BYTES = 1 + sizeof(uint64_t);
+static const size_t RPC_RSP_HEADER_BYTES = sizeof(uint64_t);
+
+static void rpc_trace_sync(const socket_ptr & sock, const std::string & endpoint) {
+    rpc_msg_trace_sync_rsp response = {};
+
+    const int64_t t1 = ggml_trace_time_us();
+    if (!send_rpc_cmd(sock, RPC_CMD_TRACE_SYNC, nullptr, 0, &response, sizeof(response))) {
+        LOG_ERROR("%s: peer %s did not answer the trace clock sync\n", __func__, endpoint.c_str());
+        return;
+    }
+    const int64_t t4 = ggml_trace_time_us();
+
+    ggml_trace_clock_offset(endpoint.c_str(), t1, response.t2, response.t3, t4);
 }
 
 // RPC client-side implementation
@@ -415,7 +495,7 @@ static inline void rpc_cpu_relax() {
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * server_features) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -430,6 +510,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    *server_features = response.features;
     sock->update_caps(response.conn_caps);
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
@@ -518,6 +599,14 @@ private:
         void                        * output;
         size_t                        output_size;
         std::promise<void>            completion;
+
+        int64_t  t_enq        = 0;
+        int      group        = -1;
+        uint64_t uid          = 0;
+        char     subject[GGML_MAX_NAME] = {};
+        int      n_nodes      = -1;
+        int      dev          = -1;
+        int64_t  serialize_us = 0;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -525,6 +614,9 @@ private:
         rpc_msg_ptr              msg;
         std::shared_future<void> sf;
     };
+    static rpc_msg_ptr make_msg(rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    void send_traced(rpc_msg & msg);
+
     std::mutex graph_mutex;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
     rpc_msg_queue    queue;
@@ -539,48 +631,84 @@ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
     dispatcher->work();
 }
 
-void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+rpc_dispatcher::rpc_msg_ptr rpc_dispatcher::make_msg(rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
     msg->input_size = input_size;
-    msg->output = nullptr;
-    msg->output_size = 0;
+    msg->output = output;
+    msg->output_size = output_size;
+    if (ggml_trace_flag) {
+        msg->t_enq = ggml_trace_time_us();
+        msg->group = ggml_trace_get_group();
+        const char * subject = ggml_trace_get_subject(&msg->uid);
+        if (subject != nullptr) {
+            snprintf(msg->subject, sizeof(msg->subject), "%s", subject);
+        }
+    }
+    return msg;
+}
+
+void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    auto msg = make_msg(cmd, input, input_size, nullptr, 0);
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
-    auto msg = std::make_shared<rpc_msg>();
-    msg->cmd = cmd;
-    msg->input = input;
-    msg->input_size = input_size;
-    msg->output = nullptr;
-    msg->output_size = 0;
+    auto msg = make_msg(cmd, input, input_size, nullptr, 0);
     GGML_ASSERT(queue.push(msg));
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
-    auto msg = std::make_shared<rpc_msg>();
-    msg->cmd = cmd;
-    msg->input = input;
-    msg->input_size = input_size;
-    msg->output = output;
-    msg->output_size = output_size;
+    auto msg = make_msg(cmd, input, input_size, output, output_size);
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
-    auto msg = std::make_shared<rpc_msg>();
-    msg->cmd = cmd;
-    msg->input = input;
-    msg->input_size = input_size;
-    msg->output = output;
-    msg->output_size = output_size;
+    auto msg = make_msg(cmd, input, input_size, output, output_size);
     GGML_ASSERT(queue.push(msg));
+}
+
+void rpc_dispatcher::send_traced(rpc_msg & msg) {
+    const int64_t t_send0 = ggml_trace_time_us();
+    bool ok = send_rpc_cmd(sock, msg.cmd, msg.input.get(), msg.input_size);
+    const int64_t t_send1 = ggml_trace_time_us();
+    int64_t t_recv0 = 0;
+    int64_t t_recv1 = 0;
+    if (ok && msg.output) {
+        ok = recv_rpc_rsp(sock, msg.output, msg.output_size, &t_recv0);
+        t_recv1 = ggml_trace_time_us();
+    }
+
+    ggml_trace_set_group(msg.group);
+    ggml_trace_set_subject(msg.subject[0] ? msg.subject : nullptr, msg.uid);
+
+    const size_t bytes_out = msg.input_size + RPC_CMD_HEADER_BYTES;
+    if (msg.output) {
+        ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_recv1 ? t_recv1 : ggml_trace_time_us(),
+                          "\"t_send0\":%lld,\"t_send1\":%lld,\"t_wait\":%lld,\"t_recv0\":%lld,\"t_recv1\":%lld,"
+                          "\"bytes_out\":%zu,\"bytes_in\":%zu,\"reply\":1,\"ok\":%d",
+                          // t_wait..t_recv0 is the wait for the reply's first byte (remote execution included)
+                          (long long) t_send0, (long long) t_send1, (long long) (t_recv0 ? t_recv0 : t_send1),
+                          (long long) t_recv0, (long long) t_recv1,
+                          bytes_out, msg.output_size + RPC_RSP_HEADER_BYTES, ok ? 1 : 0);
+    } else if (msg.n_nodes >= 0) {
+        ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_send1,
+                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,"
+                          "\"reply\":0,\"ok\":%d,\"n_nodes\":%d,\"dev\":%d,\"serialize_us\":%lld",
+                          (long long) t_send0, (long long) t_send1, bytes_out, ok ? 1 : 0,
+                          msg.n_nodes, msg.dev, (long long) msg.serialize_us);
+    } else {
+        ggml_trace_eventf("rpc.client", rpc_cmd_name(msg.cmd), msg.t_enq, t_send1,
+                          "\"t_send0\":%lld,\"t_send1\":%lld,\"bytes_out\":%zu,\"bytes_in\":0,\"reply\":0,\"ok\":%d",
+                          (long long) t_send0, (long long) t_send1, bytes_out, ok ? 1 : 0);
+    }
+
+    RPC_STATUS_ASSERT(ok);
 }
 
 ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
@@ -644,8 +772,14 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    uint8_t server_features = 0;
+    if (!negotiate_hello(sock, &server_features)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+    }
+    ggml_trace_open(nullptr, "rpc-client");
+    // a server without the tracer passes HELLO but drops the connection on TRACE_SYNC
+    if (ggml_trace_flag && (server_features & RPC_HELLO_FEATURE_TRACE)) {
+        rpc_trace_sync(sock, endpoint);
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
@@ -671,7 +805,9 @@ void rpc_dispatcher::work() {
             LOG_DBG2("[%s] %s (in: %zu, out: %zu)\n", __func__, rpc_cmd_name(msg_ptr->cmd), msg_ptr->input_size, msg_ptr->output_size);
             const bool trace = rpc_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
-            if (msg_ptr->output) {
+            if (ggml_trace_flag) {
+                send_traced(*msg_ptr);
+            } else if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
             } else {
@@ -840,6 +976,7 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %zu\n", __func__, tensor->name, offset, size);
@@ -905,6 +1042,7 @@ static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, 
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (ggml_trace_flag) { ggml_trace_set_subject(tensor->name, 0); }
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %zu\n", __func__, tensor->name, offset, size);
     auto request = std::make_shared<rpc_msg_get_tensor_req>();
     request->tensor = serialize_tensor(tensor);
@@ -1224,11 +1362,24 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
     auto & device_graph_uids = graph_uids[device];
     bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
+    const int64_t t_ser0 = ggml_trace_flag ? ggml_trace_time_us() : 0;
+    if (ggml_trace_flag) {
+        ggml_trace_set_subject(cgraph->nodes[cgraph->n_nodes - 1]->name, cgraph->uid);
+    }
+    auto push_graph = [&](rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+        auto msg = make_msg(cmd, input, input_size, nullptr, 0);
+        if (ggml_trace_flag) {
+            msg->n_nodes      = cgraph->n_nodes;
+            msg->dev          = (int) device;
+            msg->serialize_us = msg->t_enq - t_ser0;
+        }
+        GGML_ASSERT(queue.push(msg));
+    };
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
         request->device = device;
         request->uid    = cgraph->uid;
-        send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+        push_graph(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
     } else {
         if (cgraph->uid != 0) {
             if (device_graph_uids.size() >= GRAPH_CACHE_MAX) {
@@ -1242,7 +1393,7 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
         uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
         LOG_DBG2("[%s] serialized graph: %zu bytes\n", __func__, input_size);
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+        push_graph(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
     }
 }
 
@@ -1432,6 +1583,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.features = RPC_HELLO_FEATURE_TRACE;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -2154,7 +2306,18 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
 
+    if (ggml_trace_flag) {
+        tls_srv.n_nodes = (int) n_nodes;
+        tls_srv.device  = (int) device;
+        // device index in the name: merge.py keys per-device rows by name
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH dev%u", device); // same row as GRAPH_RECOMPUTE
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
+    }
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_end(backends[device], tls_srv.gpu_tag);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     sg.graph = graph;
     LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
@@ -2173,7 +2336,17 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
+    if (ggml_trace_flag) {
+        tls_srv.n_nodes = graph->n_nodes;
+        tls_srv.device  = (int) device;
+        char gpu_span[32];
+        snprintf(gpu_span, sizeof(gpu_span), "GRAPH dev%u", device); // same row as GRAPH_COMPUTE
+        tls_srv.gpu_tag = ggml_trace_gpu_begin(backends[device], gpu_span);
+    }
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_end(backends[device], tls_srv.gpu_tag);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
@@ -2437,8 +2610,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     sock->update_caps(req.conn_caps);
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
     while (true) {
+        int64_t t_wait0 = 0;
+        if (ggml_trace_flag) {
+            tls_srv = rpc_server_trace();
+            ggml_trace_gpu_flush();
+            t_wait0 = ggml_trace_time_us();
+        }
         if (!sock->recv_data(&cmd, 1)) {
             break;
+        }
+        if (ggml_trace_flag) {
+            tls_srv.active  = true;
+            tls_srv.cmd     = cmd;
+            tls_srv.t_wait0 = t_wait0;
+            tls_srv.t_recv0 = ggml_trace_time_us();
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -2450,6 +2635,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
                 return;
+            }
+            case RPC_CMD_TRACE_SYNC: {
+                rpc_msg_trace_sync_rsp response = {};
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                response.t2 = ggml_trace_time_us();
+                response.t3 = ggml_trace_time_us();
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
             }
             case RPC_CMD_DEVICE_COUNT: {
                 if (!recv_msg(sock, nullptr, 0)) {
@@ -2721,6 +2918,28 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 return;
             }
         }
+        if (ggml_trace_flag && tls_srv.active) {
+            if (tls_srv.t_exec1 == 0) {
+                tls_srv.t_exec1 = ggml_trace_time_us();
+            }
+            ggml_trace_eventf("rpc.server", rpc_cmd_name((enum rpc_cmd) cmd),
+                              tls_srv.t_recv0, tls_srv.t_send1 ? tls_srv.t_send1 : tls_srv.t_exec1,
+                              "\"t_wait0\":%lld,\"t_recv0\":%lld,\"t_recv1\":%lld,\"t_exec0\":%lld,"
+                              "\"t_exec1\":%lld,\"t_send0\":%lld,\"t_send1\":%lld,"
+                              "\"bytes_in\":%zu,\"bytes_out\":%zu,\"n_nodes\":%d,\"dev\":%d,\"gpu_tag\":%llu",
+                              (long long) tls_srv.t_wait0, (long long) tls_srv.t_recv0,
+                              (long long) tls_srv.t_recv1, (long long) tls_srv.t_exec0,
+                              (long long) tls_srv.t_exec1, (long long) tls_srv.t_send0,
+                              (long long) tls_srv.t_send1,
+                              tls_srv.bytes_in, tls_srv.bytes_out, tls_srv.n_nodes, tls_srv.device,
+                              (unsigned long long) tls_srv.gpu_tag);
+            tls_srv.active = false;
+        }
+    }
+    if (ggml_trace_flag) {
+        ggml_trace_gpu_flush();
+        // peer idles until killed: nothing else would flush this tail
+        ggml_trace_flush();
     }
 }
 
