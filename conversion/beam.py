@@ -55,11 +55,17 @@ class BeamModel(TextModel):
             raise ValueError("Beam: attention_bias=True is not supported")
         self._experts: dict[tuple[int, str], dict[int, Tensor]] = {}
 
+    def get_vocab_base(self):
+        # Beam ships a serialized TokenizersBackend (Transformers 5 class name).
+        from transformers import PreTrainedTokenizerFast
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.dir_model, extra_special_tokens={})
+        return super().get_vocab_base(tokenizer)
+
     def set_vocab(self):
         self._set_vocab_gpt2()
         # otherwise EOT is guessed from a hash-ordered scan
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(self.dir_model)
+        from transformers import PreTrainedTokenizerFast
+        tok = PreTrainedTokenizerFast.from_pretrained(self.dir_model, extra_special_tokens={})
         ret_id = tok.convert_tokens_to_ids("<|return|>")  # ty: ignore[unresolved-attribute]
         if isinstance(ret_id, int) and ret_id >= 0:
             self.gguf_writer.add_eot_token_id(ret_id)
