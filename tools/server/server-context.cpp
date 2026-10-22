@@ -6851,6 +6851,13 @@ private:
             return false;
         }
 
+        // [TAG_PREEMPT] A realtime transcription slot's audio rows are consumed when the batch is built and its stream does not produce them again, so the batch cannot be given up and rebuilt: keep the old path.
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && slot.audio_stream) {
+                return false;
+            }
+        }
+
         // [TAG_PREEMPT_ASYNC] A restoring slot holds its cells but is skipped below, so land it first: it may be the only other resident.
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_RESTORING) {
