@@ -128,8 +128,11 @@ struct rpc_msg_hello_rsp {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
-// inverted so that an older server, which reports 0, keeps the hash-first upload
-#define RPC_SRV_FLAG_NO_CACHE (1 << 0)
+// inverted so that an older server, which reports 0, keeps the hash-first upload.
+// Bits 0 and 1 of this byte are already used by other optional server features
+// (trace clock sync, peer transfers); a server with those sets them, so they must not
+// be read as "no cache".
+#define RPC_SRV_FLAG_NO_CACHE (1 << 2)
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
