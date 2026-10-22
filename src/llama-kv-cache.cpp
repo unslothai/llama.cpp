@@ -101,7 +101,8 @@ static bool llama_dev_supports_paged_attn(
 
     bool res = true;
 
-    const int64_t n_kv = page_size;
+    // the graph's K/V span the whole pool and its page table is sized for it (get_n_kv(), build_input_pages())
+    const int64_t n_kv = n_cells;
 
     for (const int64_t n_tokens : { (int64_t) 1, (int64_t) 4, (int64_t) 16, (int64_t) 512 }) {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd_head_k, n_tokens, n_head,    1);

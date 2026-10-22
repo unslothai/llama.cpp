@@ -325,6 +325,9 @@ endif()
 # [TAG_EXACT_CONCURRENCY] the event query a backend publishes through its registry is found and answers
 llama_build_and_test(test-event-query.cpp LINK ggml)
 
+# [TAG_EXACT_CONCURRENCY] a paged FLASH_ATTN_EXT is claimed only in the shapes the paged kernel launches
+llama_build_and_test(test-paged-fa-supports.cpp LINK ggml)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

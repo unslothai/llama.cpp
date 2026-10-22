@@ -759,19 +759,34 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// [TAG_EXACT_CONCURRENCY] The shapes the paged kernel can run: one-column F16 vector kernel, whole 256-cell pages, a table row of
+// [count, page IDs...] per query and a mask row per query covering every cell. supports_op answers with this and the launch asserts it.
+static bool ggml_cuda_fattn_paged_shape_ok(const ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * pages = ggml_cuda_fattn_pages(dst);
+
+    float softcap;
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+
+    return pages && mask &&
+        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+        Q->ne[3] == 1 && Q->ne[2] % K->ne[2] == 0 &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1] &&
+        pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) &&
+        pages->ne[0] == 1 + K->ne[1]/FATTN_KQ_STRIDE && pages->ne[1] == Q->ne[1] &&
+        softcap == 0.0f;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    if (const ggml_tensor * pages = ggml_cuda_fattn_pages(dst)) {
-        GGML_ASSERT(dst->src[0]->ne[0] == 256 && dst->src[2]->ne[0] == 256);
-        GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
-        GGML_ASSERT(dst->src[3] && dst->src[0]->ne[3] == 1);
-        GGML_ASSERT(pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages));
-        GGML_ASSERT(pages->ne[0] == 1 + dst->src[1]->ne[1]/FATTN_KQ_STRIDE);
-        GGML_ASSERT(pages->ne[1] == dst->src[0]->ne[1]);
-        float softcap;
-        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
-        GGML_ASSERT(softcap == 0.0f);
+    if (ggml_cuda_fattn_pages(dst)) {
+        GGML_ASSERT(ggml_cuda_fattn_paged_shape_ok(dst));
         fattn_kernel_t kernel = flash_attn_ext_vec<256, 1, GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
         launch_fattn<256, 1, 1>(ctx, dst, kernel, 4, 0, 128, false, false, false, /*use_sparse =*/ false);
         return;
@@ -824,18 +839,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     // [TAG_EXACT_CONCURRENCY] the paged path always runs the one-column F16 vector kernel, whatever the batch size or arch
-    if (const ggml_tensor * pages = ggml_cuda_fattn_pages(dst)) {
+    if (ggml_cuda_fattn_pages(dst)) {
 #ifndef FLASH_ATTN_AVAILABLE
         return false;
 #endif // FLASH_ATTN_AVAILABLE
-        float softcap;
-        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
-
-        return dst->src[0]->ne[0] == 256 && dst->src[1]->ne[0] == 256 && dst->src[2]->ne[0] == 256 &&
-            dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16 &&
-            dst->src[3] && dst->src[0]->ne[3] == 1 && dst->src[0]->ne[2] % dst->src[1]->ne[2] == 0 &&
-            pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) && pages->ne[1] == dst->src[0]->ne[1] &&
-            softcap == 0.0f;
+        return ggml_cuda_fattn_paged_shape_ok(dst);
     }
 
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
