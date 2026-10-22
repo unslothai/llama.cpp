@@ -1416,21 +1416,19 @@ static void llama_sampler_dist_backend_apply(
     // an unscaled u above it would select past the last candidate with a non-zero probability
     struct ggml_tensor * total = ggml_view_1d(ctx, cumsum, 1, (n - 1)*ggml_element_size(cumsum));
     struct ggml_tensor * target = ggml_mul(ctx, inp_uniform, total);
+    // a target of at least FLT_MIN never selects a candidate with zero probability (filtered to -inf by an earlier
+    // sampler): with u = 0 the first candidate that reaches it is the first one with a non-zero probability; u < 1
+    // keeps the target at most the total, so the index stays at or before the last candidate with a non-zero one
+    target = ggml_clamp(ctx, target, FLT_MIN, FLT_MAX);
     ggml_set_name(target, "dist_target");
 
-    // number of candidates whose running sum is below the target = index of the first one that reaches it
-    struct ggml_tensor * below = ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, cumsum, target)));
-    struct ggml_tensor * idxf  = ggml_sum(ctx, below);
+    // index of the first candidate whose running sum reaches the target = number of candidates below it
+    // = n - number of candidates above the float just below the target (1 - 2^-24 times it), in the same full
+    // vocabulary passes as one comparison (sub, step, sum); all other ops are on single values
+    struct ggml_tensor * below_target = ggml_scale(ctx, target, 1.0f - 0x1p-24f);
+    struct ggml_tensor * above = ggml_step(ctx, ggml_sub(ctx, cumsum, below_target));
+    struct ggml_tensor * idxf  = ggml_scale_bias(ctx, ggml_sum(ctx, above), -1.0f, (float) n);
     ggml_set_name(idxf, "dist_index_f32");
-
-    // never select a candidate with zero probability (filtered to -inf by an earlier sampler):
-    // lower bound = number of leading zero-probability candidates,
-    // upper bound = index of the last candidate with a non-zero probability (the first where the sum reaches the total)
-    struct ggml_tensor * lo = ggml_scale_bias(ctx, ggml_sum(ctx, ggml_step(ctx, cumsum)), -1.0f, (float) n);
-    struct ggml_tensor * hi = ggml_sum(ctx, ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, cumsum, total))));
-
-    idxf = ggml_add(ctx, lo, ggml_relu(ctx, ggml_sub(ctx, idxf, lo))); // max(idxf, lo)
-    idxf = ggml_sub(ctx, idxf, ggml_relu(ctx, ggml_sub(ctx, idxf, hi))); // min(idxf, hi)
     idxf = ggml_clamp(ctx, idxf, 0.0f, (float) (n - 1));
 
     struct ggml_tensor * idx = ggml_cast(ctx, idxf, GGML_TYPE_I32);
