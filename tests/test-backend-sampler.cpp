@@ -2606,7 +2606,34 @@ static void test_synthetic_parity(const test_params & params) {
         std::function<void(llama_sampler *)> build;
     };
     const float ninf = -INFINITY;
+    // a large random row (the entropy of a 150k vocabulary, accumulated on both sides)
+    std::vector<float> big(150000);
+    {
+        std::mt19937 rng(42);
+        std::uniform_real_distribution<float> ud(-5.0f, 5.0f);
+        for (auto & x : big) {
+            x = ud(rng);
+        }
+    }
     const std::vector<synth_case> cases = {
+        // an infinite dynamic temperature (entropy 0, negative exponent) flattens the kept candidates: their order
+        // is the one before the scaling, as the CPU sorts first
+        { "dynatemp_inf_order", { 0, 1, 100, 2 }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, -1.0f));
+            llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f)); } },
+        // an infinite dynamic temperature keeps a candidate an earlier filter removed masked (no NaN)
+        { "dynatemp_inf_filtered", { 0, -87, -1000 }, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_min_p(1e-38f, 1));
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, -2.0f)); } },
+        // logit bias after a sorting sampler: the array is not sorted anymore for top-p
+        { "dynatemp_bias_top_p", { 2.12f, 3.85f, 0.35f, -2.02f, -4.3f, 0.95f, -1.2f, -1.08f }, [](llama_sampler * c) {
+            const llama_logit_bias lb[] = { { 0, -INFINITY }, { 2, 1.5f } };
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.7f, 0.5f, 1.0f));
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(8, 2, lb));
+            llama_sampler_chain_add(c, llama_sampler_init_top_p(0.7f, 2)); } },
+        // dynamic temperature over a large vocabulary
+        { "dynatemp_150k", big, [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, 1.5f)); } },
         // min-p fallback with a tie at the cut: the CPU keeps exactly min_keep candidates
         { "min_p_keep_tie", { 2, 1, 1, 0 }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_min_p(1.0f, 2)); } },
         // dynamic temperature whose whole range is <= 0 is greedy on the CPU (the first maximum)
@@ -2967,7 +2994,7 @@ static void test_nested_chain_cpu_fallback(const test_params & params) {
 
 static void test_cpu_parity(const test_params & params) {
     const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
-    const int n_seeds = getenv("PARITY_SEEDS") ? atoi(getenv("PARITY_SEEDS")) : 24;
+    const int n_seeds = std::max(1, getenv("PARITY_SEEDS") ? atoi(getenv("PARITY_SEEDS")) : 24);
 
     int n_draws = 0;
     int n_fail  = 0;
@@ -2989,7 +3016,7 @@ static void test_cpu_parity(const test_params & params) {
 
 static void test_cpu_parity_multi_output(const test_params & params) {
     const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
-    const int n_seeds = getenv("PARITY_SEEDS") ? atoi(getenv("PARITY_SEEDS")) / 2 : 12;
+    const int n_seeds = std::max(1, getenv("PARITY_SEEDS") ? atoi(getenv("PARITY_SEEDS")) / 2 : 12);
 
     int n_draws = 0;
     int n_fail  = 0;
