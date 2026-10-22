@@ -975,21 +975,27 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     if (sampled_probs || sampled_logits) {
         const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
         cur.resize(count);
-        size_t n = 0;
-        for (uint32_t i = 0; i < count; ++i) {
-            const llama_token_data td = {
+        const auto td_at = [&](uint32_t i) {
+            return llama_token_data{
                 /* .id    = */ sampled_ids    ? sampled_ids[i]    : (llama_token) i,
                 /* .logit = */ sampled_logits ? sampled_logits[i] : logf(sampled_probs[i]),
                 /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
             };
-            cur[i] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
+        };
+        size_t n = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const llama_token_data td = td_at(i);
             if (td.logit != -INFINITY) {
-                cur[n++] = td;
+                cur[n++] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
             }
         }
-        if (n > 0) {
-            cur.resize(n);
+        if (n == 0) {
+            for (uint32_t i = 0; i < count; ++i) {
+                cur[i] = td_at(i);
+            }
+            n = count;
         }
+        cur.resize(n);
     } else {
         const auto * logits = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);

@@ -147,21 +147,42 @@ struct common_sampler {
         if (sampled_probs || sampled_logits) {
             const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
             cur.resize(count);
-            size_t n = 0;
-            for (uint32_t i = 0; i < count; ++i) {
-                const llama_token_data td = {
+            const auto td_at = [&](uint32_t i) {
+                return llama_token_data{
                     /* .id    = */ sampled_ids    ? sampled_ids[i]    : (llama_token) i,
                     /* .logit = */ sampled_logits ? sampled_logits[i] : logf(sampled_probs[i]),
                     /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
                 };
-                cur[i] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
-                if (td.logit != -INFINITY) {
-                    cur[n++] = td;
+            };
+            size_t n = 0;
+            if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+                // the backend sampled the token: no CPU sampler reads the candidates, copy them as they are (a
+                // full-vocabulary row is ~250k candidates per step and per sequence, the compaction doubles its cost)
+                if (sampled_ids && sampled_logits && sampled_probs) {
+                    for (uint32_t i = 0; i < count; ++i) {
+                        cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+                    }
+                } else {
+                    for (uint32_t i = 0; i < count; ++i) {
+                        cur[i] = td_at(i);
+                    }
+                }
+                n = count;
+            } else {
+                for (uint32_t i = 0; i < count; ++i) {
+                    const llama_token_data td = td_at(i);
+                    if (td.logit != -INFINITY) {
+                        cur[n++] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
+                    }
+                }
+                if (n == 0) {
+                    for (uint32_t i = 0; i < count; ++i) {
+                        cur[i] = td_at(i);
+                    }
+                    n = count;
                 }
             }
-            if (n > 0) {
-                cur.resize(n);
-            }
+            cur.resize(n);
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
