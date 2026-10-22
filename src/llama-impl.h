@@ -117,6 +117,9 @@ bool llama_exact_concurrency();
 // [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's batch-invariant kernels
 bool llama_exact_backend_name(const char * reg_name);
 
+// [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's kernels: the name, and the extension that ships with them (an older module of the same name has neither)
+bool llama_exact_backend_reg(ggml_backend_reg_t reg);
+
 // [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by such a backend
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft);
 

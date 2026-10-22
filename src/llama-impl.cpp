@@ -220,6 +220,11 @@ bool llama_exact_backend_name(const char * reg_name) {
     return reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0);
 }
 
+bool llama_exact_backend_reg(ggml_backend_reg_t reg) {
+    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg)) &&
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_exact_decode_width") != nullptr;
+}
+
 // [TAG_EXACT_CONCURRENCY] Host buffers matter: an op runs where its weight lives, and a host weight's op moves to the GPU only for wide batches (ggml_backend_cuda_device_offload_op).
 // The CPU matmul picks between its SGEMM and its vector dot by the batch width too.
 bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
@@ -230,7 +235,7 @@ bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
 
-    return reg && llama_exact_backend_name(ggml_backend_reg_name(reg));
+    return llama_exact_backend_reg(reg);
 }
 
 bool llama_exact_concurrency() {

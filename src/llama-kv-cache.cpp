@@ -69,12 +69,7 @@ static bool llama_dev_has_paged_attn(ggml_backend_dev_t dev) {
         return false;
     }
 
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (!reg) {
-        return false;
-    }
-
-    return llama_exact_backend_name(ggml_backend_reg_name(reg));
+    return llama_exact_backend_reg(ggml_backend_dev_backend_reg(dev));
 }
 
 // [TAG_EXACT_CONCURRENCY] Whether the device can run paged attention for this layer shape; the registry name only says which backends carry the kernels.
