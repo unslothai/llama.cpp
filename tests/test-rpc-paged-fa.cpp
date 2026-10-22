@@ -73,6 +73,10 @@ static bool port_open(int port) {
 
 static int run_client(const std::string & endpoint, bool paged) {
     const pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork the RPC client");
+        return -1;
+    }
     if (pid == 0) {
         send_graph(endpoint, paged);
     }
@@ -86,6 +90,10 @@ int main() {
     const std::string endpoint = "127.0.0.1:" + std::to_string(port);
 
     const pid_t server = fork();
+    if (server < 0) {
+        perror("fork the RPC server");
+        return 1;  // nothing to kill: kill(-1) would signal every process this user owns
+    }
     if (server == 0) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         ggml_backend_rpc_start_server(endpoint.c_str(), nullptr, 1, 1, &dev);

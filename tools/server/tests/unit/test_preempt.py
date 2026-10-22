@@ -131,6 +131,14 @@ def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_
     return [first.result(), second]
 
 
+def _complete_together(n_predict: int, n_prompt, timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    """Both prompts in one request, so they are queued at once and overlap whatever the client's or the host's speed."""
+    return server.make_request("POST", "/completion", data={
+        "n_predict": n_predict, "prompt": [_prompt_of(n_prompt[0], _PROMPT_A), _prompt_of(n_prompt[1], _PROMPT_B)],
+        "ignore_eos": True, "temperature": 0.0, "seed": 42, "cache_prompt": False,
+    }, timeout=timeout)
+
+
 def _wait_preempted(timeout: float = 30.0) -> bool:
     """True once some slot is parked: its cells are in host RAM and it wants them back."""
     deadline = time.time() + timeout
@@ -257,7 +265,7 @@ def test_a_request_that_cannot_be_helped_gets_the_context_error_and_the_server_l
     _start(n_ctx=256)
 
     if knob == "ram-0":
-        assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
+        assert _complete_together(110, (120, 60)).status_code != 200
     else:
         res = server.make_request("POST", "/completion", data={
             "n_predict": 160, "n_cmpl": 2, "prompt": _PROMPT_A,
@@ -284,7 +292,7 @@ def test_a_server_that_never_asked_for_parking_behaves_as_upstream():
     assert "preemption:" not in text, "a server that did not ask for parking announced it"
     assert _ASYNC_BANNER not in text, "the async park path was set up without being asked for"
 
-    assert any(res.status_code != 200 for res in _complete_overlapping((110, 100), (120, 60)))
+    assert _complete_together(110, (120, 60)).status_code != 200
 
     text = _log()
     assert "Context size has been exceeded" in text
