@@ -3326,6 +3326,16 @@ private:
 
                     guard.wait_for(slot->id_group);
 
+                    // wait_for() let the group finish its decode, which may have released this slot; only its
+                    // group is still locked, so re-check this slot rather than search them all again
+                    if (!slot->is_processing() || !slot->task ||
+                        slot->task->params.oaicompat_cmpl_id != task.params.control_cmpl_id) {
+                        res->success = false;
+                        res->message = "no active completion for this id";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
                     if (task.params.control_action == "reasoning_end") {
                         // the budget sampler only exists when reasoning control was armed
                         if (!slot->task->params.sampling.reasoning_control) {
