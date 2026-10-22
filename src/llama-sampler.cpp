@@ -734,6 +734,19 @@ static void llama_sampler_chain_free(struct llama_sampler * smpl) {
 }
 
 static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, bool draft_rows);
+static bool llama_sampler_masks_without_removing(const struct llama_sampler * smpl);
+
+// every sampler of the chain (and of its nested chains) runs on the CPU
+static void llama_sampler_chain_force_cpu(struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface->apply != llama_sampler_chain_apply) {
+        return;
+    }
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+    for (auto & entry : chain->samplers) {
+        entry.is_backend = false;
+        llama_sampler_chain_force_cpu(entry.ptr);
+    }
+}
 
 static bool llama_sampler_chain_backend_init(
         struct llama_sampler       * smpl,
@@ -771,10 +784,30 @@ static bool llama_sampler_chain_backend_init(
             cur_prefix = false;
         }
 
+        // a nested chain that is not a backend unit runs on the CPU as a whole: its own prefix must not be
+        // skipped there (its samplers would run nowhere)
+        if (!cur_prefix) {
+            llama_sampler_chain_force_cpu(smpl.ptr);
+        }
+
         smpl.is_backend = cur_prefix;
         backend_prefix = cur_prefix;
 
         res = res && cur_prefix;
+    }
+
+    // the CPU samplers after a backend prefix get the candidates the prefix kept: the ones a backend filter
+    // masked with -INF are dropped, as the CPU filters remove them. A sampler that sets logits to -INF and keeps
+    // the candidates on the CPU (logit bias of -INF, temperature <= 0) cannot be told apart from a filter, so a
+    // chain with such a sampler in its prefix and a CPU suffix runs on the CPU, where the candidates are exact
+    if (!res) {
+        bool masks = false;
+        for (const auto & entry : chain->samplers) {
+            masks = masks || (entry.is_backend && llama_sampler_masks_without_removing(entry.ptr));
+        }
+        if (masks) {
+            llama_sampler_chain_force_cpu(smpl);
+        }
     }
 
     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
@@ -1915,7 +1948,10 @@ static void llama_sampler_min_p_backend_apply(
     struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, n);
     ggml_set_name(logits_rows, "logits_rows");
 
+    // clamped into the row before the gather, as in llama_sampler_backend_argmax_first (CUDA returns -1 for a
+    // row of -INF)
     struct ggml_tensor * max_idx = ggml_argmax(ctx, logits);
+    max_idx = ggml_cast(ctx, ggml_clamp(ctx, ggml_cast(ctx, max_idx, GGML_TYPE_F32), 0.0f, (float) (n - 1)), GGML_TYPE_I32);
     ggml_set_name(max_idx, "max_idx");
 
     struct ggml_tensor * max_logit = ggml_get_rows(ctx, logits_rows, max_idx);
@@ -4226,9 +4262,10 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     // search for the remaining candidates that were not found in the previous step
     for (size_t i = 0; i < cur_p->size; ++i) {
         for (const auto & lb : ctx->to_search) {
-            // no break: a token listed several times gets the sum of its biases, as in the direct path above
+            // the merged biases list each token once
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
+                break;
             }
         }
     }
@@ -4731,6 +4768,38 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
         ctx->rows_tokens.clear();
         ctx->row_offset = 0;
     }
+}
+
+static bool llama_sampler_masks_without_removing(const struct llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & entry : chain->samplers) {
+            if (entry.is_backend && llama_sampler_masks_without_removing(entry.ptr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_logit_bias_i) {
+        for (const auto & lb : ((const llama_sampler_logit_bias *) smpl->ctx)->merged()) {
+            if (lb.bias == -INFINITY) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_temp_i) {
+        return ((const llama_sampler_temp *) smpl->ctx)->temp <= 0.0f;
+    }
+    if (smpl->iface == &llama_sampler_temp_ext_i) {
+        // greedy (temperature <= 0) as plain temperature, or when the dynamic temperature can reach 0
+        const auto * ctx = (const llama_sampler_temp_ext *) smpl->ctx;
+        return ctx->delta <= 0.0f ? ctx->temp <= 0.0f : ctx->temp - ctx->delta <= 0.0f;
+    }
+    return false;
 }
 
 static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, bool draft_rows) {
