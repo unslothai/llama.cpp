@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <vector>
 
+// DeepSeek-V4.1 cross-layer KV sharing: the layer whose compressed-KV storage `il` reads: its kv source or, when the
+// source is on another device (layer split), a per-device mirror fed with the source's new rows so the whole cache
+// never crosses devices. -1 = no compressed KV. no mirrors when offload == false
+int32_t llama_dsv41_kv_read_layer(const llama_model & model, int32_t il, bool offload);
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -163,6 +168,9 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // [n_layer] storage layer -> layer whose rows it holds (itself, or the source of a mirror)
+    std::vector<int32_t> comp_kv_src;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
