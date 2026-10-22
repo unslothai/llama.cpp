@@ -1968,6 +1968,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // [TAG_EXACT_CONCURRENCY] a page is keyed by position/page size, so a negative position has no page: refuse it as invalid input
+    if (llama_exact_concurrency()) {
+        const llama_batch & batch = balloc->get_batch();
+
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.pos[i] < 0) {
+                LLAMA_LOG_ERROR("%s: exact concurrency needs non-negative positions (token %d is at %d)\n", __func__, i, batch.pos[i]);
+                return -1;
+            }
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 

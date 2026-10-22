@@ -79,6 +79,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    {
+        // a negative position is an invalid batch: decode refuses it, it never reaches the page allocator
+        common_batch batch(ctx);
+        batch.add(1, -1, 1, true);
+
+        const int32_t ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+        if (ret >= 0 || llama_memory_seq_pos_max(mem, 1) != -1) {
+            fprintf(stderr, "%s : a token at position -1 was not refused as an invalid batch (decode returned %d)\n", __func__, ret);
+            return 1;
+        }
+    }
+
     if (!decode_range(ctx, 0, 0, 599)) {
         fprintf(stderr, "%s : failed to fill sequence 0\n", __func__);
         return 1;
