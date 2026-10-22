@@ -4460,6 +4460,11 @@ private:
             return -1;
         }
 
+        // LLAMA_SERVER_PREEMPT_GRANULARITY (test knob) plans in blocks the memory does not have, so its cells cannot be read in them
+        if ((uint32_t) preempt_alloc_granularity != llama_memory_alloc_granularity(mem)) {
+            return -1;
+        }
+
         std::vector<llama_seq_id> idle;
         if (n_idle) {
             for (const auto & slot : slots) {
