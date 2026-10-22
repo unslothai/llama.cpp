@@ -196,7 +196,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
-        // image-token router bias, unused by the text-only graph
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
 
@@ -893,13 +892,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         }
         cb(logits, "ffn_moe_logits", il);
 
+        // image (embedding) tokens use the vision router bias, as DeepSeek-V4
+        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+            exp_probs_b = layer.ffn_exp_probs_b_vl;
+        }
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
+                exp_probs_b,
                 n_expert, hparams.n_expert_used(),
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,

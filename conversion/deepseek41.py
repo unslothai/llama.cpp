@@ -5,7 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Callable, Iterable, TYPE_CHECKING, cast
+from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from .base import LazyTorchTensor, ModelBase, TextModel, gguf
-from .deepseek import DeepseekV4Model
+from .deepseek import DeepseekV4FlashVisionModel, DeepseekV4Model
 
 
 # Engram hash constants from inference/engram.py, stored in the GGUF: the token map needs the HF tokenizers
@@ -120,7 +120,8 @@ class DeepseekV41Model(DeepseekV4Model):
     """DeepSeek-V4.1 text model, lossless: FP8 (e4m3, 32x32 ue8m0 blocks) linears dequantized to BF16 (F32 with
     --outtype f32), routed experts copied bit-exact as MXFP4, Engram tables (e4m3 rows, one e8m0 scale per 32) copied
     bit-exact as MXFP8 (DSV41_ENGRAM_TYPE=bf16: the exact BF16 lookup, F32 with --outtype f32), router and Engram gate
-    F32. DSpark (mtp.*) and the vision tower are not converted.
+    F32. DSpark (mtp.*) is not converted here (--dspark, DeepseekV41DSparkModel); the vision tower goes to an mmproj
+    (--mmproj, DeepseekV41VisionModel).
     The Engram tables of all layers are written as one per_layer_token_embd (rows concatenated in layer order) with
     the PLE keys of qwen4exp: absolute head offsets and bucket counts, so the runtime can read it lazily."""
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
@@ -443,3 +444,45 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         if new_name == "conf_proj.weight":
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+class DeepseekV41VisionModel(DeepseekV4FlashVisionModel):
+    """DeepSeek-V4.1 vision tower (projector deepseek41v): the V4-Flash-Vision ViT + 3x3 aligner, with the V4.1 token
+    block ([START] ([IMAGE]*w [NEWLINE])*h [END], no pads) and resize plan. ref: inference/vision.py,
+    inference/image_processor.py of deepseek-ai/DeepSeek-V4.1-Flash-1017. The checkpoint config is HF-style
+    (vision_config); image_start / image_end / image_newline are written like V4's sentinels, there is no image_pad."""
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        vc = self.global_config.get("vision_config")
+        if not vc or vc.get("num_hidden_layers", 0) == 0:
+            raise ValueError("DeepseekV41VisionModel requires vision_config.num_hidden_layers > 0")
+        return {
+            "num_hidden_layers":   vc["num_hidden_layers"],
+            "hidden_size":         vc["hidden_size"],
+            "num_attention_heads": vc["num_attention_heads"],
+            "intermediate_size":   vc["intermediate_size"],
+            "patch_size":          vc["patch_size"],
+            # dynamic resolution; only used for compat / warmup
+            "image_size":          vc["patch_size"] * vc["downsample_ratio"] * 16,
+            "rope_theta":          vc.get("rope_theta", 10000.0),
+            "downsample_ratio":    vc["downsample_ratio"],
+            "min_pixels":          vc["min_pixels"],
+            "max_image_tokens":    vc["max_image_tokens"],
+            "max_wh_ratio":        vc.get("max_wh_ratio"),
+        }
+
+    def set_gguf_parameters(self):
+        assert self.hparams_vision is not None
+        super(DeepseekV4FlashVisionModel, self).set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK41V)
+        # pytorch default eps (vision.py), not the LLM rms_norm_eps (1e-20)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
+        self.gguf_writer.add_vision_use_silu(True)
+        self.gguf_writer.add_vision_projector_scale_factor(self.hparams_vision["downsample_ratio"])
+        self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
+        # hardcoded in clip.cpp (PROJECTOR_TYPE_DEEPSEEK41V); add GGUF keys if a later model differs
+        assert self.hparams_vision["max_image_tokens"] == 1024, self.hparams_vision["max_image_tokens"]
+        assert self.hparams_vision["max_wh_ratio"] is None, self.hparams_vision["max_wh_ratio"]
+        assert self.hparams_vision["rope_theta"] == 10000, self.hparams_vision["rope_theta"]
