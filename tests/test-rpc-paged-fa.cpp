@@ -14,6 +14,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -134,12 +136,24 @@ int main() {
     }
     const std::string endpoint = "127.0.0.1:" + std::to_string(port);
 
+    // the server's stderr, so the test can see the server itself refuse the graph: a client that fails locally looks the same from the client side
+    const char * tmp = getenv("TMPDIR");
+    std::string log_path = std::string(tmp && *tmp ? tmp : "/tmp") + "/test-rpc-paged-fa.XXXXXX";
+    const int log_fd = mkstemp(&log_path[0]);
+    if (log_fd < 0) {
+        perror("create a file for the RPC server's log");
+        return 1;
+    }
+
     const pid_t server = fork();
     if (server < 0) {
         perror("fork the RPC server");
+        close(log_fd);
+        unlink(log_path.c_str());
         return 1;  // nothing to kill: kill(-1) would signal every process this user owns
     }
     if (server == 0) {
+        dup2(log_fd, STDERR_FILENO);
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         ggml_backend_rpc_start_server(endpoint.c_str(), nullptr, 1, 1, &dev);
         _exit(1);
@@ -179,12 +193,24 @@ int main() {
             fprintf(stderr, "the paged client ended with %d, not a refusal from the server, so this test proves nothing\n", paged);
             rc = 1;
         } else {
-            printf("ok, the RPC server refused the paged graph and kept serving\n");
+            std::ifstream     log_in(log_path);
+            std::stringstream log_text;
+            log_text << log_in.rdbuf();
+
+            if (log_text.str().find("is a paged FLASH_ATTN_EXT, which RPC does not support") == std::string::npos) {
+                fprintf(stderr, "the paged client was refused, but the RPC server did not log refusing the graph: the failure was the client's own\n");
+                rc = 1;
+            } else {
+                printf("ok, the RPC server refused the paged graph and kept serving\n");
+            }
         }
     }
 
     kill(server, SIGKILL);
     waitpid(server, nullptr, 0);
+
+    close(log_fd);
+    unlink(log_path.c_str());
 
     return rc;
 }

@@ -149,15 +149,13 @@ def _await(cond, what: str, alive=None, stall: float = 120.0, poll: float = 0.02
         time.sleep(poll)
 
 
-def _wait_processing(slot_ids, timeout: float = 30.0):
-    """Return once every one of these slots is processing; a request that ended first is a failure, not a hang."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_processing(slot_ids, stall: float = 120.0):
+    """Return once every one of these slots is processing, waiting as long as the server keeps making progress (see _await)."""
+    def processing():
         slots = server.make_request("GET", "/slots").body
-        if all(any(s["id"] == i and s["is_processing"] for s in slots) for i in slot_ids):
-            return
-        time.sleep(0.005)
-    pytest.fail(f"slots {slot_ids} never showed as processing")  # ty: ignore[invalid-argument-type]
+        return all(any(s["id"] == i and s["is_processing"] for s in slots) for i in slot_ids)
+
+    _await(processing, f"slots {slot_ids} processing", stall=stall, poll=0.005)
 
 
 def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_TIMEOUT):
@@ -529,20 +527,24 @@ def test_cancel_while_a_copy_is_in_flight_frees_the_slot():
 def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_keeps():
     _start(n_ctx=1024, n_slots=3)
 
+    # tokenized before anything runs, so no request waits on /tokenize inside the overlap window
     ids = _prompt_of(500, _PROMPT_C)
+    long_prompts = [_prompt_of(200, _PROMPT_A), _prompt_of(200, _PROMPT_B)]
 
     with ThreadPoolExecutor(4) as pool:
         first = pool.submit(_complete, 460, ids, 0)
         _wait_processing([0])
         follower = pool.submit(_complete, 8, ids[:8], 0)
-        long_ones = [pool.submit(_complete, 400, _prompt_of(200, _PROMPT_A), 1),
-                     pool.submit(_complete, 400, _prompt_of(200, _PROMPT_B), 2)]
-        parked = _wait_preempted()
+        long_ones = [pool.submit(_complete, 400, long_prompts[0], 1),
+                     pool.submit(_complete, 400, long_prompts[1], 2)]
     results = [first.result(), follower.result(), long_ones[0].result(), long_ones[1].result()]
 
     text = _log()
-    assert parked, "the pool never came under pressure, so no slot was waiting for the cells slot 0 keeps"
-    assert "trimmed to the" in text, "the started slot kept the cells of the request before it"
+    # a park is counted in its request's response, which a poll of /slots can miss between two reads
+    assert any(r.body.get("preempt", {}).get("parks", 0) > 0 for r in results if r.status_code == 200), \
+        "the pool never came under pressure, so no slot was waiting for the cells slot 0 keeps"
+    # no "trimmed to the" requirement: when the batch builder reaches the started slot before the planner needs its cells, the
+    # stale cells are gone without a trim, which is correct; a slot counted by the prompt it kept fails the completions below
     assert "resume failed" not in text
     assert "Context size has been exceeded" not in text
     for res, n_predict in zip(results, (460, 8, 400, 400)):
@@ -1194,18 +1196,22 @@ def test_two_image_chats_that_outgrow_the_parking_budget_both_finish():
 
 def test_a_park_during_the_prefill_does_not_count_the_restarted_prompt_twice():
     os.environ["LLAMA_SERVER_PREEMPT_FAIL_SAVE"] = "1"
-    _start(n_ctx=2048, n_batch=256)
+    # 64-token chunks: the follower's first chunk fits beside the resident long before its 1500 tokens do, so it is parked mid-prefill
+    # over a window of ~1000 resident steps rather than the few that separate one 256-token chunk fitting from two
+    _start(n_ctx=2048, n_batch=64)
+
+    n_prompt = 1500
+    n_predict = 8
+    follower_prompt = _prompt_of(n_prompt, _PROMPT_B)  # tokenized before the resident starts, not inside the window
 
     resident = []
     t = threading.Thread(target=lambda: resident.append(_complete(1900, _PROMPT_A)), daemon=True)
     t.start()
 
-    _await(lambda: any(s.get("n_prompt_tokens", 0) >= 1600 for s in server.make_request("GET", "/slots").body),
+    _await(lambda: any(s.get("n_prompt_tokens", 0) >= 1000 for s in server.make_request("GET", "/slots").body),
            "the resident growing into the pool", alive=t.is_alive, poll=0.005)
 
-    n_prompt = 500
-    n_predict = 8
-    comments, final = _stream_completion(n_predict, _prompt_of(n_prompt, _PROMPT_B))
+    comments, final = _stream_completion(n_predict, follower_prompt)
     t.join(120)
 
     assert resident and resident[0].status_code == 200, resident
@@ -1744,14 +1750,16 @@ def test_a_started_slot_trimmed_below_its_sliding_window_prefills_again():
     server.model_hf_file = None
     server.model_alias = "tinygemma3"
     server.override_kvs = ["gemma3.attention.sliding_window=int:32"]
-    _start(n_ctx=512, n_slots=2, n_batch=64, n_ubatch=64, cache_ram=0, n_threads=4)
-    stale = [100 + k % 50 for k in range(200)]
+    # the busy slot reaches the follower's admission ~500 steps before the pool would purge the stale cache, not ~40
+    _start(n_ctx=1024, n_slots=2, n_batch=512, n_ubatch=64, cache_ram=0, n_threads=4)
+    stale = [100 + k % 50 for k in range(400)]
+    follower = stale[:40] + [400 + k % 50 for k in range(500)]
     assert _cached(1, stale, 1).status_code == 200
     with ThreadPoolExecutor(1) as pool:
-        busy = pool.submit(_cached, 400, [300 + k % 50 for k in range(40)], 0)
-        _await(lambda: _n_decoded(_slot_view(0)) >= 230, "the busy slot filling the pool", alive=lambda: not busy.done())
-        # 40 tokens in common, far below the 32 newest cells the window kept of the stale 200
-        res = _cached(16, stale[:40] + [400 + k % 50 for k in range(60)], 1)
+        busy = pool.submit(_cached, 800, [300 + k % 50 for k in range(40)], 0)
+        _await(lambda: _n_decoded(_slot_view(0)) >= 100, "the busy slot filling the pool", alive=lambda: not busy.done())
+        # 40 tokens in common, far below the 32 newest cells the window kept of the stale 400
+        res = _cached(16, follower, 1)
         busy = busy.result()
     for r in (res, busy):
         assert r.status_code == 200, r.body

@@ -102,6 +102,8 @@ class ServerProcess:
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_draft_n_ubatch: int | None = None
+    spec_ngram_mod_n_min: int | None = None
+    spec_ngram_mod_n_max: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
@@ -258,6 +260,10 @@ class ServerProcess:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
+        if self.spec_ngram_mod_n_min is not None:
+            server_args.extend(["--spec-ngram-mod-n-min", self.spec_ngram_mod_n_min])
+        if self.spec_ngram_mod_n_max is not None:
+            server_args.extend(["--spec-ngram-mod-n-max", self.spec_ngram_mod_n_max])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
         if self.spec_draft_n_ubatch:
