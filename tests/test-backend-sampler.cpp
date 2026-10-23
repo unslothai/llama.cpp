@@ -2774,6 +2774,7 @@ static void test_all_masked_row(const test_params & params) {
     sp.xtc_probability = 1.0f;
     sp.xtc_threshold   = 0.0f;
     sp.seed = 7;
+    sp.temp = 0.0f; // greedy: an all -INF row has no valid distribution for dist (it asserts in Debug builds)
     sp.backend_sampling = true;
     common_sampler * gpu = common_sampler_init(params.model.get(), sp);
 
@@ -2781,7 +2782,7 @@ static void test_all_masked_row(const test_params & params) {
     llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, (int32_t) all_inf.size(), all_inf.data()));
     llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.0f, 0, 7));
-    llama_sampler_chain_add(chain, llama_sampler_init_dist(7));
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     llama_sampler_ptr chain_owner(chain);
 
     std::vector<llama_sampler_seq_config> configs = { { 0, common_sampler_get(gpu) }, { 1, chain } };
@@ -2812,7 +2813,7 @@ static void test_all_masked_row(const test_params & params) {
     // CPU reference of the same chain on the same (all -INF) candidates: the token the CPU samplers pick
     llama_sampler * ref = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(ref, llama_sampler_init_xtc(1.0f, 0.0f, 0, 7));
-    llama_sampler_chain_add(ref, llama_sampler_init_dist(7));
+    llama_sampler_chain_add(ref, llama_sampler_init_greedy());
     std::vector<llama_token_data> cur;
     for (llama_token t = 0; t < n_vocab; ++t) {
         cur.push_back({ t, -INFINITY, 0.0f });
@@ -3026,6 +3027,130 @@ static void test_custom_masking_cpu_suffix(const test_params & params) {
     }
     GGML_ASSERT(n_diff == 0);
     printf("backend custom masking sampler CPU suffix test PASSED\n");
+}
+
+// built-in backend samplers whose arithmetic can turn a finite logit into -INF and keep the candidate on the CPU
+// (logit bias at or below -2^103, temperature below 1, penalties that can grow a negative logit past FLT_MAX),
+// followed by a CPU sampler that depends on the number of candidates (XTC): the chain must run on the CPU.
+// A finite bias first sets tokens 10..12 to 0 and every other token to -100 (XTC removes 10 and 11 on the CPU
+// as long as n_vocab - 3 candidates remain)
+static void test_masking_classes_cpu_suffix(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The capital of France is");
+
+    std::vector<float> logits0;
+    {
+        std::vector<llama_sampler_seq_config> no_configs;
+        test_context tctx(params, no_configs, 1);
+        common_batch batch(tctx.ctx.get());
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            batch.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+        }
+        GGML_ASSERT(llama_process(tctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+        const float * lg = llama_get_logits_ith(tctx.ctx.get(), (int32_t) prompt.size() - 1);
+        logits0.assign(lg, lg + n_vocab);
+    }
+    std::vector<llama_logit_bias> shape;
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        shape.push_back({ t, (t >= 10 && t <= 12 ? 0.0f : -100.0f) - logits0[t] });
+    }
+    std::vector<llama_logit_bias> huge;
+    for (llama_token t = 20; t < 25; ++t) {
+        huge.push_back({ t, -FLT_MAX });
+    }
+
+    struct masking_class {
+        const char * name;
+        std::function<void(llama_sampler *)> add;
+        std::vector<llama_token> accepted;
+    };
+    const std::vector<masking_class> classes = {
+        // two finite biases of -FLT_MAX overflow tokens 20..24 to -INF
+        { "bias_overflow", [&](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(n_vocab, (int32_t) huge.size(), huge.data()));
+            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(n_vocab, (int32_t) huge.size(), huge.data())); }, {} },
+        // -100 / 1e-37 overflows every token but 10..12 to -INF
+        { "temp_overflow", [&](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_temp(1e-37f)); }, {} },
+        // a frequency penalty of FLT_MAX on tokens 20..24 (accepted twice) overflows them to -INF
+        { "penalties_overflow", [&](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_penalties(n_vocab, 16, 1.0f, FLT_MAX, 0.0f)); },
+            { 20, 21, 22, 23, 24, 20, 21, 22, 23, 24 } },
+    };
+
+    int n_failed_classes = 0;
+    for (const auto & mc : classes) {
+        auto make_chain = [&](uint32_t seed) {
+            llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, (int32_t) shape.size(), shape.data()));
+            mc.add(chain);
+            llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.2f, (size_t) n_vocab - 3, seed));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+            for (llama_token t : mc.accepted) {
+                llama_sampler_accept(chain, t);
+            }
+            return chain;
+        };
+
+        int n_diff = 0;
+        for (uint32_t seed = 1; seed <= 6; ++seed) {
+            llama_sampler * cpu = make_chain(seed);
+            llama_sampler * gpu = make_chain(seed);
+            {
+            std::vector<llama_sampler_seq_config> no_configs;
+            std::vector<llama_sampler_seq_config> configs = { { 0, gpu } };
+            test_context ctx_cpu(params, no_configs, 1);
+            test_context ctx_gpu(params, configs,    1);
+            common_batch batch_cpu(ctx_cpu.ctx.get());
+            common_batch batch_gpu(ctx_gpu.ctx.get());
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                batch_cpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+                batch_gpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+            }
+            GGML_ASSERT(llama_process(ctx_cpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_cpu.get()) == 0);
+            GGML_ASSERT(llama_process(ctx_gpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_gpu.get()) == 0);
+
+            const int32_t idx = (int32_t) prompt.size() - 1;
+            const llama_token tc = llama_sampler_sample(cpu, ctx_cpu.ctx.get(), idx);
+            const llama_token tg = llama_sampler_sample(gpu, ctx_gpu.ctx.get(), idx);
+            printf("masking class %-18s seed %u: cpu %d gpu %d\n", mc.name, seed, tc, tg);
+            n_diff += tc != tg;
+            }
+            llama_sampler_free(cpu);
+            llama_sampler_free(gpu);
+        }
+        printf("masking class %-18s: %d of 6 seeds differ\n", mc.name, n_diff);
+        n_failed_classes += n_diff != 0;
+    }
+    GGML_ASSERT(n_failed_classes == 0);
+    printf("backend masking classes CPU suffix test PASSED\n");
+}
+
+// a chain without any backend sampler (here XTC first) is not attached to the context: no sampler would run on
+// the backend, and the CPU samplers get the model logits exactly as without backend sampling
+static void test_cpu_only_chain_not_exported(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The capital of France is");
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.2f, 3, 7));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(7));
+    llama_sampler_ptr chain_owner(chain);
+
+    std::vector<llama_sampler_seq_config> configs = { { 0, chain } };
+    test_context tctx(params, configs, 1);
+    common_batch batch(tctx.ctx.get());
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        batch.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+    }
+    GGML_ASSERT(llama_process(tctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    const int32_t idx = (int32_t) prompt.size() - 1;
+    const bool exported = llama_get_sampled_logits_ith(tctx.ctx.get(), idx) != nullptr ||
+                          llama_get_sampled_probs_ith (tctx.ctx.get(), idx) != nullptr;
+    printf("CPU-only chain: backend outputs exported: %d, model logits: %d\n", exported, llama_get_logits_ith(tctx.ctx.get(), idx) != nullptr);
+    GGML_ASSERT(!exported && llama_get_logits_ith(tctx.ctx.get(), idx) != nullptr);
+    printf("CPU-only chain not exported test PASSED\n");
 }
 
 // a nested chain with backend penalties and a CPU-only sampler after them runs on the CPU as a whole: its
@@ -3257,6 +3382,8 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_prompt_penalties",       test_multi_output_prompt_penalties,    true },
     { "test_masking_bias_cpu_suffix",             test_masking_bias_cpu_suffix,          true },
     { "test_custom_masking_cpu_suffix",           test_custom_masking_cpu_suffix,        true },
+    { "test_masking_classes_cpu_suffix",          test_masking_classes_cpu_suffix,       true },
+    { "test_cpu_only_chain_not_exported",         test_cpu_only_chain_not_exported,      true },
     { "test_nested_chain_cpu_fallback",           test_nested_chain_cpu_fallback,        true },
     { "test_all_masked_row",                      test_all_masked_row,                   true },
     { "test_cpu_parity",                          test_cpu_parity,                       true },
