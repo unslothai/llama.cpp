@@ -1419,6 +1419,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
+        // a chain whose first sampler does not run on the backend runs entirely on the CPU: it is not attached, so
+        // its samplers get the model logits exactly as without backend sampling
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        if (chain->samplers.empty() || !chain->samplers.front().is_backend) {
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
+        }
+
+        // a ubatch has at most n_ubatch rows of a sequence: the chains past that are never built
+        llama_sampler_backend_set_n_chains(sampler, std::min(cparams.n_outputs_max_per_seq, cparams.n_ubatch));
+
         sampling.samplers[seq_id] = sampler;
 
         sched_need_reserve = true;
@@ -2537,9 +2551,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
-    // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
+    // every sampler builds min(n_outputs_max_per_seq, n_ubatch) chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
-        res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+        res += llama_sampler_backend_n_nodes(sampler) * std::min(cparams.n_outputs_max_per_seq, cparams.n_ubatch);
     }
 
     if (cparams.training) {
@@ -2665,6 +2679,16 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
+
+    // the reserve plans the worst case of the sampling outputs: a decode outputs the results of the chains of the
+    // rows it samples, which can be any of them (the reserve ubatch has fewer rows than n_seqs*n_outputs_max_per_seq
+    // when n_ubatch is small), and a plan made with every chain's results as outputs covers all of them, so the
+    // allocator does not plan again when the sampled rows change (ggml_gallocr_needs_realloc)
+    if (gf) {
+        for (ggml_tensor * t : res->t_sampling_chains) {
+            ggml_set_output(t);
+        }
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {

@@ -1605,12 +1605,13 @@ inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
 }
 
 inline static void ggml_vec_cumsum_f32(const int n, float * y, const float * x) {
+    // accumulate in ggml_float (double): a running f32 sum over a large row (a 150k+ vocabulary of probabilities)
+    // drifts by ~n * FLT_EPSILON, the backend dist sampler compares it with u * total and picked a neighbouring
+    // candidate of the CPU sampler's (which sums in double)
+    ggml_float sum = 0.0;
     for (int i = 0; i < n; ++i) {
-        if (i == 0) {
-            y[i] = x[i];
-        } else {
-            y[i] = y[i - 1] + x[i];
-        }
+        sum += (ggml_float) x[i];
+        y[i] = (float) sum;
     }
 }
 

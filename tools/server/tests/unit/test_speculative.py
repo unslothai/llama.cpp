@@ -265,3 +265,42 @@ def test_draft_token_probs():
         assert abs(tok_draft["logprob"] - tok_no_draft["logprob"]) < 0.25
     # real logprobs are not all exactly 0.0 (prob 1.0)
     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
+
+
+def test_backend_sampling_then_grammar_same_slot():
+    # a speculating slot samples on the backend, then the same slot gets a request with a grammar: common_sampler_init
+    # turns backend sampling off for it (grammar), and the server must not attach the backend chain to the slot again
+    global server
+    server.backend_sampling = True
+    server.n_slots = 1
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 32,
+        "backend_sampling": True,
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["draft_n"] > 0
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 6,
+        "backend_sampling": True,
+        "grammar": 'root ::= "a"{5,5}',
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["content"] == "aaaaa"
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 8,
+        "backend_sampling": True,
+    })
+    assert res.status_code == 200, res.body

@@ -493,7 +493,78 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // the flags the plan's tensor lifetimes were computed from, one entry per node and then per leaf in plan order,
+    // see ggml_gallocr_lifetime_bits (a source is a node or a leaf of the same graph, or a tensor allocated outside
+    // it: its flags are the ones of its own entry; which tensor a source slot points to may change, e.g. with
+    // ggml_build_forward_select, without changing the lifetimes)
+    // the node sizes alone do not tell whether a plan still holds: a tensor that became an output must
+    // not share memory with a later tensor, an input must be allocated before the first node runs
+    uint8_t * lifetime_bits;
+    size_t    n_lifetime_bits;
+    size_t    lifetime_bits_cap; // allocated entries of lifetime_bits
+    uint64_t  lifetime_shape; // ggml_gallocr_graph_shape of the graph the plan was made for
 };
+
+enum ggml_gallocr_lifetime_bit {
+    GGML_GALLOCR_LIFETIME_PRESENT        = 1,
+    GGML_GALLOCR_LIFETIME_INPUT          = 2,
+    GGML_GALLOCR_LIFETIME_OUTPUT         = 4,
+    GGML_GALLOCR_LIFETIME_VIEW_OF_OUTPUT = 8,
+};
+
+// the tensor flags ggml_gallocr_alloc_graph_impl reads when it decides a lifetime: inputs are allocated
+// before any node, outputs (or views of outputs) are never freed nor reused by a later tensor
+static uint8_t ggml_gallocr_lifetime_bits(const struct ggml_tensor * t) {
+    if (t == NULL) {
+        return 0;
+    }
+    uint8_t bits = GGML_GALLOCR_LIFETIME_PRESENT;
+    if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+        bits |= GGML_GALLOCR_LIFETIME_INPUT;
+    }
+    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        bits |= GGML_GALLOCR_LIFETIME_OUTPUT;
+    }
+    if (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        bits |= GGML_GALLOCR_LIFETIME_VIEW_OF_OUTPUT;
+    }
+    return bits;
+}
+
+// a signature of the graph's structure that does not depend on the tensor sizes (they change with the number of
+// tokens): the op and type of every node and leaf and the op of every source; two graphs with the same signature
+// are the same graph built again, so a slot of one is the same tensor in the other
+static uint64_t ggml_gallocr_graph_shape(const struct ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a
+#define GGML_GALLOCR_MIX(v) do { h ^= (uint64_t) (v); h *= 1099511628211ULL; } while (0)
+    GGML_GALLOCR_MIX(graph->n_nodes);
+    GGML_GALLOCR_MIX(graph->n_leafs);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        GGML_GALLOCR_MIX(node->op);
+        GGML_GALLOCR_MIX(node->type);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            GGML_GALLOCR_MIX(node->src[j] ? (int) node->src[j]->op + 1 : 0);
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        GGML_GALLOCR_MIX(graph->leafs[i]->type);
+    }
+#undef GGML_GALLOCR_MIX
+    return h;
+}
+
+// a plan made with lifetime bits `planned` is valid for a tensor with bits `cur` when the same slot holds a tensor
+// (or none) and every flag of `cur` was already set at planning time: dropping an input or output flag only means
+// the plan allocates the tensor earlier or keeps it longer than needed
+static bool ggml_gallocr_lifetime_covered(uint8_t planned, uint8_t cur) {
+    return ((planned ^ cur) & GGML_GALLOCR_LIFETIME_PRESENT) == 0 && (cur & ~planned) == 0;
+}
+
+static size_t ggml_gallocr_n_lifetime_bits(const struct ggml_cgraph * graph) {
+    return (size_t) graph->n_nodes + (size_t) graph->n_leafs;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -539,6 +610,8 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
     }
+
+    free(galloc->lifetime_bits);
 
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers != NULL) {
@@ -839,6 +912,30 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 
+    // a new plan for a graph with the same tensor slots as the previous plan keeps the outputs that plan covered
+    // (they are marked as outputs while planning): the plan grows to the union of the outputs seen and then holds,
+    // where a plan of only the current outputs would be made again every time the outputs alternate (the rows of
+    // the sequences of one decode split across ubatches, see ggml_gallocr_needs_realloc)
+    struct ggml_tensor ** union_outputs = NULL;
+    size_t n_union_outputs = 0;
+    const uint64_t graph_shape = ggml_gallocr_graph_shape(graph);
+    if (galloc->lifetime_bits != NULL && galloc->n_lifetime_bits > 0 && galloc->n_nodes == graph->n_nodes &&
+            galloc->n_leafs == graph->n_leafs && galloc->n_lifetime_bits == ggml_gallocr_n_lifetime_bits(graph) &&
+            galloc->lifetime_shape == graph_shape) {
+        union_outputs = malloc(sizeof(struct ggml_tensor *) * galloc->n_lifetime_bits);
+        GGML_ASSERT(union_outputs != NULL);
+        size_t k = 0;
+        for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
+            struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+            const uint8_t planned = galloc->lifetime_bits[k++];
+            if ((planned & GGML_GALLOCR_LIFETIME_OUTPUT) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                t->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                union_outputs[n_union_outputs++] = t;
+            }
+        }
+        GGML_ASSERT(k == galloc->n_lifetime_bits);
+    }
+
     // reset allocators
     for (int i = 0; i < galloc->n_buffers; i++) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
@@ -900,6 +997,33 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
         }
     }
+
+    // remember the flags this plan was made with
+    {
+        const size_t n_bits = ggml_gallocr_n_lifetime_bits(graph);
+        if (galloc->lifetime_bits_cap < n_bits) {
+            free(galloc->lifetime_bits);
+            galloc->lifetime_bits = malloc(n_bits);
+            GGML_ASSERT(galloc->lifetime_bits != NULL);
+            galloc->lifetime_bits_cap = n_bits;
+        }
+        galloc->n_lifetime_bits = n_bits;
+        size_t k = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(graph->nodes[i]);
+        }
+        for (int i = 0; i < graph->n_leafs; i++) {
+            galloc->lifetime_bits[k++] = ggml_gallocr_lifetime_bits(graph->leafs[i]);
+        }
+        GGML_ASSERT(k == n_bits);
+        galloc->lifetime_shape = graph_shape;
+    }
+
+    // the outputs kept from the previous plan are recorded in the plan, the graph gets its own flags back
+    for (size_t i = 0; i < n_union_outputs; i++) {
+        union_outputs[i]->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    }
+    free(union_outputs);
 
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -1019,6 +1143,34 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
         return true;
+    }
+
+    if (galloc->n_lifetime_bits != ggml_gallocr_n_lifetime_bits(graph)) {
+        return true;
+    }
+
+    // the plan holds while every tensor's flags are covered by the flags it was made with: a tensor that was
+    // planned as an input or an output (allocated early, never freed or reused) can be a plain tensor now,
+    // but a tensor that became an input or an output may share memory with another tensor in this plan
+    {
+        const uint8_t * bits = galloc->lifetime_bits;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            if (!ggml_gallocr_lifetime_covered(*bits++, ggml_gallocr_lifetime_bits(node))) {
+                GGML_LOG_DEBUG("%s: node %s became an input or output since the plan\n", __func__, node->name);
+                return true;
+            }
+        }
+        // leaves are allocated before any node whatever their flags, so becoming an input does not change the plan
+        // of a leaf (only becoming an output does: outputs are never freed)
+        const uint8_t leaf_mask = (uint8_t) ~GGML_GALLOCR_LIFETIME_INPUT;
+        for (int i = 0; i < graph->n_leafs; i++) {
+            const uint8_t planned = *bits++ & leaf_mask;
+            if (!ggml_gallocr_lifetime_covered(planned, ggml_gallocr_lifetime_bits(graph->leafs[i]) & leaf_mask)) {
+                GGML_LOG_DEBUG("%s: leaf %s became an input or output since the plan\n", __func__, graph->leafs[i]->name);
+                return true;
+            }
+        }
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {

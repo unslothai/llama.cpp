@@ -1339,21 +1339,25 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
-    // set the inputs only for the active samplers in the current ubatch
-    std::unordered_set<llama_seq_id> active_samplers;
+    // set the inputs only for the active samplers in the current ubatch; one pass collects, per sequence, the
+    // input tokens of its output rows in the order build_sampling assigns them to chains
+    std::map<llama_seq_id, std::vector<llama_token>> active_samplers;
     for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
         if (ubatch->output[i]) {
-            llama_seq_id seq_id = ubatch->seq_id[i][0];
-            active_samplers.insert(seq_id);
+            // an embedding row has no token id (a mixed batch stores a placeholder there)
+            const bool token_row = ubatch->token != nullptr && (!ubatch->is_mixed() || !ubatch->type[i]);
+            active_samplers[ubatch->seq_id[i][0]].push_back(token_row ? ubatch->token[i] : LLAMA_TOKEN_NULL);
         }
     }
 
-    for (auto seq_id : active_samplers) {
+    for (auto & [seq_id, rows_tokens] : active_samplers) {
         if (samplers.find(seq_id) == samplers.end()) {
             continue;
         }
 
         auto & sampler = samplers[seq_id];
+
+        llama_sampler_backend_set_rows(sampler, rows_tokens.data(), (uint32_t) rows_tokens.size());
 
         if (sampler->iface->backend_set_input) {
             sampler->iface->backend_set_input(sampler);
@@ -1405,6 +1409,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_sampling_chains.clear();
 
     params = {};
 
@@ -4161,13 +4166,15 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> no_rows;
 
-    // every sampler builds n_outputs_max_per_seq chains, like the reserve, so the graph keeps its topology
+    // every sampler builds min(n_outputs_max_per_seq, n_ubatch) chains, like the reserve, so the graph keeps its topology
     // whatever rows the ubatch outputs: a chain without a row works on the first row and is not selected
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
-        for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
+        // a ubatch has at most n_ubatch rows of a sequence, so a chain at or past n_ubatch would never be active
+        const uint32_t n_chains = std::min(cparams.n_outputs_max_per_seq, cparams.n_ubatch);
+        for (uint32_t i = 0; i < n_chains; ++i) {
             const bool     active = i < rows.size();
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;
@@ -4184,6 +4191,12 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                if (t != nullptr) {
+                    res->t_sampling_chains.push_back(t);
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

@@ -371,6 +371,9 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+                                        // with backend samplers, the dist draws of the output rows of a sequence
+                                        // follow the rows (row g takes draw g); backend penalties with several rows
+                                        // need llama_sampler_chain_set_backend_draft_rows
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -1451,6 +1454,12 @@ extern "C" {
     // a type of llama_sampler that can chain multiple samplers one after another
 
     LLAMA_API struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params);
+
+    // [EXPERIMENTAL] the output rows of a sequence in one decode are draft-verification rows: row g is sampled after
+    // the input tokens of rows 1..g were accepted (common_sampler_sample_and_accept_n) and those inputs are token ids.
+    // Lets the backend penalty sampler run with n_outputs_max_per_seq > 1; without it the penalties stay on the CPU
+    // there, so any other use of several outputs per sequence stays exact. Call before the chain is attached.
+    LLAMA_API void llama_sampler_chain_set_backend_draft_rows(struct llama_sampler * chain, bool draft_rows);
 
     // important: takes ownership of the sampler object and will free it when llama_sampler_free is called
     LLAMA_API void                   llama_sampler_chain_add(      struct llama_sampler * chain, struct llama_sampler * smpl);

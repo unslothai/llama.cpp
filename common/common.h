@@ -297,6 +297,7 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    bool backend_draft_rows = false; // the output rows of a sequence are draft-verification rows (llama_sampler_chain_params)
 
     // print the parameters into a string
     std::string print() const;

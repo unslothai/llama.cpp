@@ -1106,6 +1106,147 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+// The plan of a graph depends on which tensors are outputs (never freed, never reused) and not only on the sizes:
+// the same graph shape planned while an intermediate was not an output lets a later tensor take its memory,
+// so once that intermediate becomes an output the plan must be recomputed (the backend sampler marks only the
+// chains of the rows a step samples as outputs, with an unchanged graph shape). A plan made while it was an
+// output stays valid when it no longer is one, and is kept (no new plan every time the outputs shrink).
+static void test_plan_follows_output_flags() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const bool mid_is_output = pass % 2 == 1;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * in  = make_input_with_size(ctx, 64);
+        ggml_tensor * a   = ggml_scale(ctx, in, 2.0f);
+        ggml_tensor * b   = ggml_scale(ctx, a,  2.0f); // can take a's memory unless a is an output
+        ggml_tensor * c   = ggml_scale(ctx, b,  2.0f);
+        if (mid_is_output) {
+            ggml_set_output(a);
+        }
+        ggml_set_output(c);
+        ggml_build_forward_expand(graph, c);
+        assign_names(ctx);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        if (mid_is_output) {
+            GGML_ASSERT(!memory_overlap(a, b));
+            GGML_ASSERT(!memory_overlap(a, c));
+        }
+        if (pass == 2) {
+            // the plan of pass 1 (a is an output) covers this graph and is kept
+            GGML_ASSERT(!memory_overlap(a, b));
+        }
+    }
+}
+
+// The outputs of a graph of one shape can alternate (the rows of the sequences of one decode split across ubatches):
+// the plan made again when a tensor becomes an output keeps the outputs the previous plan covered, so it converges to
+// their union and is not made again on every alternation (a plan of only the current outputs would let c take b's
+// memory while a is the output, and be made again each time)
+static void test_plan_keeps_union_of_outputs() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    for (int pass = 0; pass < 6; ++pass) {
+        const bool a_is_output = pass % 2 == 0;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * in = make_input_with_size(ctx, 64);
+        ggml_tensor * a  = ggml_scale(ctx, in, 2.0f);
+        ggml_tensor * b  = ggml_scale(ctx, a,  2.0f);
+        ggml_tensor * c  = ggml_scale(ctx, b,  2.0f); // can take b's memory unless b is an output
+        ggml_tensor * d  = ggml_scale(ctx, c,  2.0f);
+        ggml_set_output(a_is_output ? a : b);
+        ggml_set_output(d);
+        ggml_build_forward_expand(graph, d);
+        assign_names(ctx);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        // a is an output now, or was one in the plan kept from pass 0 on
+        GGML_ASSERT(!memory_overlap(a, b));
+        GGML_ASSERT(!memory_overlap(a, c));
+        if (!a_is_output || pass >= 2) {
+            // b is an output now, or was one in a plan that is kept from pass 1 on
+            GGML_ASSERT(!memory_overlap(b, c));
+            GGML_ASSERT(!memory_overlap(b, d));
+        }
+        // the graph keeps its own flags
+        GGML_ASSERT(((b->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) == !a_is_output);
+    }
+}
+
+// A graph built with ggml_build_forward_select (llama's input embeddings: the token rows or the raw embeddings) has
+// the same nodes and leafs whichever alternative is selected, only the source of the consumer changes: from a
+// computed tensor to an input leaf. That input leaf is an input in every plan, so a plan made for one alternative
+// holds for the other and must not be made again (GGML_SCHED_NO_REALLOC treats that as an error). A multi-buffer
+// gallocr cannot re-plan by itself, so ggml_gallocr_alloc_graph returns false when it judges the plan stale.
+static void test_plan_holds_for_selected_source() {
+    dummy_backend              backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int idx = pass % 2;
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * tok  = make_input_with_size(ctx, 64);
+        ggml_tensor * embd = make_input_with_size(ctx, 64);
+        ggml_tensor * rows = ggml_scale(ctx, tok, 2.0f);
+        ggml_tensor * alts[2] = { rows, embd };
+        ggml_tensor * sel = ggml_build_forward_select(graph, alts, 2, idx);
+        ggml_tensor * out = ggml_scale(ctx, sel, 2.0f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        assign_names(ctx);
+
+        if (pass == 0) {
+            std::vector<int> node_ids(graph->n_nodes, 0);
+            std::vector<int> leaf_ids(graph->n_leafs, 0);
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_ids.data(), leaf_ids.data()));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(!memory_overlap(tok, embd));
+        GGML_ASSERT(!memory_overlap(embd, out));
+    }
+}
+
+// A leaf that is reserved as a plain tensor and later marked as an input (an input set only once the graph is built
+// for real) keeps its plan: leaves are allocated before any node whatever their flags, so the input flag does not
+// change where a leaf or anything else lives. A multi-buffer gallocr cannot re-plan by itself, so
+// ggml_gallocr_alloc_graph returns false when it judges the plan stale (GGML_SCHED_NO_REALLOC aborts there).
+static void test_plan_holds_when_leaf_becomes_input() {
+    dummy_backend              backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    for (int pass = 0; pass < 3; ++pass) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * leaf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        if (pass > 0) {
+            ggml_set_input(leaf);
+        }
+        ggml_tensor * a   = ggml_scale(ctx, leaf, 2.0f);
+        ggml_tensor * out = ggml_scale(ctx, a, 2.0f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        assign_names(ctx);
+
+        if (pass == 0) {
+            std::vector<int> node_ids(graph->n_nodes, 0);
+            std::vector<int> leaf_ids(graph->n_leafs, 0);
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_ids.data(), leaf_ids.data()));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1139,5 +1280,9 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_plan_follows_output_flags", test_plan_follows_output_flags);
+    run("test_plan_keeps_union_of_outputs", test_plan_keeps_union_of_outputs);
+    run("test_plan_holds_for_selected_source", test_plan_holds_for_selected_source);
+    run("test_plan_holds_when_leaf_becomes_input", test_plan_holds_when_leaf_becomes_input);
     return 0;
 }

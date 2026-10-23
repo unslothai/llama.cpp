@@ -973,6 +973,9 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // the results of every sampling chain, active or not (see llama_context::graph_reserve)
+    std::vector<ggml_tensor *> t_sampling_chains;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 

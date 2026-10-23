@@ -141,17 +141,26 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
-        if (sampled_probs) {
-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
-            cur.resize(sampled_probs_count);
-            for (uint32_t i = 0; i < sampled_probs_count; ++i) {
-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
-            }
-        } else if (sampled_logits) {
-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
-            cur.resize(sampled_logits_count);
-            for (uint32_t i = 0; i < sampled_logits_count; i++) {
-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+        // the candidates of the backend prefix, as they are: a chain with a CPU suffix keeps a backend prefix only
+        // when the prefix leaves exactly the CPU sampler's candidates (llama_sampler_chain_backend_init)
+        if (sampled_probs || sampled_logits) {
+            const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
+            cur.resize(count);
+            const auto td_at = [&](uint32_t i) {
+                return llama_token_data{
+                    /* .id    = */ sampled_ids    ? sampled_ids[i]    : (llama_token) i,
+                    /* .logit = */ sampled_logits ? sampled_logits[i] : logf(sampled_probs[i]),
+                    /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
+                };
+            };
+            if (sampled_ids && sampled_logits && sampled_probs) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+                }
+            } else {
+                for (uint32_t i = 0; i < count; ++i) {
+                    cur[i] = td_at(i);
+                }
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -210,6 +219,7 @@ struct common_sampler * common_sampler_init(
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
+    llama_sampler_chain_set_backend_draft_rows(chain, params.backend_draft_rows);
 
     std::vector<llama_sampler *> samplers;
 
