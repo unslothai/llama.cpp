@@ -149,6 +149,9 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch_ext & batch_inp);
+
+    // [TAG_EXACT_CONCURRENCY] false, logged, when the decode tokens figure has outgrown this context's batch geometry
+    bool exact_geometry_holds(const char * fn) const;
     int decode(const llama_batch_ext & batch_inp);
 
     // compat version
@@ -317,6 +320,9 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // [TAG_EXACT_CONCURRENCY] this context's batch geometry, held for its life so the decode tokens figure cannot outgrow it
+    llama_exact_geometry_hold exact_geometry;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

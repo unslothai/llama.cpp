@@ -419,6 +419,8 @@ llama_build_and_test(test-mtmd-impl.cpp LINK mtmd)
 # [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
 llama_build_and_test(test-exact-decode-tokens.cpp)
+llama_test(test-exact-decode-tokens NAME test-exact-decode-tokens-live-context LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-decode-tokens-live-context PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-speculative-shared-bound.cpp)
 
 # server helpers that need no model; server-context exists only where tools/ adds the server

@@ -127,3 +127,20 @@ bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft);
 bool llama_exact_report_n_seq(uint32_t n_seq);
 
 bool llama_exact_check_n_seq(uint32_t n_seq);
+
+// [TAG_EXACT_CONCURRENCY] A live exact context's batch geometry, held while it lives: its batch must keep holding a whole ubatch
+// beside a decode step of every sequence, n_batch >= n_ubatch + n_seq_max * llama_exact_decode_tokens(), so the process-wide
+// tokens figure may only grow to what the tightest live context still holds (llama_set_exact_decode_tokens() refuses past it).
+struct llama_exact_geometry_hold {
+    llama_exact_geometry_hold() = default;
+    llama_exact_geometry_hold(const llama_exact_geometry_hold &) = delete;
+    llama_exact_geometry_hold & operator=(const llama_exact_geometry_hold &) = delete;
+    ~llama_exact_geometry_hold();
+
+    // checks the geometry against the current figure and records it in one step, so no figure can grow in between; false, recording
+    // nothing, when it does not hold. A context with one sequence has no decode step beside its ubatch and is not recorded
+    bool acquire(uint32_t n_batch, uint32_t n_ubatch, uint32_t n_seq_max);
+
+    bool     held  = false;
+    uint32_t slack = 0; // decode tokens per sequence the batch holds beside a whole ubatch
+};

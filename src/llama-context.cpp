@@ -393,16 +393,15 @@ llama_context::llama_context(
 
     // [TAG_EXACT_CONCURRENCY] the batch must hold a whole ubatch beside a decode step of every other sequence, or a prompt that shares a
     // batch is split into shorter ubatches than it gets alone; checked here too, so callers that skip common_exact_concurrency_init() get it
-    if (llama_exact_concurrency() && cparams.n_seq_max > 1) {
+    // The geometry is held for the context's life, so the tokens figure cannot later grow past it (llama_exact_geometry_hold).
+    if (llama_exact_concurrency() && cparams.n_seq_max > 1 && !exact_geometry.acquire(cparams.n_batch, cparams.n_ubatch, cparams.n_seq_max)) {
         const uint64_t n_cols  = uint64_t(cparams.n_seq_max) * std::max(1u, llama_exact_decode_tokens());
         const uint64_t n_min   = uint64_t(cparams.n_ubatch) + n_cols;
 
-        if (uint64_t(cparams.n_batch) < n_min) {
-            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY needs a batch of at least %" PRIu64 " tokens for a %u-token ubatch beside a decode step of "
-                    "%u sequences (%" PRIu64 " columns), but the batch is %u%s: raise n_batch (and n_ctx), or lower n_ubatch\n", __func__,
-                    n_min, cparams.n_ubatch, cparams.n_seq_max, n_cols, cparams.n_batch, cparams.causal_attn && cparams.n_batch == cparams.n_ctx ? " (clamped to n_ctx)" : "");
-            throw std::runtime_error("exact concurrency: the batch cannot hold a whole ubatch beside a decode step");
-        }
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY needs a batch of at least %" PRIu64 " tokens for a %u-token ubatch beside a decode step of "
+                "%u sequences (%" PRIu64 " columns), but the batch is %u%s: raise n_batch (and n_ctx), or lower n_ubatch\n", __func__,
+                n_min, cparams.n_ubatch, cparams.n_seq_max, n_cols, cparams.n_batch, cparams.causal_attn && cparams.n_batch == cparams.n_ctx ? " (clamped to n_ctx)" : "");
+        throw std::runtime_error("exact concurrency: the batch cannot hold a whole ubatch beside a decode step");
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
@@ -1682,7 +1681,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+// [TAG_EXACT_CONCURRENCY] Backstop for llama_set_exact_decode_tokens(), which refuses to grow the figure past a live context's batch:
+// a context never runs under a geometry its constructor would refuse, and is refused before any batch or memory state is touched.
+bool llama_context::exact_geometry_holds(const char * fn) const {
+    if (!llama_exact_concurrency() || cparams.n_seq_max <= 1) {
+        return true;
+    }
+
+    const uint64_t n_cols = uint64_t(cparams.n_seq_max) * std::max(1u, llama_exact_decode_tokens());
+
+    if (uint64_t(cparams.n_batch) < uint64_t(cparams.n_ubatch) + n_cols) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY needs a batch of at least %" PRIu64 " tokens for a %u-token ubatch beside a decode step of "
+                "%u sequences (%" PRIu64 " columns) since the decode tokens figure grew, but this context's batch is %u; the step is refused\n",
+                fn, uint64_t(cparams.n_ubatch) + n_cols, cparams.n_ubatch, cparams.n_seq_max, n_cols, cparams.n_batch);
+        return false;
+    }
+
+    return true;
+}
+
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (!exact_geometry_holds(__func__)) {
+        return -1;
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1922,6 +1944,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (!exact_geometry_holds(__func__)) {
+        return -1;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

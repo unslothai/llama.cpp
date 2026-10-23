@@ -10,6 +10,7 @@
 #include <climits>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -300,6 +301,39 @@ bool llama_exact_report_n_seq(uint32_t n_seq) {
     return true;
 }
 
+// the slack of every live exact context with more than one sequence (see llama_exact_geometry_hold), guarded by g_exact_mutex
+static std::multiset<uint32_t> g_exact_live_slack;
+
+bool llama_exact_geometry_hold::acquire(uint32_t n_batch, uint32_t n_ubatch, uint32_t n_seq_max) {
+    if (n_seq_max <= 1) {
+        return true;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    const uint32_t s = n_batch >= n_ubatch ? (n_batch - n_ubatch) / n_seq_max : 0;
+
+    if (s < std::max(1u, g_exact_decode_tokens.load(std::memory_order_relaxed))) {
+        return false;
+    }
+
+    g_exact_live_slack.insert(s);
+    held  = true;
+    slack = s;
+
+    return true;
+}
+
+llama_exact_geometry_hold::~llama_exact_geometry_hold() {
+    if (!held) {
+        return;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(g_exact_mutex);
+
+    g_exact_live_slack.erase(g_exact_live_slack.find(slack));
+}
+
 bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
     n_tokens = n_tokens > 0 ? n_tokens : 1;
 
@@ -308,6 +342,15 @@ bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
     // never lowered: a narrower context set up later would turn an existing speculative context's verify steps into prompts
     if (n_tokens <= g_exact_decode_tokens.load(std::memory_order_relaxed)) {
         return true;
+    }
+
+    // a live context whose batch cannot hold the larger step beside a whole ubatch would be split differently than it is alone, which
+    // its constructor refuses; refused here as well, leaving the old figure, until that context is gone
+    if (!g_exact_live_slack.empty() && n_tokens > *g_exact_live_slack.begin()) {
+        LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY cannot raise the decode tokens per sequence to %u: a live context's batch holds only %u "
+                "per sequence beside a whole ubatch; create it with a larger n_batch (or a smaller n_ubatch), or free it first\n",
+                __func__, n_tokens, *g_exact_live_slack.begin());
+        return false;
     }
 
     // every context widens with the figure, so report the width first; one the explicit bound cannot cover leaves the old figure in place.
