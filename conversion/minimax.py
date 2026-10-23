@@ -420,8 +420,9 @@ class MiniMaxM3Model(MiniMaxM2Model):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         # Gemma-style (1 + w) RMSNorm: bake the +1 in so llama.cpp can use plain RMSNorm
+        # (in fp32 whatever the incoming dtype: adding 1.0 in F16 / BF16 rounds away the low bits of w)
         if name.endswith("norm.weight"):
-            data_torch = data_torch + 1.0
+            data_torch = data_torch.to(torch.float32) + 1.0
 
         yield from super().modify_tensors(data_torch, name, bid)
 
