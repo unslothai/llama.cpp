@@ -156,13 +156,45 @@ def _await(cond, what: str, alive=None, stall: float = 120.0, poll: float = 0.02
         time.sleep(poll)
 
 
-def _wait_processing(slot_ids, stall: float = 120.0):
-    """Return once every one of these slots is processing, waiting as long as the server keeps making progress (see _await)."""
+def _wait_processing(slot_ids, alive=None, stall: float = 120.0):
+    """Return once every one of these slots is processing, waiting as long as the server keeps making progress (see _await);
+    alive() false (the request that was to make them busy has ended) fails at once instead of polling for what cannot happen."""
     def processing():
         slots = server.make_request("GET", "/slots").body
         return all(any(s["id"] == i and s["is_processing"] for s in slots) for i in slot_ids)
 
-    _await(processing, f"slots {slot_ids} processing", stall=stall, poll=0.005)
+    _await(processing, f"slots {slot_ids} processing", alive=alive, stall=stall, poll=0.005)
+
+
+_LAUNCH_RE  = re.compile(r"id +(\d+) \| task \d+ \| processing task")
+_RELEASE_RE = re.compile(r"id +(\d+) \| task \d+ \| stop processing")
+
+
+def _require_overlap(slot: int, what: str) -> None:
+    """Fail, naming the setup and not the scheduler, unless another slot's request was launched while this slot's last one was
+    in flight. The server writes its log in order, so that launch must fall between this slot's last launch and its release: a
+    client delay that lets the earlier request end first leaves nothing to preempt, and a run like that exercised nothing."""
+    start, end, others = None, None, []
+    for i, line in enumerate(_log().splitlines()):
+        if m := _LAUNCH_RE.search(line):
+            if int(m.group(1)) == slot:
+                start, end = i, None
+            else:
+                others.append(i)
+        elif (m := _RELEASE_RE.search(line)) and int(m.group(1)) == slot and start is not None:
+            end = i
+    if start is None or not any(start < i and (end is None or i < end) for i in others):
+        pytest.fail(f"precondition not met, the case was not exercised: {what}; slot {slot} ended before any other "  # ty: ignore[invalid-argument-type]
+                    f"request was launched (the client was too slow to overlap them)")
+
+
+def _require_pressure(bodies, what: str) -> None:
+    """Fail, naming the setup, when none of these completed requests was parked: two requests that both finished whole without a
+    park never needed more cells than the pool has (one that did would have been refused or truncated), so the newer one came
+    when the older was too near its end, and the policy under test was never asked."""
+    if sum(body["preempt"]["parks"] for body in bodies) == 0:
+        pytest.fail(f"precondition not met, the case was not exercised: {what}; nothing was parked, so the pool was never "  # ty: ignore[invalid-argument-type]
+                    f"short (the client was too slow to overlap them)")
 
 
 def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_TIMEOUT):
@@ -171,8 +203,9 @@ def _complete_overlapping(n_predict, n_prompt, timeout: float = DEFAULT_REQUEST_
     other  = _prompt_of(n_prompt[1], _PROMPT_B)
     with ThreadPoolExecutor(1) as pool:
         first = pool.submit(_complete, n_predict[0], leader, 0, 0.0, None, timeout)
-        _wait_processing([0])
+        _wait_processing([0], alive=lambda: not first.done())
         second = _complete(n_predict[1], other, 1, 0.0, None, timeout)
+    _require_overlap(0, "the follower on slot 1 beside the leader on slot 0")
     return [first.result(), second]
 
 
@@ -180,7 +213,7 @@ def _complete_together(n_predict: int, n_prompt, timeout: float = DEFAULT_REQUES
     """Both prompts in one request, so they are queued at once and overlap whatever the client's or the host's speed."""
     return server.make_request("POST", "/completion", data={
         "n_predict": n_predict, "prompt": [_prompt_of(n_prompt[0], _PROMPT_A), _prompt_of(n_prompt[1], _PROMPT_B)],
-        "ignore_eos": True, "temperature": 0.0, "seed": 42, "cache_prompt": False,
+        "ignore_eos": True, "return_tokens": True, "temperature": 0.0, "seed": 42, "cache_prompt": False,
     }, timeout=timeout)
 
 
@@ -279,16 +312,17 @@ def test_two_generations_that_do_not_fit_together_both_finish(knob):
     n_ctx = 1024
     (_start_async if knob == "async" else _start)(n_ctx=n_ctx)
 
-    n_predict = (460, 400)
-    results = _complete_overlapping(n_predict, (500, 200))
+    # one request with both prompts: queued at once, so they overlap whatever the client's speed; 500 + 200 + 2 * 460 > 1024
+    n_predict = 460
+    response = _complete_together(n_predict, (500, 200))
+    assert response.status_code == 200, response.body
 
     text = _log()
     _assert_recovered(text, "preempted as a last resort" if knob.startswith("last-resort") else "preempted:")
-    for res, n_wanted in zip(results, n_predict):
-        assert res.status_code == 200, res.body
-        assert res.body["timings"]["predicted_n"] == n_wanted
-        assert res.body["truncated"] is False
-        assert len(res.body["tokens"]) == n_wanted
+    for body in response.body:
+        assert body["timings"]["predicted_n"] == n_predict
+        assert body["truncated"] is False
+        assert len(body["tokens"]) == n_predict
 
     if knob == "pages":
         held   = [int(n) for n in re.findall(rf"kv (\d+)/{n_ctx}", text)]
@@ -447,9 +481,10 @@ def test_a_park_whose_host_allocation_fails_is_parked_by_recompute():
     other = _prompt_of(200, _PROMPT_B)
     with ThreadPoolExecutor(1) as pool:
         first = pool.submit(_complete, 460, leader, 0)
-        _wait_processing([0])
+        _wait_processing([0], alive=lambda: not first.done())
         second = _complete(400, other, 1)
     results = [first.result(), second]
+    _require_overlap(0, "the request on slot 1 beside the one on slot 0")
 
     text = _log()
     assert "could not take the host memory" in text, "the injected allocation failure never fired"
@@ -540,7 +575,7 @@ def test_a_started_slot_is_counted_by_the_cells_it_holds_not_by_the_prompt_it_ke
 
     with ThreadPoolExecutor(4) as pool:
         first = pool.submit(_complete, 460, ids, 0)
-        _wait_processing([0])
+        _wait_processing([0], alive=lambda: not first.done())
         follower = pool.submit(_complete, 8, ids[:8], 0)
         long_ones = [pool.submit(_complete, 400, long_prompts[0], 1),
                      pool.submit(_complete, 400, long_prompts[1], 2)]
@@ -1561,14 +1596,17 @@ def test_a_started_slot_that_fits_once_trimmed_parks_nobody():
     idle = [300 + i % 30 for i in range(60)]
     assert _cached(1, old, 0).status_code == 200
     assert _cached(1, idle, 2).status_code == 200
-    with ThreadPoolExecutor(1) as pool:
-        gen = pool.submit(_cached, 220, [200 + i for i in range(90)], 1)
-        _wait_processing([1])
-        started = _cached(4, old[:300] + [400 + i % 100 for i in range(336)], 0)
-        generating = gen.result()
-    for res in (started, generating):
-        assert res.status_code == 200, res.body
-        assert res.body["preempt"]["parks"] == 0, res.body["preempt"]
+    # both prompts in one request, so they overlap whatever the client's speed: the new one takes the never-used slot 1, the one
+    # sharing old[:300] takes slot 0, and before slot 0 is trimmed 600 + 336 + 90 + 60 cells exceed the pool
+    response = server.make_request("POST", "/completion", data={
+        "prompt": [[200 + i for i in range(90)], old[:300] + [400 + i % 100 for i in range(336)]],
+        "n_predict": 4, "cache_prompt": True, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+    })
+    assert response.status_code == 200, response.body
+    assert [body["id_slot"] for body in response.body] == [1, 0], [body["id_slot"] for body in response.body]
+    for body in response.body:
+        assert body["tokens_predicted"] == 4, body
+        assert body["preempt"]["parks"] == 0, body["preempt"]
     rerun = _cached(1, idle, 2)
     assert rerun.body["timings"]["cache_n"] == 59, rerun.body["timings"]
     text = _log()
@@ -1618,9 +1656,10 @@ def test_a_single_request_beside_an_n_2_request_is_parked_so_both_finish():
     _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128)
     with ThreadPoolExecutor(1) as pool:
         single = pool.submit(_cached, 300, [100 + k % 50 for k in range(600)], 0)
-        _wait_processing([0])
+        _wait_processing([0], alive=lambda: not single.done())
         family = _oai_n([200 + k % 50 for k in range(200)], 2, 250)
         single = single.result()
+    _require_overlap(0, "the n = 2 request beside the single one on slot 0")
     assert single.status_code == 200, single.body
     assert single.body["timings"]["predicted_n"] == 300
     assert family.status_code == 200, family.body
@@ -1669,11 +1708,16 @@ def test_a_started_request_reusing_a_long_prefix_does_not_park_an_older_generati
         _await(lambda: _n_decoded(_slot_view(0)) >= 280, "the older request decoding 280 tokens", alive=lambda: not older.done(), poll=0.002)
         newer = _cached(4, earlier + [300 + k % 50 for k in range(300)], 1)
         older = older.result()
+    # launched beside an older request holding 320+ cells, the newer one's 904 exceed the pool
+    _require_overlap(0, "the newer request on slot 1 beside the older one decoding on slot 0")
     for res, n_predict in ((older, 600), (newer, 4)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
-    assert older.body["preempt"]["parks"] == 0, "the older generating request was parked for a newer one"
-    assert newer.body["preempt"]["parks"] > 0
+    _require_pressure((older.body, newer.body), "the newer request reusing a long prefix beside the older one")
+    # the suite also runs under LLAMA_ARG_PREEMPT_POLICY=cost, which may park the older request, the cheaper one, instead
+    if server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs":
+        assert older.body["preempt"]["parks"] == 0, "the older generating request was parked for a newer one"
+        assert newer.body["preempt"]["parks"] > 0
 
 
 @pytest.mark.parametrize("policy", ["fcfs", "cost"])
@@ -1688,14 +1732,14 @@ def test_the_policy_decides_whether_the_newest_or_the_cheapest_slot_is_parked(po
         _await(lambda: _n_decoded(_slot_view(0)) >= 20, "the older request decoding 20 tokens", alive=lambda: not older.done(), poll=0.005)
         newer = _cached(500, [200 + k % 50 for k in range(300)], 1)
         older = older.result()
+    _require_overlap(0, "the newer request on slot 1 beside the older one decoding on slot 0")
     for res, n_predict in ((older, 600), (newer, 500)):
         assert res.status_code == 200, res.body
         assert res.body["timings"]["predicted_n"] == n_predict
+    _require_pressure((older.body, newer.body), "the newer request beside the older one")
     if policy == "fcfs":
-        assert older.body["preempt"]["parks"] == 0
+        assert older.body["preempt"]["parks"] == 0, "the older request was parked for a newer one"
         assert newer.body["preempt"]["parks"] > 0
-    else:
-        assert older.body["preempt"]["parks"] + newer.body["preempt"]["parks"] > 0
     text = _log()
     assert 0 <= text.find("purging slot 2") < text.find("preempted:"), "a running slot was parked while an idle one held cells"
 
@@ -1705,23 +1749,26 @@ def test_fcfs_resumes_parked_requests_in_arrival_order():
     os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "fcfs"
     _start(n_ctx=1024, n_slots=3, n_batch=128, n_ubatch=128)
     assert server.make_request("GET", "/props").body["preempt"]["policy"] == "fcfs"
-    with ThreadPoolExecutor(3) as pool:
-        futures = []
-        for i, n_predict in enumerate((700, 450, 450)):
-            futures.append(pool.submit(_cached, n_predict, [100 * (i + 1) + k % 50 for k in range(40)], i))
-            _wait_processing([i])
-        results = [f.result() for f in futures]
-    for res, n_predict in zip(results, (700, 450, 450)):
-        assert res.status_code == 200, res.body
-        assert res.body["timings"]["predicted_n"] == n_predict
-    assert results[0].body["preempt"]["parks"] == 0, "the oldest request was parked"
+    # three prompts in one request: queued at once in this order, so they overlap whatever the client's speed; each fits alone
+    # (40 + 700 cells), together they need 2220 of 1024
+    response = server.make_request("POST", "/completion", data={
+        "prompt": [[100 * (i + 1) + k % 50 for k in range(40)] for i in range(3)],
+        "n_predict": 700, "cache_prompt": True, "ignore_eos": True, "temperature": 0.0, "seed": 42,
+    })
+    assert response.status_code == 200, response.body
+    results = response.body
+    for body in results:
+        assert body["timings"]["predicted_n"] == 700, body
+    assert results[0]["preempt"]["parks"] == 0, "the oldest request was parked"
+    oldest, middle, newest = (body["id_slot"] for body in results)
     text = _log()
     resumed = [int(m) for m in re.findall(r"id +(\d+) \| task \d+ \| resumed after", text)]
     assert resumed, "nothing was parked"
     parked = [int(m) for m in re.findall(r"id +(\d+) \| task \d+ \| preempted:", text)]
-    assert parked[0] == 2, parked
-    if 1 in parked:
-        assert resumed.index(1) < resumed.index(2), resumed
+    assert oldest not in parked, parked
+    assert parked[0] == newest, (parked, newest)
+    if middle in parked:
+        assert resumed.index(middle) < resumed.index(newest), resumed
 
 
 def test_fcfs_runs_the_oldest_to_the_end_of_the_window_beside_a_held_prompt():

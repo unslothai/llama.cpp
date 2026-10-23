@@ -688,7 +688,7 @@ These words will not be included in the completion, so make sure to add them to 
 
 While a request is streaming, the server sends SSE comment lines that a client reading raw lines can act on and every SSE event consumer ignores:
 
-- `: preempted` - the slot was parked and the stream is silent until it comes back. A parked stream is kept alive with the same comment about every two seconds.
+- `: preempted` - the slot was parked. Until it comes back the stream carries no data, only the `: preempt-keepalive` comments described below.
 - `: resumed` - the slot is running again.
 - `: recomputed` - sent right after `: resumed` when that resume re-prefilled the sequence rather than restoring its saved bytes, i.e. what follows is the continuation `preempt.recomputes` counts.
 - `: preempt-keepalive` - sent while the slot stays parked, at most every 2 seconds, or at the request's `sse_ping_interval` when that is shorter.

@@ -63,7 +63,7 @@ def _log() -> str:
 
 
 def _slots() -> list:
-    return requests.get(f"http://{server.server_host}:{server.server_port}/slots").json()
+    return requests.get(f"http://{server.server_host}:{server.server_port}/slots", timeout=DEFAULT_HTTP_TIMEOUT).json()
 
 
 def _server_progress():
@@ -93,7 +93,10 @@ def _await(cond, what: str, alive=None, stall: float = 120.0, poll: float = 0.02
 
 
 def _post(path: str, data: dict):
-    return requests.post(f"http://{server.server_host}:{server.server_port}{path}", json=data, stream=True)
+    # bounded like make_request: a server that takes the connection and then stops sending fails the test instead of hanging it.
+    # The read timeout is per read, and a parked stream is kept alive every two seconds, so only a stall reaches it
+    return requests.post(f"http://{server.server_host}:{server.server_port}{path}", json=data, stream=True,
+                         timeout=(DEFAULT_HTTP_TIMEOUT, DEFAULT_REQUEST_TIMEOUT))
 
 
 def _stream_raw(path: str, data: dict) -> tuple[list[str], list[str]]:
