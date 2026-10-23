@@ -102,6 +102,8 @@ class ServerProcess:
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_draft_n_ubatch: int | None = None
+    spec_ngram_mod_n_min: int | None = None
+    spec_ngram_mod_n_max: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
@@ -128,6 +130,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     llama_cache: str | None = None
+    override_kvs: List[str] | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -192,6 +195,8 @@ class ServerProcess:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
+        for kv in self.override_kvs or []:
+            server_args.extend(["--override-kv", kv])
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
@@ -255,6 +260,10 @@ class ServerProcess:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
+        if self.spec_ngram_mod_n_min is not None:
+            server_args.extend(["--spec-ngram-mod-n-min", self.spec_ngram_mod_n_min])
+        if self.spec_ngram_mod_n_max is not None:
+            server_args.extend(["--spec-ngram-mod-n-max", self.spec_ngram_mod_n_max])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
         if self.spec_draft_n_ubatch:

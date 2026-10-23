@@ -23,7 +23,9 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <set>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <deque>
 #include <exception>
@@ -143,7 +145,91 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_PREEMPTED,  // [TAG_PREEMPT] cells released, everything needed to resume is in host RAM
+    SLOT_STATE_PREEMPTING, // [TAG_PREEMPT_ASYNC] the copy out is running; the cells are still this slot's
+    SLOT_STATE_RESTORING,  // [TAG_PREEMPT_ASYNC] the copy back in is running; the cells are allocated but not yet filled
 };
+
+// [TAG_PREEMPT] Server-side preemption: under KV pressure a slot's sequence is parked in host RAM and restored later instead of failing the request.
+constexpr int32_t PREEMPT_N_MARGIN   = 8;  // cells left spare on top of the reservation
+constexpr int64_t PREEMPT_KEEPALIVE_MS = 2000;  // SSE keepalive period while a streaming slot is parked.
+constexpr int32_t PREEMPT_N_STARVED  = 3;  // Preemptions after which a slot is protected.
+
+static std::string preempt_notice_comment(const server_task_result_preempt_notice & notice) {
+    const std::string suffix = (notice.batched ? " " + std::to_string(notice.index) : "") + "\n\n";
+
+    std::string res = (notice.parked ? ": preempted" : ": resumed") + suffix;
+
+    // [TAG_PREEMPT] The resume re-prefilled from tokens, so the output is not bit-identical to an uninterrupted run.
+    if (!notice.parked && notice.recomputed) {
+        res += ": recomputed" + suffix;
+    }
+
+    return res;
+}
+constexpr int32_t PREEMPT_N_FAIL_MAX = 8;  // Failed restores before the slot is given up.
+constexpr int64_t PREEMPT_FAIL_US    = 60ll * 1000 * 1000;  // Only applies after the slot was parked this long.
+constexpr int64_t PREEMPT_ROTATE_US  =  2ll * 1000 * 1000;  // A parked head waiting this long gets a resident rotated out for it, and new prompts wait.
+constexpr int64_t PREEMPT_ROTATE_RECOMPUTE_US = 30ll * 1000 * 1000;  // After this long the head may also rotate a resident that would need a re-prefill.
+constexpr int32_t PREEMPT_ROTATE_MIN_GEN = 32;  // Tokens a resumed slot decodes before it can be rotated out again.
+constexpr int64_t PREEMPT_ROTATE_BOUNDED_US = 30ll * 1000 * 1000;  // A resident that will end by itself is rotated only for a head parked this long, and only if it would run longer than this again.
+
+// [TAG_PREEMPT_ASYNC] An async park frees cells only when its copy lands, so it must start this many steps before the pool runs out.
+constexpr int32_t PREEMPT_N_ASYNC_STEPS = 8;
+
+// [TAG_PREEMPT] Test knob: LLAMA_SERVER_PREEMPT_FAIL_SAVE=N fails the Nth park's host allocation to exercise the recompute fallback.
+static bool preempt_fail_save() {
+    static int32_t n_left = []() {
+        const char * val = getenv("LLAMA_SERVER_PREEMPT_FAIL_SAVE");
+
+        return val ? std::max(0, atoi(val)) : 0;
+    }();
+
+    return n_left > 0 && --n_left == 0;
+}
+
+// [TAG_PREEMPT_ASYNC] Test knob: LLAMA_SERVER_PREEMPT_PAGEABLE=N treats the Nth async park's buffer as pageable, as a large allocation can be.
+static bool preempt_force_pageable() {
+    static int32_t n_left = []() {
+        const char * val = getenv("LLAMA_SERVER_PREEMPT_PAGEABLE");
+
+        return val ? std::max(0, atoi(val)) : 0;
+    }();
+
+    return n_left > 0 && --n_left == 0;
+}
+
+using llama_state_seq_copy_ptr = std::shared_ptr<llama_state_seq_copy>;
+
+static llama_state_seq_copy_ptr llama_state_seq_copy_make(llama_context * ctx) {
+    llama_state_seq_copy * cpy = ctx ? llama_state_seq_copy_init(ctx) : nullptr;
+
+    return cpy ? llama_state_seq_copy_ptr(cpy, llama_state_seq_copy_free) : llama_state_seq_copy_ptr();
+}
+
+// [TAG_EXACT_CONCURRENCY] The planner counts cells, not tokens: pages are per sequence, so a token count overestimates the room.
+
+static constexpr int32_t preempt_n_cells_g(int32_t n_tokens, int32_t g) {
+    return (g <= 1 || n_tokens <= 0) ? n_tokens : ((n_tokens + g - 1) / g) * g;
+}
+
+static constexpr int32_t preempt_n_cells_step_g(int32_t n_tokens, int32_t n_step, int32_t g) {
+    return preempt_n_cells_g(n_tokens + n_step, g) - preempt_n_cells_g(n_tokens, g);
+}
+
+static_assert(preempt_n_cells_g(0, 1) == 0 && preempt_n_cells_g(1, 1) == 1 &&
+              preempt_n_cells_g(8191, 1) == 8191 && preempt_n_cells_g(-3, 1) == -3,
+              "at a granularity of 1 a run of n tokens has to cost exactly n cells");
+static_assert(preempt_n_cells_step_g(0, 1, 1) == 1 && preempt_n_cells_step_g(8191, 1, 1) == 1 &&
+              preempt_n_cells_step_g(1000, 512, 1) == 512,
+              "at a granularity of 1 a step of n tokens has to cost exactly n cells");
+
+static_assert(preempt_n_cells_g(1, 256) == 256 && preempt_n_cells_g(256, 256) == 256 &&
+              preempt_n_cells_g(257, 256) == 512,
+              "a tail page is charged in full");
+static_assert(preempt_n_cells_step_g(255, 1, 256) == 0 && preempt_n_cells_step_g(256, 1, 256) == 256 &&
+              preempt_n_cells_step_g(256, 257, 256) == 512,
+              "a step is free until it crosses a page boundary and costs whole pages when it does");
 
 struct server_slot; // forward declaration
 
@@ -254,6 +340,36 @@ struct server_batch {
         }
     }
 };
+
+// whether the prompt of a task may be split over several ubatches
+static bool task_can_split(const server_task & task, llama_context * ctx) {
+    // a decision over a non-causal context reads the whole prompt in one batch
+    if (task.type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx)) {
+        return false;
+    }
+    // MTP supports splitting - uses task.need_embd() not the slot's need_embd()
+    if (!task.need_embd()) {
+        return true;
+    }
+    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
+    if (!llama_get_memory(ctx)) {
+        return false;
+    }
+    // context can be chunked/split if the pooling type is LAST
+    const auto pooling = llama_pooling_type(ctx);
+    if (pooling == LLAMA_POOLING_TYPE_LAST) {
+        return true;
+    }
+    // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
+    if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx)) {
+        return true;
+    }
+    // a decision task reads its outputs from the last batch
+    if (task.type == SERVER_TASK_TYPE_DECISION) {
+        return true;
+    }
+    return false;
+}
 
 struct server_slot {
     int id;
@@ -382,6 +498,471 @@ struct server_slot {
         prompt.clear();
     }
 
+    slot_state           state_before_preempt = SLOT_STATE_IDLE;
+    std::vector<uint8_t> preempt_state_tgt;
+    std::vector<uint8_t> preempt_state_dft;
+
+    // [TAG_PREEMPT_ASYNC] Park and resume transfers; shared_ptr so they survive vector reallocation.
+    llama_state_seq_copy_ptr preempt_cpy_tgt;
+    llama_state_seq_copy_ptr preempt_cpy_dft;
+
+    bool preempt_is_async() const {
+        return (bool) preempt_cpy_tgt;
+    }
+
+    template <typename F>
+    auto preempt_sum(F f) const -> decltype(f(preempt_cpy_tgt.get())) {
+        if (!preempt_is_async()) {
+            return 0;
+        }
+
+        return f(preempt_cpy_tgt.get()) + (preempt_cpy_dft ? f(preempt_cpy_dft.get()) : 0);
+    }
+
+    template <typename F>
+    void preempt_each(F f) const {
+        if (preempt_cpy_tgt) {
+            f(preempt_cpy_tgt.get());
+        }
+
+        if (preempt_cpy_dft) {
+            f(preempt_cpy_dft.get());
+        }
+    }
+
+    int64_t preempt_sync_us() const {
+        return preempt_sum(llama_state_seq_copy_sync_us);
+    }
+
+    size_t preempt_n_copies() const {
+        return preempt_sum(llama_state_seq_copy_n_copies);
+    }
+
+    // [TAG_PREEMPT_ASYNC] A copy is running: not schedulable, but the slot still owns its cells.
+    bool preempt_in_flight() const {
+        return state == SLOT_STATE_PREEMPTING || state == SLOT_STATE_RESTORING;
+    }
+
+    bool preempt_is_out() const {
+        return state == SLOT_STATE_PREEMPTED || preempt_in_flight();
+    }
+    int32_t              n_preempt      = 0;   // times the CURRENT task has been preempted
+    int32_t              n_recompute    = 0;  // of which recompute parks
+    int32_t              n_ctx_shift    = 0;  // a slot cycling through shifts is at the pool's limit
+    int32_t              n_preempt_fail = 0;   // consecutive failed restores
+    int64_t              t_preempt_us   = 0;
+    int64_t              t_preempt_copy_us = 0;  // [TAG_PREEMPT_ASYNC]
+    bool                 preempt_rotation_refused = false;
+    bool                 preempt_hold_logged      = false;
+    bool                 preempt_grow             = false;  // the next park may pin a buffer larger than the sequence
+    int64_t              preempt_rank             = -1;     // fcfs resume order once rotated out, -1 = by arrival
+
+    // [TAG_PREEMPT] Last budget refusal: tokens, held capacity and RAM in use then; -1 when none.
+    mutable int32_t      preempt_refused_n    = -1;
+    mutable size_t       preempt_refused_held = 0;
+    mutable size_t       preempt_refused_used = 0;
+
+    // [TAG_PREEMPT] Service since the last resume, so two slots rotating for each other both make progress.
+    int64_t              t_preempt_resume_us = 0;
+    int32_t              n_gen_resume        = 0;
+
+    void preempt_mark_resumed() {
+        t_preempt_resume_us = ggml_time_us();
+        n_gen_resume        = (int32_t) stats.n_gen;
+    }
+
+    // [TAG_PREEMPT_ASYNC] Grow pinned buffers by 1.5x so a slightly longer re-park does not re-pin.
+    static size_t preempt_grown_capacity(size_t held, size_t need) {
+        // the buffers never shrink: a smaller state leaves the capacity where it was
+        if (need <= held || held == 0) {
+            return std::max(held, need);
+        }
+
+        const size_t step = 64u << 10;
+
+        return ((std::max(need, held + held / 2) + step - 1) / step) * step;
+    }
+
+    bool preempt_buf_reserve(llama_state_seq_copy * cpy, size_t size, bool grow) const {
+        const size_t held = llama_state_seq_copy_buf_capacity(cpy);
+        const size_t cap  = grow ? preempt_grown_capacity(held, size) : size;
+
+        if (llama_state_seq_copy_buf_resize(cpy, cap) == nullptr || llama_state_seq_copy_buf_resize(cpy, size) == nullptr) {
+            return false;
+        }
+
+        if (llama_state_seq_copy_buf_capacity(cpy) != held) {
+            SLT_INF(*this, "pinned park buffer %s: %.3f MiB for a %.3f MiB state\n", held == 0 ? "allocated" : "grown",
+                    llama_state_seq_copy_buf_capacity(cpy) / (1024.0 * 1024.0), size / (1024.0 * 1024.0));
+        }
+
+        return true;
+    }
+
+    size_t preempt_state_grown() const {
+        if (!preempt_is_async()) {
+            return preempt_state_required();
+        }
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        size_t res = preempt_grown_capacity(llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()), size_tgt);
+
+        // a draft buffer is held whether or not this park fills it
+        if (preempt_cpy_dft) {
+            res += preempt_grown_capacity(llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()), size_dft);
+        }
+
+        return res;
+    }
+
+    // [TAG_PREEMPT] With --preempt-ram exhausted, a park drops the cells and the resume re-prefills the tokens.
+    bool                 preempt_recompute = false;
+    bool                 preempt_reprefill = false;
+    bool                 backend_sampler   = false;  // see the re-prefill's last token in update_slots
+    server_tokens        preempt_tokens;  // prompt plus generated tokens, for the re-prefill
+
+    size_t preempt_state_size() const {
+        // Count capacity, not live size: pinned buffers persist between parks and --preempt-ram must bound them.
+        return preempt_is_async() ? preempt_sum(llama_state_seq_copy_buf_capacity)
+                                  : preempt_state_tgt.size() + preempt_state_dft.size();
+    }
+
+    void preempt_state_free() {
+        // release() can be reached while a copy still uses the buffer.
+        preempt_each(llama_state_seq_copy_buf_free);
+
+        preempt_state_tgt.clear();
+        preempt_state_tgt.shrink_to_fit();
+        preempt_state_dft.clear();
+        preempt_state_dft.shrink_to_fit();
+    }
+
+    void preempt_copy_wait() {
+        preempt_each(llama_state_seq_copy_wait);
+    }
+
+    size_t preempt_state_required() const {
+        return llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) +
+               (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
+    }
+
+    // [TAG_PREEMPT] RAM a park adds beyond what it holds, per buffer: spare target capacity cannot take the draft's state.
+    size_t preempt_state_extra() const {
+        const size_t need_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t need_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        const size_t held_tgt = preempt_is_async() ? llama_state_seq_copy_buf_capacity(preempt_cpy_tgt.get()) : preempt_state_tgt.size();
+        const size_t held_dft = preempt_is_async() ? (preempt_cpy_dft ? llama_state_seq_copy_buf_capacity(preempt_cpy_dft.get()) : 0)
+                                                   : preempt_state_dft.size();
+
+        return (need_tgt > held_tgt ? need_tgt - held_tgt : 0) + (need_dft > held_dft ? need_dft - held_dft : 0);
+    }
+
+    // Take the slot out of the next step; the draft is a prediction, so it is dropped with the cells.
+    void preempt_detach() {
+        // [TAG_PREEMPT] Accepted tokens waiting for a replay after a checkpoint restore are output already decided: keep them, the cells are at the checkpoint.
+        if (!spec_is_replay) {
+            spec_draft.clear();
+            spec_ckpt.clear();
+        }
+        spec_i_batch.clear();
+
+        i_batch = -1;
+    }
+
+    bool preempt_copy_done() {
+        return llama_state_seq_copy_done(preempt_cpy_tgt.get()) &&
+               (!preempt_cpy_dft || llama_state_seq_copy_done(preempt_cpy_dft.get()));
+    }
+
+    bool preempt_resumed() {
+        n_preempt_fail = 0;
+
+        state = state_before_preempt;
+
+        preempt_mark_resumed();
+
+        // the per-sequence speculative state stayed live while parked; begin() would reset the draft sampler's random stream
+
+        return true;
+    }
+
+    bool preempt_save_poll() {
+        if (!preempt_copy_done()) {
+            return false;
+        }
+
+        mem.seq_rm(id, -1, -1);
+
+        state = SLOT_STATE_PREEMPTED;
+
+        return true;
+    }
+
+    bool preempt_restore_poll() {
+        if (!preempt_copy_done()) {
+            return false;
+        }
+
+        llama_state_seq_copy_buf_resize(preempt_cpy_tgt.get(), 0);
+
+        if (preempt_cpy_dft) {
+            llama_state_seq_copy_buf_resize(preempt_cpy_dft.get(), 0);
+        }
+
+        return preempt_resumed();
+    }
+
+    const server_tokens & preempt_input() const {
+        return preempt_tokens.empty() ? task->tokens : preempt_tokens;
+    }
+
+    int32_t preempt_n_input() const {
+        return preempt_tokens.empty() ? (task ? task->n_tokens() : 0) : (int32_t) preempt_tokens.size();
+    }
+
+    // [TAG_PREEMPT] Recompute park: drop the cells, keep the tokens, re-prefill on resume. Sampler and counters are kept, so the stream continues; it is bit-exact only if prefill and decode numerics match.
+    bool preempt_save_recompute() {
+        preempt_state_free();
+        preempt_detach();
+
+        if (state == SLOT_STATE_GENERATING) {
+            preempt_tokens = std::move(prompt.tokens);
+            prompt.tokens  = server_tokens();
+
+            prompt.tokens.has_mtmd = preempt_tokens.has_mtmd;  // the re-prefill pushes the chunk's placeholder back
+        }
+
+        prompt_clear();
+
+        state_before_preempt     = state;
+        state                    = SLOT_STATE_PREEMPTED;
+        t_preempt_us             = ggml_time_us();
+        preempt_recompute        = true;
+        preempt_rotation_refused = false;
+
+        n_preempt++;
+        n_recompute++;
+
+        return true;
+    }
+
+    bool preempt_restore_recompute() {
+        preempt_recompute = false;
+        n_preempt_fail    = 0;
+
+        if (preempt_tokens.empty()) {
+            state = state_before_preempt;  // its prompt was not processed yet, so restart it
+
+            preempt_mark_resumed();
+
+            // The restart skips SLOT_STATE_STARTED, so reset these here or the dropped prefix is counted twice.
+            stats.n_prompt_cached    = 0;
+            stats.n_prompt_processed = 0;
+
+            return true;
+        }
+
+        preempt_reprefill = true;
+        state             = SLOT_STATE_PROCESSING_PROMPT;
+
+        return true;
+    }
+
+    void preempt_reprefill_done() {
+        preempt_reprefill = false;
+        preempt_tokens.clear();
+
+        i_batch = -1;
+        state   = SLOT_STATE_GENERATING;
+
+        preempt_mark_resumed();  // a re-prefill is not service
+
+        if (can_speculate()) {
+            common_speculative_begin(spec, id, prompt.tokens.get_text_tokens());
+        }
+    }
+
+    // [TAG_PREEMPT_ASYNC] With a transfer this only issues the copy; the cells stay the slot's until preempt_save_poll() sees it land.
+    bool preempt_save() {
+        if (preempt_fail_save()) {
+            SLT_ERR(*this, "%s", "failed to allocate the host memory for the preemption state (test knob)\n");
+            preempt_state_free();
+            return false;
+        }
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        // a state always has its header, so 0 is the size query's error return: nothing can be saved, so the cells stay
+        if (size_tgt == 0 || (ctx_dft && size_dft == 0)) {
+            SLT_ERR(*this, "%s", "could not size the sequence state, so it is not parked to host memory\n");
+            preempt_state_free();
+            return false;
+        }
+
+        if (preempt_is_async()) {
+            if (!preempt_buf_reserve(preempt_cpy_tgt.get(), size_tgt, preempt_grow) ||
+                (size_dft > 0 && (!preempt_cpy_dft ||
+                                  !preempt_buf_reserve(preempt_cpy_dft.get(), size_dft, preempt_grow)))) {
+                SLT_ERR(*this, "failed to allocate %.3f MiB of pinned host memory for the preemption state\n",
+                        (size_tgt + size_dft) / (1024.0 * 1024.0));
+                preempt_state_free();
+                return false;
+            }
+
+            // [TAG_PREEMPT_ASYNC] A large buffer can still come back pageable, and copies into pageable memory block, so this slot parks synchronously from now on.
+            const bool pageable = !llama_state_seq_copy_buf_is_pinned(preempt_cpy_tgt.get()) ||
+                                  (size_dft > 0 && !llama_state_seq_copy_buf_is_pinned(preempt_cpy_dft.get())) ||
+                                  preempt_force_pageable();
+
+            if (pageable) {
+                SLT_WRN(*this, "the host memory for a %.3f MiB park is pageable, so this slot parks synchronously from now on\n",
+                        (size_tgt + size_dft) / (1024.0 * 1024.0));
+
+                preempt_cpy_tgt.reset();
+                preempt_cpy_dft.reset();
+            } else {
+                if (llama_state_seq_copy_get(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
+                    SLT_ERR(*this, "%s", "failed to issue the copy of the target sequence out of the KV cache\n");
+                    preempt_state_free();
+                    return false;
+                }
+
+                if (size_dft > 0 &&
+                    llama_state_seq_copy_get(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
+                    SLT_ERR(*this, "%s", "failed to issue the copy of the draft sequence out of the KV cache\n");
+                    preempt_state_free();
+                    return false;
+                }
+
+                preempt_detach();
+
+                // No seq_rm() here: the copy still reads these cells; preempt_save_poll() releases them.
+                state_before_preempt = state;
+                state                = SLOT_STATE_PREEMPTING;
+                t_preempt_us         = ggml_time_us();
+
+                n_preempt++;
+
+                return true;
+            }
+        }
+
+        try {
+            preempt_state_tgt.resize(size_tgt);
+            preempt_state_dft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_ERR(*this, "failed to allocate %.3f MiB for the preemption state: %s\n",
+                    (size_tgt + size_dft) / (1024.0 * 1024.0), e.what());
+            preempt_state_free();
+            return false;
+        }
+
+        if (llama_state_seq_get_data_ext(ctx_tgt, preempt_state_tgt.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt) {
+            SLT_ERR(*this, "%s", "failed to copy the target sequence out of the KV cache\n");
+            preempt_state_free();
+            return false;
+        }
+
+        if (size_dft > 0 &&
+            llama_state_seq_get_data_ext(ctx_dft, preempt_state_dft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft) {
+            SLT_ERR(*this, "%s", "failed to copy the draft sequence out of the KV cache\n");
+            preempt_state_free();
+            return false;
+        }
+
+        preempt_detach();
+
+        // prompt.tokens is kept: the resume sizes its request from it.
+        mem.seq_rm(id, -1, -1);
+
+        state_before_preempt = state;
+        state                = SLOT_STATE_PREEMPTED;
+        t_preempt_us         = ggml_time_us();
+        preempt_rotation_refused = false;
+
+        n_preempt++;
+
+        return true;
+    }
+
+    // [TAG_PREEMPT_ASYNC] With a transfer this only issues the copy; the slot is RESTORING and its cells hold no state until it lands.
+    bool preempt_restore() {
+        if (preempt_recompute) {
+            return preempt_restore_recompute();
+        }
+
+        if (preempt_is_async()) {
+            const size_t size_tgt = llama_state_seq_copy_buf_size(preempt_cpy_tgt.get());
+            const size_t size_dft = preempt_cpy_dft ? llama_state_seq_copy_buf_size(preempt_cpy_dft.get()) : 0;
+
+            if (llama_state_seq_copy_set(preempt_cpy_tgt.get(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
+                (size_dft > 0 &&
+                 llama_state_seq_copy_set(preempt_cpy_dft.get(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft)) {
+                // Let issued copies finish before dropping the half-written sequence.
+                preempt_copy_wait();
+                mem.seq_rm(id, -1, -1);
+                n_preempt_fail++;
+                return false;
+            }
+
+            state = SLOT_STATE_RESTORING;
+
+            return true;
+        }
+
+        const size_t size_tgt = preempt_state_tgt.size();
+        const size_t size_dft = preempt_state_dft.size();
+
+        if (llama_state_seq_set_data_ext(ctx_tgt, preempt_state_tgt.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_tgt ||
+            (size_dft > 0 &&
+             llama_state_seq_set_data_ext(ctx_dft, preempt_state_dft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != size_dft)) {
+            mem.seq_rm(id, -1, -1);
+            n_preempt_fail++;
+            return false;
+        }
+
+        preempt_state_free();
+
+        return preempt_resumed();
+    }
+
+    // [TAG_PREEMPT] Rewind prompt.tokens to what the cache holds after a built batch is given up; `sampled` is kept.
+    void rewind_to_cache() {
+        // With M-RoPE media a position is not a token, so convert before truncating.
+        const llama_pos pos_cached = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
+
+        size_t n_cached = pos_cached > 0 ? prompt.tokens.size_up_to_pos(pos_cached) : 0;
+
+        // A cut inside a media chunk drops the whole chunk.
+        bool split_chunk = false;
+
+        while (n_cached > 0 && prompt.tokens.pos_next(n_cached) > pos_cached) {
+            n_cached--;
+            split_chunk = true;
+        }
+
+        if (n_cached < (size_t) prompt.n_tokens()) {
+            prompt.tokens.keep_first(n_cached);
+        }
+
+        if (split_chunk) {
+            mem.seq_rm(id, prompt.tokens.pos_next(), -1);
+        }
+
+        GGML_ASSERT(prompt.tokens.pos_next() <= pos_cached);
+
+        // The last chunk was marked done when built but never ran.
+        if (state == SLOT_STATE_DONE_PROMPT && task && prompt.n_tokens() < preempt_n_input()) {
+            state = SLOT_STATE_PROCESSING_PROMPT;
+        }
+
+        preempt_detach();
+    }
+
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
@@ -446,7 +1027,24 @@ struct server_slot {
 
         n_predict_max = -1;
 
+        preempt_state_free();
+        preempt_tokens.clear();
+        preempt_recompute    = false;
+        preempt_reprefill    = false;
+        state_before_preempt = SLOT_STATE_IDLE;
+        n_preempt            = 0;
+        n_recompute          = 0;
+        n_preempt_fail       = 0;
+        n_ctx_shift          = 0;
+        t_preempt_us         = 0;
+        t_preempt_resume_us  = 0;
+        n_gen_resume         = 0;
+        preempt_hold_logged  = false;
+        preempt_rank         = -1;
+        preempt_refused_n    = -1;
+
         llama_set_sampler(ctx_tgt, id, nullptr);
+        backend_sampler = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -493,32 +1091,7 @@ struct server_slot {
 
     bool can_split() const {
         GGML_ASSERT(task);
-        // a decision over a non-causal context reads the whole prompt in one batch
-        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
-            return false;
-        }
-        // MTP supports splitting - uses task->need_embd() not need_embd()
-        if (!task->need_embd()) {
-            return true;
-        }
-        // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-        if (!llama_get_memory(ctx_tgt)) {
-            return false;
-        }
-        // context can be chunked/split if the pooling type is LAST
-        const auto pooling = llama_pooling_type(ctx_tgt);
-        if (pooling == LLAMA_POOLING_TYPE_LAST) {
-            return true;
-        }
-        // causal rerankers read the last token and have a KV cache, so they can also be chunked/split.
-        if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
-            return true;
-        }
-        // a decision task reads its outputs from the last batch
-        if (task->type == SERVER_TASK_TYPE_DECISION) {
-            return true;
-        }
-        return false;
+        return task_can_split(*task, ctx_tgt);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -649,6 +1222,13 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
+
+            // [TAG_PREEMPT] [TAG_PREEMPT_ASYNC] A parked slot has no cells, so drop the mirror or the next task prefix-matches an empty cache; wait for any copy first.
+            if (preempt_is_out()) {
+                preempt_copy_wait();
+                preempt_state_free();
+                prompt_clear();
+            }
 
             state = SLOT_STATE_IDLE;
 
@@ -798,10 +1378,15 @@ struct server_slot {
         json res;
 
         res = {
-            {"id",            id},
-            {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
-            {"is_processing", is_processing()},
+            {"id",              id},
+            {"n_ctx",           n_ctx},
+            {"speculative",     can_speculate()},
+            {"is_processing",   is_processing()},
+            // [TAG_PREEMPT] Slots copying out or restoring still hold cells, so they count as resident.
+            {"is_preempted",    state == SLOT_STATE_PREEMPTED},
+            {"is_transferring", preempt_in_flight()},
+            {"n_preempt",       n_preempt},
+            {"n_recompute",     n_recompute},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -1029,6 +1614,9 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // [TAG_PREEMPT_ASYNC] Whether every slot still parks asynchronously, for the HTTP thread: /props is served from metadata copied at load.
+    std::atomic<bool> preempt_async_live { false };
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -1052,6 +1640,30 @@ public:
 
     void reset_metrics_bucket() {
         metrics.reset_bucket();
+    }
+
+    // [TAG_PREEMPT] The first prompt of a request that cannot be served, with its error; false if all pass.
+    // Checked up front because a park notice opens the stream with 200, after which a rejection could only be sent in-stream.
+    bool tasks_prompt_rejected(const std::vector<server_task> & tasks, json & error) const {
+        std::string msg;
+        error_type  type = ERROR_TYPE_SERVER;
+
+        for (const auto & task : tasks) {
+            if (!task_prompt_rejected(task, msg, type, /* with_sampler */ true)) {
+                continue;
+            }
+
+            error = format_error_response(msg, type);
+
+            if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
+                error["n_prompt_tokens"] = task.n_tokens();
+                error["n_ctx"]           = n_ctx_slot();
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
 private:
@@ -1118,6 +1730,17 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // [TAG_PREEMPT_ASYNC] Slots may hold copies touching KV tensors of the contexts about to be freed.
+        for (auto & slot : slots) {
+            slot.preempt_copy_wait();
+
+            slot.preempt_cpy_tgt.reset();
+            slot.preempt_cpy_dft.reset();
+        }
+
+        preempt_ram_kind_logged  = false;
+        preempt_recompute_logged = false;
+
         spec.reset();
         spec_init.reset();
 
@@ -1529,6 +2152,20 @@ private:
                 }
             };
 
+            // [TAG_PREEMPT_ASYNC] One transfer per context: each owns a backend and installs the fences the context records as a transfer is issued.
+            if (preempt_async_possible()) {
+                slot.preempt_cpy_tgt = llama_state_seq_copy_make(ctx_tgt);
+
+                if (slot.preempt_cpy_tgt && ctx_dft) {
+                    slot.preempt_cpy_dft = llama_state_seq_copy_make(ctx_dft);
+
+                    if (!slot.preempt_cpy_dft) {
+                        // a draft that cannot copy asynchronously would block mid-park, so the slot stays synchronous
+                        slot.preempt_cpy_tgt.reset();
+                    }
+                }
+            }
+
             slot.reset();
         }
 
@@ -1547,6 +2184,131 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            preempt_async_ok = !slots.empty();
+
+            for (const auto & slot : slots) {
+                preempt_async_ok = preempt_async_ok && slot.preempt_is_async();
+            }
+
+            if (preempt_async_possible()) {
+                if (preempt_async_ok) {
+                    // A host buffer type may return pageable memory, and copies into it block the issuing thread.
+                    bool pinned = llama_state_seq_copy_buf_can_pin(slots[0].preempt_cpy_tgt.get());
+
+                    if (pinned) {
+                        auto * cpy = slots[0].preempt_cpy_tgt.get();
+
+                        pinned = llama_state_seq_copy_buf_resize(cpy, 1u << 20) != nullptr &&
+                                 llama_state_seq_copy_buf_is_pinned(cpy);
+
+                        llama_state_seq_copy_buf_free(cpy);
+                    }
+
+                    if (pinned) {
+                        SRV_INF("%s", "preemption: parking and resuming asynchronously through pinned host memory\n");
+                    } else {
+                        SRV_WRN("%s", "preemption: the host memory on offer is pageable, so a copy would block the decode; parking and resuming synchronously\n");
+                        preempt_async_ok = false;
+                    }
+                } else {
+                    SRV_WRN("%s", "preemption: this backend cannot copy asynchronously, parking and resuming synchronously\n");
+                }
+            } else if (params_base.preempt_ram_mib != 0 && params_base.preempt_async &&
+                       !llama_model_is_recurrent(model_tgt) && preempt_state_relocates()) {
+                SRV_WRN("%s", "preemption: a recurrent state does not stay in one row, so a copy running beside the decode could read another sequence; parking and resuming synchronously\n");
+            }
+
+            if (!preempt_async_ok) {
+                for (auto & slot : slots) {
+                    slot.preempt_cpy_tgt.reset();
+                    slot.preempt_cpy_dft.reset();
+                }
+            }
+
+            preempt_async_all  = preempt_async_ok;
+            preempt_async_live = preempt_async_all;
+        }
+
+        {
+            preempt_alloc_granularity = (int32_t) std::max(1u, llama_memory_alloc_granularity(llama_get_memory(ctx_tgt)));
+
+            // Test knob: the paged kernel needs head size 256, which harness models lack.
+            const char * LLAMA_SERVER_PREEMPT_GRANULARITY = getenv("LLAMA_SERVER_PREEMPT_GRANULARITY");
+
+            if (LLAMA_SERVER_PREEMPT_GRANULARITY) {
+                preempt_alloc_granularity = std::max(1, atoi(LLAMA_SERVER_PREEMPT_GRANULARITY));
+
+                SRV_WRN("LLAMA_SERVER_PREEMPT_GRANULARITY = %d (test knob: planning the kv pool in blocks of %d cells)\n",
+                        preempt_alloc_granularity, preempt_alloc_granularity);
+            } else if (preempt_alloc_granularity > 1 && params_base.preempt_ram_mib != 0) {
+                SRV_INF("preemption: the kv pool allocates %d cells at a time, planning in pages\n",
+                        preempt_alloc_granularity);
+            }
+        }
+
+        {
+            preempt_resume_head = true;
+
+            const char * LLAMA_SERVER_PREEMPT_RESUME = getenv("LLAMA_SERVER_PREEMPT_RESUME");
+            if (LLAMA_SERVER_PREEMPT_RESUME && strcmp(LLAMA_SERVER_PREEMPT_RESUME, "head") != 0) {
+                if (strcmp(LLAMA_SERVER_PREEMPT_RESUME, "pass") != 0) {
+                    SRV_ERR("LLAMA_SERVER_PREEMPT_RESUME = %s is not a resume order; use head (the default) or pass\n",
+                            LLAMA_SERVER_PREEMPT_RESUME);
+                    return false;
+                }
+                preempt_resume_head = false;
+                SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_RESUME = pass (parked slots come back most-preempted first, and a smaller slot may pass a head that does not fit)\n");
+            }
+
+            const char * LLAMA_SERVER_PREEMPT_EVERY = getenv("LLAMA_SERVER_PREEMPT_EVERY");
+            preempt_test_every = LLAMA_SERVER_PREEMPT_EVERY ? atoi(LLAMA_SERVER_PREEMPT_EVERY) : 0;
+
+            preempt_fcfs = params_base.preempt_policy == "fcfs";
+
+            // LLAMA_SERVER_PREEMPT_POLICY: fcfs or cost, as --preempt-policy when neither that flag nor LLAMA_ARG_PREEMPT_POLICY was given; or a cost test knob: smallest (default), largest, youngest or oldest.
+            const char * LLAMA_SERVER_PREEMPT_POLICY = getenv("LLAMA_SERVER_PREEMPT_POLICY");
+            preempt_test_policy = "smallest";
+
+            if (LLAMA_SERVER_PREEMPT_POLICY && (strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0 || strcmp(LLAMA_SERVER_PREEMPT_POLICY, "cost") == 0)) {
+                if (!params_base.preempt_policy_set) {
+                    preempt_fcfs = strcmp(LLAMA_SERVER_PREEMPT_POLICY, "fcfs") == 0;
+                }
+            } else if (LLAMA_SERVER_PREEMPT_POLICY) {
+                preempt_test_policy = LLAMA_SERVER_PREEMPT_POLICY;
+            }
+
+            if (preempt_test_policy != "smallest") {
+                SRV_WRN("LLAMA_SERVER_PREEMPT_POLICY = %s (test knob: victim choice for comparison only)\n", preempt_test_policy.c_str());
+            }
+
+            if (preempt_test_every > 0) {
+                SRV_WRN("LLAMA_SERVER_PREEMPT_EVERY = %d (test knob: preempting every slot every %d tokens)\n",
+                        preempt_test_every, preempt_test_every);
+            }
+
+            const char * LLAMA_SERVER_PREEMPT_PLANNER = getenv("LLAMA_SERVER_PREEMPT_PLANNER");
+            preempt_planner_off = LLAMA_SERVER_PREEMPT_PLANNER && strcmp(LLAMA_SERVER_PREEMPT_PLANNER, "off") == 0;
+
+            if (preempt_planner_off) {
+                SRV_WRN("%s", "LLAMA_SERVER_PREEMPT_PLANNER = off (test knob: nothing is parked ahead of the decode, only as a last resort)\n");
+            }
+
+            // assigned, not only set: a reload with an attention model after a recurrent one re-enables preemption
+            preempt_recurrent = llama_model_is_recurrent(model_tgt);
+
+            if (preempt_recurrent && params_base.preempt_ram_mib != 0) {
+                SRV_WRN("%s", "preemption: off, the recurrent cache holds one state per sequence whatever its length, so there is no cell pool to run out of\n");
+            }
+
+            // [TAG_PREEMPT] A cache with its own cells per sequence (DeepSeek V4, even when unified): parking one frees nothing another sequence could use.
+            preempt_unshared = !preempt_recurrent && llama_get_memory(ctx_tgt) && !llama_memory_shares_cells(llama_get_memory(ctx_tgt));
+
+            if (preempt_unshared && params_base.kv_unified && params_base.preempt_ram_mib != 0) {
+                SRV_WRN("%s", "preemption: off, this cache keeps its own cells per sequence even when unified, so parking one frees no room for another\n");
             }
         }
 
@@ -1570,6 +2332,13 @@ private:
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
         if (decision.type != COMMON_DECISION_TYPE_NONE && !params_base.cache_ram_explicit) {
             SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
+            params_base.cache_ram_mib    = 0;
+            params_base.cache_idle_slots = false;
+        }
+
+        // [TAG_EXACT_CONCURRENCY] Exact mode prefills every prompt in full (slot_reuses_prefix()), so a state restored from RAM would be thrown away
+        if (common_exact_concurrency() && (params_base.cache_ram_mib != 0 || params_base.cache_idle_slots)) {
+            SRV_INF("%s", "exact concurrency: prompt cache disabled, prompts are always prefilled in full\n");
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
         }
@@ -2033,9 +2802,10 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                slot.backend_sampler = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.backend_sampler = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2299,6 +3069,24 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void send_preempt_notice(server_slot & slot, bool parked, bool recomputed = false) {
+        if (!slot.task || !slot.task->params.stream) {
+            return;
+        }
+
+        auto res = std::make_unique<server_task_result_preempt_notice>();
+
+        res->id         = slot.task->id;
+        res->index      = slot.task->index;
+        res->id_slot    = slot.id;
+        res->parked     = parked;
+        res->recomputed = recomputed;
+        res->n_preempt  = slot.n_preempt;
+        res->batched    = slot.task->batched;
+
+        queue_results.send(std::move(res));
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -2388,6 +3176,9 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+        res->n_preempt             = slot.n_preempt;
+        res->n_recompute           = slot.n_recompute;
+        res->preempt_report        = preempt_last_resort_possible();
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
@@ -2647,6 +3438,9 @@ private:
             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
             }
+
+            // [TAG_PREEMPT] copy_prompt_to() replaces it once the parent's prompt is in; until then those cells could neither be used nor parked
+            slot->prompt_clear();
 
             int id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
@@ -3097,10 +3891,14 @@ private:
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
+                    int n_preempted_slots  = 0;
 
                     for (server_slot & slot : slots) {
                         if (slot.is_processing()) {
                             n_processing_slots++;
+                        }
+                        if (slot.preempt_is_out()) {
+                            n_preempted_slots++;
                         }
                     }
                     SRV_DBG("n_processing_slots = %d\n", n_processing_slots);
@@ -3109,6 +3907,8 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->n_preempted_slots   = n_preempted_slots;
+                    res->preempt_ram_bytes   = preempt_ram_used();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -3365,9 +4165,13 @@ private:
 
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            // [TAG_PREEMPT] Parked or copying slots took no part in the failure.
+            if (slot.is_processing() && !slot.preempt_is_out()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+
+                // the batch builder already counted tokens that never reached the cells, so a retry must not reuse them (as on a failed decode)
+                slot.prompt_clear();
             }
         }
     }
@@ -3401,6 +4205,1639 @@ private:
         ~scoped_timer() {}
     };
 #endif
+
+
+    // LLAMA_SERVER_PREEMPT_EVERY=N: preempt every generating slot every N tokens, for the determinism test.
+    int32_t preempt_test_every = 0;
+    std::string preempt_test_policy = "smallest"; // LLAMA_SERVER_PREEMPT_POLICY, see load_model
+
+    // [TAG_PREEMPT] --preempt-policy fcfs: park the newest arrival, resume and reserve in arrival order.
+    bool preempt_fcfs = false;
+
+    bool preempt_async_ok  = false;  // some slot still parks asynchronously: keep the async margin
+    bool preempt_async_all = false;  // every slot does, as /props reports
+
+
+    void preempt_async_refresh() {
+        preempt_async_ok  = false;
+        preempt_async_all = !slots.empty();
+
+        for (const auto & slot : slots) {
+            preempt_async_ok  = preempt_async_ok  || slot.preempt_is_async();
+            preempt_async_all = preempt_async_all && slot.preempt_is_async();
+        }
+
+        preempt_async_live = preempt_async_all;
+    }
+
+    // [TAG_EXACT_CONCURRENCY] Pool allocation granularity: 1, or the page size under exact concurrency; LLAMA_SERVER_PREEMPT_GRANULARITY overrides.
+    int32_t preempt_alloc_granularity = 1;
+
+    int32_t preempt_n_cells(int32_t n_tokens) const {
+        return preempt_n_cells_g(n_tokens, preempt_alloc_granularity);
+    }
+
+    int32_t preempt_n_cells_step(int32_t n_tokens, int32_t n_step) const {
+        return preempt_n_cells_step_g(n_tokens, n_step, preempt_alloc_granularity);
+    }
+
+    // LLAMA_SERVER_PREEMPT_PLANNER=off (test knob): only the KV-full retry ladder.
+    bool preempt_planner_off = false;
+
+    // LLAMA_SERVER_PREEMPT_RESUME=head or pass, read at load, per context
+    bool preempt_resume_head = true;
+
+    bool preempt_recurrent = false;
+
+    bool preempt_unshared = false;  // the sequences do not draw on one pool of cells
+
+    bool preempt_batch_abandoned = false;
+
+    // [TAG_PREEMPT_ASYNC] A context shift is pending; it is applied in place inside the next llama_decode.
+    bool preempt_shift_pending = false;
+
+    int32_t preempt_n_spec_max() const {
+        return spec ? std::max(0, common_speculative_n_max(&params_base.speculative)) : 0;
+    }
+
+    bool preempt_ram_kind_logged = false;
+
+    bool preempt_recompute_logged = false;
+
+    void preempt_log_ram_kind(const server_slot & slot) {
+        if (preempt_ram_kind_logged || !slot.preempt_is_async()) {
+            return;
+        }
+
+        if (llama_state_seq_copy_buf_capacity(slot.preempt_cpy_tgt.get()) == 0) {
+            return;
+        }
+
+        preempt_ram_kind_logged = true;
+
+        SRV_INF("preemption: parking into %s host memory\n",
+                llama_state_seq_copy_buf_is_pinned(slot.preempt_cpy_tgt.get()) ? "pinned" : "pageable");
+    }
+
+    int32_t preempt_n_spec(const server_slot & slot) const {
+        int32_t res = preempt_n_spec_max();
+
+        if (res == 0 || !slot.task || !slot.can_speculate()) {
+            return 0;
+        }
+
+        // A recompute park emptied the prompt, so bound the draft by preempt_tokens; reading the empty prompt once failed a fitting sequence as impossible.
+        // A generating slot reads its own prompt: a context shift made it shorter than the task's, and the task's would undercharge the draft.
+        const bool    generating   = slot.state == SLOT_STATE_GENERATING || (slot.preempt_is_out() && slot.state_before_preempt == SLOT_STATE_GENERATING);
+        const bool    n_from_input = slot.preempt_recompute || slot.preempt_reprefill || !generating;
+        const int32_t n_tokens     = n_from_input ? std::max(slot.prompt.n_tokens(), slot.preempt_n_input()) : slot.prompt.n_tokens();
+
+        res = std::min(res, slot.n_ctx - n_tokens - 2);
+
+        if (slot.n_remaining() > 0) {
+            res = std::min(res, slot.n_remaining() - 1);
+        }
+
+        return std::max(0, res);
+    }
+
+    size_t preempt_ram_used() const {
+        size_t res = 0;
+
+        for (const auto & slot : slots) {
+            res += slot.preempt_state_size();
+        }
+
+        return res;
+    }
+
+    // [TAG_PREEMPT_ASYNC] Restored slots keep pinned buffers; free the largest first when a park does not fit --preempt-ram.
+    void preempt_reclaim_idle_ram(size_t budget, size_t extra, const server_slot & keep) {
+        for (;;) {
+            if (preempt_ram_used() + extra <= budget) {
+                return;
+            }
+
+            server_slot * best = nullptr;
+
+            for (auto & other : slots) {
+                if (&other == &keep) {
+                    continue;
+                }
+
+                if (other.state == SLOT_STATE_PREEMPTED || other.state == SLOT_STATE_PREEMPTING || other.state == SLOT_STATE_RESTORING) {
+                    continue;
+                }
+
+                if (other.preempt_state_size() == 0) {
+                    continue;
+                }
+
+                if (!best || other.preempt_state_size() > best->preempt_state_size()) {
+                    best = &other;
+                }
+            }
+
+            if (!best) {
+                return;
+            }
+
+            SLT_INF(*best, "%.1f MiB of idle parked RAM returned so that another slot can park\n",
+                    best->preempt_state_size() / (1024.0 * 1024.0));
+
+            best->preempt_state_free();
+        }
+    }
+
+    size_t preempt_ram_budget() const {
+        if (params_base.preempt_ram_mib < 0) {
+            return SIZE_MAX;
+        }
+
+        // in 64 bits, saturated: a 32-bit size_t wraps 4096 MiB to 0
+        const uint64_t bytes = (uint64_t) params_base.preempt_ram_mib * 1024 * 1024;
+
+        return bytes > (uint64_t) SIZE_MAX ? SIZE_MAX : (size_t) bytes;
+    }
+
+    bool preempt_fits_budget(const server_slot & slot) {
+        const size_t budget = preempt_ram_budget();
+
+        if (budget == SIZE_MAX) {
+            return true;  // unlimited: no need to size the state
+        }
+
+        // Capacity this slot already holds is reused, so the park costs only the rest.
+        const size_t held = slot.preempt_state_size();
+
+        // [TAG_PREEMPT] Sizing walks the pool; a state that only grew cannot fit where it did not, unless RAM was freed.
+        if (slot.preempt_refused_n >= 0 && slot.prompt.n_tokens() >= slot.preempt_refused_n &&
+            held <= slot.preempt_refused_held && preempt_ram_used() >= slot.preempt_refused_used &&
+            !preempt_idle_ram_reclaimable(slot)) {
+            return false;
+        }
+
+        const size_t extra = slot.preempt_state_extra();
+
+        preempt_reclaim_idle_ram(budget, extra, slot);
+
+        const bool res = preempt_ram_used() + extra <= budget;
+
+        slot.preempt_refused_n    = res ? -1 : slot.prompt.n_tokens();
+        slot.preempt_refused_held = held;
+        slot.preempt_refused_used = preempt_ram_used();
+
+        return res;
+    }
+
+    // preempt_reclaim_idle_ram() could free host RAM for `keep`.
+    bool preempt_idle_ram_reclaimable(const server_slot & keep) const {
+        for (const auto & other : slots) {
+            if (&other != &keep && !other.preempt_is_out() && other.preempt_state_size() > 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void preempt_trim_ram(server_slot & slot) {
+        if (preempt_ram_used() > preempt_ram_budget() && slot.preempt_state_size() > 0) {
+            SLT_INF(slot, "%.1f MiB of parked RAM returned: the pool is over its budget\n", slot.preempt_state_size() / (1024.0 * 1024.0));
+            slot.preempt_state_free();
+        }
+    }
+
+    // The batch builder reuses a cached prefix only for a stateful task, and never under exact concurrency, where the cached cells
+    // were computed in other ubatches than a cold prompt's and would make the output depend on what ran before.
+    static bool slot_reuses_prefix(const server_task & task) {
+        return task.params.cache_prompt && !task.is_stateless() && !common_exact_concurrency();
+    }
+
+    size_t preempt_n_keep(const server_slot & slot) const {
+        if (!slot_reuses_prefix(*slot.task)) {
+            return 0;
+        }
+
+        // [TAG_PREEMPT] Cache reuse shifts chunks from beyond the common prefix back in, so the whole cached prompt is kept for it to search.
+        if (slot.task->params.n_cache_reuse > 0 && llama_memory_can_shift(llama_get_memory(ctx_tgt)) && !slot.prompt.tokens.has_mtmd) {
+            return slot.prompt.tokens.size();
+        }
+
+        size_t n_keep = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+
+        // the bounds the batch builder applies to n_past: a decision group's children start from the shared prefix, and a decision's first position is evaluated
+        if (slot.task->n_tokens_shared > 0) {
+            n_keep = std::min(n_keep, (size_t) slot.task->n_tokens_shared);
+        }
+
+        if (const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1; n_decision_first >= 0) {
+            n_keep = std::min(n_keep, (size_t) n_decision_first);
+        }
+
+        if (slot.alora_invocation_start > 0) {
+            n_keep = std::min(n_keep, (size_t) (slot.alora_invocation_start - 1));
+        }
+
+        return n_keep;
+    }
+
+    // A freshly assigned slot still mirrors the previous prompt, so count from preempt_n_keep().
+    int32_t preempt_n_retained(const server_slot & slot) const {
+        if (slot.preempt_recompute) {
+            return slot.preempt_n_input();  // a recompute park needs all its cells back at once; a prompt dropped in its prefill restarts, so it waits for room for all of it
+        }
+
+        if (slot.state == SLOT_STATE_STARTED && slot.task) {
+            return (int32_t) preempt_n_keep(slot);
+        }
+
+        return slot.prompt.n_tokens();
+    }
+
+    // [TAG_PREEMPT] Cells for media chunks pending at n_have: pre_decode() runs them outside any kv-full retry, so reserve them up front.
+    int32_t preempt_n_mtmd_pending(const server_slot & slot, int32_t n_have) const {
+        if (!slot.task || !slot.task->tokens.has_mtmd) {
+            return 0;
+        }
+
+        const auto & tokens = slot.task->tokens;
+
+        int32_t res = 0;
+
+        for (int32_t i = n_have; i >= 0 && i < (int32_t) tokens.size(); ) {
+            const int32_t n = (int32_t) tokens.chunk_n_tokens_at(i);
+
+            if (n <= 0) {
+                break;
+            }
+
+            res += n;
+            i   += n;
+        }
+
+        return res;
+    }
+
+    int32_t preempt_n_need(const server_slot & slot) const {
+        int32_t res = preempt_n_retained(slot);
+
+        if (slot.state_before_preempt == SLOT_STATE_GENERATING) {
+            res += 1 + preempt_n_spec(slot);
+        } else {
+            const int32_t n_mtmd = preempt_n_mtmd_pending(slot, res);
+            const int32_t n_left = slot.preempt_n_input() - res;
+
+            // a prompt held in full needs no further cell: a non-causal one may be exactly n_ctx long, as admission allows
+            res += n_mtmd > 0 ? n_mtmd : std::max(0, std::min((int32_t) llama_n_batch(ctx_tgt), n_left));
+        }
+
+        // [TAG_EXACT_CONCURRENCY] A restore takes fresh pages and its tail page counts in full; undercounting admits a resume find_slot cannot satisfy.
+        return preempt_n_cells(res);
+    }
+
+    // [TAG_PREEMPT] Prompt tokens a family member shares with the one charged first: n_cmpl > 1 clones share all of it, a decision group only its parent's first n_tokens_shared.
+    static int32_t preempt_family_n_shared(const server_task & task) {
+        return task.family_n_shared > 0 ? task.family_n_shared : task.n_tokens();
+    }
+
+    // [TAG_PREEMPT] Occupancy read from the KV cells themselves: a cell several sequences share counts once, whoever's task tree it came from.
+    // With n_idle, also the cells only idle slots hold, which purging them would free. -1 when the memory cannot tell; the estimates below are the fallback.
+    // The memory whose cells the planner can read, or null: LLAMA_SERVER_PREEMPT_GRANULARITY (test knob) plans in blocks the memory does not have.
+    llama_memory_t preempt_kv_mem() const {
+        llama_memory_t mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+
+        return mem && (uint32_t) preempt_alloc_granularity == llama_memory_alloc_granularity(mem) ? mem : nullptr;
+    }
+
+    // [TAG_PREEMPT] Cells freed if these sequences all went: a prefix one of them shares with a sequence that stays is not counted. -1 if unknown.
+    int32_t preempt_kv_reclaim(const std::vector<llama_seq_id> & seqs) const {
+        llama_memory_t mem = preempt_kv_mem();
+        int32_t        res = -1;
+
+        if (!mem || llama_memory_n_cells_used(mem, seqs.data(), seqs.size(), &res) < 0) {
+            return -1;
+        }
+
+        return res;
+    }
+
+    int32_t preempt_kv_cells(int32_t * n_idle) const {
+        llama_memory_t mem = preempt_kv_mem();
+        if (!mem) {
+            return -1;
+        }
+
+        std::vector<llama_seq_id> idle;
+        if (n_idle) {
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    idle.push_back(slot.id);
+                }
+            }
+        }
+
+        return llama_memory_n_cells_used(mem, idle.data(), idle.size(), n_idle);
+    }
+
+    int32_t preempt_kv_used() const {
+        if (const int32_t n = preempt_kv_cells(nullptr); n >= 0) {
+            return n;
+        }
+
+        int32_t res = 0;
+
+        // n_cmpl > 1 siblings share the prompt's cells via seq_cp, so charge them once.
+        std::vector<int> charged;
+
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTED) {
+                continue;  // parked: its cells are in host RAM
+            }
+
+            // [TAG_PREEMPT_ASYNC] Not skipped: a slot mid-copy still holds cells, and skipping it would hand them out twice.
+
+            if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                res += preempt_n_cells(slot.prompt.n_tokens());
+                continue;
+            }
+
+            // [TAG_PREEMPT] A finished member's cached prompt still shares the family's cells, so an idle slot counts as the member it last served.
+            const server_task * member = slot.task ? slot.task.get() : (!slot.is_processing() ? slot.task_prev.get() : nullptr);
+
+            if (member && (member->is_parent() || member->is_child())) {
+                const int family = member->is_parent() ? member->id : member->id_parent;
+
+                if (std::find(charged.begin(), charged.end(), family) != charged.end()) {
+                    res += preempt_n_cells(std::max(0, slot.prompt.n_tokens() - preempt_family_n_shared(*member)));
+                    continue;
+                }
+
+                charged.push_back(family);
+            }
+
+            res += preempt_n_cells(slot.prompt.n_tokens());
+        }
+
+        return res;
+    }
+
+    // [TAG_PREEMPT] Cells a slot holds once its output limit is reached; -1 if it has no limit.
+    int32_t preempt_n_final(const server_slot & slot) const {
+        if (!slot.task || slot.n_remaining() < 0) {
+            return -1;
+        }
+
+        // a generating slot, also one parked in RAM, reads its own prompt: a context shift made it shorter than the task's
+        const bool    generating = slot.state == SLOT_STATE_GENERATING || (slot.preempt_is_out() && slot.state_before_preempt == SLOT_STATE_GENERATING);
+        const int32_t n_cur      = std::max(slot.prompt.n_tokens(), !generating || slot.preempt_recompute || slot.preempt_reprefill ? slot.preempt_n_input() : 0);
+
+        // n_predict may be INT32_MAX: sum in 64 bits before clamping
+        return preempt_n_cells((int32_t) std::min<int64_t>(slot.n_ctx, int64_t(n_cur) + slot.n_remaining() + 1));
+    }
+
+    // Cells the residents hold once each reaches its output limit; -1 if one has no limit, or shares cells with a sibling. 64 bits: many slots of a large context overflow 32.
+    int64_t preempt_kv_projected() const {
+        int64_t res = 0;
+
+        for (const auto & slot : slots) {
+            if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED) {
+                continue;
+            }
+
+            // [TAG_PREEMPT] A held prompt does not grow before the head has had its turn: charge only the cells it sits on, as preempt_kv_reserve() does.
+            if (preempt_held(slot)) {
+                res += preempt_n_cells(slot.prompt.n_tokens());
+                continue;
+            }
+
+            const int32_t n = preempt_n_final(slot);
+
+            if (n < 0 || preempt_is_family(slot) || slot.state == SLOT_STATE_WAIT_OTHER) {
+                return -1;
+            }
+
+            res += n;
+        }
+
+        return res;
+    }
+
+    int32_t preempt_n_idle_cells() const {
+        if (int32_t n_idle = 0; preempt_kv_cells(&n_idle) >= 0) {
+            return n_idle;
+        }
+
+        int32_t res = 0;
+
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                res += preempt_n_cells(slot.prompt.n_tokens());
+            }
+        }
+
+        return res;
+    }
+
+    // [TAG_PREEMPT_ASYNC] Room kept free so running slots can keep decoding until a park lands; resume candidates are charged the same.
+    int32_t preempt_n_margin(int32_t n_additional_running = 0) const {
+        if (!preempt_async_ok) {
+            // [TAG_EXACT_CONCURRENCY] One step can cost a whole page.
+            return preempt_n_cells(PREEMPT_N_MARGIN);
+        }
+
+        int32_t n_running = n_additional_running;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && (!slot.preempt_is_out() || slot.state == SLOT_STATE_RESTORING)) {
+                n_running++;
+            }
+        }
+
+        // [TAG_EXACT_CONCURRENCY] Round up once, not per slot, or a page per slot is wasted.
+        return preempt_n_cells(
+                PREEMPT_N_MARGIN + n_running * (1 + preempt_n_spec_max()) * PREEMPT_N_ASYNC_STEPS);
+    }
+
+    int32_t preempt_kv_reserve() const {
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        int32_t res     = 0;
+        int32_t res_pmt = 0;
+        int32_t res_mm  = 0;
+        int32_t n_pmt   = 0;
+
+        // [TAG_EXACT_CONCURRENCY] Reserve the cells the next step adds: used already rounds tail pages up, so only a page crossing costs.
+        for (const auto & slot : slots) {
+            const int32_t n_cur = slot.prompt.n_tokens();
+
+            // [TAG_PREEMPT_ASYNC] A restoring slot decodes as soon as its copy lands, so charge the step of the state it returns to.
+            const slot_state state = slot.state == SLOT_STATE_RESTORING ? slot.state_before_preempt : slot.state;
+
+            switch (state) {
+                case SLOT_STATE_GENERATING:
+                case SLOT_STATE_DONE_PROMPT:
+                    {
+                        // [TAG_PREEMPT] A realtime transcription step decodes the audio rows it holds: its first step is the whole prefix at once.
+                        const int32_t n_audio = slot.audio_stream ? (int32_t) (slot.inp_embd.size() / batch.n_embd) : 0;
+
+                        res += preempt_n_cells_step(n_cur, n_audio > 0 ? n_audio : 1 + preempt_n_spec(slot));
+                    } break;
+                case SLOT_STATE_STARTED:
+                case SLOT_STATE_PROCESSING_PROMPT:
+                    {
+                        // [TAG_PREEMPT] A prompt held for a parked head takes no step.
+                        if (preempt_held(slot)) {
+                            break;
+                        }
+
+                        const int32_t n_have = preempt_n_retained(slot);
+                        const int32_t n_mtmd = preempt_n_mtmd_pending(slot, n_have);
+
+                        // a media chunk is decoded whole, past the batch cap and the kv-full retry
+                        if (n_mtmd > 0) {
+                            res_mm += preempt_n_cells_step(n_have, n_mtmd);
+                            break;
+                        }
+
+                        const int32_t n_left = slot.preempt_n_input() - n_have;
+
+                        // [TAG_PREEMPT] A re-prefill keeps the room it was resumed into, or later restores take it and park it again with no progress.
+                        if (slot.preempt_reprefill) {
+                            res += preempt_n_cells_step(n_have, std::max(0, n_left) + 1 + preempt_n_spec(slot));
+                            break;
+                        }
+
+                        // a prompt held in full needs no further cell: the builder re-evaluates its last token in the cell it frees, as preempt_n_need() counts
+                        res_pmt += preempt_n_cells_step(n_have, std::max(0, std::min(n_batch, n_left)));
+                        n_pmt++;
+                    } break;
+                default:
+                    break;
+            }
+        }
+
+        return res + res_mm + std::min(res_pmt, preempt_n_cells(n_batch) + std::max(0, n_pmt - 1) * (preempt_alloc_granularity - 1));
+    }
+
+    // [TAG_PREEMPT] Trim a just-started slot to its kept prefix first, or it is sized by the previous request's prompt.
+    bool preempt_normalize_started_all() {
+        bool res = false;
+
+        for (auto & slot : slots) {
+            const int32_t before = slot.prompt.n_tokens();
+
+            preempt_normalize_started(slot);
+
+            if (slot.prompt.n_tokens() < before) {
+                SLT_INF(slot, "trimmed to the %d cells its request keeps ahead of the batch builder, %d released\n",
+                        slot.prompt.n_tokens(), before - slot.prompt.n_tokens());
+                res = true;
+            }
+        }
+
+        return res;
+    }
+
+    void preempt_normalize_started(server_slot & slot) {
+        if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+            return;
+        }
+
+        const size_t n_keep = preempt_n_keep(slot);
+
+        if (n_keep >= slot.prompt.tokens.size()) {
+            return;
+        }
+
+        // A memory without partial removal aborts on one, so drop the whole stale sequence.
+        const bool partial_ok = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                                (!ctx_dft || ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+
+        if (!partial_ok) {
+            slot.prompt.tokens.clear();
+            slot.mem.seq_rm(slot.id, -1, -1);
+            return;
+        }
+
+        slot.prompt.tokens.keep_first(n_keep);
+        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+        // [TAG_PREEMPT] A sliding window holds only the newest cells: cut below them, nothing of the prefix is left, and the reuse check aborts on an empty sequence that claims tokens.
+        if (n_keep > 0 && llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) == -1) {
+            slot.prompt.tokens.clear();
+            slot.mem.seq_rm(slot.id, -1, -1);
+        }
+    }
+
+    // `recompute`: no victim fits the host budget, so pick again and drop cells instead of copying. `n_deficit`: a single victim covering it is preferred over several smaller ones.
+    server_slot * preempt_pick_victim(bool * recompute = nullptr, int32_t n_deficit = 0) {
+        server_slot * leader    = nullptr;
+        int32_t       n_running = 0;
+
+        for (auto & slot : slots) {
+            preempt_normalize_started(slot);
+        }
+
+        // [TAG_PREEMPT] A started slot is not the leader: the cells it keeps are an earlier request's, and exempting them would park an older request already running.
+        for (auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out()) {
+                n_running++;
+
+                const bool started     = slot.state == SLOT_STATE_STARTED;
+                const bool started_cur = leader && leader->state == SLOT_STATE_STARTED;
+
+                if (!leader || (started_cur && !started) || (started == started_cur && slot.prompt.n_tokens() > leader->prompt.n_tokens())) {
+                    leader = &slot;
+                }
+            }
+        }
+
+        if (n_running < 2) {
+            // a conversation that does not fit alone is a real overflow
+            return nullptr;
+        }
+
+        if (preempt_fcfs) {
+            return preempt_pick_victim_fcfs(recompute);
+        }
+
+        // the largest-policy test knob exempts nobody; an n_cmpl > 1 leader cannot be parked anyway, so exempting it keeps nobody else safe
+        const server_slot * exempt = preempt_test_policy == "largest" || !preempt_parkable(*leader) ? nullptr : leader;
+
+        // only the default policy weighs the deficit; the others pin the order
+        if (preempt_test_policy != "smallest") {
+            n_deficit = 0;
+        }
+
+        server_slot * victim = preempt_pick_victim_pass_any(exempt, recompute, n_deficit);
+
+        // [TAG_PREEMPT] Beside slots that cannot be parked (n_cmpl > 1, TTS, realtime transcription) the leader may be the only one that can; parking it lets them finish.
+        if (!victim && exempt && preempt_any_unparkable_running()) {
+            victim = preempt_pick_victim_pass_any(nullptr, recompute, n_deficit);
+        }
+
+        return victim;
+    }
+
+    server_slot * preempt_pick_victim_pass_any(const server_slot * exempt, bool * recompute, int32_t n_deficit) {
+        server_slot * victim = preempt_pick_victim_pass(exempt, false, n_deficit);
+
+        if (!victim && recompute) {
+            victim = preempt_pick_victim_pass(exempt, true, n_deficit);
+
+            *recompute = victim != nullptr;
+        }
+
+        return victim;
+    }
+
+    // [TAG_PREEMPT] The most recently arrived resident, never the oldest, which always runs. Copied if the budget holds it, else dropped.
+    server_slot * preempt_pick_victim_fcfs(bool * recompute) {
+        // [TAG_PREEMPT] Beside held prompts the oldest can be the only eligible slot; parked, it is resumed first, so it would ping-pong at the window's end instead of finishing.
+        const server_slot * oldest = nullptr;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && slot.task && (!oldest || slot.task->id < oldest->task->id)) {
+                oldest = &slot;
+            }
+        }
+
+        const auto pick = [&](const server_slot * exempt) {
+            server_slot * res = nullptr;
+
+            for (auto & slot : slots) {
+                if (&slot != exempt && preempt_victim_eligible(slot, nullptr, true) && (!res || slot.task->id > res->task->id)) {
+                    res = &slot;
+                }
+            }
+
+            return res;
+        };
+
+        server_slot * victim = pick(oldest);
+
+        // [TAG_PREEMPT] Beside slots that cannot be parked (n_cmpl > 1, TTS, realtime transcription) the oldest may be the only one that can; parking it lets them finish. A held one would not take the cells, so it does not count.
+        if (!victim && oldest) {
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && !slot.preempt_is_out() && !preempt_parkable(slot) && !preempt_held(slot)) {
+                    victim = pick(nullptr);
+                    break;
+                }
+            }
+        }
+
+        if (victim && !preempt_fits_budget(*victim)) {
+            if (!recompute) {
+                return nullptr;
+            }
+
+            *recompute = true;
+        }
+
+        return victim;
+    }
+
+    static bool preempt_is_family(const server_slot & slot) {
+        return slot.task && (slot.task->is_parent() || slot.task->is_child());
+    }
+
+    bool preempt_any_unparkable_running() const {
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && !preempt_parkable(slot)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Cells a park of this slot releases; a prefix it shares with another sequence stays.
+    int32_t preempt_n_freed_cells(const server_slot & slot) const {
+        if (const int32_t n = preempt_kv_reclaim({ slot.id }); n >= 0) {
+            return n;
+        }
+
+        return preempt_n_cells(slot.prompt.n_tokens());
+    }
+
+    int32_t preempt_n_freed(const server_slot & slot) const {
+        const int32_t n_cur = slot.prompt.n_tokens();
+
+        int32_t res = preempt_n_freed_cells(slot);
+
+        if (slot.state == SLOT_STATE_GENERATING) {
+            res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
+        } else if (!preempt_held(slot)) {
+            const int32_t n_have = preempt_n_retained(slot);
+            const int32_t n_mtmd = preempt_n_mtmd_pending(slot, n_have);
+            const int32_t n_left = slot.preempt_n_input() - n_have;
+
+            if (n_mtmd == 0 && slot.preempt_reprefill) {
+                res += preempt_n_cells_step(n_have, std::max(0, n_left) + 1 + preempt_n_spec(slot));  // as preempt_kv_reserve() charges it
+            } else {
+                res += preempt_n_cells_step(n_have, n_mtmd > 0 ? n_mtmd : std::max(0, std::min((int32_t) llama_n_batch(ctx_tgt), n_left)));
+            }
+        }
+
+        return res;
+    }
+
+    // [TAG_PREEMPT] The one check every victim and rotation selector applies, and preempt_park() enforces: see server_task::preempt_resumable().
+    static bool preempt_parkable(const server_slot & slot) {
+        return slot.task && slot.task->preempt_resumable();
+    }
+
+    bool preempt_victim_eligible(server_slot & slot, const server_slot * exempt, bool recompute) {
+        // Before the batch is built every slot is at a token boundary; a slot holding no cells is still worth parking.
+        if (slot.state != SLOT_STATE_GENERATING &&
+            slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+            slot.state != SLOT_STATE_STARTED) {
+            return false;
+        }
+
+        if (&slot == exempt) {
+            return false;
+        }
+
+        if (preempt_held(slot) && slot.prompt.n_tokens() == 0) {
+            return false;
+        }
+
+        if (!preempt_parkable(slot)) {
+            return false;
+        }
+
+        // A started slot about to be rejected gets its own 4xx; a park notice would turn it into 200 plus an in-stream error.
+        if (slot.state == SLOT_STATE_STARTED) {
+            std::string msg;
+            error_type  type = ERROR_TYPE_SERVER;
+
+            if (slot_prompt_rejected(slot, msg, type)) {
+                return false;
+            }
+        }
+
+        if (!recompute && !preempt_fits_budget(slot)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // A slot mid re-prefill has produced nothing since it was dropped, so it is protected like a starved one.
+    static bool preempt_starved(const server_slot & slot) {
+        return slot.n_preempt >= PREEMPT_N_STARVED || slot.preempt_reprefill;
+    }
+
+    server_slot * preempt_pick_victim_pass(const server_slot * exempt, bool recompute, int32_t n_deficit = 0) {
+        server_slot * victim = nullptr;
+
+        server_slot * cover[2] = { nullptr, nullptr };
+
+        for (auto & slot : slots) {
+            if (!preempt_victim_eligible(slot, exempt, recompute)) {
+                continue;
+            }
+
+            const bool starved     = preempt_starved(slot);
+            const bool starved_cur = victim && preempt_starved(*victim);
+
+            if (!victim ||
+                (starved_cur && !starved) ||
+                (starved_cur == starved && preempt_better_victim(slot, *victim))) {
+                victim = &slot;
+            }
+
+            if (n_deficit > 0) {
+                const int32_t n_freed = preempt_n_freed(slot);
+
+                server_slot *& best = cover[starved ? 1 : 0];
+
+                if (n_freed >= n_deficit && (!best || n_freed < preempt_n_freed(*best))) {
+                    best = &slot;
+                }
+            }
+        }
+
+        // a starved slot is only taken where the order would take one anyway
+        const bool victim_starved = victim && preempt_starved(*victim);
+
+        if (cover[0]) {
+            return cover[0];
+        }
+
+        if (cover[1] && victim_starved) {
+            return cover[1];
+        }
+
+        return victim;
+    }
+
+    bool preempt_better_victim(const server_slot & a, const server_slot & b) const {
+        if (preempt_test_policy == "largest") {
+            return a.prompt.n_tokens() > b.prompt.n_tokens();
+        }
+
+        if (preempt_test_policy == "youngest") {
+            return a.task->id > b.task->id;
+        }
+
+        if (preempt_test_policy == "oldest") {
+            return a.task->id < b.task->id;
+        }
+
+        return a.prompt.n_tokens() < b.prompt.n_tokens();
+    }
+
+    // [TAG_PREEMPT] The oldest parked slot once it has waited PREEMPT_ROTATE_US; then no never-resident prompt may take its cells.
+    const server_slot * preempt_reserved_for = nullptr;
+
+    void preempt_update_reservation() {
+        const server_slot * head = nullptr;
+
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTED && (!head || preempt_resumes_before(slot, *head))) {
+                head = &slot;
+            }
+        }
+
+        // under fcfs the oldest parked request holds its room against newer ones at once
+        preempt_reserved_for = head && (preempt_fcfs || ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) ? head : nullptr;
+    }
+
+    // [TAG_PREEMPT] Resume order: arrival under fcfs, park time under cost.
+    bool preempt_resumes_before(const server_slot & a, const server_slot & b) const {
+        return preempt_fcfs ? preempt_rank(a) < preempt_rank(b) : a.t_preempt_us < b.t_preempt_us;
+    }
+
+    // [TAG_PREEMPT] fcfs order: twice the task id, or just behind the head a slot was rotated out for, or it would resume at once ahead of it.
+    static int64_t preempt_rank(const server_slot & slot) {
+        return slot.preempt_rank >= 0 ? slot.preempt_rank : 2 * (int64_t) slot.task->id;
+    }
+
+    // [TAG_PREEMPT] A never-resident prompt waits while the head's reservation stands. Re-prefills, resumed prompts, and empty or rejected prompts go on.
+    bool preempt_held(const server_slot & slot) const {
+        if (!preempt_reserved_for || &slot == preempt_reserved_for || !slot.task) {
+            return false;
+        }
+
+        if (slot.n_preempt > 0 || slot.preempt_reprefill) {
+            return false;
+        }
+
+        // [TAG_PREEMPT] An n_cmpl > 1 prompt on cells cannot be parked or rotated, so holding it keeps the head from the cells it sits on.
+        if (preempt_is_family(slot) && slot.prompt.n_tokens() > 0) {
+            return false;
+        }
+
+        if (preempt_fcfs && slot.task->id < preempt_reserved_for->task->id) {
+            return false;
+        }
+
+        if (slot.state == SLOT_STATE_STARTED) {
+            if (slot.preempt_input().empty()) {
+                return false;
+            }
+
+            std::string msg;
+            error_type  type = ERROR_TYPE_SERVER;
+
+            return !slot_prompt_rejected(slot, msg, type);
+        }
+
+        if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            return preempt_fcfs ? slot.task->id > preempt_reserved_for->task->id
+                                : slot.stats.t_start > preempt_reserved_for->t_preempt_us;
+        }
+
+        return false;
+    }
+
+    void preempt_log_held(server_slot & slot) {
+        if (slot.preempt_hold_logged) {
+            return;
+        }
+
+        slot.preempt_hold_logged = true;
+
+        SLT_INF(slot, "prompt held: slot %d has been parked %.1f s and is owed the cells first\n",
+                preempt_reserved_for->id, (ggml_time_us() - preempt_reserved_for->t_preempt_us) / 1e6);
+    }
+
+    // [TAG_PREEMPT] A resumed slot is not rotated out before PREEMPT_ROTATE_MIN_GEN tokens (or one token and PREEMPT_ROTATE_US), so two slots cannot swap cells without progress.
+    bool preempt_served(const server_slot & slot) const {
+        const int32_t n_gen = (int32_t) slot.stats.n_gen - slot.n_gen_resume;
+
+        // a slot never parked counts from its first token, or a long prefill is rotated out after one token
+        const int64_t t_from = slot.n_preempt == 0 ? slot.stats.t_prompt_last : slot.t_preempt_resume_us;
+
+        return n_gen >= PREEMPT_ROTATE_MIN_GEN ||
+               (n_gen > 0 && ggml_time_us() - t_from >= PREEMPT_ROTATE_US);
+    }
+
+    // [TAG_PREEMPT] Time until a resident ends by itself, at its rate since it last resumed; -1 if it may never end (it context-shifts, or may shift with no output limit).
+    int64_t preempt_us_to_end(const server_slot & slot) const {
+        if (slot.n_ctx_shift > 0 || (params_base.ctx_shift && slot.n_remaining() < 0)) {
+            return -1;
+        }
+
+        int64_t n_left = slot.n_remaining() >= 0 ? slot.n_remaining() : INT32_MAX;
+
+        if (!params_base.ctx_shift) {
+            n_left = std::min<int64_t>(n_left, std::max(0, slot.n_ctx - slot.prompt.n_tokens()));
+        }
+
+        const int32_t n_gen  = (int32_t) slot.stats.n_gen - slot.n_gen_resume;
+        const int64_t t_from = slot.n_preempt == 0 ? slot.stats.t_prompt_last : slot.t_preempt_resume_us;
+
+        if (n_gen <= 0) {
+            return INT64_MAX;
+        }
+
+        return (int64_t) std::min<double>((double) n_left * (double) (ggml_time_us() - t_from) / n_gen, (double) INT64_MAX / 2);
+    }
+
+    // [TAG_PREEMPT] Set by every park and cleared by the first scan that finds nobody out, so an idle or disabled server skips the slot scans.
+    bool preempt_maybe_out = false;
+
+    bool preempt_any_out() {
+        if (!preempt_maybe_out) {
+            return false;
+        }
+
+        for (const auto & slot : slots) {
+            if (slot.preempt_is_out()) {
+                return true;
+            }
+        }
+
+        preempt_maybe_out = false;
+
+        return false;
+    }
+
+    // [TAG_PREEMPT] Sync parks finish here, async ones are counted by update_preempt_copies() when they land. The notice is sent with the save, since the slot is already detached and silent.
+    bool preempt_park(server_slot & slot, int64_t t_start, bool recompute = false) {
+        if (!preempt_parkable(slot)) {
+            SLT_WRN(slot, "%s", "not parked: this slot cannot be resumed by replaying its prompt\n");
+            return false;
+        }
+
+        slot.t_preempt_copy_us = t_start;
+
+        preempt_maybe_out = true;
+
+        // [TAG_PREEMPT_ASYNC] Reserve ahead only if the budget still fits another state that size: the slack is charged and must not block the next park.
+        if (!recompute && slot.preempt_is_async()) {
+            const size_t held  = slot.preempt_state_size();
+            const size_t grown = slot.preempt_state_grown();
+
+            slot.preempt_grow = preempt_ram_used() - held + 2 * grown <= preempt_ram_budget();
+        }
+
+        const bool was_async = slot.preempt_is_async();
+
+        // [TAG_PREEMPT] Budget checks do not guarantee the allocation; preempt_save() unwinds on failure, so fall back to a recompute park.
+        if (!recompute && !slot.preempt_save()) {
+            SLT_WRN(slot, "%s", "the park could not take the host memory the budget allowed, so it drops its cells instead and the resume re-prefills its tokens\n");
+
+            recompute = true;
+        }
+
+        // [TAG_PREEMPT_ASYNC] A slot whose buffer came back pageable parks synchronously from now on: the margin and /props follow the slots left.
+        if (was_async && !slot.preempt_is_async()) {
+            preempt_async_refresh();
+        }
+
+        if (recompute) {
+            if (!slot.preempt_save_recompute()) {
+                return false;
+            }
+
+            if (!preempt_recompute_logged) {
+                preempt_recompute_logged = true;
+
+                // [TAG_EXACT_CONCURRENCY] A host-restored state is identical; a re-prefilled one differs in the last bits on CUDA, where prefill and decode use different kernels.
+                if (common_exact_concurrency()) {
+                    SRV_WRN("%s", "exact concurrency: a re-prefilled sequence is not guaranteed byte-identical to one that was never parked; raise --preempt-ram until every parked sequence fits it\n");
+                }
+
+                SRV_WRN("preemption: --preempt-ram %d MiB holds no further parked sequence, so a park drops its cells and the resume re-prefills its tokens\n",
+                        params_base.preempt_ram_mib);
+            }
+        }
+
+        preempt_log_ram_kind(slot);
+
+        if (slot.state == SLOT_STATE_PREEMPTED) {
+            metrics.n_preempt++;
+        }
+
+        if (slot.preempt_recompute) {
+            metrics.n_preempt_recompute++;
+        }
+
+        send_preempt_notice(slot, true);
+
+        return true;
+    }
+
+    void preempt_parked(server_slot & slot, const char * note) {
+        metrics.n_preempt++;
+
+        SLT_WRN(slot, "park completed after %.2f ms%s: %d cells released, %.1f MiB parked, kv %d/%d\n",
+                (ggml_time_us() - slot.t_preempt_copy_us) / 1e3, note,
+                slot.prompt.n_tokens(),
+                slot.preempt_state_size() / (1024.0 * 1024.0),
+                preempt_kv_used(), n_ctx);
+    }
+
+    // [TAG_PREEMPT] Announced on landing, the first moment the slot can be scheduled.
+    void preempt_restored(server_slot & slot, const char * note) {
+        metrics.n_resume++;
+
+        preempt_trim_ram(slot);
+
+        send_preempt_notice(slot, false);
+
+        SLT_WRN(slot, "restore completed after %.2f ms%s: %d tokens back in the cache, kv %d/%d, preemptions %d\n",
+                (ggml_time_us() - slot.t_preempt_copy_us) / 1e3, note,
+                slot.prompt.n_tokens(),
+                preempt_kv_used(), n_ctx,
+                slot.n_preempt);
+    }
+
+    void update_preempt_copies() {
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTING) {
+                if (slot.preempt_save_poll()) {
+                    preempt_parked(slot, "");
+                }
+            } else if (slot.state == SLOT_STATE_RESTORING) {
+                if (slot.preempt_restore_poll()) {
+                    preempt_restored(slot, "");
+                }
+            }
+        }
+    }
+
+    // [TAG_PREEMPT_ASYNC] Wait for all copies before a shift: it is one in-place graph over the whole K cache.
+    void preempt_wait_for_shift() {
+        if (!preempt_shift_pending) {
+            return;
+        }
+
+        preempt_shift_pending = false;
+
+        while (preempt_wait_in_flight()) {
+        }
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_RESTORING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (slot.preempt_restore_poll()) {
+                preempt_restored(slot, " (waited for, a context shift is due)");
+            }
+        }
+    }
+
+    // [TAG_PREEMPT] Run the pending shift now: a park before the next decode would save moved positions with unshifted K, and removing the sequence drops the pending deltas.
+    void preempt_apply_shift() {
+        if (!preempt_shift_pending) {
+            return;
+        }
+
+        // nothing can be parked: leave the shift to llama_decode(), which applies it together with any later one
+        if (!preempt_last_resort_possible()) {
+            preempt_shift_pending = false;
+            return;
+        }
+
+        preempt_wait_for_shift();
+
+        // a shift that did not complete stays recorded: a park now would save moved positions with unshifted K and drop the pending deltas
+        if (llama_memory_update(ctx_tgt) < 0 || (ctx_dft && llama_memory_update(ctx_dft) < 0)) {
+            throw std::runtime_error("the KV cache shift did not complete");
+        }
+    }
+
+    bool preempt_copies_in_flight() const {
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTING) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool preempt_wait_in_flight() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PREEMPTING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (!slot.preempt_save_poll()) {
+                continue;
+            }
+
+            preempt_parked(slot, " (waited for)");
+
+            return true;
+        }
+
+        return false;
+    }
+
+    void update_preemption() {
+        preempt_reserved_for = nullptr;
+
+        if (!params_base.kv_unified || slots.size() < 2) {
+            return;  // a cache per slot: no slot can take another's cells
+        }
+
+        if (!llama_get_memory(ctx_tgt)) {
+            return;  // no cache (embedding model): nothing to park
+        }
+
+        const bool any_out = preempt_any_out();
+
+        if (params_base.preempt_ram_mib == 0 && !any_out) {
+            return;
+        }
+
+        if (any_out) {
+            update_preempt_copies();
+        }
+
+        if (params_base.preempt_ram_mib == 0 || preempt_recurrent || preempt_unshared) {
+            return;  // --preempt-ram 0, or no shared pool of cells: retry ladder only
+        }
+
+        const int32_t n_cells = n_ctx;
+
+        const bool head_of_line = preempt_resume_head;
+
+        // nobody parked: nothing to resume
+        while (any_out) {
+            preempt_update_reservation();
+
+            std::vector<server_slot *> parked;
+
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PREEMPTED) {
+                    parked.push_back(&slot);
+                }
+            }
+
+            if (parked.empty()) {
+                break;
+            }
+
+            std::sort(parked.begin(), parked.end(), [this, head_of_line](const server_slot * a, const server_slot * b) {
+                if (!head_of_line && a->n_preempt != b->n_preempt) {
+                    return a->n_preempt > b->n_preempt;
+                }
+
+                return preempt_resumes_before(*a, *b);
+            });
+
+            if (head_of_line) {
+                parked.resize(1);
+            }
+
+            server_slot * best = nullptr;
+
+            const auto impossible = std::find_if(parked.begin(), parked.end(),
+                    [this, n_cells](const server_slot * slot) { return preempt_n_need(*slot) > n_cells; });
+
+            if (impossible != parked.end()) {
+                SLT_WRN(**impossible, "parked sequence of %d tokens cannot fit the pool of %d cells even alone, failing it\n",
+                        preempt_n_need(**impossible), n_cells);
+                send_error(**impossible, "Context size has been exceeded.");
+                (*impossible)->release();
+                continue;
+            }
+
+            // Room for the sequence and everyone's next step, or the resume preempts somebody at once; with nobody resident an exact fit is allowed.
+            for (;;) {
+                const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
+                const int32_t margin   = occupied == 0 ? 0 : preempt_n_margin(1);
+
+                // [TAG_PREEMPT] With every resident bounded, also wait until all of them can reach their output limit beside it, or the growth parks someone again.
+                const int64_t projected = occupied == 0 ? 0 : preempt_kv_projected();
+
+                for (auto * slot : parked) {
+                    if (occupied + preempt_n_need(*slot) + margin <= n_cells &&
+                        (projected < 0 || preempt_n_final(*slot) < 0 || projected + preempt_n_final(*slot) + margin <= (int64_t) n_cells)) {
+                        best = slot;
+                        break;
+                    }
+                }
+
+                if (best) {
+                    break;
+                }
+
+                if (preempt_normalize_started_all()) {
+                    continue;
+                }
+
+                if (!try_clear_idle_slots()) {
+                    break;
+                }
+            }
+
+            // Nothing fits: once the head has waited its turn, park a resident, since one may hold the room indefinitely.
+            if (!best) {
+                server_slot * head = parked.front();
+
+                // [TAG_PREEMPT_ASYNC] A park still copying holds its cells, so rotating now would park a second resident.
+                if (!preempt_copies_in_flight() && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_US) {
+                    const int32_t occupied = preempt_kv_used() + preempt_kv_reserve();
+                    const int32_t need     = preempt_n_need(*head);
+                    const int32_t margin   = preempt_n_margin(1);
+
+                    // [TAG_PREEMPT] The margin is charged on what stays resident after the rotation; with nobody left an exact fit is allowed, as on restore.
+                    auto room_after = [&](int32_t n_freed) {
+                        const int32_t n_left = occupied - n_freed;
+
+                        return n_left + need + (n_left <= 0 ? 0 : margin) <= n_cells;
+                    };
+
+                    server_slot * pick           = nullptr;
+                    bool          pick_enough    = false;
+                    bool          budget_refused = false;
+                    bool          recompute      = false;
+                    int32_t       n_freed_all    = 0;
+
+                    auto rotate_pick = [&](bool with_recompute) {
+                        n_freed_all = 0;
+
+                        // [TAG_PREEMPT] A prefix two candidates share is freed only if both go, so all of them are read together.
+                        std::vector<llama_seq_id> seqs_all;
+                        int32_t                   n_steps_all = 0;
+                        int32_t                   n_pick      = 0;
+
+                        for (auto & slot : slots) {
+                            // [TAG_PREEMPT] Residents that have had their service since resuming, and held prompts sitting on cells.
+                            const bool held = preempt_held(slot) && slot.prompt.n_tokens() > 0;
+
+                            if (!held && (slot.state != SLOT_STATE_GENERATING || !preempt_served(slot))) {
+                                continue;
+                            }
+
+                            if (!preempt_parkable(slot)) {
+                                continue;
+                            }
+
+                            // [TAG_PREEMPT] Time-slicing residents that end by themselves only trades park copies for nothing; one that would still hold the head long yields once the head has waited long. Under fcfs a resident newer than the head always yields.
+                            if (!held && !(preempt_fcfs && preempt_rank(slot) > preempt_rank(*head))) {
+                                const int64_t t_end = preempt_us_to_end(slot);
+
+                                if (t_end >= 0 && (ggml_time_us() - head->t_preempt_us < PREEMPT_ROTATE_BOUNDED_US || t_end < PREEMPT_ROTATE_BOUNDED_US)) {
+                                    continue;
+                                }
+                            }
+
+                            // The head's bytes are not credited: the resident is parked before the head is freed, so both states are held at once.
+                            if (!with_recompute && !preempt_fits_budget(slot)) {
+                                budget_refused = true;
+                                continue;
+                            }
+
+                            const int32_t n_freed = preempt_n_freed(slot);
+
+                            n_freed_all += n_freed;
+                            n_steps_all += n_freed - preempt_n_freed_cells(slot);
+                            seqs_all.push_back(slot.id);
+
+                            const bool enough = room_after(n_freed);
+
+                            if (!pick ||
+                                (enough && !pick_enough) ||
+                                (enough == pick_enough && (enough ? n_freed < n_pick : n_freed > n_pick))) {
+                                pick        = &slot;
+                                pick_enough = enough;
+                                n_pick      = n_freed;
+                            }
+                        }
+
+                        if (const int32_t n = seqs_all.empty() ? -1 : preempt_kv_reclaim(seqs_all); n >= 0) {
+                            n_freed_all = n + n_steps_all;
+                        }
+                    };
+
+                    // [TAG_PREEMPT] Short alone, a pick is only a first step: if every candidate together cannot make room, it would wait parked beside the head for nothing.
+                    auto drop_futile = [&]() {
+                        if (pick && !pick_enough && !room_after(n_freed_all)) {
+                            pick = nullptr;
+                        }
+                    };
+
+                    rotate_pick(false);
+                    drop_futile();
+
+                    // [TAG_PREEMPT] A resident the budget cannot swap is rotated by dropping its cells, since waiting has no bound. The head waits longer for this, as it costs the resident a full re-prefill.
+                    if (!pick && budget_refused && ggml_time_us() - head->t_preempt_us >= PREEMPT_ROTATE_RECOMPUTE_US) {
+                        rotate_pick(true);
+                        drop_futile();
+
+                        recompute = pick != nullptr;
+                    }
+
+                    const int64_t t_start   = ggml_time_us();
+                    const int32_t n_rotated = pick ? pick->prompt.n_tokens() : 0;
+
+                    if (!pick && budget_refused && !head->preempt_rotation_refused) {
+                        head->preempt_rotation_refused = true;
+
+                        SLT_WRN(*head, "no rotation: --preempt-ram %d MiB does not hold this parked state and a resident's at once, and the two are held together while the resident is parked and the head restored; the head waits for a resident to finish, or %.0f s for one to be rotated out by dropping its cells\n",
+                                params_base.preempt_ram_mib, PREEMPT_ROTATE_RECOMPUTE_US / 1e6);
+                    }
+
+                    if (pick && preempt_park(*pick, t_start, recompute)) {
+                        server_slot & slot = *pick;
+
+                        slot.preempt_rank = std::max(preempt_rank(slot), preempt_rank(*head) + 1);
+
+                        if (slot.preempt_recompute) {
+                            SLT_WRN(slot, "rotated out after %d context shifts: %d cells dropped, %d tokens to re-prefill on resume, a head parked %.1f s takes its turn%s, preemptions %d\n",
+                                    slot.n_ctx_shift, n_rotated,
+                                    slot.preempt_n_input(),
+                                    (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                    pick_enough ? "" : " (not enough room by itself)",
+                                    slot.n_preempt);
+                        } else {
+                            SLT_WRN(slot, "rotated out after %d context shifts: %d cells released, %.1f MiB parked, a head parked %.1f s takes its turn%s, preemptions %d\n",
+                                    slot.n_ctx_shift, slot.prompt.n_tokens(),
+                                    slot.preempt_state_size() / (1024.0 * 1024.0),
+                                    (ggml_time_us() - head->t_preempt_us) / 1e6,
+                                    pick_enough ? "" : " (not enough room by itself)",
+                                    slot.n_preempt);
+                        }
+
+                        // [TAG_PREEMPT_ASYNC] Sync parks freed their cells, so re-examine the head now; async ones on the pass that sees the copy land.
+                        if (slot.state == SLOT_STATE_PREEMPTED) {
+                            best = head;
+                        }
+                    }
+                }
+
+                if (best) {
+                    continue;
+                }
+
+                break;
+            }
+
+            const int64_t t_start = ggml_time_us();
+
+            const bool recompute = best->preempt_recompute;
+
+            best->t_preempt_copy_us = t_start;
+
+            if (!best->preempt_restore()) {
+                if (best->n_preempt_fail % 64 == 1) {
+                    SLT_WRN(*best, "resume failed (%d in a row, parked %.1f s), staying preempted\n",
+                            best->n_preempt_fail, (ggml_time_us() - best->t_preempt_us) / 1e6);
+                }
+
+                if (best->n_preempt_fail >= PREEMPT_N_FAIL_MAX &&
+                    ggml_time_us() - best->t_preempt_us > PREEMPT_FAIL_US) {
+                    send_error(*best, "failed to restore the preempted sequence");
+                    best->release();
+                }
+
+                break;
+            }
+
+            if (best->state == SLOT_STATE_RESTORING) {
+                SLT_WRN(*best, "resumed after %.2f s: %d tokens, restore issued in %.2f ms (%zu transfers, %.2f ms sync), kv %d/%d, preemptions %d\n",
+                        (ggml_time_us() - best->t_preempt_us) / 1e6,
+                        best->prompt.n_tokens(),
+                        (ggml_time_us() - t_start) / 1e3,
+                        best->preempt_n_copies(), best->preempt_sync_us() / 1e3,
+                        preempt_kv_used(), n_cells,
+                        best->n_preempt);
+
+                continue;
+            }
+
+            metrics.n_resume++;
+
+            send_preempt_notice(*best, false, recompute);
+
+            if (recompute) {
+                SLT_WRN(*best, "resumed after %.2f s: %d tokens to re-prefill, kv %d/%d, preemptions %d\n",
+                        (ggml_time_us() - best->t_preempt_us) / 1e6,
+                        best->preempt_n_input(),
+                        preempt_kv_used(), n_cells,
+                        best->n_preempt);
+            } else {
+                SLT_WRN(*best, "resumed after %.2f s: %d tokens back in the cache in %.2f ms, kv %d/%d, preemptions %d\n",
+                        (ggml_time_us() - best->t_preempt_us) / 1e6,
+                        best->prompt.n_tokens(),
+                        (ggml_time_us() - t_start) / 1e3,
+                        preempt_kv_used(), n_cells,
+                        best->n_preempt);
+            }
+        }
+
+        preempt_update_reservation();
+
+        if (preempt_test_every > 0) {
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || !preempt_parkable(slot) ||
+                    (int32_t) slot.stats.n_gen < (slot.n_preempt + 1) * preempt_test_every) {
+                    continue;
+                }
+
+                // the budget refusing is the recompute case, so the knob covers it
+                const bool recompute = !preempt_fits_budget(slot);
+
+                if (preempt_park(slot, ggml_time_us(), recompute)) {
+                    SLT_WRN(slot, "preempted on request after %d generated tokens, %.1f MiB parked\n",
+                            (int32_t) slot.stats.n_gen, slot.preempt_state_size() / (1024.0 * 1024.0));
+                }
+            }
+        }
+
+        if (preempt_planner_off) {
+            return;  // test knob: leave the pool to the retry ladder
+        }
+
+        for (;;) {
+            const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
+
+            if (n_used + preempt_n_margin() <= n_cells) {
+                break;
+            }
+
+            // [TAG_PREEMPT] A started slot still holds its previous prompt: trim it before the shortfall is believed.
+            if (preempt_normalize_started_all()) {
+                continue;
+            }
+
+            // [TAG_PREEMPT] The step fits and purging idle slots would cover the margin: purging is instant, so keep their caches until the step needs the cells.
+            if (n_used <= n_cells && n_used - preempt_n_idle_cells() + preempt_n_margin() <= n_cells) {
+                break;
+            }
+
+            if (try_clear_idle_slots()) {
+                continue;
+            }
+
+            // [TAG_PREEMPT_ASYNC] An issued park will free cells, so waiting for it beats parking somebody else.
+            if (preempt_copies_in_flight()) {
+                if (n_used > n_cells) {
+                    if (preempt_wait_in_flight()) {
+                        continue;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            bool recompute = false;
+
+            server_slot * victim = preempt_pick_victim(&recompute, n_used + preempt_n_margin() - n_cells);
+
+            if (!victim) {
+                SRV_DBG("the kv pool needs %d of %d cells and nothing can be preempted (parked %.1f MiB of the %d MiB --preempt-ram budget)\n",
+                        n_used, n_cells, preempt_ram_used() / (1024.0 * 1024.0), params_base.preempt_ram_mib);
+                break;
+            }
+
+            const int32_t n_tokens = victim->prompt.n_tokens();
+            const int64_t t_start  = ggml_time_us();
+
+            if (!preempt_park(*victim, t_start, recompute)) {
+                break;  // the retry ladder is still behind us
+            }
+
+            if (victim->state == SLOT_STATE_PREEMPTING) {
+                SLT_WRN(*victim, "preempted: %d cells, park issued in %.2f ms (%zu transfers, %.2f ms sync), %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
+                        n_tokens,
+                        (ggml_time_us() - t_start) / 1e3,
+                        victim->preempt_n_copies(), victim->preempt_sync_us() / 1e3,
+                        victim->preempt_state_size() / (1024.0 * 1024.0),
+                        preempt_kv_used(), n_cells, n_used,
+                        victim->n_preempt);
+
+                // [TAG_PREEMPT_ASYNC] Short only of the lookahead, the step still fits; short of the step itself, wait for the copy or the retry ladder ends every request.
+                if (n_used + preempt_n_margin() > n_cells) {
+                    continue;
+                }
+
+                break;
+            }
+
+            if (victim->preempt_recompute) {
+                SLT_WRN(*victim, "preempted: %d cells dropped in %.2f ms, %d tokens to re-prefill on resume, kv %d/%d (wanted %d), preemptions %d\n",
+                        n_tokens,
+                        (ggml_time_us() - t_start) / 1e3,
+                        victim->preempt_n_input(),
+                        preempt_kv_used(), n_cells, n_used,
+                        victim->n_preempt);
+            } else {
+                SLT_WRN(*victim, "preempted: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
+                        n_tokens,
+                        (ggml_time_us() - t_start) / 1e3,
+                        victim->preempt_state_size() / (1024.0 * 1024.0),
+                        preempt_kv_used(), n_cells, n_used,
+                        victim->n_preempt);
+            }
+        }
+    }
+
+    // Checks a request must pass before its prompt is processed; true if rejected. An empty prompt is a final response, not an error.
+    // They run in the order a slot meets them, so a request failing several gets the error it got before they were moved up front:
+    // launch_slot_with_task() first (token ids, samplers), then the batch builder (empty prompt, logits, sizes).
+    // with_sampler: a task not launched yet, whose sampling parameters are tried when a batch-builder check would refuse it.
+    // [TAG_PREEMPT] This also runs on the HTTP thread (tasks_prompt_rejected()), so it reads only what the server loop never changes
+    // after loading: the vocabulary and model, the context's sizes and flags, and the task itself. The aLoRA-set check stays in
+    // launch_slot_with_task(): it reads params_base.lora_adapters, which POST /lora-adapters replaces on the server loop.
+    bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type, bool with_sampler = false) const {
+        // Mirrors launch_slot_with_task(), run earlier so a sibling is not rejected inside an already opened 200 stream.
+        if (!task.tokens.validate(ctx_tgt)) {
+            msg  = "Prompt contains invalid tokens";
+            type = ERROR_TYPE_INVALID_REQUEST;
+            return true;
+        }
+
+        // as the batch builder: an empty prompt is answered with an empty final response before any check below
+        if (task.tokens.empty()) {
+            return false;
+        }
+
+        if (!task_built_prompt_rejected(task, msg, type)) {
+            return false;
+        }
+
+        // the launch refuses sampling parameters the samplers cannot take before the batch builder gets to the checks above; tried
+        // only on this path, where the request is refused either way, so an accepted one builds its samplers once, at the launch
+        if (with_sampler && task.need_sampling()) {
+            try {
+                common_params_sampling sampling = task.params.sampling; // common_sampler_init() takes them by non-const reference
+                common_sampler_ptr     smpl(common_sampler_init(model_tgt, sampling));
+            } catch (const std::exception & e) {
+                msg  = std::string("Failed to initialize samplers: ") + e.what();
+                type = ERROR_TYPE_INVALID_REQUEST;
+            }
+        }
+
+        return true;
+    }
+
+    // The batch builder's checks of a non-empty prompt, in its order; true if rejected.
+    bool task_built_prompt_rejected(const server_task & task, std::string & msg, error_type & type) const {
+        // TODO: support memory-less logits computation
+        if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
+            msg  = "the current context does not support logits computation. skipping";
+            type = ERROR_TYPE_SERVER;
+            return true;
+        }
+
+        if (!task_can_split(task, ctx_tgt)) {
+            const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+            if (task.n_tokens() > n_ubatch) {
+                msg = string_format(
+                    "input (%d tokens) is too large to process. increase the physical batch "
+                    "size (current batch size: %d)",
+                    task.n_tokens(), n_ubatch);
+                type = ERROR_TYPE_SERVER;
+                return true;
+            }
+
+            if (task.n_tokens() > n_ctx_slot()) {
+                msg = string_format(
+                    "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                    task.n_tokens(), n_ctx_slot());
+                type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (task.n_tokens() >= n_ctx_slot()) {
+            msg = string_format(
+                "request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
+                task.n_tokens(), n_ctx_slot());
+            type = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+            return true;
+        }
+
+        const int32_t n_batch          = llama_n_batch(ctx_tgt);
+        const int32_t n_decision_first = task.type == SERVER_TASK_TYPE_DECISION ? task.decision.pos_first() : -1;
+        if (n_decision_first >= 0 && task.n_tokens() - n_decision_first > n_batch) {
+            msg = string_format(
+                "the question and its options (%d tokens) are too large to process. "
+                "increase the batch size (current batch size: %d)",
+                task.n_tokens() - n_decision_first, n_batch);
+            type = ERROR_TYPE_INVALID_REQUEST;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool slot_prompt_rejected(const server_slot & slot, std::string & msg, error_type & type) const {
+        if (!slot.task) {
+            return false;
+        }
+
+        return task_prompt_rejected(*slot.task, msg, type);
+    }
 
     // fill slot.inp_embd with the next rows of the audio stream
     // returns false if the slot has nothing to decode now
@@ -3494,6 +5931,21 @@ private:
         }
 
         try {
+            // [TAG_PREEMPT] Fit the pool to the next step, after any context shift; inside the guard since a shift or park can throw.
+            pre_decode_shift();
+
+            // [TAG_PREEMPT] Take the next audio rows of realtime transcriptions now, so the plan reserves their width; pre_decode() decodes the rows a slot holds.
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.audio_stream && slot.task->type != SERVER_TASK_TYPE_TTS) {
+                    slot_audio_step(slot);
+                }
+            });
+
+            // A slot must never be parked with a shift pending on its cells.
+            preempt_apply_shift();
+
+            update_preemption();
+
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
         } catch (const std::exception & e) {
@@ -3535,6 +5987,18 @@ private:
 
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        // [TAG_PREEMPT_ASYNC] A --cache-reuse shift is found inside pre_decode(), after the wait above; apply it to the draft too, or a KV-full park saves a draft state with the shift still pending.
+        try {
+            preempt_apply_shift();
+        } catch (const std::exception & e) {
+            SRV_ERR("preempt_apply_shift() failed: %s\n", e.what());
+            abort_all_slots("preempt_apply_shift() failed: " + std::string(e.what()));
+
+            // the batch holds positions the shift did not move, skip now to avoid UB
+            return;
+        }
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3546,6 +6010,11 @@ private:
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
+
+                if (preempt_batch_abandoned) {
+                    preempt_batch_abandoned = false;
+                    break;
+                }
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -3649,9 +6118,9 @@ private:
         });
     }
 
-    void pre_decode() {
-        // apply context-shift if needed
-        // TODO: simplify and improve
+    // apply context-shift if needed
+    // TODO: simplify and improve
+    void pre_decode_shift() {
         iterate(slots, [&](server_slot & slot) {
             if (slot.task && slot.task->type == SERVER_TASK_TYPE_TTS) {
                 // TTS slots drive their own decode loop in process_tts_slots(), never enter the shared batch
@@ -3695,8 +6164,18 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                slot.n_ctx_shift++;
+                preempt_shift_pending = true;
+
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+
+                // [TAG_PREEMPT] the aLoRA invocation moves with its tokens, or a recompute park would replay the adapted tokens without the adapter
+                if (slot.alora_invocation_start > 0) {
+                    const int n_pre = slot.alora_invocation_start - 1;
+
+                    slot.alora_invocation_start = 1 + n_pre - std::clamp(n_pre - n_keep, 0, n_discard);
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3717,7 +6196,9 @@ private:
                 slot.truncated = true;
             }
         });
+    }
 
+    void pre_decode() {
         // start populating the batch for this iteration
         batch.clear();
 
@@ -3875,7 +6356,7 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS) {
+                if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.preempt_is_out()) {
                     return;
                 }
 
@@ -3895,9 +6376,18 @@ private:
                     return;
                 }
 
+                // [TAG_PREEMPT] A never-resident prompt does not overtake a parked head that has waited its turn.
+                if (preempt_held(slot)) {
+                    preempt_log_held(slot);
+                    return;
+                }
+
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    const auto & input_tokens = slot.task->tokens;
+                    const auto & input_tokens = slot.preempt_input();
+
+                    // [TAG_PREEMPT] The re-prefill list of a recompute park, else the request's prompt.
+                    const int32_t n_input_tokens = slot.preempt_n_input();
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -3938,59 +6428,22 @@ private:
                             return;
                         }
 
-                        // TODO: support memory-less logits computation
-                        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
-                            send_error(slot, "the current context does not support logits computation. skipping", ERROR_TYPE_SERVER);
-                            slot.release();
-                            return;
+                        {
+                            std::string msg;
+                            error_type  type = ERROR_TYPE_SERVER;
+
+                            if (slot_prompt_rejected(slot, msg, type)) {
+                                send_error(slot, msg, type);
+                                slot.release();
+                                return;
+                            }
                         }
 
-                        if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
-                                send_error(slot,
-                                           string_format(
-                                               "input (%d tokens) is too large to process. increase the physical batch "
-                                               "size (current batch size: %d)",
-                                               slot.task->n_tokens(), n_ubatch),
-                                           ERROR_TYPE_SERVER);
-                                slot.release();
-                                return;
-                            }
-
-                            if (slot.task->n_tokens() > slot.n_ctx) {
-                                send_error(
-                                    slot,
-                                    string_format(
-                                        "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-                        } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
-                                           string_format("request (%d tokens) exceeds the available context size (%d "
-                                                         "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
-                            }
-
-                            // the outputs of a decision are read from one batch
+                        if (slot.can_split()) {
+                            // the decision size is checked in slot_prompt_rejected; its first position bounds the reuse below
                             const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
-                            if (n_decision_first >= 0 && slot.task->n_tokens() - n_decision_first > n_batch) {
-                                send_error(slot,
-                                           string_format("the question and its options (%d tokens) are too large to process. "
-                                                         "increase the batch size (current batch size: %d)",
-                                                         slot.task->n_tokens() - n_decision_first, n_batch),
-                                           ERROR_TYPE_INVALID_REQUEST);
-                                slot.release();
-                                return;
-                            }
 
-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                            if (slot_reuses_prefix(*slot.task)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4054,6 +6507,8 @@ private:
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+
+                                            preempt_shift_pending = true;
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -4230,8 +6685,29 @@ private:
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
+                        if (batch.size() + n_input_tokens > n_batch) {
                             return;
+                        }
+                    }
+
+                    // [TAG_EXACT_CONCURRENCY] A prompt gets its standalone ubatch shapes only if it adds whole ubatches here; otherwise a neighbour's token shortens the last one.
+                    int32_t n_batch_cur = n_batch;
+
+                    if (common_exact_concurrency() && slot.can_split() && !slot.prompt.tokens.has_mtmd) {
+                        const int32_t n_avail = n_batch - (int32_t) batch.size();
+                        const int32_t n_left  = n_input_tokens - slot.prompt.n_tokens();
+
+                        if (n_left > n_avail) {
+                            const int32_t n_take = n_avail - n_avail % n_ubatch;
+
+                            if (n_take > 0) {
+                                n_batch_cur = (int32_t) batch.size() + n_take;
+                            } else {
+                                // Waiting ends: common_exact_batch_geometry() refused a batch too small for a whole ubatch beside every decode, and the prompts ahead are finite.
+                                SLT_DBG(slot, "exact concurrency: %d of %d batch tokens left, short of a %d-token ubatch: the prefill waits\n",
+                                        n_avail, n_batch, n_ubatch);
+                                return;
+                            }
                         }
                     }
 
@@ -4283,6 +6759,9 @@ private:
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
+                    // a re-prefill walks its own list, which the message spans do not index
+                    do_checkpoint = do_checkpoint && !slot.preempt_reprefill;
+
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
@@ -4306,10 +6785,14 @@ private:
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
                         if (
-                            cur_token_idx >= slot.task->n_tokens() ||
+                            cur_token_idx >= n_input_tokens ||
                             input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
                         ) {
                             break;
+                        }
+
+                        // [TAG_PREEMPT_ASYNC] The chunk decodes whole, past the kv-full retry, so a park issued for it must land first.
+                        while (preempt_wait_in_flight()) {
                         }
 
                         // process the mtmd chunk
@@ -4332,8 +6815,12 @@ private:
                         }
 
                         metrics_queue_prompt(n_tokens_out);
-                        slot.stats.n_prompt_processed += n_tokens_out;
-                        slot.stats.update_prompt_last();
+
+                        // [TAG_PREEMPT] A re-prefill is real compute but not the request's prompt.
+                        if (!slot.preempt_reprefill) {
+                            slot.stats.n_prompt_processed += n_tokens_out;
+                            slot.stats.update_prompt_last();
+                        }
 
                         // add the mtmd chunk to cache
                         {
@@ -4351,7 +6838,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < n_input_tokens && batch.size() < n_batch_cur) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4389,6 +6876,11 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // [TAG_EXACT_CONCURRENCY] Re-prefill an already decoded token one per step beside the other decodes, as it was decoded; batching it wide diverged the output at the second park.
+                        if (slot.preempt_reprefill && common_exact_concurrency() && slot.prompt.n_tokens() >= slot.task->n_tokens()) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -4410,7 +6902,7 @@ private:
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                if (n_input_tokens == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -4426,24 +6918,30 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    const bool near_prompt_end = n_input_tokens < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    if (slot.prompt.n_tokens() == n_input_tokens) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.size() > 0);
 
                         // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        // [TAG_PREEMPT] Except a re-prefill's last token under a backend sampler: it was sampled before the park, and sampling again would advance the stream's RNG by one draw.
+                        if (!(slot.preempt_reprefill && slot.backend_sampler && !slot.can_speculate())) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
 
-                        slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
+                        slot.i_batch = batch.size() - 1;
 
-                        slot.init_sampler();
+                        if (!slot.preempt_reprefill) {
+                            slot.stats.n_gen = 0;
+
+                            slot.init_sampler();
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -4543,6 +7041,217 @@ private:
         return true;
     }
 
+    // [TAG_PREEMPT_ASYNC] Recurrent memory compacts active sequences in find_slot(), so a decode beside a park can move the row being copied. This applies to hybrids and the draft too.
+    static bool preempt_state_relocates(const llama_model * model) {
+        return model && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model));
+    }
+
+    bool preempt_state_relocates() const {
+        return preempt_state_relocates(model_tgt) || preempt_state_relocates(model_dft);
+    }
+
+    bool preempt_async_possible() const {
+        return params_base.preempt_async && params_base.kv_unified && params_base.preempt_ram_mib != 0 &&
+               slots.size() >= 2 && llama_get_memory(ctx_tgt) && !preempt_state_relocates();
+    }
+
+    // [TAG_PREEMPT] For clients deciding whether to rely on parking; notices is the in-stream notice protocol version.
+    json preempt_props() const {
+        return json {
+            { "enabled",     params_base.kv_unified && slots.size() >= 2 && params_base.preempt_ram_mib != 0 &&
+                             !preempt_recurrent && !preempt_unshared && ctx_tgt && llama_get_memory(ctx_tgt) },
+            { "ram_mib",     params_base.preempt_ram_mib },
+            { "async",       preempt_async_all },
+            { "notices",     2 },
+            { "recurrent",   preempt_recurrent },
+            { "granularity", preempt_alloc_granularity },
+            { "policy",      preempt_fcfs ? "fcfs" : "cost" },
+        };
+    }
+
+    bool preempt_last_resort_possible() const {
+        return params_base.kv_unified && params_base.preempt_ram_mib != 0 && !preempt_recurrent && !preempt_unshared && slots.size() >= 2 && llama_get_memory(ctx_tgt);
+    }
+
+    // [TAG_PREEMPT] Retry ladder exhausted: give up the batch, rewind residents to the cache's token boundary and park the smallest. A media chunk mid-prompt keeps the old path.
+    bool preempt_last_resort(int32_t off) {
+        if (!preempt_last_resort_possible()) {
+            return false;
+        }
+
+        // [TAG_PREEMPT] A realtime transcription slot's audio rows are consumed when the batch is built and its stream does not produce them again, so the batch cannot be given up and rebuilt: keep the old path.
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && !slot.preempt_is_out() && slot.audio_stream) {
+                return false;
+            }
+        }
+
+        // [TAG_PREEMPT_ASYNC] A restoring slot holds its cells but is skipped below, so land it first: it may be the only other resident.
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_RESTORING) {
+                continue;
+            }
+
+            slot.preempt_copy_wait();
+
+            if (slot.preempt_restore_poll()) {
+                preempt_restored(slot, " (waited for, as a last resort)");
+            }
+        }
+
+        int32_t n_running = 0;
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing() || slot.state == SLOT_STATE_PREEMPTED || slot.preempt_in_flight()) {
+                continue;
+            }
+
+            // A resident mid-prompt on a media chunk cannot be rewound to a token boundary; a generating one can.
+            if (slot.prompt.tokens.has_mtmd && slot.state != SLOT_STATE_GENERATING) {
+                return false;
+            }
+
+            n_running++;
+        }
+
+        if (n_running < 2) {
+            return false;  // a conversation that does not fit alone is a real overflow
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED && slot.state != SLOT_STATE_WAIT_OTHER &&
+                !slot.preempt_in_flight()) {
+                slot.rewind_to_cache();
+            }
+        }
+
+        const int32_t n_cells  = n_ctx;
+        int32_t       n_parked = 0;
+
+        for (;;) {
+            const int32_t n_used = preempt_kv_used() + preempt_kv_reserve();
+
+            if (n_parked > 0 && n_used + preempt_n_margin() <= n_cells) {
+                break;
+            }
+
+            bool recompute = false;
+
+            server_slot * victim = preempt_pick_victim(&recompute, n_used + preempt_n_margin() - n_cells);
+
+            if (!victim) {
+                break;
+            }
+
+            const int32_t n_tokens = victim->prompt.n_tokens();
+            const int64_t t_start  = ggml_time_us();
+
+            if (!preempt_park(*victim, t_start, recompute)) {
+                break;
+            }
+
+            n_parked++;
+
+            if (victim->state == SLOT_STATE_PREEMPTING) {
+                while (preempt_wait_in_flight()) {
+                }
+
+                SLT_WRN(*victim, "preempted as a last resort: %d cells released, kv %d/%d (wanted %d), preemptions %d\n",
+                        n_tokens, preempt_kv_used(), n_cells, n_used, victim->n_preempt);
+                continue;
+            }
+
+            SLT_WRN(*victim, "preempted as a last resort%s: %d cells released in %.2f ms, %.1f MiB parked, kv %d/%d (wanted %d), preemptions %d\n",
+                    victim->preempt_recompute ? " by dropping its cells" : "",
+                    n_tokens,
+                    (ggml_time_us() - t_start) / 1e3,
+                    victim->preempt_state_size() / (1024.0 * 1024.0),
+                    preempt_kv_used(), n_cells, n_used,
+                    victim->n_preempt);
+        }
+
+        if (n_parked == 0) {
+            return preempt_fail_largest_family();  // nothing parked: the error path cleans up the rewind
+        }
+
+        SRV_WRN("last resort: batch given up at off = %d, %d slot(s) parked, kv %d/%d resident\n",
+                off, n_parked, preempt_kv_used(), n_cells);
+
+        return true;
+    }
+
+    // [TAG_PREEMPT] n_cmpl > 1 slots cannot be parked: when nothing else can be, end only the family holding the most cells, not every slot.
+    bool preempt_fail_largest_family() {
+        auto family_of = [](const server_slot & slot) {
+            return slot.task->is_parent() ? slot.task->id : slot.task->id_parent;
+        };
+
+        auto running = [](const server_slot & slot) {
+            return slot.is_processing() && !slot.preempt_is_out();
+        };
+
+        int     family  = -1;
+        int32_t n_cells = 0;
+
+        for (const auto & slot : slots) {
+            if (!running(slot) || !preempt_is_family(slot)) {
+                continue;
+            }
+
+            int32_t n = 0;
+
+            std::vector<llama_seq_id> seqs;
+
+            for (const auto & other : slots) {
+                if (running(other) && preempt_is_family(other) && family_of(other) == family_of(slot)) {
+                    n += other.prompt.n_tokens();
+                    seqs.push_back(other.id);
+                }
+            }
+
+            // [TAG_PREEMPT] The members share their prompt's cells, so the sum of their prompts counts it once per member; read what ending them frees.
+            if (const int32_t n_freed = preempt_kv_reclaim(seqs); n_freed >= 0) {
+                n = n_freed;
+            }
+
+            if (family < 0 || n > n_cells) {
+                family  = family_of(slot);
+                n_cells = n;
+            }
+        }
+
+        bool others = false;
+
+        for (const auto & slot : slots) {
+            others |= running(slot) && (!preempt_is_family(slot) || family_of(slot) != family);
+        }
+
+        if (family < 0 || !others) {
+            return false;
+        }
+
+        for (auto & slot : slots) {
+            if (running(slot) && preempt_is_family(slot) && family_of(slot) == family) {
+                SLT_WRN(slot, "%s", "the n_cmpl > 1 request holding the most cells cannot be parked, ending it alone\n");
+                send_error(slot, "Context size has been exceeded.");
+                slot.release();
+                slot.prompt_clear();
+            }
+        }
+
+        return true;
+    }
+
+    bool batch_has_spec_groups() const {
+        for (const auto & slot : slots) {
+            if (!slot.spec_i_batch.empty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -4587,10 +7296,31 @@ private:
         });
 
         if (ret != 0) {
+            // [TAG_PREEMPT_ASYNC] Halving frees no cells, so wait for an issued park first or the ladder ends every request.
+            if (ret == 1 && preempt_wait_in_flight()) {
+                SRV_WRN("%s", "waited for an in-flight park before retrying the decode\n");
+                return false;  // retry at the same batch size
+            }
+
             {
                 std::string err;
 
+                // [TAG_PREEMPT] Halving would split a slot's sampled token from its draft and make the verify step throw.
+                if (ret == 1 && n_batch > 1 && preempt_last_resort_possible() && batch_has_spec_groups()) {
+                    if (try_clear_idle_slots()) {
+                        SRV_WRN("%s", "failed to find free space in the KV cache, retrying after purging an idle slot\n");
+                        return false;  // retry at the same width
+                    }
+
+                    n_batch = 1;
+                }
+
                 if (n_batch == 1 && ret == 1) {
+                    if (preempt_last_resort(off)) {
+                        preempt_batch_abandoned = true;
+                        return true;
+                    }
+
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
@@ -4611,7 +7341,7 @@ private:
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
-                        if (slot.is_processing()) {
+                        if (slot.is_processing() && slot.state != SLOT_STATE_PREEMPTED && !slot.preempt_in_flight()) {
                             send_error(slot, err);
                             slot.release();
 
@@ -4708,7 +7438,7 @@ private:
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->params.stream && slot.task->params.return_progress) {
+                if (slot.task->params.stream && slot.task->params.return_progress && !slot.preempt_reprefill) {
                     send_partial_response(slot, {}, true);
                 }
             }
@@ -4719,6 +7449,12 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                // [TAG_PREEMPT] The re-prefill is back; the already sampled token is decoded next, so do not sample.
+                if (slot.preempt_reprefill) {
+                    slot.preempt_reprefill_done();
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch.view);
@@ -4999,7 +7735,7 @@ private:
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
         metrics.n_decode++;
         for (const auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() && !slot.preempt_is_out()) {
                 metrics.n_busy_slots++;
             }
             metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
@@ -5020,7 +7756,8 @@ private:
             n_prompt_tokens++;
 
             auto & slot = slots[t.id_slot];
-            if (slot.stats.is_set()) {
+            // [TAG_PREEMPT] Replayed tokens were already counted as prompt.
+            if (slot.stats.is_set() && !slot.preempt_reprefill) {
                 slot.stats.n_prompt_processed++;
             }
         }
@@ -5038,7 +7775,8 @@ private:
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
             auto & slot = slots[t.id_slot];
-            if (t.is_prompt && slot.stats.is_set()) {
+            // [TAG_PREEMPT] A re-prefill must not move the prompt/generation boundary, since n_gen carries across the park.
+            if (t.is_prompt && slot.stats.is_set() && !slot.preempt_reprefill) {
                 slot.stats.set_prompt_last(t_now);
             }
         }
@@ -5153,6 +7891,7 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+        /* preempt                 */ impl->preempt_props(),
     };
 }
 
@@ -5261,6 +8000,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
 
+            // [TAG_EXACT_CONCURRENCY] Exact mode gives each page to one sequence, so reject n_cmpl > 1 here as a 400 rather than fail at seq_cp.
+            if (task.params.n_cmpl > 1 && common_exact_concurrency()) {
+                throw std::runtime_error(
+                    "n > 1 is not supported while LLAMA_EXACT_CONCURRENCY is set: each "
+                    "completion needs its own sequence, and in exact mode a KV page belongs "
+                    "to a single sequence. Send n separate requests, or unset the variable.");
+            }
+
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
                 int n_children = task.params.n_cmpl - 1;
@@ -5270,6 +8017,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             tasks.push_back(std::move(task));
+        }
+
+        // [TAG_PREEMPT] Validate all prompts before queueing: a parked member's notice opens the stream before another could be rejected.
+        {
+            json error;
+
+            if (ctx_server.tasks_prompt_rejected(tasks, error)) {
+                res->error(error);
+                return res;
+            }
         }
 
         rd.post_tasks(std::move(tasks), chat_session);
@@ -5314,6 +8071,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 usage["completion_tokens"] = n_completion_tokens;
                 usage["total_tokens"]      = usage["prompt_tokens"].get<int64_t>() + n_completion_tokens;
 
+                if (arr[0].contains("preempt")) {
+                    int64_t n_parks      = 0;
+                    int64_t n_recomputes = 0;
+                    for (const auto & r : arr) {
+                        if (r.contains("preempt")) {
+                            n_parks      += json_value(r.at("preempt"), "parks",      (int64_t) 0);
+                            n_recomputes += json_value(r.at("preempt"), "recomputes", (int64_t) 0);
+                        }
+                    }
+                    arr[0]["preempt"] = json {
+                        {"parks",      n_parks},
+                        {"recomputes", n_recomputes},
+                    };
+                }
                 res->ok(arr[0]);
             } else {
                 // multi-results, non-OAI compat
@@ -5324,37 +8095,51 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        // [TAG_PREEMPT] A slot can be parked before any token exists, so its notices are sent before the first result.
+        std::string preempt_prefix;
+        std::set<size_t> parked_idx;
         auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
-        }
-
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
-        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+        if (first_result != nullptr && dynamic_cast<server_task_result_preempt_notice*>(first_result.get()) != nullptr) {
+            const auto * notice = static_cast<server_task_result_preempt_notice*>(first_result.get());
+            preempt_prefix = preempt_notice_comment(*notice);
+            if (notice->parked) {
+                parked_idx.insert(notice->index);
+            } else {
+                parked_idx.erase(notice->index);
+            }
+            first_result.reset();
         } else {
-            res->data = format_oai_sse(first_result_json);
+            if (first_result == nullptr) {
+                GGML_ASSERT(req.should_stop());
+                return res; // connection is closed
+            }
+
+            if (first_result->is_error()) {
+                res->error(first_result->to_json());
+                return res;
+            }
+
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
+        }
+
+        json first_result_json = first_result ? first_result->to_json() : json(nullptr);
+        if (first_result_json == nullptr) {
+            res->data = preempt_prefix; // simply send HTTP headers and status code
+        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+            res->data = preempt_prefix + format_anthropic_sse(first_result_json);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            res->data = preempt_prefix + format_oai_resp_sse(first_result_json);
+        } else {
+            res->data = preempt_prefix + format_oai_sse(first_result_json);
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, parked_idx](std::string & output) mutable -> bool {
+            const bool parked = !parked_idx.empty();
+
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -5405,10 +8190,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // receive subsequent results
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
-                auto result = rd.next([&timeout, &start_time, sse_ping_interval, &effective_should_stop]() {
+                // [TAG_PREEMPT] A parked slot is silent, so ping at least every 2 s regardless of --sse-ping; a shorter requested interval is kept.
+                const int64_t ping_cfg = sse_ping_interval > 0 ? (int64_t) sse_ping_interval * 1000 : -1;
+                const int64_t ping_ms  = parked ? (ping_cfg > 0 ? std::min(ping_cfg, PREEMPT_KEEPALIVE_MS) : PREEMPT_KEEPALIVE_MS) : ping_cfg;
+                auto result = rd.next([&timeout, &start_time, ping_ms, &effective_should_stop]() {
                     if (effective_should_stop()) {
                         return true; // should_stop condition met
-                    } else if (sse_ping_interval > 0 && ggml_time_ms() - start_time > (int64_t)sse_ping_interval * 1000) {
+                    } else if (ping_ms > 0 && ggml_time_ms() - start_time > ping_ms) {
                         timeout = true;
                         return true; // timeout
                     }
@@ -5418,7 +8206,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (timeout) {
                     // some clients may time out (e.g. undici) will time out if no data is received for a while, so we need to send a ping to keep the connection alive
                     SRV_DBG("%s", "sending SSE ping\n");
-                    output = ":\n\n";
+                    output = parked ? ": preempt-keepalive\n\n" : ":\n\n";
                     return true;
                 }
 
@@ -5434,12 +8222,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                } else if (const auto * notice = dynamic_cast<server_task_result_preempt_notice*>(result.get())) {
+                    if (notice->parked) {
+                        parked_idx.insert(notice->index);
+                    } else {
+                        parked_idx.erase(notice->index);
+                    }
+                    output = preempt_notice_comment(*notice);
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
+                    if (res_json.is_null()) {
+                        // [TAG_PREEMPT] Skip the pre-token empty signal once a notice opened the stream.
+                        return true;
+                    }
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
@@ -5572,6 +8371,9 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_slots",              params.endpoint_slots },
         { "endpoint_props",              params.endpoint_props },
         { "endpoint_metrics",            params.endpoint_metrics },
+        // [TAG_EXACT_CONCURRENCY] Tells clients whether the mode is active, since a build ignoring the variable still starts.
+        { "exact_concurrency",           common_exact_concurrency() },
+        { "preempt",                     meta.preempt },
         { "ui",                          params.ui },
         { "ui_settings",                 meta.json_ui_settings },
         { "chat_template",               tmpl_default },
@@ -5760,7 +8562,12 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            // [TAG_PREEMPT_ASYNC] A slot can fall back to synchronous parks after load, which the copied metadata does not see.
+            if (props["preempt"].contains("async")) {
+                props["preempt"]["async"] = ctx_server.preempt_async_live.load();
+            }
+            res->ok(props);
         }
         return res;
     };
@@ -7055,6 +9862,10 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     if (is_sleeping) {
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
+        // [TAG_PREEMPT_ASYNC] as the awake handler: a slot may have fallen back to synchronous parks since load
+        if (cached_props["preempt"].contains("async")) {
+            cached_props["preempt"]["async"] = ctx_server.preempt_async_live.load();
+        }
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;

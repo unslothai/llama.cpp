@@ -2180,6 +2180,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
             return false;
         }
+        // [TAG_EXACT_CONCURRENCY] supports_op never offers RPC a page table, so a graph with one is not from a scheduler and its page ids cannot be trusted.
+        if (graph->nodes[i] != nullptr && graph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT && graph->nodes[i]->src[5] != nullptr) {
+            LOG_ERROR("[%s] graph node %d (id=%" PRId64 ") is a paged FLASH_ATTN_EXT, which RPC does not support\n", __func__, i, id);
+            return false;
+        }
         if (graph->nodes[i] != nullptr) {
             LOG_DBG3("[%s] node %u: id=%" PRId64 ", %s\n", __func__, i, id, rpc_log_format_tensor(graph->nodes[i]).c_str());
             const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
@@ -2887,7 +2892,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads; the remote end is not asked, so it is not claimed here
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -1204,6 +1205,26 @@ llm_arch llm_arch_from_string(const std::string & name) {
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
     return LLM_TENSOR_INFOS.at(tensor);
+}
+
+bool llm_tensor_name_is_input_layer(const std::string & name) {
+    for (const auto & [tensor, info] : LLM_TENSOR_INFOS) {
+        if (info.layer != LLM_TENSOR_LAYER_INPUT) {
+            continue;
+        }
+
+        const auto it = LLM_TENSOR_NAMES.find(tensor);
+        if (it == LLM_TENSOR_NAMES.end()) {
+            continue;
+        }
+
+        const size_t n = strlen(it->second);
+        if (name.compare(0, n, it->second) == 0 && (name.size() == n || name[n] == '.')) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool llm_arch_is_recurrent(const llm_arch & arch) {

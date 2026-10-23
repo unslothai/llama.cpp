@@ -49,6 +49,11 @@
 
 #define GGML_CUDA_CC_PASCAL          600
 #define GGML_CUDA_CC_DP4A            610 // minimum compute capability for __dp4a, an intrinsic for byte-wise dot products
+// [TAG_BATCH_INVARIANT] 0 = off, 1 = split every batched matmul, 2 = split only where it changes bits
+int ggml_cuda_batch_invariant();
+// widest batch the split applies to, 0 = no bound; bounding it gives up prompt-phase invariance only
+int ggml_cuda_batch_invariant_max_cols();
+
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
@@ -1278,6 +1283,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    int max_cols = -1;  // [TAG_EXACT_CONCURRENCY] the batch-invariant column bound the kernels were captured under
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;

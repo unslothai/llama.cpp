@@ -95,6 +95,11 @@ int llama_completion(int argc, char ** argv) {
         return 1;
     }
 
+    // --context-shift removes cached cells and shifts the rest down once the context fills (self-extend is refused in the common init)
+    if (params.ctx_shift && !common_exact_concurrency_position_edit_ok("--context-shift")) {
+        return 1;
+    }
+
     auto & sparams = params.sampling;
 
     // save choice to use color for later

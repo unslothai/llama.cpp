@@ -35,6 +35,13 @@ int main(int argc, char ** argv){
 
     llama_context * ctx = llama_init->context();
 
+    // a refused context (e.g. an exact concurrency check) leaves the model loaded and the context null
+    if (llama_init->model() == nullptr || ctx == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
+        return 1;
+    }
+
     // tokenize the prompt
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx, params.prompt, true, true);

@@ -1586,6 +1586,11 @@ json server_decision_context::format_answer(const server_decision_question & que
 //
 
 std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots) {
+    // [TAG_EXACT_CONCURRENCY] Exact mode refuses seq_cp (a page belongs to one sequence), so every task keeps its whole prompt.
+    if (common_exact_concurrency()) {
+        return std::move(tasks);
+    }
+
     n_slots = std::max(n_slots, (size_t) 1);
 
     std::vector<server_task> groups;
@@ -1608,8 +1613,10 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
         }
 
         parent.n_tokens_shared = n_shared;
+        parent.family_n_shared = n_shared;
         for (size_t j = i + 1; j < end; j++) {
             tasks[j].id_parent = parent.id;
+            tasks[j].family_n_shared = n_shared;
             parent.child_tasks.push_back(std::move(tasks[j]));
         }
         groups.push_back(std::move(parent));

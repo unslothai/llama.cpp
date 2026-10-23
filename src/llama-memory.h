@@ -101,6 +101,19 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // [TAG_EXACT_CONCURRENCY] Allocation granularity: n tokens occupy round_up(n, granularity) cells. Not pure virtual, so old modules inherit 1.
+    virtual uint32_t alloc_granularity() const { return 1; }
+
+    // [TAG_PREEMPT] True when the sequences draw on one pool of cells, so one sequence's growth takes room from the others. Not pure virtual, so old modules inherit true.
+    virtual bool shares_cells() const { return true; }
+
+    // [TAG_PREEMPT] Cells held by at least one sequence, read from the cells: a shared cell once, a partly used block in full. With n_reclaimable, also
+    // the cells every one of whose sequences is in seq_free. -1 when this memory cannot tell. Not pure virtual, so old modules inherit -1.
+    virtual int32_t n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const {
+        (void) seq_free; (void) n_seq_free; (void) n_reclaimable;
+        return -1;
+    }
+
     //
     // ops
     //

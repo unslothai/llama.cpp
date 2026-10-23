@@ -188,6 +188,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
     llama_build_and_test(test-llama-grammar.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
+    # [TAG_EXACT_CONCURRENCY] the buffer types the mode treats as invariant, through llama-impl.h
+    llama_build_and_test(test-exact-buft.cpp LINK llama)
     llama_build_and_test(test-chat.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -317,10 +319,84 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+# [TAG_EXACT_CONCURRENCY] the RPC server refuses a paged FLASH_ATTN_EXT; the test forks its own server, so POSIX only
+if (GGML_RPC AND NOT GGML_BACKEND_DL AND NOT WIN32)
+    llama_build_and_test(test-rpc-paged-fa.cpp LINK ggml)
+endif()
+
+# [TAG_EXACT_CONCURRENCY] the event query a backend publishes through its registry is found and answers
+llama_build_and_test(test-event-query.cpp LINK ggml)
+
+# [TAG_EXACT_CONCURRENCY] a paged FLASH_ATTN_EXT is claimed only in the shapes the paged kernel launches
+llama_build_and_test(test-paged-fa-supports.cpp LINK ggml)
+if (GGML_CUDA_FA AND (GGML_CUDA OR GGML_HIP))
+    # the paged kernel is compiled in, so the test expects it rather than skipping when a valid shape is refused
+    target_compile_definitions(test-paged-fa-supports PRIVATE LLAMA_TEST_PAGED_FA_ENABLED)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
+
+# Guards on the asynchronous per-sequence state transfer
+# Skips itself on a backend that cannot copy asynchronously
+llama_build_and_test(test-state-seq-copy.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-seq-copy PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# [TAG_EXACT_CONCURRENCY] page bookkeeping of the paged KV pool, and a non-layer weight on the host refused. Exact mode needs CUDA and 256-wide
+# K/V heads, which the generic test model does not have, so they run only against LLAMA_TEST_EXACT_MODEL, and fail if no exact context can be made.
+set(LLAMA_TEST_EXACT_MODEL "" CACHE FILEPATH "a model with 256-wide K/V heads for the exact-concurrency model tests")
+llama_build(test-exact-pages.cpp)
+llama_build(test-exact-weights.cpp)
+if (LLAMA_TEST_EXACT_MODEL)
+    llama_test(test-exact-pages   LABEL "model" ARGS -m "${LLAMA_TEST_EXACT_MODEL}")
+    llama_test(test-exact-weights LABEL "model" ARGS -m "${LLAMA_TEST_EXACT_MODEL}")
+endif()
+
+# [TAG_EXACT_CONCURRENCY] every tool that copies cells between sequences refuses exact concurrency up front (common_exact_concurrency_seq_copy_ok),
+# before any model or context exists: the refusal message must appear, and nothing may crash first
+function(llama_test_exact_seq_copy name target)
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+    set_tests_properties(${name} PROPERTIES
+        LABELS "main"
+        ENVIRONMENT "LLAMA_EXACT_CONCURRENCY=1"
+        PASS_REGULAR_EXPRESSION "LLAMA_EXACT_CONCURRENCY does not support")
+endfunction()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+    llama_test_exact_seq_copy(test-exact-seq-copy-lookahead   llama-lookahead   -m "${MODEL_DEST}" -p "hi" -n 1)
+    llama_test_exact_seq_copy(test-exact-seq-copy-parallel    llama-parallel    -m "${MODEL_DEST}" -pps -np 2 -ns 2)
+    llama_test_exact_seq_copy(test-exact-seq-copy-speculative llama-speculative -m "${MODEL_DEST}" -md "${MODEL_DEST}" -np 2 -kvu -p "hi")
+    # the same refusal for tools that move or rescale cached positions (context shift, self-extend)
+    llama_test_exact_seq_copy(test-exact-position-edit-passkey llama-passkey -m "${MODEL_DEST}")
+endif()
+# exact concurrency refuses the context of a model it cannot run (on CPU every model): a tool must report the null context, not dereference it
+function(llama_test_exact_null_context name target)
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+    set_tests_properties(${name} PROPERTIES
+        LABELS "model"
+        FIXTURES_REQUIRED test-download-model
+        ENVIRONMENT "LLAMA_EXACT_CONCURRENCY=1"
+        PASS_REGULAR_EXPRESSION "failed to load the model or create the context")
+endfunction()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+    llama_test_exact_null_context(test-exact-null-context-lookup            llama-lookup            -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello" -n 4)
+    llama_test_exact_null_context(test-exact-null-context-lookup-stats      llama-lookup-stats      -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello")
+    llama_test_exact_null_context(test-exact-null-context-lookup-create     llama-lookup-create     -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello")
+    llama_test_exact_null_context(test-exact-null-context-speculative-simple llama-speculative-simple -m "${MODEL_DEST}" -md "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello" -n 4)
+endif()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+    llama_test_exact_seq_copy(test-exact-position-edit-completion-self-extend   llama-completion -m "${MODEL_DEST}" --grp-attn-n 2 -p "hi" -n 1 -no-cnv)
+    llama_test_exact_seq_copy(test-exact-position-edit-completion-context-shift llama-completion -m "${MODEL_DEST}" --context-shift -p "hi" -n 1 -no-cnv)
+    llama_test_exact_seq_copy(test-exact-seq-copy-batched-bench llama-batched-bench -m "${MODEL_DEST}" -pps -npp 8 -ntg 1 -npl 2)
+endif()
+
+# [TAG_PREEMPT] the occupancy the server's planner reads: shared cells counted once, and the cells only given sequences hold
+llama_build_and_test(test-memory-cells-used.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-memory-cells-used PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
@@ -341,6 +417,26 @@ endif()
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
+
+# [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
+llama_build_and_test(test-exact-geometry.cpp)
+llama_build_and_test(test-exact-decode-tokens.cpp)
+llama_test(test-exact-decode-tokens NAME test-exact-decode-tokens-live-context LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-exact-decode-tokens-live-context PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-speculative-shared-bound.cpp)
+
+# server helpers that need no model; server-context exists only where tools/ adds the server
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    llama_build_and_test(test-server-tokens.cpp)
+    target_link_libraries(test-server-tokens PRIVATE server-context mtmd)
+    target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    llama_build_and_test(test-server-decision-exact.cpp)
+    target_link_libraries(test-server-decision-exact PRIVATE server-context mtmd)
+    target_include_directories(test-server-decision-exact PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    llama_build_and_test(test-server-preempt-kind.cpp)
+    target_link_libraries(test-server-preempt-kind PRIVATE server-context mtmd)
+    target_include_directories(test-server-preempt-kind PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

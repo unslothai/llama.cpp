@@ -81,6 +81,10 @@ struct common_speculative_draft_params {
     uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
+// [TAG_PREEMPT] The draft bound every drafting sequence of one batch shares when the drafter needs equal blocks (DSpark, DFlash2): the configured
+// n_max, lowered to the tightest per-call bound (dp.n_max > 0) among the sequences that are drafting.
+int32_t common_speculative_n_draft_shared(const std::vector<common_speculative_draft_params> & dparams, int32_t n_max);
+
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation

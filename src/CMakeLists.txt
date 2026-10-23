@@ -69,6 +69,21 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
+# [TAG_JCC_ALIGN] JCC-erratum x86 cores skip the uop cache for jumps on 32-byte boundaries; keep them off, or decode speed depends on code layout.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$" AND NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    # GCC passes it to binutils as; clang's integrated assembler takes it only as a driver flag
+    check_cxx_compiler_flag("-Wa,-mbranches-within-32B-boundaries" LLAMA_CXX_HAS_JCC_ALIGN)
+    if (LLAMA_CXX_HAS_JCC_ALIGN)
+        target_compile_options(llama PRIVATE -Wa,-mbranches-within-32B-boundaries)
+    else()
+        check_cxx_compiler_flag("-mbranches-within-32B-boundaries" LLAMA_CXX_HAS_JCC_ALIGN_DRIVER)
+        if (LLAMA_CXX_HAS_JCC_ALIGN_DRIVER)
+            target_compile_options(llama PRIVATE -mbranches-within-32B-boundaries)
+        endif()
+    endif()
+endif()
+
 target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)

@@ -49,6 +49,13 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
+    // a refused context (e.g. an exact concurrency check) leaves the model loaded and the context null
+    if (model_tgt == nullptr || ctx_tgt == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
+        return 1;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
     // load the draft model (if any) - this also creates the MTP draft context when MTP speculation is enabled
@@ -58,6 +65,16 @@ int main(int argc, char ** argv) {
         common_params params_dft = common_base_params_to_speculative(params);
 
         spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+
+        // a draft model or an MTP head needs its draft context, which can be refused (e.g. by exact concurrency) while the target's is not
+        const bool needs_dft = params.speculative.has_dft() ||
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+        if (needs_dft && ((params.speculative.has_dft() && spec_init->model() == nullptr) || spec_init->context() == nullptr)) {
+            LOG_ERR("%s: failed to load the draft model or create the draft context\n", __func__);
+            common_log_flush(common_log_main());
+            return 1;
+        }
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();

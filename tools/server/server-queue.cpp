@@ -528,12 +528,16 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, const
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
     size_t index = 0;
+    // [TAG_PREEMPT] Multiple prompts or completions number their results, and preempt notices must say which one they belong to.
+    const bool batched = id_tasks.size() > 1;
     for (auto & task : tasks) {
-        task.index = index++;
+        task.index   = index++;
+        task.batched = batched;
         states.push_back(task_result_state(session));
         // for child tasks
         for (auto & child_task : task.child_tasks) {
-            child_task.index = index++;
+            child_task.index   = index++;
+            child_task.batched = batched;
             states.push_back(task_result_state(session));
         }
     }

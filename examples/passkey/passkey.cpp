@@ -31,6 +31,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the junk is decoded in a rolling context: once it fills, a prefix is removed and the rest shifted down (and --grp-attn-n divides positions)
+    if (!common_exact_concurrency_position_edit_ok("passkey's rolling context")) {
+        return 1;
+    }
+
     int n_junk = params.n_junk;
     int n_keep = params.n_keep;
     int n_grp  = params.grp_attn_n;

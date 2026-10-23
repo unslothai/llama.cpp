@@ -47,8 +47,10 @@ int main(int argc, char ** argv) {
     auto * model = llama_init->model();
     auto * ctx   = llama_init->context();
 
-    if (model == NULL) {
-        LOG_ERR("%s: unable to load model\n", __func__);
+    // a refused context (e.g. an exact concurrency check) leaves the model loaded and the context null
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
 

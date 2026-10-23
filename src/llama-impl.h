@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
 #include <string>
 #include <type_traits>
@@ -109,3 +110,37 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 // arrays are rendered only until the result is longer than max_len
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);
+
+// [TAG_EXACT_CONCURRENCY] opt-in mode under which a sequence's attention depends only on its own cells, so its output does not change when others share the KV cache
+bool llama_exact_concurrency();
+
+// [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's batch-invariant kernels
+bool llama_exact_backend_name(const char * reg_name);
+
+// [TAG_EXACT_CONCURRENCY] whether a backend registry carries the mode's kernels: the name, and the extension that ships with them (an older module of the same name has neither)
+bool llama_exact_backend_reg(ggml_backend_reg_t reg);
+
+// [TAG_EXACT_CONCURRENCY] whether a tensor placed in this buffer type is computed by such a backend
+bool llama_exact_buft_invariant(ggml_backend_buffer_type_t buft);
+
+// [TAG_EXACT_CONCURRENCY] a context reports how many sequences it was created with, so the backend knows the width every context needs
+bool llama_exact_report_n_seq(uint32_t n_seq);
+
+bool llama_exact_check_n_seq(uint32_t n_seq);
+
+// [TAG_EXACT_CONCURRENCY] A live exact context's batch geometry, held while it lives: its batch must keep holding a whole ubatch
+// beside a decode step of every sequence, n_batch >= n_ubatch + n_seq_max * llama_exact_decode_tokens(), so the process-wide
+// tokens figure may only grow to what the tightest live context still holds (llama_set_exact_decode_tokens() refuses past it).
+struct llama_exact_geometry_hold {
+    llama_exact_geometry_hold() = default;
+    llama_exact_geometry_hold(const llama_exact_geometry_hold &) = delete;
+    llama_exact_geometry_hold & operator=(const llama_exact_geometry_hold &) = delete;
+    ~llama_exact_geometry_hold();
+
+    // checks the geometry against the current figure and records it in one step, so no figure can grow in between; false, recording
+    // nothing, when it does not hold. A context with one sequence has no decode step beside its ubatch and is not recorded
+    bool acquire(uint32_t n_batch, uint32_t n_ubatch, uint32_t n_seq_max);
+
+    bool     held  = false;
+    uint32_t slack = 0; // decode tokens per sequence the batch holds beside a whole ubatch
+};

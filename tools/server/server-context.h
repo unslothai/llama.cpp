@@ -56,6 +56,9 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // [TAG_PREEMPT] the /props "preempt" block
+    json preempt = json::object();
 };
 
 enum server_state {

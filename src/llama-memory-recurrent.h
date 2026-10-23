@@ -61,6 +61,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool shares_cells() const override { return false; }  // one state per sequence
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

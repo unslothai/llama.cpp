@@ -2996,6 +2996,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = true;
             break;
 
+        case GGML_OP_FLASH_ATTN_EXT:
+            // [TAG_EXACT_CONCURRENCY] src[5] is the page table, which only the CUDA backend reads
+            supp = op->src[5] == nullptr && htp_kparams_check(sess, op);
+            break;
+
         default:
             supp = htp_kparams_check(sess, op);
             break;

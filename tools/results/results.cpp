@@ -70,8 +70,10 @@ int main(int argc, char ** argv) {
     common_init_result_ptr llama_init = common_init_from_params(params);
     struct llama_model   * model = llama_init->model();
     struct llama_context * lctx  = llama_init->context();
-    if (model == nullptr) {
-        LOG_ERR("%s: unable to load model\n", __func__);
+    // a refused context (e.g. an exact concurrency check) leaves the model loaded and the context null
+    if (model == nullptr || lctx == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));

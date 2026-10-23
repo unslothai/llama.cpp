@@ -2490,6 +2490,8 @@ extern "C" {
     //   n_head % ne32      == 0
     //   ne3    % ne33      == 0
     //
+    // optional src[5] (pages): [1 + n_pages, n_batch] I32, set after this call; row i is a count then the physical KV page ids query i reads, in logical order.
+    // Only the CUDA backend (incl. HIP and MUSA) reads it; others ignore it and rely on the mask, which must still hide every cell outside those pages.
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

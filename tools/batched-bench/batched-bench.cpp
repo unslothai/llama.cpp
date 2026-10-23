@@ -29,6 +29,11 @@ int llama_batched_bench(int argc, char ** argv) {
         return 1;
     }
 
+    // -pps evaluates the prompt once and copies it to the other sequences
+    if (params.is_pp_shared && !common_exact_concurrency_seq_copy_ok("a shared prompt (-pps)")) {
+        return 1;
+    }
+
     int is_pp_shared   = params.is_pp_shared;
     int is_tg_separate = params.is_tg_separate;
 

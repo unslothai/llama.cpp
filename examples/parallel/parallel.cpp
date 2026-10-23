@@ -170,6 +170,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // -pps evaluates the system prompt once and copies it to every client's sequence
+    if (params.is_pp_shared && !common_exact_concurrency_seq_copy_ok("a shared system prompt (-pps)")) {
+        return 1;
+    }
+
     // number of simultaneous "clients" to simulate
     const int32_t n_clients = params.n_parallel;
 
@@ -200,6 +205,12 @@ int main(int argc, char ** argv) {
 
     auto * model = llama_init->model();
     auto * ctx   = llama_init->context();
+
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
+        return 1;
+    }
 
     auto * mem = llama_get_memory(ctx);
 
