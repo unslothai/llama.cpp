@@ -2515,6 +2515,7 @@ static std::vector<parity_case> parity_cases(const llama_vocab * vocab) {
 struct synth_candidates {
     std::map<llama_token, float> finite; // id -> logit of the candidates that are not -INF
     int n_dims = 1;                      // of the exported logits
+    llama_token selected = -1;           // the token a selecting sampler (greedy, dist) picked, if any
 };
 
 static synth_candidates synth_run_cpu(llama_sampler * chain, const std::vector<float> & logits) {
@@ -2529,6 +2530,9 @@ static synth_candidates synth_run_cpu(llama_sampler * chain, const std::vector<f
         if (arr.data[i].logit != -INFINITY) {
             res.finite[arr.data[i].id] = arr.data[i].logit;
         }
+    }
+    if (arr.selected >= 0) {
+        res.selected = arr.data[arr.selected].id;
     }
     return res;
 }
@@ -2563,6 +2567,12 @@ static synth_candidates synth_run_backend(llama_sampler * chain, const std::vect
     ggml_tensor * out_logits = ggml_cont(ctx, ggml_reshape_1d(ctx, data.logits, ggml_nelements(data.logits)));
     ggml_set_output(out_logits);
     ggml_build_forward_expand(gf, out_logits);
+    ggml_tensor * out_sampled = nullptr;
+    if (data.sampled) {
+        out_sampled = ggml_cont(ctx, ggml_reshape_1d(ctx, data.sampled, 1));
+        ggml_set_output(out_sampled);
+        ggml_build_forward_expand(gf, out_sampled);
+    }
     ggml_tensor * out_ids = nullptr;
     if (data.candidates) {
         out_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, data.candidates, ggml_nelements(data.candidates)));
@@ -2593,6 +2603,11 @@ static synth_candidates synth_run_backend(llama_sampler * chain, const std::vect
         if (lg[i] != -INFINITY) {
             res.finite[ids[i]] = lg[i];
         }
+    }
+    if (out_sampled) {
+        int32_t tok = -1;
+        ggml_backend_tensor_get(out_sampled, &tok, 0, sizeof(tok));
+        res.selected = tok;
     }
 
     ggml_gallocr_free(galloc);
@@ -2661,11 +2676,6 @@ static void test_synthetic_parity(const test_params & params) {
             llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 1, lb));
             llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.8f, 0.5f, 1.5f)); } },
         // duplicate biases after a reordering sampler: summed on both sides
-        { "logit_bias_dup_reordered", { 0, -1, 1, 2 }, [](llama_sampler * c) {
-            const llama_logit_bias lb[] = { { 3, 10.0f }, { 3, -100.0f } };
-            llama_sampler_chain_add(c, llama_sampler_init_top_k(2));
-            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 2, lb)); } },
-        // a computed dynamic temperature of 0 is greedy (only the first maximum is left), not a tiny temperature
         { "dynatemp_zero_temp", { 1, 1000, -1000, 3 }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.0f, 1.0f, 1.0f)); } },
         // a tiny positive dynamic temperature divides as on the CPU (no clamp)
         { "dynatemp_tiny_temp", { 0, 1e-30f, 2e-30f, 3e-30f }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(1e-30f, 1e-31f, 1.0f)); } },
@@ -2685,16 +2695,16 @@ static void test_synthetic_parity(const test_params & params) {
         { "dynatemp_one_cand_neg_exp", { ninf, 3, ninf }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.0f, 1.0f, -1.0f)); } },
         // a fully masked row passes dynamic temperature unchanged (no NaN from the softmax of -INF)
         { "dynatemp_all_masked", { ninf, ninf, ninf, ninf }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.5f, 0.5f, 1.0f)); } },
+        // with one live candidate or none the CPU leaves the row as it is (not sorted): greedy picks the same token
+        { "dynatemp_all_masked_greedy", std::vector<float>(32, ninf), [](llama_sampler * c) {
+            llama_sampler_chain_add(c, llama_sampler_init_temp_ext(0.5f, 0.5f, 1.0f));
+            llama_sampler_chain_add(c, llama_sampler_init_greedy()); } },
         // greedy on a fully masked row (CUDA argmax returns -1 there)
         { "greedy_all_masked", { ninf, ninf, ninf, ninf }, [](llama_sampler * c) {
             llama_sampler_chain_add(c, llama_sampler_init_temp_ext(-1.0f, 0.5f, 1.0f)); } },
         // min-p on a fully masked row (its max gather must stay inside the row)
         { "min_p_all_masked", { -INFINITY, -INFINITY, -INFINITY, -INFINITY }, [](llama_sampler * c) { llama_sampler_chain_add(c, llama_sampler_init_min_p(0.5f, 1)); } },
         // duplicate biases add up to 0: both sides add the merged sum once, the greedy order stays
-        { "logit_bias_dup_cancel", { 0.1f, 0.099999f, 0.0f, -1.0f }, [](llama_sampler * c) {
-            const llama_logit_bias lb[] = { { 0, 100.0f }, { 0, -100.0f } };
-            llama_sampler_chain_add(c, llama_sampler_init_logit_bias(4, 2, lb));
-            llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f)); } },
         { "greedy_top_k", { 0, 3, 1, 4, 2 }, [](llama_sampler * c) {
             llama_sampler_chain_add(c, llama_sampler_init_top_k(4));
             llama_sampler_chain_add(c, llama_sampler_init_temp(0.0f));
@@ -2736,6 +2746,8 @@ static void test_synthetic_parity(const test_params & params) {
                 continue;
             }
             bool ok = rc.finite.size() == rb.finite.size() && rb.n_dims == 1;
+            // a selecting sampler picks the same token (also on a row without finite candidates)
+            ok = ok && (rc.selected < 0 || rb.selected < 0 || rc.selected == rb.selected);
             for (const auto & [id, l] : rb.finite) {
                 ok = ok && !std::isnan(l);
             }
@@ -2743,8 +2755,8 @@ static void test_synthetic_parity(const test_params & params) {
                 const auto it = rb.finite.find(id);
                 ok = ok && it != rb.finite.end() && fabsf(it->second - l) <= 1e-4f*std::max(1.0f, fabsf(l));
             }
-            printf("synthetic %-26s %-6s cpu %zu cand, backend %zu cand (dims %d) %s\n", sc.name, ggml_backend_dev_name(dev),
-                    rc.finite.size(), rb.finite.size(), rb.n_dims, ok ? "OK" : "FAIL");
+            printf("synthetic %-26s %-6s cpu %zu cand, backend %zu cand (dims %d) selected %d / %d %s\n", sc.name, ggml_backend_dev_name(dev),
+                    rc.finite.size(), rb.finite.size(), rb.n_dims, rc.selected, rb.selected, ok ? "OK" : "FAIL");
             if (!ok) {
                 for (const auto & [id, l] : rc.finite) { printf("    cpu %d %.6g\n", id, l); }
                 for (const auto & [id, l] : rb.finite) { printf("    bk  %d %.6g\n", id, l); }
@@ -3195,6 +3207,56 @@ static void test_model_inf_logits_cpu_suffix(const test_params & params) {
     printf("backend model -INF logits CPU suffix test PASSED\n");
 }
 
+// a token listed more than once in a logit bias: the CPU adds its biases one at a time, as before (their float
+// sum can overflow where the sequence does not: -3e38 + 2e38 + 2e38 = 1e38, but 2e38 + 2e38 = INF), and the
+// sampler stays on the CPU, where the backend could only add one value per token
+static void test_logit_bias_duplicates(const test_params & params) {
+    GGML_UNUSED(params);
+    const llama_logit_bias lb[] = { { 0, 2e38f }, { 0, 2e38f } };
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(3, 2, lb));
+    std::vector<llama_token_data> cur = { { 0, -3e38f, 0.0f }, { 1, -2e38f, 0.0f }, { 2, -1e38f, 0.0f } };
+    llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(chain, &arr);
+    printf("logit bias duplicates: token 0 logit %g (sequential: 1e38)\n", arr.data[0].logit);
+    GGML_ASSERT(std::isfinite(arr.data[0].logit) && fabsf(arr.data[0].logit - 1e38f) <= 1e32f);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    const bool offloaded = chain->iface->backend_init(chain, buft, 1);
+    printf("logit bias duplicates: chain offloaded %d, sampler %s\n", offloaded, llama_sampler_name(llama_sampler_chain_get(chain, 0)));
+    GGML_ASSERT(!offloaded);
+    llama_sampler_free(chain);
+    printf("backend logit bias duplicates test PASSED\n");
+}
+
+// a penalties sampler cloned from a chain that declared draft rows (backend_draft_rows) and added to a chain that
+// did not: the opt-in belongs to the chain, so with several outputs per sequence the clone stays on the CPU
+static void test_penalties_clone_draft_rows(const test_params & params) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(params.model.get()));
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+
+    llama_sampler_chain_params cp = llama_sampler_chain_default_params();
+    cp.backend_draft_rows = true;
+    llama_sampler * donor = llama_sampler_chain_init(cp);
+    llama_sampler_chain_add(donor, llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.5f, 0.0f));
+    llama_sampler_chain_add(donor, llama_sampler_init_dist(1));
+    GGML_ASSERT(donor->iface->backend_init(donor, buft, 4));
+    printf("penalties clone: donor %s\n", llama_sampler_name(llama_sampler_chain_get(donor, 0)));
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_clone(llama_sampler_chain_get(donor, 0)));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(1));
+    chain->iface->backend_init(chain, buft, 4);
+    const char * name = llama_sampler_name(llama_sampler_chain_get(chain, 0));
+    printf("penalties clone: clone in a chain without draft rows %s\n", name);
+    GGML_ASSERT(name[0] != '+');
+
+    llama_sampler_free(chain);
+    llama_sampler_free(donor);
+    printf("backend penalties clone draft rows test PASSED\n");
+}
+
 // a chain without any backend sampler (here XTC first) is not attached to the context: no sampler would run on
 // the backend, and the CPU samplers get the model logits exactly as without backend sampling
 static void test_cpu_only_chain_not_exported(const test_params & params) {
@@ -3452,6 +3514,8 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_custom_masking_cpu_suffix",           test_custom_masking_cpu_suffix,        true },
     { "test_masking_classes_cpu_suffix",          test_masking_classes_cpu_suffix,       true },
     { "test_cpu_only_chain_not_exported",         test_cpu_only_chain_not_exported,      true },
+    { "test_logit_bias_duplicates",               test_logit_bias_duplicates,            true },
+    { "test_penalties_clone_draft_rows",          test_penalties_clone_draft_rows,       true },
     { "test_model_inf_logits_cpu_suffix",         test_model_inf_logits_cpu_suffix,      true },
     { "test_nested_chain_cpu_fallback",           test_nested_chain_cpu_fallback,        true },
     { "test_all_masked_row",                      test_all_masked_row,                   true },
