@@ -16,6 +16,7 @@
 #include <vector>
 #include <memory>
 #include <fstream>
+#include <random>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -463,6 +464,15 @@ struct clip_enc_state {
     std::vector<ggml_tensor *> v;
 };
 
+// per-sequence state of audio generation, see clip_gen_state_init()
+struct clip_gen_state {
+    std::mt19937 rng;
+
+    ggml_context_ptr        ctx_data;
+    ggml_backend_buffer_ptr buf;
+    std::vector<ggml_tensor *> slots; // same order as list_gen_state_slots(), F32 [ne0, ne1]
+};
+
 // forward declaration
 // TODO: improve this later
 struct clip_ctx;
@@ -527,6 +537,7 @@ enum projector_type {
     PROJECTOR_TYPE_EXAONE4_5,
     PROJECTOR_TYPE_MINICPMV4_6,
     PROJECTOR_TYPE_MINICPMV4_7,
+    PROJECTOR_TYPE_MINICPM_OCR_1_0,
     PROJECTOR_TYPE_GRANITE_SPEECH,
     PROJECTOR_TYPE_MIMOVL,
     PROJECTOR_TYPE_MINIMAX_M3,
@@ -537,6 +548,7 @@ enum projector_type {
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_MUSE_GLIMMER,
+    PROJECTOR_TYPE_SENSENOVA_U1,
     PROJECTOR_TYPE_COHERE2V,
     PROJECTOR_TYPE_MUSE_SPARK_AUDIO,
     PROJECTOR_TYPE_UNKNOWN,
@@ -600,6 +612,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_HUNYUANVL,         "hunyuanvl"},
     { PROJECTOR_TYPE_MINICPMV4_6,       "minicpmv4_6"},
     { PROJECTOR_TYPE_MINICPMV4_7,       "minicpmv4_7"},
+    { PROJECTOR_TYPE_MINICPM_OCR_1_0,   "minicpm_ocr_1_0"},
     { PROJECTOR_TYPE_GRANITE_SPEECH,    "granite_speech"},
     { PROJECTOR_TYPE_MIMOVL,            "mimovl"},
     { PROJECTOR_TYPE_MINIMAX_M3,        "minimax_m3"},
@@ -611,6 +624,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+    { PROJECTOR_TYPE_SENSENOVA_U1,      "sensenova_u1"},
     { PROJECTOR_TYPE_COHERE2V,          "cohere2v"},
     { PROJECTOR_TYPE_MUSE_SPARK_AUDIO,  "muse-spark-audio"},
 };
