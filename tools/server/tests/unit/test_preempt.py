@@ -1428,31 +1428,31 @@ def test_a_long_resident_that_never_shifts_is_rotated_out_for_an_aged_head(polic
 
 
 def test_one_victim_that_covers_the_shortfall_is_parked_instead_of_several_small_ones():
+    # the smallest single victim that covers the shortfall is the cost policy's choice; the fixture restores the policy afterwards
+    os.environ["LLAMA_ARG_PREEMPT_POLICY"] = "cost"
     _serve_with_training_context(8192)
     _start(n_ctx=4864, n_slots=4, n_batch=2048)
+    assert server.make_request("GET", "/props").body["preempt"]["policy"] == "cost"
 
-    small = [_prompt_of(400, _PROMPT_A), _prompt_of(400, _PROMPT_B)]
-    medium = _prompt_of(1400, _PROMPT_C)
-    leader = _prompt_of(3267, _PROMPT_A)
-
-    with ThreadPoolExecutor(4) as pool:
-        residents = [pool.submit(_raw_completion, 300, p, i) for i, p in enumerate(small + [medium])]
-        _await(lambda: all(_n_decoded(s) > 0 for s in server.make_request("GET", "/slots").body if s["id"] < 3),
-               "the three residents decoding", alive=lambda: not all(r.done() for r in residents), poll=0.002)
-        last = pool.submit(_raw_completion, 8, leader, 3)
-        results = [r.result() for r in residents] + [last.result()]
-
-    for res, n_predict in zip(results, (300, 300, 300, 8)):
-        assert res.status_code == 200, res.body
-        assert res.body["timings"]["predicted_n"] == n_predict
+    # all four prompts in one request, so they are queued at once whatever the client's speed. At their output limits the two small
+    # ones and the leader hold 700 + 700 + 3400 cells, which fit the 4864 once the 1700 of the medium one are parked; parking both
+    # small ones instead would not be enough
+    prompts = [_prompt_of(400, _PROMPT_A), _prompt_of(400, _PROMPT_B), _prompt_of(1400, _PROMPT_C), _prompt_of(3100, _PROMPT_A)]
+    response = server.make_request("POST", "/completion", data={
+        "prompt": prompts, "n_predict": 300, "ignore_eos": True, "temperature": 0.0, "seed": 42, "cache_prompt": False,
+    })
+    assert response.status_code == 200, response.body
+    for body in response.body:
+        assert body["timings"]["predicted_n"] == 300, body
 
     text = _log()
     assert "Context size has been exceeded" not in text
     first_resume = text.find("resumed after")
     assert first_resume > 0, "nothing was parked"
-    parks = [int(n) for n in re.findall(r"preempted: (\d+) cells", text[:first_resume])]
+    parks = [(int(slot), int(n)) for slot, n in re.findall(r"id +(\d+) \| task \d+ \| preempted: (\d+) cells", text[:first_resume])]
     assert len(parks) == 1, f"parked {parks} where one resident covered the shortfall"
-    assert parks[0] >= 1400, parks
+    assert parks[0][0] == response.body[2]["id_slot"], (parks, [body["id_slot"] for body in response.body])
+    assert parks[0][1] >= 1400, parks
 
 
 @pytest.mark.parametrize("ram", ["8192", "0", "unset"])

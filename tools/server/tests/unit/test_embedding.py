@@ -360,3 +360,11 @@ def test_an_empty_completion_prompt_on_an_embedding_server_is_an_empty_response(
     assert server.make_request("POST", "/completion", data={"prompt": [], "n_predict": 1}).status_code == 400
     res = server.make_request("POST", "/completion", data={"prompt": [[1] * 600], "n_predict": 1})
     assert res.status_code == 500 and "logits" in res.body["error"]["message"], res.body
+    # the checks keep the order they have when the slot is launched and its prompt built: an invalid token is a bad request (400)
+    # before the context is asked for logits, and so are sampling parameters the samplers refuse
+    res = server.make_request("POST", "/completion", data={"prompt": [[99999999]], "n_predict": 1})
+    assert res.status_code == 400 and res.body["error"]["type"] == "invalid_request_error", res.body
+    assert "invalid tokens" in res.body["error"]["message"], res.body
+    res = server.make_request("POST", "/completion", data={"prompt": [[1] * 600], "n_predict": 1, "repeat_penalty": 0})
+    assert res.status_code == 400 and res.body["error"]["type"] == "invalid_request_error", res.body
+    assert "Failed to initialize samplers" in res.body["error"]["message"], res.body

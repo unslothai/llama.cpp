@@ -1646,7 +1646,7 @@ public:
         error_type  type = ERROR_TYPE_SERVER;
 
         for (const auto & task : tasks) {
-            if (!task_prompt_rejected(task, msg, type)) {
+            if (!task_prompt_rejected(task, msg, type, /* with_sampler */ true)) {
                 continue;
             }
 
@@ -5731,17 +5731,42 @@ private:
         }
     }
 
-    // Checks a request must pass before its prompt is processed; true if rejected. An empty prompt is a final response, not an error.
-    bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type) const {
-        // as the batch builder: an empty prompt is answered with an empty final response before any check below
-        if (task.tokens.empty()) {
-            return false;
+    // As launch_slot_with_task() resolves them: the task's own adapter scales, or the server's, refused when all the enabled ones
+    // are aLoRAs and there is not exactly one of them.
+    bool task_runs_several_aloras(const server_task & task) const {
+        const auto & loras = params_base.lora_adapters;
+
+        bool   all_alora = false;
+        size_t n_enabled = 0;
+
+        for (size_t i = 0; i < loras.size(); ++i) {
+            float scale = loras[i].scale;
+            if (!task.params.lora.empty()) {
+                const auto it = task.params.lora.find((int) i);
+                scale = it != task.params.lora.end() ? it->second : 0.0f;
+            }
+            if (scale != 0) {
+                if (llama_adapter_get_alora_n_invocation_tokens(loras[i].ptr) == 0) {
+                    return false;
+                }
+                all_alora = true;
+            }
+            if (scale > 0) {
+                n_enabled++;
+            }
         }
 
-        // TODO: support memory-less logits computation
-        if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
-            msg  = "the current context does not support logits computation. skipping";
-            type = ERROR_TYPE_SERVER;
+        return all_alora && n_enabled != 1;
+    }
+
+    // Checks a request must pass before its prompt is processed; true if rejected. An empty prompt is a final response, not an error.
+    // They run in the order a slot meets them, so a request failing several gets the error it got before they were moved up front:
+    // launch_slot_with_task() first (aLoRA set, token ids, samplers), then the batch builder (empty prompt, logits, sizes).
+    // with_sampler: a task not launched yet, whose sampling parameters are tried when a batch-builder check would refuse it.
+    bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type, bool with_sampler = false) const {
+        if (task_runs_several_aloras(task)) {
+            msg  = "Cannot run multiple aLoRAs in a single request";
+            type = ERROR_TYPE_INVALID_REQUEST;
             return true;
         }
 
@@ -5749,6 +5774,39 @@ private:
         if (!task.tokens.validate(ctx_tgt)) {
             msg  = "Prompt contains invalid tokens";
             type = ERROR_TYPE_INVALID_REQUEST;
+            return true;
+        }
+
+        // as the batch builder: an empty prompt is answered with an empty final response before any check below
+        if (task.tokens.empty()) {
+            return false;
+        }
+
+        if (!task_built_prompt_rejected(task, msg, type)) {
+            return false;
+        }
+
+        // the launch refuses sampling parameters the samplers cannot take before the batch builder gets to the checks above; tried
+        // only on this path, where the request is refused either way, so an accepted one builds its samplers once, at the launch
+        if (with_sampler && task.need_sampling()) {
+            try {
+                common_params_sampling sampling = task.params.sampling; // common_sampler_init() takes them by non-const reference
+                common_sampler_ptr     smpl(common_sampler_init(model_tgt, sampling));
+            } catch (const std::exception & e) {
+                msg  = std::string("Failed to initialize samplers: ") + e.what();
+                type = ERROR_TYPE_INVALID_REQUEST;
+            }
+        }
+
+        return true;
+    }
+
+    // The batch builder's checks of a non-empty prompt, in its order; true if rejected.
+    bool task_built_prompt_rejected(const server_task & task, std::string & msg, error_type & type) const {
+        // TODO: support memory-less logits computation
+        if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
+            msg  = "the current context does not support logits computation. skipping";
+            type = ERROR_TYPE_SERVER;
             return true;
         }
 
