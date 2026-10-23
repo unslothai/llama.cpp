@@ -718,6 +718,7 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
     const auto * chain_src = (const llama_sampler_chain *) smpl->ctx;
 
     auto * result = llama_sampler_chain_init(chain_src->params);
+    ((llama_sampler_chain *) result->ctx)->backend_draft_rows = chain_src->backend_draft_rows;
 
     for (const auto & smpl : chain_src->samplers) {
         llama_sampler_chain_add(result, llama_sampler_clone(smpl.ptr));
@@ -759,7 +760,7 @@ static bool llama_sampler_chain_backend_init(
 
     // a chain that declares draft rows declares them for the samplers of its nested chains too (a nested chain's
     // own backend_init does not turn them off again)
-    if (chain->params.backend_draft_rows) {
+    if (chain->backend_draft_rows) {
         for (auto & entry : chain->samplers) {
             llama_sampler_penalties_set_draft_rows(entry.ptr, true);
         }
@@ -921,6 +922,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .iface = */ &llama_sampler_chain_i,
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
+            /* .backend_draft_rows   = */ false,
             /* .is_init              = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
@@ -929,6 +931,13 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .n_sample             = */ 0,
         }
     );
+}
+
+void llama_sampler_chain_set_backend_draft_rows(struct llama_sampler * chain, bool draft_rows) {
+    GGML_ASSERT(chain != nullptr && chain->iface == &llama_sampler_chain_i);
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    GGML_ASSERT(!p->is_init && "set the draft rows before the chain is attached to a context");
+    p->backend_draft_rows = draft_rows;
 }
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
@@ -3149,7 +3158,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     std::vector<llama_token> rows_tokens = {};
     uint32_t row_offset = 0; // first row of the current ubatch
 
-    // the rows are draft-verification rows (llama_sampler_chain_params.backend_draft_rows of the chain)
+    // the rows are draft-verification rows (llama_sampler_chain_set_backend_draft_rows on the chain)
     bool draft_rows = false;
 
     // backend helpers
@@ -3314,7 +3323,7 @@ static bool llama_sampler_penalties_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    // several outputs per sequence: only as draft-verification rows (llama_sampler_chain_params.backend_draft_rows),
+    // several outputs per sequence: only as draft-verification rows (llama_sampler_chain_set_backend_draft_rows),
     // every chain then gets its own history, see rows_tokens; other uses of several outputs (prompt outputs of
     // which only some are sampled, rows without token ids) keep the penalties on the CPU, which sees the history
     // the caller actually accepted
@@ -4304,10 +4313,10 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
 
     // search for the remaining candidates that were not found in the previous step
     for (size_t i = 0; i < cur_p->size; ++i) {
+        // every entry of the token, one at a time in list order (a token can be listed more than once)
         for (const auto & lb : ctx->to_search) {
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
-                break;
             }
         }
     }
@@ -4886,6 +4895,26 @@ static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, 
         }
     } else if (smpl->iface == &llama_sampler_penalties_i) {
         ((llama_sampler_penalties *) smpl->ctx)->draft_rows = draft_rows;
+    }
+}
+
+void llama_sampler_backend_set_n_chains(llama_sampler * sampler, uint32_t n_chains) {
+    GGML_ASSERT(sampler != nullptr);
+
+    n_chains = std::max<uint32_t>(1, n_chains);
+
+    if (sampler->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) sampler->ctx;
+        for (auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            llama_sampler_backend_set_n_chains(entry.ptr, n_chains);
+        }
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        ((llama_sampler_dist *) sampler->ctx)->n_chains = n_chains;
+    } else if (sampler->iface == &llama_sampler_penalties_i) {
+        ((llama_sampler_penalties *) sampler->ctx)->n_chains = n_chains;
     }
 }
 

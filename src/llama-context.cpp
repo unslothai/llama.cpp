@@ -1430,6 +1430,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             return false;
         }
 
+        // a ubatch has at most n_ubatch rows of a sequence: the chains past that are never built
+        llama_sampler_backend_set_n_chains(sampler, std::min(cparams.n_outputs_max_per_seq, cparams.n_ubatch));
+
         sampling.samplers[seq_id] = sampler;
 
         sched_need_reserve = true;
@@ -2548,9 +2551,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
-    // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
+    // every sampler builds min(n_outputs_max_per_seq, n_ubatch) chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
-        res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+        res += llama_sampler_backend_n_nodes(sampler) * std::min(cparams.n_outputs_max_per_seq, cparams.n_ubatch);
     }
 
     if (cparams.training) {

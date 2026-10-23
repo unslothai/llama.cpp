@@ -77,8 +77,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
-        /*.no_perf            =*/ true,
-        /*.backend_draft_rows =*/ false,
+        /*.no_perf =*/ true,
     };
 
     return result;
