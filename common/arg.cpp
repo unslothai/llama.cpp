@@ -1312,6 +1312,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         params.lr.init();
 
         if (!common_exact_concurrency_init(ctx_arg.params)) {
+            common_log_flush(common_log_main()); // the refusal is logged on the logger's thread, and the tool exits next
             ctx_arg.params = params_org;
             return false;
         }

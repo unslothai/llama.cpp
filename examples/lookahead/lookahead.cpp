@@ -76,6 +76,7 @@ int main(int argc, char ** argv) {
 
     if (model == nullptr || ctx == nullptr) {
         LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
 

@@ -97,6 +97,7 @@ int main(int argc, char ** argv) {
 
     if (model_tgt == nullptr || ctx_tgt == nullptr) {
         LOG_ERR("%s: failed to load the target model or create its context\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
 
@@ -120,6 +121,7 @@ int main(int argc, char ** argv) {
 
     if (model_dft == nullptr || ctx_dft == nullptr) {
         LOG_ERR("%s: failed to load the draft model or create its context\n", __func__);
+        common_log_flush(common_log_main());
         return 1;
     }
 

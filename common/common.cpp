@@ -1247,6 +1247,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // [TAG_EXACT_CONCURRENCY] Checked before any context exists, so none is created outside the explicit bound.
     if (!model_only && !common_exact_concurrency_init(params)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to load the model, see the error above\n");
+        common_log_flush(common_log_main()); // the logger writes on its own thread, and the caller may exit at once
         return;
     }
 
@@ -1300,6 +1301,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (!common_exact_concurrency_model(params, model)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to create a context, see the error above\n");
+        common_log_flush(common_log_main());
         return;
     }
 
@@ -1388,6 +1390,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        common_log_flush(common_log_main()); // a refused context (e.g. an exact concurrency check) is reported before the caller exits
         return;
     }
 
@@ -1395,6 +1398,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (!common_exact_concurrency_context(params, lctx)) {
         COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY: refusing to serve this context, see the error above\n");
+        common_log_flush(common_log_main());
         pimpl->context.reset();
         return;
     }
@@ -1496,6 +1500,9 @@ bool common_exact_concurrency_seq_copy_ok(const char * what) {
 
     COM_ERR("LLAMA_EXACT_CONCURRENCY does not support %s: it copies cells between sequences, and exact concurrency gives each page "
             "one owner, so every such copy is refused (llama_memory_seq_cp ignores it) and the tool would run on missing cells\n", what);
+
+    // the logger writes on its own thread and the caller exits next: without a flush the line can be lost
+    common_log_flush(common_log_main());
 
     return false;
 }
