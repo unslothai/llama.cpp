@@ -28,8 +28,8 @@
 #include "ggml-common.h"
 #include "hex-bitmap.h"
 #include "htp-ctx.h"
+#include "htp-dcache.h"
 #include "htp-ops.h"
-#include "htp-tensor.h"
 #include "htp_iface.h"
 #include "work-queue.h"
 #include "hex-profile.h"
@@ -316,9 +316,17 @@ static int vtcm_release_callback(unsigned int rctx, void * state) {
     return 0;
 }
 
-static int vtcm_alloc(struct htp_context * ctx) {
+static unsigned int vtcm_query_size(void) {
     unsigned int vtcm_size = 8 * 1024 * 1024;  // 8MB default
-    HAP_compute_res_query_VTCM(0, &vtcm_size, NULL, NULL, NULL);
+    unsigned int vtcm_avail;
+    compute_res_vtcm_page_t total_layout, avail_layout;
+    // some images (e.g. FuSa cDSP) fail the query when the layout out-params are NULL
+    HAP_compute_res_query_VTCM(0, &vtcm_size, &total_layout, &vtcm_avail, &avail_layout);
+    return vtcm_size;
+}
+
+static int vtcm_alloc(struct htp_context * ctx) {
+    unsigned int vtcm_size = vtcm_query_size();
 
     compute_res_attr_t attr;
     HAP_compute_res_attr_init(&attr);
@@ -363,11 +371,90 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
-AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
+// Non-BURST modes leave DCVS enabled and keep the HTP awake.
+// BURST pins all corners to MAX and disables DCVS.
+// Corner constants are from HAP_power.h (HAP_dcvs_voltage_corner_t / HAP_dcvs_exp_vcorner_t).
+struct htp_power_profile {
+    boolean  dcvs_enable;
+    uint32_t bus_min_corner;
+    uint32_t bus_max_corner;
+    uint32_t bus_target_corner;
+    uint32_t core_min_corner;
+    uint32_t core_max_corner;
+    uint32_t core_target_corner;
+    boolean  sleep_disable;
+    uint32_t hmx_min_corner;    // only used when __HVX_ARCH__ >= 75
+    uint32_t hmx_max_corner;
+    uint32_t hmx_target_corner;
+    uint32_t hmx_perf_mode;
+};
+
+#define HTP_POWER_PROFILE_ENTRY(min_c, max_c, hmx_c) \
+    { \
+        .dcvs_enable        = TRUE, \
+        .bus_min_corner     = (min_c), \
+        .bus_max_corner     = (max_c), \
+        .bus_target_corner  = (max_c), \
+        .core_min_corner    = (min_c), \
+        .core_max_corner    = (max_c), \
+        .core_target_corner = (max_c), \
+        .sleep_disable      = TRUE, \
+        .hmx_min_corner     = (hmx_c), \
+        .hmx_max_corner     = (hmx_c), \
+        .hmx_target_corner  = (hmx_c), \
+        .hmx_perf_mode      = HAP_CLK_PERF_HIGH, \
+    }
+
+static const struct htp_power_profile htp_power_profiles[HTP_POWER_MODE_COUNT] = {
+    [HTP_POWER_MODE_LOW_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS2, HAP_DCVS_EXP_VCORNER_MIN_SVS),
+    [HTP_POWER_MODE_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS, HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_EXP_VCORNER_SVS),
+    [HTP_POWER_MODE_HIGH_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_VCORNER_NOM, HAP_DCVS_EXP_VCORNER_SVS_L2),
+    [HTP_POWER_MODE_LOW_BALANCED] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM, HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_EXP_VCORNER_NOM),
+    [HTP_POWER_MODE_BALANCED] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_VCORNER_TURBO, HAP_DCVS_EXP_VCORNER_NOM_L1),
+    [HTP_POWER_MODE_HIGH_PERFORMANCE] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_TURBO, HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_EXP_VCORNER_TUR_L2),
+    [HTP_POWER_MODE_SUSTAINED_HIGH_PERFORMANCE] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_EXP_VCORNER_TUR_L2),
+    [HTP_POWER_MODE_BURST] = {
+        .dcvs_enable        = FALSE,
+        .bus_min_corner     = HAP_DCVS_VCORNER_MAX,
+        .bus_max_corner     = HAP_DCVS_VCORNER_MAX,
+        .bus_target_corner  = HAP_DCVS_VCORNER_MAX,
+        .core_min_corner    = HAP_DCVS_VCORNER_MAX,
+        .core_max_corner    = HAP_DCVS_VCORNER_MAX,
+        .core_target_corner = HAP_DCVS_VCORNER_MAX,
+        .sleep_disable      = TRUE,
+        .hmx_min_corner     = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_max_corner     = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_target_corner  = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_perf_mode      = HAP_CLK_PERF_HIGH,
+    },
+};
+
+#undef HTP_POWER_PROFILE_ENTRY
+
+AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem, uint32_t power_mode) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
         return AEE_EBADPARM;
     }
+
+    if (power_mode >= HTP_POWER_MODE_COUNT) {
+        FARF(ERROR, "invalid power-mode %u, falling back to burst", (unsigned) power_mode);
+        power_mode = HTP_POWER_MODE_BURST;
+    }
+    const struct htp_power_profile * pwr = &htp_power_profiles[power_mode];
+    FARF(ALWAYS, "power-mode %u : dcvs-enable %d bus[%u,%u,%u] core[%u,%u,%u] sleep-disable %d hmx[%u,%u,%u]",
+         (unsigned) power_mode, (int) pwr->dcvs_enable,
+         (unsigned) pwr->bus_min_corner, (unsigned) pwr->bus_max_corner, (unsigned) pwr->bus_target_corner,
+         (unsigned) pwr->core_min_corner, (unsigned) pwr->core_max_corner, (unsigned) pwr->core_target_corner,
+         (int) pwr->sleep_disable,
+         (unsigned) pwr->hmx_min_corner, (unsigned) pwr->hmx_max_corner, (unsigned) pwr->hmx_target_corner);
 
     if (h->ctx) {
         FARF(ERROR, "Queue already open");
@@ -499,17 +586,17 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
         request.type                              = HAP_power_set_DCVS_v3;
         request.dcvs_v3.set_dcvs_enable           = TRUE;
-        request.dcvs_v3.dcvs_enable               = FALSE;
+        request.dcvs_v3.dcvs_enable               = pwr->dcvs_enable;
         request.dcvs_v3.set_bus_params            = TRUE;
-        request.dcvs_v3.bus_params.min_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.max_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.target_corner  = HAP_DCVS_VCORNER_MAX;
+        request.dcvs_v3.bus_params.min_corner     = pwr->bus_min_corner;
+        request.dcvs_v3.bus_params.max_corner     = pwr->bus_max_corner;
+        request.dcvs_v3.bus_params.target_corner  = pwr->bus_target_corner;
         request.dcvs_v3.set_core_params           = TRUE;
-        request.dcvs_v3.core_params.min_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+        request.dcvs_v3.core_params.min_corner    = pwr->core_min_corner;
+        request.dcvs_v3.core_params.max_corner    = pwr->core_max_corner;
+        request.dcvs_v3.core_params.target_corner = pwr->core_target_corner;
         request.dcvs_v3.set_sleep_disable         = TRUE;
-        request.dcvs_v3.sleep_disable             = TRUE;
+        request.dcvs_v3.sleep_disable             = pwr->sleep_disable;
 
 #if (__HEXAGON_ARCH__ >= 79)
         HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
@@ -537,10 +624,10 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         request.hmx_v2.set_power     = TRUE;
         request.hmx_v2.power_up      = TRUE;
         request.hmx_v2.set_clock     = TRUE;
-        request.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.min_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.perf_mode     = HAP_CLK_PERF_HIGH;
+        request.hmx_v2.target_corner = pwr->hmx_target_corner;
+        request.hmx_v2.min_corner    = pwr->hmx_min_corner;
+        request.hmx_v2.max_corner    = pwr->hmx_max_corner;
+        request.hmx_v2.perf_mode     = pwr->hmx_perf_mode;
         FARF(ALWAYS, "Setting HMX clock\n");
         err = HAP_power_set((void *) ctx, &request);
         if (err != AEE_SUCCESS) {
@@ -691,9 +778,7 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     *n_hvx     = n_hvx_val;
     *n_hmx     = 1;
 
-    uint32_t vtcm_sz = 8 * 1024 * 1024; // 8MB default fallback
-    HAP_compute_res_query_VTCM(0, (unsigned int *)&vtcm_sz, NULL, NULL, NULL);
-    *vtcm_size = vtcm_sz;
+    *vtcm_size = vtcm_query_size();
 
     return AEE_SUCCESS;
 }
@@ -756,7 +841,7 @@ static int op_fence(struct htp_ops_context * octx) {
     atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
 
     if (mode == 1) {
-        htp_flush_dirty_ranges(ctx);
+        htp_dcache_flush_dirty_ranges(ctx);
 
         htp_mdev_group_barrier(octx);
 
@@ -861,6 +946,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_RELU:
         case HTP_OP_UNARY_STEP:
         case HTP_OP_L2_NORM:
+        case HTP_OP_HADAMARD:
             return op_unary(octx);
 
         case HTP_OP_GLU_SWIGLU:
@@ -869,7 +955,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_GLU_GEGLU:
         case HTP_OP_GLU_GEGLU_QUICK:
         case HTP_OP_GLU_GEGLU_ERF:
-            return op_activations(octx);
+        case HTP_OP_GLU_REGLU:
+        case HTP_OP_GLU_SIGMOID:
+            return op_glu(octx);
 
         case HTP_OP_SOFTMAX:
             return op_softmax(octx);
@@ -1132,7 +1220,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
     }
 
-    htp_tensor_flush_all(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
+    htp_dcache_flush_dirty_tensors(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
 
     // Prep output tensors
     for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
@@ -1148,7 +1236,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+    htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
     htp_mdev_group_barrier(octx);
 
@@ -1158,8 +1246,6 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
-    octx->src2_spad.src = NULL;
-    octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
 
     return octx->status;
@@ -1220,10 +1306,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
-    memset(octx, 0, sizeof(*octx));
-    octx->n_threads     = ctx->n_threads;
-    octx->n_threads_div = ctx->n_threads_div;
-    octx->ctx           = ctx;
+    htp_ops_context_reset(octx, ctx);
 
     mdev_group_init(ctx, req);
 
