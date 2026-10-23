@@ -48,6 +48,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_q_case<GGML_TYPE_IQ1_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -375,6 +378,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q6_K:
 // -------------------------------------------------
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -406,7 +410,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (turing_mma_available(cc)) {
-        return true;
+        // For dense IQ1_M, dequantization + cuBLAS is faster for large batch sizes:
+        if (type != GGML_TYPE_IQ1_M || n_experts > 0 || ne11 < 128) {
+            return true;
+        }
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
@@ -458,6 +465,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                case GGML_TYPE_IQ1_M:
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
