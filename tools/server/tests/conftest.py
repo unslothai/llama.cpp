@@ -12,6 +12,14 @@ def configure_worker_port(request):
         os.environ["PORT"] = str(8080 + worker_num * 10)
 
 
+# the report of each phase on the item (item.rep_setup / rep_call / rep_teardown), so a fixture can tell that its test failed
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)
+
+
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test
 @pytest.fixture(autouse=True)
 def stop_server_after_each_test():

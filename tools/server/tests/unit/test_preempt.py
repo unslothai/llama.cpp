@@ -27,7 +27,7 @@ _PROMPT_C = "In a small village by the sea there lived a fisherman who"
 
 
 @pytest.fixture(autouse=True)
-def create_server():
+def create_server(request):
     global server
     server = ServerPreset.tinyllama2()
     server.n_slots = 2
@@ -40,6 +40,13 @@ def create_server():
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
     yield
+    # a failed test shows the end of the server log, which CI does not keep otherwise
+    rep = getattr(request.node, "rep_call", None)
+    if rep is not None and rep.failed and server.log_path and os.path.exists(server.log_path):
+        with open(server.log_path, errors="replace") as f:
+            tail = f.readlines()[-300:]
+        print(f"---- last {len(tail)} lines of the server log ({server.log_path}) ----")
+        print("".join(tail))
     if _cuda_devices is None:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
     else:
@@ -1519,11 +1526,11 @@ def test_a_multi_prompt_oai_completion_counts_the_parks_of_every_prompt():
     assert merged.body["preempt"]["recomputes"] == sum(c["recomputes"] for c in counts), (merged.body["preempt"], counts)
 
 
-def _cached(n_predict: int, prompt: list, id_slot: int):
+def _cached(n_predict: int, prompt: list, id_slot: int, timeout: float = DEFAULT_REQUEST_TIMEOUT):
     return server.make_request("POST", "/completion", data={
         "n_predict": n_predict, "prompt": prompt, "id_slot": id_slot, "cache_prompt": True,
         "ignore_eos": True, "temperature": 0.0, "seed": 42,
-    })
+    }, timeout=timeout)
 
 
 def test_a_started_slot_replacing_its_prompt_does_not_purge_an_idle_slot():
@@ -1750,17 +1757,23 @@ def test_a_started_slot_trimmed_below_its_sliding_window_prefills_again():
     server.model_hf_file = None
     server.model_alias = "tinygemma3"
     server.override_kvs = ["gemma3.attention.sliding_window=int:32"]
-    # the busy slot reaches the follower's admission ~500 steps before the pool would purge the stale cache, not ~40
+    # Once the busy slot holds 80 cells, its cells, the stale 450 and the follower's first 512-token chunk overflow the 1024-cell pool, so
+    # the planner trims the follower's started slot before the batch builder would; the busy slot (40 + 200 cells beside the stale 450)
+    # never grows enough to purge the stale cache first. Its tail past the wait is 160 tokens, as before round 15 (170), not the 700 a
+    # slow runner (1.6 s a step on the Windows CI runner) spent past the 600 s read timeout, and both requests are bounded below it.
     _start(n_ctx=1024, n_slots=2, n_batch=512, n_ubatch=64, cache_ram=0, n_threads=4)
-    stale = [100 + k % 50 for k in range(400)]
+    stale = [100 + k % 50 for k in range(450)]
     follower = stale[:40] + [400 + k % 50 for k in range(500)]
     assert _cached(1, stale, 1).status_code == 200
     with ThreadPoolExecutor(1) as pool:
-        busy = pool.submit(_cached, 800, [300 + k % 50 for k in range(40)], 0)
-        _await(lambda: _n_decoded(_slot_view(0)) >= 100, "the busy slot filling the pool", alive=lambda: not busy.done())
-        # 40 tokens in common, far below the 32 newest cells the window kept of the stale 400
-        res = _cached(16, follower, 1)
-        busy = busy.result()
+        busy = pool.submit(_cached, 200, [300 + k % 50 for k in range(40)], 0, 450.0)
+        _await(lambda: _n_decoded(_slot_view(0)) >= 40, "the busy slot filling the pool", alive=lambda: not busy.done())
+        # 40 tokens in common, far below the 32 newest cells the window kept of the stale 450
+        res = _cached(16, follower, 1, 450.0)
+        try:
+            busy = busy.result(timeout=480.0)
+        except Exception as e:
+            pytest.fail(f"the busy 200-token request did not finish ({type(e).__name__}: {e}); see the server log below")  # ty: ignore[invalid-argument-type]
     for r in (res, busy):
         assert r.status_code == 200, r.body
     text = _log()
