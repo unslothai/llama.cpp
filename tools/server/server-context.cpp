@@ -5733,6 +5733,11 @@ private:
 
     // Checks a request must pass before its prompt is processed; true if rejected. An empty prompt is a final response, not an error.
     bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type) const {
+        // as the batch builder: an empty prompt is answered with an empty final response before any check below
+        if (task.tokens.empty()) {
+            return false;
+        }
+
         // TODO: support memory-less logits computation
         if (task.need_logits() && !llama_get_memory(ctx_tgt)) {
             msg  = "the current context does not support logits computation. skipping";

@@ -367,6 +367,23 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     llama_test_exact_seq_copy(test-exact-seq-copy-parallel    llama-parallel    -m "${MODEL_DEST}" -pps -np 2 -ns 2)
     llama_test_exact_seq_copy(test-exact-seq-copy-speculative llama-speculative -m "${MODEL_DEST}" -md "${MODEL_DEST}" -np 2 -kvu -p "hi")
 endif()
+# exact concurrency refuses the context of a model it cannot run (on CPU every model): a tool must report the null context, not dereference it
+function(llama_test_exact_null_context name target)
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+    set_tests_properties(${name} PROPERTIES
+        LABELS "model"
+        FIXTURES_REQUIRED test-download-model
+        ENVIRONMENT "LLAMA_EXACT_CONCURRENCY=1"
+        PASS_REGULAR_EXPRESSION "failed to load the model or create the context")
+endfunction()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+    llama_test_exact_null_context(test-exact-null-context-lookup            llama-lookup            -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello" -n 4)
+    llama_test_exact_null_context(test-exact-null-context-lookup-stats      llama-lookup-stats      -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello")
+    llama_test_exact_null_context(test-exact-null-context-lookup-create     llama-lookup-create     -m "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello")
+    llama_test_exact_null_context(test-exact-null-context-speculative-simple llama-speculative-simple -m "${MODEL_DEST}" -md "${MODEL_DEST}" -c 512 -b 256 -ub 64 -p "hello" -n 4)
+endif()
+
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
     llama_test_exact_seq_copy(test-exact-seq-copy-batched-bench llama-batched-bench -m "${MODEL_DEST}" -pps -npp 8 -ntg 1 -npl 2)
 endif()
@@ -397,6 +414,7 @@ llama_build_and_test(test-mtmd-impl.cpp LINK mtmd)
 
 # [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
+llama_build_and_test(test-speculative-shared-bound.cpp)
 
 # server helpers that need no model; server-context exists only where tools/ adds the server
 if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)

@@ -49,6 +49,13 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
+    // a refused context (e.g. an exact concurrency check) leaves the model loaded and the context null
+    if (model_tgt == nullptr || ctx_tgt == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        common_log_flush(common_log_main());
+        return 1;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
     // load the draft model (if any) - this also creates the MTP draft context when MTP speculation is enabled

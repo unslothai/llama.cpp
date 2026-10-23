@@ -81,6 +81,12 @@ int main(int argc, char ** argv) {
     llama_init = common_init_from_params(params);
     {
         auto * model = llama_init->model();
+        // only the model is used here, so a refused context does not matter, a missing model does
+        if (model == nullptr) {
+            LOG_ERR("%s: failed to load the model\n", __func__);
+            common_log_flush(common_log_main());
+            return 1;
+        }
         const char * clip_path = params.mmproj.path.c_str();
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu          = params.mmproj_use_gpu;

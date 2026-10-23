@@ -171,6 +171,18 @@ bool common_speculative_are_compatible(
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
+int32_t common_speculative_n_draft_shared(const common_speculative_draft_params_vec & dparams, int32_t n_max) {
+    int32_t res = n_max;
+
+    for (const auto & dp : dparams) {
+        if (dp.drafting && dp.n_max > 0) {
+            res = std::min(res, dp.n_max);
+        }
+    }
+
+    return res;
+}
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -1281,6 +1293,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch.clear();
 
+        // DSpark's markov head and DFlash2's convolution and selector split the token axis into equal blocks, so their sequences share
+        // one bound, the tightest per-call bound; each draft is truncated to its own bound afterwards. Other drafters keep their own bound.
+        const bool    equal_blocks   = is_dspark || is_dflash2;
+        const int32_t n_draft_shared = common_speculative_n_draft_shared(dparams, params.n_max);
+
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
@@ -1297,7 +1314,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             // the caller's remaining context bounds the block as well as the configured maximum: the whole block is decoded before any truncation
-            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+            const int32_t n_draft = equal_blocks ? n_draft_shared : dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
