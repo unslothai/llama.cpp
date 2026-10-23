@@ -1419,6 +1419,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
+        // a chain whose first sampler does not run on the backend runs entirely on the CPU: it is not attached, so
+        // its samplers get the model logits exactly as without backend sampling
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        if (chain->samplers.empty() || !chain->samplers.front().is_backend) {
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
+        }
+
         sampling.samplers[seq_id] = sampler;
 
         sched_need_reserve = true;

@@ -4797,6 +4797,12 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
 }
 
 static bool llama_sampler_masks_without_removing(const struct llama_sampler * smpl) {
+    // a sampler masks without removing when it can leave a candidate at -INF that the CPU sampler keeps in the
+    // array: the CPU suffix after a backend prefix gets the candidates without the -INF ones (the backend filters
+    // write -INF where the CPU filters remove), so such a chain runs on the CPU. Besides an explicit -INF this
+    // includes arithmetic that overflows a finite logit (any finite input, as an earlier sampler can set it)
+    static constexpr float overflow_shift = 0x1p103f; // half an ulp of FLT_MAX: -FLT_MAX - x is -INF from here
+
     if (smpl == nullptr) {
         return false;
     }
@@ -4810,31 +4816,40 @@ static bool llama_sampler_masks_without_removing(const struct llama_sampler * sm
         return false;
     }
     if (smpl->iface == &llama_sampler_logit_bias_i) {
+        // logit + bias overflows to -INF for some finite logit when bias <= -2^103 (and -INF itself)
         for (const auto & lb : ((const llama_sampler_logit_bias *) smpl->ctx)->merged()) {
-            if (lb.bias == -INFINITY) {
+            if (lb.bias <= -overflow_shift) {
                 return true;
             }
         }
         return false;
     }
     if (smpl->iface == &llama_sampler_temp_i) {
-        return ((const llama_sampler_temp *) smpl->ctx)->temp <= 0.0f;
+        // greedy (temperature <= 0) masks every candidate but one; logit / t overflows for some finite logit when t < 1
+        return ((const llama_sampler_temp *) smpl->ctx)->temp < 1.0f;
     }
     if (smpl->iface == &llama_sampler_temp_ext_i) {
-        // greedy (temperature <= 0) as plain temperature, or when the dynamic temperature can reach 0
+        // the same for the lowest temperature it can apply (the plain one, or temp - delta when dynamic)
         const auto * ctx = (const llama_sampler_temp_ext *) smpl->ctx;
-        return ctx->delta <= 0.0f ? ctx->temp <= 0.0f : ctx->temp - ctx->delta <= 0.0f;
+        return (ctx->delta <= 0.0f ? ctx->temp : ctx->temp - ctx->delta) < 1.0f;
     }
-    // the other built-in backend samplers either remove what they mask on the CPU too (top-k, top-p, min-p),
-    // only shift logits (penalties) or select (greedy, dist); a sampler implemented outside llama.cpp may set
-    // logits to -INF and keep the candidates, so it is treated as masking
+    if (smpl->iface == &llama_sampler_penalties_i) {
+        // a repeat penalty above 1 multiplies the negative logits; the frequency and presence penalties subtract up
+        // to last_n * freq + present
+        const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
+        const double shift = (double) std::max(ctx->penalty_freq, 0.0f) * std::max(ctx->penalty_last_n, 1) +
+                             (double) std::max(ctx->penalty_present, 0.0f);
+        return ctx->penalty_repeat > 1.0f || shift >= (double) overflow_shift;
+    }
+    // the other built-in backend samplers remove what they mask on the CPU too (top-k, top-p, min-p) or select
+    // (greedy, dist); a sampler implemented outside llama.cpp may set logits to -INF and keep the candidates, so it
+    // is treated as masking
     if (smpl->iface == &llama_sampler_empty_i  ||
         smpl->iface == &llama_sampler_greedy_i ||
         smpl->iface == &llama_sampler_dist_i   ||
         smpl->iface == &llama_sampler_top_k_i  ||
         smpl->iface == &llama_sampler_top_p_i  ||
-        smpl->iface == &llama_sampler_min_p_i  ||
-        smpl->iface == &llama_sampler_penalties_i) {
+        smpl->iface == &llama_sampler_min_p_i) {
         return false;
     }
     return true;
