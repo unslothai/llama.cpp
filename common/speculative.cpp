@@ -1294,7 +1294,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch.clear();
 
         // DSpark's markov head and DFlash2's convolution and selector split the token axis into equal blocks, so their sequences share
-        // one bound, the tightest per-call bound; each draft is truncated to its own bound afterwards. Other drafters keep their own bound.
+        // one bound, the tightest per-call bound; it is at most every drafting sequence's own bound, so no draft exceeds its caller's
+        // limit. Other drafters keep their own bound.
         const bool    equal_blocks   = is_dspark || is_dflash2;
         const int32_t n_draft_shared = common_speculative_n_draft_shared(dparams, params.n_max);
 
