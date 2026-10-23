@@ -1422,10 +1422,6 @@ struct llama_moe_cache::impl {
         return (int64_t) c.size() == w->ne[2] ? &c : nullptr;
     }
 
-    void clear_seed_counts() {
-        seed_counts.clear();
-    }
-
     bool has_seed_counts() const {
         return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
@@ -1553,10 +1549,6 @@ void llama_moe_cache::set_seed_counts(const ggml_tensor * w, const std::vector<i
 
 const std::vector<int32_t> * llama_moe_cache::get_seed_counts(const ggml_tensor * w) const {
     return pimpl->get_seed_counts(w);
-}
-
-void llama_moe_cache::clear_seed_counts() {
-    pimpl->clear_seed_counts();
 }
 
 bool llama_moe_cache::has_seed_counts() const {

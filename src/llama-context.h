@@ -408,6 +408,7 @@ private:
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+    bool moe_cache_seed_cur     = false; // the stored routing counts were read in this prompt (else they are the last prompt's)
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
