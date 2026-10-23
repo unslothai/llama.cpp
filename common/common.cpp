@@ -1507,9 +1507,28 @@ bool common_exact_concurrency_seq_copy_ok(const char * what) {
     return false;
 }
 
+bool common_exact_concurrency_position_edit_ok(const char * what) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    COM_ERR("LLAMA_EXACT_CONCURRENCY does not support %s: it moves or rescales the positions of cached cells (llama_memory_seq_add / "
+            "seq_div), and a cell's page offset is its position, so every such edit is refused and the tool would decode at positions "
+            "its cells do not have\n", what);
+
+    common_log_flush(common_log_main());
+
+    return false;
+}
+
 bool common_exact_concurrency_init(const common_params & params) {
     if (!common_exact_concurrency()) {
         return true;
+    }
+
+    // SelfExtend (--grp-attn-n > 1) divides the positions of cached cells as the context fills
+    if (params.grp_attn_n > 1 && !common_exact_concurrency_position_edit_ok("self-extend (--grp-attn-n > 1)")) {
+        return false;
     }
 
 

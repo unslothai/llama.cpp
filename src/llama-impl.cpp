@@ -310,12 +310,14 @@ bool llama_set_exact_decode_tokens(uint32_t n_tokens) {
         return true;
     }
 
-    // every context widens with the figure, so report the width first; one the explicit bound cannot cover leaves the old figure in place
-    const uint32_t n_seq = g_exact_max_n_seq.load(std::memory_order_relaxed);
+    // every context widens with the figure, so report the width first; one the explicit bound cannot cover leaves the old figure in place.
+    // Before any context exists, check it for one sequence: stored unchecked, a figure past the bound could never be lowered again and
+    // would refuse every later context, a one-sequence one included.
+    const uint32_t n_seq = std::max(1u, g_exact_max_n_seq.load(std::memory_order_relaxed));
 
     uint32_t n_cols = 0;
 
-    if (n_seq > 0 && (!llama_exact_width_of(n_seq, n_tokens, n_cols) || !llama_set_exact_decode_width(n_cols))) {
+    if (!llama_exact_width_of(n_seq, n_tokens, n_cols) || !llama_set_exact_decode_width(n_cols)) {
         return false;
     }
 

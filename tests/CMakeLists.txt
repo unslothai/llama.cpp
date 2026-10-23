@@ -366,6 +366,8 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     llama_test_exact_seq_copy(test-exact-seq-copy-lookahead   llama-lookahead   -m "${MODEL_DEST}" -p "hi" -n 1)
     llama_test_exact_seq_copy(test-exact-seq-copy-parallel    llama-parallel    -m "${MODEL_DEST}" -pps -np 2 -ns 2)
     llama_test_exact_seq_copy(test-exact-seq-copy-speculative llama-speculative -m "${MODEL_DEST}" -md "${MODEL_DEST}" -np 2 -kvu -p "hi")
+    # the same refusal for tools that move or rescale cached positions (context shift, self-extend)
+    llama_test_exact_seq_copy(test-exact-position-edit-passkey llama-passkey -m "${MODEL_DEST}")
 endif()
 # exact concurrency refuses the context of a model it cannot run (on CPU every model): a tool must report the null context, not dereference it
 function(llama_test_exact_null_context name target)
@@ -385,6 +387,8 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+    llama_test_exact_seq_copy(test-exact-position-edit-completion-self-extend   llama-completion -m "${MODEL_DEST}" --grp-attn-n 2 -p "hi" -n 1 -no-cnv)
+    llama_test_exact_seq_copy(test-exact-position-edit-completion-context-shift llama-completion -m "${MODEL_DEST}" --context-shift -p "hi" -n 1 -no-cnv)
     llama_test_exact_seq_copy(test-exact-seq-copy-batched-bench llama-batched-bench -m "${MODEL_DEST}" -pps -npp 8 -ntg 1 -npl 2)
 endif()
 
@@ -414,6 +418,7 @@ llama_build_and_test(test-mtmd-impl.cpp LINK mtmd)
 
 # [TAG_EXACT_CONCURRENCY] the batch shape the mode requires, checked without a model
 llama_build_and_test(test-exact-geometry.cpp)
+llama_build_and_test(test-exact-decode-tokens.cpp)
 llama_build_and_test(test-speculative-shared-bound.cpp)
 
 # server helpers that need no model; server-context exists only where tools/ adds the server

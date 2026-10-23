@@ -1034,6 +1034,10 @@ bool common_exact_concurrency_init(const common_params & params);
 // a model, for the feature that copies: exact concurrency refuses such copies, so the tool is refused instead (false, logged).
 bool common_exact_concurrency_seq_copy_ok(const char * what);
 
+// [TAG_EXACT_CONCURRENCY] As common_exact_concurrency_seq_copy_ok(), for a tool whose feature moves or rescales cached positions
+// (llama_memory_seq_add / seq_div: context shift, self-extend): exact concurrency refuses those edits, so the tool is refused.
+bool common_exact_concurrency_position_edit_ok(const char * what);
+
 // the same for what only the loaded model tells: false if the model must not be served in exact mode
 bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
 

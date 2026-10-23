@@ -66,6 +66,16 @@ int main(int argc, char ** argv) {
 
         spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
 
+        // a draft model or an MTP head needs its draft context, which can be refused (e.g. by exact concurrency) while the target's is not
+        const bool needs_dft = params.speculative.has_dft() ||
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+        if (needs_dft && ((params.speculative.has_dft() && spec_init->model() == nullptr) || spec_init->context() == nullptr)) {
+            LOG_ERR("%s: failed to load the draft model or create the draft context\n", __func__);
+            common_log_flush(common_log_main());
+            return 1;
+        }
+
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();
     }
