@@ -5731,45 +5731,14 @@ private:
         }
     }
 
-    // As launch_slot_with_task() resolves them: the task's own adapter scales, or the server's, refused when all the enabled ones
-    // are aLoRAs and there is not exactly one of them.
-    bool task_runs_several_aloras(const server_task & task) const {
-        const auto & loras = params_base.lora_adapters;
-
-        bool   all_alora = false;
-        size_t n_enabled = 0;
-
-        for (size_t i = 0; i < loras.size(); ++i) {
-            float scale = loras[i].scale;
-            if (!task.params.lora.empty()) {
-                const auto it = task.params.lora.find((int) i);
-                scale = it != task.params.lora.end() ? it->second : 0.0f;
-            }
-            if (scale != 0) {
-                if (llama_adapter_get_alora_n_invocation_tokens(loras[i].ptr) == 0) {
-                    return false;
-                }
-                all_alora = true;
-            }
-            if (scale > 0) {
-                n_enabled++;
-            }
-        }
-
-        return all_alora && n_enabled != 1;
-    }
-
     // Checks a request must pass before its prompt is processed; true if rejected. An empty prompt is a final response, not an error.
     // They run in the order a slot meets them, so a request failing several gets the error it got before they were moved up front:
-    // launch_slot_with_task() first (aLoRA set, token ids, samplers), then the batch builder (empty prompt, logits, sizes).
+    // launch_slot_with_task() first (token ids, samplers), then the batch builder (empty prompt, logits, sizes).
     // with_sampler: a task not launched yet, whose sampling parameters are tried when a batch-builder check would refuse it.
+    // [TAG_PREEMPT] This also runs on the HTTP thread (tasks_prompt_rejected()), so it reads only what the server loop never changes
+    // after loading: the vocabulary and model, the context's sizes and flags, and the task itself. The aLoRA-set check stays in
+    // launch_slot_with_task(): it reads params_base.lora_adapters, which POST /lora-adapters replaces on the server loop.
     bool task_prompt_rejected(const server_task & task, std::string & msg, error_type & type, bool with_sampler = false) const {
-        if (task_runs_several_aloras(task)) {
-            msg  = "Cannot run multiple aLoRAs in a single request";
-            type = ERROR_TYPE_INVALID_REQUEST;
-            return true;
-        }
-
         // Mirrors launch_slot_with_task(), run earlier so a sibling is not rejected inside an already opened 200 stream.
         if (!task.tokens.validate(ctx_tgt)) {
             msg  = "Prompt contains invalid tokens";
