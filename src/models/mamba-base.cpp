@@ -40,11 +40,10 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
     ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     conv               = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner, n_seqs);
 
-    // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
-    cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
-
-    // {n_embd, 2*d_inner} @ {n_embd, n_seq_tokens, n_seqs} => {2*d_inner, n_seq_tokens, n_seqs}
+    // {n_embd, 2*d_inner} @ {n_embd, n_tokens} => {2*d_inner, n_tokens}
     ggml_tensor * xz = build_lora_mm(layer.ssm_in, cur, layer.ssm_in_s);
+    // {2*d_inner, n_tokens} => {2*d_inner, n_seq_tokens, n_seqs}
+    xz = ggml_reshape_3d(ctx0, xz, xz->ne[0], n_seq_tokens, n_seqs);
     // split the above in two
     // => {d_inner, n_seq_tokens, n_seqs}
     ggml_tensor * x  = ggml_view_3d(ctx0, xz, d_inner, xz->ne[1], xz->ne[2], xz->nb[1], xz->nb[2], 0);
@@ -84,8 +83,10 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
 
     // ssm
     {
-        // {d_inner, dt_rank + 2*d_state} @ {d_inner, n_seq_tokens, n_seqs} => {dt_rank + 2*d_state, n_seq_tokens, n_seqs}
-        ggml_tensor * x_db = build_lora_mm(layer.ssm_x, x);
+        // {d_inner, dt_rank + 2*d_state} @ {d_inner, n_tokens} => {dt_rank + 2*d_state, n_tokens}
+        ggml_tensor * x_db = build_lora_mm(layer.ssm_x, ggml_reshape_2d(ctx0, x, d_inner, n_seq_tokens * n_seqs));
+        // => {dt_rank + 2*d_state, n_seq_tokens, n_seqs}
+        x_db = ggml_reshape_3d(ctx0, x_db, x_db->ne[0], n_seq_tokens, n_seqs);
         // split
         ggml_tensor * dt   = ggml_view_3d(ctx0, x_db, dt_rank, n_seq_tokens, n_seqs, x_db->nb[1], x_db->nb[2], 0);
         ggml_tensor * B =
@@ -104,9 +105,11 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
             dt = ggml_cont(ctx0, dt);
         }
 
-        // {dt_rank, d_inner} @ {dt_rank, n_seq_tokens, n_seqs} => {d_inner, n_seq_tokens, n_seqs}
-        dt = build_lora_mm(layer.ssm_dt, dt);
+        // {dt_rank, d_inner} @ {dt_rank, n_tokens} => {d_inner, n_tokens}
+        dt = build_lora_mm(layer.ssm_dt, ggml_reshape_2d(ctx0, dt, dt_rank, n_seq_tokens * n_seqs));
         dt = ggml_add(ctx0, dt, layer.ssm_dt_b);
+        // => {d_inner, n_seq_tokens, n_seqs}
+        dt = ggml_reshape_3d(ctx0, dt, d_inner, n_seq_tokens, n_seqs);
 
         cur = x;
         x   = ggml_reshape_4d(ctx0, x, head_dim, n_head, n_seq_tokens, n_seqs);
@@ -140,12 +143,12 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
         y = ggml_add(ctx0, y, ggml_mul(ctx0, cur, layer.ssm_d));
         y = ggml_swiglu_split(ctx0, ggml_cont(ctx0, z), y);
 
-        // {d_inner, n_embd} @ {d_inner, n_seq_tokens, n_seqs} => {n_embd, n_seq_tokens, n_seqs}
+        // {d_inner, n_seq_tokens, n_seqs} => {d_inner, n_tokens}
+        y = ggml_reshape_2d(ctx0, y, d_inner, n_seq_tokens * n_seqs);
+
+        // {d_inner, n_embd} @ {d_inner, n_tokens} => {n_embd, n_tokens}
         cur = build_lora_mm(layer.ssm_out, y, layer.ssm_out_s);
     }
-
-    // {n_embd, n_seq_tokens, n_seqs} => {n_embd, n_tokens}
-    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);
 
     return cur;
 }
