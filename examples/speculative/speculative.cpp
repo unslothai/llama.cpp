@@ -55,9 +55,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // [TAG_EXACT_CONCURRENCY] the draft branches copy the target's cells to other sequences, which exact mode refuses (one owner per page)
-    if (common_exact_concurrency() && params.n_parallel > 1) {
-        LOG_ERR("%s: LLAMA_EXACT_CONCURRENCY does not support a branching draft (--parallel/-np > 1), use -np 1\n", __func__);
+    // the draft branches (-np > 1) copy the target's and the draft's cells between sequences
+    if (params.n_parallel > 1 && !common_exact_concurrency_seq_copy_ok("a branching draft (--parallel/-np > 1), use -np 1")) {
         return 1;
     }
 
@@ -96,6 +95,11 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
+    if (model_tgt == nullptr || ctx_tgt == nullptr) {
+        LOG_ERR("%s: failed to load the target model or create its context\n", __func__);
+        return 1;
+    }
+
     // load the draft model
     params.devices = params.speculative.draft.devices;
     params.model = params.speculative.draft.mparams;
@@ -113,6 +117,11 @@ int main(int argc, char ** argv) {
 
     model_dft = llama_init_dft->model();
     ctx_dft   = llama_init_dft->context();
+
+    if (model_dft == nullptr || ctx_dft == nullptr) {
+        LOG_ERR("%s: failed to load the draft model or create its context\n", __func__);
+        return 1;
+    }
 
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);

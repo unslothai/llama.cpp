@@ -1489,16 +1489,22 @@ bool common_exact_concurrency_model(const common_params & params, const llama_mo
     return true;
 }
 
+bool common_exact_concurrency_seq_copy_ok(const char * what) {
+    if (!common_exact_concurrency()) {
+        return true;
+    }
+
+    COM_ERR("LLAMA_EXACT_CONCURRENCY does not support %s: it copies cells between sequences, and exact concurrency gives each page "
+            "one owner, so every such copy is refused (llama_memory_seq_cp ignores it) and the tool would run on missing cells\n", what);
+
+    return false;
+}
+
 bool common_exact_concurrency_init(const common_params & params) {
     if (!common_exact_concurrency()) {
         return true;
     }
 
-    // -pps copies the prompt's cells to the other sequences, and exact mode gives each page one owner: the copy is refused, so the tools would run without it.
-    if (params.is_pp_shared) {
-        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support -pps (a prompt shared by copying its cells): use independent prompts\n");
-        return false;
-    }
 
     // DFlash and DSpark turn causal attention off on the draft context, which paged attention needs; refuse here instead of asserting in the graph.
     for (const auto type : params.speculative.types) {

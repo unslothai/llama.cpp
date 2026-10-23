@@ -49,6 +49,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the Jacobi window and the verification n-grams are copies of sequence 0
+    if (!common_exact_concurrency_seq_copy_ok("lookahead decoding")) {
+        return 1;
+    }
+
     const int W = 15; // lookahead window
     const int N = 5;  // n-gram size
     const int G = 15; // max verification n-grams
@@ -68,6 +73,11 @@ int main(int argc, char ** argv) {
 
     auto * model = llama_init->model();
     auto * ctx   = llama_init->context();
+
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("%s: failed to load the model or create the context\n", __func__);
+        return 1;
+    }
 
     auto * mem = llama_get_memory(ctx);
 

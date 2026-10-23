@@ -3755,6 +3755,9 @@ llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa()
 }
 
 llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_enabled) const {
+    // [TAG_EXACT_CONCURRENCY] the MSA attention does not read the page table, so its pages would be attended as if contiguous
+    llm_graph_reject_exact_concurrency("MSA KV (attn_kv_msa)");
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_msa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_msa>(hparams, cparams, mctx_cur);

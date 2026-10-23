@@ -352,6 +352,25 @@ if (LLAMA_TEST_EXACT_MODEL)
     llama_test(test-exact-weights LABEL "model" ARGS -m "${LLAMA_TEST_EXACT_MODEL}")
 endif()
 
+# [TAG_EXACT_CONCURRENCY] every tool that copies cells between sequences refuses exact concurrency up front (common_exact_concurrency_seq_copy_ok),
+# before any model or context exists: the refusal message must appear, and nothing may crash first
+function(llama_test_exact_seq_copy name target)
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+    set_tests_properties(${name} PROPERTIES
+        LABELS "main"
+        ENVIRONMENT "LLAMA_EXACT_CONCURRENCY=1"
+        PASS_REGULAR_EXPRESSION "LLAMA_EXACT_CONCURRENCY does not support")
+endfunction()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+    llama_test_exact_seq_copy(test-exact-seq-copy-lookahead   llama-lookahead   -m "${MODEL_DEST}" -p "hi" -n 1)
+    llama_test_exact_seq_copy(test-exact-seq-copy-parallel    llama-parallel    -m "${MODEL_DEST}" -pps -np 2 -ns 2)
+    llama_test_exact_seq_copy(test-exact-seq-copy-speculative llama-speculative -m "${MODEL_DEST}" -md "${MODEL_DEST}" -np 2 -kvu -p "hi")
+endif()
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+    llama_test_exact_seq_copy(test-exact-seq-copy-batched-bench llama-batched-bench -m "${MODEL_DEST}" -pps -npp 8 -ntg 1 -npl 2)
+endif()
+
 # [TAG_PREEMPT] the occupancy the server's planner reads: shared cells counted once, and the cells only given sequences hold
 llama_build_and_test(test-memory-cells-used.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-memory-cells-used PROPERTIES FIXTURES_REQUIRED test-download-model)

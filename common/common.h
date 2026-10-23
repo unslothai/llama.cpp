@@ -1030,6 +1030,10 @@ bool common_exact_batch_geometry(int n_batch, int n_ubatch, int n_decode_width, 
 // report that width to the CUDA backend, refusing a smaller explicit GGML_CUDA_BATCH_INVARIANT_MAX_COLS; false if the configuration must not run
 bool common_exact_concurrency_init(const common_params & params);
 
+// [TAG_EXACT_CONCURRENCY] Every tool that copies cells between sequences (llama_memory_seq_cp with src != dst) calls this before loading
+// a model, for the feature that copies: exact concurrency refuses such copies, so the tool is refused instead (false, logged).
+bool common_exact_concurrency_seq_copy_ok(const char * what);
+
 // the same for what only the loaded model tells: false if the model must not be served in exact mode
 bool common_exact_concurrency_model(const common_params & params, const struct llama_model * model);
 

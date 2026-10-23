@@ -391,6 +391,20 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // [TAG_EXACT_CONCURRENCY] the batch must hold a whole ubatch beside a decode step of every other sequence, or a prompt that shares a
+    // batch is split into shorter ubatches than it gets alone; checked here too, so callers that skip common_exact_concurrency_init() get it
+    if (llama_exact_concurrency() && cparams.n_seq_max > 1) {
+        const uint64_t n_cols  = uint64_t(cparams.n_seq_max) * std::max(1u, llama_exact_decode_tokens());
+        const uint64_t n_min   = uint64_t(cparams.n_ubatch) + n_cols;
+
+        if (uint64_t(cparams.n_batch) < n_min) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY needs a batch of at least %" PRIu64 " tokens for a %u-token ubatch beside a decode step of "
+                    "%u sequences (%" PRIu64 " columns), but the batch is %u%s: raise n_batch (and n_ctx), or lower n_ubatch\n", __func__,
+                    n_min, cparams.n_ubatch, cparams.n_seq_max, n_cols, cparams.n_batch, cparams.causal_attn && cparams.n_batch == cparams.n_ctx ? " (clamped to n_ctx)" : "");
+            throw std::runtime_error("exact concurrency: the batch cannot hold a whole ubatch beside a decode step");
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
