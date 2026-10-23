@@ -4162,6 +4162,9 @@ private:
             if (slot.is_processing() && !slot.preempt_is_out()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+
+                // the batch builder already counted tokens that never reached the cells, so a retry must not reuse them (as on a failed decode)
+                slot.prompt_clear();
             }
         }
     }
@@ -4340,7 +4343,14 @@ private:
     }
 
     size_t preempt_ram_budget() const {
-        return params_base.preempt_ram_mib < 0 ? SIZE_MAX : (size_t) params_base.preempt_ram_mib * 1024 * 1024;
+        if (params_base.preempt_ram_mib < 0) {
+            return SIZE_MAX;
+        }
+
+        // in 64 bits, saturated: a 32-bit size_t wraps 4096 MiB to 0
+        const uint64_t bytes = (uint64_t) params_base.preempt_ram_mib * 1024 * 1024;
+
+        return bytes > (uint64_t) SIZE_MAX ? SIZE_MAX : (size_t) bytes;
     }
 
     bool preempt_fits_budget(const server_slot & slot) {
@@ -4661,7 +4671,10 @@ private:
                 case SLOT_STATE_GENERATING:
                 case SLOT_STATE_DONE_PROMPT:
                     {
-                        res += preempt_n_cells_step(n_cur, 1 + preempt_n_spec(slot));
+                        // [TAG_PREEMPT] A realtime transcription step decodes the audio rows it holds: its first step is the whole prefix at once.
+                        const int32_t n_audio = slot.audio_stream ? (int32_t) (slot.inp_embd.size() / batch.n_embd) : 0;
+
+                        res += preempt_n_cells_step(n_cur, n_audio > 0 ? n_audio : 1 + preempt_n_spec(slot));
                     } break;
                 case SLOT_STATE_STARTED:
                 case SLOT_STATE_PROCESSING_PROMPT:
@@ -4688,7 +4701,8 @@ private:
                             break;
                         }
 
-                        res_pmt += preempt_n_cells_step(n_have, std::max(1, std::min(n_batch, n_left)));
+                        // a prompt held in full needs no further cell: the builder re-evaluates its last token in the cell it frees, as preempt_n_need() counts
+                        res_pmt += preempt_n_cells_step(n_have, std::max(0, std::min(n_batch, n_left)));
                         n_pmt++;
                     } break;
                 default:
@@ -4782,7 +4796,7 @@ private:
         }
 
         // the largest-policy test knob exempts nobody; an n_cmpl > 1 leader cannot be parked anyway, so exempting it keeps nobody else safe
-        const server_slot * exempt = preempt_test_policy == "largest" || preempt_is_family(*leader) ? nullptr : leader;
+        const server_slot * exempt = preempt_test_policy == "largest" || !preempt_parkable(*leader) ? nullptr : leader;
 
         // only the default policy weighs the deficit; the others pin the order
         if (preempt_test_policy != "smallest") {
@@ -4791,8 +4805,8 @@ private:
 
         server_slot * victim = preempt_pick_victim_pass_any(exempt, recompute, n_deficit);
 
-        // [TAG_PREEMPT] Beside n_cmpl > 1 slots the leader may be the only slot that can be parked; parking it lets them finish.
-        if (!victim && exempt && preempt_any_family_running()) {
+        // [TAG_PREEMPT] Beside slots that cannot be parked (n_cmpl > 1, TTS, realtime transcription) the leader may be the only one that can; parking it lets them finish.
+        if (!victim && exempt && preempt_any_unparkable_running()) {
             victim = preempt_pick_victim_pass_any(nullptr, recompute, n_deficit);
         }
 
@@ -4836,10 +4850,10 @@ private:
 
         server_slot * victim = pick(oldest);
 
-        // [TAG_PREEMPT] Beside n_cmpl > 1 slots the oldest may be the only slot that can be parked; parking it lets them finish. A held one would not take the cells, so it does not count.
+        // [TAG_PREEMPT] Beside slots that cannot be parked (n_cmpl > 1, TTS, realtime transcription) the oldest may be the only one that can; parking it lets them finish. A held one would not take the cells, so it does not count.
         if (!victim && oldest) {
             for (const auto & slot : slots) {
-                if (slot.is_processing() && !slot.preempt_is_out() && preempt_is_family(slot) && !preempt_held(slot)) {
+                if (slot.is_processing() && !slot.preempt_is_out() && !preempt_parkable(slot) && !preempt_held(slot)) {
                     victim = pick(nullptr);
                     break;
                 }
@@ -4861,9 +4875,9 @@ private:
         return slot.task && (slot.task->is_parent() || slot.task->is_child());
     }
 
-    bool preempt_any_family_running() const {
+    bool preempt_any_unparkable_running() const {
         for (const auto & slot : slots) {
-            if (slot.is_processing() && !slot.preempt_is_out() && preempt_is_family(slot)) {
+            if (slot.is_processing() && !slot.preempt_is_out() && !preempt_parkable(slot)) {
                 return true;
             }
         }
@@ -4895,7 +4909,7 @@ private:
             if (n_mtmd == 0 && slot.preempt_reprefill) {
                 res += preempt_n_cells_step(n_have, std::max(0, n_left) + 1 + preempt_n_spec(slot));  // as preempt_kv_reserve() charges it
             } else {
-                res += preempt_n_cells_step(n_have, n_mtmd > 0 ? n_mtmd : std::max(1, std::min((int32_t) llama_n_batch(ctx_tgt), n_left)));
+                res += preempt_n_cells_step(n_have, n_mtmd > 0 ? n_mtmd : std::max(0, std::min((int32_t) llama_n_batch(ctx_tgt), n_left)));
             }
         }
 
@@ -5864,6 +5878,13 @@ private:
         try {
             // [TAG_PREEMPT] Fit the pool to the next step, after any context shift; inside the guard since a shift or park can throw.
             pre_decode_shift();
+
+            // [TAG_PREEMPT] Take the next audio rows of realtime transcriptions now, so the plan reserves their width; pre_decode() decodes the rows a slot holds.
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.audio_stream && slot.task->type != SERVER_TASK_TYPE_TTS) {
+                    slot_audio_step(slot);
+                }
+            });
 
             // A slot must never be parked with a shift pending on its cells.
             preempt_apply_shift();
