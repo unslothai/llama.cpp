@@ -1770,8 +1770,10 @@ static void test_multi_output_multi_sequence_dist(const test_params & params) {
         GGML_ASSERT(n_logits == (uint32_t) n_vocab);
         GGML_ASSERT(n_probs == (uint32_t) n_vocab);
 
-        float prob_sum = 0.0f;
-        float cumsum_before = 0.0f;
+        // sums in double, as the samplers (CPU and backend dist) do: a float sum over the vocabulary drifts by more
+        // than the tolerance near the end of the row
+        double prob_sum = 0.0;
+        double cumsum_before = 0.0;
         for (llama_token token = 0; token < n_vocab; ++token) {
             const float expected_logit = reference_logits[token] / temp;
             const float tolerance = 1e-4f * std::max(1.0f, std::fabs(expected_logit));
@@ -1785,12 +1787,12 @@ static void test_multi_output_multi_sequence_dist(const test_params & params) {
             }
         }
 
-        GGML_ASSERT(std::fabs(prob_sum - 1.0f) <= 1e-3f);
+        GGML_ASSERT(std::fabs(prob_sum - 1.0) <= 1e-3);
 
-        const float rnd = reference_dist(reference_rngs[seq_id]);
-        const float cumsum_sampled = cumsum_before + sampled_probs[backend_token];
-        GGML_ASSERT(rnd >= cumsum_before - 1e-4f);
-        GGML_ASSERT(rnd <= cumsum_sampled + 1e-4f);
+        const double rnd = (float) reference_dist(reference_rngs[seq_id]);
+        const double cumsum_sampled = cumsum_before + sampled_probs[backend_token];
+        GGML_ASSERT(rnd >= cumsum_before - 1e-4);
+        GGML_ASSERT(rnd <= cumsum_sampled + 1e-4);
     }
 
     printf("backend multi-sequence multi-output dist test PASSED\n");
@@ -3304,6 +3306,26 @@ static void test_penalties_clone_draft_rows(const test_params & params) {
 
     llama_sampler_free(chain);
     llama_sampler_free(donor);
+
+    // the same for a sampler taken out of an opted-in chain with llama_sampler_chain_remove (also from behind a CPU
+    // sampler, which does not stop the opt-in reaching it)
+    llama_sampler * owner = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_set_backend_draft_rows(owner, true);
+    llama_sampler_chain_add(owner, llama_sampler_init_xtc(1.0f, 0.4f, 1, 7));
+    llama_sampler_chain_add(owner, llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.5f, 0.0f));
+    owner->iface->backend_init(owner, buft, 4);
+    llama_sampler * removed = llama_sampler_chain_remove(owner, 1);
+    GGML_ASSERT(removed != nullptr);
+    llama_sampler * dest = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(dest, removed);
+    llama_sampler_chain_add(dest, llama_sampler_init_dist(1));
+    dest->iface->backend_init(dest, buft, 4);
+    const char * name_removed = llama_sampler_name(llama_sampler_chain_get(dest, 0));
+    printf("penalties remove: removed from an opted-in chain, in a chain without draft rows %s\n", name_removed);
+    GGML_ASSERT(name_removed[0] != '+');
+    llama_sampler_free(dest);
+    llama_sampler_free(owner);
+
     printf("backend penalties clone draft rows test PASSED\n");
 }
 
@@ -3376,9 +3398,22 @@ static void test_chain_columns_n_ubatch(const test_params & params) {
 
     const auto [small, pen_small, uni_small] = run(8);
     const auto [large, pen_large, uni_large] = run(512);
+    // n_ubatch 1: one chain, one row per ubatch, each after the draft inputs of the rows before it; n_ubatch 3 does
+    // not divide the rows of the sequence
+    const auto [one,   pen_one,   uni_one]   = run(1);
+    const auto [three, pen_three, uni_three] = run(3);
     GGML_ASSERT(pen_small == 8 && uni_small == 8);
     GGML_ASSERT(pen_large == 64 && uni_large == 64);
-    GGML_ASSERT(small == large);
+    GGML_ASSERT(pen_one == 1 && uni_one == 1);
+    GGML_ASSERT(pen_three == 3 && uni_three == 3);
+    int n_diff_one = 0, n_diff_three = 0;
+    for (size_t i = 0; i < large.size(); ++i) {
+        n_diff_one   += one[i]   != large[i];
+        n_diff_three += three[i] != large[i];
+    }
+    printf("chain columns: rows differing from one ubatch: n_ubatch 1 %d, n_ubatch 3 %d, n_ubatch 8 %d (of %zu)\n",
+            n_diff_one, n_diff_three, small == large ? 0 : -1, large.size());
+    GGML_ASSERT(small == large && n_diff_one == 0 && n_diff_three == 0);
     printf("backend chain columns n_ubatch test PASSED\n");
 }
 

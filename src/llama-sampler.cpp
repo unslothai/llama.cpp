@@ -1064,6 +1064,10 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
     auto * result = p->samplers[i].ptr;
     p->samplers.erase(p->samplers.begin() + i);
 
+    // the draft rows opt-in belongs to the chain: a sampler taken out of it does not keep it (as for a clone), the
+    // chain it is added to applies its own
+    llama_sampler_penalties_set_draft_rows(result, false);
+
     return result;
 }
 
@@ -3506,7 +3510,9 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
 
     // chain j of this ubatch samples row g = row_offset + j of the sequence; its history is the accepted one plus
     // the input tokens of rows 1..g (row 0's input token is the last accepted token, already in the history)
-    if (n_chains == 1 || n_rows <= 1) {
+    // (one physical chain does not mean one row: with n_ubatch smaller than the rows of the sequence, the rows of one
+    // decode come one ubatch at a time, each after the draft inputs of the rows before it)
+    if (n_rows <= 1) {
         llama_sampler_penalties_fill_column(*sctx, sctx->token_count, 0);
         for (uint32_t j = 1; j < n_chains; ++j) {
             std::copy_n(sctx->host_token_ids.begin(), sctx->n_max, sctx->host_token_ids.begin() + (size_t) j*sctx->n_max);
