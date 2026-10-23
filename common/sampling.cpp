@@ -141,9 +141,8 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
-        // the backend samplers mask the candidates they drop with -INF where the CPU samplers remove them:
-        // keep only the candidates the backend kept, so the CPU samplers that follow see what they would on the CPU;
-        // a row the backend masked entirely keeps all of this row's candidates, as they are
+        // the candidates of the backend prefix, as they are: a chain with a CPU suffix keeps a backend prefix only
+        // when the prefix leaves exactly the CPU sampler's candidates (llama_sampler_chain_backend_init)
         if (sampled_probs || sampled_logits) {
             const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
             cur.resize(count);
@@ -154,35 +153,15 @@ struct common_sampler {
                     /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
                 };
             };
-            size_t n = 0;
-            if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
-                // the backend sampled the token: no CPU sampler reads the candidates, copy them as they are (a
-                // full-vocabulary row is ~250k candidates per step and per sequence, the compaction doubles its cost)
-                if (sampled_ids && sampled_logits && sampled_probs) {
-                    for (uint32_t i = 0; i < count; ++i) {
-                        cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
-                    }
-                } else {
-                    for (uint32_t i = 0; i < count; ++i) {
-                        cur[i] = td_at(i);
-                    }
+            if (sampled_ids && sampled_logits && sampled_probs) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
                 }
-                n = count;
             } else {
                 for (uint32_t i = 0; i < count; ++i) {
-                    const llama_token_data td = td_at(i);
-                    if (td.logit != -INFINITY) {
-                        cur[n++] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
-                    }
-                }
-                if (n == 0) {
-                    for (uint32_t i = 0; i < count; ++i) {
-                        cur[i] = td_at(i);
-                    }
-                    n = count;
+                    cur[i] = td_at(i);
                 }
             }
-            cur.resize(n);
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);

@@ -737,7 +737,7 @@ static void llama_sampler_chain_free(struct llama_sampler * smpl) {
 }
 
 static void llama_sampler_penalties_set_draft_rows(struct llama_sampler * smpl, bool draft_rows);
-static bool llama_sampler_masks_without_removing(const struct llama_sampler * smpl);
+static bool llama_sampler_backend_inexact(const struct llama_sampler * smpl);
 
 // every sampler of the chain (and of its nested chains) runs on the CPU
 static void llama_sampler_chain_force_cpu(struct llama_sampler * smpl) {
@@ -799,14 +799,14 @@ static bool llama_sampler_chain_backend_init(
         res = res && cur_prefix;
     }
 
-    // the CPU samplers after a backend prefix get the candidates the prefix kept: the ones a backend filter
-    // masked with -INF are dropped, as the CPU filters remove them. A sampler that sets logits to -INF and keeps
-    // the candidates on the CPU (logit bias of -INF, temperature <= 0) cannot be told apart from a filter, so a
-    // chain with such a sampler in its prefix and a CPU suffix runs on the CPU, where the candidates are exact
+    // the CPU samplers after a backend prefix get the whole row the prefix produced, as it is: a -INF logit can be a
+    // candidate the CPU keeps (from the model itself, e.g. a reduced-vocabulary output, or a masking sampler) or one a
+    // CPU filter removes, and the row does not tell them apart. A chain with a CPU suffix keeps a backend prefix only
+    // when the prefix leaves the CPU's candidates exactly (llama_sampler_backend_inexact), else it runs on the CPU
     if (!res) {
         bool masks = false;
         for (const auto & entry : chain->samplers) {
-            masks = masks || (entry.is_backend && llama_sampler_masks_without_removing(entry.ptr));
+            masks = masks || (entry.is_backend && llama_sampler_backend_inexact(entry.ptr));
         }
         if (masks) {
             llama_sampler_chain_force_cpu(smpl);
@@ -972,9 +972,8 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
     auto & cur = *cur_ptr;
 
-    // the backend samplers mask the candidates they drop with -INF where the CPU samplers remove them:
-    // keep only the candidates the backend kept, so the CPU samplers that follow see what they would on the CPU;
-    // a row the backend masked entirely keeps all of this row's candidates, as they are
+    // the candidates of the backend prefix, as they are: a chain with a CPU suffix keeps a backend prefix only when
+    // the prefix leaves exactly the CPU sampler's candidates (llama_sampler_chain_backend_init)
     if (sampled_probs || sampled_logits) {
         const uint32_t count = sampled_probs ? llama_get_sampled_probs_count_ith(ctx, idx) : llama_get_sampled_logits_count_ith(ctx, idx);
         cur.resize(count);
@@ -985,20 +984,9 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
                 /* .p     = */ sampled_probs  ? sampled_probs[i]  : 0.0f,
             };
         };
-        size_t n = 0;
         for (uint32_t i = 0; i < count; ++i) {
-            const llama_token_data td = td_at(i);
-            if (td.logit != -INFINITY) {
-                cur[n++] = td; // n <= i: the compacted prefix never overwrites an entry not read yet
-            }
+            cur[i] = td_at(i);
         }
-        if (n == 0) {
-            for (uint32_t i = 0; i < count; ++i) {
-                cur[i] = td_at(i);
-            }
-            n = count;
-        }
-        cur.resize(n);
     } else {
         const auto * logits = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
@@ -4796,11 +4784,12 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
     }
 }
 
-static bool llama_sampler_masks_without_removing(const struct llama_sampler * smpl) {
-    // a sampler masks without removing when it can leave a candidate at -INF that the CPU sampler keeps in the
-    // array: the CPU suffix after a backend prefix gets the candidates without the -INF ones (the backend filters
-    // write -INF where the CPU filters remove), so such a chain runs on the CPU. Besides an explicit -INF this
-    // includes arithmetic that overflows a finite logit (any finite input, as an earlier sampler can set it)
+static bool llama_sampler_backend_inexact(const struct llama_sampler * smpl) {
+    // a backend sampler is inexact before a CPU suffix when its output row can differ from the CPU sampler's
+    // candidates: a filter that writes -INF where the CPU removes the candidate (top-p, min-p), or a sampler that can
+    // set a logit to -INF where the CPU keeps it at -INF but the backend row then cannot be told apart from a removed
+    // one (an explicit -INF, or arithmetic that overflows a finite logit: any finite input, as an earlier sampler
+    // can set it); top-k shrinks the row as the CPU does
     static constexpr float overflow_shift = 0x1p103f; // half an ulp of FLT_MAX: -FLT_MAX - x is -INF from here
 
     if (smpl == nullptr) {
@@ -4809,7 +4798,7 @@ static bool llama_sampler_masks_without_removing(const struct llama_sampler * sm
     if (smpl->iface == &llama_sampler_chain_i) {
         const auto * chain = (const llama_sampler_chain *) smpl->ctx;
         for (const auto & entry : chain->samplers) {
-            if (entry.is_backend && llama_sampler_masks_without_removing(entry.ptr)) {
+            if (entry.is_backend && llama_sampler_backend_inexact(entry.ptr)) {
                 return true;
             }
         }
@@ -4841,15 +4830,12 @@ static bool llama_sampler_masks_without_removing(const struct llama_sampler * sm
                              (double) std::max(ctx->penalty_present, 0.0f);
         return ctx->penalty_repeat > 1.0f || shift >= (double) overflow_shift;
     }
-    // the other built-in backend samplers remove what they mask on the CPU too (top-k, top-p, min-p) or select
-    // (greedy, dist); a sampler implemented outside llama.cpp may set logits to -INF and keep the candidates, so it
-    // is treated as masking
+    // top-k keeps the first k candidates as the CPU does (the row shrinks); greedy and dist select; top-p and
+    // min-p write -INF where the CPU removes; a sampler implemented outside llama.cpp may do either
     if (smpl->iface == &llama_sampler_empty_i  ||
         smpl->iface == &llama_sampler_greedy_i ||
         smpl->iface == &llama_sampler_dist_i   ||
-        smpl->iface == &llama_sampler_top_k_i  ||
-        smpl->iface == &llama_sampler_top_p_i  ||
-        smpl->iface == &llama_sampler_min_p_i) {
+        smpl->iface == &llama_sampler_top_k_i) {
         return false;
     }
     return true;
