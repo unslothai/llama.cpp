@@ -410,7 +410,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (turing_mma_available(cc)) {
-        return true;
+        // For dense IQ1_M, dequantization + cuBLAS is faster for large batch sizes:
+        if (type != GGML_TYPE_IQ1_M || n_experts > 0 || ne11 < 128) {
+            return true;
+        }
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
