@@ -1161,8 +1161,12 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 return true;
             }
         }
+        // leaves are allocated before any node whatever their flags, so becoming an input does not change the plan
+        // of a leaf (only becoming an output does: outputs are never freed)
+        const uint8_t leaf_mask = (uint8_t) ~GGML_GALLOCR_LIFETIME_INPUT;
         for (int i = 0; i < graph->n_leafs; i++) {
-            if (!ggml_gallocr_lifetime_covered(*bits++, ggml_gallocr_lifetime_bits(graph->leafs[i]))) {
+            const uint8_t planned = *bits++ & leaf_mask;
+            if (!ggml_gallocr_lifetime_covered(planned, ggml_gallocr_lifetime_bits(graph->leafs[i]) & leaf_mask)) {
                 GGML_LOG_DEBUG("%s: leaf %s became an input or output since the plan\n", __func__, graph->leafs[i]->name);
                 return true;
             }

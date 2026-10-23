@@ -1216,6 +1216,37 @@ static void test_plan_holds_for_selected_source() {
     }
 }
 
+// A leaf that is reserved as a plain tensor and later marked as an input (an input set only once the graph is built
+// for real) keeps its plan: leaves are allocated before any node whatever their flags, so the input flag does not
+// change where a leaf or anything else lives. A multi-buffer gallocr cannot re-plan by itself, so
+// ggml_gallocr_alloc_graph returns false when it judges the plan stale (GGML_SCHED_NO_REALLOC aborts there).
+static void test_plan_holds_when_leaf_becomes_input() {
+    dummy_backend              backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    for (int pass = 0; pass < 3; ++pass) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * leaf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        if (pass > 0) {
+            ggml_set_input(leaf);
+        }
+        ggml_tensor * a   = ggml_scale(ctx, leaf, 2.0f);
+        ggml_tensor * out = ggml_scale(ctx, a, 2.0f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        assign_names(ctx);
+
+        if (pass == 0) {
+            std::vector<int> node_ids(graph->n_nodes, 0);
+            std::vector<int> leaf_ids(graph->n_leafs, 0);
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_ids.data(), leaf_ids.data()));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1252,5 +1283,6 @@ int main() {
     run("test_plan_follows_output_flags", test_plan_follows_output_flags);
     run("test_plan_keeps_union_of_outputs", test_plan_keeps_union_of_outputs);
     run("test_plan_holds_for_selected_source", test_plan_holds_for_selected_source);
+    run("test_plan_holds_when_leaf_becomes_input", test_plan_holds_when_leaf_becomes_input);
     return 0;
 }
