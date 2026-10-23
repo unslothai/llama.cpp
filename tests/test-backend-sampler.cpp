@@ -93,7 +93,8 @@ struct test_context {
             uint32_t n_outputs_max = 0,
             uint32_t n_ubatch = 0,
             uint32_t n_outputs_max_per_seq = 1,
-            uint32_t n_tokens_max = 512) {
+            uint32_t n_tokens_max = 512,
+            ggml_backend_sched_eval_callback cb_eval = nullptr) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
@@ -111,6 +112,7 @@ struct test_context {
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
         cparams.kv_unified = true;
+        cparams.cb_eval = cb_eval;
 
         // If n_seq_max is not specified, calculate it from configs
         if (n_seq_max < 0) {
@@ -3127,6 +3129,72 @@ static void test_masking_classes_cpu_suffix(const test_params & params) {
     printf("backend masking classes CPU suffix test PASSED\n");
 }
 
+// a model can output -INF logits itself (reduced-vocabulary outputs: eagle3, dflash); the CPU samplers keep those
+// candidates, so the CPU suffix after a backend prefix must get them too. The model output is set to 0.3, 0.2, -1
+// on tokens 10..12 and -INF elsewhere (eval callback on result_output), then temperature 1.5 (backend), XTC with
+// min_keep 3 (CPU) and dist: the CPU keeps n_vocab candidates before XTC
+static bool cb_eval_reduced_vocab(struct ggml_tensor * t, bool ask, void *) {
+    if (strcmp(t->name, "result_output") != 0) {
+        return ask ? false : true;
+    }
+    if (ask) {
+        return true;
+    }
+    const int64_t n_vocab = t->ne[0];
+    std::vector<float> row(n_vocab, -INFINITY);
+    row[10] = 0.3f; row[11] = 0.2f; row[12] = -1.0f;
+    for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+        ggml_backend_tensor_set(t, row.data(), r*t->nb[1], n_vocab*sizeof(float));
+    }
+    return true;
+}
+
+static void test_model_inf_logits_cpu_suffix(const test_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const std::vector<llama_token> prompt = tokenize_prompt(vocab, "The capital of France is");
+
+    auto make_chain = [](uint32_t seed) {
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(1.5f));
+        llama_sampler_chain_add(chain, llama_sampler_init_xtc(1.0f, 0.2f, 3, seed));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+        return chain;
+    };
+
+    int n_diff = 0;
+    for (uint32_t seed = 1; seed <= 8; ++seed) {
+        llama_sampler * cpu = make_chain(seed);
+        llama_sampler * gpu = make_chain(seed);
+        {
+        std::vector<llama_sampler_seq_config> no_configs;
+        std::vector<llama_sampler_seq_config> configs = { { 0, gpu } };
+        test_context ctx_cpu(params, no_configs, 1, 0, 0, 1, 512, cb_eval_reduced_vocab);
+        test_context ctx_gpu(params, configs,    1, 0, 0, 1, 512, cb_eval_reduced_vocab);
+        common_batch batch_cpu(ctx_cpu.ctx.get());
+        common_batch batch_gpu(ctx_gpu.ctx.get());
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            batch_cpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+            batch_gpu.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+        }
+        GGML_ASSERT(llama_process(ctx_cpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_cpu.get()) == 0);
+        GGML_ASSERT(llama_process(ctx_gpu.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_gpu.get()) == 0);
+
+        const int32_t idx = (int32_t) prompt.size() - 1;
+        const float * lg = llama_get_logits_ith(ctx_cpu.ctx.get(), idx);
+        GGML_ASSERT(lg[10] == 0.3f && lg[0] == -INFINITY); // the callback did set the model output
+        const llama_token tc = llama_sampler_sample(cpu, ctx_cpu.ctx.get(), idx);
+        const llama_token tg = llama_sampler_sample(gpu, ctx_gpu.ctx.get(), idx);
+        printf("model -INF logits + CPU suffix, seed %u: cpu %d gpu %d\n", seed, tc, tg);
+        n_diff += tc != tg;
+        }
+        llama_sampler_free(cpu);
+        llama_sampler_free(gpu);
+    }
+    printf("model -INF logits + CPU suffix: %d of 8 seeds differ\n", n_diff);
+    GGML_ASSERT(n_diff == 0);
+    printf("backend model -INF logits CPU suffix test PASSED\n");
+}
+
 // a chain without any backend sampler (here XTC first) is not attached to the context: no sampler would run on
 // the backend, and the CPU samplers get the model logits exactly as without backend sampling
 static void test_cpu_only_chain_not_exported(const test_params & params) {
@@ -3384,6 +3452,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_custom_masking_cpu_suffix",           test_custom_masking_cpu_suffix,        true },
     { "test_masking_classes_cpu_suffix",          test_masking_classes_cpu_suffix,       true },
     { "test_cpu_only_chain_not_exported",         test_cpu_only_chain_not_exported,      true },
+    { "test_model_inf_logits_cpu_suffix",         test_model_inf_logits_cpu_suffix,      true },
     { "test_nested_chain_cpu_fallback",           test_nested_chain_cpu_fallback,        true },
     { "test_all_masked_row",                      test_all_masked_row,                   true },
     { "test_cpu_parity",                          test_cpu_parity,                       true },
