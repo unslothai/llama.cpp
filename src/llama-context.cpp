@@ -547,10 +547,12 @@ llama_context::llama_context(
             throw std::runtime_error("exact concurrency: non-causal attention is not supported with a KV cache");
         }
 
-        // [TAG_EXACT_CONCURRENCY] without a memory, decode() runs encode(), which packs the sequences of a batch into one ubatch with no isolation
-        if (llama_exact_concurrency() && !memory) {
-            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model has no sequence memory (an encoder); its batches are not isolated per sequence\n", __func__);
-            throw std::runtime_error("exact concurrency: a context without sequence memory is not supported");
+        // [TAG_EXACT_CONCURRENCY] encode() packs the sequences of a batch into one ubatch with no isolation: a memoryless model runs it from decode(),
+        // an encoder-decoder (T5) runs it for every input
+        if (llama_exact_concurrency() && (!memory || llama_model_has_encoder(&model))) {
+            LLAMA_LOG_ERROR("%s: LLAMA_EXACT_CONCURRENCY is set but this model encodes (%s); encoder batches are not isolated per sequence\n", __func__,
+                    memory ? "an encoder-decoder" : "an encoder without sequence memory");
+            throw std::runtime_error("exact concurrency: encoder models are not supported");
         }
     }
 

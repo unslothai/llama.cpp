@@ -1283,6 +1283,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    int max_cols = -1;  // [TAG_EXACT_CONCURRENCY] the batch-invariant column bound the kernels were captured under
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;

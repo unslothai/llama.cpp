@@ -48,6 +48,9 @@ public:
 
     int32_t n_cells_used(const llama_seq_id * seq_free, size_t n_seq_free, int32_t * n_reclaimable) const override { return kv_base->n_cells_used(seq_free, n_seq_free, n_reclaimable); }
 
+    // [TAG_EXACT_CONCURRENCY] the pages of the base cache: the planner and the whole-context save refusal read it
+    uint32_t alloc_granularity() const override { return kv_base->alloc_granularity(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

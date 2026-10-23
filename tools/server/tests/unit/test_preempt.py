@@ -358,12 +358,13 @@ def test_a_server_that_never_asked_for_parking_behaves_as_upstream():
 def test_a_late_prompt_and_a_generating_slot_both_finish(planner):
     if planner == "off":
         os.environ["LLAMA_SERVER_PREEMPT_PLANNER"] = "off"
-    _start(n_ctx=256)
+    # a long leader: the follower is sent once the leader is seen processing, and a short one could finish before the follower arrives
+    _start(n_ctx=2048)
 
-    n_b = 150
-    n_predict_a = 230
-    n_predict_b = 90
-    assert 8 + n_predict_a + n_b + n_predict_b > 256
+    n_b = 1500
+    n_predict_a = 1900
+    n_predict_b = 500
+    assert 8 + n_predict_a + n_b + n_predict_b > 2048
     results = _complete_overlapping((n_predict_a, n_predict_b), (8, n_b))
 
     text = _log()

@@ -55,6 +55,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // [TAG_EXACT_CONCURRENCY] the draft branches copy the target's cells to other sequences, which exact mode refuses (one owner per page)
+    if (common_exact_concurrency() && params.n_parallel > 1) {
+        LOG_ERR("%s: LLAMA_EXACT_CONCURRENCY does not support a branching draft (--parallel/-np > 1), use -np 1\n", __func__);
+        return 1;
+    }
+
     if (params.speculative.draft.mparams.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
         return 1;

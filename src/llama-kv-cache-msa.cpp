@@ -106,11 +106,21 @@ llama_memory_context_ptr llama_kv_cache_msa::init_batch(
     GGML_UNUSED(embd_all);
 
     do {
+        // [TAG_EXACT_CONCURRENCY] as llama_kv_cache::init_batch: a token of several sequences cannot sit in single-owner pages
+        if (llama_exact_concurrency() && balloc.has_shared_tokens()) {
+            LLAMA_LOG_ERROR("%s: exact concurrency does not support tokens shared by several sequence ids; "
+                    "give every token exactly one sequence id\n", __func__);
+            break;
+        }
+
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            // [TAG_EXACT_CONCURRENCY] as llama_kv_cache::init_batch: split_simple packs all prompts into one ubatch, the set split gives each its own
+            const uint32_t isolate = llama_exact_concurrency() && balloc.has_seq_wider_than(llama_exact_decode_tokens()) ? llama_exact_decode_tokens() : 0;
+
+            auto ubatch = n_stream == 1 && !isolate ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, n_stream > 1, 0, isolate);
 
             if (ubatch.n_tokens == 0) {
                 break;

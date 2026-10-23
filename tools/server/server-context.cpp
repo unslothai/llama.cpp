@@ -6115,6 +6115,13 @@ private:
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
+                // [TAG_PREEMPT] the aLoRA invocation moves with its tokens, or a recompute park would replay the adapted tokens without the adapter
+                if (slot.alora_invocation_start > 0) {
+                    const int n_pre = slot.alora_invocation_start - 1;
+
+                    slot.alora_invocation_start = 1 + n_pre - std::clamp(n_pre - n_keep, 0, n_discard);
+                }
+
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {

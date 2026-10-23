@@ -3065,7 +3065,15 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+    // [TAG_EXACT_CONCURRENCY] a wider decode width moves the column bound process-wide; a graph captured under the old one replays the kernels it chose
+    const int max_cols = ggml_cuda_batch_invariant_max_cols();
+
+    if (graph->max_cols != max_cols) {
+        graph->max_cols = max_cols;
+        res = true;
+    }
+
+    if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);

@@ -1494,6 +1494,12 @@ bool common_exact_concurrency_init(const common_params & params) {
         return true;
     }
 
+    // -pps copies the prompt's cells to the other sequences, and exact mode gives each page one owner: the copy is refused, so the tools would run without it.
+    if (params.is_pp_shared) {
+        COM_ERR("%s", "LLAMA_EXACT_CONCURRENCY does not support -pps (a prompt shared by copying its cells): use independent prompts\n");
+        return false;
+    }
+
     // DFlash and DSpark turn causal attention off on the draft context, which paged attention needs; refuse here instead of asserting in the graph.
     for (const auto type : params.speculative.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
