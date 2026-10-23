@@ -4190,9 +4190,13 @@ void llm_graph_context::build_sampling() const {
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
-            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
-                if (t != nullptr) {
-                    res->t_sampling_chains.push_back(t);
+            // a ubatch has at most n_ubatch rows, so a chain at or past n_ubatch is never active: its results need
+            // no place in the reserve's outputs
+            if (i < cparams.n_ubatch) {
+                for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                    if (t != nullptr) {
+                        res->t_sampling_chains.push_back(t);
+                    }
                 }
             }
 

@@ -1594,6 +1594,33 @@ static void llama_sampler_backend_sort_desc(
     data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, logits_rows, order), n);
 }
 
+// llama_sampler_backend_sort_desc where cond (one value, 0 or 1) is 1, else the row unchanged: the permutation is
+// the sorted order or the identity, selected without branching on device data
+static void llama_sampler_backend_sort_desc_if(
+        struct ggml_context       * ctx,
+        struct llama_sampler_data * data,
+        struct ggml_tensor        * cond) {
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    const int64_t n = logits->ne[0];
+
+    struct ggml_tensor * order = ggml_cast(ctx, ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC), GGML_TYPE_F32);
+    struct ggml_tensor * perms = ggml_concat(ctx,
+            ggml_reshape_2d(ctx, ggml_arange(ctx, 0.0f, (float) n, 1.0f), n, 1), ggml_reshape_2d(ctx, order, n, 1), 1);
+    struct ggml_tensor * perm  = ggml_cast(ctx,
+            ggml_reshape_1d(ctx, ggml_get_rows(ctx, perms, ggml_cast(ctx, cond, GGML_TYPE_I32)), n), GGML_TYPE_I32);
+    ggml_set_name(perm, "sort_desc_if_idx");
+
+    if (data->candidates) {
+        struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, n);
+        data->candidates = ggml_reshape_1d(ctx, ggml_get_rows(ctx, candidates_rows, perm), n);
+    } else {
+        data->candidates = perm;
+    }
+
+    struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, n);
+    data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, logits_rows, perm), n);
+}
+
 static void llama_sampler_top_k_backend_apply(
         struct llama_sampler      * smpl,
         struct ggml_context       * ctx,
@@ -2424,34 +2451,39 @@ static void llama_sampler_temp_ext_backend_apply(
         return;
     }
 
-    // the CPU sampler sorts the candidates (llama_sampler_softmax_impl) before it scales them: sort here too, so
-    // candidates that end up equal after the scaling (an infinite temperature) keep the CPU's order
-    llama_sampler_backend_sort_desc(ctx, data);
+    // the CPU sampler sees only the candidates earlier samplers kept; here the dropped ones are -INF,
+    // so count the finite ones for the maximum entropy (step(-x - FLT_MAX) is 1 only for x = -INF)
+    struct ggml_tensor * is_masked0 = ggml_step(ctx,
+            ggml_scale_bias(ctx, ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits)), -1.0f, -FLT_MAX));
+    struct ggml_tensor * n_cand = ggml_scale_bias(ctx, ggml_sum(ctx, is_masked0), -1.0f, (float) ggml_nelements(data->logits));
+    ggml_set_name(n_cand, "temp_ext_n_cand");
+
+    // has_entropy = step(n_cand - 1.5): two candidates or more. With one candidate or none (a fully masked row)
+    // the CPU sampler returns before anything, leaving the row as it is (not sorted, not greedy): the row is
+    // passed through below; the entropy is computed on a row of zeros instead, so that nothing on the way is NaN
+    // (the softmax of a row of -INF is)
+    struct ggml_tensor * has_entropy = ggml_step(ctx, ggml_scale_bias(ctx, n_cand, 1.0f, -1.5f));
+
+    // the CPU sampler sorts the candidates (llama_sampler_softmax_impl) before it scales them, once it has two or
+    // more: sort here too, so candidates that end up equal after the scaling (an infinite temperature) keep the
+    // CPU's order, and keep the row's order otherwise
+    llama_sampler_backend_sort_desc_if(ctx, data, has_entropy);
 
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * is_masked = ggml_step(ctx, ggml_scale_bias(ctx, logits, -1.0f, -FLT_MAX));
 
     // Calculate min_temp, max_temp.
     const float min_temp = std::max(0.0f, sctx->temp - sctx->delta);
     const float max_temp = sctx->temp + sctx->delta;
 
-    // the whole range is <= 0: every dynamic temperature is <= 0, which the CPU sampler treats as greedy
+    const int64_t n = logits->ne[0];
+
+    // the whole range is <= 0: every dynamic temperature is <= 0, which the CPU sampler treats as greedy (with one
+    // candidate or none it leaves the row: the greedy pick on the unsorted row is the same token)
     if (max_temp <= 0.0f) {
         llama_sampler_backend_temp_sampling(ctx, gf, data, 0.0f);
         return;
     }
-
-    // the CPU sampler sees only the candidates earlier samplers kept; here the dropped ones are -INF,
-    // so count the finite ones for the maximum entropy (step(-x - FLT_MAX) is 1 only for x = -INF)
-    struct ggml_tensor * is_masked = ggml_step(ctx, ggml_scale_bias(ctx, logits, -1.0f, -FLT_MAX));
-    struct ggml_tensor * n_cand    = ggml_scale_bias(ctx, ggml_sum(ctx, is_masked), -1.0f, (float) logits->ne[0]);
-    ggml_set_name(n_cand, "temp_ext_n_cand");
-
-    const int64_t n = logits->ne[0];
-
-    // has_entropy = step(n_cand - 1.5): two candidates or more. With one candidate or none (a fully masked row)
-    // the CPU sampler returns before anything, so the logits are passed through below; the entropy is computed
-    // on a row of zeros instead, so that nothing on the way is NaN (the softmax of a row of -INF is)
-    struct ggml_tensor * has_entropy = ggml_step(ctx, ggml_scale_bias(ctx, n_cand, 1.0f, -1.5f));
     struct ggml_tensor * ent_rows    = ggml_concat(ctx,
             ggml_reshape_2d(ctx, ggml_fill(ctx, logits, 0.0f), n, 1), ggml_reshape_2d(ctx, logits, n, 1), 1);
     struct ggml_tensor * ent_logits  = ggml_reshape_1d(ctx,
@@ -3265,8 +3297,8 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
 
         // the same state as the dist clone: history, row tokens of the current decode, chains per sequence
         result_ctx->copy_state(*ctx);
-        result_ctx->n_chains   = ctx->n_chains;
-        result_ctx->draft_rows = ctx->draft_rows;
+        result_ctx->n_chains = ctx->n_chains;
+        // not draft_rows: the opt-in belongs to the chain the clone is added to (llama_sampler_chain_backend_init)
     }
 
     return result;
@@ -4208,10 +4240,8 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
     struct ggml_tensor * inp_logit_bias;
     struct ggml_tensor * inp_logit_idxs;
 
-    // the biases per token for the backend: the CPU sampler adds every entry, so a token listed several times
-    // gets the sum (ggml_set_rows with a repeated index would keep only one of them)
-    // computed once (logit_bias is const): the CPU sampler uses the same merged biases, adding a token's sum
-    // once, so both sides round the same way
+    // the biases per token (a token listed several times gets the sum): the backend runs only lists without
+    // repeated tokens, where it is the list itself; computed once (logit_bias is const)
     mutable std::vector<llama_logit_bias> merged_cache = {};
     mutable bool                          merged_done  = false;
 
@@ -4260,8 +4290,7 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     ctx->to_search.clear();
 
     // update the candidates that have not been shuffled in the vocabulary (i.e. idx == id)
-    // (each token once, with the sum of its biases, as the backend sampler)
-    for (const auto & lb : ctx->merged()) {
+    for (const auto & lb : ctx->logit_bias) {
         if (lb.token >= 0 && cur_p->size > (size_t) lb.token && cur_p->data[lb.token].id == lb.token) {
             cur_p->data[lb.token].logit += lb.bias;
         } else {
@@ -4276,7 +4305,6 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     // search for the remaining candidates that were not found in the previous step
     for (size_t i = 0; i < cur_p->size; ++i) {
         for (const auto & lb : ctx->to_search) {
-            // the merged biases list each token once
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
                 break;
@@ -4385,8 +4413,14 @@ static bool llama_sampler_logit_bias_backend_init(
 
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
 
-    // the same device check as the other backend samplers (fill, set_rows, get_rows)
-    const bool res = llama_sampler_backend_support(smpl, buft);
+    // a token listed more than once stays on the CPU: the CPU sampler adds its biases one at a time (their float
+    // sum can differ, even overflow where the sequence does not), and ggml_set_rows keeps one value per row.
+    // The same device check as the other backend samplers (fill, set_rows, get_rows)
+    size_t n_valid = 0;
+    for (const auto & lb : sctx->logit_bias) {
+        n_valid += lb.token >= 0 && lb.token < sctx->n_vocab;
+    }
+    const bool res = sctx->merged().size() == n_valid && llama_sampler_backend_support(smpl, buft);
 
     sctx->init(res);
 
