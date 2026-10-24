@@ -176,6 +176,37 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// memory of the extra model, laid out on the devices of the main model
+static std::vector<llama_device_memory_data> common_get_extra_memory_data(
+        const common_fit_extra_model * extra, const std::vector<ggml_backend_dev_t> & devs, ggml_log_level log_level) {
+    std::vector<ggml_backend_dev_t> devs_extra;
+    uint32_t ngl_extra = 0;
+    uint32_t nct_extra = 0;
+    uint32_t nex_extra = 0;
+
+    const std::vector<llama_device_memory_data> measured = common_get_device_memory_data_impl(
+        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+
+    std::vector<llama_device_memory_data> ret(devs.size() + 1);
+    ret.back().mb = measured.back().mb;
+    for (size_t je = 0; je < devs_extra.size(); je++) {
+        for (size_t id = 0; id < devs.size(); id++) {
+            if (devs_extra[je] == devs[id]) {
+                ret[id].mb.model   += measured[je].mb.model;
+                ret[id].mb.context += measured[je].mb.context;
+                ret[id].mb.compute += measured[je].mb.compute;
+                break;
+            }
+        }
+    }
+    if (extra->shares_model) {
+        for (llama_device_memory_data & dmd : ret) {
+            dmd.mb.model = 0;
+        }
+    }
+    return ret;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -208,44 +239,17 @@ static void common_params_fit_impl(
         }
 
         if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
-            std::vector<ggml_backend_dev_t> devs_extra;
-            uint32_t ngl_extra = 0;
-            uint32_t nct_extra = 0;
-            uint32_t nex_extra = 0;
-
             extra->cparams->n_ctx = cparams->n_ctx;
 
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
 
-            dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                dmds_extra = common_get_extra_memory_data(extra, devs, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
-                return;
-            }
-
-            dmds_extra = dmds_t(devs.size() + 1);
-            dmds_extra.back().mb = measured.back().mb;
-            for (size_t je = 0; je < devs_extra.size(); je++) {
-                for (size_t id = 0; id < devs.size(); id++) {
-                    if (devs_extra[je] == devs[id]) {
-                        dmds_extra[id].mb.model   += measured[je].mb.model;
-                        dmds_extra[id].mb.context += measured[je].mb.context;
-                        dmds_extra[id].mb.compute += measured[je].mb.compute;
-                        break;
-                    }
-                }
-            }
-            if (extra->shares_model) {
-                for (llama_device_memory_data & dmd : dmds_extra) {
-                    dmd.mb.model = 0;
-                }
             }
 
             n_ctx_extra = cparams->n_ctx;
@@ -901,6 +905,73 @@ enum common_params_fit_status common_fit_params(
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
+}
+
+uint32_t common_fit_n_ubatch(
+        const char * path_model,
+        const llama_model_params * mparams,
+        llama_context_params * cparams,
+        const size_t * margins,
+        uint32_t n_ubatch_max,
+        const common_fit_extra_model * extra,
+        ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+
+    // a draft context follows the ubatch of the main context unless it was given its own
+    const bool extra_follows = extra != nullptr && extra->cparams->n_ubatch == cparams->n_ubatch;
+
+    while (cparams->n_ubatch < n_ubatch_max) {
+        const uint32_t n_ubatch_prev = cparams->n_ubatch;
+        cparams->n_ubatch = std::min(2*n_ubatch_prev, n_ubatch_max);
+        if (extra_follows) {
+            extra->cparams->n_ubatch = cparams->n_ubatch;
+        }
+
+        // the weights and the context are already placed, only the compute buffers grow
+        bool fits = true;
+        try {
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t hp_ngl = 0;
+            uint32_t hp_nct = 0;
+            uint32_t hp_nex = 0;
+            std::vector<llama_device_memory_data> dmds = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            if (extra != nullptr) {
+                extra->cparams->n_ctx = cparams->n_ctx;
+                const std::vector<llama_device_memory_data> dmds_extra = common_get_extra_memory_data(extra, devs, log_level);
+                for (size_t id = 0; id < dmds.size(); id++) {
+                    dmds[id].mb.model   += dmds_extra[id].mb.model;
+                    dmds[id].mb.context += dmds_extra[id].mb.context;
+                    dmds[id].mb.compute += dmds_extra[id].mb.compute;
+                }
+            }
+
+            // without devices the fit targets system memory
+            const size_t nd = std::max<size_t>(devs.size(), 1);
+            for (size_t id = 0; id < nd; id++) {
+                const llama_device_memory_data & dmd = devs.empty() ? dmds.back() : dmds[id];
+                const int64_t projected_free = (devs.empty() ? dmd.total : dmd.free) - int64_t(dmd.mb.total());
+                LOG_TRC("%s: n_ubatch=%" PRIu32 ", id=%zu: %" PRId64 " MiB free vs. target of %" PRId64 " MiB\n",
+                    __func__, cparams->n_ubatch, id, projected_free/MiB, int64_t(margins[id])/MiB);
+                if (projected_free < int64_t(margins[id])) {
+                    fits = false;
+                }
+            }
+        } catch (const std::runtime_error & e) {
+            LOG_WRN("%s: failed to measure memory at n_ubatch = %" PRIu32 ": %s\n", __func__, cparams->n_ubatch, e.what());
+            fits = false;
+        }
+
+        if (!fits) {
+            cparams->n_ubatch = n_ubatch_prev;
+            if (extra_follows) {
+                extra->cparams->n_ubatch = n_ubatch_prev;
+            }
+            break;
+        }
+    }
+
+    return cparams->n_ubatch;
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {

@@ -1238,6 +1238,11 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     // same key as llama_model_chat_template(model, nullptr)
     info.has_chat_tmpl = gguf_find_key(gguf_ctx.get(), "tokenizer.chat_template") >= 0;
 
+    const int64_t exp_id = gguf_find_key(gguf_ctx.get(), (arch + ".expert_count").c_str());
+    if (exp_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), exp_id) == GGUF_TYPE_UINT32) {
+        info.n_expert = gguf_get_val_u32(gguf_ctx.get(), exp_id);
+    }
+
     return info;
 }
 
@@ -1271,13 +1276,31 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+
+        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            fit_log_level);
+
+        // a MoE ubatch reads (and, for experts in host memory, uploads) the weights of nearly every expert, so a prompt
+        // costs one pass over all experts per ubatch: without -ub, grow the ubatch of a MoE model towards the logical batch
+        // in the memory the fit left over, so that it never costs context or weights on the device
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && params.fit_ubatch && !params.n_ubatch_set && params.n_ubatch < params.n_batch &&
+            common_get_gguf_info(params.model.path).n_expert > 0) {
+            common_fit_n_ubatch(params.model.path.c_str(), &mparams, &cparams,
+                params.fit_params_target.data(),
+                std::min(params.n_batch, 4096),
+                has_draft || spec_mtp ? &extra : nullptr,
+                fit_log_level);
+            if ((int32_t) cparams.n_ubatch != params.n_ubatch) {
+                params.n_ubatch = cparams.n_ubatch; // the draft context follows params.n_ubatch
+                COM_INF("MoE model, n_ubatch = %d fits in free memory (set -ub to override)\n", params.n_ubatch);
+            }
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
