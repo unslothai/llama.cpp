@@ -457,7 +457,7 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
-    bool    n_ubatch_set          = false; // -ub was given; without it MoE models use n_batch (up to 4096)
+    bool    n_ubatch_set          = false; // -ub was given; without it --fit grows the ubatch of MoE models in free memory
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
