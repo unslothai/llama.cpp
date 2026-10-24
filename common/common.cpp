@@ -1289,7 +1289,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // a MoE ubatch reads (and, for experts in host memory, uploads) the weights of nearly every expert, so a prompt
         // costs one pass over all experts per ubatch: without -ub, grow the ubatch of a MoE model towards the logical batch
         // in the memory the fit left over, so that it never costs context or weights on the device
-        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !params.n_ubatch_set && params.n_ubatch < params.n_batch &&
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && params.fit_ubatch && !params.n_ubatch_set && params.n_ubatch < params.n_batch &&
             common_get_gguf_info(params.model.path).n_expert > 0) {
             common_fit_n_ubatch(params.model.path.c_str(), &mparams, &cparams,
                 params.fit_params_target.data(),

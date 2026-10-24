@@ -2894,6 +2894,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(
+        { "-fitub", "--fit-ubatch" }, "[on|off]",
+        string_format("whether --fit grows the ubatch of MoE models into free device memory when -ub is not set ('on' or 'off', default: '%s')", params.fit_ubatch ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_ubatch = true;
+            } else if (is_falsey(value)) {
+                params.fit_ubatch = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-ubatch: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_UBATCH"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {
