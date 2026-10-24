@@ -70,9 +70,9 @@
 | `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
 | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
 | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
-| `-fitub, --fit-ubatch [on\|off]` | whether --fit grows the ubatch of MoE models into free device memory when -ub is not set ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT_UBATCH) |
 | `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices, default: 1024<br/>(env: LLAMA_ARG_FIT_TARGET) |
 | `-fitc, --fit-ctx N` | minimum ctx size that can be set by --fit option, default: 4096<br/>(env: LLAMA_ARG_FIT_CTX) |
+| `-fitu, --fit-ubatch [on\|off]` | whether --fit may raise the ubatch size of MoE models into leftover device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT_UBATCH) |
 | `--check-tensors` | check model tensor data for invalid values (default: false) |
 | `--override-kv KEY=TYPE:VALUE,...` | advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.<br/>types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false |
 | `--op-offload, --no-op-offload` | whether to offload host tensor operations to device (default: true) |

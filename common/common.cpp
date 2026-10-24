@@ -1298,7 +1298,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 fit_log_level);
             if ((int32_t) cparams.n_ubatch != params.n_ubatch) {
                 params.n_ubatch = cparams.n_ubatch; // the draft context follows params.n_ubatch
-                COM_INF("MoE model, n_ubatch = %d fits in free memory (set -ub to override)\n", params.n_ubatch);
+                COM_INF("MoE model, n_ubatch = %d fits in free memory (set -ub or -fitu off to override)\n", params.n_ubatch);
             }
         }
     }
