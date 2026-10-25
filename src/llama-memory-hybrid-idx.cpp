@@ -257,13 +257,9 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
-    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        if (mem_idx) {
-            mem_idx->state_write(io, seq_id, flags);
-        }
+    if (mem_idx) {
+        mem_idx->state_write(io, seq_id, flags);
     }
-
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -276,17 +272,16 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
-        }
+        // the indexer cache has the SWA type of the attention cache, so both read the same partial state
+        get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
 
         get_mem_recr()->state_read(io, seq_id, flags);
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-            if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
-                // the restore rewrites the cells behind the pool layout's back
+        if (mem_idx) {
+            mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            // a restore that rewrites cells does it behind the pool layout's back
+            if (!sinfos_attn.empty()) {
                 mem_idx_stale_set(seq_id, 0);
             }
         }
@@ -609,16 +604,6 @@ llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::g
     return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd);
 }
 
-ggml_tensor * llama_memory_hybrid_idx_context::gather_mla_rows(
-        ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const {
-    GGML_ASSERT(mem != nullptr);
-    ggml_tensor * k = mem->get_mem_attn()->get_k_storage(il);
-    GGML_ASSERT(k->ne[0] == n_embd);
-
-    ggml_tensor * rows = ggml_view_2d(ctx, k, k->ne[0], k->ne[1]*k->ne[2], k->nb[1], 0);
-    return ggml_get_rows(ctx, rows, ggml_reshape_1d(ctx, idxs, n_rows));
-}
-
 // k-pool DSA indexer (glm5-next, qwen4exp QSA)
 
 // Sizes only, used by the full cache context so get_n_kpool() works during graph reserve.
@@ -745,7 +730,7 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 }
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
-        ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+        ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
@@ -773,7 +758,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
-    GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
+    GGML_ASSERT(ggml_nelements(new_pool_idxs) == (int64_t) kpool*n_new_g);
     // the graph always scatters the fresh pooled keys back into the cache, see build_qsa_sel
     GGML_ASSERT(new_pool_rep != nullptr && ggml_backend_buffer_is_host(new_pool_rep->buffer));
     GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new_g);
@@ -797,7 +782,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // Use the first ubatch cell for padded gathers.
+    // a cell of this ubatch, written before any read, so the padded pools read a finite K row
     int64_t dummy_cell = 0;
     {
         const llama_seq_id s = ubatch->seq_id[0][0];
@@ -820,21 +805,21 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // Gather maps padding to a real cell and masks it separately.
-    const int32_t sentinel = gather ? (int32_t) dummy_cell : (int32_t) n_kv;
+    // padding and absent cells point at the n_kv sentinel row, one past the live cells
+    const int32_t sentinel = (int32_t) n_kv;
 
     float *  gm    = nullptr;
     uint32_t n_sel = 0;
     uint32_t n_top = 0; // Pools per token in the selection.
-    if (gather_mask != nullptr) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(gather_mask->buffer));
-        GGML_ASSERT(gather_mask->type == GGML_TYPE_F32);
-        GGML_ASSERT(gather_mask->ne[3] == (int64_t) n_tokens && gather_mask->ne[1] == 1 && gather_mask->ne[2] == 1);
-        n_sel = (uint32_t) gather_mask->ne[0];
+    if (sel_mask != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask->buffer));
+        GGML_ASSERT(sel_mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(sel_mask->ne[3] == (int64_t) n_tokens && sel_mask->ne[1] == 1 && sel_mask->ne[2] == 1);
+        n_sel = (uint32_t) sel_mask->ne[0];
         // The tail slots, when selected, are the n_sel % kpool != 0 remainder.
         n_top = n_sel / kpool;
         GGML_ASSERT(n_sel % kpool == 0 || n_sel % kpool == kpool - 1);
-        gm = (float *) gather_mask->data;
+        gm = (float *) sel_mask->data;
     }
 
     // pools are laid out per sequence
@@ -857,7 +842,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         const auto & sq = lay.seqs[s];
         seq_pool_start[s] = (uint32_t) pool_end.size();
 
-        const bool inert = !gather && n_stream_kv > 1 && !seq_in_ub[s];
+        const bool inert = n_stream_kv > 1 && !seq_in_ub[s];
 
         for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
@@ -869,8 +854,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             pcell[ip] = (int32_t) gcell(sq, rep);
 
             for (uint32_t k = 0; k < kpool; ++k) {
-                pidx[(size_t) ip*kpool + k] = inert ? sentinel :
-                    (int32_t) (gather ? gcell(sq, sq.cells[j + k].second) : (int64_t) sq.cells[j + k].second);
+                pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
             }
 
             if (st.is_new[ip] == st.generation) {
@@ -972,13 +956,13 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             bool    real = false;
             if (k < n_tail && by_order) {
                 const uint32_t c = sq.cells[rank[i] - k].second;
-                cell = (int32_t) (gather ? gcell(sq, c) : (int64_t) c);
+                cell = (int32_t) c;
                 real = true;
             } else if (k < n_tail) {
                 const llama_pos pt = p - (llama_pos) k;
                 auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pt, 0u));
                 if (it != sq.cells.end() && it->first == pt) {
-                    cell = (int32_t) (gather ? gcell(sq, it->second) : (int64_t) it->second);
+                    cell = (int32_t) it->second;
                     real = true;
                 }
             }
