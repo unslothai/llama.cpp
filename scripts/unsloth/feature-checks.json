@@ -148,6 +148,7 @@
     "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
     "unslothai#287": "MUL_MAT_ID MMVQ batch cap keyed on the compiled arch; it only differs when a build lacks the device's own arch (a P100 on cuda12-legacy), needs a CUDA host, and no runner in the pipeline has one",
-    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe"
+    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe",
+    "unslothai#269": "server-side KV preemption (--preempt-ram, --preempt-async), preemption notices and opt-in exact concurrency (LLAMA_EXACT_CONCURRENCY); the server parks and restores slots and pins per-sequence output, which no arch, backend-op or mtmd probe can observe. Covered by the server preemption tests (tools/server/tests/unit/test_preempt.py, test_preempt_notify.py), which need a CUDA host for the exact path"
   }
 }
