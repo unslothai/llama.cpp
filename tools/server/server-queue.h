@@ -5,10 +5,13 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <thread>
-#include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -155,14 +158,52 @@ struct server_response {
 private:
     bool running = true;
 
-    // for keeping track of all tasks waiting for the result
-    std::unordered_set<int> waiting_task_ids;
+    // One waiter per reader, shared by every id it registered in one call. A single shared vector
+    // plus one cv instead costs N wakeups and N scans per token, N^2 per decode step. A send
+    // notifies this reader's own cv, so the wakeup is O(1) even though it is a notify_all.
+    // arrival order is global, not per waiter: a reader can name ids from several waiters and
+    // must still be served oldest first, which is what scanning the shared vector gave
+    struct pending {
+        uint64_t               seq;
+        server_task_result_ptr res;
+    };
 
-    // the main result queue (using ptr for polymorphism)
-    std::vector<server_task_result_ptr> queue_results;
+    struct waiter {
+        std::condition_variable cv;
+
+        std::deque<pending> results;
+    };
+
+    using waiter_ptr = std::shared_ptr<waiter>;
+
+    std::unordered_map<int, waiter_ptr> waiting;
+
+    // stamped onto every queued result so arrival order survives being split across waiters
+    uint64_t next_seq = 0;
 
     std::mutex mutex_results;
-    std::condition_variable condition_results;
+
+    // parks a reader whose ids left the waiting list, so it honours its timeout, and a reader
+    // whose ids span several waiters, for which no single waiter's condition is enough
+    std::condition_variable condition_gone;
+
+    // how many readers are parked on condition_gone even though a result could already be
+    // delivered to them, i.e. their ids are spread over several waiters or only partly
+    // registered. Normally zero, so send() pays one integer compare rather than a second notify:
+    // server_response_reader registers all of its ids in one call, before it ever receives.
+    size_t n_split_readers = 0;
+
+    // ids registered together share one waiter, so the first hit is the right one. mutex_results held.
+    waiter_ptr find_waiter(const std::unordered_set<int> & id_tasks) const;
+
+    // pop the oldest queued result whose id the caller asked for. mutex_results held.
+    server_task_result_ptr take_result(const std::unordered_set<int> & id_tasks);
+
+    // The waiter that covers EVERY requested id, or nullptr when they are spread over several
+    // waiters or any of them is not registered. Only then does one waiter's condition cover the
+    // whole receive; an id that is absent now can be registered onto a different waiter while
+    // the reader waits. mutex_results held.
+    waiter_ptr sole_waiter(const std::unordered_set<int> & id_tasks) const;
 
 public:
     // add the id_task to the list of tasks waiting for response
