@@ -16,6 +16,7 @@
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_SENSENOVA_U1:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
@@ -389,13 +390,13 @@ void llama_model_saver::add_kv_from_model() {
         add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
         add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS, std::vector<uint64_t>(
                 hparams.ple_layer_multipliers.begin(),
-                hparams.ple_layer_multipliers.begin() + hparams.ple_ngram_size));
+                hparams.ple_layer_multipliers.begin() + hparams.ple_n_modules*hparams.ple_ngram_size));
         add_kv(LLM_KV_PLE_HEAD_OFFSETS,      std::vector<uint64_t>(
                 hparams.ple_head_offsets.begin(),
-                hparams.ple_head_offsets.begin() + hparams.ple_n_heads));
+                hparams.ple_head_offsets.begin() + hparams.ple_n_modules*hparams.ple_n_heads));
         add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,  std::vector<uint64_t>(
                 hparams.ple_head_vocab_sizes.begin(),
-                hparams.ple_head_vocab_sizes.begin() + hparams.ple_n_heads));
+                hparams.ple_head_vocab_sizes.begin() + hparams.ple_n_modules*hparams.ple_n_heads));
     }
 
     const float rope_scaling_factor = hparams.rope_freq_scale_train == 1.0f ? 0.0f : 1.0f/hparams.rope_freq_scale_train;
@@ -458,6 +459,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_TOKENIZER_ADD_SEP,                 vocab.get_add_sep());
     add_kv(LLM_KV_TOKENIZER_ADD_PREFIX,              vocab.get_add_space_prefix());
     add_kv(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS,         vocab.get_remove_extra_whitespaces());
+    add_kv(LLM_KV_TOKENIZER_CLEAN_SPACES,            vocab.get_clean_spaces());
     add_kv(LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP,    vocab.get_precompiled_charsmap());
     // add_kv(LLM_KV_TOKENIZER_HF_JSON,                 ???);
     // add_kv(LLM_KV_TOKENIZER_RWKV,                    ???);

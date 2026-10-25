@@ -435,6 +435,61 @@ static void test_decision_escape(testing & t) {
     });
 }
 
+static void test_rerank_template(testing & t) {
+    struct test_case {
+        const char * name;
+        std::string tmpl;
+        std::string query;
+        std::string doc;
+        std::string expected;
+    };
+    const test_case cases[] = {
+        {"plain inputs", "Q: {query}\nD: {document}", "query", "doc", "Q: query\nD: doc"},
+        {"document placeholder in query", "Q: {query}\nD: {document}", "Explain {document}.", "doc", "Q: Explain {document}.\nD: doc"},
+        {"query placeholder in query", "{query}|{document}", "{query}", "doc", "{query}|doc"},
+        {"placeholders in both inputs", "{query}|{document}", "{query} {document}", "{query} {document}", "{query} {document}|{query} {document}"},
+        {"repeated placeholders", "{query}|{document}|{query}|{document}", "{document}", "doc", "{document}|doc|{document}|doc"},
+        {"adjacent reversed placeholders", "{document}{query}", "query", "doc", "docquery"},
+        {"query only", "{query}", "{document}", "doc", "{document}"},
+        {"document only", "{document}", "query", "{query}", "{query}"},
+        {"no placeholders", "fixed", "{document}", "{query}", "fixed"},
+        {"unknown and incomplete placeholders", "{unknown}|{query}|{document}|{query", "query", "doc", "{unknown}|query|doc|{query"},
+        {"nested braces", "{{query}}|{{document}}", "query", "doc", "{query}|{doc}"},
+        {"placeholder formed at boundary", "{query}ument}", "{doc", "doc", "{document}"},
+        {"empty inputs", "Q: {query}\nD: {document}", "", "", "Q: \nD: "},
+        {"empty template", "", "query", "doc", ""},
+    };
+    for (const auto & test : cases) {
+        t.assert_equal(test.name, test.expected, format_rerank_template(test.tmpl, test.query, test.doc));
+    }
+}
+
+//
+// server_decision_context: the recursive functions stop at RECURSIVE_LIMIT
+//
+
+static void test_decision_depth(testing & t) {
+    const auto prepare = [](size_t depth) {
+        server_decision_context ctx;
+        ctx.type = COMMON_DECISION_TYPE_H2O_LIGHTNING; // the state goes through decision_py_dump
+        std::string error;
+        try {
+            ctx.prepare_state(json::parse(std::string(depth, '[') + std::string(depth, ']')));
+        } catch (const std::invalid_argument & e) {
+            error = e.what();
+        }
+        return error;
+    };
+    t.test("state at the limit", [&](testing & t) {
+        const std::string error = prepare(128);
+        t.assert_true("accepted: " + error, error.empty());
+    });
+    t.test("deep state", [&](testing & t) {
+        const std::string error = prepare(1000);
+        t.assert_true("rejected as nested: " + error, error.find("nested more than 128 levels deep") != std::string::npos);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -454,6 +509,8 @@ int main(int argc, char ** argv) {
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);
+    t.test("rerank_template", test_rerank_template);
+    t.test("decision_depth",  test_decision_depth);
 
     return t.summary();
 }
