@@ -129,6 +129,12 @@
         { "kind": "backend-op", "op": "GET_ROWS", "params": "type=mxfp8" },
         { "kind": "mtmd",       "projector": "deepseek41v" }
       ]
+    },
+    "minimax-m31": {
+      "owner": "unslothai#320",
+      "checks": [
+        { "kind": "arch", "arch": "minimax-m3" }
+      ]
     }
   },
   "unchecked": {
