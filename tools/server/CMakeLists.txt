@@ -19,6 +19,7 @@ add_library(${TARGET} STATIC
     server-context.h
     server-stream.cpp
     server-stream.h
+    server-speculative-batch.h
     server-tools.cpp
     server-tools.h
     server-mcp.cpp

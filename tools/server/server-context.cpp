@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-speculative-batch.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -3071,7 +3072,13 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t end = std::min(off + n_batch, batch.size());
+            for (const auto & slot : slots) {
+                if (!slot.spec_i_batch.empty()) {
+                    end = server_speculative_batch_end(off, end, slot.spec_i_batch.front(), slot.spec_i_batch.back());
+                }
+            }
+            const int32_t n_tokens = end - off;
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -4117,9 +4124,13 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
-        // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
+        // Drafts are indivisible decode units. Slots outside this view are verified
+        // when their own view is decoded; a partially included draft is still a bug.
         iterate(slots, [&](server_slot & slot) {
+            if (slot.spec_i_batch.empty() ||
+                    slot.spec_i_batch.back() < off || slot.spec_i_batch.front() >= off + n_batch_tokens) {
+                return;
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
@@ -4238,6 +4249,18 @@ private:
                 return;
             }
 
+            if (!is_inside_view(slot.spec_i_batch.front())) {
+                return;
+            }
+
+            // Samplers index the logits of the current decode, not the full batch.
+            auto spec_i_view = slot.spec_i_batch;
+            for (auto & i : spec_i_view) {
+                i -= off;
+            }
+            SLT_DBG(slot, "verifying draft in sub-batch [%d, %d), local indices [%d, %d]\n",
+                    off, off + n_batch_tokens, spec_i_view.front(), spec_i_view.back());
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -4258,14 +4281,14 @@ private:
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
-                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft, slot.spec_draft_q);
                 } else {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
 
