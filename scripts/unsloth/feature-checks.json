@@ -65,7 +65,7 @@
       ]
     },
     "muse-spark": { "owner": null, "checks": [ { "kind": "arch", "arch": "muse-spark" }, { "kind": "mtmd", "projector": "muse-spark-audio" } ] },
-    "flint": { "owner": "unslothai#314", "checks": [ { "kind": "arch", "arch": "flint" } ] },
+    "flint": { "owner": null, "checks": [ { "kind": "arch", "arch": "flint" } ] },
     "beam": { "owner": null, "checks": [ { "kind": "arch", "arch": "beam" } ] },
     "nemotron-3.5": {
       "owner": null,
@@ -128,6 +128,12 @@
         { "kind": "arch",       "arch": "deepseek41" },
         { "kind": "backend-op", "op": "GET_ROWS", "params": "type=mxfp8" },
         { "kind": "mtmd",       "projector": "deepseek41v" }
+      ]
+    },
+    "minimax-m31": {
+      "owner": "unslothai#320",
+      "checks": [
+        { "kind": "arch", "arch": "minimax-m3" }
       ]
     }
   },
