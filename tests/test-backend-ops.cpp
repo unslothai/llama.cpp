@@ -7362,8 +7362,7 @@ struct test_top_k : public test_case {
     }
 };
 
-// top_k of one row viewed out of a larger tensor, as backend sampling reads a logits row:
-// with an odd row width the view starts off the backend's storage-buffer alignment
+// top_k of one row viewed out of an odd-width tensor, as backend sampling reads a logits row
 struct test_top_k_row_view : public test_top_k {
     const int64_t row;
 

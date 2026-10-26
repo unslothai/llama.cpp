@@ -11458,9 +11458,8 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     }
 }
 
-// The topk shaders index their input from the binding start, so a view that does not start on
-// minStorageBufferOffsetAlignment (backend sampling's logits row r sits r * n_vocab * 4 bytes in) is
-// first copied to an aligned scratch in prealloc_x, past the `reserved` bytes topk itself uses.
+// topk shaders read from the binding start: copy a misaligned view (backend sampling's logits row r sits
+// r * n_vocab * 4 bytes in) to an aligned scratch in prealloc_x, past the `reserved` bytes topk uses.
 static vk_subbuffer ggml_vk_topk_src(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, size_t reserved) {
     const uint32_t misalign = get_misalign_bytes(ctx, src0);
     if (misalign == 0) {
