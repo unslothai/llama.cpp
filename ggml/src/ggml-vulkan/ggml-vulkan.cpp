@@ -11507,6 +11507,9 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, dst_buf, src0_buf, src0_buf, src0_buf }, pc, elements);
+        if (src0_buf.buffer == ctx->prealloc_x) {
+            ctx->prealloc_x_need_sync = true;
+        }
         return;
     }
 
