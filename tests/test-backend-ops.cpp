@@ -7362,6 +7362,29 @@ struct test_top_k : public test_case {
     }
 };
 
+// top_k of one row viewed out of an odd-width tensor, as backend sampling reads a logits row
+struct test_top_k_row_view : public test_top_k {
+    const int64_t row;
+
+    test_top_k_row_view(int64_t n, int64_t row, int k)
+        : test_top_k(GGML_TYPE_F32, {n, row + 1, 1, 1}, k, false), row(row) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",row=" + std::to_string(row);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+        input = a;
+
+        ggml_tensor * out = ggml_top_k(ctx, ggml_view_1d(ctx, a, ne[0], row * a->nb[1]), k);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // top_k over rows like log-probabilities: distinct negative values, fewer
 // than k +inf (none for k = 1, so the expected indices are unique) and many
 // -inf (masked tokens)
@@ -11828,6 +11851,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
+        }
+    }
+    for (int k : {1, 10, 40, 1023, 4000}) {
+        for (int64_t n : {1001, 248094}) {
+            if (k <= n) {
+                test_cases.emplace_back(new test_top_k_row_view(n, 1, k));
+                test_cases.emplace_back(new test_top_k_row_view(n, 3, k));
+            }
         }
     }
     for (int k : {1, 10, 40}) {

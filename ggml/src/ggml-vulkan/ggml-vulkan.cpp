@@ -6256,7 +6256,7 @@ vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_t
     GGML_ABORT("fatal error");
 }
 
-void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline, const ggml_tensor * tensor, const vk_subbuffer & in, const vk_subbuffer & out) {
+void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline, const ggml_tensor * tensor, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t in_misalign_elems) {
     VK_LOG_DEBUG("ggml_vk_cpy_to_contiguous((" << tensor << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << "), ";
     std::cerr << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ")");
 
@@ -6276,6 +6276,7 @@ void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context& subctx
     pc.nb11 = (uint32_t)tensor->ne[0];
     pc.nb12 = (uint32_t)(tensor->ne[0] * tensor->ne[1]);
     pc.nb13 = (uint32_t)(tensor->ne[0] * tensor->ne[1] * tensor->ne[2]);
+    pc.misalign_offsets = in_misalign_elems << 16;
     init_pushconst_fastdiv(pc);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, elements);
     ggml_vk_sync_buffers(ctx, subctx);
@@ -11457,6 +11458,27 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     }
 }
 
+// topk shaders read from the binding start: copy a misaligned view (backend sampling's logits row r sits
+// r * n_vocab * 4 bytes in) to an aligned scratch in prealloc_x, past the `reserved` bytes topk uses.
+static vk_subbuffer ggml_vk_topk_src(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, size_t reserved) {
+    const uint32_t misalign = get_misalign_bytes(ctx, src0);
+    if (misalign == 0) {
+        return ggml_vk_tensor_subbuffer(ctx, src0);
+    }
+    const size_t offset = ROUNDUP_POW2(reserved, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const size_t size   = ggml_nelements(src0) * sizeof(float);
+    if (ctx->prealloc_size_x < offset + size) {
+        ctx->prealloc_size_x = offset + size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    vk_pipeline pipeline = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, GGML_TYPE_F32);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer out { ctx->prealloc_x, offset, size };
+    ggml_vk_cpy_to_contiguous(ctx, subctx, pipeline, src0, ggml_vk_tensor_subbuffer(ctx, src0, true), out,
+                              misalign / ggml_type_size(src0->type));
+    return out;
+}
+
 void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ncols = src0->ne[0];
     uint32_t nrows = ggml_nrows(src0);
@@ -11479,11 +11501,14 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             1,
         };
         // the non-QSA path only uses bindings 0/1; bind valid buffers for the unused QSA slots
-        vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+        vk_subbuffer src0_buf = ggml_vk_topk_src(ctx, subctx, src0, 0);
         vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, dst_buf, src0_buf, src0_buf, src0_buf }, pc, elements);
+        if (src0_buf.buffer == ctx->prealloc_x) {
+            ctx->prealloc_x_need_sync = true;
+        }
         return;
     }
 
@@ -11565,7 +11590,7 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 
         if (num_elements == ncols) {
             pc2.first_pass = 1;
-            src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+            src_buf = ggml_vk_topk_src(ctx, subctx, src0, 2 * dbl_buf_size);
         } else {
             src_buf = { ctx->prealloc_x, dbl_buf_index * dbl_buf_size, dbl_buf_size };
         }
