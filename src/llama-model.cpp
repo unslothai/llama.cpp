@@ -2824,8 +2824,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_MINIMAX_M3:
             {
-                // sparse (MSA) layers carry an indexer key cache; a layer is sparse iff it has indexer
-                // tensors (MiniMax-M3: the MoE layers, MiniMax-M3.1: every layer)
+                // a layer is sparse (MSA) iff it has indexer tensors
                 const auto * mm3 = static_cast<const llama_model_minimax_m3 *>(this);
                 llama_kv_cache::layer_filter_cb filter_idx =
                     [mm3](int32_t il) { return mm3->is_msa_layer(il); };

@@ -16,7 +16,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         if (hidden_act == "gelu" || hidden_act == "gelu_pytorch_tanh") {
             hparams.llm_ffn_op = LLM_FFN_GELU;
         } else if (hidden_act == "swigluoai") {
-            // MiniMax-M3 DSpark: clamped SwiGLU, alpha = 1.702, limit = 7.0 (checked by the converter)
+            // alpha and limit are checked by the converter
             hparams.llm_ffn_op = LLM_FFN_SWIGLU_OAI_MOE;
         } else if (hidden_act != "silu") {
             throw std::runtime_error("unsupported DFlash hidden activation: " + hidden_act);

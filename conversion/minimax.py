@@ -174,12 +174,7 @@ class MiniMaxM2Model(TextModel):
 class MiniMaxM3Model(MiniMaxM2Model):
     model_arch = gguf.MODEL_ARCH.MINIMAXM3
 
-    # MiniMax-M3.1 checkpoints: quant_method "mxfp8" (attention / indexer / shared / dense MLP as
-    # F8_E4M3 + E8M0 weight_scale_inv per [1, 32]) with routed experts in compressed-tensors NVFP4
-    # (weight_packed, weight_scale F8_E4M3 per 16, weight_global_scale, input_global_scale).
-    # --outtype auto keeps the experts NVFP4 (per-expert 1/global as ffn_*_exps.scale) and writes the
-    # MXFP8 tensors exactly as BF16 (or Q8_0 with --fp8-as-q8); an explicit --outtype dequantizes
-    # every tensor exactly through F32 first.
+    # --outtype auto keeps experts NVFP4 and writes MXFP8 tensors exactly as BF16 (or Q8_0 with --fp8-as-q8)
     _NVFP4_PROJ = {"w1": gguf.MODEL_TENSOR.FFN_GATE_EXP, "w2": gguf.MODEL_TENSOR.FFN_DOWN_EXP, "w3": gguf.MODEL_TENSOR.FFN_UP_EXP}
 
     def __init__(self, dir_model, ftype, *args, **kwargs):
@@ -193,7 +188,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
 
     @staticmethod
     def _dequant_mxfp8(weight: Tensor, scale: Tensor) -> Tensor:
-        # exact: fp8 * 2^(e - 127) is representable in fp32 for every E8M0 byte except 255 (NaN)
+        # exact in fp32 for every E8M0 byte except 255 (NaN)
         rows, cols = weight.shape
         e = scale.view(torch.uint8).to(torch.float64)
         s = torch.exp2(e - 127.0).repeat_interleave(32, dim=1)[:, :cols]
@@ -203,11 +198,11 @@ class MiniMaxM3Model(MiniMaxM2Model):
 
     @classmethod
     def _dequant_nvfp4_eager(cls, packed: Tensor, scale: Tensor, global_scale: Tensor) -> Tensor:
-        # exact: e2m1 * e4m3 / global evaluated in fp64, rounded once to fp32
+        # exact: evaluated in fp64, rounded once to fp32
         if cls._e2m1_pair_lut is None:
             v = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
             v16 = v + [-x for x in v]
-            # byte b holds element 2i in the low nibble and 2i+1 in the high nibble
+            # low nibble = element 2i, high nibble = 2i+1
             cls._e2m1_pair_lut = torch.tensor([[v16[b & 15], v16[b >> 4]] for b in range(256)], dtype=torch.float64)
         rows = packed.shape[0]
         vals = cls._e2m1_pair_lut[packed.view(torch.uint8).to(torch.int64)].reshape(rows, -1)
@@ -219,13 +214,13 @@ class MiniMaxM3Model(MiniMaxM2Model):
         if not isinstance(packed, LazyTorchTensor):
             return cls._dequant_nvfp4_eager(packed, scale, global_scale)
         rows, packed_cols = packed.shape
-        # one lazy node around the eager decode (a lazy op chain costs ~10 s per expert tensor)
+        # a lazy op chain costs ~10 s per expert tensor
         return LazyTorchTensor(meta=LazyTorchTensor.meta_with_dtype_and_shape(torch.float32, (rows, packed_cols * 2)),
                                args=(packed, scale, global_scale), func=cls._dequant_nvfp4_eager)
 
     @staticmethod
     def _nvfp4_pack_np(packed: Tensor, scale: Tensor) -> np.ndarray:
-        # same bytes as ModelBase._nvfp4_pack (compressed-tensors packing -> ggml block_nvfp4), in numpy
+        # same bytes as ModelBase._nvfp4_pack
         p = packed.contiguous().view(torch.uint8).numpy()
         d = scale.contiguous().view(torch.uint8).numpy() & 0x7F
         rows, packed_cols = p.shape
@@ -237,9 +232,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
         raw = np.concatenate([d.reshape(rows, n_super, 4), qs.reshape(rows, n_super, 32)], axis=-1)
         return raw.reshape(rows, n_super * 36)
 
-    # stacked [n_expert, rows, cols] routed-expert tensors are written straight to gguf_writer, built
-    # lazily (only the tensor being written is resident, cf. _mxfp4_expert_tensor) and per expert in a
-    # thread pool: the torch / numpy kernels release the GIL, a serial loop takes hours on the real model
+    # experts are built lazily and in a thread pool: a serial loop takes hours on the real model
     _EXPERT_THREADS = 16
     _DEQUANT_RAW = {
         gguf.LlamaFileType.ALL_F32:     (gguf.GGMLQuantizationType.F32,  torch.float32,  4),
@@ -263,7 +256,6 @@ class MiniMaxM3Model(MiniMaxM2Model):
             if native:
                 return self._nvfp4_pack_np(t[0], t[1])
             w = self._dequant_nvfp4_eager(t[0], t[1], t[2])
-            # torch's float -> bf16 / f16 casts round to nearest even, like gguf.quants
             return w.to(self._DEQUANT_RAW[self.ftype][1]).contiguous().view(torch.uint8).numpy()
 
         def load(fns_list) -> np.ndarray:
@@ -310,8 +302,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
                 for aux in (base + "_scale", base + "_global_scale"):
                     if aux not in self.model_tensors:
                         raise KeyError(f"{name}: missing {aux}")
-                # input_global_scale is the trained W4A4 activation scale; llama.cpp computes its own
-                # activation scales (or none), so it is dropped
+                # trained activation scale; llama.cpp computes its own
                 if (module + ".input_global_scale") in self.model_tensors:
                     n_input_scale += 1
                     if float(LazyTorchTensor.to_eager(self.model_tensors[module + ".input_global_scale"]()).float()) == 1.0:
@@ -354,7 +345,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
                         f"shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
             self.gguf_writer.add_tensor(new_name, data, raw_dtype=qtype)
             if self._nvfp4_native:
-                # per-expert 1/global, applied to the matmul output by build_moe_ffn
+                # per-expert 1/global, applied by build_moe_ffn
                 self.gguf_writer.add_tensor(new_name.replace(".weight", ".scale"), np.array(inv_global, dtype=np.float32))
 
         for name in remove:
@@ -372,9 +363,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
         self.gguf_writer.add_expert_weights_scale(self.find_hparam(["routed_scaling_factor"]))
         self.gguf_writer.add_expert_weights_norm(True)
 
-        # transformers >= 5.15 resolves minimax_m3_vl natively and folds sparse_attention_config /
-        # moe_layer_freq into index_* / layer_types / mlp_layer_types, dropping the fields it does not
-        # consume (sparse_score_type, sparse_init_block, sparse_disable_index_value): read the raw file
+        # transformers >= 5.15 folds the sparse config and drops fields: read the raw file
         raw = self._raw_text_config()
         sac = raw.get("sparse_attention_config") or self.find_hparam(["sparse_attention_config"])
         for flat, legacy in (("index_n_heads", "sparse_num_index_heads"), ("index_head_dim", "sparse_index_dim"),
@@ -387,8 +376,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
             raise NotImplementedError(f"sparse_score_type {sac['sparse_score_type']!r}")
         if int(sac.get("sparse_init_block", 0)) != 0:
             raise NotImplementedError(f"sparse_init_block {sac['sparse_init_block']}")
-        # which layers run MSA is carried by the presence of blk.N.indexer.* (loader side), so the
-        # indexer tensors must exist exactly on the layers sparse_attention_freq marks sparse
+        # the loader marks MSA layers by the presence of blk.N.indexer.*
         freq = sac.get("sparse_attention_freq")
         n_layer = self.find_hparam(["num_hidden_layers"])
         if freq is not None:
@@ -420,7 +408,6 @@ class MiniMaxM3Model(MiniMaxM2Model):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         # Gemma-style (1 + w) RMSNorm: bake the +1 in so llama.cpp can use plain RMSNorm
-        # (in fp32 whatever the incoming dtype: adding 1.0 in F16 / BF16 rounds away the low bits of w)
         if name.endswith("norm.weight"):
             data_torch = data_torch.to(torch.float32) + 1.0
 
@@ -506,9 +493,7 @@ class MiniMaxM3VisionModel(MmprojModel):
 @ModelBase.register("DSparkMiniMaxDraftModel")
 @ModelBase.example("MiniMaxAI/MiniMax-M3.1-Flash")
 class DSparkMiniMaxModel(DSparkModel):
-    # MiniMax-M3.1 DSpark draft (the `dspark/` folder of the checkpoint): a DFlash block drafter with
-    # MiniMax-M3 dense layers (Gemma norms, per-head Gemma QK norms, partial NeoX RoPE, SwiGLU-OAI MLP)
-    # plus the vanilla Markov head and the confidence head. Embeddings and lm_head come from the target.
+    # MiniMax-M3.1 DSpark draft; embeddings and lm_head come from the target
     model_arch = gguf.MODEL_ARCH.DFLASH
 
     _PREFIX = "language_model.model.dspark."
@@ -516,8 +501,7 @@ class DSparkMiniMaxModel(DSparkModel):
     def __init__(self, dir_model, *args, **kwargs):
         hparams = kwargs.pop("hparams", None)
         if hparams is None:
-            # read config.json as is: transformers >= 5.15 resolves minimax_m3_vl to its own config class,
-            # which drops the DSpark keys and reports the default hidden_act
+            # raw config.json: transformers >= 5.15 drops the DSpark keys
             with open(dir_model / "config.json", "r", encoding="utf-8") as f:
                 hparams = json.load(f)
         hparams = {**hparams, **hparams.get("text_config", {})}
@@ -544,7 +528,7 @@ class DSparkMiniMaxModel(DSparkModel):
         if any(lt != "sliding_attention" for lt in layer_types):
             raise ValueError(f"MiniMax DSpark: expects uniform sliding_attention layers, got {layer_types}")
 
-        # the draft's FFN is the dense one (dspark_ffn_hidden_size), not the MoE expert width
+        # dense FFN width, not the MoE expert width
         hparams["dense_intermediate_size"] = hparams.get("dspark_ffn_hidden_size", hparams["dense_intermediate_size"])
         for k in ("num_local_experts", "num_experts_per_tok", "n_shared_experts", "shared_intermediate_size",
                   "moe_intermediate_size", "num_experts", "scoring_func", "use_routing_bias", "routed_scaling_factor"):
@@ -578,7 +562,7 @@ class DSparkMiniMaxModel(DSparkModel):
         return super().filter_tensors((name, gen))
 
     def dequant_model(self):
-        # MXFP8 (quant_method "mxfp8", block [1, 32]): F8_E4M3 weight * 2^(E8M0 - 127) per 32 inputs
+        # MXFP8: F8_E4M3 weight * 2^(E8M0 - 127) per 32 inputs
         quant_config = self.hparams.get("quantization_config") or {}
         if quant_config.get("quant_method") == "mxfp8":
             if list(quant_config.get("weight_block_size", [1, 32])) != [1, 32]:
@@ -609,13 +593,13 @@ class DSparkMiniMaxModel(DSparkModel):
         self.gguf_writer.add_hidden_act("swigluoai")
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
-        # confidence head is a tiny F32 projection in the reference (params_dtype=float32)
+        # F32 in the reference
         if "confidence_head" in name or new_name.startswith("conf_proj"):
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Gemma-style (1 + w) RMSNorm, computed in fp32 by the reference: add 1 in fp32, not in bf16
+        # add 1 in fp32: bf16 rounding loses the low bits of w
         if name.endswith("norm.weight"):
             data_torch = data_torch.to(torch.float32) + 1.0
         yield from super().modify_tensors(data_torch, name, bid)

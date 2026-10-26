@@ -64,9 +64,7 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-        // indexer: required on the MoE layers (MiniMax-M3); optional on the leading dense layers, which
-        // run MSA when it is present (MiniMax-M3.1 sets sparse_attention_freq on every layer). A layer
-        // is sparse iff it carries indexer tensors, see llama_model_minimax_m3::is_msa_layer()
+        // indexer optional on dense layers: a layer is sparse iff it carries indexer tensors
         {
             const int idx_flags = i < (int) hparams.n_layer_dense_lead ? TENSOR_NOT_REQUIRED : 0;
             layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, idx_flags);
@@ -102,8 +100,7 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-// tokens per MSA batch chunk so that per_token_elems * tokens stays below 2^31 elements
-// (MSA_MAX_ELEMS overrides the cap, for testing the chunked path at small contexts)
+// keeps per_token_elems * tokens below 2^31 (MSA_MAX_ELEMS overrides, for testing)
 static int64_t msa_tokens_per_chunk(int64_t per_token_elems, int64_t n_tokens) {
     static const int64_t max_elems = [] {
         const char * e = getenv("MSA_MAX_ELEMS");
@@ -324,8 +321,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // DFlash/DSpark drafts read the residual stream entering layer il (index n_layer = the last layer's output,
-    // before the final norm); that one needs every row, so the output-row crop moves after the loop
+    // DFlash/DSpark drafts need every row, so the output-row crop moves after the loop
     const bool tap_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     for (int il = 0; il < n_layer; ++il) {
@@ -477,10 +473,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
                     cur = build_attn_msa_fa(Qcur, kfa, vfa, mfa, Gp, kq_scale, il);
                 } else {
-                    // batch: per stream, in token chunks. The largest intermediates (indexer scores
-                    // [n_ps, Hd, n], block mask expanded to cells [n_kv, n, Hd]) grow with context x tokens;
-                    // chunking keeps every one of them below 2^31 elements (int32 indexing in backend
-                    // kernels, e.g. CUDA pool2d, overflows past that: 270K ctx at -ub 2048).
+                    // chunk tokens: backend kernels index with int32 and overflow past 2^31 elements
                     const int64_t n_chunk = msa_tokens_per_chunk(std::max<int64_t>(n_ps, n_kv)*Hd, n_tps);
                     std::vector<ggml_tensor *> outs;
                     for (int64_t st = 0; st < ns; ++st) {
@@ -495,10 +488,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * v_s = ggml_view_4d(ctx0, v, D, HKV, n_kv, 1,
                                 v->nb[1], v->nb[2], v->nb[3], st*v->nb[3]);
 
-                        // the indexer keys are gathered through the pos -> cell map once per stream
                         ggml_tensor * ikp = ggml_get_rows(ctx0, ik_s, psl_s);   // [n_idx_dim, n_ps]
 
-                        // cache views with groups on ne[3];
                         ggml_tensor * kfa = ggml_permute(ctx0, k_s, 0, 3, 1, 2);
                         ggml_tensor * vfa = ggml_permute(ctx0, v_s, 0, 3, 1, 2);
 
@@ -510,7 +501,6 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                                 iq->nb[1], iq->nb[2], t0*iq->nb[2]);
                         ggml_tensor * pm_s = ggml_view_3d(ctx0, msa->pos_mask, n_ps, 1, nt,
                                 msa->pos_mask->nb[1], msa->pos_mask->nb[1], t0*msa->pos_mask->nb[1]);
-                        // F32 copy of this chunk's rows of the FA (f16) mask for the final mask add
                         ggml_tensor * mf_s = ggml_cast(ctx0, ggml_view_3d(ctx0, msa_kqm, n_kv, nt, 1,
                                 msa_kqm->nb[1], msa_kqm->nb[3], st*msa_kqm->nb[3] + c0*msa_kqm->nb[1]), GGML_TYPE_F32);
                         ggml_tensor * bias_s = ggml_view_3d(ctx0, msa->bias, nblk, 1, nt,
@@ -518,7 +508,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * q_s = ggml_view_3d(ctx0, Qcur, D, n_head, nt,
                                 Qcur->nb[1], Qcur->nb[2], t0*Qcur->nb[2]);
 
-                        // block scores, unscaled: only the top-k ordering matters
+                        // unscaled: only the top-k ordering matters
                         ggml_tensor * sc = ggml_mul_mat(ctx0, ikp,
                                 ggml_reshape_2d(ctx0, iq_s, n_idx_dim, Hd*nt));
                         // indexer scores run in F32
