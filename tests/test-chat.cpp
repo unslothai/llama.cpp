@@ -7945,8 +7945,64 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
-// DeepSeek V4.1: extra message keys (encoding.py golden cases 3 and 4) and "\n\n" around media markers
+// DeepSeek V4.1: extra message keys, "\n\n" around media markers, reasoning_effort mapping, system-message tools
 static void test_deepseek_v4_1_message_fields() {
+    LOG_DBG("%s\n", __func__);
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, DEEPSEEK_V4_1_MIN_TEMPLATE));
+    auto render = [&](const char * messages_json, bool add_generation_prompt) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
+        inputs.add_generation_prompt = add_generation_prompt;
+        inputs.enable_thinking = false;
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+    };
+
+    assert_equals(std::string("<｜User｜>q<｜action｜>"),
+                  render(R"([{"role": "user", "content": "q", "task": "action"}])", false));
+
+    assert_contains(render(R"([
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "namespace": "ns", "function": {"name": "f", "arguments": {"x": 1}}}]}
+        ])", false),
+        "<｜DSML｜ invoke name=\"ns::f\">");
+
+    assert_equals(std::string("<｜User｜>a\n\n<__media__>\n\nb<｜Assistant｜></think>"),
+                  render(R"([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "media_marker", "text": "<__media__>"}, {"type": "text", "text": "b"}]}])", true));
+
+    for (const auto & [effort, expected] : std::vector<std::pair<std::string, std::string>>{
+             { "minimal", "<｜effort=low｜>" }, { "low", "<｜effort=low｜>" }, { "medium", "" },
+             { "high", "<｜effort=high｜>" }, { "xhigh", "<｜effort=max｜>" }, { "max", "<｜effort=max｜>" } }) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+        assert_equals("<｜User｜>Hey there!" + expected + "<｜Assistant｜><think>",
+                      common_chat_templates_apply(tmpls.get(), inputs).prompt.str());
+    }
+
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(R"([
+            {"role": "system", "content": "s", "tools": [{"type": "function", "function": {"name": "get_time",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]},
+            {"role": "user", "content": "q"}
+        ])"));
+        inputs.add_generation_prompt = true;
+        inputs.enable_thinking = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        common_chat_session session(tmpls.get(), nullptr, inputs, {});
+        const auto & msg = session.finish(common_chat_input(std::string(
+            "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_time\">\n"
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>")));
+        assert_equals(size_t(1), msg.tool_calls.size());
+        assert_equals(std::string("get_time"), msg.tool_calls[0].name);
+        assert_equals(std::string("{\"city\":\"Tokyo\"}"), msg.tool_calls[0].arguments);
+    }
+}
+
+// DeepSeek V4.1 shipped template (models/templates): extra message keys (encoding.py golden cases 3 and 4) and "\n\n" around media markers
+static void test_deepseek_v4_1_shipped_template_fields() {
     LOG_DBG("%s\n", __func__);
 
     auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja");
@@ -8411,6 +8467,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_deepseek_v4_1_message_fields();
+        test_deepseek_v4_1_shipped_template_fields();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_prompt_parts();
