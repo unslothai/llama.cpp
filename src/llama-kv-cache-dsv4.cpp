@@ -428,8 +428,11 @@ static void dsv4_state_read_k_cache(
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
     }
 
-    // refill the mirrors from their source rows just read
-    std::vector<uint8_t> buf;
+    if (n_rows_ref == 0) {
+        return;
+    }
+
+    // refill the mirrors from their sources; a mirror gets the same rows as its source, so a whole copy is exact
     for (uint32_t il : kv->get_layer_ids()) {
         const int32_t src = kv_src[il];
         if (src == (int32_t) il) {
@@ -437,20 +440,11 @@ static void dsv4_state_read_k_cache(
         }
         ggml_tensor * t_src = kv->get_k_storage(src);
         ggml_tensor * t_dst = kv->get_k_storage(il);
-        GGML_ASSERT(t_src->type == t_dst->type && t_src->ne[0] == t_dst->ne[0]);
+        if (t_src->type != t_dst->type || !ggml_are_same_shape(t_src, t_dst)) {
+            throw std::runtime_error("DSV4 K-cache mirror layout mismatch");
+        }
 
-        const size_t row_size      = ggml_row_size(t_src->type, t_src->ne[0]);
-        const size_t stream_stride = (size_t) kv_size*row_size;
-        const size_t size          = (size_t) n_rows_ref*row_size;
-        if (size == 0) {
-            continue;
-        }
-        buf.resize(size);
-        for (uint32_t s = 0; s < ns; ++s) {
-            const size_t offset = (size_t) (s0 + s)*stream_stride;
-            ggml_backend_tensor_get(t_src, buf.data(), offset, size);
-            ggml_backend_tensor_set(t_dst, buf.data(), offset, size);
-        }
+        ggml_backend_tensor_copy(t_src, t_dst);
     }
 }
 
@@ -946,13 +940,12 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
             uint32_t        n_rs_seq,
         const char    * name,
         const llama_memory_i::layer_filter_cb & filter) :
+    hparams(model.hparams),
     ratio(ratio),
     state_size(state_size),
     n_embd_state(n_embd_state),
     n_stream(unified ? 1 : n_seq_max),
     n_rs_seq(n_rs_seq) {
-    const llama_hparams & hparams = model.hparams;
-
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
@@ -1027,7 +1020,15 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
     }
 
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf;
+        if (hparams.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // set dummy buffer for DSV4 state so that the backend scheduler won't try to allocate it
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for DSV4 compressor state");
         }
@@ -1119,9 +1120,15 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-        ret[buft] += ggml_backend_buffer_get_size(buf.get());
+
+        if (hparams.no_alloc) {
+            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else {
+            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        }
     }
     return ret;
 }
@@ -1339,10 +1346,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // crosses devices. no mirrors without offload
     const uint32_t n_layer = model.hparams.n_layer();
     comp_read.assign(n_layer, -1);
-    comp_kv_src.resize(n_layer);
+    comp_il_src.resize(n_layer);
     for (uint32_t il = 0; il < n_layer; ++il) {
         const int32_t src = is_v41 ? model.hparams.dsv41_kv_src[il] : (int32_t) il;
-        comp_kv_src[il] = src >= 0 ? src : (int32_t) il;
+        comp_il_src[il] = src >= 0 ? src : (int32_t) il;
         if (model.hparams.dsv4_compress_ratios[il] == 0) {
             continue;
         }
@@ -1353,7 +1360,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         // the first layer of this source on this device holds the mirror
         comp_read[il] = il;
         for (int32_t j = src + 1; j < (int32_t) il; ++j) {
-            if (comp_read[j] == j && comp_kv_src[j] == src && model.dev_layer(j) == model.dev_layer(il)) {
+            if (comp_read[j] == j && comp_il_src[j] == src && model.dev_layer(j) == model.dev_layer(il)) {
                 comp_read[il] = j;
                 break;
             }
@@ -1798,9 +1805,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const uint32_t n_rows_lid = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_max, lid_state->get_ratio(), kv_lid->get_size()) : kv_lid->get_size();
 
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa, comp_kv_src);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca, comp_kv_src);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid, comp_kv_src);
+        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa, comp_il_src);
+        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca, comp_il_src);
+        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid, comp_il_src);
     }
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
@@ -1838,9 +1845,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (!partial_only) {
         clear_compressed(seq_id, true);
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, comp_kv_src);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, comp_kv_src);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, comp_kv_src);
+        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, comp_il_src);
+        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, comp_il_src);
+        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, comp_il_src);
     }
 
     csa_state->state_read(io, seq_id, flags);
