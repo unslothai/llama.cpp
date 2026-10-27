@@ -23,6 +23,9 @@ static const size_t DECISION_LEV_N_RATINGS = 9;
 // a longer state keeps its head and its tail
 static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
 
+// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
+static const int RECURSIVE_LIMIT = 128;
+
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
@@ -201,6 +204,15 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max   = labels.size();
         noul_true_first = true;
+    } else if (model_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+        // the classes come from the GGUF classifier labels, the request API is binary: [inconsistent, consistent]
+        const uint32_t n_classes = llama_model_n_cls_out(model);
+        if (n_classes != 2 || llama_model_n_embd_out(model) != (int32_t) n_classes) {
+            throw std::runtime_error(string_format("decision model must have 2 classifier labels and output one score per class, got %u labels and %d scores",
+                n_classes, llama_model_n_embd_out(model)));
+        }
+        n_options_max = n_classes;
+        choice_sorted = true;
     } else {
         throw std::runtime_error("unsupported decision model type: " + type_name);
     }
@@ -228,6 +240,9 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
     if (!body.contains("questions") || !body.at("questions").is_object() || body.at("questions").empty()) {
         throw std::invalid_argument("\"questions\" must be a non-empty object");
     }
+    if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV && body.at("questions").size() != 1) {
+        throw std::invalid_argument("this model answers exactly one question");
+    }
 
     std::vector<server_decision_question> questions;
     for (const auto & [id, q] : body.at("questions").items()) {
@@ -241,7 +256,9 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         // h2o-lightning: the instructions can be left out, the template has a default, and the type defaults to choice
         const bool is_h2o = type == COMMON_DECISION_TYPE_H2O_LIGHTNING;
         const json instructions = q.contains("instructions") ? q.at("instructions") : (is_h2o ? json(std::string()) : json());
-        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o) {
+        // minicpm-ocr-jev answers one fixed question, the prompt is entirely in the template
+        const bool is_ocr_jev = type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV;
+        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o && !is_ocr_jev) {
             throw err("\"instructions\" must be provided");
         }
         if (strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
@@ -319,6 +336,26 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
             throw err("\"type\" must be one of: choice, score, noul");
         }
 
+        // the classes are fixed: "0" is inconsistent, "1" is consistent
+        if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+            // the task text is in the template, an instructions from the request would be dropped
+            if (!instructions.is_null()) {
+                throw err("\"instructions\" is not used by this model, the task is part of its prompt");
+            }
+            if (question.type == SERVER_DECISION_QUESTION_CHOICE) {
+                const auto & opts = question.options;
+                if (opts.size() != 2 || opts[0].key != "0" || opts[1].key != "1" || !opts[0].description.is_null() || !opts[1].description.is_null()) {
+                    throw err("\"criteria\" must be {\"0\": null, \"1\": null}");
+                }
+            } else if (question.type == SERVER_DECISION_QUESTION_NOUL) {
+                if (!criteria.is_null()) {
+                    throw err("\"criteria\" is not supported for a noul question");
+                }
+            } else {
+                throw err("only choice and noul questions are supported");
+            }
+        }
+
         if (question.options.size() > n_options_max) {
             throw err(string_format("too many options (%zu), this model supports at most %zu", question.options.size(), n_options_max));
         }
@@ -357,6 +394,9 @@ static void decision_load_audio(const json & data, std::vector<raw_buffer> & fil
 }
 
 json server_decision_context::parse_state(const json & body, std::vector<raw_buffer> & files) const {
+    if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV && !body.at("state").is_string()) {
+        throw std::invalid_argument("\"state\" must be the OCR text");
+    }
     if (body.contains("videos") && !body.at("videos").is_null() && !body.at("videos").empty()) {
         throw std::invalid_argument("\"videos\" is not supported");
     }
@@ -371,6 +411,11 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
         for (const auto & url : body.at(key)) {
             decision_load_image(url, files);
         }
+    }
+
+    // the prompt has the original image, then the image rendered from the OCR text
+    if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV && files.size() != 2) {
+        throw std::invalid_argument(string_format("this model needs exactly 2 images (the original, then the rendered one), got %zu", files.size()));
     }
 
     const json & state = body.at("state");
@@ -417,7 +462,10 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
 //
 
 // replace text in all strings of a JSON value
-static json decision_replace_text(const json & val, const std::string & search, const std::string & replace) {
+static json decision_replace_text(const json & val, const std::string & search, const std::string & replace, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     if (val.is_string()) {
         std::string str = val.get<std::string>();
         string_replace_all(str, search, replace);
@@ -426,14 +474,14 @@ static json decision_replace_text(const json & val, const std::string & search, 
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_replace_text(item, search, replace));
+            out.push_back(decision_replace_text(item, search, replace, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[key] = decision_replace_text(item, search, replace);
+            out[key] = decision_replace_text(item, search, replace, depth + 1);
         }
         return out;
     }
@@ -441,18 +489,21 @@ static json decision_replace_text(const json & val, const std::string & search, 
 }
 
 // sort the keys of all objects of a JSON value
-static json decision_sort_keys(const json & val) {
+static json decision_sort_keys(const json & val, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_sort_keys(item));
+            out.push_back(decision_sort_keys(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         std::map<std::string, json> sorted;
         for (const auto & [key, item] : val.items()) {
-            sorted[key] = decision_sort_keys(item);
+            sorted[key] = decision_sort_keys(item, depth + 1);
         }
         json out = json::object();
         for (const auto & [key, item] : sorted) {
@@ -464,7 +515,10 @@ static json decision_sort_keys(const json & val) {
 }
 
 // kev flattens a JSON value into text, the keys of an object are kept as labels (kev/api.py: render)
-static std::string decision_kev_render(const json & val, int indent = 0) {
+static std::string decision_kev_render(const json & val, int indent = 0, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     const std::string pad(2 * indent, ' ');
     if (val.is_null()) {
         return "";
@@ -478,7 +532,7 @@ static std::string decision_kev_render(const json & val, int indent = 0) {
     if (val.is_array()) {
         std::string out;
         for (const auto & item : val) {
-            const std::string text = decision_kev_render(item, indent + 1);
+            const std::string text = decision_kev_render(item, indent + 1, depth + 1);
             out += (out.empty() ? "" : "\n") + pad + "- " + text.substr(std::min(text.size(), text.find_first_not_of(" \t\n\r")));
         }
         return out;
@@ -487,7 +541,7 @@ static std::string decision_kev_render(const json & val, int indent = 0) {
         std::string out;
         for (const auto & [key, item] : val.items()) {
             const bool is_nested = item.is_object() || item.is_array();
-            out += (out.empty() ? "" : "\n") + pad + key + (is_nested ? ":\n" : ": ") + decision_kev_render(item, is_nested ? indent + 1 : 0);
+            out += (out.empty() ? "" : "\n") + pad + key + (is_nested ? ":\n" : ": ") + decision_kev_render(item, is_nested ? indent + 1 : 0, depth + 1);
         }
         return out;
     }
@@ -528,21 +582,24 @@ static std::string decision_kev_text(const json & val) {
 }
 
 // lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
-static json decision_d1omni_escape(const json & val) {
+static json decision_d1omni_escape(const json & val, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     if (val.is_string()) {
         return server_decision_escape_special_tokens(val.get<std::string>());
     }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_d1omni_escape(item));
+            out.push_back(decision_d1omni_escape(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[server_decision_escape_special_tokens(key)] = decision_d1omni_escape(item);
+            out[server_decision_escape_special_tokens(key)] = decision_d1omni_escape(item, depth + 1);
         }
         return out;
     }
@@ -669,6 +726,9 @@ static void decision_py_str(std::string & out, const std::string & s, bool ensur
 
 // json.dumps() of Python: indent < 0 is no indent, keys stay in their order
 static void decision_py_dump(std::string & out, const json & val, int indent, int level, const std::string & item_sep, const std::string & key_sep, bool ensure_ascii) {
+    if (level >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     const auto newline = [&](int lvl) {
         return indent < 0 ? std::string() : "\n" + std::string(indent * lvl, ' ');
     };
@@ -1022,6 +1082,11 @@ std::string server_decision_context::render(
         inp["instructions"] = decision_kev_text(question.instructions);
     }
 
+    // the OCR text must not be parsed as special tokens
+    if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+        inp["state"] = server_decision_escape_special_tokens(state.get<std::string>());
+    }
+
     // the input must not contain the marker of the options
     if (!text_marker.empty()) {
         inp = decision_replace_text(inp, text_marker, " ");
@@ -1073,6 +1138,12 @@ void server_decision_context::fill_task(
     }
 
     const std::string prompt = render(state, questions, question, variant, files.size());
+
+    if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+        task.tokens          = process_mtmd_prompt(mctx, prompt, files, init_opt);
+        task.decision.pooled = true;
+        return;
+    }
 
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
         type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
@@ -1513,8 +1584,8 @@ json server_decision_context::format_answer(const server_decision_question & que
         if (s.size() != n) {
             throw std::runtime_error("decision result does not match the number of options");
         }
-        // a joint head returns NaN if it could not use the decision order
-        if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v); })) {
+        // a joint head returns NaN if it could not use the decision order, +inf would make the softmax NaN
+        if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v) || v == INFINITY; })) {
             throw std::runtime_error("the model could not evaluate the decision");
         }
         std::vector<double> logits(s.begin(), s.end());
