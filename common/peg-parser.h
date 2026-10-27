@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <string>
 #include <string_view>
@@ -182,6 +183,10 @@ inline common_peg_parse_flags operator~(common_peg_parse_flags a) {
     return static_cast<common_peg_parse_flags>(~int(a));
 }
 
+struct common_peg_recursion_error : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+
 struct common_peg_parse_context {
     std::string input;               // [h,   e,  l,  l,  o,  _,  w,  o,  r,  l,  d]
     std::vector<llama_token> tokens; // [id, -1, -1, -1, -1, id, -1, -1, -1, -1, -1]
@@ -189,6 +194,7 @@ struct common_peg_parse_context {
     common_peg_ast_arena ast;
 
     int parse_depth;
+    std::vector<int> rule_depth; // index: rule child id
 
     common_peg_parse_context(common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_NONE)
         : flags(flags), parse_depth(0) {}
@@ -356,12 +362,6 @@ class common_peg_arena {
     void build_grammar(const common_grammar_builder & builder, bool lazy = false) const;
 
     std::string dump(common_peg_parser_id id) const;
-
-    common_json to_json() const;
-    static common_peg_arena from_json(const common_json & j);
-
-    std::string save() const;
-    void load(const std::string & data);
 
     friend class common_peg_parser_builder;
 
