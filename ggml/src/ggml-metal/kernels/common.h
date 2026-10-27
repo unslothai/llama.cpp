@@ -68,6 +68,14 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// unsigned E4M3 (bias 7), 0x7F (NaN) decodes to 0 as on the CPU; unlike ggml_ue4m3_to_fp32 there is no 0.5 factor since kvalues_mxfp4_f is not doubled
+// the 7 bits placed in an fp16 give the right value scaled by 2^-8, subnormals included
+static inline float ue4m3_to_fp32(uint8_t x) {
+    const float v = (float) as_type<half>((ushort) ((x & 0x7F) << 7)) * 256.0f;
+
+    return x == 0x7F ? 0.0f : v;
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
