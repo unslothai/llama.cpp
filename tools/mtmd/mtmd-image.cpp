@@ -1539,6 +1539,9 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const cli
 
     // load_image rounds the normalized input to bf16 (round to nearest even)
     for (auto & e : out.entries) {
+        if (e.is_placeholder()) {
+            continue;
+        }
         std::vector<float> buf = e.get_ro_buf();
         for (float & v : buf) {
             v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));

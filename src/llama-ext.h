@@ -141,6 +141,10 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Run a pending scheduler reserve now instead of on the next decode, e.g. so that the memory breakdown of an
+// allocation-free context reflects flags that change the graph shape
+LLAMA_API void llama_sched_reserve(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

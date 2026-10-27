@@ -287,6 +287,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids;
+    std::vector<const ggml_tensor *> engram_tab; // non-null: host table, rows gathered in set_input
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
@@ -315,9 +316,17 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         if (model.can_prefetch.count(model.per_layer_tok_embd)) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
+        std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {
-                ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
+                if (engram_tab[e]) {
+                    // host gather: same rows and conversion as the CPU GET_ROWS
+                    rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
+                    llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
+                } else {
+                    ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
+                }
             }
         }
     }
@@ -354,7 +363,8 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
     for (auto * t : engram_ids) {
-        res &= t->ne[0] == (int64_t) model.hparams.ple_n_heads*params.ubatch.n_tokens;
+        res &= t->type == GGML_TYPE_F32 ? t->ne[1] == (int64_t) params.ubatch.n_tokens
+                                        : t->ne[0] == (int64_t) model.hparams.ple_n_heads*params.ubatch.n_tokens;
     }
     res &= (engram_keep != nullptr) == (!engram_ids.empty() && params.ubatch.embd != nullptr);
     if (engram_keep) {
@@ -777,7 +787,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    // LLAMA_DSV41_HOST_GATHER=0: in-graph GET_ROWS on the host tables (one CPU split each) instead of
+    // gathering token and Engram rows in set_input (bitwise the same rows)
+    static const bool host_gather = dsv41_env_on("LLAMA_DSV41_HOST_GATHER");
+
+    ggml_tensor * inp = build_inp_embd(model.tok_embd, 1.0f, host_gather);
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
@@ -791,10 +805,22 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         if (!hparams.is_ple(il)) {
             continue;
         }
+        const ggml_tensor * tab = model.per_layer_tok_embd;
+        if (host_gather && llm_graph_host_rows_supported(tab) && tab->ne[0] == (int64_t) hparams.ple_head_dim) {
+            // host-resident table: rows are gathered in set_input
+            ggml_tensor * rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) hparams.ple_n_heads*tab->ne[0], n_tokens);
+            ggml_set_name(rows, ("engram_rows_in-" + std::to_string(il)).c_str());
+            ggml_set_input(rows);
+            inp41->engram_ids.push_back(rows);
+            inp41->engram_tab.push_back(tab);
+            engram_rows.push_back(rows);
+            continue;
+        }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
         ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
         ggml_set_input(ids);
         inp41->engram_ids.push_back(ids);
+        inp41->engram_tab.push_back(nullptr);
 
         ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
         rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
@@ -929,7 +955,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
