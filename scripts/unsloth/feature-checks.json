@@ -123,7 +123,7 @@
       ]
     },
     "deepseek41": {
-      "owner": "unslothai#298",
+      "owner": "unslothai#332",
       "checks": [
         { "kind": "arch",       "arch": "deepseek41" },
         { "kind": "backend-op", "op": "GET_ROWS", "params": "type=mxfp8" },
