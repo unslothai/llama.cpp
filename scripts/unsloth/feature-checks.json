@@ -142,6 +142,7 @@
     "unslothai#149": "once-per-process HIP warning when GGML_CUDA_ENABLE_UNIFIED_MEMORY is on (=0 parsing is upstream since ggml-org#30327); needs a HIP host, and no runner in the pipeline has one",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
     "unslothai#328": "Vulkan top_k on a view off minStorageBufferOffsetAlignment (backend draft sampling over an odd vocab); covered by test-backend-ops TOP_K row cases, which need a Vulkan device, and no runner in the pipeline has one",
+    "unslothai#330": "Metal NVFP4 mul_mv, mul_mv_ext, mul_mv_id, mul_mv_mma, mul_mm, mul_mm_id and get_rows kernels; covered by test-backend-ops MUL_MAT, MUL_MAT_ID and GET_ROWS with -p nvfp4, which need a Metal device, and no runner in the pipeline has one. A backend-op check here would pass on CUDA, which has NVFP4 upstream, and so cannot tell the pin apart",
     "unslothai#335": "backend sampling chains of inactive sequences are flagged as outputs so the graph allocator cannot alias their buffers; only observable with a block draft (DFlash / DSpark) on a multi-slot server, which needs a draft model and a GPU host the pipeline does not have",
     "unslothai#336": "new architecture; its graph, converter metadata and loader are covered by test-llama-archs, which the CPU gate already runs",
     "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
