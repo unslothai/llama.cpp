@@ -170,6 +170,24 @@ def repin_one(pin: dict, base: str, work: Path) -> dict:
         out["files"] = [f["file"] for f in res.get("resolved", [])]
         run(["git", *git_id, "commit", "-q", "--no-edit"], cwd=repo)
 
+    # As the nightly does after its merge loop: a pin and upstream that each added a ggml op both
+    # took static_assert(GGML_OP_COUNT == N) to N+1, and the merge kept one stale N+1. Repinning
+    # onto that would hand the nightly a pin that does not compile on its own.
+    rec = subprocess.run(
+        [sys.executable, str(HERE / "reconcile_op_count.py"), "--root", str(repo),
+         "--base-ref", f"refs/tags/{base}"],
+        capture_output=True, text=True,
+    )
+    if rec.returncode != 0:
+        out["action"] = "conflict"
+        out["note"] = "reconcile_op_count.py refused the merge: " + " / ".join(
+            (rec.stderr or rec.stdout).strip().splitlines()[-3:])
+        run(["git", "reset", "-q", "--hard", pin["sha"]], cwd=repo, check=False)
+        return out
+    if run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo).stdout.strip():
+        run(["git", *git_id, "commit", "-q", "-am", "Reconcile ggml op counts"], cwd=repo)
+        out["reconciled"] = [x for x in rec.stdout.splitlines() if x.startswith("fix  ")]
+
     new_sha = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
     out["action"] = "repin"
     out["new_sha"] = new_sha
@@ -191,6 +209,8 @@ def markdown(base: str, results: list[dict]) -> str:
             what = f"repinned `{r['sha'][:10]}` to `{r['new_sha'][:10]}`"
             if r["hunks"]:
                 what += f" ({len(r['hunks'])} add/add hunk(s) resolved)"
+            if r.get("reconciled"):
+                what += f" ({len(r['reconciled'])} ggml op-count line(s) reconciled)"
         elif r["action"] == "conflict":
             what = f"**conflict, not resolvable automatically** -- {r['note']}"
         elif r["action"] == "third-party":
