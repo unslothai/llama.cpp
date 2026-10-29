@@ -4278,6 +4278,15 @@ void llm_graph_context::build_sampling() const {
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
+            // flag the outputs of every chain, active or not: the graph keeps its topology across ubatches, so the
+            // allocator can reuse the tensor addresses of a graph built for a different set of active chains, and an
+            // output that was an intermediate there (freed and overwritten by the next chain) would alias here
+            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                if (t != nullptr && t != logits_seq) {
+                    ggml_set_output(t);
+                }
+            }
+
             if (data.sampled != nullptr) {
                 if (active) {
                     res->t_sampled[row] = data.sampled;
