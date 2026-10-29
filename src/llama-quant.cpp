@@ -333,6 +333,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
+    // limite: very small gates and dense connection mixers
+    if (arch == LLM_ARCH_LIMITE) {
+        quantize &= name.find("attn_gate.weight")    == std::string::npos;
+        quantize &= name.find("attn_ve_gate.weight") == std::string::npos;
+        quantize &= name.find("mudd_")               == std::string::npos;
+    }
+
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
@@ -344,6 +351,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 
     // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
     quantize &= name.find("conv2d_spatial.weight") == std::string::npos;
+
+    // do not quantize LFM3-Audio's encoder convs and codec, the codec output does not survive quantization
+    quantize &= name.rfind("a.conv1d.", 0) != 0;
+    quantize &= name.find("conv_dw") == std::string::npos;
+    quantize &= name.rfind("a.gen.wav.", 0) != 0;
 
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;

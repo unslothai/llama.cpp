@@ -34,6 +34,7 @@ enum llama_non_causal_type {
     LLAMA_NON_CAUSAL_TYPE_ALL      = 0, // all layers non-causal, SWA still applied (gemma 3, qwen-vl, ...)
     LLAMA_NON_CAUSAL_TYPE_SWA_ONLY = 1, // SWA layers non-causal, dense layers stay causal (gemma 4)
     LLAMA_NON_CAUSAL_TYPE_SWA_FULL = 2, // all layers non-causal, SWA not applied between tokens of the current ubatch (deepseek 4)
+    LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY = 3, // dense layers non-causal, SWA layers stay causal (lfm3 d1)
 };
 
 // M-RoPE: which input position slot feeds each RoPE section
@@ -236,6 +237,13 @@ struct llama_hparams {
     uint32_t n_hrm_h_cycles = 0;
     uint32_t n_hrm_l_cycles = 0;
     bool     hrm_prefix_lm = false;
+
+    // limite
+    float    f_xsa_eps = 0.0f;
+    std::array<float, 3> final_logit_sigmoid_capping = {}; // scale, shift, temperature
+    uint32_t n_mudd_ff   = 0;
+    uint32_t n_mudd_taps = 0;
+    std::array<int32_t, LLAMA_MAX_LAYERS> mudd_tap_idx; // [n_layer][n_mudd_taps], -1 = no mixing
 
     bool ssm_dt_b_c_rms = false;
 

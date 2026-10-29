@@ -332,6 +332,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_hrm_text(params);
         case LLM_ARCH_BEAM:
             return new llama_model_beam(params);
+        case LLM_ARCH_LIMITE:
+            return new llama_model_limite(params);
         case LLM_ARCH_COGVLM:
             return new llama_model_cogvlm(params);
         case LLM_ARCH_PANGU_EMBED:
@@ -2803,8 +2805,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
-    // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
+    // the non-causal LFM2 and LFM3 decision graphs read the whole prompt in one batch, nothing is kept
     if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
+        return nullptr;
+    }
+    if (arch == LLM_ARCH_LFM3 && !hparams.causal_attn) {
         return nullptr;
     }
 
@@ -3576,6 +3581,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
+        case LLM_ARCH_LIMITE:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope
