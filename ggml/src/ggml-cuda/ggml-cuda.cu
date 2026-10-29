@@ -190,6 +190,12 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
+            // said once: reports of this path going wrong come from users who did not know a front-end set the variable
+            GGML_LOG_WARN_ONCE("GGML_CUDA_ENABLE_UNIFIED_MEMORY is set, allocating device memory as managed. "
+                               "On integrated GPUs this draws host RAM instead of the device carve-out, which is "
+                               "usually slower and can reduce the largest model that will load. Unset the variable "
+                               "or set it to 0 to disable it.\n");
+
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
             // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
             (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
