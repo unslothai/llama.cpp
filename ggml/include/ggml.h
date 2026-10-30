@@ -381,6 +381,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -437,6 +439,7 @@ extern "C" {
         GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
         GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
         GGML_TYPE_COUNT   = 67,
+        GGML_TYPE_F8_E4M3 = 43,
     };
 
     // [TAG_GGML_PREC]
@@ -496,6 +499,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ1_XS   = 40, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_XXS  = 41, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_XXXS = 42, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
     };
 
     // available tensor operations:
