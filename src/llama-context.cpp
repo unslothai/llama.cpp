@@ -4785,3 +4785,7 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+void llama_sched_reserve(struct llama_context * ctx) {
+    ctx->sched_reserve();
+}

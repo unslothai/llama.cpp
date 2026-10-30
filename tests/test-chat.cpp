@@ -4407,10 +4407,9 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
 
     // DeepSeek V4.1: V4 behaviour, DSML tag names with a leading space
     {
-        auto tst = peg_tester("deepseek-v4.1-min",
-                              common_chat_templates_ptr(common_chat_templates_init(nullptr, DEEPSEEK_V4_1_MIN_TEMPLATE)),
-                              detailed_debug);
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja", detailed_debug);
 
+        // non-thinking mode: the generation prompt ends with </think>
         tst.test("Hello, world!\nWhat's up?")
             .enable_thinking(false)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
@@ -8081,6 +8080,69 @@ static void test_deepseek_v4_1_message_fields() {
     }
 }
 
+// DeepSeek V4.1 shipped template (models/templates): extra message keys (encoding.py golden cases 3 and 4) and "\n\n" around media markers
+static void test_deepseek_v4_1_shipped_template_fields() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1-Flash-1017.jinja");
+    auto render = [&](const char * messages_json, bool add_generation_prompt) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
+        inputs.add_generation_prompt = add_generation_prompt;
+        inputs.chat_template_kwargs["thinking_mode"] = "\"chat\"";
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+    };
+
+    assert_equals(std::string("<｜begin▁of▁sentence｜><｜User｜>q<｜Assistant｜></think><｜action｜>"),
+                  render(R"([{"role": "user", "content": "q", "task": "action"}])", false));
+
+    {
+        auto prompt = render(R"([
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b", "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]},
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "namespace": "ns", "function": {"name": "f", "arguments": {"x": 1}}}]}
+        ])", false);
+        assert_contains(prompt, "<｜System｜>b\n\n## Tools");
+        assert_contains(prompt, "{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}");
+        assert_contains(prompt, "<｜DSML｜ invoke name=\"ns::f\">");
+    }
+
+    assert_equals(std::string("<｜begin▁of▁sentence｜><｜User｜>a\n\n<__media__>\n\nb<｜Assistant｜></think>"),
+                  render(R"([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "media_marker", "text": "<__media__>"}, {"type": "text", "text": "b"}]}])", true));
+
+    // OpenAI reasoning_effort values never fail
+    for (const auto & [effort, budget] : std::vector<std::pair<std::string, std::string>>{
+             { "minimal", "50" }, { "low", "50" }, { "medium", "75" }, { "high", "75" }, { "xhigh", "100" }, { "max", "100" } }) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        assert_contains(prompt, "<｜System｜>Reasoning Effort: " + budget + " (range 1-100");
+    }
+
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(R"([
+            {"role": "system", "content": "s", "tools": [{"type": "function", "function": {"name": "get_time",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]},
+            {"role": "user", "content": "q"}
+        ])"));
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["thinking_mode"] = "\"chat\"";
+        inputs.enable_thinking = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        common_chat_session session(tmpls.get(), nullptr, inputs, {});
+        const auto & msg = session.finish(common_chat_input(std::string(
+            "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_time\">\n"
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>")));
+        assert_equals(size_t(1), msg.tool_calls.size());
+        assert_equals(std::string("get_time"), msg.tool_calls[0].name);
+        assert_equals(std::string("{\"city\":\"Tokyo\"}"), msg.tool_calls[0].arguments);
+    }
+}
+
 static void test_prompt_parts() {
     LOG_DBG("%s\n", __func__);
     const std::string tmpl_src =
@@ -8502,6 +8564,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_deepseek_v4_1_message_fields();
+        test_deepseek_v4_1_shipped_template_fields();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_prompt_parts();

@@ -432,6 +432,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
+        // MXFP8 (E4M3, E8M0 scale), gather-only. Fork-local, top of the reserved range so the
+        // count above the IQ1 types stays put; files written while it was 43 (before upstream
+        // took 43 for F8_E4M3) are told apart by their byte size when read (gguf.cpp).
+        GGML_TYPE_MXFP8   = 63,
         // IQ1_S's 8-element ternary codebook with a narrower index; see ggml-common.h.
         // 42..63 stay reserved for upstream (42 is already Q2_0), so fork-local types start
         // at 64 and a stock build rejects these files instead of misreading them.
