@@ -23,6 +23,7 @@ on:
       - scripts/unsloth/relocate_kpack.py
       - scripts/unsloth/slice_*.sh
       - scripts/unsloth/slim_source_archive.sh
+      - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
@@ -42,6 +43,7 @@ on:
       - scripts/unsloth/relocate_kpack.py
       - scripts/unsloth/slice_*.sh
       - scripts/unsloth/slim_source_archive.sh
+      - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
@@ -156,6 +158,7 @@ jobs:
                    scripts/unsloth/test_check_workflow_triggers.py \
                    scripts/unsloth/test_relocate_kpack.py \
                    scripts/unsloth/test_slim_source_archive.py \
+                   scripts/unsloth/test_link_bundle_copies.py \
                    scripts/unsloth/test_slicing.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
