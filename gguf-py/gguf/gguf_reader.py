@@ -335,7 +335,10 @@ class GGUFReader:
     def _build_tensors(self, start_offs: int, fields: list[ReaderField]) -> None:
         tensors = []
         tensor_names = set() # keep track of name to prevent duplicated tensors
-        for field in fields:
+        # MXFP8 was type 43 in this fork until upstream took 43 for F8_E4M3: read a type-43 tensor whose span
+        # (to the next tensor, or to the end of the file for the last one) fits MXFP8 and not F8_E4M3 as MXFP8
+        tensor_offs = [int(field.parts[5][0]) for field in fields] + [len(self.data) - start_offs]
+        for i_field, field in enumerate(fields):
             _name_len, name_data, _n_dims, dims, raw_dtype, offset_tensor = field.parts
             # check if there's any tensor having same name already in the list
             tensor_name = str(bytes(name_data), encoding = 'utf-8')
@@ -343,6 +346,14 @@ class GGUFReader:
                 raise ValueError(f'Found duplicated tensor with name {tensor_name}')
             tensor_names.add(tensor_name)
             ggml_type = GGMLQuantizationType(raw_dtype[0])
+            if ggml_type == GGMLQuantizationType.F8_E4M3 and int(dims[0]) % 32 == 0:
+                n_f8 = int(np.prod(dims.tolist(), dtype=object))
+                n_mx = n_f8 // 32 * 33
+                span = tensor_offs[i_field + 1] - tensor_offs[i_field]
+                last = i_field + 1 == len(fields)
+                pad_mx, pad_f8 = -(-n_mx // self.alignment) * self.alignment, -(-n_f8 // self.alignment) * self.alignment
+                if (span == pad_mx or (last and n_mx <= span <= pad_mx)) and span > pad_f8:
+                    ggml_type = GGMLQuantizationType.MXFP8
             # use Python ints: np.prod on uint64 wraps silently on overflow
             n_elems = 1
             for dim in dims.tolist():

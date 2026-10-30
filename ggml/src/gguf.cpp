@@ -368,6 +368,11 @@ struct gguf_reader {
         return data_offset;
     }
 
+    // bytes left between the current position and the end of the input
+    uint64_t remain() const {
+        return nbytes_remain;
+    }
+
     // position in the file where the GGUF data starts, alignment is relative to it, not to the file
     uint64_t start() const {
         return start_offset;
@@ -786,6 +791,41 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
     // store the current file offset - this is where the data section starts
     ctx->offset = gr.tell();
+
+    // MXFP8 was type 43 in this fork until upstream took 43 for F8_E4M3. Files written before that store the
+    // MXFP8 tensors as 43; tell them apart by the bytes the tensor occupies in the data section: the span to the
+    // next tensor (or, for the last one, to the end of the file) fits MXFP8 (33 bytes per 32 values) and not
+    // F8_E4M3 (1 byte per value). A real F8_E4M3 tensor always fills exactly its own padded size.
+    {
+        const uint64_t data_end = gr.remain(); // the reader sits at the start of the data section
+        for (size_t i = 0; i < ctx->info.size(); ++i) {
+            gguf_tensor_info & ti = ctx->info[i];
+            if (ti.t.type != GGML_TYPE_F8_E4M3 || ti.t.ne[0] % ggml_blck_size(GGML_TYPE_MXFP8) != 0) {
+                continue;
+            }
+            const int64_t n_rows = ggml_nrows(&ti.t);
+            const size_t  f8     = ggml_row_size(GGML_TYPE_F8_E4M3, ti.t.ne[0]) * n_rows;
+            const size_t  mx     = ggml_row_size(GGML_TYPE_MXFP8,   ti.t.ne[0]) * n_rows;
+            bool legacy;
+            if (i + 1 < ctx->info.size()) {
+                const uint64_t span = ctx->info[i + 1].offset - ti.offset;
+                legacy = ctx->info[i + 1].offset > ti.offset &&
+                    span == GGML_PAD(mx, ctx->alignment) && span != GGML_PAD(f8, ctx->alignment);
+            } else {
+                const uint64_t span = data_end > ti.offset ? data_end - ti.offset : 0;
+                legacy = span >= mx && span <= GGML_PAD(mx, ctx->alignment) && span > GGML_PAD(f8, ctx->alignment);
+            }
+            if (!legacy) {
+                continue;
+            }
+            ti.t.type  = GGML_TYPE_MXFP8;
+            ti.t.nb[0] = ggml_type_size(GGML_TYPE_MXFP8);
+            ti.t.nb[1] = ti.t.nb[0]*(ti.t.ne[0]/ggml_blck_size(GGML_TYPE_MXFP8));
+            for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                ti.t.nb[j] = ti.t.nb[j - 1]*ti.t.ne[j - 1];
+            }
+        }
+    }
 
     // compute the total size of the data section, taking into account the alignment
     {
