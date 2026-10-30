@@ -290,9 +290,8 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
     // in_proj: {n_embd, 2*d_inner} @ {n_embd, n_seq_tokens, n_seqs} => {2*d_inner, n_seq_tokens, n_seqs}
     ggml_tensor * zx = build_lora_mm(model.layers[il].ssm_in, cur);
     cb(zx, "mamba_in_proj", il);
-    // {8192, 5, 1, 1} -> {8192, 1, 5, 1}
-    zx = ggml_permute(ctx0, zx, 0, 2, 1, 3);
-    zx = ggml_cont_4d(ctx0, zx, head_dim * 2, n_heads, n_seq_tokens, n_seqs);
+    // {2*d_inner, n_seq_tokens, n_seqs} => {head_dim * 2, n_heads, n_seq_tokens, n_seqs}
+    zx = ggml_reshape_4d(ctx0, zx, head_dim * 2, n_heads, n_seq_tokens, n_seqs);
     cb(zx, "mamba_in_proj_out", il);
 
     // split into z and x
@@ -393,7 +392,7 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
                     ggml_view_1d(ctx0, y_ssm, n_heads * head_dim * d_state * n_seqs,
                                  n_heads * head_dim * n_seq_tokens * n_seqs * ggml_element_size(y_ssm)),
                     ggml_view_1d(ctx0, ssm_states_all, n_heads * head_dim * d_state * n_seqs,
-                                 kv_head * n_seqs * n_heads * head_dim * d_state * ggml_element_size(ssm_states_all))));
+                                 kv_head * n_heads * head_dim * d_state * ggml_element_size(ssm_states_all))));
         cb(ssm_states_all, "mamba_ssm_states", il);
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_heads, n_seq_tokens, n_seqs,
