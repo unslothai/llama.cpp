@@ -394,8 +394,8 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
         if (use_banded_flash(il)) {
             GGML_ASSERT(q->type == GGML_TYPE_F32);
-            auto * k_rot = is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot;
-            auto * v_rot = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
+            auto * k_rot = is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il];
+            auto * v_rot = is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il];
 
             if (k_rot) {
                 q = llama_mul_mat_hadamard(ctx0, q, k_rot);
