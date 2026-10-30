@@ -1295,6 +1295,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.fit_params_target.data(),
                 std::min(params.n_batch, 4096),
                 has_draft || spec_mtp ? &extra : nullptr,
+                params.speculative.draft.n_ubatch <= 0, // otherwise the draft keeps its own --spec-draft-n-ubatch
                 fit_log_level);
             if ((int32_t) cparams.n_ubatch != params.n_ubatch) {
                 params.n_ubatch = cparams.n_ubatch; // the draft context follows params.n_ubatch

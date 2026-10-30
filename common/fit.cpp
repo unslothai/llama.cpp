@@ -914,11 +914,11 @@ uint32_t common_fit_n_ubatch(
         const size_t * margins,
         uint32_t n_ubatch_max,
         const common_fit_extra_model * extra,
+        bool extra_follows,
         ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
 
-    // a draft context follows the ubatch of the main context unless it was given its own
-    const bool extra_follows = extra != nullptr && extra->cparams->n_ubatch == cparams->n_ubatch;
+    extra_follows = extra_follows && extra != nullptr;
 
     while (cparams->n_ubatch < n_ubatch_max) {
         const uint32_t n_ubatch_prev = cparams->n_ubatch;
