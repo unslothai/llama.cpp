@@ -142,9 +142,7 @@
     "unslothai#149": "once-per-process HIP warning when GGML_CUDA_ENABLE_UNIFIED_MEMORY is on (=0 parsing is upstream since ggml-org#30327); needs a HIP host, and no runner in the pipeline has one",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
     "unslothai#328": "Vulkan top_k on a view off minStorageBufferOffsetAlignment (backend draft sampling over an odd vocab); covered by test-backend-ops TOP_K row cases, which need a Vulkan device, and no runner in the pipeline has one",
-    "unslothai#330": "Metal NVFP4 mul_mv, mul_mv_ext, mul_mv_id, mul_mv_mma, mul_mm, mul_mm_id and get_rows kernels; covered by test-backend-ops MUL_MAT, MUL_MAT_ID and GET_ROWS with -p nvfp4, which need a Metal device, and no runner in the pipeline has one. A backend-op check here would pass on CUDA, which has NVFP4 upstream, and so cannot tell the pin apart",
     "unslothai#335": "backend sampling chains of inactive sequences are flagged as outputs so the graph allocator cannot alias their buffers; only observable with a block draft (DFlash / DSpark) on a multi-slot server, which needs a draft model and a GPU host the pipeline does not have",
-    "unslothai#336": "new architecture; its graph, converter metadata and loader are covered by test-llama-archs, which the CPU gate already runs",
     "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
     "unslothai#241": "CUDA graph cache keyed by shape with no count cap (tensor split keeps replaying its 2 * n_layers + 1 graphs per device), macOS row prefetch and the F16 glm5-next indexer cache under a quantized -ctk (the NextN draft graph is upstream since ggml-org#29928); the first needs a CUDA host (multi-GPU for the cap), the second has no observable output difference, the last needs a real GLM-5-Next model",
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model",
@@ -152,7 +150,6 @@
     "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
     "unslothai#287": "MUL_MAT_ID MMVQ batch cap keyed on the compiled arch; it only differs when a build lacks the device's own arch (a P100 on cuda12-legacy), needs a CUDA host, and no runner in the pipeline has one",
-    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe",
-    "ggml-org#31360": "Metal unary bf16 casts without constexpr, so the Metal library compiles with the macOS 14 / 15 Metal toolchains (ggml-org#31272); the shader is compiled at runtime by the host OS, which needs a macOS 14 / 15 Metal device, and no runner in the pipeline has one. Drop the pin once the base tag carries ggml-org#31360"
+    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe"
   }
 }

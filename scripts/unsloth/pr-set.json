@@ -19,9 +19,9 @@
   ],
   "prs": [
     "https://github.com/ggml-org/llama.cpp/pull/24423/commits/2e715c0639c6f07c57c943f8d5a7919953af8f7c",
-    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/3582c5ee05115892e4e96520be0026c3ceb9f829",
+    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/e9169362f0498e5bd38f2ec237be6bca867dd3f0",
     "https://github.com/unslothai/llama.cpp/pull/70/commits/883f2c9ba78f3847148454adf025da29385fff3e",
-    "https://github.com/unslothai/llama.cpp/pull/61/commits/97611a1ca7e9ba9ef83dd1c33896b287c4e625d8",
+    "https://github.com/unslothai/llama.cpp/pull/61/commits/722adcdff6341cd4befa07ca49486db17d8f6f39",
     "https://github.com/unslothai/llama.cpp/pull/95/commits/496a8a646f19b244b5e2eaf4cf64f920ed31c1a3",
     "https://github.com/unslothai/llama.cpp/pull/158/commits/fb9b9462041ad58cde9a274e7984c3c6fb01b279",
     "https://github.com/unslothai/llama.cpp/pull/157/commits/6c6da89266ba7839d825c9997782af4f4d26b81b",
@@ -33,18 +33,15 @@
     "https://github.com/unslothai/llama.cpp/pull/243/commits/30a106edde47fa4f135e5770ce4e7b6e1bfb7fb9",
     "https://github.com/unslothai/llama.cpp/pull/251/commits/44e8107537f3eb93875becf5238f990ae1aff54f",
     "https://github.com/unslothai/llama.cpp/pull/270/commits/7968eda613e427ad5ccbab61df43246a9a82c53a",
-    "https://github.com/unslothai/llama.cpp/pull/264/commits/02aa36940eef3387220336283c99e7449febaf6f",
+    "https://github.com/unslothai/llama.cpp/pull/264/commits/ece77054f77b106a7075899758fc3a40ecf80315",
     "https://github.com/unslothai/llama.cpp/pull/266/commits/af3b2bc3201ecf75cf7fd1fbb1f76e264920809d",
     "https://github.com/unslothai/llama.cpp/pull/283/commits/644ca7d817b8a591c61dee2e17778b43b1ecf3eb",
     "https://github.com/unslothai/llama.cpp/pull/287/commits/22fb037b1b84513e141d724bb9403ecb48925e32",
-    "https://github.com/unslothai/llama.cpp/pull/332/commits/80f0f5a8e4676d8a83c04516c97b2fca1ca3cc52",
+    "https://github.com/unslothai/llama.cpp/pull/332/commits/3203729909875eebcd177d046bffbafae2d044e9",
     "https://github.com/unslothai/llama.cpp/pull/304/commits/9bdbff40023030692111a2eed05b9452ba2250b5",
     "https://github.com/unslothai/llama.cpp/pull/311/commits/819e95b316743cd2ed7bb54b68f52f5ca1ea820a",
     "https://github.com/unslothai/llama.cpp/pull/320/commits/822be707b23345b291f3042defa7508aa813cc4b",
     "https://github.com/unslothai/llama.cpp/pull/328/commits/02428e283cb078eb320deeda71ff599278bd4927",
-    "https://github.com/unslothai/llama.cpp/pull/330/commits/3adf93fa5ae019c153c8c1ace3a698189b7db41d",
-    "https://github.com/unslothai/llama.cpp/pull/335/commits/b240c56069c24a87272f76be2678d04400d39ef8",
-    "https://github.com/unslothai/llama.cpp/pull/336/commits/88a70c8949890c579a2b389ba9cc5079cdde9230",
-    "https://github.com/ggml-org/llama.cpp/pull/31360/commits/97d62c1dbad7d9ee1e1f465941a3d334ee97b62f"
+    "https://github.com/unslothai/llama.cpp/pull/335/commits/b240c56069c24a87272f76be2678d04400d39ef8"
   ]
 }
