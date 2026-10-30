@@ -135,6 +135,12 @@
       "checks": [
         { "kind": "arch", "arch": "minimax-m3" }
       ]
+    },
+    "mistral-large4": {
+      "owner": "unslothai#336",
+      "checks": [
+        { "kind": "arch", "arch": "mistral-large4" }
+      ]
     }
   },
   "unchecked": {
@@ -144,7 +150,6 @@
     "unslothai#328": "Vulkan top_k on a view off minStorageBufferOffsetAlignment (backend draft sampling over an odd vocab); covered by test-backend-ops TOP_K row cases, which need a Vulkan device, and no runner in the pipeline has one",
     "unslothai#330": "Metal NVFP4 mul_mv, mul_mv_ext, mul_mv_id, mul_mv_mma, mul_mm, mul_mm_id and get_rows kernels; covered by test-backend-ops MUL_MAT, MUL_MAT_ID and GET_ROWS with -p nvfp4, which need a Metal device, and no runner in the pipeline has one. A backend-op check here would pass on CUDA, which has NVFP4 upstream, and so cannot tell the pin apart",
     "unslothai#335": "backend sampling chains of inactive sequences are flagged as outputs so the graph allocator cannot alias their buffers; only observable with a block draft (DFlash / DSpark) on a multi-slot server, which needs a draft model and a GPU host the pipeline does not have",
-    "unslothai#336": "new architecture; its graph, converter metadata and loader are covered by test-llama-archs, which the CPU gate already runs",
     "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
     "unslothai#241": "CUDA graph cache keyed by shape with no count cap (tensor split keeps replaying its 2 * n_layers + 1 graphs per device), macOS row prefetch and the F16 glm5-next indexer cache under a quantized -ctk (the NextN draft graph is upstream since ggml-org#29928); the first needs a CUDA host (multi-GPU for the cap), the second has no observable output difference, the last needs a real GLM-5-Next model",
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model",
