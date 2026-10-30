@@ -234,20 +234,34 @@ void ggml_cuda_mul_mat_q(
 
     int J_best        = 0;
     int nthreads_best = 0;
-    {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
 
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        const int64_t ncols_expert = (ne12*n_expert_used + ne02 - 1) / ne02;
+
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_expert, fallback, cc, smpbo, prec_src1, &nthreads_best);
+        } else {
+            J_best = ggml_cuda_mmq_get_J_best(src0->type, ne12, fallback, cc, smpbo, prec_src1, &nthreads_best);
+
+            // prefer the tile width for the average expert if it gets the compact MoE tiling
+            int nthreads_expert = 0;
+            const int J_expert  = ggml_cuda_mmq_get_J_best(src0->type, ncols_expert, fallback, cc, smpbo, prec_src1, &nthreads_expert);
+
+            // for up to 16 tokens the expert tiles are at most 2x narrower than the dense ones: the compact tiling was
+            // measured slower there on Blackwell, and on T4/L4 for at most 1 column per 16 experts, keep the dense tiling
+            const bool compact_gain = !(ne12 <= 16 &&
+                ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL) || ne12*n_expert_used*16 <= ne02));
+            if (J_expert > 0 && compact_gain &&
+                    mmq_moe_compact_ntx(ne12*n_expert_used, ne12, ne02, J_expert) > 0) {
+                J_best        = J_expert;
+                nthreads_best = nthreads_expert;
             }
         }
-
-        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+    } else {
+        J_best = ggml_cuda_mmq_get_J_best(src0->type, ne11, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -321,7 +335,7 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
