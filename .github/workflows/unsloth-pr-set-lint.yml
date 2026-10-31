@@ -120,7 +120,7 @@ jobs:
             # false-fail a legitimate giant PR.
             if [ "$COMMITS" -gt 250 ]; then
               echo "::notice::${SRC}#${NUM} has ${COMMITS} commits (over the API listing cap); skipping pin membership check"
-            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$PIN"; then
+            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -x "$PIN" > /dev/null; then
               echo "::error file=$FILE::pinned commit ${PIN} is not a commit of ${SRC}#${NUM}"
               fail=1
               continue
