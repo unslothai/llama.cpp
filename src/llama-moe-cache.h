@@ -71,10 +71,9 @@ public:
     bool seed_check() const;
     void seed_verify();
 
-    // routing of an earlier large ubatch of the prompt, used to seed when the seeding ubatch copies all experts without reading its ids (counts[e] = tokens routed to e)
+    // routing of an earlier large ubatch (of this prompt, else of the last one), used to seed when the seeding ubatch copies all experts without reading its ids (counts[e] = tokens routed to e)
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
-    void clear_seed_counts();
     bool has_seed_counts() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
