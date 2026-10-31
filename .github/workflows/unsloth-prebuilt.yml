@@ -927,6 +927,7 @@ jobs:
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
           SHA='${{ needs.resolve.outputs.commit }}'
+          bash tooling/scripts/unsloth/slim_source_archive.sh "dist/llama.cpp-source-${TAG}.tar.gz"
           cp "dist/llama.cpp-source-${TAG}.tar.gz" "dist/llama.cpp-source-commit-${SHA}.tar.gz"
 
       - name: Generate manifest + sha256 index

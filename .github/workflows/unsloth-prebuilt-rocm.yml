@@ -1253,6 +1253,14 @@ jobs:
     - name: Ship the rocBLAS kernel packs
       run: python3 kpack-tooling/scripts/unsloth/relocate_kpack.py --bundle llama.cpp/build/bin --kpack-src /opt/rocm/.kpack --archs "$MAPPED_TARGET"
 
+    # Nothing links or dlopens these; the dependency check below fails if that changes.
+    - name: Drop unused compiler libraries
+      run: rm -f llama.cpp/build/bin/libclang-cpp.so* llama.cpp/build/bin/libLLVM.so*
+
+    # After every rewrite of the libraries, so the links can only point at finished bytes.
+    - name: Link identical library copies
+      run: bash kpack-tooling/scripts/unsloth/link_bundle_copies.sh llama.cpp/build/bin
+
     # Reject missing dependencies and runner libraries that mask an incomplete
     # bundle. Only glibc, libstdc++ and libgcc_s may resolve outside the bundle.
     - name: Check the bundle resolves its own dependencies
