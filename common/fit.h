@@ -37,6 +37,18 @@ common_params_fit_status common_fit_params(
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// to call after common_fit_params: grows cparams->n_ubatch in powers of 2 up to n_ubatch_max while the projected memory use
+// stays within the margins on every device, without changing the weights or the context; returns the new n_ubatch
+uint32_t common_fit_n_ubatch(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+                       const size_t * margins,      // margins of memory to leave per device in bytes
+                           uint32_t   n_ubatch_max, // largest n_ubatch to try
+      const common_fit_extra_model * extra,         // model to fit alongside the main one, nullptr if there is none
+                               bool   extra_follows, // the extra context has no n_ubatch of its own and grows with the main one
+                     ggml_log_level   log_level);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

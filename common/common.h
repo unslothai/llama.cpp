@@ -457,6 +457,7 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool    n_ubatch_set          = false; // -ub was given; without it --fit grows the ubatch of MoE models in free memory
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -483,6 +484,7 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+    bool    fit_ubatch         = true;  // whether --fit may raise n_ubatch of MoE models into leftover device memory
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
@@ -986,6 +988,7 @@ struct common_gguf_info {
     common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
     uint32_t             n_ctx_train   = 0;                            // 0 if unknown
     bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
+    uint32_t             n_expert      = 0;                            // 0 if unknown or not a MoE model
 };
 
 common_gguf_info common_get_gguf_info(const std::string & fname);

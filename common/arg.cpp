@@ -1677,9 +1677,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
-        string_format("physical maximum batch size (default: %d)", params.n_ubatch),
+        string_format("physical maximum batch size (default: %d, MoE models with --fit: up to n_batch (max 4096) in free memory)", params.n_ubatch),
         [](common_params & params, int value) {
-            params.n_ubatch = value;
+            params.n_ubatch     = value;
+            params.n_ubatch_set = true;
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
@@ -2938,6 +2939,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fit_params_min_ctx = value;
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
+    add_opt(common_arg(
+        { "-fitu", "--fit-ubatch" }, "[on|off]",
+        string_format("whether --fit may raise the ubatch size of MoE models into leftover device memory ('on' or 'off', default: '%s')", params.fit_ubatch ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_ubatch = true;
+            } else if (is_falsey(value)) {
+                params.fit_ubatch = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-ubatch: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_UBATCH"));
     add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
