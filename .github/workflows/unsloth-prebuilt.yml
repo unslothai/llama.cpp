@@ -260,7 +260,7 @@ jobs:
             # the API; past that, skip rather than false-fail.
             if [ "$N_COMMITS" -gt 250 ]; then
               echo "note: ${SRC}#${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
-            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
+            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -x "$SHA" > /dev/null; then
               echo "refusing ${SRC}#${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away); fix the pin in scripts/unsloth/pr-set.json" >&2
               exit 1
             fi
