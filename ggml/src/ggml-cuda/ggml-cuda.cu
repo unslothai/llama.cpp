@@ -6108,7 +6108,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if defined(GGML_USE_HIP) || (!defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080)
 // host memory that device can read in stream order: registered by ggml_backend_cuda_host_map, or pinned by someone else (which
 // ggml_cuda_host_map maps without registering it), for that device or for all of them (portable)
 static bool ggml_cuda_host_is_mapped(int device, const void * ptr, size_t size) {
@@ -6135,8 +6135,12 @@ static bool ggml_cuda_host_is_mapped(int device, const void * ptr, size_t size) 
 #endif
 
 // device copies of a copy-only instance (the scheduler copy queue): the kernel, except copy engines on compute capability 10.x where they measured faster (GGML_CUDA_COPY_QUEUE_KERNEL=0/1 overrides)
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if defined(GGML_USE_HIP) || (!defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080)
 static bool ggml_cuda_copy_queue_kernel(int device) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(device);
+    return true;
+#else
     static const std::vector<bool> kernel = [] {
         const char * env = getenv("GGML_CUDA_COPY_QUEUE_KERNEL");
         std::vector<bool> res(ggml_cuda_info().device_count, true);
@@ -6149,13 +6153,14 @@ static bool ggml_cuda_copy_queue_kernel(int device) {
         return res;
     }();
     return device >= 0 && device < (int) kernel.size() ? kernel[device] : true;
+#endif
 }
 #endif
 
-// many small copies in two calls: uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8), device copies with one kernel
+// many small copies in two calls: uploads as one cudaMemcpyBatchAsync (CUDA >= 12.8, HIP: one async copy each), device copies with one kernel
 // GGML_CUDA_COPY_REGIONS_KERNEL=0 puts the device copies in the batch, GGML_CUDA_COPY_BATCH=0 disables both
 static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+#if !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080)
     GGML_UNUSED(backend);
     GGML_UNUSED(regions);
     GGML_UNUSED(n_regions);
@@ -6223,16 +6228,21 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         }
     }
 
-    cudaMemcpyAttributes attr = {};
-    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attr.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
-    size_t attr_idx = 0;
-
     ggml_cuda_set_device(cuda_ctx->device);
     if (!d2d_dsts.empty()) {
         ggml_cuda_copy_regions_d2d(cuda_ctx->stream(), ggml_cuda_info().devices[cuda_ctx->device].nsm,
             d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
     }
+#if defined(GGML_USE_HIP)
+    for (size_t i = 0; i < dsts.size(); i++) {
+        CUDA_CHECK(hipMemcpyAsync(dsts[i], srcs[i], sizes[i], hipMemcpyDefault, cuda_ctx->stream()));
+    }
+#else
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attr_idx = 0;
+
     if (!dsts.empty()) {
 #if CUDART_VERSION >= 13000
         CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attr, &attr_idx, 1, cuda_ctx->stream()));
@@ -6241,6 +6251,7 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), dsts.size(), &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
 #endif
     }
+#endif
     return true;
 #endif
 }
