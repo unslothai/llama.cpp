@@ -401,7 +401,7 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
-    // MoE cache lookups of the context while the request ran, other slots included
+    // MoE cache lookups while the request ran, left at 0 when another slot shared a decode
     uint64_t n_moe_cache_hits   = 0;
     uint64_t n_moe_cache_misses = 0;
 

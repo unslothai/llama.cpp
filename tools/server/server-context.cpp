@@ -365,6 +365,7 @@ struct server_slot {
     server_slot_stats stats;
 
     llama_perf_context_data perf_start = {};
+    bool perf_shared = false; // another slot decoded in the same batch, so the context counters are not ours alone
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -375,7 +376,7 @@ struct server_slot {
 
     server_slot_stats get_stats() const {
         server_slot_stats res = stats;
-        if (res.is_set()) {
+        if (res.is_set() && !perf_shared) {
             const auto perf = llama_perf_context(ctx_tgt);
             res.n_moe_cache_hits   = perf.n_moe_cache_hits   - perf_start.n_moe_cache_hits;
             res.n_moe_cache_misses = perf.n_moe_cache_misses - perf_start.n_moe_cache_misses;
@@ -3513,6 +3514,7 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
                         slot.perf_start = llama_perf_context(ctx_tgt);
+                        slot.perf_shared = false;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -4172,6 +4174,18 @@ private:
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+        }
+
+        {
+            int n_active = 0;
+            for (const auto & slot : slots) {
+                n_active += slot.is_processing();
+            }
+            if (n_active > 1) {
+                for (auto & slot : slots) {
+                    slot.perf_shared |= slot.is_processing();
+                }
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
