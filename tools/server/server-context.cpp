@@ -2870,7 +2870,7 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
-                    res->perf                = llama_perf_context(ctx_tgt);
+                    res->perf                = perf_last;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3125,6 +3125,9 @@ private:
             }
         }
     }
+
+    // perf counters as of the last decode, /metrics can run on the queue worker while a decode updates the live ones
+    llama_perf_context_data perf_last = {};
 
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
@@ -4197,6 +4200,8 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        perf_last = llama_perf_context(ctx_tgt);
 
         if (ret != 0) {
             {
