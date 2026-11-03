@@ -62,6 +62,9 @@ def test_metrics_prometheus_format():
         "llamacpp:spec_decode_num_draft_tokens_total",
         "llamacpp:spec_decode_num_accepted_tokens_total",
         "llamacpp:spec_decode_num_drafts_total",
+        "llamacpp:moe_cache_hits_total",
+        "llamacpp:moe_cache_misses_total",
+        "llamacpp:moe_cache_uploaded_bytes_total",
     ]
     expected_gauges = [
         "llamacpp:prompt_tokens_seconds",

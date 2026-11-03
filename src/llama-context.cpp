@@ -3575,6 +3575,13 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.n_eval      = std::max(1, n_eval);
     data.n_reused    = std::max(0, n_reused);
 
+    if (moe_cache) {
+        const auto st = moe_cache->get_stats();
+        data.n_moe_cache_hits   = st.hits   - moe_stats_base.hits;
+        data.n_moe_cache_misses = st.misses - moe_stats_base.misses;
+        data.moe_cache_bytes    = st.bytes  - moe_stats_base.bytes;
+    }
+
     return data;
 }
 
@@ -3583,6 +3590,10 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+
+    if (moe_cache) {
+        moe_stats_base = moe_cache->get_stats();
+    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -4548,6 +4559,12 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    const uint64_t n_moe = data.n_moe_cache_hits + data.n_moe_cache_misses;
+    if (n_moe > 0) {
+        LLAMA_LOG_INFO("%s:   MoE cache hits = %10.2f %% (%" PRIu64 " / %" PRIu64 " experts, %.2f MiB uploaded)\n",
+                __func__, 100.0*data.n_moe_cache_hits/n_moe, data.n_moe_cache_hits, n_moe, data.moe_cache_bytes/1024.0/1024.0);
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

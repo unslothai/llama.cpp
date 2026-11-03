@@ -625,6 +625,12 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
     return pimpl->copy_experts(backend, w, dst, e, last);
 }
 
+llama_moe_cache_stats llama_moe_cache::get_stats() const {
+    const auto & s = pimpl->stats_small;
+    const auto & l = pimpl->stats_large;
+    return { s.hits + l.hits, s.misses + l.misses, s.bytes + l.bytes };
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
     for (const auto & d : pimpl->devices) {

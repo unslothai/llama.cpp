@@ -1685,6 +1685,11 @@ extern "C" {
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+
+        // MoE cache lookups (--moe-cache-mib), 0 if the cache is not used
+        uint64_t n_moe_cache_hits;
+        uint64_t n_moe_cache_misses;
+        uint64_t moe_cache_bytes;    // uploaded on misses
     };
 
     struct llama_perf_sampler_data {

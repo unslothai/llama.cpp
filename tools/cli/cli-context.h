@@ -14,6 +14,9 @@
 struct cli_timings {
     double prompt_per_second    = 0.0;
     double predicted_per_second = 0.0;
+
+    uint64_t moe_cache_hits   = 0;
+    uint64_t moe_cache_misses = 0;
 };
 
 struct cli_context_impl;

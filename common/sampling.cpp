@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -589,6 +590,12 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
         LOG_INF("%s: unaccounted time = %10.2f ms / %5.1f %%      (total - sampling - prompt eval - eval) / (total)\n", __func__, t_unacc_ms, t_unacc_pc);
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+        const uint64_t n_moe = data.n_moe_cache_hits + data.n_moe_cache_misses;
+        if (n_moe > 0) {
+            LOG_INF("%s:   MoE cache hits = %10.2f %% (%" PRIu64 " / %" PRIu64 " experts, %.2f MiB uploaded)\n",
+                    __func__, 100.0*data.n_moe_cache_hits/n_moe, data.n_moe_cache_hits, n_moe, data.moe_cache_bytes/1024.0/1024.0);
+        }
 
         common_memory_breakdown_print(ctx);
     }
