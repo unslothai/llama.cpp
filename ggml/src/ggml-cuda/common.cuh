@@ -1465,14 +1465,20 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from graph key to cuda_graph - allows multiple graphs per context when the
+    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
+    // split is called with different tensor shapes (e.g. a speculative verify batch)
+    // a cuda graph instance is only valid for the shapes it captured, so a caller that
+    // alternates shapes needs one instance per shape to stay on the graph path. the map is
+    // bounded only by the time based sweep below, as upstream does: tensor split mode alone
+    // needs about 2 * n_layers + 1 graphs per device and shape, so any count cap small enough
+    // to matter evicts graphs that are still in use and re-captures them on every token
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr, int64_t time_now = ggml_time_us()) {
+    ggml_cuda_graph * cuda_graph(uint64_t graph_key, int64_t time_now = ggml_time_us()) {
         // Give all cached graphs 10s to be reused after an idle period, without updating each graph.
         if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
             next_graph_eviction_time = time_now + 10'000'000;
@@ -1483,7 +1489,7 @@ struct ggml_backend_cuda_context {
         if (time_now >= next_graph_eviction_time) {
             next_graph_eviction_time = time_now + 5'000'000;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (it->first != first_node_ptr && time_now - it->second->last_used_time >= 10'000'000) {
+                if (it->first != graph_key && time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1491,9 +1497,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
