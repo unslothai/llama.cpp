@@ -11,6 +11,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <memory>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <vector>
@@ -79,6 +81,26 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (ctx == nullptr) {
         llama_model_free(model);
         throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    // a draft measured next to its target (ctx_other set by common_fit_draft_target): the speculative decoder turns on
+    // nextn embeddings for DFlash/DSpark/Eagle3 drafts after creating them and installs the backend samplers only on
+    // those (not on DFlash2 / LiliCorr), so do the same and reserve again: the breakdown below then covers the compute
+    // graph the draft actually runs with
+    if (cparams->ctx_other != nullptr) {
+        const bool spec_draft = llama_model_target_layer_ids_n(model) > 0;
+        char buf[32] = {};
+        const bool is_lilicorr = llama_model_meta_val_str(model, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0;
+        const bool is_dflash2  = llama_model_dflash_selector_top_k(model) > 0;
+        if (!spec_draft || is_dflash2 || is_lilicorr) {
+            for (size_t i = 0; i < cparams->n_samplers; i++) {
+                llama_set_sampler(ctx, cparams->samplers[i].seq_id, nullptr);
+            }
+        }
+        if (spec_draft) {
+            llama_set_embeddings_nextn(ctx, true, /*masked*/ !is_dflash2 && !is_lilicorr);
+        }
+        llama_sched_reserve(ctx);
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -257,6 +279,67 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// drafts that borrow token_embd/output from their target (DFlash, DSpark, Eagle3) cannot create a context on their
+// own: while measuring such a draft, give it an allocation-free target context as ctx_other (its memory is counted with
+// the main model, not here) and the backend top-k samplers the speculative decoder installs on the draft
+struct common_fit_draft_target {
+    llama_context_params * cparams_dft;
+    llama_context_params   cparams_dft_orig;
+    llama_model   * model = nullptr;
+    llama_context * ctx   = nullptr;
+    std::vector<llama_sampler *>         chains;
+    std::vector<llama_sampler_seq_config> configs;
+
+    common_fit_draft_target(const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
+            llama_context_params * cparams_dft, bool backend_sampling, ggml_log_level log_level)
+        : cparams_dft(cparams_dft), cparams_dft_orig(*cparams_dft) {
+        struct user_data_t {
+            ggml_log_callback callback;
+            void * user_data;
+            ggml_log_level min_level;
+        } ud;
+        llama_log_get(&ud.callback, &ud.user_data);
+        ud.min_level = log_level;
+        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+            const user_data_t * ud = (const user_data_t *) user_data;
+            ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+        }, &ud);
+
+        llama_model_params mparams_copy = *mparams;
+        mparams_copy.no_alloc  = true;
+        mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+        model = llama_model_load_from_file(path_model, mparams_copy);
+        if (model != nullptr) {
+            ctx = llama_init_from_model(model, *cparams);
+        }
+        llama_log_set(ud.callback, ud.user_data);
+        if (ctx == nullptr) {
+            return; // the draft is measured on its own, as before
+        }
+
+        cparams_dft->ctx_other = ctx;
+        if (backend_sampling && cparams_dft->n_samplers == 0) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) std::max<uint32_t>(1, cparams_dft->n_seq_max); ++seq_id) {
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                chains.push_back(chain);
+                configs.push_back({ seq_id, chain });
+            }
+            cparams_dft->samplers   = configs.data();
+            cparams_dft->n_samplers = configs.size();
+        }
+    }
+
+    ~common_fit_draft_target() {
+        *cparams_dft = cparams_dft_orig;
+        for (llama_sampler * chain : chains) {
+            llama_sampler_free(chain);
+        }
+        llama_free(ctx);
+        llama_model_free(model);
+    }
+};
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -298,6 +381,12 @@ static void common_params_fit_impl(
 
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
+
+            std::unique_ptr<common_fit_draft_target> draft_target;
+            if (!extra->shares_model) {
+                draft_target.reset(new common_fit_draft_target(
+                    path_model, mparams, cparams, extra->cparams, extra->backend_sampling, log_level));
+            }
 
             dmds_t measured;
             try {

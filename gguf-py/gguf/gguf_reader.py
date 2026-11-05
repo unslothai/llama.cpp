@@ -30,6 +30,7 @@ from gguf.constants import (
     GGMLQuantizationType,
     GGUFValueType,
     GGUFEndian,
+    LlamaFileType,
 )
 
 # limits mirroring ggml/src/gguf.cpp (not part of gguf.h)
@@ -332,10 +333,63 @@ class GGUFReader:
             tensor_fields.append(field)
         return offs, tensor_fields
 
+    def _legacy_mxfp8(self, start_offs: int, fields: list[ReaderField]) -> set[int]:
+        # MXFP8 was type 43 in this fork until upstream took 43 for F8_E4M3, so files written before that store their
+        # MXFP8 tensors as 43. Tell them apart by the bytes a type-43 tensor occupies in the data section: the span to
+        # the next tensor in data order (or to the end of the file for the last one) fits MXFP8 (33 bytes per 32
+        # values) or F8_E4M3 (1 byte per value). Small tensors at an alignment above 32 can pad to the same span either
+        # way; the rest of the file decides those: a type-43 tensor that fits only one of the two, a type-63 (MXFP8)
+        # tensor or general.file_type MOSTLY_F8_E4M3. With nothing to go on, the file is refused instead of guessed.
+        # Returns the indices of the tensors to read as MXFP8.
+        align = int(self.alignment)
+        offs = sorted({int(field.parts[5][0]) for field in fields})
+        next_offs = dict(zip(offs, offs[1:] + [None]))
+        data_size = len(self.data) - start_offs
+        fits: dict[int, str | None] = {}
+        for i_field, field in enumerate(fields):
+            dims, raw_dtype, offset_tensor = field.parts[3], field.parts[4], field.parts[5]
+            if int(raw_dtype[0]) != GGMLQuantizationType.F8_E4M3:
+                continue
+            if int(dims[0]) % 32 != 0:
+                fits[i_field] = 'f8'
+                continue
+            n_f8 = 1
+            for dim in dims.tolist():
+                n_f8 *= int(dim)
+            n_mx = n_f8 // 32 * 33
+            pad_f8, pad_mx = -(-n_f8 // align) * align, -(-n_mx // align) * align
+            off = int(offset_tensor[0])
+            if next_offs[off] is not None:
+                span = next_offs[off] - off
+                fits_mx, fits_f8 = span == pad_mx, span == pad_f8
+            else:
+                span = data_size - off
+                fits_mx, fits_f8 = n_mx <= span <= pad_mx, n_f8 <= span <= pad_f8
+            fits[i_field] = 'both' if fits_mx and fits_f8 else 'mx' if fits_mx else 'f8' if fits_f8 else None
+        file_type = self.fields.get('general.file_type')
+        new_ids = ('f8' in fits.values()
+                   or any(int(field.parts[4][0]) == GGMLQuantizationType.MXFP8 for field in fields)
+                   or (file_type is not None and int(file_type.parts[-1][0]) == LlamaFileType.MOSTLY_F8_E4M3))
+        old_ids = 'mx' in fits.values()
+        legacy = set()
+        for i_field, fit in fits.items():
+            if fit == 'both':
+                if old_ids == new_ids:
+                    name = str(bytes(fields[i_field].parts[1]), encoding = 'utf-8')
+                    raise ValueError(
+                        f'Tensor {name} has type 43 and its size fits both MXFP8 (type 43 in files this fork wrote '
+                        f'before MXFP8 moved to type 63) and F8_E4M3 at alignment {align}, and nothing else in the '
+                        'file tells which one it is; convert the model again')
+                fit = 'mx' if old_ids else 'f8'
+            if fit == 'mx':
+                legacy.add(i_field)
+        return legacy
+
     def _build_tensors(self, start_offs: int, fields: list[ReaderField]) -> None:
         tensors = []
         tensor_names = set() # keep track of name to prevent duplicated tensors
-        for field in fields:
+        legacy_mxfp8 = self._legacy_mxfp8(start_offs, fields)
+        for i_field, field in enumerate(fields):
             _name_len, name_data, _n_dims, dims, raw_dtype, offset_tensor = field.parts
             # check if there's any tensor having same name already in the list
             tensor_name = str(bytes(name_data), encoding = 'utf-8')
@@ -343,6 +397,8 @@ class GGUFReader:
                 raise ValueError(f'Found duplicated tensor with name {tensor_name}')
             tensor_names.add(tensor_name)
             ggml_type = GGMLQuantizationType(raw_dtype[0])
+            if i_field in legacy_mxfp8:
+                ggml_type = GGMLQuantizationType.MXFP8
             # use Python ints: np.prod on uint64 wraps silently on overflow
             n_elems = 1
             for dim in dims.tolist():
