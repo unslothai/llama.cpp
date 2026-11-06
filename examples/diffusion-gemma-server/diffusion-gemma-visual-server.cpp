@@ -328,9 +328,14 @@ int main(int argc, char ** argv) {
         for (int b = 0; b < std::max(1, n_blocks); b++) {
             const int32_t prefix_len = (int32_t) prefix.size();
             const int32_t max_length = prefix_len + (int32_t) canvas_length;
-            if (max_length > MAXTOK) {
+            // Without the prompt-KV store (multi-GPU split), every step encodes [prompt|canvas]
+            // in one ubatch, so the hard limit is n_ubatch, not MAXTOK (#16925).
+            const int32_t budget = base.kv_cache
+                ? MAXTOK
+                : std::min(MAXTOK, (int32_t) llama_n_ubatch(ctx));
+            if (max_length > budget) {
                 // needed vs budget, so the client can render a readable "conversation too long" message.
-                printf("ERR toolong %d %d\n", (int) max_length, MAXTOK); fflush(stdout);
+                printf("ERR toolong %d %d\n", (int) max_length, (int) budget); fflush(stdout);
                 break;
             }
 
