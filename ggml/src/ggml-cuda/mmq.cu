@@ -328,7 +328,7 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
             ne02, ne12, n_expert_used, ne11, J_best, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }

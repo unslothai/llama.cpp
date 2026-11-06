@@ -86,7 +86,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
         GGML_ASSERT(sis1 > 0);
 
-        ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), tile_spec_dev.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), tile_spec_dev.get(),
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), 16,
             si1, sis1, /*write_inverse =*/ false, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
