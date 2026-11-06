@@ -18,8 +18,8 @@
     "tag + pins), so keep its pin listed until the change lands upstream."
   ],
   "prs": [
-    "https://github.com/ggml-org/llama.cpp/pull/24423/commits/40faaef95f074ab84dba2efa73d7968c39b76ce1",
-    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/3258a1d5aeb493e1d992dd027245056179adf738",
+    "https://github.com/ggml-org/llama.cpp/pull/24423/commits/6745aa612170d2c060571e4197f71f5e6cb076a2",
+    "https://github.com/ggml-org/llama.cpp/pull/25731/commits/f4b56133ae08bf17c4a21cae1482dd33817740e4",
     "https://github.com/unslothai/llama.cpp/pull/70/commits/883f2c9ba78f3847148454adf025da29385fff3e",
     "https://github.com/unslothai/llama.cpp/pull/61/commits/722adcdff6341cd4befa07ca49486db17d8f6f39",
     "https://github.com/unslothai/llama.cpp/pull/95/commits/496a8a646f19b244b5e2eaf4cf64f920ed31c1a3",
@@ -36,7 +36,6 @@
     "https://github.com/unslothai/llama.cpp/pull/264/commits/9fec7cbf9133c27f4f238d60445c94f446f7ea6b",
     "https://github.com/unslothai/llama.cpp/pull/266/commits/af3b2bc3201ecf75cf7fd1fbb1f76e264920809d",
     "https://github.com/unslothai/llama.cpp/pull/283/commits/644ca7d817b8a591c61dee2e17778b43b1ecf3eb",
-    "https://github.com/unslothai/llama.cpp/pull/287/commits/22fb037b1b84513e141d724bb9403ecb48925e32",
     "https://github.com/unslothai/llama.cpp/pull/332/commits/1e9e789b7a656d437ce1d0f0e6f0af41828712ef",
     "https://github.com/unslothai/llama.cpp/pull/304/commits/9bdbff40023030692111a2eed05b9452ba2250b5",
     "https://github.com/unslothai/llama.cpp/pull/311/commits/819e95b316743cd2ed7bb54b68f52f5ca1ea820a",
