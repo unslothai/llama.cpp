@@ -11286,6 +11286,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // 1-bit i-quants on the MMQ path: batch sizes on both sides of the MMVQ/MMQ switch and every MMQ J tile,
+    // row counts with and without the out-of-bounds fallback, and MoE shapes with many experts.
+    for (ggml_type type_a : {GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S}) {
+        for (int64_t k : {256, 1024, 4096, 5376}) {
+            for (int64_t n : {1, 2, 8, 9, 16, 64, 128, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, k, {1, 1}, {1, 1}));
+            }
+            for (int64_t n : {9, 77, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 129, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, 64, 1024, {2, 3}, {1, 1}));
+        for (int n_mats : {256, 512}) {
+            for (int n_used : {9, 22}) {
+                for (int n : {1, 9, 64, 512}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, 128, n, 1024));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, true, 136, 100, 2048));
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
@@ -12753,6 +12775,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // 1-bit i-quant MoE up projections with many experts (Nemotron-3.5 style: 240-496 experts, top-9, k = 1024)
+    for (ggml_type type_a : {GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS}) {
+        for (int n_mats : {240, 496}) {
+            for (int bs : {1, 8, 32, 128, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, 9, false, 2560, bs, 1024));
+            }
+        }
+        for (int bs : {16, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 4096, {1, 1}, {1, 1}));
+        }
+        // smaller MoE shape, cheap enough to set up on slow hosts
+        for (int bs : {1, 32, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 512, bs, 1024));
+        }
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
