@@ -182,6 +182,28 @@ rc, rep, out = run(d, m, "--gpu")
 check("a full (--gpu) build without llama-server is a failure, not a deferral",
       rc == 1 and rep["deferred"] == 0 and "missing from this full build" in json.dumps(rep), out)
 
+# --- 12. a Windows build names its binaries *.exe --------------------------
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("feature_matrix", SCRIPT)
+fm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fm)
+d = Path(tempfile.mkdtemp(prefix="fm_win_"))
+(d / "bin").mkdir()
+for n in ("test-backend-ops.exe", "test-llama-archs.exe", "llama-server.exe"):
+    (d / "bin" / n).write_text("")
+try:
+    found = fm.bins(d)
+except SystemExit as e:
+    found = e
+check("a build with only .exe binaries is found", found == d / "bin", found)
+check("and its binaries resolve to the .exe",
+      fm.exe(d / "bin", "test-backend-ops").name == "test-backend-ops.exe"
+      and fm.exe(d / "bin", "llama-server").name == "llama-server.exe")
+for n in ("test-mtmd-impl", "test-mtmd-impl.exe"):
+    (d / "bin" / n).write_text("")
+check("a POSIX name still wins when both exist", fm.exe(d / "bin", "test-mtmd-impl").name == "test-mtmd-impl")
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
