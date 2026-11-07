@@ -27,6 +27,8 @@ const uint32_t MatBr = 16;
 const uint32_t MatBc = 16;
 
 const uint32_t rows_per_thread = Br / row_split;
+// row_split is also the subgroup count; each subgroup computes k_slabs 16-row slabs of S.
+const uint32_t k_slabs = Bc / (MatBc * row_split);
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 
@@ -263,9 +265,12 @@ void main() {
         }
 
         // K * Q^T -> S^T: Bc x HSK_pad * HSK_pad x Br -> Bc x Br
-        // Bc split across workgroup (four subgroups), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
+        // Bc split across workgroup (k_slabs slabs per subgroup), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
         // This is written transposed in order to allow for N being 8 if implementations need it
-        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat[k_slabs];
+        [[unroll]] for (uint32_t s = 0; s < k_slabs; ++s) {
+            SfMat[s] = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+        }
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
 
@@ -307,25 +312,37 @@ void main() {
                 barrier();
             }
 
-            if (stage_k) {
-                uint coord = (gl_SubgroupID * MatBc) * kvsh_stride;
-                coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-            } else {
-                const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
-                coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
-            }
-            } else {
-                uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
-                coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-            }
-
             coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
 
-            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            [[unroll]] for (uint32_t s = 0; s < k_slabs; ++s) {
+                const uint k_row = (s * row_split + gl_SubgroupID) * MatBc;
+                if (stage_k) {
+                    uint coord = k_row * kvsh_stride;
+                    coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    const uint coord = k_offset / 4 + (j * Bc + k_row) * k_stride / 4 + d * 16 / 4;
+                    coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                }
+
+                SfMat[s] = coopMatMulAdd(KMat, QMat, SfMat[s]);
+            }
+            } else {
+                coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
+
+                [[unroll]] for (uint32_t s = 0; s < k_slabs; ++s) {
+                    const uint k_row = (s * row_split + gl_SubgroupID) * MatBc;
+                    uint coord = k_row * kvsh_stride + d * 16 / 4;
+                    coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+
+                    SfMat[s] = coopMatMulAdd(KMat, QMat, SfMat[s]);
+                }
+            }
         }
 
-        uint coord = gl_SubgroupID * MatBc * sfshstride;
-        coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint32_t s = 0; s < k_slabs; ++s) {
+            uint coord = (s * row_split + gl_SubgroupID) * MatBc * sfshstride;
+            coopMatStore(SfMat[s], sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
+        }
         barrier();
 
         if (LOGIT_SOFTCAP) {
