@@ -57,6 +57,8 @@ export {
 	SpecialFileType
 } from './files.enums';
 
+export { HfEntryType, HfModelSort, SidecarForm } from './huggingface.enums';
+
 export {
 	MCPConnectionPhase,
 	MCPLogLevel,
@@ -67,9 +69,29 @@ export {
 	JsonSchemaType
 } from './mcp.enums';
 
-export { ModelCapability, ModelModality } from './model.enums';
+export {
+	ModelAuxSidecar,
+	ModelCapability,
+	ModelDraftSidecar,
+	ModelModality,
+	ModelSelectableFileKind
+} from './model.enums';
 
-export { ServerRole, ServerModelStatus, ServerModelsSseEventType } from './server.enums';
+export {
+	ModelDownloadConfirmAction,
+	ModelDownloadStopRequest,
+	ModelGroupKind,
+	ModelRowDownloadState,
+	ModelsTableGroupKind,
+	ModelsTableSortKey
+} from './model.enums';
+
+export {
+	ServerRole,
+	ServerModelSource,
+	ServerModelStatus,
+	ServerModelsSseEventType
+} from './server.enums';
 
 export { ParameterSource, SyncableParameterType, SettingsFieldType } from './settings.enums';
 
@@ -78,6 +100,7 @@ export {
 	ColorMode,
 	HtmlInputType,
 	McpPromptVariant,
+	MenuKind,
 	ScrollCarouselVariant,
 	SidebarAction,
 	TooltipSide,

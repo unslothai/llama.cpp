@@ -4,10 +4,10 @@
 #include <cstring>
 
 // Kimi-K3 MoonViT-3d, image path.
-// Follows clip_graph_kimik25, but with RMSNorm, no biases, qkv width != n_embd, and a post-norm patchmergerv2 projector.
+// Follows mtmd_graph_kimik25, but with RMSNorm, no biases, qkv width != n_embd, and a post-norm patchmergerv2 projector.
 // Images only: at t == 1 the temporal pool and the temporal position term vanish.
 
-ggml_tensor * clip_graph_kimik3::resize_position_embeddings_3d(uint32_t interpolation_mode) {
+ggml_tensor * mtmd_graph_kimik3::resize_position_embeddings_3d(uint32_t interpolation_mode) {
     ggml_tensor * pos_embd = model.position_embeddings;
     const int height       = img.ny() / patch_size;
     const int width        = img.nx() / patch_size;
@@ -31,7 +31,7 @@ ggml_tensor * clip_graph_kimik3::resize_position_embeddings_3d(uint32_t interpol
     return pos_embd;
 }
 
-ggml_cgraph * clip_graph_kimik3::build() {
+ggml_cgraph * mtmd_graph_kimik3::build() {
     ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
     ggml_set_name(pos_h, "pos_h");
     ggml_set_input(pos_h);
@@ -43,7 +43,7 @@ ggml_cgraph * clip_graph_kimik3::build() {
     ggml_tensor * learned_pos_embd = resize_position_embeddings_3d(GGML_SCALE_MODE_BILINEAR);
 
     // Q/K are de-interleaved during conversion.
-    auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
+    auto add_pos = [&](ggml_tensor * cur, const mtmd_layer &) {
         return build_rope_2d(ctx0, cur, pos_w, pos_h, hparams.rope_theta, false);
     };
 

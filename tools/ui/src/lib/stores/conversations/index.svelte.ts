@@ -16,6 +16,7 @@ import { DatabaseService } from '$lib/services/database.service';
 import { MigrationService } from '$lib/services/migration.service';
 import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
+import { draftMessagesStore } from '$lib/stores/chat/drafts.svelte';
 import {
 	ConversationPreferences,
 	type ConversationsPreferencesHost
@@ -53,6 +54,13 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	private initPromise: Promise<void> | null = null;
 
 	/**
+	 * Messages loadConversation just read, handed off once so the chat
+	 * screen can reuse them for sibling info instead of re-fetching the
+	 * whole conversation a second time.
+	 */
+	private lastLoadedMessages: { convId: string; messages: DatabaseMessage[] } | null = null;
+
+	/**
 	 * Memo of the last findMessageIndex() lookup. Streaming calls it once per
 	 * chunk for the same message, so a validated cache hit keeps that O(1)
 	 * instead of a linear scan of activeMessages on every token.
@@ -88,7 +96,13 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		if (this.activeConversation?.id === id) {
-			this.activeConversation = { ...this.activeConversation, ...updates };
+			// field-wise, not object replacement: effects that track the active
+			// conversation identity would otherwise refire on every rename or pin
+			const target = this.activeConversation as unknown as Record<string, unknown>;
+
+			for (const [key, value] of Object.entries(updates)) {
+				if (target[key] !== value) target[key] = value;
+			}
 		}
 	}
 
@@ -143,7 +157,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 				tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 				this.clearActiveConversation();
-				await tabsStore.close(activeId, activeId);
+				await tabsStore.closeConversation(activeId);
 			} else {
 				tabsStore.removeTabs([...idsToRemove]);
 			}
@@ -168,15 +182,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		if (convIds.length === 0) return;
 
 		try {
-			const fetched = await DatabaseService.getConversationsWithMessages(convIds);
-			const activeId = this.activeConversation?.id;
-			const overridden = fetched.get(activeId ?? '');
-
-			if (overridden && activeId) {
-				overridden.conv = { ...this.activeConversation! };
-			}
-
-			const exported = [...fetched.values()];
+			const exported = await this.getConversationsForExport(convIds);
 
 			if (exported.length === 0) {
 				toast.error('No conversations to export');
@@ -210,11 +216,8 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			const updates = await DatabaseService.bulkToggleConversationPins(convIds);
 			const activeId = this.activeConversation?.id;
 
-			if (activeId && updates.has(activeId)) {
-				this.activeConversation = {
-					...this.activeConversation!,
-					pinned: updates.get(activeId)!
-				};
+			if (this.activeConversation && activeId && updates.has(activeId)) {
+				this.activeConversation.pinned = updates.get(activeId)!;
 			}
 
 			for (let i = 0; i < this.conversations.length; i++) {
@@ -244,12 +247,27 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		this.preferences.resetPending();
 	}
 
+	/** One-shot handoff of the messages the last loadConversation read. */
+	consumeLastLoadedMessages(convId: string): DatabaseMessage[] | null {
+		if (this.lastLoadedMessages?.convId !== convId) return null;
+
+		const messages = this.lastLoadedMessages.messages;
+
+		this.lastLoadedMessages = null;
+
+		return messages;
+	}
+
 	/**
 	 * Creates a new conversation and navigates to it
 	 * @param name - Optional name for the conversation
+	 * @param draft - Optional input draft to carry over to the new conversation
 	 * @returns The ID of the created conversation
 	 */
-	async createConversation(name?: string): Promise<string> {
+	async createConversation(
+		name?: string,
+		draft?: { message: string; files: ChatUploadedFile[] }
+	): Promise<string> {
 		const conversationName = name || `Chat ${new Date().toLocaleString()}`;
 		// The tool policy is seeded from the current defaults: edits made inside
 		// the conversation afterwards live on its row and do not flow back into
@@ -268,7 +286,16 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		this.activeConversation = conversation;
 		this.activeMessages = [];
 
+		if (draft) {
+			draftMessagesStore.saveDraftMessage(conversation.id, draft.message, draft.files);
+		}
+
 		await goto(RouterService.chat(conversation.id));
+
+		// the draft moved to the new conversation, so drop the copy saved for the new-chat screen
+		if (draft) {
+			draftMessagesStore.clearDraftMessage(undefined);
+		}
 
 		return conversation.id;
 	}
@@ -327,7 +354,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 					tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 					this.clearActiveConversation();
-					await tabsStore.close(activeId, activeId);
+					await tabsStore.closeConversation(activeId);
 				} else {
 					tabsStore.removeTabs([...idsToRemove]);
 				}
@@ -348,7 +375,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 				if (this.activeConversation?.id === convId) {
 					this.clearActiveConversation();
-					await tabsStore.close(convId, convId);
+					await tabsStore.closeConversation(convId);
 				} else {
 					tabsStore.removeTabs([convId]);
 				}
@@ -365,16 +392,11 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 * @param convId - The conversation ID to download
 	 */
 	async downloadConversation(convId: string): Promise<void> {
-		const conversation =
-			this.activeConversation?.id === convId
-				? this.activeConversation
-				: await DatabaseService.getConversation(convId);
+		const [exportedConversation] = await this.getConversationsForExport([convId]);
 
-		if (!conversation) return;
+		if (!exportedConversation) return;
 
-		const messages = await DatabaseService.getConversationMessages(convId);
-
-		ConversationTransferService.downloadConversationFile({ conv: conversation, messages });
+		ConversationTransferService.downloadConversationFile(exportedConversation);
 	}
 
 	/**
@@ -454,6 +476,19 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	}
 
 	/**
+	 * Gets conversations and their messages from the database for export.
+	 * @param convIds - Conversation IDs
+	 * @returns List of conversations with messages, ordered by the input IDs
+	 */
+	async getConversationsForExport(convIds: string[]): Promise<ExportedConversation[]> {
+		const fetched = await DatabaseService.getConversationsWithMessages(convIds);
+
+		return convIds
+			.map((id) => fetched.get(id))
+			.filter((entry): entry is ExportedConversation => entry !== undefined);
+	}
+
+	/**
 	 * Imports conversations from provided data (without file picker)
 	 * @param data - Array of conversation data with messages
 	 * @returns The conversations written to the database and the ones skipped
@@ -509,22 +544,15 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			// it doesn't belong to this conversation.
 			this.preferences.pendingCwd = null;
 
+			const allMessages = await DatabaseService.getConversationMessages(convId);
+
+			// set conversation and messages in one sync block so effects never see
+			// the new conversation with the previous conversation's messages
+			this.lastLoadedMessages = { convId, messages: allMessages };
 			this.activeConversation = conversation;
-
-			if (conversation.currNode) {
-				const allMessages = await DatabaseService.getConversationMessages(convId);
-				const filteredMessages = filterByLeafNodeId(
-					allMessages,
-					conversation.currNode,
-					false
-				) as DatabaseMessage[];
-
-				this.activeMessages = filteredMessages;
-			} else {
-				const messages = await DatabaseService.getConversationMessages(convId);
-
-				this.activeMessages = messages;
-			}
+			this.activeMessages = conversation.currNode
+				? (filterByLeafNodeId(allMessages, conversation.currNode, false) as DatabaseMessage[])
+				: allMessages;
 
 			return true;
 		} catch (error) {
@@ -558,7 +586,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		const currentLeafNodeId = findLeafNode(allMessages, siblingId);
 
 		await DatabaseService.updateCurrentNode(this.activeConversation.id, currentLeafNodeId);
-		this.activeConversation = { ...this.activeConversation, currNode: currentLeafNodeId };
+		this.activeConversation.currNode = currentLeafNodeId;
 		await this.refreshActiveMessages();
 
 		if (rootMessage && this.activeMessages.length > 0) {
@@ -694,7 +722,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		if (this.activeConversation?.id === targetId) {
-			this.activeConversation = { ...this.activeConversation, lastModified: now };
+			this.activeConversation.lastModified = now;
 		}
 
 		DatabaseService.updateConversation(targetId, { lastModified: now }).catch((error) =>
@@ -710,7 +738,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		if (!this.activeConversation) return;
 
 		await DatabaseService.updateCurrentNode(this.activeConversation.id, nodeId);
-		this.activeConversation = { ...this.activeConversation, currNode: nodeId };
+		this.activeConversation.currNode = nodeId;
 	}
 
 	/**

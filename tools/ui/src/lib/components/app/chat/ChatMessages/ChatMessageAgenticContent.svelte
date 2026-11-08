@@ -8,14 +8,14 @@
 		MarkdownContent
 	} from '$lib/components/app';
 	import { AgenticSectionType, ChatMessageStatsView, ToolPermissionDecision } from '$lib/enums';
-	import { agenticStore, settingsStore } from '$lib/stores';
+	import { agenticStore, conversationsStore, settingsStore } from '$lib/stores';
 	import type {
 		AgenticSection,
 		ChatMessageAgenticTimings,
 		ChatMessageAgenticTurnStats,
 		DatabaseMessage
 	} from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
+	import { deriveAgenticSections, isSectionExpandedByDefault } from '$lib/utils';
 
 	interface Props {
 		message: DatabaseMessage;
@@ -26,14 +26,20 @@
 
 	let {
 		isLastAssistantMessage = false,
-		isStreaming = false,
+		isStreaming: isChatStreaming = false,
 		message,
 		toolMessages = []
 	}: Props = $props();
 
+	// The chat-level streaming flag is shared by every message; only the last
+	// assistant message is actually live, so earlier ones must not keep their
+	// unresolved tool calls spinning while a newer reply streams.
+	const isStreaming = $derived(isChatStreaming && isLastAssistantMessage);
+
 	let expandedStates: Record<number, boolean> = $state({});
 
 	const showThoughtInProgress = $derived(Boolean(settingsStore.config.showThoughtInProgress));
+	const showToolCallInProgress = $derived(Boolean(settingsStore.config.showToolCallInProgress));
 	const alwaysShowToolCallContent = $derived(
 		Boolean(settingsStore.config.alwaysShowToolCallContent)
 	);
@@ -46,48 +52,39 @@
 		isLastAssistantMessage ? !!agenticStore.getLastError(message.convId) : false
 	);
 
-	let permissionDismissed = $state(false);
-
 	const pendingPermission = $derived(
-		isStreaming && isLastAssistantMessage
-			? agenticStore.getPendingPermissionRequest(message.convId)
-			: null
+		isStreaming ? agenticStore.getPendingPermissionRequest(message.convId) : null
 	);
 
-	let prevPendingRef: typeof pendingPermission = null;
-	$effect(() => {
-		if (pendingPermission !== prevPendingRef) {
-			prevPendingRef = pendingPermission;
+	// dismissal applies to the request object, so the next request ( new
+	// identity ) shows the card again without any reset bookkeeping
+	let dismissedPermission: typeof pendingPermission = $state(null);
 
-			if (pendingPermission) {
-				permissionDismissed = false;
-			}
-		}
-	});
+	const visiblePermission = $derived(
+		pendingPermission && dismissedPermission !== pendingPermission ? pendingPermission : null
+	);
 
 	function handlePermission(decision: ToolPermissionDecision) {
-		permissionDismissed = true;
+		dismissedPermission = pendingPermission;
 		agenticStore.resolvePermission(message.convId, decision);
 	}
 
-	let continueDismissed = $state(false);
-
 	const pendingContinue = $derived(
-		isStreaming && isLastAssistantMessage
-			? agenticStore.getPendingContinueRequest(message.convId)
-			: false
+		isStreaming ? agenticStore.getPendingContinueRequest(message.convId) : false
 	);
 
-	let prevContinueRef = false;
-	$effect(() => {
-		if (pendingContinue !== prevContinueRef) {
-			prevContinueRef = pendingContinue;
+	let continueDismissed = $state(false);
 
-			if (pendingContinue) {
-				continueDismissed = false;
-			}
+	// the continue request is a plain boolean, so there is no identity to
+	// compare against; clear the dismissal whenever no request is pending so
+	// the next one starts from a clean state
+	$effect(() => {
+		if (!pendingContinue) {
+			continueDismissed = false;
 		}
 	});
+
+	const showContinue = $derived(Boolean(pendingContinue) && !continueDismissed);
 
 	function handleContinue(shouldContinue: boolean) {
 		continueDismissed = true;
@@ -98,6 +95,14 @@
 
 	const currentlyExecutingToolCallId = $derived(
 		isStreaming ? agenticStore.getExecutingToolCallId(message.convId) : null
+	);
+
+	// Cwd the agentic loop passes to tool calls in this conversation; the exec
+	// block shows it until the result message persists the real one.
+	const conversationCwd = $derived(
+		conversationsStore.activeConversation?.id === message.convId
+			? conversationsStore.activeConversation?.cwd
+			: undefined
 	);
 
 	type TurnGroup = {
@@ -137,28 +142,17 @@
 		return groups;
 	});
 
-	function getDefaultExpanded(section: AgenticSection): boolean {
-		if (
-			section.type === AgenticSectionType.TOOL_CALL ||
-			section.type === AgenticSectionType.TOOL_CALL_PENDING ||
-			section.type === AgenticSectionType.TOOL_CALL_STREAMING
-		) {
-			return alwaysShowToolCallContent;
-		}
-
-		if (section.type === AgenticSectionType.REASONING_PENDING) {
-			return showThoughtInProgress;
-		}
-
-		return false;
-	}
-
 	function isExpanded(index: number, section: AgenticSection): boolean {
 		if (expandedStates[index] !== undefined) {
 			return expandedStates[index];
 		}
 
-		return getDefaultExpanded(section);
+		return isSectionExpandedByDefault(section, {
+			alwaysShowToolCallContent,
+			executingToolCallId: currentlyExecutingToolCallId,
+			showThoughtInProgress,
+			showToolCallInProgress
+		});
 	}
 
 	function toggleExpanded(index: number, section: AgenticSection) {
@@ -194,7 +188,8 @@
 		/>
 	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING || section.type === AgenticSectionType.TOOL_CALL_STREAMING}
 		<ChatMessageToolCallBlock
-			attachments={message?.extra}
+			attachments={section.toolResultExtras}
+			{conversationCwd}
 			isExecuting={section.toolCallId !== undefined &&
 				section.toolCallId === currentlyExecutingToolCallId}
 			{isStreaming}
@@ -238,15 +233,15 @@
 		{/each}
 	{/if}
 
-	{#if pendingPermission && !permissionDismissed}
+	{#if visiblePermission}
 		<ChatMessageActionCardPermissionRequest
 			onDecision={handlePermission}
-			serverLabel={pendingPermission.serverLabel}
-			toolName={pendingPermission.toolName}
+			serverLabel={visiblePermission.serverLabel}
+			toolName={visiblePermission.toolName}
 		/>
 	{/if}
 
-	{#if pendingContinue && !continueDismissed}
+	{#if showContinue}
 		<ChatMessageActionCardContinueRequest onDecision={handleContinue} />
 	{/if}
 </div>
