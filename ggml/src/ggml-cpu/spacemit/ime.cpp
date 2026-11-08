@@ -1046,6 +1046,10 @@ class tensor_traits_common : public tensor_traits_base {
                         return true;
                 }
             case GGML_OP_FLASH_ATTN_EXT:
+                // K/V row lists are handled by the generic CPU path
+                if (op->src[5] != nullptr) {
+                    return false;
+                }
                 forward_flash_attn_ext_f16(params, op);
                 return true;
             case GGML_OP_CONT:
@@ -1176,7 +1180,7 @@ class tensor_traits_common : public tensor_traits_base {
         const int64_t DK = nek0;
         const int64_t DV = nev0;
 
-        const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_DEFAULT);
+        const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_BF16 || dst->op_params[3] == GGML_PREC_DEFAULT);
         const bool supported_types = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
         const bool supported_shape = (DK > 0 && DK <= 128 && DV > 0 && DV <= 128);
         const bool supported_vlen  = (__riscv_vlenb() == 128);
@@ -1489,6 +1493,9 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_riscv64_spacemit_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
