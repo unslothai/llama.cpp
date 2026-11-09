@@ -100,8 +100,10 @@ export {
 	ColorMode,
 	HtmlInputType,
 	McpPromptVariant,
+	MenuKind,
 	ScrollCarouselVariant,
 	SidebarAction,
+	SidebarSectionKind,
 	TooltipSide,
 	UrlProtocol
 } from './ui.enums';

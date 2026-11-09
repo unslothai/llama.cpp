@@ -17,6 +17,38 @@ export const COPY_FEEDBACK_RESET_MS = 1500;
 /** How long a collapsible block's body takes to expand or collapse. */
 export const COLLAPSIBLE_TRANSITION_MS = 200;
 
+/**
+ * Parts of a message where right-click keeps the browser's own menu (open or
+ * copy a link, save an image, copy code or a field), not the message actions.
+ */
+export const NATIVE_CONTEXT_MENU_SELECTOR =
+	'a, img, video, audio, pre, code, input, textarea, [contenteditable="true"]';
+
+/**
+ * A sidebar section under a dragged chat, or one being moved: the faint tint
+ * of the sidebar's resize handle, edged like the handle while it is dragged.
+ */
+export const SIDEBAR_DRAG_HIGHLIGHT_CLASS = 'bg-foreground/6 ring-1 ring-foreground/15 ring-inset';
+
+/** How long a sidebar chat row takes to slide out of a section, or into one. */
+export const SIDEBAR_ROW_SLIDE_MS = 200;
+
+/** Chats a sidebar section shows before its "Show more" row. */
+export const SIDEBAR_SECTION_PREVIEW_COUNT = 6;
+
+/**
+ * The "Show less" row of an opened section stays at the bottom of the sidebar
+ * while the section scrolls under it, with room below it and a fade above
+ * (see app.css). "Show more" is a plain row.
+ */
+export const SIDEBAR_SHOW_MORE_ROW_CLASS = 'sidebar-show-more sticky bottom-0 z-10 pb-2';
+
+/** Ids of the sidebar's conversation sections, for their folded state. */
+export const SIDEBAR_SECTION_IDS = {
+	PINNED: 'pinned',
+	RECENT: 'recent'
+} as const;
+
 export const FORK_TREE_DEPTH_PADDING = 8;
 export const SYSTEM_MESSAGE_PLACEHOLDER = 'System message';
 
