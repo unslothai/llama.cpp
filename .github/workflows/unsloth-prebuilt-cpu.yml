@@ -466,8 +466,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   vcvars: x64,         omp_arch: x86_64,  cpu_variants: 'ON' }
-          - { arch: arm64, vcvars: amd64_arm64, omp_arch: aarch64, cpu_variants: 'OFF' }
+          - { arch: x64,   vcvars: x64,         cpu_variants: 'ON' }
+          - { arch: arm64, vcvars: amd64_arm64, cpu_variants: 'OFF' }
     defaults:
       run:
         shell: pwsh
@@ -535,7 +535,10 @@ jobs:
       # Build recipe copied from ggml-org/llama.cpp release.yml (windows-cpu):
       # clang via the per-arch LLVM toolchain file, "Ninja Multi-Config", OpenMP,
       # BoringSSL, and GGML_CPU_ALL_VARIANTS only on x64 (it is an x86 microarch
-      # fan-out). vcvarsall sets the env (incl. the amd64_arm64 cross toolchain),
+      # fan-out). GGML_OPENMP_FETCH takes the OpenMP runtime from LLVM's own
+      # release (checksum pinned in ggml/src/CMakeLists.txt) and puts libomp.dll
+      # and its license beside the binaries, as upstream does since
+      # ggml-org/llama.cpp#26678. vcvarsall sets the env (incl. the amd64_arm64 cross toolchain),
       # so this runs in cmd. CMAKE_ARGS mirrors upstream's env.CMAKE_ARGS and
       # builds the full tool + server set (no --target), matching the macOS bins.
       - name: Build
@@ -551,6 +554,7 @@ jobs:
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=${{ matrix.cpu_variants }} ^
             -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
             -DGGML_RPC=ON ^
             -DLLAMA_BUILD_TESTS=OFF ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
@@ -578,11 +582,7 @@ jobs:
           cmake --build build --config Release --target llama-diffusion-gemma-visual-server llama-diffusion-cli
           exit /b 0
 
-      # Ninja Multi-Config emits to build/bin/Release. Ship the OpenMP runtime
-      # (GGML_OPENMP=ON) from the VS LLVM redist -- exactly as upstream does --
-      # globbing the MSVC version dir so an image bump does not break the path.
-      # Sort newest-first: older toolsets' libomp lacks entry points current
-      # clang imports (__kmpc_dispatch_deinit -> STATUS_ENTRYPOINT_NOT_FOUND).
+      # Ninja Multi-Config emits to build/bin/Release.
       # The build legs extract a source tarball rather than checking this repo
       # out, so the signing action and its scripts are not on disk. Fetch just
       # .github into a subdirectory: a checkout at the workspace root would
@@ -615,13 +615,10 @@ jobs:
         run: |
           $rel = "src/build/bin/Release"
           Copy-Item src/LICENSE $rel/
-          $redist = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\MSVC"
-          $omp = Get-ChildItem "$redist\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC*.OpenMP.LLVM\libomp140.${{ matrix.omp_arch }}.dll" -ErrorAction SilentlyContinue |
-            Sort-Object { [version]$_.Directory.Parent.Parent.Parent.Name } -Descending |
-            Select-Object -First 1
-          if (-not $omp) { Write-Error "libomp140.${{ matrix.omp_arch }}.dll not found in the VS LLVM redist"; exit 1 }
-          Write-Host "shipping OpenMP runtime: $($omp.FullName)"
-          Copy-Item $omp.FullName $rel/
+          # The build put LLVM's libomp.dll and its license here; a bundle without them loads nothing.
+          foreach ($required in 'libomp.dll', 'LICENSE-LLVM-OpenMP') {
+            if (-not (Test-Path "$rel/$required")) { Write-Error "$required is missing from the build output"; exit 1 }
+          }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $asset = "app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip"
           Push-Location $rel
@@ -629,8 +626,8 @@ jobs:
           Pop-Location
           Get-ChildItem dist
 
-      # Smoke the packaged x64 bundle: launching an exe loads ggml-base and the
-      # picked libomp, so --version fails on a bad pick. timeout-minutes bounds
+      # Smoke the packaged x64 bundle: launching an exe loads ggml-base and
+      # libomp, so --version fails when either is unusable. timeout-minutes bounds
       # a loader hard-error that can block instead of exiting. arm64 is
       # cross-compiled and cannot run here.
       - name: Smoke test bundle (x64 only)
