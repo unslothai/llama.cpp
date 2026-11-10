@@ -1247,9 +1247,13 @@ jobs:
       run: |
         sudo apt-get install -y patchelf
         cd llama.cpp/build/bin
-        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
-        for file in *.so* llama-*; do
-          [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
+        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally.
+        # Every ELF file, not a name pattern: `llama` and `ggml-rpc-server` match neither *.so* nor
+        # llama-*, and shipped with the build tree's RUNPATH (lemonade-sdk/llamacpp-rocm#153).
+        for file in *; do
+          [ -f "$file" ] && [ ! -L "$file" ] || continue
+          file -b "$file" | grep -q '^ELF' || continue
+          patchelf --set-rpath '$ORIGIN' "$file"
         done
 
     # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
@@ -1272,8 +1276,11 @@ jobs:
         bundle="$(pwd -P)"
         system='^((libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)$'
         bad=""
-        for file in *.so* llama-*; do
+        for file in *; do
           [ -f "$file" ] && [ ! -L "$file" ] || continue
+          file -b "$file" | grep -q '^ELF' || continue
+          rpath="$(patchelf --print-rpath "$file")"
+          [ "$rpath" = '$ORIGIN' ] || bad+="$file: library search path is '$rpath', not \$ORIGIN"$'\n'
           while read -r name arrow path _; do
             # vdso (and on some hosts the dynamic loader) is listed without "=>".
             [ "$arrow" = "=>" ] || continue
