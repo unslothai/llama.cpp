@@ -1114,34 +1114,37 @@ jobs:
         # If artifacts from ROCm or Llama.cpp change, you may need to update this list
         # To get a new list of all libraries, run:
         # gather_required_libs.py --rocm-dir /opt/rocm --dest-dir llama.cpp/build/bin
+        # cp -P keeps TheRock's libX.so -> libX.so.N -> libX.so.N.M links. Following them stored
+        # every library two or three times (1.2 GB of a 2.0 GB gfx1151 bundle), and gzip cannot
+        # fold copies that far apart, so the download was twice the size it needed to be.
         echo "Copying required ROCm libraries to build directory..."
-        cp -v /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
-        cp -v /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
-        cp -v /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
-        cp -v /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
-        cp -v /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
-        cp -v /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_liblzma.so* not found"
-        cp -v /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
-        cp -v /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
-        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
-        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
-        cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
-        cp -v /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
-        cp -v /opt/rocm/lib/libtensilelite-host.so* "$build_bin_path/" 2>/dev/null || echo "libtensilelite-host.so* not found"
-        cp -v /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
-        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
-        cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
+        cp -Pv /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
+        cp -Pv /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
+        cp -Pv /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
+        cp -Pv /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
+        cp -Pv /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
+        cp -Pv /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_liblzma.so* not found"
+        cp -Pv /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
+        cp -Pv /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
+        cp -Pv /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
+        cp -Pv /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
+        cp -Pv /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
+        cp -Pv /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
+        cp -Pv /opt/rocm/lib/libtensilelite-host.so* "$build_bin_path/" 2>/dev/null || echo "libtensilelite-host.so* not found"
+        cp -Pv /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
+        cp -Pv /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
+        cp -Pv /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
         # libtensilelite-host needs the unversioned libomp.so; cp follows the symlink.
         cp -v /opt/rocm/lib/llvm/lib/libomp.so "$build_bin_path/" 2>/dev/null || echo "libomp.so not found"
 
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
 
         # libatomic.so.1 is a transitive dependency of librocm_sysdeps_numa
         # (libhsa-runtime64 -> numa -> libatomic) but it is a system GCC runtime
@@ -1232,10 +1235,10 @@ jobs:
           echo "::error::the rebuilt libhsa-runtime64 lacks exports the shipped one has"
           exit 1
         fi
-        # The copy step above flattened the .so / .so.1 / .so.1.x symlinks into files:
-        # replace every one, so no unpatched copy ships beside the one the loader uses.
+        # The .so and .so.1 names are links to this one file, so every name gets the patched runtime.
+        cp -v "$new_lib" "$old_lib"
         for f in "$build_bin_path"/libhsa-runtime64.so*; do
-          cp -v "$new_lib" "$f"
+          cmp -s "$new_lib" "$f" || { echo "::error::$f is not the rebuilt libhsa-runtime64"; exit 1; }
         done
 
         # HIP's ROCR imports resolve against the rebuilt runtime. Library-level
@@ -1273,7 +1276,7 @@ jobs:
         sparse-checkout: scripts/unsloth
         persist-credentials: false
 
-    # After patchelf, which can leave a second copy of the reference; rewrites every copy (unslothai/unsloth#13663).
+    # After patchelf, which can leave a second copy of the reference in a library; rewrites every copy (unslothai/unsloth#13663).
     - name: Ship the rocBLAS kernel packs
       run: python3 kpack-tooling/scripts/unsloth/relocate_kpack.py --bundle llama.cpp/build/bin --kpack-src /opt/rocm/.kpack --archs "$MAPPED_TARGET"
 
@@ -1285,6 +1288,11 @@ jobs:
         bundle="$(pwd -P)"
         system='^((libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)$'
         bad=""
+        # A link must end at a file inside the bundle: cp -P copies links as links.
+        for link in *; do
+          [ -L "$link" ] || continue
+          [ -f "$link" ] && [ "$(dirname "$(readlink -f "$link")")" = "$bundle" ] || bad+="$link: link does not resolve inside the bundle"$'\n'
+        done
         for file in *; do
           [ -f "$file" ] && [ ! -L "$file" ] || continue
           file -b "$file" | grep -q '^ELF' || continue
