@@ -120,9 +120,9 @@ runs:
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}-${{ inputs.tag }}
+        key: cuda-depend-${{ inputs.cuda }}-windows-${{ inputs.profile }}-${{ inputs.tag }}
         restore-keys: |
-          cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}
+          cuda-depend-${{ inputs.cuda }}-windows-${{ inputs.profile }}
         append-timestamp: false
         variant: ccache
         max-size: ${{ inputs.max-size }}
@@ -134,7 +134,9 @@ runs:
         ccache --set-config=compiler_check=content
         ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
         ccache --set-config=compression_level=6
-        ccache -p | Select-String -Pattern "compiler_check|sloppiness|compression|max_size|cache_dir"
+        # Depend mode and the "depend" cache keys: see unsloth-cuda-linux-setup.
+        ccache --set-config=depend_mode=true
+        ccache -p | Select-String -Pattern "compiler_check|sloppiness|compression|depend_mode|max_size|cache_dir"
         ccache -z
 
     - name: Configure
