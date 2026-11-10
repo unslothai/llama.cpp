@@ -12,9 +12,9 @@ implementing one PlatformStrategy (its dependency-walk tool, lib-name
 convention, backend glob, and archive format), not writing a new packaging
 script.
 
-The installer normally uses PyTorch's CUDA runtime, selected by runtime_line.
-BUNDLE_CUDA_RUNTIME=1 includes cudart/cublas DLLs for Windows ARM64, where
-PyTorch has no CUDA build.
+BUNDLE_CUDA_RUNTIME=1 includes the cudart/cublas DLLs, set by both Windows CUDA
+legs: chat-only Studio installs have no PyTorch to supply them, and ARM64 has no
+PyTorch CUDA build at all.
 
 Linux is the CI-validated path. macOS/Windows strategies follow the correct
 platform conventions (otool/@loader_path/tar.gz; dir-local DLLs/zip) but have
