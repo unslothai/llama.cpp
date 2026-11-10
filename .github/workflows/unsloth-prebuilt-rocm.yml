@@ -671,6 +671,11 @@ jobs:
           exit 1
         }
 
+    # The MIT notice has to travel with the binaries, as it does in the CPU and Vulkan bundles.
+    - name: Add the llama.cpp license
+      if: ${{ (matrix.slice || 0) == 0 }}
+      run: Copy-Item llama.cpp\LICENSE llama.cpp\build\bin\LICENSE
+
     # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
     - name: Fetch kpack tooling
       if: ${{ (matrix.slice || 0) == 0 }}
@@ -1242,6 +1247,10 @@ jobs:
           exit 1
         fi
         echo "libhsa-runtime64 rebuilt from rocm-systems $sha with the KFD wave count"
+
+    # The MIT notice has to travel with the binaries, as it does in the CPU and Vulkan bundles.
+    - name: Add the llama.cpp license
+      run: cp llama.cpp/LICENSE llama.cpp/build/bin/LICENSE
 
     - name: Set RPATH for portable distribution
       run: |
