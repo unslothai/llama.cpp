@@ -29,6 +29,7 @@
 	import {
 		chatStore,
 		conversationsStore,
+		deviceStore,
 		mcpStore,
 		modelsStore,
 		serverStore,
@@ -45,13 +46,10 @@
 	} from '$lib/types';
 	import {
 		buildMentionInsertion,
-		containsCodeSpan,
-		containsFileMentionLink,
 		findCommandToken,
 		findMentionToken,
 		getConversationModel,
 		isIMEComposing,
-		isOffsetInCodeBlock,
 		parseClipboardContent,
 		uuid
 	} from '$lib/utils';
@@ -59,9 +57,12 @@
 		AudioRecorder,
 		convertToWav,
 		createAudioFile,
-		isAudioRecordingSupported
+		describeMicrophoneError,
+		isAudioRecordingSupported,
+		microphoneUnavailableReason
 	} from '$lib/utils/browser-only';
 	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	interface Props {
 		// Data
@@ -109,31 +110,21 @@
 	}: Props = $props();
 
 	// Component References
-	// Shared handle of the two input renderers (plain textarea + rich chat form input).
-	type ChatInputHandle = {
-		focus(): void;
-		resetHeight(): void;
-		getElement(): HTMLElement | undefined;
-		getCaretOffset(): number;
-		setCaretOffset(offset: number): void;
-	};
 
 	let audioRecorder: AudioRecorder | undefined;
 	let chatFormActionsRef: ChatFormActions | undefined = $state(undefined);
 	let fileInputRef: ChatFormInputFileInputInvisible | undefined = $state(undefined);
 	let pickersRef: { handleKeydown: (event: KeyboardEvent) => boolean } | undefined =
 		$state(undefined);
-	let inputRef: ChatInputHandle | undefined = $state(undefined);
-
-	// Render-mode gate: the plain textarea by default, the rich chat form input
-	// while the buffer carries a `file://` mention link or a complete code
-	// span (badges and code chips need a DOM the textarea cannot provide).
-	// Demotes back once neither remains.
-	let useRichInput = $state(false);
+	let inputRef: ChatFormInput | undefined = $state(undefined);
 
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
+	/** Why this page can't record at all (no HTTPS, no recorder), which no tap fixes. */
+	let micUnavailableReason = $state<string | null>(null);
+	/** Why the last start failed (denied, no microphone, busy); the next tap tries again. */
+	let micError = $state<string | null>(null);
 
 	// Invisible anchor at the form's top edge so the mention/WD popovers
 	// float above the box.
@@ -141,6 +132,14 @@
 
 	let cwd = $derived(
 		conversationsStore.activeConversation?.cwd ?? conversationsStore.preferences.pendingCwd
+	);
+
+	let showWorkingDirectory = $derived(conversationsStore.preferences.hasEnabledCwdTools());
+	// A phone has no chip for the working directory under the form: a chat shows it in its
+	// header (see ChatScreenMobileHeader), and a new chat, which has no header yet, offers it in
+	// the + menu
+	let isWorkingDirectoryInAddMenu = $derived(
+		showWorkingDirectory && deviceStore.isMobile && !conversationsStore.activeConversation
 	);
 
 	const pickers = useChatFormPickers({
@@ -219,36 +218,9 @@
 	);
 	let canSubmit = $derived(value.trim().length > 0 || hasAttachments);
 
-	// Caret offset restored after a renderer swap. Callers that mutate
-	// `value` themselves (e.g. the mention picker) pin the target offset
-	// BEFORE the assignment; otherwise the swap effect snapshots the
-	// current caret.
-	let pendingCaretOffset = 0;
-	let caretOffsetPinned = false;
-
-	function queueCaretRestore() {
-		queueMicrotask(() => {
-			inputRef?.focus();
-			inputRef?.setCaretOffset(pendingCaretOffset);
-			caretOffsetPinned = false;
-		});
-	}
-
-	$effect(() => {
-		const wantRichInput = containsFileMentionLink(value ?? '') || containsCodeSpan(value ?? '');
-
-		if (useRichInput === wantRichInput) return;
-
-		if (!caretOffsetPinned) {
-			pendingCaretOffset = inputRef?.getCaretOffset() ?? (value ?? '').length;
-		}
-
-		useRichInput = wantRichInput;
-		queueCaretRestore();
-	});
-
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
+		micUnavailableReason = microphoneUnavailableReason();
 		audioRecorder = new AudioRecorder();
 	});
 
@@ -256,8 +228,8 @@
 		inputRef?.focus();
 	}
 
-	export function resetTextareaHeight() {
-		inputRef?.resetHeight();
+	export function openWorkingDirectoryPicker() {
+		pickers.handleWorkingDirectoryOpen();
 	}
 
 	export function openModelSelector() {
@@ -296,8 +268,10 @@
 
 	function handleKeydown(event: KeyboardEvent) {
 		// Pickers consume navigation/escape keys first; when consumed, skip
-		// the enter-to-submit logic below.
+		// the enter-to-submit logic below and keep the key from the editor.
 		if (pickers.handleKeydown(event)) {
+			event.preventDefault();
+
 			return;
 		}
 
@@ -305,12 +279,11 @@
 			const isModifier = event.ctrlKey || event.metaKey;
 			const sendOnEnter = currentConfig.sendOnEnter !== false;
 
-			// Caret inside a fenced code block (closed, or still open
-			// while being typed): Enter adds a line, never submits. The
-			// rich chat form input consumes this case locally; this gate
-			// covers the plain textarea, where skipping submit lets the
-			// native newline through.
-			if (!isModifier && isOffsetInCodeBlock(value ?? '', inputRef?.getCaretOffset() ?? 0)) {
+			// Caret inside a code block (``` or ~~~ fenced, closed or
+			// still open while being typed, or indented): Enter adds a
+			// line, never submits - skipping submit lets the editor's own
+			// newline through.
+			if (!isModifier && inputRef?.isCaretInCodeBlock()) {
 				return;
 			}
 
@@ -501,23 +474,18 @@
 
 		if (!built) return;
 
-		// Pin the post-insertion caret BEFORE the swap effect runs;
-		// otherwise the effect clobbers it with the textarea's selection
-		// at promotion time (browser-dependent: usually reset to 0).
-		pendingCaretOffset = built.caretOffset;
-		caretOffsetPinned = true;
-
-		value = built.newValue;
-		onValueChange?.(built.newValue);
-
-		// Already in rich chat form input mode: no renderer flip, so the swap
-		// effect's caret restore never runs.
-		if (useRichInput) {
-			queueCaretRestore();
-		}
+		// one undoable edit; the input reports the new value like typing
+		inputRef?.replaceText(built.newValue, built.caretOffset);
 	}
 
 	async function handleMicClick() {
+		// a phone shows no tooltip on a tap, so the reason comes as a toast
+		if (micUnavailableReason) {
+			toast.error(micUnavailableReason);
+
+			return;
+		}
+
 		if (!audioRecorder || !recordingSupported) {
 			console.warn('Audio recording not supported');
 
@@ -539,8 +507,10 @@
 			try {
 				await audioRecorder.startRecording();
 				isRecording = true;
+				micError = null;
 			} catch (error) {
-				console.error('Failed to start recording:', error);
+				micError = describeMicrophoneError(error);
+				toast.error(micError);
 			}
 		}
 	}
@@ -617,7 +587,6 @@
 				onKeydown={handleKeydown}
 				onPaste={handlePaste}
 				{placeholder}
-				{useRichInput}
 			/>
 
 			{#if mcpStore.resources.hasAttachments}
@@ -638,10 +607,14 @@
 				{isLoading}
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
+				micWarning={micUnavailableReason ?? micError}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
+				onWorkingDirectoryClick={isWorkingDirectoryInAddMenu
+					? pickers.handleWorkingDirectoryOpen
+					: undefined}
 				{showAddButton}
 				{showModelSelector}
 				{uploadedFiles}
@@ -651,7 +624,8 @@
 
 	<ContextGaugePopup />
 
-	{#if conversationsStore.preferences.hasEnabledCwdTools()}
+	{#if showWorkingDirectory}
+		<!-- a phone opens the picker from elsewhere (see isWorkingDirectoryInAddMenu): no chip here -->
 		<ChatFormCurrentWorkingDirectory
 			bind:query={pickers.workingDirectoryQuery}
 			customAnchor={mentionAnchor}
@@ -661,6 +635,7 @@
 			onChange={handleWorkingDirectoryChange}
 			onClose={pickers.handleWorkingDirectoryClose}
 			onOpen={pickers.handleWorkingDirectoryOpen}
+			showChip={!deviceStore.isMobile}
 		/>
 	{/if}
 </form>

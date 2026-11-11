@@ -302,10 +302,12 @@ export interface ChatMessageActionsContext {
 	readonly siblingInfo: ChatMessageSiblingInfo | null;
 	readonly deletionInfo: ChatMessageDeletionInfo | null;
 	readonly showDeleteDialog: boolean;
+	readonly showForkDialog: boolean;
 	copy: () => void;
 	requestDelete: () => void;
 	confirmDelete: () => void;
 	setShowDeleteDialog: (show: boolean) => void;
+	setShowForkDialog: (show: boolean) => void;
 	navigateToSibling: (siblingId: string) => void;
 	forkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
 }
@@ -354,4 +356,6 @@ export interface ChatFormActionsContext {
 	readonly hasVisionModality: boolean;
 	onFileUpload?: () => void;
 	onSystemPromptClick?: () => void;
+	/** Opens the working directory picker; set where the + menu offers it (a phone's new chat). */
+	onWorkingDirectoryClick?: () => void;
 }

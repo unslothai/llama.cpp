@@ -555,7 +555,7 @@ struct server_task_result_embd : server_task_result {
 
 // one event of a realtime conversation: text and audio of the response being generated, or its end
 struct server_task_result_realtime : server_task_result {
-    std::string        text;
+    common_chat_input  content;             // the text with its token
     std::vector<float> audio;               // PCM F32 at the sample rate of mtmd_gen_audio_get_info()
     bool               response_done = false;
     bool               cancelled     = false;
@@ -686,7 +686,8 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -706,8 +707,8 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_data main;
+    common_state_data drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -722,7 +723,7 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
+            res += ckpt->size();
         }
 
         return res;

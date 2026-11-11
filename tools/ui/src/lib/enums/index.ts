@@ -26,8 +26,7 @@ export {
 	PdfViewMode,
 	ReasoningFormat,
 	ChatFormCommandAction,
-	FileMentionEntryType,
-	ChatFormInputRichTokenKind
+	FileMentionEntryType
 } from './chat.enums';
 
 export { SessionRecordType } from './conversation-import.enums';
@@ -100,8 +99,10 @@ export {
 	ColorMode,
 	HtmlInputType,
 	McpPromptVariant,
+	MenuKind,
 	ScrollCarouselVariant,
 	SidebarAction,
+	SidebarSectionKind,
 	TooltipSide,
 	UrlProtocol
 } from './ui.enums';
