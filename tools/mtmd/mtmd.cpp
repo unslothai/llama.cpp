@@ -1025,6 +1025,7 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_KIMIK25:
+            case PROJECTOR_TYPE_KIMIK3:
                 {
                     // GLM-5.2-V reuses the Kimi-K2.5 vision encoder and projector, but marks
                     // images with its own tokens, so decide based on the text model vocab

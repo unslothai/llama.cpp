@@ -7044,6 +7044,7 @@ class VisionProjectorType:
     KIMIVL = "kimivl"
     PADDLEOCR = "paddleocr"
     KIMIK25 = "kimik25"
+    KIMIK3 = "kimik3"
     KIMIK31 = "kimik31"
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"

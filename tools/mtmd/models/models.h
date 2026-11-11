@@ -593,6 +593,13 @@ struct mtmd_graph_parakeet : mtmd_graph {
     ggml_cgraph * build() override;
 };
 
+struct mtmd_graph_kimik3 : mtmd_graph {
+    mtmd_graph_kimik3(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+
+    ggml_tensor * resize_position_embeddings_3d(uint32_t interpolation_mode);
+};
+
 struct mtmd_graph_exaone4_5 : mtmd_graph {
     mtmd_graph_exaone4_5(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
     ggml_cgraph * build() override;

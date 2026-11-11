@@ -894,6 +894,10 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_deepseek4v>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_KIMIK3:
+            {
+                builder = std::make_unique<mtmd_graph_kimik3>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_COGVLM:
             {
                 builder = std::make_unique<mtmd_graph_cogvlm>(ctx, img);
