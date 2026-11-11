@@ -114,6 +114,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: true,
+				help: 'Render the markdown in the message input as you write it: every line but the one you are on shows as it will look in the conversation. When disabled, the input shows the plain markdown text.',
+				key: SETTINGS_KEYS.LIVE_MARKDOWN_PREVIEW,
+				label: 'Live markdown preview in the message input',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: true,
 				help: 'Automatically show microphone button instead of send button when textarea is empty for models with audio modality support.',
 				key: SETTINGS_KEYS.AUTO_MIC_ON_EMPTY,
 				label: 'Show microphone on empty input',
@@ -332,6 +339,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				help: 'Display the organization name alongside model names in the model selector, in the trigger and in the model rows.',
 				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME,
 				label: 'Show organization name in model selector',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: false,
+				help: 'Keep the organization name on a phone too, where the model selector is narrow. Applies only while the organization name is shown.',
+				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME_ON_MOBILE,
+				label: 'Show organization name on mobile',
 				type: SettingsFieldType.CHECKBOX
 			},
 			{

@@ -1,11 +1,20 @@
-/** Data attribute that tags ChatFormInputRich code spans and blocks. */
-export const CODE_TOKEN_ATTR = 'data-code-token';
-
 export const INITIAL_FILE_SIZE = 0;
 export const PROMPT_CONTENT_SEPARATOR = '\n\n';
 export const CLIPBOARD_CONTENT_QUOTE_PREFIX = '"';
 export const PROMPT_TRIGGER_PREFIX = '/';
 export const NEW_CHAT_DRAFT_KEY = '__new_chat__';
+
+/**
+ * How far the chat form floats above the bottom of the screen: a phone browser's toolbar is
+ * already a margin below it (iOS Safari's most of all), and the installed app keeps it clear
+ * of the home indicator, in line with the bottom corner action.
+ */
+export const CHAT_FORM_BOTTOM_OFFSET = {
+	desktop: '1rem',
+	installedApp: '1.5rem',
+	iosSafari: '0.5rem',
+	phoneBrowser: '0.75rem'
+} as const;
 
 /**
  * The chat form moving between its centered (new chat) and bottom positions:
