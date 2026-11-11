@@ -1287,15 +1287,21 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from graph key to cuda_graph - allows multiple graphs per context when the
+    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
+    // split is called with different tensor shapes (e.g. a speculative verify batch)
+    // a cuda graph instance is only valid for the shapes it captured, so a caller that
+    // alternates shapes needs one instance per shape to stay on the graph path. the map is
+    // bounded only by the time based sweep below, as upstream does: tensor split mode alone
+    // needs about 2 * n_layers + 1 graphs per device and shape, so any count cap small enough
+    // to matter evicts graphs that are still in use and re-captures them on every token
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time = 0;
 
     // defined in ggml-cuda.cu, which includes graph.cuh
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr, int64_t time_now = ggml_time_us());
+    ggml_cuda_graph * cuda_graph(uint64_t graph_key, int64_t time_now = ggml_time_us());
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
