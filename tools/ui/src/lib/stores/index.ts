@@ -32,13 +32,20 @@ export { contextStatsStore } from './chat/context-stats.svelte';
 export { agenticStore } from './agentic/index.svelte';
 
 // CONVERSATIONS
+export { sidebarDragStore } from './sidebar-drag.svelte';
 export { conversationsStore } from './conversations/index.svelte';
 
 // MCP
 export { mcpStore } from './mcp/index.svelte';
 
+// GROUPS (named sidebar sections for chats)
+export { groupsStore } from './groups.svelte';
+
 // MODELS
 export { modelsStore } from './models/index.svelte';
+
+// MODELS DISCOVER (HuggingFace browse state for the discover dialog)
+export { modelsDiscoverStore } from './models-discover/index.svelte';
 
 // SERVER
 export { serverStore } from './server.svelte';
@@ -48,8 +55,6 @@ export { uiStore } from './ui.svelte';
 
 // SETTINGS / UI PREFERENCES
 export { settingsStore } from './settings/index.svelte';
-
-export { settingsReferrer } from './settings/referrer.svelte';
 
 export { permissionsStore } from './permissions.svelte';
 

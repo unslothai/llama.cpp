@@ -25,6 +25,10 @@
 	<div class="py-8 text-center text-sm text-muted-foreground">No tools available</div>
 {:else}
 	<div class="space-y-2">
+		<p class="text-sm text-muted-foreground">
+			Applies to new conversations. Tool picks inside a chat only affect that chat.
+		</p>
+
 		{#each groups as group (group.key)}
 			{@const isExpanded = expandedGroups.has(group.key)}
 			<Collapsible.Root onOpenChange={() => toggleExpanded(group.key)} open={isExpanded}>
@@ -36,6 +40,22 @@
 					{:else}
 						<ChevronRight class="h-3.5 w-3.5 shrink-0" />
 					{/if}
+
+					{@const groupToggleKey =
+						group.source === ToolSource.MCP && group.serverId
+							? toolsStore.getMcpServerToolsKey(group.serverId)
+							: null}
+
+					<Checkbox
+						checked={groupToggleKey
+							? toolsStore.isToolEnabled(groupToggleKey)
+							: toolsStore.isCategoryEnabled(group.source)}
+						onCheckedChange={() =>
+							groupToggleKey
+								? toolsStore.toggleTool(groupToggleKey)
+								: toolsStore.toggleCategory(group.source)}
+						onclick={(e) => e.stopPropagation()}
+					/>
 
 					{@const faviconUrl = group.serverId ? mcpStore.getServerFavicon(group.serverId) : null}
 

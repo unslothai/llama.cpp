@@ -2,14 +2,20 @@
 	import { goto } from '$app/navigation';
 	import {
 		ChatMessageAssistant,
+		ChatMessageCompaction,
 		ChatMessageMcpPrompt,
 		ChatMessageSynthetic,
 		ChatMessageSystem,
 		ChatMessageUser
 	} from '$lib/components/app/chat';
-	import { REASONING_TAGS, ROUTES, SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
+	import {
+		AGENTIC_TEXT_COPY_SEPARATOR,
+		REASONING_TAGS,
+		ROUTES,
+		SYSTEM_MESSAGE_PLACEHOLDER
+	} from '$lib/constants';
 	import { setChatMessageActionsContext, setChatMessageEditContext } from '$lib/contexts';
-	import { AgenticSectionType, AttachmentType, MessageRole } from '$lib/enums';
+	import { AgenticSectionType, AttachmentType, MessageRole, MessageType } from '$lib/enums';
 	import { DatabaseService } from '$lib/services/database.service';
 	import { chatStore, conversationsStore, deviceStore } from '$lib/stores';
 	import type {
@@ -55,6 +61,7 @@
 	// Synthetic cwd-change messages render with the folder-row UI instead
 	// of a user bubble. The persisted flag is the single source of truth.
 	let isSynthetic = $derived(Boolean(message.isSynthetic));
+	let isCompaction = $derived(message.type === MessageType.COMPACTION);
 
 	let rawEditContent = $derived.by(() => {
 		if (message.role !== MessageRole.ASSISTANT) return undefined;
@@ -105,6 +112,7 @@
 	let editedUploadedFiles = $state<ChatUploadedFile[]>([]);
 	let isEditing = $state(false);
 	let showDeleteDialog = $state(false);
+	let showForkDialog = $state(false);
 	let shouldBranchAfterEdit = $state(false);
 	let textareaElement: HTMLTextAreaElement | undefined = $state();
 
@@ -181,8 +189,14 @@
 		navigateToSibling: handleNavigateToSibling,
 		requestDelete: handleDelete,
 		setShowDeleteDialog: handleShowDeleteDialogChange,
+		setShowForkDialog: (show: boolean) => {
+			showForkDialog = show;
+		},
 		get showDeleteDialog() {
 			return showDeleteDialog;
+		},
+		get showForkDialog() {
+			return showForkDialog;
 		},
 		get siblingInfo() {
 			return siblingInfo;
@@ -237,6 +251,24 @@
 	}
 
 	function handleCopy() {
+		// Agentic sessions render as a single entry anchored on the first assistant
+		// turn, whose own content is typically just the first tool call. Copy the
+		// text sections of the whole session so the clipboard matches the visible
+		// response instead of the anchor turn.
+		if (message.role === MessageRole.ASSISTANT) {
+			const sections = deriveAgenticSections(message, toolMessages, [], false);
+			const text = sections
+				.filter((section) => section.type === AgenticSectionType.TEXT)
+				.map((section) => section.content)
+				.join(AGENTIC_TEXT_COPY_SEPARATOR);
+
+			if (text) {
+				chatActions.copy(message, text);
+
+				return;
+			}
+		}
+
 		chatActions.copy(message);
 	}
 
@@ -290,6 +322,10 @@
 		chatActions.regenerateWithBranching(message, modelOverride);
 	}
 
+	function handleRegenerateCompaction() {
+		chatActions.regenerateCompaction(message);
+	}
+
 	function handleContinue() {
 		chatActions.continueAssistantMessage(message);
 	}
@@ -306,7 +342,7 @@
 	function focusMainChatForm() {
 		if (deviceStore.isMobile) return;
 
-		document.querySelector<HTMLTextAreaElement>('.chat-screen-form-wrapper textarea')?.focus();
+		document.querySelector<HTMLElement>('.chat-screen-form-wrapper .cm-content')?.focus();
 	}
 
 	async function handleSaveEdit() {
@@ -381,11 +417,13 @@
 	}
 </script>
 
-<div class:chat-message--synthetic={isSynthetic} class="chat-message">
+<div>
 	{#if message.role === MessageRole.SYSTEM}
 		<ChatMessageSystem bind:textareaElement class={className} {message} />
 	{:else if mcpPromptExtra}
 		<ChatMessageMcpPrompt class={className} mcpPrompt={mcpPromptExtra} {message} />
+	{:else if isCompaction}
+		<ChatMessageCompaction class={className} {message} onRegenerate={handleRegenerateCompaction} />
 	{:else if isSynthetic}
 		<ChatMessageSynthetic class={className} {message} />
 	{:else if message.role === MessageRole.USER}
@@ -402,25 +440,3 @@
 		/>
 	{/if}
 </div>
-
-<style>
-	/*
-	 * The browser skips layout and paint for messages outside the
-	 * viewport. contain-intrinsic-size reuses the last rendered size
-	 * once known; 500px sizes messages that have never been rendered.
-	 */
-	.chat-message {
-		--chat-message-intrinsic-size: 500px;
-		content-visibility: auto;
-		contain-intrinsic-size: auto var(--chat-message-intrinsic-size);
-	}
-
-	/*
-	 * Synthetic rows (e.g. the working-directory change) are small, so an
-	 * accurate placeholder keeps the injected row from inflating the
-	 * auto-scroll offset; the 500px default is for ordinary bubbles.
-	 */
-	.chat-message--synthetic {
-		--chat-message-intrinsic-size: 40px;
-	}
-</style>

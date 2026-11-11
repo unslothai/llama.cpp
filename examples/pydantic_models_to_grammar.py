@@ -1177,7 +1177,7 @@ def create_dynamic_model_from_function(func: Callable[..., Any]):
         dynamic_fields[param.name] = (
             param.annotation if param.annotation != inspect.Parameter.empty else str, default_value)
     # Creating the dynamic model
-    dynamic_model = create_model(f"{getattr(func, '__name__')}", **dynamic_fields)
+    dynamic_model = create_model(f"{getattr(func, '__name__')}", **dynamic_fields)  # ty: ignore[no-matching-overload]
 
     for name, param_doc in param_docs:
         dynamic_model.model_fields[name].description = param_doc.description
@@ -1285,7 +1285,7 @@ def convert_dictionary_to_pydantic_model(dictionary: dict[str, Any], model_name:
                     if items != {}:
                         array = {"properties": items}
                         array_type = convert_dictionary_to_pydantic_model(array, f"{model_name}_{field_name}_items")
-                        fields[field_name] = (list[array_type], ...)  # ty: ignore[invalid-type-form]
+                        fields[field_name] = (list[array_type], ...)
                     else:
                         fields[field_name] = (list, ...)
                 elif field_type == "object":

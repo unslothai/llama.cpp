@@ -9,20 +9,26 @@
 
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
-import { ROUTES } from '$lib/constants';
+import { NEW_CHAT_TAB_ID, ROUTES } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import { ConversationTransferService } from '$lib/services/conversation-transfer.service';
 import { DatabaseService } from '$lib/services/database.service';
 import { MigrationService } from '$lib/services/migration.service';
 import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
+import { draftMessagesStore } from '$lib/stores/chat/drafts.svelte';
 import {
 	ConversationPreferences,
 	type ConversationsPreferencesHost
 } from '$lib/stores/conversations/preferences.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { tabsStore } from '$lib/stores/tabs.svelte';
-import { filterByLeafNodeId, findLeafNode, generateConversationTitle } from '$lib/utils';
+import {
+	collectForkFamily,
+	filterByLeafNodeId,
+	findLeafNode,
+	generateConversationTitle
+} from '$lib/utils';
 import { SvelteSet } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -51,6 +57,13 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 	/** In-flight init run; shared by concurrent callers, reset on failure to allow retry */
 	private initPromise: Promise<void> | null = null;
+
+	/**
+	 * Messages loadConversation just read, handed off once so the chat
+	 * screen can reuse them for sibling info instead of re-fetching the
+	 * whole conversation a second time.
+	 */
+	private lastLoadedMessages: { convId: string; messages: DatabaseMessage[] } | null = null;
 
 	/**
 	 * Memo of the last findMessageIndex() lookup. Streaming calls it once per
@@ -88,7 +101,13 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		if (this.activeConversation?.id === id) {
-			this.activeConversation = { ...this.activeConversation, ...updates };
+			// field-wise, not object replacement: effects that track the active
+			// conversation identity would otherwise refire on every rename or pin
+			const target = this.activeConversation as unknown as Record<string, unknown>;
+
+			for (const [key, value] of Object.entries(updates)) {
+				if (target[key] !== value) target[key] = value;
+			}
 		}
 	}
 
@@ -102,6 +121,23 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			convId,
 			generateConversationTitle(content, Boolean(settingsStore.config.titleGenerationUseFirstLine))
 		);
+	}
+
+	/**
+	 * Puts the active conversation into a group, or out of one with null.
+	 * With no active conversation the pick is buffered and the next created
+	 * chat joins that group.
+	 *
+	 * @param groupId - Target group, null to leave the current one
+	 */
+	async assignActiveConversationGroup(groupId: string | null): Promise<void> {
+		const active = this.activeConversation;
+
+		if (active) {
+			await this.setConversationGroup(active.id, groupId);
+		} else {
+			this.preferences.pendingGroupId = groupId;
+		}
 	}
 
 	/**
@@ -143,7 +179,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 				tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 				this.clearActiveConversation();
-				await tabsStore.close(activeId, activeId);
+				await tabsStore.closeConversation(activeId);
 			} else {
 				tabsStore.removeTabs([...idsToRemove]);
 			}
@@ -168,15 +204,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		if (convIds.length === 0) return;
 
 		try {
-			const fetched = await DatabaseService.getConversationsWithMessages(convIds);
-			const activeId = this.activeConversation?.id;
-			const overridden = fetched.get(activeId ?? '');
-
-			if (overridden && activeId) {
-				overridden.conv = { ...this.activeConversation! };
-			}
-
-			const exported = [...fetched.values()];
+			const exported = await this.getConversationsForExport(convIds);
 
 			if (exported.length === 0) {
 				toast.error('No conversations to export');
@@ -210,11 +238,8 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			const updates = await DatabaseService.bulkToggleConversationPins(convIds);
 			const activeId = this.activeConversation?.id;
 
-			if (activeId && updates.has(activeId)) {
-				this.activeConversation = {
-					...this.activeConversation!,
-					pinned: updates.get(activeId)!
-				};
+			if (this.activeConversation && activeId && updates.has(activeId)) {
+				this.activeConversation.pinned = updates.get(activeId)!;
 			}
 
 			for (let i = 0; i < this.conversations.length; i++) {
@@ -244,28 +269,57 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		this.preferences.resetPending();
 	}
 
+	/** One-shot handoff of the messages the last loadConversation read. */
+	consumeLastLoadedMessages(convId: string): DatabaseMessage[] | null {
+		if (this.lastLoadedMessages?.convId !== convId) return null;
+
+		const messages = this.lastLoadedMessages.messages;
+
+		this.lastLoadedMessages = null;
+
+		return messages;
+	}
+
 	/**
 	 * Creates a new conversation and navigates to it
 	 * @param name - Optional name for the conversation
+	 * @param draft - Optional input draft to carry over to the new conversation
 	 * @returns The ID of the created conversation
 	 */
-	async createConversation(name?: string): Promise<string> {
+	async createConversation(
+		name?: string,
+		draft?: { message: string; files: ChatUploadedFile[] }
+	): Promise<string> {
 		const conversationName = name || `Chat ${new Date().toLocaleString()}`;
-		// Working directory and reasoning effort picked on the new-chat screen
-		// get threaded into the new conversation here, then cleared so they
-		// don't bleed onto subsequent new chats.
+		// The tool policy is seeded from the current defaults: edits made inside
+		// the conversation afterwards live on its row and do not flow back into
+		// the defaults. Working directory picked on the new-chat screen gets
+		// threaded in here too, then cleared so it doesn't bleed onto subsequent
+		// new chats.
 		const conversation = await DatabaseService.createConversation(conversationName, {
 			cwd: this.preferences.pendingCwd ?? undefined,
-			reasoningEffort: this.preferences.pendingReasoningEffort
+			groupId: this.preferences.pendingGroupId ?? undefined,
+			reasoningEffort: this.preferences.pendingReasoningEffort,
+			...this.preferences.getToolPolicySnapshot()
 		});
 
 		this.preferences.pendingCwd = null;
+		this.preferences.pendingGroupId = null;
 
 		this.conversations = [conversation, ...this.conversations];
 		this.activeConversation = conversation;
 		this.activeMessages = [];
 
+		if (draft) {
+			draftMessagesStore.saveDraftMessage(conversation.id, draft.message, draft.files);
+		}
+
 		await goto(RouterService.chat(conversation.id));
+
+		// the draft moved to the new conversation, so drop the copy saved for the new-chat screen
+		if (draft) {
+			draftMessagesStore.clearDraftMessage(undefined);
+		}
 
 		return conversation.id;
 	}
@@ -324,7 +378,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 					tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 					this.clearActiveConversation();
-					await tabsStore.close(activeId, activeId);
+					await tabsStore.closeConversation(activeId);
 				} else {
 					tabsStore.removeTabs([...idsToRemove]);
 				}
@@ -345,7 +399,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 				if (this.activeConversation?.id === convId) {
 					this.clearActiveConversation();
-					await tabsStore.close(convId, convId);
+					await tabsStore.closeConversation(convId);
 				} else {
 					tabsStore.removeTabs([convId]);
 				}
@@ -362,16 +416,11 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 * @param convId - The conversation ID to download
 	 */
 	async downloadConversation(convId: string): Promise<void> {
-		const conversation =
-			this.activeConversation?.id === convId
-				? this.activeConversation
-				: await DatabaseService.getConversation(convId);
+		const [exportedConversation] = await this.getConversationsForExport([convId]);
 
-		if (!conversation) return;
+		if (!exportedConversation) return;
 
-		const messages = await DatabaseService.getConversationMessages(convId);
-
-		ConversationTransferService.downloadConversationFile({ conv: conversation, messages });
+		ConversationTransferService.downloadConversationFile(exportedConversation);
 	}
 
 	/**
@@ -451,6 +500,28 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	}
 
 	/**
+	 * Gets conversations and their messages from the database for export.
+	 * @param convIds - Conversation IDs
+	 * @returns List of conversations with messages, ordered by the input IDs
+	 */
+	async getConversationsForExport(convIds: string[]): Promise<ExportedConversation[]> {
+		const [fetched, groups] = await Promise.all([
+			DatabaseService.getConversationsWithMessages(convIds),
+			DatabaseService.getAllGroups()
+		]);
+		const groupsById = new Map(groups.map((group) => [group.id, group]));
+
+		return convIds
+			.map((id) => fetched.get(id))
+			.filter((entry): entry is ExportedConversation => entry !== undefined)
+			.map((entry) => {
+				const group = entry.conv.groupId ? groupsById.get(entry.conv.groupId) : undefined;
+
+				return group ? { ...entry, group: { id: group.id, name: group.name } } : entry;
+			});
+	}
+
+	/**
 	 * Imports conversations from provided data (without file picker)
 	 * @param data - Array of conversation data with messages
 	 * @returns The conversations written to the database and the ones skipped
@@ -506,22 +577,15 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			// it doesn't belong to this conversation.
 			this.preferences.pendingCwd = null;
 
+			const allMessages = await DatabaseService.getConversationMessages(convId);
+
+			// set conversation and messages in one sync block so effects never see
+			// the new conversation with the previous conversation's messages
+			this.lastLoadedMessages = { convId, messages: allMessages };
 			this.activeConversation = conversation;
-
-			if (conversation.currNode) {
-				const allMessages = await DatabaseService.getConversationMessages(convId);
-				const filteredMessages = filterByLeafNodeId(
-					allMessages,
-					conversation.currNode,
-					false
-				) as DatabaseMessage[];
-
-				this.activeMessages = filteredMessages;
-			} else {
-				const messages = await DatabaseService.getConversationMessages(convId);
-
-				this.activeMessages = messages;
-			}
+			this.activeMessages = conversation.currNode
+				? (filterByLeafNodeId(allMessages, conversation.currNode, false) as DatabaseMessage[])
+				: allMessages;
 
 			return true;
 		} catch (error) {
@@ -555,7 +619,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		const currentLeafNodeId = findLeafNode(allMessages, siblingId);
 
 		await DatabaseService.updateCurrentNode(this.activeConversation.id, currentLeafNodeId);
-		this.activeConversation = { ...this.activeConversation, currNode: currentLeafNodeId };
+		this.activeConversation.currNode = currentLeafNodeId;
 		await this.refreshActiveMessages();
 
 		if (rootMessage && this.activeMessages.length > 0) {
@@ -586,11 +650,17 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	}
 
 	/**
-	 * Start a fresh chat by navigating to the bare `#/` new-chat screen. The
-	 * chat layout opens a new-chat tab for it when Conversation tabs are on.
+	 * Start a fresh chat by navigating to the bare `#/` new-chat screen.
+	 *
+	 * @param options.inNewTab - With Conversation tabs on, open it in a tab of
+	 *   its own, like the tab bar's "+", so the open chat keeps its tab
 	 */
-	async openNewChat(): Promise<void> {
+	async openNewChat({ inNewTab = false } = {}): Promise<void> {
+		if (inNewTab && settingsStore.config.conversationTabs)
+			await tabsStore.openInNewTab(NEW_CHAT_TAB_ID);
+
 		this.clearActiveConversation();
+		this.preferences.pendingGroupId = null;
 		await goto(ROUTES.START);
 	}
 
@@ -625,6 +695,33 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		return undefined;
+	}
+
+	/**
+	 * Moves a conversation with its whole fork family into a group, or out of one
+	 * when `groupId` is null: a family never splits across sections. A pinned chat
+	 * that joins a group leaves Pinned, since group sections do not show pinned chats.
+	 *
+	 * @param convId - Conversation to move
+	 * @param groupId - Target group, null to take the conversations out of their group
+	 */
+	async setConversationGroup(convId: string, groupId: string | null): Promise<void> {
+		const ids = new Set(collectForkFamily(this.conversations, convId));
+
+		try {
+			await DatabaseService.setConversationsGroup([...ids], groupId);
+
+			for (const conversation of this.conversations) {
+				if (!ids.has(conversation.id)) continue;
+
+				this.applyConversationUpdate(conversation.id, {
+					groupId: groupId ?? undefined,
+					...(groupId && conversation.pinned ? { pinned: false } : {})
+				});
+			}
+		} catch (error) {
+			console.error('Failed to move conversation to group:', error);
+		}
 	}
 
 	/**
@@ -691,7 +788,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		if (this.activeConversation?.id === targetId) {
-			this.activeConversation = { ...this.activeConversation, lastModified: now };
+			this.activeConversation.lastModified = now;
 		}
 
 		DatabaseService.updateConversation(targetId, { lastModified: now }).catch((error) =>
@@ -707,7 +804,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		if (!this.activeConversation) return;
 
 		await DatabaseService.updateCurrentNode(this.activeConversation.id, nodeId);
-		this.activeConversation = { ...this.activeConversation, currNode: nodeId };
+		this.activeConversation.currNode = nodeId;
 	}
 
 	/**

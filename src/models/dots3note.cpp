@@ -9,13 +9,9 @@ void llama_model_dots3note::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     hparams.f_norm_eps = 1e-6;  // eps for the indexer k_norm layer norm
 
-    // TODO: use MTP layer
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
-    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_all");
-
     // MoE parameters
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared);
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,  hparams.n_layer_dense_lead);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,        hparams.expert_weights_norm, false);
@@ -60,7 +56,7 @@ void llama_model_dots3note::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_embd_head_qk_rope = hparams.n_rot();
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
-    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_ff_exp        = hparams.n_ff_exp();
     const int64_t n_expert_shared = hparams.n_expert_shared;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -149,11 +145,19 @@ void llama_model_dots3note::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_dots3note::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+llama_rope_params llama_model_dots3note::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    res.freq_scale = cparams.rope_freq_scale;
+
+    return res;
 }
 
-llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_params & params) :
+std::unique_ptr<llm_graph_context> llama_model_dots3note::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(params);
+}
+
+llama_model_dots3note::graph::graph(const llm_graph_params & params) :
     llm_graph_context(params) {
     GGML_ASSERT(hparams.is_mla());
 
@@ -190,7 +194,6 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
         const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope;
 
         const float kq_scale    = 1.0f/sqrtf(float(n_embd_head_k_mla));
-        const float freq_base_l = model.get_rope_freq_base(cparams, il);
 
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
@@ -215,9 +218,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
 
                 // {n_embd_indexer_head, n_indexer_head, n_tokens}
                 indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, n_tokens);
-                indexer_q = ggml_rope_ext(ctx0, indexer_q, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+                indexer_q = build_rope_indexer(indexer_q, inp_pos, il);
                 cb(indexer_q, "indexer_q", il);
 
                 ggml_tensor * indexer_k = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_k, cur);
@@ -228,15 +229,13 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
 
                 // {n_embd_indexer_head, 1, n_tokens}
                 indexer_k = ggml_reshape_3d(ctx0, indexer_k, n_embd_indexer_head, 1, n_tokens);
-                indexer_k = ggml_rope_ext(ctx0, indexer_k, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+                indexer_k = build_rope_indexer(indexer_k, inp_pos, il);
                 cb(indexer_k, "indexer_k", il);
 
                 // perform Hadamard transform on indexer q and k
-                indexer_q = ggml_mul_mat(ctx0, inp_attn->get_dsa()->self_k_rot_lid, indexer_q);
+                indexer_q = ggml_mul_mat(ctx0, inp_attn->get_dsa()->self_k_rot_lid[il], indexer_q);
                 cb(indexer_q, "indexer_q", il);
-                indexer_k = ggml_mul_mat(ctx0, inp_attn->get_dsa()->self_k_rot_lid, indexer_k);
+                indexer_k = ggml_mul_mat(ctx0, inp_attn->get_dsa()->self_k_rot_lid[il], indexer_k);
                 cb(indexer_k, "indexer_k", il);
 
                 // store indexer keys to KV cache
@@ -260,7 +259,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
 
                 ggml_tensor * indexer_score = nullptr;
                 if (cparams.fused_lid) {
-                    indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn->get_dsa()->get_kq_mask_lid());
+                    indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn->get_dsa()->self_attn_mask_lid.raw);
                     cb(indexer_score, "indexer_score", il);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
                 } else {
@@ -290,7 +289,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                     indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
                     cb(indexer_score, "indexer_score", il);
 
-                    ggml_tensor * indexer_kq_mask = inp_attn->get_dsa()->get_kq_mask_lid();
+                    ggml_tensor * indexer_kq_mask = inp_attn->get_dsa()->self_attn_mask_lid.raw;
                     indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
                     cb(indexer_score, "indexer_score", il);
                 }
@@ -336,12 +335,10 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
             k_pe = build_norm(k_pe, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
             cb(k_pe, "k_pe", il);
 
-            q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            q_pe = build_rope(q_pe, inp_pos, il);
             cb(q_pe, "q_pe", il);
 
-            k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            k_pe = build_rope(k_pe, inp_pos, il);
             cb(k_pe, "k_pe", il);
 
             kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
@@ -475,6 +472,4 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

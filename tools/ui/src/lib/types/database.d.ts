@@ -1,6 +1,12 @@
-import { AttachmentType, ReasoningEffort } from '$lib/enums';
+import { AttachmentType, ReasoningEffort, ToolSource } from '$lib/enums';
 import type { ChatMessageTimings, ChatMessageType, ChatRole } from '$lib/types/chat';
+import type { Group } from '$lib/types/groups';
 
+/**
+ * @deprecated Legacy per-conversation MCP server flags. MCP server enabled
+ * state is global now; per-conversation tool policy lives in
+ * `disabledTools` / `disabledToolCategories`. Read by the migration only.
+ */
 export interface McpServerOverride {
 	serverId: string;
 	enabled: boolean;
@@ -11,11 +17,18 @@ export interface DatabaseConversation {
 	id: string;
 	lastModified: number;
 	name: string;
+	/** @deprecated See {@link McpServerOverride}. Kept on rows for downgrade compatibility. */
 	mcpServerOverrides?: McpServerOverride[];
 	thinkingEnabled?: boolean;
 	reasoningEffort?: ReasoningEffort;
 	cwd?: string;
+	/** Tool keys disabled for this conversation, incl. server-scoped MCP group keys (`mcp:<serverId>`) */
+	disabledTools?: string[];
+	/** Tool categories disabled for this conversation */
+	disabledToolCategories?: ToolSource[];
 	forkedFromConversationId?: string;
+	/** Sidebar group the conversation is sorted into. */
+	groupId?: string;
 	pinned?: boolean;
 }
 
@@ -124,6 +137,8 @@ export interface DatabaseMessage {
 	toolCwd?: string;
 	/** Internal flag marking a UI-generated message (e.g. a cwd change). The row is sent to the model as a "user" turn so chat templates accept it; the flag is only read by the renderer. */
 	isSynthetic?: boolean;
+	/** Steps a compaction node keeps as written before it, read by the model after its summary */
+	kept?: number;
 	children: string[];
 	extra?: DatabaseMessageExtra[];
 	timings?: ChatMessageTimings;
@@ -132,6 +147,8 @@ export interface DatabaseMessage {
 
 export type ExportedConversation = {
 	conv: DatabaseConversation;
+	/** The conversation's group, so an import elsewhere can sort it into one of that name. */
+	group?: Pick<Group, 'id' | 'name'>;
 	messages: DatabaseMessage[];
 };
 
