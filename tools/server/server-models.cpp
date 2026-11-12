@@ -714,6 +714,8 @@ void server_models::unfinished_downloads_remove(const std::string & name) {
     }
     bool ok = common_download_remove(name);
     SRV_INF("removing unfinished download name=%s (%s)\n", name.c_str(), ok ? "succeeded" : "nothing cached");
+    // other clients still list it as a paused download
+    notify_sse("model_remove", name, {});
 }
 
 bool server_models::remove_sidecar(const std::string & name, const std::string & kind) {
@@ -1361,6 +1363,7 @@ void server_models::unload(const std::string & name) {
     if (it != mapping.end()) {
         if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
+            it->second.download_stop_requested = true;
             it->second.request_exit();
             // for convenience, we wait the status change here
             wait(lk, name, [](const server_model_meta & new_meta) {
@@ -1388,6 +1391,7 @@ void server_models::unload_all() {
     for (auto & [name, inst] : mapping) {
         if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
+            inst.download_stop_requested = true;
             inst.request_exit();
         } else if (inst.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
@@ -1483,6 +1487,7 @@ void server_models::update_status(const std::string & name, const update_status_
 
 void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok) {
     json curr;
+    bool stopped = false;
     {
         std::lock_guard<std::mutex> lk(mutex);
         auto it = mapping.find(name);
@@ -1491,6 +1496,7 @@ void server_models::update_download_progress(const std::string & name, const com
                 // mark the instance to be erased on next load_models() call
                 it->second.meta.status = SERVER_MODEL_STATUS_DOWNLOADED;
                 need_reload = true;
+                stopped = it->second.download_stop_requested;
 
                 // a download that failed keeps its tag: its partial files are still
                 // there and re-posting the tag resumes them
@@ -1512,7 +1518,13 @@ void server_models::update_download_progress(const std::string & name, const com
     }
     if (done) {
         cv.notify_all(); // notify in case unload() is waiting for download to be cancelled
-        notify_sse(ok ? "download_finished" : "download_failed", name, {});
+        // a stop a client asked for (pause or cancel) is no error: say so, so that every
+        // client, not only the one that asked, can tell it from a failed download
+        if (ok) {
+            notify_sse("download_finished", name, {});
+        } else {
+            notify_sse("download_failed", name, stopped ? json{{"stopped", true}} : json{});
+        }
     } else {
         notify_sse("download_progress", name, curr);
     }
@@ -1535,6 +1547,7 @@ bool server_models::remove(const std::string & name) {
     if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
         // cancel in-flight download
         SRV_INF("cancelling download for model name=%s\n", name.c_str());
+        it->second.download_stop_requested = true;
         it->second.request_exit();
     } else if (it->second.meta.is_running()) {
         // stop running instance
@@ -2643,7 +2656,8 @@ server_http_proxy::server_http_proxy(
         const std::map<std::string, uploaded_file> & files,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
-        int32_t timeout_write
+        int32_t timeout_write,
+        const std::string & resolved_addr
         ) {
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
@@ -2658,7 +2672,11 @@ server_http_proxy::server_http_proxy(
     }
 
     // setup Client
-    cli->set_follow_location(true);
+    if (!resolved_addr.empty()) {
+        // pin the checked address; a redirect could lead to an unchecked one
+        cli->set_direct_hostname_addr_map({{host, resolved_addr}});
+    }
+    cli->set_follow_location(resolved_addr.empty());
     cli->set_connection_timeout(timeout_read, 0); // use --timeout value instead of hardcoded 5 s
     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
     cli->set_read_timeout(timeout_write, 0);
