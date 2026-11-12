@@ -55,6 +55,9 @@ static __global__ void flash_attn_ext_banded_f32(
         uint64_t m_nb1,
         uint64_t m_nb2,
         uint64_t m_nb3,
+        const float * __restrict__ sinks,
+        int64_t sinks_s1,
+        int64_t sinks_s2,
         uint64_t r_nb0,
         uint64_t r_nb1,
         uint64_t r_nb2,
@@ -148,6 +151,22 @@ static __global__ void flash_attn_ext_banded_f32(
         row_sum = row_sum*old_scale + value_scale;
     }
 
+    // attention sink: an extra logit with a zero value
+    if (sinks) {
+        const float sink = sinks[ih + iq*sinks_s1 + ib*sinks_s2];
+        if (sink > row_max) {
+            const float old_scale = expf(row_max - sink);
+#pragma unroll
+            for (int j = 0; j < values_per_lane; ++j) {
+                out[j] *= old_scale;
+            }
+            row_sum = row_sum*old_scale + 1.0f;
+            row_max = sink;
+        } else {
+            row_sum += expf(sink - row_max);
+        }
+    }
+
     const float inv_sum = row_sum == 0.0f ? 0.0f : 1.0f/row_sum;
     float * dst_row = dst + ((ib*n_q + iq)*n_head_q + ih)*D;
 #pragma unroll
@@ -201,6 +220,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         (rel->ne[3] != 1 && rel->ne[3] != q->ne[3])) {
         return false;
     }
+    const ggml_tensor * sinks = dst->src[4];
+    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
+        return false;
+    }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
@@ -214,6 +237,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[6];
+    const ggml_tensor * sinks = dst->src[4];
 
     // only the MMA kernel reads src[6]; delegating otherwise drops the bias
     if (ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
@@ -240,6 +264,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+        sinks ? (const float *) sinks->data : nullptr, \
+        sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \
+        sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
 
     if (q->ne[0] == 64) {
