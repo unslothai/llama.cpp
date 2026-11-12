@@ -328,14 +328,17 @@ jobs:
     # for a bundle that never shipped (same pattern as the CPU/CUDA children).
     #
     # The ROCm version is in the key, and in the restore prefix, because ccache hashes the compiler into every entry: a cache from another nightly can never hit.
+    # "depend" names the generation written in depend mode (see Configure ccache). An older cache can
+    # hold a manifest that maps current sources to an object with out-of-date GPU code, and a direct
+    # hit would keep returning it, so those caches are never restored.
     - name: ccache
       # Best-effort; see the verification in Configure ccache below.
       continue-on-error: true
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
+        key: rocm-depend-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
+          rocm-depend-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         max-size: 2G
@@ -358,6 +361,12 @@ jobs:
           ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
           ccache --set-config=compression_level=6
+          # ROCm 10.1 and later: `clang -E` on a HIP source prints the host code only, so ccache's
+          # preprocessor fallback sees no change in per-arch code (#if defined(RDNA3) ...) and returns
+          # an object that still holds the old GPU code. Depend mode never preprocesses: a result is
+          # reused only when the source and every file the compiler read are unchanged
+          # (ggml-org/llama.cpp#31231).
+          ccache --set-config=depend_mode=true
           "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
         } else {
           Write-Output "::warning::ccache unusable (found '$have', need >= 4.10); building without a cache"
@@ -527,7 +536,7 @@ jobs:
       with:
         path: shards/${{ matrix.slice }}
         # Shard index ahead of the target so the generation prefix restore never picks a shard.
-        key: ccache-rocm-shard${{ matrix.slice }}-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: ccache-rocm-depend-shard${{ matrix.slice }}-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     # A late or failed shard only means this leg compiles that slice in the full build below.
     - name: Wait for the warm shards
@@ -544,13 +553,13 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: shards/1
-        key: ccache-rocm-shard1-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+        key: ccache-rocm-depend-shard1-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
     - name: Restore warm shard 2
       if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) >= 3 }}
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: shards/2
-        key: ccache-rocm-shard2-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
+        key: ccache-rocm-depend-shard2-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-
 
     - name: Merge warm shards into the ccache
       if: ${{ (matrix.slice || 0) == 0 && (matrix.slices || 1) >= 2 }}
@@ -661,6 +670,11 @@ jobs:
           Write-Error "ROCm bin directory not found: $rocmBinPath"
           exit 1
         }
+
+    # The MIT notice has to travel with the binaries, as it does in the CPU and Vulkan bundles.
+    - name: Add the llama.cpp license
+      if: ${{ (matrix.slice || 0) == 0 }}
+      run: Copy-Item llama.cpp\LICENSE llama.cpp\build\bin\LICENSE
 
     # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
     - name: Fetch kpack tooling
@@ -800,7 +814,7 @@ jobs:
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ github.workspace }}\.ccache
-        key: ccache-rocm-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: ccache-rocm-depend-windows-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-ubuntu:
     name: linux/${{ matrix.gfx_target }}
@@ -948,9 +962,9 @@ jobs:
       continue-on-error: true
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
+        key: rocm-depend-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}
         restore-keys: |
-          rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
+          rocm-depend-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}
         append-timestamp: false
         variant: ccache
         # ccache 4.13 from the action's binary; apt on ubuntu-22.04 ships 4.5.1.
@@ -974,6 +988,8 @@ jobs:
           ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
           ccache --set-config=compression_level=6
+          # Depend mode: see the Windows job.
+          ccache --set-config=depend_mode=true
           echo "CCACHE_LAUNCHER=ccache" >> "$GITHUB_ENV"
           exit 0
         fi
@@ -1098,34 +1114,37 @@ jobs:
         # If artifacts from ROCm or Llama.cpp change, you may need to update this list
         # To get a new list of all libraries, run:
         # gather_required_libs.py --rocm-dir /opt/rocm --dest-dir llama.cpp/build/bin
+        # cp -P keeps TheRock's libX.so -> libX.so.N -> libX.so.N.M links. Following them stored
+        # every library two or three times (1.2 GB of a 2.0 GB gfx1151 bundle), and gzip cannot
+        # fold copies that far apart, so the download was twice the size it needed to be.
         echo "Copying required ROCm libraries to build directory..."
-        cp -v /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
-        cp -v /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
-        cp -v /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
-        cp -v /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
-        cp -v /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
-        cp -v /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_liblzma.so* not found"
-        cp -v /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
-        cp -v /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
-        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
-        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
-        cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
-        cp -v /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
-        cp -v /opt/rocm/lib/libtensilelite-host.so* "$build_bin_path/" 2>/dev/null || echo "libtensilelite-host.so* not found"
-        cp -v /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
-        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
-        cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
+        cp -Pv /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
+        cp -Pv /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
+        cp -Pv /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
+        cp -Pv /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
+        cp -Pv /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
+        cp -Pv /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_liblzma.so* not found"
+        cp -Pv /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
+        cp -Pv /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
+        cp -Pv /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
+        cp -Pv /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
+        cp -Pv /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
+        cp -Pv /opt/rocm/lib/liborigami.so* "$build_bin_path/" 2>/dev/null || echo "liborigami.so* not found"
+        cp -Pv /opt/rocm/lib/libtensilelite-host.so* "$build_bin_path/" 2>/dev/null || echo "libtensilelite-host.so* not found"
+        cp -Pv /opt/rocm/lib/librocm_kpack.so* "$build_bin_path/" 2>/dev/null || echo "librocm_kpack.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
+        cp -Pv /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
+        cp -Pv /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$build_bin_path/" 2>/dev/null || echo "libclang-cpp.so* not found"
         # libtensilelite-host needs the unversioned libomp.so; cp follows the symlink.
         cp -v /opt/rocm/lib/llvm/lib/libomp.so "$build_bin_path/" 2>/dev/null || echo "libomp.so not found"
 
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
+        cp -Pv /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
 
         # libatomic.so.1 is a transitive dependency of librocm_sysdeps_numa
         # (libhsa-runtime64 -> numa -> libatomic) but it is a system GCC runtime
@@ -1216,10 +1235,10 @@ jobs:
           echo "::error::the rebuilt libhsa-runtime64 lacks exports the shipped one has"
           exit 1
         fi
-        # The copy step above flattened the .so / .so.1 / .so.1.x symlinks into files:
-        # replace every one, so no unpatched copy ships beside the one the loader uses.
+        # The .so and .so.1 names are links to this one file, so every name gets the patched runtime.
+        cp -v "$new_lib" "$old_lib"
         for f in "$build_bin_path"/libhsa-runtime64.so*; do
-          cp -v "$new_lib" "$f"
+          cmp -s "$new_lib" "$f" || { echo "::error::$f is not the rebuilt libhsa-runtime64"; exit 1; }
         done
 
         # HIP's ROCR imports resolve against the rebuilt runtime. Library-level
@@ -1232,13 +1251,21 @@ jobs:
         fi
         echo "libhsa-runtime64 rebuilt from rocm-systems $sha with the KFD wave count"
 
+    # The MIT notice has to travel with the binaries, as it does in the CPU and Vulkan bundles.
+    - name: Add the llama.cpp license
+      run: cp llama.cpp/LICENSE llama.cpp/build/bin/LICENSE
+
     - name: Set RPATH for portable distribution
       run: |
         sudo apt-get install -y patchelf
         cd llama.cpp/build/bin
-        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
-        for file in *.so* llama-*; do
-          [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
+        # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally.
+        # Every ELF file, not a name pattern: `llama` and `ggml-rpc-server` match neither *.so* nor
+        # llama-*, and shipped with the build tree's RUNPATH (lemonade-sdk/llamacpp-rocm#153).
+        for file in *; do
+          [ -f "$file" ] && [ ! -L "$file" ] || continue
+          file -b "$file" | grep -q '^ELF' || continue
+          patchelf --set-rpath '$ORIGIN' "$file"
         done
 
     # The source tarball carries no scripts/unsloth (the upstream checkout drops it).
@@ -1249,7 +1276,7 @@ jobs:
         sparse-checkout: scripts/unsloth
         persist-credentials: false
 
-    # After patchelf, which can leave a second copy of the reference; rewrites every copy (unslothai/unsloth#13663).
+    # After patchelf, which can leave a second copy of the reference in a library; rewrites every copy (unslothai/unsloth#13663).
     - name: Ship the rocBLAS kernel packs
       run: python3 kpack-tooling/scripts/unsloth/relocate_kpack.py --bundle llama.cpp/build/bin --kpack-src /opt/rocm/.kpack --archs "$MAPPED_TARGET"
 
@@ -1269,8 +1296,16 @@ jobs:
         bundle="$(pwd -P)"
         system='^((libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)$'
         bad=""
-        for file in *.so* llama-*; do
+        # A link must end at a file inside the bundle: cp -P copies links as links.
+        for link in *; do
+          [ -L "$link" ] || continue
+          [ -f "$link" ] && [ "$(dirname "$(readlink -f "$link")")" = "$bundle" ] || bad+="$link: link does not resolve inside the bundle"$'\n'
+        done
+        for file in *; do
           [ -f "$file" ] && [ ! -L "$file" ] || continue
+          file -b "$file" | grep -q '^ELF' || continue
+          rpath="$(patchelf --print-rpath "$file")"
+          [ "$rpath" = '$ORIGIN' ] || bad+="$file: library search path is '$rpath', not \$ORIGIN"$'\n'
           while read -r name arrow path _; do
             # vdso (and on some hosts the dynamic loader) is listed without "=>".
             [ "$arrow" = "=>" ] || continue
@@ -1338,4 +1373,4 @@ jobs:
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ github.workspace }}/.ccache
-        key: ccache-rocm-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: ccache-rocm-depend-linux-${{ matrix.gfx_target }}-${{ env.DETECTED_ROCM_VERSION }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

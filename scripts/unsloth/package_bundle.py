@@ -142,7 +142,7 @@ class WindowsStrategy(PlatformStrategy):
     # No portable readelf/otool equivalent; the project's own DLLs live beside
     # the binaries in build/bin/Release, so bundle those by name convention.
     # libomp: the Windows arm64 CPU bundle is a clang build with GGML_OPENMP=ON
-    # and carries the VS LLVM redist's libomp140.aarch64.dll beside the binaries.
+    # and carries LLVM's libomp.dll (GGML_OPENMP_FETCH) beside the binaries.
     # ggml-cpu.dll imports it by name, so a curated bundle built from that tree
     # (the arm64 CUDA leg) has to keep it or nothing in the bundle loads.
     LOCAL_DLL_PREFIXES = ("ggml", "llama", "mtmd", "libomp")
@@ -256,6 +256,10 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
         for lic in sorted(lic_dir.glob("*")):
             if lic.is_file():
                 licenses += [f"=== {lic.name} ===", lic.read_text(), ""]
+    # A bundle composed from the Windows CPU bundle ships that build's libomp.dll.
+    omp_license = Path(cfg["bin_dir"]) / "LICENSE-LLVM-OpenMP"
+    if omp_license.is_file():
+        licenses += ["=== LLVM OpenMP (libomp) ===", omp_license.read_text(), ""]
     (stage / "THIRD_PARTY_LICENSES.txt").write_text("\n".join(licenses))
 
     info = {
