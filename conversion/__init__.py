@@ -141,6 +141,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "HYV4ForCausalLM": "hy_v4",
     "IQuestCoderForCausalLM": "llama",
     "InklingForConditionalGeneration": "inkling",
+    "Inkling2ForConditionalGeneration": "inkling2",
     "InternLM2ForCausalLM": "internlm",
     "InternLM3ForCausalLM": "internlm",
     "JAISLMHeadModel": "jais",
