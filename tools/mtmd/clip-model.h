@@ -640,6 +640,9 @@ struct clip_model {
     ggml_tensor * inkling_dmel_embd_w        = nullptr;
     ggml_tensor * inkling_dmel_final_norm_w  = nullptr;
 
+    // inkling2
+    ggml_tensor * inkling2_cls_pos = nullptr;
+
     // "indexed" patch embedding norms
     ggml_tensor * patch_norm_1_w = nullptr;
     ggml_tensor * patch_norm_1_b = nullptr;

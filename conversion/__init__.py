@@ -361,6 +361,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "HunYuanVLForConditionalGeneration": "hunyuan",
     "Idefics3ForConditionalGeneration": "smolvlm",
     "InklingForConditionalGeneration": "inkling",
+    "Inkling2ForConditionalGeneration": "inkling2_mmproj",
     "InternVisionModel": "internvl",
     "JanusForConditionalGeneration": "januspro",
     "KimiK25ForConditionalGeneration": "kimivl",

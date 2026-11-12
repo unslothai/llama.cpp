@@ -986,6 +986,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_inkling>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                builder = std::make_unique<clip_graph_inkling2>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_COHERE2V:
@@ -1531,6 +1535,15 @@ struct clip_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_INKLING2:
+                    {
+                        hparams.ffn_op = FFN_GELU_ERF;
+                        log_ffn_op = "gelu_erf";
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
+                        hparams.image_resize_pad  = PAD_NONE;
+                        hparams.warmup_image_size = 640;
+                    } break;
                 case PROJECTOR_TYPE_INKLING:
                     {
                         if (is_vision) {
@@ -2748,6 +2761,13 @@ struct clip_model_loader {
 
 
         switch (model.proj_type) {
+            case PROJECTOR_TYPE_INKLING2:
+                {
+                    GGML_ASSERT(model.class_embedding && model.position_embeddings && model.patch_embeddings_0);
+                    model.inkling2_cls_pos = get_tensor(TN_INKLING2_CLS_POS);
+                    model.mm_ffn_up_w      = get_tensor(string_format(TN_MM_UP,   "weight"));
+                    model.mm_ffn_down_w    = get_tensor(string_format(TN_MM_DOWN, "weight"));
+                } break;
             case PROJECTOR_TYPE_INKLING:
                 {
                     if (model.modality == CLIP_MODALITY_VISION) {
@@ -4912,6 +4932,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_D1OMNI_V:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_INKLING2:
             {
                 // dynamic size
                 int out_patch_size = params.patch_size * ctx->model.hparams.n_merge;
@@ -6039,6 +6060,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_f32("mimovl_idx_col",       idx_col);
                 set_input_attn_mask(mask);
             } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                // CLS first at (0, 0), then the native patches in raster order at (row + 1, col + 1)
+                GGML_ASSERT(n_pos == num_patches + 1);
+                std::vector<int> rows(n_pos, 0);
+                std::vector<int> cols(n_pos, 0);
+                for (int i = 0; i < num_patches; i++) {
+                    rows[i + 1] = i / pos_w + 1;
+                    cols[i + 1] = i % pos_w + 1;
+                }
+                set_input_i32("pos_h", rows);
+                set_input_i32("pos_w", cols);
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
@@ -7064,6 +7098,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
+        case PROJECTOR_TYPE_INKLING2:
             return ctx->model.mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_GLM_EDGE:
             return ctx->model.mm_model_mlp_3_w->ne[1];

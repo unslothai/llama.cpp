@@ -6782,6 +6782,7 @@ class DecisionType:
 
 class VisionProjectorType:
     INKLING = "inkling"
+    INKLING2 = "inkling2"
     GEMMA3 = "gemma3"
     GEMMA3NV = "gemma3nv"
     GEMMA3NA = "gemma3na"
