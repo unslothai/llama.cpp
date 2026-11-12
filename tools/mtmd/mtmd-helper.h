@@ -78,6 +78,19 @@ MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(
                     bool placeholder,
                     struct mtmd_helper_init_opt opt);
 
+// streaming resampler for raw mono F32 PCM (e.g. realtime input), to match mtmd_get_audio_sample_rate()
+// it keeps state between calls, use one per stream
+struct mtmd_helper_resampler;
+typedef struct mtmd_helper_resampler mtmd_helper_resampler;
+
+// returns NULL on failure
+MTMD_API mtmd_helper_resampler * mtmd_helper_resampler_init(int32_t rate_in, int32_t rate_out);
+MTMD_API void                    mtmd_helper_resampler_free(mtmd_helper_resampler * ctx);
+
+// *out is valid until the next call
+// returns the number of output samples (can be 0), < 0 on error
+MTMD_API int64_t mtmd_helper_resampler_process(mtmd_helper_resampler * ctx, const float * in, size_t n_in, const float ** out);
+
 // helper to count the total number of tokens from a list of chunks, useful to keep track of KV cache
 MTMD_API size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks);
 
@@ -248,6 +261,7 @@ struct mtmd_helper_gen_audio_inp {
 
     int32_t  top_k;
     float    top_p;
+    float    temp; // audio frame temperature if the model supports it, < 0 = model default, 0 = greedy
     uint32_t seed; // UINT32_MAX for random (default: random)
 
     enum mtmd_helper_gen_audio_outtype out_type;
@@ -318,6 +332,7 @@ MTMD_API int32_t mtmd_helper_gen_audio_flush(mtmd_helper_gen_audio * ctx);
 #ifdef __cplusplus
 #include <set>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace mtmd_helper {
@@ -331,6 +346,12 @@ struct mtmd_helper_video_deleter {
     void operator()(mtmd_helper_video * val) { mtmd_helper_video_free(val); }
 };
 using video_ptr = std::unique_ptr<mtmd_helper_video, mtmd_helper_video_deleter>;
+
+// audio input-related C++ wrappers
+struct mtmd_helper_resampler_deleter {
+    void operator()(mtmd_helper_resampler * val) { mtmd_helper_resampler_free(val); }
+};
+using resampler_ptr = std::unique_ptr<mtmd_helper_resampler, mtmd_helper_resampler_deleter>;
 
 // audio generation-related C++ wrappers
 struct mtmd_helper_gen_audio_deleter {
@@ -408,6 +429,68 @@ inline std::vector<llama_logit_bias> audio_stream_logit_bias(const mtmd_context 
 }
 
 } // namespace mtmd_helper
+
+//
+// test API (C++ only)
+// internals of mtmd_helper_video, do not use in applications
+//
+
+struct mtmd_helper_video_src {
+    uint32_t width    = 0;
+    uint32_t height   = 0;
+    float    fps      = 0.0f;
+    int32_t  n_frames = -1;
+    float    duration = -1.0f;
+};
+
+struct mtmd_helper_video_seq {
+    float fps_target = 0.0f;
+    mtmd_helper_video_info info = {};
+    std::string id;
+
+    bool    src_alive     = false;
+    int32_t current_frame = 0;
+
+    std::string prompt_start         = "Video:";
+    int32_t     timestamp_interval_ms = 5000;
+    float       next_timestamp_ms     = 0.0f;
+
+    mtmd_video_template tmpl = MTMD_VIDEO_TEMPLATE_DEFAULT;
+
+    int32_t     target_frames = 0;
+    int32_t     out_width     = 0;
+    int32_t     out_height    = 0;
+
+    std::vector<int32_t> frame_indices;
+    size_t      next_index = 0;
+    int32_t     src_frame  = 0;
+    double      src_fps    = 0.0;
+
+    std::vector<uint8_t> frame_buf;
+    std::string   pending_text;
+    mtmd_bitmap * pending_frame = nullptr;
+
+    int32_t            n_src_frames = 0;
+    int                audio_rate   = 0;
+    std::vector<float> soundtrack;
+    mtmd_bitmap *      pending_audio = nullptr;
+    bool          start_emitted = false;
+
+    mtmd_helper_video_seq() = default;
+    mtmd_helper_video_seq(const mtmd_helper_video_seq &) = delete;
+    mtmd_helper_video_seq & operator=(const mtmd_helper_video_seq &) = delete;
+    virtual ~mtmd_helper_video_seq();
+
+    virtual bool read_raw_frame() = 0;
+
+    void configure(const mtmd_video_config & cfg, const mtmd_helper_video_src & src, float fps_target_arg);
+
+    int32_t ts_per_n_frames() const;
+
+    mtmd_bitmap * soundtrack_slice(int32_t idx) const;
+    mtmd_bitmap * read_next_frame();
+    int32_t read_next(mtmd_bitmap ** out_bitmap, char ** out_text);
+};
 #endif
 
 #endif

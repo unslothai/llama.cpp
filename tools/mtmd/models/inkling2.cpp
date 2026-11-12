@@ -2,7 +2,7 @@
 
 // Perception-Encoder ViT: CLS token, learned position grid resized per image, 2D RoPE (CLS at (0, 0)),
 // then CLS removal, 2x2 merge and a GELU MLP. One output per 40x40 cell.
-ggml_cgraph * clip_graph_inkling2::build() {
+ggml_cgraph * mtmd_graph_inkling2::build() {
     const int merge = hparams.n_merge;
     GGML_ASSERT(merge == 2);
     GGML_ASSERT(n_patches_x % merge == 0 && n_patches_y % merge == 0);
@@ -36,7 +36,7 @@ ggml_cgraph * clip_graph_inkling2::build() {
     inp = ggml_concat(ctx0, cls, inp, 1); // [n_embd, 1 + n_patches]
     cb(inp, "inp_pos", -1);
 
-    auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
+    auto add_pos = [&](ggml_tensor * cur, const mtmd_layer &) {
         return build_rope_2d(ctx0, cur, pos_w, pos_h, hparams.rope_theta, false);
     };
 

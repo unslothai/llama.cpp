@@ -214,6 +214,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek4(params);
         case LLM_ARCH_DEEPSEEK41:
             return new llama_model_deepseek41(params);
+        case LLM_ARCH_XING4_0:
+            return new llama_model_xing4_0(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -242,6 +244,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_nemotron_h(params);
         case LLM_ARCH_NEMOTRON_H_MOE:
             return new llama_model_nemotron_h_moe(params);
+        case LLM_ARCH_METIS16:
+            return new llama_model_metis16(params);
         case LLM_ARCH_EXAONE:
             return new llama_model_exaone(params);
         case LLM_ARCH_EXAONE4:
@@ -290,6 +294,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_afmoe(params);
         case LLM_ARCH_LAGUNA:
             return new llama_model_laguna(params);
+        case LLM_ARCH_RICURSIVE:
+            return new llama_model_ricursive(params);
         case LLM_ARCH_ERNIE4_5:
             return new llama_model_ernie4_5(params);
         case LLM_ARCH_ERNIE4_5_MOE:
@@ -366,6 +372,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_KIMI_K3:
             return new llama_model_kimi_k3(params);
+        case LLM_ARCH_KIMI_K31:
+            return new llama_model_kimi_k31(params);
         case LLM_ARCH_GLM5_NEXT:
             return new llama_model_glm5_next(params);
         case LLM_ARCH_STEP35:
@@ -519,7 +527,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
+        if (ud->model->arch == LLM_ARCH_HRM_TEXT || ud->model->arch == LLM_ARCH_METIS16) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
@@ -1053,6 +1061,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_7B:            return "7B";
         case LLM_TYPE_8B:            return "8B";
         case LLM_TYPE_9B:            return "9B";
+        case LLM_TYPE_10B:           return "10B";
         case LLM_TYPE_11B:           return "11B";
         case LLM_TYPE_12B:           return "12B";
         case LLM_TYPE_13B:           return "13B";
@@ -1473,6 +1482,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_CLASSIFIER_POOLING_TYPE, hparams.pooling_type_cls, false);
+    ml.get_key(LLM_KV_CLASSIFIER_FREE_GUIDANCE, hparams.classifier_free_guidance, false);
     std::string act_cls;
     if (ml.get_key(LLM_KV_CLASSIFIER_ACTIVATION, act_cls, false)) {
         const auto it = LLM_CLS_ACT_TYPES_FROM_STRING.find(act_cls);
@@ -1547,6 +1557,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
+    std::fill(hparams.swiglu_clamp.begin(),       hparams.swiglu_clamp.end(),       0.0f);
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
@@ -1690,8 +1701,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF unless mmap is in use; see #28160, #31943
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO && !ml.use_mmap) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
@@ -1805,6 +1816,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
+
+            if (hparams.has_kv(i)) {
+                layer.k_cache_s = create_tensor(tn(LLM_TENSOR_ATTN_K, "k_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.v_cache_s = create_tensor(tn(LLM_TENSOR_ATTN_V, "v_scale", i), {1}, TENSOR_NOT_REQUIRED);
+
+                if ((layer.k_cache_s && layer.k_cache_s->type != GGML_TYPE_F32) ||
+                    (layer.v_cache_s && layer.v_cache_s->type != GGML_TYPE_F32)) {
+                    throw std::runtime_error(format("KV cache scales for layer %d must be F32", i));
+                }
+            }
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
@@ -2851,6 +2872,36 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+llama_rope_params llama_model::get_rope_params(const llama_cparams & cparams, int il) const {
+    llama_rope_params res;
+
+    res.n_rot       = hparams.has_rope(il) ? hparams.n_rot(il) : 0;
+    res.n_offs      = hparams.n_lora_kv > 0 ? hparams.n_embd_head_k(il) - hparams.n_rot(il) : 0;
+    res.type        = hparams.rope_type;
+    res.n_ctx_orig  = cparams.n_ctx_orig_yarn;
+    res.freq_base   = get_rope_freq_base (cparams, il);
+    res.freq_scale  = get_rope_freq_scale(cparams, il);
+    res.ext_factor  = cparams.yarn_ext_factor;
+    res.attn_factor = cparams.yarn_attn_factor;
+    res.beta_fast   = cparams.yarn_beta_fast;
+    res.beta_slow   = cparams.yarn_beta_slow;
+    res.factors     = get_rope_factors(cparams, il);
+
+    return res;
+}
+
+llama_rope_params llama_model::get_rope_params_indexer(const llama_cparams & cparams, int il) const {
+    llama_rope_params res = get_rope_params(cparams, il);
+
+    res.n_offs     = 0;
+    res.type       = LLAMA_ROPE_TYPE_NEOX;
+    res.freq_base  = cparams.rope_freq_base;
+    res.freq_scale = cparams.rope_freq_scale;
+    res.factors    = nullptr;
+
+    return res;
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -3247,8 +3298,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
-                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
+                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_KIMI_K31);
+                    if (arch == LLM_ARCH_KIMI_K31) {
+                        // DSA layers keep a K-only MLA cache plus a per-token indexer key cache,
+                        // the KDA layers stay recurrent
+                        filter_attn = [&](uint32_t il) {
+                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        };
+                        filter_recr = [&](uint32_t il) {
+                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        };
+                        filter_idx = [&](uint32_t il) {
+                            return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                        };
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
                         // all layers have both an attention KV cache and a recurrent (conv) state
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -3471,6 +3534,8 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->build_layer_inp_dev();
 
+    llm->build_h_nextn_dev();
+
     llm->res->set_outputs(params);
 
     return llm->res->get_gf();
@@ -3626,11 +3691,14 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_METIS16:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_KIMI_K31:
         case LLM_ARCH_INKLING:
         case LLM_ARCH_INKLING2:
         case LLM_ARCH_GLM5_NEXT:
+        case LLM_ARCH_STARCODER:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -3639,7 +3707,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_DECI:
         case LLM_ARCH_BAICHUAN:
-        case LLM_ARCH_STARCODER:
         case LLM_ARCH_INTERNLM2:
         case LLM_ARCH_MINICPM:
         case LLM_ARCH_XVERSE:
@@ -3655,6 +3722,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
+        case LLM_ARCH_XING4_0:
         case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
@@ -3712,6 +3780,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
+        case LLM_ARCH_RICURSIVE:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_PHI2:
@@ -4120,6 +4189,10 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
 uint32_t llama_model_n_tokens_delay(const struct llama_model * model) {
     return model->hparams.n_tokens_delay;
+}
+
+bool llama_model_classifier_free_guidance(const struct llama_model * model) {
+    return model->hparams.classifier_free_guidance;
 }
 
 uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out) {
