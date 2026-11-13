@@ -13218,7 +13218,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64, 8, 2,  1,  64,  8, 1, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 2, 33,  64, 16, 2, GGML_TYPE_F16, GGML_TYPE_F32, sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 64, 256, 32, 2, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        // few rows vs a long cache: the split-KV decode path
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 1, 4096, 1024, 2, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 4, 2048, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2, 1, 1000,    8, 1, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     // production-scale n_kv straddling the observed ~16.4-16.9K garbage threshold
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));

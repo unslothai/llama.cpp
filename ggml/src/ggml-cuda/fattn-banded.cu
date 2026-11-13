@@ -2,6 +2,7 @@
 #include "fattn-banded.cuh"
 #include "fattn.cuh"
 
+#include <algorithm>
 #include <cstdint>
 
 static __device__ __forceinline__ float fattn_banded_load(
@@ -176,6 +177,262 @@ static __global__ void flash_attn_ext_banded_f32(
     }
 }
 
+// Split-KV variant for few query rows (decode): the kernel above gives each (query, head) ONE warp that walks every
+// cached position serially (~3 dependent global loads per key), so a decode step at depth n costs ~n * 2 us per head
+// with only n_head warps on the GPU. Here every (query, head) row is spread over n_chunks blocks of NW warps; each warp
+// keeps an online softmax over its strided keys, the block merges its warps in shared memory and writes one partial
+// (max, sum, out[D]); flash_attn_ext_banded_f32_merge combines the partials and adds the sink. Same math, different
+// summation order.
+template<int D, int NW>
+static __global__ void flash_attn_ext_banded_f32_split(
+        const char * __restrict__ q,
+        const char * __restrict__ k,
+        const char * __restrict__ v,
+        const char * __restrict__ mask,
+        const char * __restrict__ rel,
+        float      * __restrict__ part,
+        float scale,
+        int type_k,
+        int type_v,
+        int type_rel,
+        int64_t n_q,
+        int64_t n_kv,
+        int64_t n_head_q,
+        int64_t n_head_kv,
+        int64_t n_chunks,
+        int64_t chunk,
+        int64_t rel_extent,
+        int64_t mask_ne2,
+        int64_t mask_ne3,
+        uint64_t q_nb1,
+        uint64_t q_nb2,
+        uint64_t q_nb3,
+        uint64_t k_nb0,
+        uint64_t k_nb1,
+        uint64_t k_nb2,
+        uint64_t k_nb3,
+        uint64_t v_nb0,
+        uint64_t v_nb1,
+        uint64_t v_nb2,
+        uint64_t v_nb3,
+        uint64_t m_nb1,
+        uint64_t m_nb2,
+        uint64_t m_nb3,
+        uint64_t r_nb0,
+        uint64_t r_nb1,
+        uint64_t r_nb2,
+        uint64_t r_nb3,
+        int64_t rel_ne3) {
+    constexpr int values_per_lane = D / WARP_SIZE;
+    static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t ic = blockIdx.x;
+    const int64_t ih = blockIdx.y;
+    const int64_t iq = int64_t(blockIdx.z) % n_q;
+    const int64_t ib = int64_t(blockIdx.z) / n_q;
+
+    const int64_t ih_kv = ih / (n_head_q / n_head_kv);
+    const char * q_row = q + uint64_t(iq)*q_nb1 + uint64_t(ih)*q_nb2 + uint64_t(ib)*q_nb3;
+
+    float q_reg[values_per_lane];
+    float out[values_per_lane];
+#pragma unroll
+    for (int j = 0; j < values_per_lane; ++j) {
+        const int d = lane + j*WARP_SIZE;
+        q_reg[j] = *(const float *)(q_row + uint64_t(d)*sizeof(float));
+        out[j] = 0.0f;
+    }
+
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+    const int64_t q_offset = n_kv - n_q;
+    const int64_t ik0 = ic*chunk;
+    const int64_t ik1 = ik0 + chunk < n_kv ? ik0 + chunk : n_kv;
+
+    for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
+        if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
+                uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
+                uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
+            continue;
+        }
+
+        const char * k_row = k + uint64_t(ik)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
+        float dot = 0.0f;
+#pragma unroll
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = lane + j*WARP_SIZE;
+            dot += q_reg[j] * fattn_banded_load(k_row + uint64_t(d)*k_nb0, type_k);
+        }
+        dot = warp_reduce_sum(dot);
+
+        float score = dot * scale;
+        if (lane == 0) {
+            const int64_t rel_dist = iq + q_offset - ik;
+            if (rel_dist >= 0 && rel_dist < rel_extent) {
+                const char * rel_value = rel +
+                    uint64_t(rel_dist)*r_nb0 + uint64_t(ih)*r_nb1 +
+                    uint64_t(iq)*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3;
+                score += fattn_banded_load(rel_value, type_rel);
+            }
+            if (mask) {
+                const char * mask_value = mask + uint64_t(ik)*sizeof(half) +
+                    uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
+                    uint64_t(ib % mask_ne3)*m_nb3;
+                score += __half2float(*(const half *) mask_value);
+            }
+        }
+        score = __shfl_sync(0xffffffff, score, 0, WARP_SIZE);
+
+        if (score == -INFINITY) {
+            continue;
+        }
+
+        float old_scale = 1.0f;
+        float value_scale = 1.0f;
+        if (score > row_max) {
+            old_scale = expf(row_max - score);
+            row_max = score;
+        } else {
+            value_scale = expf(score - row_max);
+        }
+
+        const char * v_row = v + uint64_t(ik)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
+#pragma unroll
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = lane + j*WARP_SIZE;
+            const float vv = fattn_banded_load(v_row + uint64_t(d)*v_nb0, type_v);
+            out[j] = out[j]*old_scale + vv*value_scale;
+        }
+        row_sum = row_sum*old_scale + value_scale;
+    }
+
+    // merge the NW warps of this block
+    __shared__ float s_max[NW];
+    __shared__ float s_sum[NW];
+    __shared__ float s_out[NW][D];
+    if (lane == 0) {
+        s_max[warp] = row_max;
+        s_sum[warp] = row_sum;
+    }
+#pragma unroll
+    for (int j = 0; j < values_per_lane; ++j) {
+        s_out[warp][lane + j*WARP_SIZE] = out[j];
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float m = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            m = fmaxf(m, s_max[w]);
+        }
+        float acc[values_per_lane];
+#pragma unroll
+        for (int j = 0; j < values_per_lane; ++j) {
+            acc[j] = 0.0f;
+        }
+        float sum = 0.0f;
+        if (m != -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < NW; ++w) {
+                if (s_max[w] == -INFINITY) {
+                    continue;
+                }
+                const float f = expf(s_max[w] - m);
+                sum += s_sum[w]*f;
+#pragma unroll
+                for (int j = 0; j < values_per_lane; ++j) {
+                    acc[j] += s_out[w][lane + j*WARP_SIZE]*f;
+                }
+            }
+        }
+        float * p = part + ((((ib*n_q + iq)*n_head_q + ih)*n_chunks) + ic)*(D + 2);
+        if (lane == 0) {
+            p[0] = m;
+            p[1] = sum;
+        }
+#pragma unroll
+        for (int j = 0; j < values_per_lane; ++j) {
+            p[2 + lane + j*WARP_SIZE] = acc[j];
+        }
+    }
+}
+
+// one warp per (query, head, batch) row: combine the n_chunks partials, add the sink, normalize
+template<int D>
+static __global__ void flash_attn_ext_banded_f32_merge(
+        const float * __restrict__ part,
+        float       * __restrict__ dst,
+        int64_t n_rows,
+        int64_t n_head_q,
+        int64_t n_q,
+        int64_t n_chunks,
+        const float * __restrict__ sinks,
+        int64_t sinks_s1,
+        int64_t sinks_s2) {
+    constexpr int values_per_lane = D / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t row = int64_t(blockIdx.x)*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (row >= n_rows) {
+        return;
+    }
+    // row = (ib*n_q + iq)*n_head_q + ih, the dst row order of the unsplit kernel
+    const int64_t ih = row % n_head_q;
+    const int64_t iq = (row / n_head_q) % n_q;
+    const int64_t ib = row / (n_head_q*n_q);
+    const float * p = part + row*n_chunks*(D + 2);
+
+    float m = -INFINITY;
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        m = fmaxf(m, p[c*(D + 2)]);
+    }
+    float out[values_per_lane];
+#pragma unroll
+    for (int j = 0; j < values_per_lane; ++j) {
+        out[j] = 0.0f;
+    }
+    float row_sum = 0.0f;
+    if (m != -INFINITY) {
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            const float * pc = p + c*(D + 2);
+            if (pc[0] == -INFINITY) {
+                continue;
+            }
+            const float f = expf(pc[0] - m);
+            row_sum += pc[1]*f;
+#pragma unroll
+            for (int j = 0; j < values_per_lane; ++j) {
+                out[j] += pc[2 + lane + j*WARP_SIZE]*f;
+            }
+        }
+    }
+    float row_max = m;
+
+    if (sinks) {
+        const float sink = sinks[ih + iq*sinks_s1 + ib*sinks_s2];
+        if (sink > row_max) {
+            const float old_scale = expf(row_max - sink);
+#pragma unroll
+            for (int j = 0; j < values_per_lane; ++j) {
+                out[j] *= old_scale;
+            }
+            row_sum = row_sum*old_scale + 1.0f;
+            row_max = sink;
+        } else {
+            row_sum += expf(sink - row_max);
+        }
+    }
+
+    const float inv_sum = row_sum == 0.0f ? 0.0f : 1.0f/row_sum;
+    float * dst_row = dst + row*D;
+#pragma unroll
+    for (int j = 0; j < values_per_lane; ++j) {
+        dst_row[lane + j*WARP_SIZE] = out[j]*inv_sum;
+    }
+}
+
 static bool fattn_banded_type_supported(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
@@ -249,6 +506,51 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     memcpy(&scale, dst->op_params, sizeof(scale));
     // the tensor extent (not op_params) is authoritative after graph cloning
     const int64_t rel_extent = rel->ne[0];
+
+    // few (query, head) rows vs a long cache (decode, short ubatches at depth): split the KV scan across blocks
+    {
+        constexpr int split_warps   = 4;
+        constexpr int min_chunk     = 64;
+        const int64_t n_rows        = q->ne[1]*q->ne[2]*q->ne[3];
+        const int64_t n_kv          = k->ne[1];
+        const int64_t target_blocks = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*16;
+        int64_t n_chunks = n_rows < target_blocks ? (target_blocks + n_rows - 1)/n_rows : 1;
+        n_chunks = std::min<int64_t>(n_chunks, (n_kv + min_chunk - 1)/min_chunk);
+        if (n_chunks > 1 && q->ne[1]*q->ne[3] <= 65535) {
+            const int64_t chunk = (n_kv + n_chunks - 1)/n_chunks;
+            n_chunks = (n_kv + chunk - 1)/chunk;
+            const int64_t D = q->ne[0];
+            ggml_cuda_pool_alloc<float> part(ctx.pool(), n_rows*n_chunks*(D + 2));
+            const dim3 sblocks(n_chunks, q->ne[2], q->ne[1]*q->ne[3]);
+            const dim3 sthreads(split_warps*WARP_SIZE, 1, 1);
+            constexpr int merge_warps = 4;
+            const dim3 mblocks((n_rows + merge_warps - 1)/merge_warps, 1, 1);
+            const dim3 mthreads(merge_warps*WARP_SIZE, 1, 1);
+            cudaStream_t stream = ctx.stream();
+#define LAUNCH_SPLIT(DD) \
+            flash_attn_ext_banded_f32_split<DD, split_warps><<<sblocks, sthreads, 0, stream>>>( \
+                (const char *) q->data, (const char *) k->data, (const char *) v->data, \
+                m ? (const char *) m->data : nullptr, (const char *) rel->data, part.get(), \
+                scale, k->type, v->type, rel->type, q->ne[1], n_kv, q->ne[2], k->ne[2], n_chunks, chunk, \
+                rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
+                q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+                v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+                m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3]); \
+            flash_attn_ext_banded_f32_merge<DD><<<mblocks, mthreads, 0, stream>>>( \
+                part.get(), (float *) dst->data, n_rows, q->ne[2], q->ne[1], n_chunks, \
+                sinks ? (const float *) sinks->data : nullptr, \
+                sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \
+                sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0)
+            if (D == 64) {
+                LAUNCH_SPLIT(64);
+            } else {
+                LAUNCH_SPLIT(128);
+            }
+#undef LAUNCH_SPLIT
+            return;
+        }
+    }
 
     constexpr int warps_per_block = 4;
     const dim3 blocks((q->ne[1] + warps_per_block - 1) / warps_per_block, q->ne[2], q->ne[3]);
