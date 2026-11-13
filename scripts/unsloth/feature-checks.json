@@ -143,6 +143,12 @@
       "checks": [
         { "kind": "arch", "arch": "minimax-m3" }
       ]
+    },
+    "mistral-large4": {
+      "owner": "unslothai#336",
+      "checks": [
+        { "kind": "arch", "arch": "mistral-large4" }
+      ]
     }
   },
   "unchecked": {
