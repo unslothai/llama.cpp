@@ -44,7 +44,7 @@
   "schema": 1,
   "features": {
     "inkling": {
-      "owner": "unslothai#371",
+      "owner": "ggml-org#32187",
       "checks": [
         { "kind": "arch",       "arch": "inkling" },
         { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
@@ -52,7 +52,7 @@
       ]
     },
     "inkling2": {
-      "owner": "unslothai#372",
+      "owner": "ggml-org#32187",
       "checks": [
         { "kind": "arch",       "arch": "inkling2" },
         { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
