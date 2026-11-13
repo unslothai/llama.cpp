@@ -53,6 +53,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reconcile_op_count import (  # noqa: E402
+    FAMILIES, HEADER, RPC_PARTS, SCAN_SUFFIXES, LayoutError, assert_re, blank_comments_and_strings, enum_count,
+    rpc_version_matches,
+)
+
 PIN_RE = re.compile(
     r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/([0-9a-f]{40})/?$"
 )
@@ -83,6 +89,20 @@ MIN_LINE = 12
 # unslothai#70, whose comment mentions GGML_OP_SSM_SCAN to explain why it does
 # NOT use it.
 COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/|(?<!\S)#(?!\s*(?:include|define|if|el|endif|pragma)).*$")
+
+# The op-count asserts belong to reconcile_op_count.py, which runs first and rewrites them to the
+# counted enum when two pins each took the same N to N+1 (each pin's own line then survives in
+# no merged tree), after proving the op tables match the enum. It is the check those lines stood for.
+# It also raises RPC_PROTO_PATCH_VERSION when the pins' identical PATCH bumps merged into one.
+# A pin's own op-count assert, as a whole line reconcile_op_count.py rewrites (any family, ggml/ only), is
+# exempt; anything else on those lines is still owed. Its PATCH line stays in
+# the contract and is satisfied by any PATCH at least the pin's under the same MAJOR.MINOR; for a pin
+# that changes the GGML_OP_COUNT enum (the only delta reconcile_op_count.py raises PATCH from, and
+# which it checks per pin itself) a newer MAJOR.MINOR also counts.
+RPC_PATCH_RE = re.compile(r"^#\s*define\s+RPC_PROTO_PATCH_VERSION\b")
+# A PATCH line the pin keeps owning still survives when reconcile_op_count.py raised PATCH past it
+# (another pin's op bump merged into the same line): same MAJOR and MINOR, PATCH at least the pin's.
+# Read with reconcile_op_count.rpc_version_matches: comment-blanked, the one unconditional define.
 
 # Binary and generated paths whose "lines" are meaningless.
 SKIP_SUFFIXES = (".npy", ".png", ".jpg", ".gguf", ".bin", ".safetensors", ".ico", ".pdf")
@@ -143,6 +163,56 @@ def load_pins(pr_set: Path) -> list[dict]:
     return pins
 
 
+def _op_assert_spans(text: str) -> list[range]:
+    """Every op-count static_assert reconcile_op_count.py rewrites (any family, comment-blanked), to its `;`."""
+    joined = blank_comments_and_strings(text)
+    spans = []
+    for count, _, _ in FAMILIES:
+        for m in assert_re(count).finditer(joined):
+            end = joined.find(";", m.end())
+            spans.append(range(m.start(), end + 1 if end >= 0 else m.end()))
+    return spans
+
+
+def normalize_op_asserts(text: str) -> str:
+    """text with every number inside an op-count assert (count and message) replaced by one '#'.
+
+    Those are the only characters reconcile_op_count.py rewrites, so a contract line and the merged
+    tree compared in this form agree whatever count the reconcile settled on (9 -> 10 included).
+    """
+    for span in sorted(_op_assert_spans(text), key=lambda r: r.start, reverse=True):
+        text = text[:span.start] + re.sub(r"\d+", "#", text[span.start:span.stop]) + text[span.stop:]
+    return text
+
+
+def op_assert_lines(text: str) -> dict[str, str]:
+    """Stripped lines of text holding op-count static_asserts -> the line in normalize_op_asserts form.
+
+    The line stays owed (a merge that deletes the assert loses the pin); only the count, which
+    reconcile_op_count.py rewrites, is free. check() matches it against the merged tree in the same form.
+    """
+    hit = [False] * len(text)
+    for span in _op_assert_spans(text):
+        for i in span:
+            hit[i] = True
+    out, pos = {}, 0
+    # numbers are replaced within a line only, so the normalized text has the same lines
+    for line, norm_line in zip(text.split("\n"), normalize_op_asserts(text).split("\n")):
+        span = range(pos, pos + len(line))
+        if line.strip() and any(hit[i] for i in span):
+            out[line.strip()] = norm_line.strip()
+        pos += len(line) + 1
+    return out
+
+
+def op_count(rev: str, cwd: Path) -> int | None:
+    text = git(["show", f"{rev}:{HEADER}"], cwd, check=False)
+    try:
+        return enum_count(text, blank_comments_and_strings(text), "ggml_op", "GGML_OP_COUNT")[0]
+    except LayoutError:
+        return None
+
+
 def derive(pin: dict, base: str, cwd: Path) -> dict:
     """What this pin puts in the tree, read off its own diff against the base.
 
@@ -155,6 +225,7 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
 
     symbols: dict[str, set[str]] = defaultdict(set)
     lines: dict[str, list[str]] = defaultdict(list)
+    added: list[tuple[str, str]] = []
     cur = None
     for ln in diff.split("\n"):
         if ln.startswith("+++ b/"):
@@ -162,13 +233,23 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
         elif ln.startswith("+++ "):
             cur = None                       # /dev/null: a deletion
         elif cur and ln.startswith("+") and not ln.startswith("+++"):
-            text = ln[1:]
-            stripped = text.strip()
-            if len(stripped) >= MIN_LINE and not TRIVIAL_RE.match(stripped):
-                lines[cur].append(stripped)
-            code = COMMENT_RE.sub("", text).strip()
-            if code:
-                symbols[cur].update(SYMBOL_RE.findall(code))
+            added.append((cur, ln[1:]))
+    # reconcile_op_count.py rewrites the count of every op-count assert (any family), so a pin's assert
+    # lines are owed with the count normalized. The PATCH line is (see rpc_raised); main_op_pin is read off the enum itself, as
+    # reconcile_op_count.py reads it, not off an assert line the pin may have only reworded.
+    asserts = {path: op_assert_lines(git(["show", f"{pin['sha']}:{path}"], cwd, check=False))
+               for path in {p for p, _ in added}
+               if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES}
+    pin_n = op_count(pin["sha"], cwd)
+    main_op_pin = pin_n is not None and pin_n != op_count(fork, cwd)
+    for cur, text in added:
+        stripped = text.strip()
+        owed = asserts.get(cur, {}).get(stripped, stripped)
+        if len(owed) >= MIN_LINE and not TRIVIAL_RE.match(owed):
+            lines[cur].append(owed)
+        code = COMMENT_RE.sub("", text).strip()
+        if code:
+            symbols[cur].update(SYMBOL_RE.findall(code))
 
     # Only symbols the base does not ALREADY have in that file are evidence of
     # this pin. Upstream naming an arch in a file the pin also touches is not
@@ -195,6 +276,7 @@ def derive(pin: dict, base: str, cwd: Path) -> dict:
         "symbols": new_symbols,
         "added_files": added,
         "owned_paths": owned,
+        "main_op_pin": main_op_pin,
         "lines": {p: v for p, v in lines.items()
                   if not p.endswith(SKIP_SUFFIXES)},
     }
@@ -215,9 +297,31 @@ def redundancy(contract: dict, base: str, cwd: Path) -> tuple[int, int]:
     total = hit = 0
     for path, wanted in contract["lines"].items():
         text = git(["show", f"{base}:{path}"], cwd, check=False)
+        if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES:
+            text = normalize_op_asserts(text)
         total += len(wanted)
         hit += sum(1 for w in wanted if w in text)
     return hit, total
+
+
+def rpc_raised(pin_text: str, text: str, allow_newer_series: bool = False) -> bool:
+    """text has the pin's RPC_PROTO MAJOR and MINOR and a PATCH at least the pin's.
+
+    allow_newer_series: a higher MAJOR.MINOR also counts (a pin that changes the op enum, whose bump
+    reconcile_op_count.py checks per pin and re-derives against the base's version).
+    """
+    try:
+        found = [rpc_version_matches(t) for t in (pin_text, text)]
+    except LayoutError:
+        return False
+    v = [{p: (m[p].group(1) if p in m else None) for p in RPC_PARTS} for m in found]
+    series = [(v[i]["MAJOR"], v[i]["MINOR"]) for i in (0, 1)]
+    if (allow_newer_series and None not in series[0] + series[1]
+            and tuple(map(int, series[1])) > tuple(map(int, series[0]))):
+        return True
+    return (v[0]["PATCH"] is not None and v[1]["PATCH"] is not None
+            and all(v[0][p] == v[1][p] for p in ("MAJOR", "MINOR"))
+            and int(v[1]["PATCH"]) >= int(v[0]["PATCH"]))
 
 
 def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
@@ -242,7 +346,14 @@ def check(pin: dict, contract: dict, root: Path, base: str, cwd: Path,
         if not target.is_file():
             continue                          # already reported, or a deletion
         text = target.read_text(errors="replace")
-        lost = [w for w in wanted if w not in text]
+        if path.startswith("ggml/") and Path(path).suffix in SCAN_SUFFIXES:
+            text = normalize_op_asserts(text)       # shared-line contract entries are in this form
+        # a PATCH line is judged on the active (comment-blanked) version only, never on its raw text
+        patch = [w for w in wanted if RPC_PATCH_RE.match(w)]
+        lost = [w for w in wanted if not RPC_PATCH_RE.match(w) and w not in text]
+        if patch and not rpc_raised(git(["show", f"{pin['sha']}:{path}"], cwd, check=False), text,
+                                    allow_newer_series=contract.get("main_op_pin", False)):
+            lost += patch
         if not lost:
             continue
         kept = len(wanted) - len(lost)
