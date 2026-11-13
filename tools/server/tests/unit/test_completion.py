@@ -631,6 +631,34 @@ def test_logit_bias(tokenize, openai_style):
     assert all(output_text.find(" " + tok + " ") == -1 for tok in exclude)
 
 
+def test_penalize_prompt():
+    global server
+    server.start()
+    # the greedy continuation " do" is already in the prompt ("The dog"), so a prompt-wide presence penalty moves it, while penalize_prompt = false leaves the first token alone
+    prompt = "Once upon a time, there was a little dog. The dog was very happy. The"
+    def first_token(**extra):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "n_predict": 1, "top_k": 1, "temperature": 0.0, "return_tokens": True, **extra,
+        })
+        assert res.status_code == 200
+        return res.body["tokens"][0], res.body["generation_settings"]["penalize_prompt"]
+    greedy, echo = first_token()
+    assert echo == True
+    penalized, _ = first_token(presence_penalty=100.0)
+    assert penalized != greedy
+    unpenalized, echo = first_token(presence_penalty=100.0, penalize_prompt=False)
+    assert unpenalized == greedy
+    assert echo == False
+    # generated tokens are still penalized, over the whole window
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 32, "top_k": 1, "temperature": 0.0, "return_tokens": True,
+        "presence_penalty": 100.0, "repeat_last_n": 4096, "penalize_prompt": False,
+    })
+    assert res.status_code == 200
+    tokens = res.body["tokens"]
+    assert len(tokens) == 32 and len(set(tokens)) == len(tokens)
+
+
 def test_cancel_request():
     global server
     server.n_ctx = 4096
