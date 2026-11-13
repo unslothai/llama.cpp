@@ -51,6 +51,14 @@
         { "kind": "mtmd",       "projector": "inkling" }
       ]
     },
+    "inkling2": {
+      "owner": "unslothai#368",
+      "checks": [
+        { "kind": "arch",       "arch": "inkling2" },
+        { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
+        { "kind": "mtmd",       "projector": "inkling2" }
+      ]
+    },
     "glm5next": {
       "owner": "unslothai#239",
       "checks": [
