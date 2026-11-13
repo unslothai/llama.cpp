@@ -864,7 +864,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const mtmd
     return output;
 }
 
-// Inkling hMLP patches
 mtmd_image_preproc_out mtmd_image_preprocessor_inkling::preprocess(const mtmd_image_u8 & img) const {
     GGML_ASSERT(hparams.patch_size == 40);
     constexpr int temporal_patch_size = 2;
@@ -888,7 +887,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling::preprocess(const mtmd_im
 
     const int p = hparams.patch_size;
     const int nph = (scaled_size.height + p - 1) / p;
-    // The extra right column is intentional, including exact multiples of 40.
     const int npw = scaled_size.width / p + 1;
 
     const float pad_raw = -1.0f / 255.0f;

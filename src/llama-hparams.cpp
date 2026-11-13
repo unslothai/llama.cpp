@@ -207,7 +207,6 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 
 uint32_t llama_hparams::n_embd_r() const {
     if (n_embd_r_impl != 0) {
-        // explicit override (e.g. inkling: 4 packed shortconv streams per layer)
         return n_embd_r_impl;
     }
 

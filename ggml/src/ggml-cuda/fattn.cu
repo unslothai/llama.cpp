@@ -584,7 +584,6 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-// The MMA kernel is the only one that reads src[6], so both call sites must agree on this.
 bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor * dst) {
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;

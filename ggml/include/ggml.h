@@ -446,9 +446,7 @@ extern "C" {
     enum ggml_prec {
         GGML_PREC_UNDEFINED = 0,
         GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
-        // stricter than F32: true IEEE F32 arithmetic, no TF32 / tensor-core / reassociating
-        // shortcuts (cuBLAS pedantic mode). Ranks below GGML_PREC_F32 so that
-        // "at least F32" tests (prec != UNDEFINED && prec <= GGML_PREC_F32) accept it.
+        // true IEEE F32, no TF32/reassociation; ranks below GGML_PREC_F32 so "at least F32" checks accept it
         GGML_PREC_F32_PEDANTIC = 5,
         GGML_PREC_F32       = 10,
         GGML_PREC_BF16      = 15,

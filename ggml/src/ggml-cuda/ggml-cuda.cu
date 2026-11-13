@@ -1960,7 +1960,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11020
         cu_compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
 #else
-        // no pedantic compute enum here; ordinary F32 is the strongest available contract
         cu_compute_type = CUBLAS_COMPUTE_32F;
 #endif
     }
@@ -2539,7 +2538,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    // same gate as ggml_cuda_mul_mat_id: a pedantic F32 request never takes the mmf path
     const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
         ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
 
@@ -2724,8 +2722,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
-        // [TAG_GGML_PREC] the slice stands in for dst: carry acc (0) and src precision (2, 3).
-        // Not op_params[1], the op hint, which describes the unsliced operands.
+        // [TAG_GGML_PREC] carry acc (0) and src precision (2, 3), not the unsliced op hint (1)
         dst_slice.op_params[0] = dst->op_params[0];
         dst_slice.op_params[2] = dst->op_params[2];
         dst_slice.op_params[3] = dst->op_params[3];

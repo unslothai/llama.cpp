@@ -780,14 +780,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
     for (int col = 0; col < cols_per_thread; ++col) {
         KQ_max_new[col] = KQ_max[col];
-        // The fp16 VKQ accumulator holds the still-unnormalized sum of softmax weights times V.
-        // With large-magnitude V (~1e3) it overflows after a few thousand KV positions even though
-        // all inputs are finite. Gated on rel_f so only the banded op (whose V is that large) pays
-        // for it. When the per-thread partial row sum of weights gets large, force
-        // the running maximum up: the regular rescale below then shrinks the accumulator, row sum,
-        // and all further weights by 2^-8, which the final normalization cancels exactly. The bump
-        // reaches all threads sharing the column via the KQ_max_new warp reduction, and re-triggers
-        // only after the row sum regrows 256x, so the number of bumps is logarithmic in n_kv.
+        // banded only: large V overflows the fp16 VKQ accumulator, so bump the running max to rescale
+        // by 2^-8 (cancelled by the final normalization); bumps are logarithmic in n_kv
         if (rel_f && KQ_rowsum[col] > 4.0f) {
             KQ_max_new[col] += 8.0f*0.6931f;
         }

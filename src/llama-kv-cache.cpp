@@ -2082,7 +2082,7 @@ void llama_kv_cache::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatc
 
         for (int64_t j = 0; j < n_kv; ++j) {
             // use the ACTUAL absolute position in the KV cell; physical slot order is not monotonic
-            int32_t rel = (int32_t) extent; // zero-bias column
+            int32_t rel = (int32_t) extent;
             if (!cells.is_empty(j)) {
                 const llama_pos d = p1 - cells.pos_get(j);
                 if (d >= 0 && d < (llama_pos) extent) {
@@ -3132,10 +3132,8 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
-    // Full-cache and update contexts do not carry a concrete ubatch/slot pair.
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
-        // reserve context: report the whole cache as position-contiguous so the worst-case graph
-        // is the banded path; reserving the dense fallback is unallocatable at large n_ctx
+        // reserve the banded path; the dense fallback is unallocatable at large n_ctx
         if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
             return n_kv;
         }

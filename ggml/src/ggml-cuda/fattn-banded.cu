@@ -91,7 +91,6 @@ static __global__ void flash_attn_ext_banded_f32(
     const int64_t q_offset = n_kv - n_q;
 
     for (int64_t ik = 0; ik < n_kv; ++ik) {
-        // skip masked positions before touching K/V
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {

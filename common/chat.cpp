@@ -1366,7 +1366,6 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_cohere2moe;
     }
 
-    // Inkling / TML: this marker combination is unique to the template
     if (src.find("<|content_thinking|>") != std::string::npos &&
         src.find("<|content_text|>") != std::string::npos &&
         src.find("<|message_model|>") != std::string::npos) {

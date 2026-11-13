@@ -65,7 +65,6 @@ ggml_cgraph * mtmd_graph_inkling::build_vision() {
     cur = build_norm(cur, model.inkling_hmlp_final_norm_w,
                      nullptr, NORM_TYPE_RMS, eps, 3);
 
-    // Batched mtmd convention: one token in ne[1], patch count in ne[2].
     cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_patches);
     ggml_build_forward_expand(gf, cur);
     return gf;
@@ -80,7 +79,6 @@ ggml_cgraph * mtmd_graph_inkling::build_audio() {
     GGML_ASSERT(model.inkling_dmel_final_norm_w);
     GGML_ASSERT(model.inkling_dmel_embd_w->ne[1] == n_mels * mel_vocab_size);
 
-    // decoder width varies per checkpoint
     const int64_t n_embd = model.inkling_dmel_embd_w->ne[0];
 
     const int64_t n_tokens = img.nx();

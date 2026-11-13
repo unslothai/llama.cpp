@@ -9141,8 +9141,6 @@ struct test_flash_attn_ext_banded : public test_case {
         if (kv_type == GGML_TYPE_F32 && rel_type == GGML_TYPE_F32) {
             return 2e-6;
         }
-        // fp16 VKQ accumulation error grows with the KV length (plus periodic accumulator
-        // rescales guarding against fp16 overflow)
         return n_kv > 8192 ? 1e-3 : 5e-4;
     }
 
@@ -9164,7 +9162,6 @@ struct test_flash_attn_ext_banded : public test_case {
         ggml_tensor * v;
         ggml_tensor * r;
         if (strided) {
-            // gaps between rows/heads force the kernels to use the 64-bit byte strides
             ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
             ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
             ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
@@ -9206,7 +9203,6 @@ struct test_flash_attn_ext_banded : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
             } else if (strcmp(t->name, "rel_logits") == 0) {
-                // A larger range makes rel_dist = E versus E-1 mistakes immediately visible.
                 init_tensor_uniform(t, -1.0f, 1.0f);
             } else {
                 init_tensor_uniform(t, -0.25f, 0.25f);
@@ -13181,14 +13177,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
-    // banded score-bias coverage: band edges, masks, decode offset, GQA, head sizes, table types
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 16, 16,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  1, 64,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 1, 64, 64, 512, 1, GGML_TYPE_F16,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 17, 33,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, true));
-    // production-scale n_kv straddling the observed ~16.4-16.9K garbage threshold
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));

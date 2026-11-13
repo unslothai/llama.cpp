@@ -782,9 +782,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, clamp_shexp);
     }
     if (arch == LLM_ARCH_INKLING) {
-        // Read unconditionally by llama_model_inkling::load_arch_hparams, which
-        // then GGML_ASSERTs shortconv_kernel > 1, d_rel > 0, both rel extents > 0
-        // and logit_scale_denom != 0, so none of these can be left out.
+        // all required: load_arch_hparams asserts each is nonzero
         ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
         ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
         ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
