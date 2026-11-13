@@ -1,3 +1,4 @@
+#include "common.h"
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -332,6 +333,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     cb(true);
                 }
                 req_stop_sleeping = false;
+                // Sleep is when the server claims the memory is gone, and it preempts the timed
+                // trim below whenever the sleep threshold is inside that idle window, so release
+                // unconditionally here. Held under the lock deliberately: dropping it around the
+                // unmap would open a wakeup window between the callbacks and the wait.
+                common_state_buffer_pool::instance().trim(0);
                 // wait until we are requested to exit sleeping state
                 condition_tasks.wait(lock, [&]{
                     return (!running || req_stop_sleeping);
@@ -357,6 +363,12 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+
+                // the only loop running while the queue is empty, so the only place a quiet server
+                // gives pooled buffers back. unlocked: trim() unmaps hundreds of MiB.
+                lock.unlock();
+                common_state_buffer_pool::instance().trim(30ll*1000*1000);
+
                 // otherwise, loop again to check sleeping condition
             }
         }
