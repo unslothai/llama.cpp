@@ -63,6 +63,7 @@ def engram_compressed_token_map(tokenizer_dir: Path) -> tuple[list[int], int]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    assert tokenizer is not None
     sentinel = "\ue000"
     normalizer = normalizers.Sequence([
         normalizers.NFKC(),
@@ -81,6 +82,7 @@ def engram_compressed_token_map(tokenizer_dir: Path) -> tuple[list[int], int]:
         text = backend.decode([token_id], skip_special_tokens=False)
         if "\ufffd" in text:
             key = backend.id_to_token(token_id)
+            assert key is not None
         else:
             normalized = normalizer.normalize_str(text)
             key = normalized if normalized else text
