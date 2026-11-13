@@ -199,9 +199,9 @@ jobs:
         continue-on-error: true
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
-          key: cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}
+          key: cuda-depend-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}
           restore-keys: |
-            cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}
+            cuda-depend-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}
           append-timestamp: false
           variant: ccache
           # Force the action's ccache 4.13 binary. Its default (`detect`) skips the install when any
@@ -228,6 +228,8 @@ jobs:
             ccache --set-config=compiler_check=content
             ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
             ccache --set-config=compression_level=6
+            # Depend mode and the "depend" cache keys: see .github/actions/unsloth-cuda-linux-setup.
+            ccache --set-config=depend_mode=true
             ccache -z
             "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           } else {
@@ -414,4 +416,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-cuda-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cuda-depend-${{ env.CUDA }}-windows-arm64-${{ env.PROFILE }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

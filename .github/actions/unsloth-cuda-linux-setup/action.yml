@@ -115,9 +115,9 @@ runs:
     - name: ccache
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
-        key: cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
+        key: cuda-depend-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
         restore-keys: |
-          cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
+          cuda-depend-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
         append-timestamp: false
         variant: ccache
         install: binary
@@ -128,11 +128,20 @@ runs:
       shell: bash
       # compiler_check=content: the toolkit is re-extracted every run, so mtime identity misses a
       # byte-identical nvcc. Sloppiness is the documented safe set; level 6 fits more under max_size.
+      #
+      # depend_mode: with several target architectures, `nvcc -E` preprocesses for the first one
+      # only. ccache's preprocessor fallback compares that output, so a change to code that a
+      # __CUDA_ARCH__ guard keeps from the first architecture, and that keeps the line count, gets
+      # the old object back. Depend mode never preprocesses: a result is reused only when the
+      # source and every file the compiler read are unchanged. The cache keys say "depend" so a
+      # cache written before this is never restored: its manifests can still map current sources
+      # to a stale object.
       run: |
         ccache --set-config=compiler_check=content
         ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
         ccache --set-config=compression_level=6
-        ccache -p | grep -E "compiler_check|sloppiness|compression|max_size|cache_dir"
+        ccache --set-config=depend_mode=true
+        ccache -p | grep -E "compiler_check|sloppiness|compression|depend_mode|max_size|cache_dir"
         ccache -z
 
     - name: Configure
