@@ -62,8 +62,18 @@ common_chat_params common_chat_params_init_harmony_xml(const common_chat_templat
         };
 
         auto analysis_open  = p.literal("<|channel|>analysis<|message|>");
-        auto analysis_body  = p.until_one_of(with_eog({ "<|end|>", "<|constrain|><|start|>assistant", "<|start|>assistant" }));
+        // The model sometimes closes an empty analysis with <|constrain|> in place of <|end|> and/or <|start|>
+        // (seen after several earlier turns sent back without reasoning), e.g.
+        // "<|channel|>analysis<|message|><|constrain|><|constrain|>assistant<|channel|>final<|message|>...".
+        // Treat those as the end of the analysis message so the reply is not swallowed as reasoning.
+        auto analysis_body  = p.until_one_of(with_eog({ "<|end|>", "<|constrain|><|start|>assistant", "<|start|>assistant",
+                                                       "<|constrain|><|constrain|>assistant<|channel|>",
+                                                       "<|constrain|>assistant<|channel|>" }));
         auto analysis_close = p.optional(p.literal("<|end|>") | p.literal("<|constrain|>") | eog);
+        // header of the message after an analysis: normally <|start|>assistant; after a <|constrain|> close
+        // tolerate <|constrain|>assistant or a bare assistant before the next channel header
+        auto next_start     = p.rule("next-start", start | p.literal("<|constrain|>assistant") |
+                                                   (p.literal("assistant") + p.peek(p.literal("<|channel|>"))));
         if (extract_reasoning) {
             p.rule("analysis", analysis_open + p.reasoning(analysis_body) + analysis_close);
         } else {
@@ -84,7 +94,7 @@ common_chat_params common_chat_params_init_harmony_xml(const common_chat_templat
                 p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
                 p.optional(p.literal("<|end|>") | eog));
 
-            return start + p.zero_or_more(analysis + start) + response_format;
+            return start + p.zero_or_more(analysis + next_start) + response_format;
         }
 
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -177,16 +187,16 @@ common_chat_params common_chat_params_init_harmony_xml(const common_chat_templat
             auto tool_call = p.trigger_rule("tool-call", tool_calls);
 
             if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
-                return start + p.zero_or_more(analysis + start) + tool_call;
+                return start + p.zero_or_more(analysis + next_start) + tool_call;
             }
 
-            return start + p.zero_or_more(analysis + start) + (tool_call | final_msg | p.content(p.rest()));
+            return start + p.zero_or_more(analysis + next_start) + (tool_call | final_msg | p.content(p.rest()));
         }
 
         auto unsolicited = p.rule("unsolicited", p.atomic(p.literal(" to=") + p.rest()));
 
         // output without a channel header is returned as content instead of failing the request
-        return start + p.zero_or_more(analysis + start) + (final_msg | unsolicited | p.content(p.rest()));
+        return start + p.zero_or_more(analysis + next_start) + (final_msg | unsolicited | p.content(p.rest()));
     });
 
     if (include_grammar) {
