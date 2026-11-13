@@ -243,6 +243,8 @@ def build_artifacts(
             "max_sm": info["max_sm"],
             "rank": info["bundle_rank"],
             "toolkit_version": info["toolkit_line"],
+            # False for a bundle packaged before the field existed.
+            "bundles_cuda_runtime": bool(info.get("bundles_cuda_runtime", False)),
         })
     for asset_name, platform, gfx in rocm_bundles:
         artifacts.append({
@@ -437,10 +439,10 @@ def main() -> int:
         assets = upstream_assets(tag, token)
         wanted: list[tuple[str, str]] = []  # (name, kind)
         for name in sorted(assets):
-            # arm64 as well as x64: package_bundle.py deliberately leaves the CUDA
-            # runtime out of every bundle, so the Windows ARM64 CUDA bundle needs
-            # upstream's cudart-...-arm64.zip recorded here or the installer has no
-            # approved hash to pair it with.
+            # arm64 as well as x64: these pair with upstream's own llama-* CUDA
+            # zips, which ship no runtime. Without an entry here the installer has
+            # no approved hash for the cudart archive. Our app-* CUDA bundles carry
+            # the runtime themselves (bundles_cuda_runtime) and need no pairing.
             if re.fullmatch(r"cudart-llama-bin-win-cuda-\d+\.\d+-(?:x64|arm64)\.zip", name):
                 wanted.append((name, "windows-cuda-upstream"))
             # The win-cuda BINARY zips must be recorded under their own names too:

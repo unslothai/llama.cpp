@@ -355,6 +355,23 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Ship the CUDA runtime, as the Windows legs do: a chat-only Studio install has no PyTorch to
+      # supply it and the NVIDIA driver does not include it, so libggml-cuda.so cannot load and
+      # llama-server runs on the CPU. Each file is copied under its soname, the name the loader
+      # asks for. NVIDIA's libcublas carries RUNPATH $ORIGIN, so libcublasLt resolves from the
+      # bundle directory as well. The packager's NEEDED walk picks all three up from there.
+      - name: Copy the CUDA runtime into the bundle
+        run: |
+          set -euo pipefail
+          major="${{ matrix.cuda }}"
+          major="${major%%.*}"
+          for lib in libcudart libcublas libcublasLt; do
+            src="$CUDA_PATH/lib/$lib.so.$major"
+            [ -e "$src" ] || { echo "the toolkit has no $src" >&2; exit 1; }
+            cp -L "$src" "src/build/bin/$lib.so.$major"
+          done
+          ls -l src/build/bin/libcu*
+
       - name: Package bundle
         env:
           PLATFORM: linux

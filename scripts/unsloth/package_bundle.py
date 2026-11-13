@@ -12,9 +12,11 @@ implementing one PlatformStrategy (its dependency-walk tool, lib-name
 convention, backend glob, and archive format), not writing a new packaging
 script.
 
-The installer normally uses PyTorch's CUDA runtime, selected by runtime_line.
-BUNDLE_CUDA_RUNTIME=1 includes cudart/cublas DLLs for Windows ARM64, where
-PyTorch has no CUDA build.
+CUDA bundles ship the cudart/cublas runtime: chat-only Studio installs have no
+PyTorch to supply it, and Windows ARM64 has no PyTorch CUDA build at all. The
+build legs copy it into BIN_DIR. On Windows BUNDLE_CUDA_RUNTIME=1 includes the
+DLLs; on Linux the NEEDED walk finds the libraries by soname. The metadata
+records the result as bundles_cuda_runtime.
 
 Linux is the CI-validated path. macOS/Windows strategies follow the correct
 platform conventions (otool/@loader_path/tar.gz; dir-local DLLs/zip) but have
@@ -198,7 +200,8 @@ def curate(strategy: PlatformStrategy, bin_dir: Path, stage: Path) -> None:
     # carries the same tool set as the full-build cpu/macos/rocm tarballs (which
     # tar all of build/bin). Each becomes a root too, so any library only it
     # needs is pulled into the closure. Runtime libraries that live outside
-    # bin_dir (e.g. the CUDA runtime) are never pulled in: the walk stays local.
+    # bin_dir are never pulled in: the walk stays local. The CUDA runtime ships
+    # because the build legs copy it into bin_dir first.
     required_set = set(required)
     for p in sorted(bin_dir.iterdir()):
         if p.name in required_set or not strategy.is_executable(p):
@@ -245,6 +248,13 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
     if "100" in supported_sms and "103" not in supported_sms:
         supported_sms = sorted([*supported_sms, "103"], key=int)
     note = f"CUDA {cfg['line'].removeprefix('cuda')} {cfg['klass']} bundle."
+    # True when the bundle carries its own cuBLAS, so it runs on a host that has
+    # the NVIDIA driver and nothing else. The installer reads this to decide
+    # whether a bundle needs a CUDA runtime from somewhere else.
+    bundles_cuda_runtime = any(
+        re.match(r"(libcublas\.so\.\d+|cublas64_\d+\.dll)$", p.name, re.IGNORECASE)
+        for p in stage.iterdir()
+    )
 
     licenses = [f"Third-party licenses bundled with this llama.cpp prebuilt ({cfg['tag']}).",
                 f"Source: https://github.com/{cfg['source_repo']} @ {cfg['commit']}", ""]
@@ -273,6 +283,7 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
         "coverage_class": cfg["klass"],
         "bundle_rank": int(cfg["rank"]),
         "toolkit_line": cfg["toolkit_line"],
+        "bundles_cuda_runtime": bundles_cuda_runtime,
         "docker_image": cfg["docker_image"],
         "supported_sms": supported_sms,
         "nvcc_validation_status": nvcc_status,
@@ -299,6 +310,7 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
         f"docker image: {cfg['docker_image']}",
         "backend: CUDA",
         f"toolkit version: {cfg['toolkit_line']}",
+        f"cuda runtime: {'bundled' if bundles_cuda_runtime else 'not bundled'}",
         f"supported sms: {','.join(supported_sms)}",
         f"nvcc validation: {nvcc_status}",
         f"min sm: {min_sm}",
