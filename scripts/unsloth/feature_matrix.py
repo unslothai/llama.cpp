@@ -57,9 +57,15 @@ class NeedsGPU(Exception):
     """
 
 
+def exe(b: Path, name: str) -> Path:
+    """b / name, or b / name.exe where only the Windows build exists."""
+    p = b / name
+    return p if p.exists() or not (b / f"{name}.exe").exists() else b / f"{name}.exe"
+
+
 def bins(build_dir: Path) -> Path:
     for c in (build_dir / "bin", build_dir):
-        if (c / "test-backend-ops").exists() or (c / "test-llama-archs").exists():
+        if exe(c, "test-backend-ops").exists() or exe(c, "test-llama-archs").exists():
             return c
     raise SystemExit(f"no test binaries under {build_dir}")
 
@@ -82,7 +88,7 @@ def probe_arch(check: dict, b: Path, gpu: bool) -> str:
     # without its "Summary:" line is retried; on one loaded core 5 of 60 runs
     # were cut off.
     for _ in range(4):
-        rc, out = run([str(b / "test-llama-archs"), "-a", arch, "-s", "1234"], b, gpu)
+        rc, out = run([str(exe(b, "test-llama-archs")), "-a", arch, "-s", "1234"], b, gpu)
         if rc != 0 or "Summary:" in out:
             break
     else:
@@ -105,7 +111,7 @@ def probe_backend_op(check: dict, b: Path, gpu: bool) -> str:
     if not gpu:
         raise NeedsGPU("test-backend-ops compares against CPU, so with no "
                        "accelerator it skips every backend and proves nothing")
-    cmd = [str(b / "test-backend-ops"), "test", "-o", check["op"]]
+    cmd = [str(exe(b, "test-backend-ops")), "test", "-o", check["op"]]
     if check.get("params"):
         cmd += ["-p", check["params"]]
     rc, out = run(cmd, b, gpu)
@@ -124,7 +130,7 @@ def probe_backend_op(check: dict, b: Path, gpu: bool) -> str:
 
 def probe_mtmd(check: dict, b: Path, gpu: bool) -> str:
     """The projector registry is intact, including this projector's entry."""
-    rc, out = run([str(b / "test-mtmd-impl"), "test_projector_registry"], b, gpu)
+    rc, out = run([str(exe(b, "test-mtmd-impl")), "test_projector_registry"], b, gpu)
     if rc != 0:
         raise Unproven(f"test-mtmd-impl exited {rc}")
     m = re.search(r"assertions\s*:\s*(\d+)", out)
@@ -155,14 +161,14 @@ def probe_penalize_prompt(check: dict, b: Path, gpu: bool) -> str:
     import time
     import urllib.request
 
-    server = b / "llama-server"
+    server = exe(b, "llama-server")
     if not server.exists():
         # Only the CPU gate builds without it; a --gpu (full build) run that lacks it proved nothing.
         if gpu:
             raise Unproven("llama-server is missing from this full build")
         raise NeedsServer("needs llama-server, which this build did not produce")
     tmp = Path(tempfile.mkdtemp(prefix="fm_pp_", dir=b))
-    rc, out = run([str(b / "test-llama-archs"), "-a", "llama", "-s", "1234", "-o", str(tmp)], b, gpu)
+    rc, out = run([str(exe(b, "test-llama-archs")), "-a", "llama", "-s", "1234", "-o", str(tmp)], b, gpu)
     model = tmp / "llama-dense.gguf"
     if rc != 0 or not model.exists():
         raise Unproven(f"test-llama-archs -o did not write {model.name} (rc {rc})")
