@@ -44,7 +44,7 @@
   "schema": 1,
   "features": {
     "inkling": {
-      "owner": "ggml-org#32187",
+      "owner": "ggml-org#25731",
       "checks": [
         { "kind": "arch",       "arch": "inkling" },
         { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
@@ -52,10 +52,9 @@
       ]
     },
     "inkling2": {
-      "owner": "ggml-org#32187",
+      "owner": "ggml-org#32268",
       "checks": [
         { "kind": "arch",       "arch": "inkling2" },
-        { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
         { "kind": "mtmd",       "projector": "inkling2" }
       ]
     },
