@@ -133,12 +133,11 @@ struct llama_context {
     bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
     bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
 
-    // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
-    bool set_state_src(llama_context * src);
+    // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
+    bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
-    void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -272,7 +271,7 @@ private:
     //
 
 public:
-    uint32_t graph_max_nodes(uint32_t n_tokens) const;
+    uint32_t graph_max_nodes() const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -297,8 +296,22 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    // create a new backend scheduler for a graph of the specified size and register the callbacks below
-    void sched_new(size_t max_nodes, bool parallel);
+    // parameters defining the backend scheduler instance
+    struct sched_params {
+        size_t max_nodes  = 0;
+        bool   parallel   = false;
+        bool   op_offload = false;
+
+        // a scheduler can serve any graph of up to max_nodes nodes
+        bool can_reuse(const sched_params & other) const {
+            return parallel   == other.parallel
+                && op_offload == other.op_offload
+                && max_nodes  <= other.max_nodes;
+        }
+    };
+
+    // create a new backend scheduler with the given parameters, unless the current one can be reused
+    void sched_new(const sched_params & params);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -389,6 +402,8 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
 
