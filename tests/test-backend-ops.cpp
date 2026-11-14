@@ -4318,6 +4318,64 @@ struct test_relu_sqr : public test_case {
     }
 };
 
+// softplus vs a double log1p(exp(x)) reference: for x < -16.6 the naive log(1 + exp(x)) returns 0 in F32
+struct test_softplus_range : public test_case {
+    const int64_t n;
+    std::vector<float> x;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SOFTPLUS_RANGE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n);
+    }
+
+    test_softplus_range(int64_t n = 4001) : n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_softplus(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        x.resize(n);
+        for (int64_t i = 0; i < n; i++) {
+            x[i] = -100.0f + 200.0f*(float) i/(float) (n - 1);
+        }
+        ggml_tensor * a = ggml_get_tensor(ctx, "a");
+        ggml_backend_tensor_set(a, x.data(), 0, ggml_nbytes(a));
+    }
+
+    // relative error vs the double reference; below FLT_MIN (x < -87.3) an absolute FLT_MIN error is allowed (FTZ)
+    // only the softplus output is scored, not the input or sentinels
+    double err(const float * a, const float * b, size_t nel) override {
+        if (nel != x.size() || memcmp(a, x.data(), nel*sizeof(float)) == 0) {
+            return 0.0;
+        }
+        double max_err = 0.0;
+        for (size_t i = 0; i < nel; i++) {
+            const double ref = std::log1p(std::exp((double) x[i]));
+            for (const float v : {a[i], b[i]}) {
+                const double d = std::fabs(v - ref);
+                const double e = ref < FLT_MIN ? (d <= FLT_MIN ? 0.0 : 1.0) : d/ref;
+                max_err = std::max(max_err, e);
+            }
+        }
+        return max_err;
+    }
+
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+};
+
 // GGML_OP_UNARY(GELU|SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
 struct test_unary_mul : public test_case {
     const ggml_unary_op op;
@@ -10501,6 +10559,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_TQ1_0,
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ1_XS, GGML_TYPE_IQ1_XXS, GGML_TYPE_IQ1_XXXS,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
 };
 
@@ -10530,6 +10589,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_TQ1_0,
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ1_XS, GGML_TYPE_IQ1_XXS, GGML_TYPE_IQ1_XXXS,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
     GGML_TYPE_BF16,
 };
@@ -10557,6 +10617,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_softplus_range());
 
     // fused relu + sqr (squared ReLU)
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10750,6 +10812,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    // MXFP8 is gather-only
+    for (int b : {1, 7}) {
+        for (bool v : {false, true}) {
+            for (bool vs0 : {false, true}) {
+                test_cases.emplace_back(new test_get_rows(GGML_TYPE_MXFP8, 256, 5, 4, b, 1, v, vs0));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_MXFP8, 256, 1000, 24, 1, 1, false));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

@@ -140,6 +140,10 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// Run a pending scheduler reserve now instead of on the next decode, e.g. so that the memory breakdown of an
+// allocation-free context reflects flags that change the graph shape
+LLAMA_API void llama_sched_reserve(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

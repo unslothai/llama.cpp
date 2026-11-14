@@ -67,6 +67,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_XS:    name = LLAMA_FTYPE_PREFIX "IQ3_XS - 3.3 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS:   name = LLAMA_FTYPE_PREFIX "IQ3_XXS - 3.0625 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ1_S:     name = LLAMA_FTYPE_PREFIX "IQ1_S - 1.5625 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XS:    name = LLAMA_FTYPE_PREFIX "IQ1_XS - 1.4375 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXS:   name = LLAMA_FTYPE_PREFIX "IQ1_XXS - 1.3125 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXXS:  name = LLAMA_FTYPE_PREFIX "IQ1_XXXS - 1.1875 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
@@ -860,6 +863,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
             case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
             case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
+            case GGML_TYPE_IQ1_XS:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_XS;   break;
+            case GGML_TYPE_IQ1_XXS:  ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXS;  break;
+            case GGML_TYPE_IQ1_XXXS: ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXXS; break;
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
@@ -1359,6 +1365,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        // the deepseek41 Engram table (~200 GB) is a CPU get_rows gather table: never put it in device memory
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && !ggml_backend_buft_is_host(buft)) {
+            LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
+            buft = ggml_backend_cpu_buffer_type();
         }
 
         // avoid using a host buffer when using mmap

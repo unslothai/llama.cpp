@@ -2349,13 +2349,15 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
     // amx kernels will be added once 6th gen xeon is released.
     const bool is_floating_type = TYPE == GGML_TYPE_F16;
 
-    const int M = dst->ne[1];
+    // single 2D src0 slice (supports_op) and contiguous src1/dst: all src1 batches are one gemm
+    GGML_ASSERT(ggml_nrows(src0) == src0->ne[1]);
+    const int M = ggml_nrows(dst);
     const int N = dst->ne[0];
     const int K = src0->ne[0];
     const int ldc = dst->nb[1] / dst->nb[0];
 
-    const int64_t ne2 = dst->ne[2];
-    const int64_t n_batch = ne2 * dst->ne[3];
+    const int64_t ne2 = 1;
+    const int64_t n_batch = 1;
 
     if (is_floating_type) {
         constexpr int BLOCK_M = 4;
