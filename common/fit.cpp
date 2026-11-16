@@ -402,9 +402,9 @@ static void common_params_fit_impl(
         LOG_WRN("%s: --moe-cache-mib auto needs a MoE model on a single GPU, not using a MoE cache\n", __func__);
         moe_cache_auto = false;
     }
-    // auto picks the expert placement itself, a user override (--cpu-moe, -ot) would otherwise leave it at a zero cache
+    // auto places the tensors itself and the fit aborts on any user override (--cpu-moe, -ot), which would leave a zero cache
     if (moe_cache_auto && mparams->tensor_buft_overrides && mparams->tensor_buft_overrides[0].pattern) {
-        LOG_WRN("%s: --moe-cache-mib auto places the experts itself, drop --cpu-moe/-ot or give a size, not using a MoE cache\n", __func__);
+        LOG_WRN("%s: --moe-cache-mib auto places the tensors itself, drop --cpu-moe/-ot or give a size, not using a MoE cache\n", __func__);
         moe_cache_auto = false;
     }
 
