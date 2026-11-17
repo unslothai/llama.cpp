@@ -606,6 +606,9 @@ static void common_params_fit_impl(
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                            if (user_cpu_moe && nd == 1) {
+                                fit_moe_cache(dmds_full[0].free - margins[0], sum_projected_used - memory_reduction, moe_cache_min_size_user);
+                            }
                             return;
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
