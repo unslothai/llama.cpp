@@ -393,7 +393,8 @@ static void common_params_fit_impl(
             add_extra_memory(dmds, mparams);
             const int64_t overshoot = int64_t(dmds[0].mb.total()) - target;
             if (overshoot <= 0) {
-                LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
+                // the cache allocates at most the host expert size, so this is the budget, not the size it ends up with
+                LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache budget %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
                     __func__, cache/MiB, (int64_t(dmds[0].free) - int64_t(dmds[0].mb.total()))/MiB);
                 return true;
             }
