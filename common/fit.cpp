@@ -385,17 +385,20 @@ static void common_params_fit_impl(
         int64_t cache = target - mem_base;
         cache -= cache % MiB;
         int64_t cache_tested = cache; // last size that was measured, for the log
+        // on an integrated GPU the host experts and the cache share the same RAM, so count both against the target
+        const bool unified = ggml_backend_dev_type(devs[0]) == GGML_BACKEND_DEVICE_TYPE_IGPU;
         for (int i = 0; i < 4 && cache_min > 0 && cache >= cache_min; i++) {
             cparams->moe_cache_size = cache;
             cache_tested = cache;
             LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
             dmds_t dmds = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
             add_extra_memory(dmds, mparams);
-            const int64_t overshoot = int64_t(dmds[0].mb.total()) - target;
+            const int64_t used      = int64_t(dmds[0].mb.total()) + (unified ? int64_t(dmds.back().mb.total()) : 0);
+            const int64_t overshoot = used - target;
             if (overshoot <= 0) {
                 // the cache allocates at most the host expert size, so this is the budget, not the size it ends up with
                 LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache budget %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
-                    __func__, cache/MiB, (int64_t(dmds[0].free) - int64_t(dmds[0].mb.total()))/MiB);
+                    __func__, cache/MiB, (int64_t(dmds[0].free) - used)/MiB);
                 return true;
             }
             cache -= GGML_PAD(overshoot, MiB);
