@@ -71,6 +71,8 @@ runs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
+    # cuda_nvml_dev: headers only (<nvml.h>, upstream #30672). nvml.dll is loaded at runtime from
+    # the driver, never linked, so the bundles gain no new dependency.
     # Toolkit from NVIDIA's redist CDN: about 1 min per job against 7 to 8 for Jimver. The 12.8.0
     # archives are the same nvcc V12.8.61 and libcublas 12.8.3.14 Jimver installed, so shipped bits are unchanged.
     - name: Install CUDA toolkit ${{ inputs.cuda }} (NVIDIA redist)
@@ -78,8 +80,8 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         switch ("${{ inputs.cuda }}") {
-          '12.8.0' { $components = @('cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_nvrtc:12.8.61', 'libcublas:12.8.3.14', 'cuda_nvtx:12.8.55', 'cuda_profiler_api:12.8.55', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55') }
-          '13.3'   { $components = @('cuda_crt:13.3.33', 'cuda_cudart:13.3.29', 'cuda_nvcc:13.3.33', 'cuda_nvrtc:13.3.33', 'libcublas:13.5.1.27', 'libnvvm:13.3.33', 'cuda_nvtx:13.3.29', 'cuda_profiler_api:13.3.27', 'cccl:13.3.3.3.1', 'visual_studio_integration:13.3.27') }
+          '12.8.0' { $components = @('cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_nvrtc:12.8.61', 'libcublas:12.8.3.14', 'cuda_nvtx:12.8.55', 'cuda_profiler_api:12.8.55', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55', 'cuda_nvml_dev:12.8.55') }
+          '13.3'   { $components = @('cuda_crt:13.3.33', 'cuda_cudart:13.3.29', 'cuda_nvcc:13.3.33', 'cuda_nvrtc:13.3.33', 'libcublas:13.5.1.27', 'libnvvm:13.3.33', 'cuda_nvtx:13.3.29', 'cuda_profiler_api:13.3.27', 'cccl:13.3.3.3.1', 'visual_studio_integration:13.3.27', 'cuda_nvml_dev:13.3.29') }
           default  { throw "no redist component table for CUDA ${{ inputs.cuda }}" }
         }
         $line = "${{ inputs.cuda }}" -replace '^(\d+\.\d+).*$', '$1'

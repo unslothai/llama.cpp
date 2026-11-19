@@ -532,6 +532,16 @@ jobs:
       - name: Install Ninja
         run: choco install ninja --no-progress
 
+      # LLVM 22.1.8, as ggml-org release.yml windows-cpu does since #32548: the image's LLVM 20
+      # fails against the VS 18 STL from MSVC 14.52 on (yvals_core.h STL1000, "expected Clang 22
+      # or newer"). It installs over C:\Program Files\LLVM; the PATH entry puts it first.
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8 --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install llvm failed: $LASTEXITCODE" }
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "C:\Program Files\LLVM\bin\clang.exe" --version
+
       # Build recipe copied from ggml-org/llama.cpp release.yml (windows-cpu):
       # clang via the per-arch LLVM toolchain file, "Ninja Multi-Config", OpenMP,
       # BoringSSL, and GGML_CPU_ALL_VARIANTS only on x64 (it is an x86 microarch
