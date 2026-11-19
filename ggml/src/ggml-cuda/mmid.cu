@@ -143,7 +143,7 @@ static __global__ void mm_ids_helper(
                 int nlower = match; // inclusive count of the matching lanes up to this one
 #pragma unroll
                 for (int offset = 1; offset < warp_size; offset <<= 1) {
-                    const int tmp = __shfl_up_sync(0xFFFFFFFF, nlower, offset, warp_size);
+                    const int tmp = ggml_cuda_shfl_up(nlower, offset, warp_size);
                     if (threadIdx.x >= static_cast<unsigned int>(offset)) {
                         nlower += tmp;
                     }
@@ -158,7 +158,7 @@ static __global__ void mm_ids_helper(
                         ids_src1[nex_prev + itc] = it*sis1 + iex % nchannels_y;
                     }
                 }
-                itc0 += __shfl_sync(0xFFFFFFFF, nlower, warp_size - 1, warp_size);
+                itc0 += ggml_cuda_shfl(nlower, warp_size - 1, warp_size);
             }
         }
     }
@@ -388,7 +388,7 @@ static __global__ void mm_ids_scatter(
         int cnt  = 0;
 #pragma unroll
         for (int j = 0; j < warp_size; ++j) {
-            const int ej = __shfl_sync(0xFFFFFFFF, expert_used, j, warp_size);
+            const int ej = ggml_cuda_shfl(expert_used, j, warp_size);
             if (ej == expert_used) {
                 cnt++;
                 rank += j < lane;
