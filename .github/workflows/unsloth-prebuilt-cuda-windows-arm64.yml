@@ -149,6 +149,8 @@ jobs:
 
       # CUDA 13.4.1 GA: x86_64 compiler tools and ARM64 runtime libraries,
       # matching ggml-org/llama.cpp#28687.
+      # cuda_nvml_dev: <nvml.h> only (upstream #30672 includes it; nvml.dll is
+      # loaded at runtime, not linked), same archive as upstream's windows-setup-cuda.
       - name: Install CUDA toolkit 13.4 (x86_64 host, ARM64 target)
         run: |
           $ErrorActionPreference = 'Stop'
@@ -159,7 +161,8 @@ jobs:
             "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.4.59-archive",
             "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.4.59-archive",
             "cuda_cudart/windows-arm64/cuda_cudart-windows-arm64-13.4.49-archive",
-            "libcublas/windows-arm64/libcublas-windows-arm64-13.7.0.27-archive"
+            "libcublas/windows-arm64/libcublas-windows-arm64-13.7.0.27-archive",
+            "cuda_nvml_dev/windows-arm64/cuda_nvml_dev-windows-arm64-13.4.61-archive"
           )
           $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA }}"
           $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'

@@ -77,12 +77,15 @@ runs:
           arm64) PLAT=linux-sbsa ;;
           *) echo "unsupported arch ${{ inputs.arch }}" >&2; exit 1 ;;
         esac
+        # cuda_nvml_dev: headers only. ggml-cuda.cu includes <nvml.h> since upstream #30672 and
+        # dlopens libnvidia-ml.so.1 at runtime, so nothing links the stub and the bundles gain no
+        # new runtime dependency.
         # 12.8.0 maps to the 12.8.1 archives on purpose: Jimver's apt metapackage served the
         # newest patch, so every Linux CUDA 12 bundle was built by nvcc V12.8.93 with libcublas
         # 12.8.4.1 (run 34168016006). Shipped bits must not change with the install method.
         case "${{ inputs.cuda }}" in
-          12.8.0) COMPONENTS="cuda_cudart:12.8.90 cuda_nvcc:12.8.93 cuda_nvrtc:12.8.93 libcublas:12.8.4.1 cuda_nvtx:12.8.90 cuda_profiler_api:12.8.90 cuda_cccl:12.8.90" ;;
-          13.3)   COMPONENTS="cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1" ;;
+          12.8.0) COMPONENTS="cuda_cudart:12.8.90 cuda_nvcc:12.8.93 cuda_nvrtc:12.8.93 libcublas:12.8.4.1 cuda_nvtx:12.8.90 cuda_profiler_api:12.8.90 cuda_cccl:12.8.90 cuda_nvml_dev:12.8.90" ;;
+          13.3)   COMPONENTS="cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1 cuda_nvml_dev:13.3.29" ;;
           *) echo "no redist component table for CUDA ${{ inputs.cuda }}" >&2; exit 1 ;;
         esac
         PREFIX="$HOME/cuda-${{ inputs.cuda }}"
