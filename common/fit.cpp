@@ -11,6 +11,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -376,10 +377,44 @@ static void common_params_fit_impl(
         }
     };
 
+    // largest MoE cache that keeps device 0 at or below target with every routed expert in host RAM, mem_base is the
+    // device memory used without a cache; sets cparams->moe_cache_size and returns true if one fits
+    auto fit_moe_cache = [&](const int64_t target, const int64_t mem_base, const size_t min_size) {
+        // a cache with the slots for the experts of only one token thrashes and is slower than no cache
+        const int64_t cache_min = 2*int64_t(min_size);
+        int64_t cache = target - mem_base;
+        cache -= cache % MiB;
+        int64_t cache_tested = cache; // last size that was measured, for the log
+        // on an integrated GPU the host experts and the cache share the same RAM, so count both against the target
+        const bool unified = ggml_backend_dev_type(devs[0]) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        for (int i = 0; i < 4 && cache_min > 0 && cache >= cache_min; i++) {
+            cparams->moe_cache_size = cache;
+            cache_tested = cache;
+            LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
+            dmds_t dmds = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds, mparams);
+            const int64_t used      = int64_t(dmds[0].mb.total()) + (unified ? int64_t(dmds.back().mb.total()) : 0);
+            const int64_t overshoot = used - target;
+            if (overshoot <= 0) {
+                // the cache allocates at most the host expert size, so this is the budget, not the size it ends up with
+                LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache budget %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
+                    __func__, cache/MiB, (int64_t(dmds[0].free) - used)/MiB);
+                return true;
+            }
+            cache -= GGML_PAD(overshoot, MiB);
+        }
+        cparams->moe_cache_size = 0;
+        LOG_INF("%s: moe cache auto: cache of %" PRId64 " MiB does not fit or is below the minimum of %" PRId64 " MiB, not using a MoE cache\n",
+            __func__, std::max<int64_t>(cache_tested, 0)/MiB, cache_min/MiB);
+        return false;
+    };
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+    size_t moe_cache_min_size_user = 0; // minimum MoE cache for the user's placement, used with --cpu-moe
+    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level,
+        moe_cache_auto ? &moe_cache_min_size_user : nullptr);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -400,6 +435,16 @@ static void common_params_fit_impl(
 
     if (moe_cache_auto && (hp_nex == 0 || nd != 1)) {
         LOG_WRN("%s: --moe-cache-mib auto needs a MoE model on a single GPU, not using a MoE cache\n", __func__);
+        moe_cache_auto = false;
+    }
+    // --cpu-moe alone keeps every routed expert in host RAM, the placement auto would choose, so auto sizes the cache for it;
+    // any other override (-ot, --n-cpu-moe) makes the fit abort or return early with no cache, so say so instead
+    const llama_model_tensor_buft_override * tbo_user = mparams->tensor_buft_overrides;
+    const bool has_tbo_user = tbo_user && tbo_user[0].pattern;
+    const bool user_cpu_moe = moe_cache_auto && has_tbo_user && !tbo_user[1].pattern &&
+        strcmp(tbo_user[0].pattern, LLM_FFN_EXPS_REGEX) == 0 && tbo_user[0].buft == ggml_backend_cpu_buffer_type();
+    if (moe_cache_auto && has_tbo_user && !user_cpu_moe) {
+        LOG_WRN("%s: --moe-cache-mib auto places the tensors itself, drop -ot/--n-cpu-moe or give a size, not using a MoE cache\n", __func__);
         moe_cache_auto = false;
     }
 
@@ -476,6 +521,9 @@ static void common_params_fit_impl(
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+                if (user_cpu_moe) {
+                    fit_moe_cache(dmds_full[0].free - margins[0], dmds_full[0].mb.total(), moe_cache_min_size_user);
+                }
                 return;
             }
         } else {
@@ -558,6 +606,9 @@ static void common_params_fit_impl(
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                            if (user_cpu_moe && nd == 1) {
+                                fit_moe_cache(dmds_full[0].free - margins[0], sum_projected_used - memory_reduction, moe_cache_min_size_user);
+                            }
                             return;
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
@@ -821,34 +872,10 @@ static void common_params_fit_impl(
         tensor_buft_overrides[1] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
 
-        // a cache with the slots for the experts of only one token thrashes and is slower than no cache
-        const int64_t cache_min = 2*int64_t(moe_cache_min_size);
-        int64_t cache = target - mem_cpu_moe;
-        cache -= cache % MiB;
-        int64_t cache_tested = cache; // last size that was measured, for the log
-        bool fits = false;
-        for (int i = 0; i < 4 && cache_min > 0 && cache >= cache_min; i++) {
-            cparams->moe_cache_size = cache;
-            cache_tested = cache;
-            LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
-            dmds_t dmds = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
-            add_extra_memory(dmds, mparams);
-            const int64_t overshoot = int64_t(dmds[0].mb.total()) - target;
-            if (overshoot <= 0) {
-                fits = true;
-                break;
-            }
-            cache -= GGML_PAD(overshoot, MiB);
-        }
-        if (fits) {
+        if (fit_moe_cache(target, mem_cpu_moe, moe_cache_min_size)) {
             rollback.active = false;
-            LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
-                __func__, cache/MiB, margins[0]/MiB);
             return;
         }
-
-        LOG_INF("%s: moe cache auto: cache of %" PRId64 " MiB does not fit or is below the minimum of %" PRId64 " MiB, not using a MoE cache\n",
-            __func__, std::max<int64_t>(cache_tested, 0)/MiB, cache_min/MiB);
     } else if (moe_cache_auto) {
         LOG_INF("%s: moe cache auto: the dense weights do not fit, not using a MoE cache\n", __func__);
     }
