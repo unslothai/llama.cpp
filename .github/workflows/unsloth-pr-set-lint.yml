@@ -22,6 +22,8 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
       - scripts/unsloth/slice_*.sh
+      - scripts/unsloth/slim_source_archive.sh
+      - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
@@ -40,6 +42,8 @@ on:
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
       - scripts/unsloth/slice_*.sh
+      - scripts/unsloth/slim_source_archive.sh
+      - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
@@ -120,7 +124,12 @@ jobs:
             # false-fail a legitimate giant PR.
             if [ "$COMMITS" -gt 250 ]; then
               echo "::notice::${SRC}#${NUM} has ${COMMITS} commits (over the API listing cap); skipping pin membership check"
-            elif ! gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$PIN"; then
+            # Listed into a variable, not piped, for the same SIGPIPE reason as unsloth-prebuilt.yml.
+            elif ! PR_SHAS="$(gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha')"; then
+              echo "::error file=$FILE::could not list the commits of ${SRC}#${NUM} (transient API failure); retry"
+              fail=1
+              continue
+            elif ! grep -qxF -- "$PIN" <<<"$PR_SHAS"; then
               echo "::error file=$FILE::pinned commit ${PIN} is not a commit of ${SRC}#${NUM}"
               fail=1
               continue
@@ -153,6 +162,8 @@ jobs:
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py \
                    scripts/unsloth/test_relocate_kpack.py \
+                   scripts/unsloth/test_slim_source_archive.py \
+                   scripts/unsloth/test_link_bundle_copies.py \
                    scripts/unsloth/test_slicing.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
