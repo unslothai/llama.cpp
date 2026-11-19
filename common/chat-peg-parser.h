@@ -150,8 +150,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
                                           const std::string &              call_id_key = "",
                                           const std::string &              gen_call_id_key = "",
                                           const std::vector<std::string> & parameters_order = {},
-                                          bool                             accept_openai_wrapper = false,
-                                          bool                             require_object_args = false);
+                                          bool                             accept_openai_wrapper = false);
 
     // Legacy-compatible helper for building XML/tagged style tool calls
     // Used by tests and manual parsers
@@ -162,9 +161,11 @@ class common_chat_peg_builder : public common_peg_parser_builder {
 
     // Helper for Python-style function call format: name(arg1="value1", arg2=123)
     // Used by LFM2 and similar templates
+    // allow_undeclared: also accept calls to names not in tools (any identifier, any arguments)
     common_peg_parser python_style_tool_calls(const common_json & tools,
                                               bool                           parallel_tool_calls,
-                                              bool                           allow_json_literals);
+                                              bool                           allow_json_literals,
+                                              bool                           allow_undeclared = false);
 
   private:
     // Python values plus JSON true/false/null.
@@ -175,15 +176,13 @@ class common_chat_peg_builder : public common_peg_parser_builder {
                                                        const std::string &            args_key,
                                                        const std::string &            effective_args_key,
                                                        const std::string &            call_id_key,
-                                                       const std::string &            gen_call_id_key,
-                                                       bool                           require_object_args);
+                                                       const std::string &            gen_call_id_key);
 
     common_peg_parser build_json_tools_nested_keys(const common_json & tools,
                                                    const std::string &            effective_name_key,
                                                    const std::string &            effective_args_key,
                                                    const std::string &            call_id_key,
-                                                   const std::string &            gen_call_id_key,
-                                                   bool                           require_object_args);
+                                                   const std::string &            gen_call_id_key);
 
     common_peg_parser build_json_tools_flat_keys(const common_json &   tools,
                                                  const std::string &              effective_name_key,
@@ -191,8 +190,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
                                                  const std::string &              call_id_key,
                                                  const std::string &              gen_call_id_key,
                                                  const std::vector<std::string> & parameters_order,
-                                                 bool                             accept_openai_wrapper,
-                                                 bool                             require_object_args);
+                                                 bool                             accept_openai_wrapper);
 };
 
 inline common_peg_arena build_chat_peg_parser(
