@@ -866,8 +866,22 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // A view cannot be partially unmapped, but VirtualUnlock on pages that are not locked
+        // drops them from the working set (failing with ERROR_NOT_LOCKED), as munmap does for RSS.
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = si.dwPageSize;
+        first = (first + page_size - 1) & ~(page_size - 1);
+        last  = std::min(last, size) & ~(page_size - 1);
+        if (last <= first) {
+            return;
+        }
+        if (!VirtualUnlock((char *) addr + first, last - first)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_LOCKED) {
+                LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(error).c_str());
+            }
+        }
     }
 
     ~impl() {
