@@ -26,6 +26,23 @@ void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,    hparams.indexer_block_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,  hparams.indexer_local_blocks);
 
+    // BC for MiniMax-M3 GGUFs without indexer_types metadata: leading dense layers have no indexer
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        hparams.is_indexer_full_impl[il] = il >= hparams.n_layer_dense_lead;
+    }
+    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+
+    // the published MiniMax-M3.1 GGUFs have no indexer_types but carry an indexer on the leading dense layers
+    // too: without the key, a layer is sparse iff it has one
+    if (gguf_find_key(ml.metadata, ml.llm_kv(LLM_KV_ATTENTION_INDEXER_TYPES).c_str()) < 0) {
+        const LLM_TN tn(LLM_ARCH_MINIMAX_M3);
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (ml.get_tensor_meta(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il).str().c_str())) {
+                hparams.is_indexer_full_impl[il] = true;
+            }
+        }
+    }
+
     msa_p = {
         /*.blk          =*/ (int) hparams.indexer_block_size,
         /*.topk_blocks  =*/ (int) hparams.indexer_top_k,
@@ -64,20 +81,6 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-        // indexer optional on dense layers: a layer is sparse iff it carries indexer tensors
-        {
-            const int idx_flags = i < (int) hparams.n_layer_dense_lead ? TENSOR_NOT_REQUIRED : 0;
-            layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, idx_flags);
-            layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, idx_flags);
-            layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
-            layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
-            const int n_idx = (layer.index_q_proj != nullptr) + (layer.index_k_proj != nullptr) +
-                              (layer.index_q_norm != nullptr) + (layer.index_k_norm != nullptr);
-            if (n_idx != 0 && n_idx != 4) {
-                throw std::runtime_error(format("%s: layer %d has %d of 4 indexer tensors", __func__, i, n_idx));
-            }
-        }
-
         if (i < (int) hparams.n_layer_dense_lead) {
             // leading dense layers
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
@@ -95,7 +98,13 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, 0);
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+        }
 
+        if (hparams.is_indexer_full(i)) {
+            layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, 0);
+            layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, 0);
+            layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, 0);
+            layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {hparams.indexer_head_size}, 0);
         }
     }
 }
@@ -107,10 +116,6 @@ static int64_t msa_tokens_per_chunk(int64_t per_token_elems, int64_t n_tokens) {
         return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) INT32_MAX;
     }();
     return std::max<int64_t>(1, std::min<int64_t>(n_tokens, max_elems / std::max<int64_t>(1, per_token_elems)));
-}
-
-bool llama_model_minimax_m3::is_msa_layer(int il) const {
-    return layers[il].index_k_proj != nullptr;
 }
 
 std::unique_ptr<llm_graph_context> llama_model_minimax_m3::build_arch_graph(const llm_graph_params & params) const {
@@ -321,8 +326,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // DFlash/DSpark drafts need every row, so the output-row crop moves after the loop
-    const bool tap_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+    const bool extract_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -351,7 +355,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            const bool is_sparse = msa_enabled && mm.is_msa_layer(il);
+            const bool is_sparse = msa_enabled && hparams.is_indexer_full(il);
 
             if (!is_sparse) {
                 cur = build_attn(inp_attn, model.layers[il].wo, NULL, model.layers[il].wo_s,
@@ -563,7 +567,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
             }
         }
 
-        if (il == n_layer - 1 && inp_out_ids && !tap_last) {
+        if (il == n_layer - 1 && inp_out_ids && !extract_last) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -623,14 +627,14 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
         inpL = cur;
     }
 
-    cur = inpL;
-
-    if (tap_last) {
-        res->t_layer_inp[n_layer] = cur;
+    if (extract_last) {
+        res->t_layer_inp[n_layer] = inpL;
         if (inp_out_ids) {
-            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
     }
+
+    cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

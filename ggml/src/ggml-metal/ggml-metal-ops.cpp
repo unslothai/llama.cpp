@@ -5014,6 +5014,31 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
         /*.d1   =*/ d1,
     };
 
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    if (props_dev->has_simdgroup_mm) {
+        auto pipeline = ggml_metal_library_get_pipeline_conv_2d_mm(lib, op);
+
+        const int nr0 = pipeline.nr0;
+        const int nr1 = pipeline.nr1;
+        const int nsg = pipeline.nsg;
+
+        const int64_t NP = ne3*ne1*ne0;
+        const int64_t OC = ne03;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (NP + nr1 - 1)/nr1, (OC + nr0 - 1)/nr0, 1, 32, nsg, 1);
+
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
 
     int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
@@ -6008,11 +6033,10 @@ static void ggml_metal_op_top_k_radix(ggml_metal_op_t ctx, int idx) {
         /*.top_k =*/ (int32_t) op->ne[0],
     };
 
-    // shared memory: 256-entry histogram + bucket/above scalars + output counter
+    // shared memory: 256-entry histogram + bucket/above scalars
     const size_t smem_histo  = GGML_PAD(256*sizeof(uint32_t), 16);
     const size_t smem_bucket = GGML_PAD(    sizeof(uint32_t), 16);
     const size_t smem_above  = GGML_PAD(    sizeof(uint32_t), 16);
-    const size_t smem_out    = GGML_PAD(    sizeof(uint32_t), 16);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -6022,7 +6046,6 @@ static void ggml_metal_op_top_k_radix(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_histo,  0);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_bucket, 1);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_above,  2);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_out,    3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 }
