@@ -122,7 +122,7 @@ static __global__ void flash_attn_ext_banded_f32(
                 score += __half2float(*(const half *) mask_value);
             }
         }
-        score = __shfl_sync(0xffffffff, score, 0, WARP_SIZE);
+        score = ggml_cuda_shfl(score, 0, WARP_SIZE);
 
         if (score == -INFINITY) {
             continue;
