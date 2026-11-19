@@ -44,7 +44,7 @@
   "schema": 1,
   "features": {
     "inkling": {
-      "owner": "ggml-org#32187",
+      "owner": "unslothai#378",
       "checks": [
         { "kind": "arch",       "arch": "inkling" },
         { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
@@ -52,11 +52,10 @@
       ]
     },
     "inkling2": {
-      "owner": "ggml-org#32187",
+      "owner": null,
       "checks": [
         { "kind": "arch",       "arch": "inkling2" },
-        { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED" },
-        { "kind": "mtmd",       "projector": "inkling2" }
+        { "kind": "mtmd",       "projector": "inkling2v" }
       ]
     },
     "glm5next": {
@@ -156,8 +155,8 @@
     "unslothai#241": "CUDA graph cache keyed by shape with no count cap (tensor split keeps replaying its 2 * n_layers + 1 graphs per device), macOS row prefetch and the F16 glm5-next indexer cache under a quantized -ctk (the NextN draft graph is upstream since ggml-org#29928); the first needs a CUDA host (multi-GPU for the cap), the second has no observable output difference, the last needs a real GLM-5-Next model",
     "unslothai#243": "glm5-next compute buffer size; a memory-layout change with no observable output difference, and the size only shows on a CUDA host with a GLM-5-Next model",
     "unslothai#251": "--moe-cache-mib auto sizes the ggml-org#29887 MoE expert cache from the fit; it only acts when a MoE model spills on a single GPU, the flag is off by default, and no runner in the pipeline has a GPU",
-    "unslothai#270": "two-subgroup coopmat1 FA tile, chosen only where the four-subgroup tile does not fit shared memory (32 KiB, e.g. the AMD proprietary driver); needs such a Vulkan device, and no runner in the pipeline has one",
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
-    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe"
+    "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe",
+    "unslothai#377": "Inkling 2 loads the optional per-expert ffn_gate_up_exps.scale and passes the gate_up and down scales to build_moe_ffn; only observable with an NVFP4 expert GGUF that keeps those tensors, and test-llama-archs builds its synthetic model without them (the inkling2 arch check above still runs the patched graph)"
   }
 }
