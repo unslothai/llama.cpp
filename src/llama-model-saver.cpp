@@ -502,6 +502,14 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_XIELU_EPS,                         hparams.xielu_eps);
 
     add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,               hparams.attn_res_block_size);
+    if (hparams.loop_n_pass > 1) {
+        add_kv(LLM_KV_NUM_LOOPS,                     hparams.loop_n_pass);
+        add_kv(LLM_KV_LOOP_CORE_START,               hparams.loop_core_start);
+        add_kv(LLM_KV_LOOP_CORE_END,                 hparams.loop_core_end);
+    }
+    if (hparams.loop_gate_rank > 0) {
+        add_kv(LLM_KV_LOOP_GATE_RANK,                hparams.loop_gate_rank);
+    }
     add_kv(LLM_KV_ACTIVATION_SITU_BETA,              hparams.situ_beta);
     add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA,       hparams.situ_linear_beta);
 
@@ -534,6 +542,8 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->output_in_s);
     add_tensor(model->output_res_score);
     add_tensor(model->output_res_query);
+    add_tensor(model->loop_res_query);
+    add_tensor(model->loop_kv_res_query);
     add_tensor(model->nextn_proj_pre);
     add_tensor(model->nextn_proj_post);
     add_tensor(model->cls);
@@ -586,7 +596,13 @@ void llama_model_saver::add_tensors_from_model() {
     // tensor once. a different tensor with an existing name still asserts below
     std::unordered_set<const struct ggml_tensor *> seen;
 
-    for (const struct llama_layer & layer : model->layers) {
+    const llama_hparams & hparams = model->hparams;
+    for (uint32_t il = 0; il < (uint32_t) model->layers.size(); ++il) {
+        // the later visits of a looped layer hold views of its weights, saved with the first visit
+        if (hparams.loop_visit(hparams.loop_layer(il)) != il) {
+            continue;
+        }
+        const struct llama_layer & layer = model->layers[il];
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             const struct ggml_tensor * tensor = reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i];
             if (tensor == nullptr || !seen.insert(tensor).second) {

@@ -593,6 +593,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // repeating layers that hold weights, the unit of n_gpu_layers (excludes nextn layers)
+    // fewer than llama_model_n_layer when layers repeat, as their visits share the weights
+    LLAMA_API int32_t llama_model_n_layer_weights(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
