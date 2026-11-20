@@ -382,6 +382,10 @@ uint32_t llama_hparams::loop_visit(uint32_t ip) const {
     return ip < loop_core_end ? ip : ip + loop_n_extra();
 }
 
+uint32_t llama_hparams::n_layer_weights() const {
+    return n_layer_all - loop_n_extra();
+}
+
 bool llama_hparams::use_mrope() const {
     return rope_sections[0] > 0 && rope_sections[1] > 0;
 }

@@ -567,6 +567,9 @@ struct llama_hparams {
     uint32_t loop_layer(uint32_t il) const;
     uint32_t loop_visit(uint32_t ip) const;
 
+    // layers that hold weights (includes nextn layers), the unit of n_gpu_layers; fewer than n_layer_all with looped layers
+    uint32_t n_layer_weights() const;
+
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function

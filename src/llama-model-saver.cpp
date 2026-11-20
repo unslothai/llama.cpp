@@ -596,7 +596,13 @@ void llama_model_saver::add_tensors_from_model() {
     // tensor once. a different tensor with an existing name still asserts below
     std::unordered_set<const struct ggml_tensor *> seen;
 
-    for (const struct llama_layer & layer : model->layers) {
+    const llama_hparams & hparams = model->hparams;
+    for (uint32_t il = 0; il < (uint32_t) model->layers.size(); ++il) {
+        // the later visits of a looped layer hold views of its weights, saved with the first visit
+        if (hparams.loop_visit(hparams.loop_layer(il)) != il) {
+            continue;
+        }
+        const struct llama_layer & layer = model->layers[il];
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             const struct ggml_tensor * tensor = reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i];
             if (tensor == nullptr || !seen.insert(tensor).second) {
