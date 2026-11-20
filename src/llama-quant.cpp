@@ -348,6 +348,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_rel_bias.weight") == std::string::npos;
     }
 
+    // dspark: the per-layer feature fusion logits stay F32
+    if (arch == LLM_ARCH_DFLASH) {
+        quantize &= name != LLM_TN(arch)(LLM_TENSOR_DSPARK_FUSE, "weight");
+    }
+
     // zaya1: the top-1 router and the grouped conv kernels stay F32
     if (arch == LLM_ARCH_ZAYA1) {
         quantize &= name.find("ffn_router_")  == std::string::npos;

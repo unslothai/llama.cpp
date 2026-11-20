@@ -131,6 +131,14 @@ class TensorNameMap:
             "model.attn_res.output_query",  # inkling2
         ),
 
+        MODEL_TENSOR.LOOP_RES_QUERY: (
+            "model.middle_cycle_cross_pass_queries",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_KV_RES_QUERY: (
+            "model.middle_cycle_cross_pass_kv_queries",  # inkling2 loop
+        ),
+
         # Rope frequencies
         MODEL_TENSOR.ROPE_FREQS: (
             "rope.freqs",  # llama-pth
@@ -543,6 +551,18 @@ class TensorNameMap:
             "model.layers.{bid}.attention_input.query",  # inkling2
         ),
 
+        MODEL_TENSOR.ATTN_K_CTX: (
+            "layers.{bid}.self_attn.k_proj_ctx",  # inkling2 dspark
+        ),
+
+        MODEL_TENSOR.ATTN_V_CTX: (
+            "layers.{bid}.self_attn.v_proj_ctx",  # inkling2 dspark
+        ),
+
+        MODEL_TENSOR.ATTN_K_CTX_NORM: (
+            "layers.{bid}.self_attn.k_norm_ctx",  # inkling2 dspark
+        ),
+
         # Feed-forward norm
         MODEL_TENSOR.FFN_NORM: (
             "layers.{bid}.moe_connection.norm",                              # metis16
@@ -815,6 +835,54 @@ class TensorNameMap:
         MODEL_TENSOR.FFN_RES_QUERY: (
             "model.layers.{bid}.mlp_input.query",  # inkling2
             "model.attn_res.mlp_queries.{bid}",    # inkling2
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_DOWN: (
+            "model.layers.{bid}.controllers.attn.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_GAIN: (
+            "model.layers.{bid}.controllers.attn.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_FORGET: (
+            "model.layers.{bid}.controllers.attn.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_DOWN: (
+            "model.layers.{bid}.controllers.k.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_GAIN: (
+            "model.layers.{bid}.controllers.k.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_FORGET: (
+            "model.layers.{bid}.controllers.k.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_DOWN: (
+            "model.layers.{bid}.controllers.v.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_GAIN: (
+            "model.layers.{bid}.controllers.v.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_FORGET: (
+            "model.layers.{bid}.controllers.v.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_DOWN: (
+            "model.layers.{bid}.controllers.mlp.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_GAIN: (
+            "model.layers.{bid}.controllers.mlp.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_FORGET: (
+            "model.layers.{bid}.controllers.mlp.forget_weight",  # inkling2 loop
         ),
 
         MODEL_TENSOR.STREAM_EMBD: (
@@ -1790,6 +1858,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
             "model.markov_head.markov_w1", # dspark
+            "markov_head.markov_w1",       # inkling2
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W2: (
@@ -1798,6 +1867,30 @@ class TensorNameMap:
 
         MODEL_TENSOR.DSPARK_CONF_PROJ: (
             "model.confidence_head.proj", # dspark
+        ),
+
+        MODEL_TENSOR.DSPARK_JOINT_PROJ: (
+            "markov_head.rnn_proj", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_MASK_EMBD: (
+            "mask_embed", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_FUSE: (
+            "fuse_weight", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_NORM: (
+            "markov_head.dflare_norm", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_HIDDEN_OUT: (
+            "markov_head.hidden_out", # inkling2
+        ),
+
+        MODEL_TENSOR.DFLARE_NORM: (
+            "layers.{bid}.dflare_norm", # inkling2
         ),
 
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE: (

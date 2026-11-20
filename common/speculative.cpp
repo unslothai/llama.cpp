@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
@@ -1374,6 +1375,19 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
     bool sample_from_anchor = true;
 
+    // Inkling2 DSpark: a recurrent markov head conditioned on the context features of the anchor,
+    // which come back from the injection and are kept per sequence, indexed by position
+    bool    has_rnn_context = false;
+    int32_t markov_rank     = 0;
+
+    size_t context_rows = 0;
+    std::vector<float>     context_embd;
+    std::vector<llama_pos> context_pos;
+
+    // probabilistic drafting of the recurrent head: one generator per sequence and the seed it was last seeded with (-1: reseed)
+    std::vector<std::mt19937> rnn_rng;
+    std::vector<int64_t>      rnn_seed;
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
@@ -1396,16 +1410,75 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             }
         }
 
-        LOG_INF("%s: - sample_from_anchor=%s\n", __func__, sample_from_anchor ? "true" : "false");
+        {
+            char buf[32] = {};
+            has_rnn_context = llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", buf, sizeof(buf)) >= 0;
+            markov_rank = has_rnn_context ? std::atoi(buf) : 0;
+        }
+
+        if (has_rnn_context) {
+            const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
+            if (n_embd_tgt != n_embd_dec || target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(model_tgt)) {
+                throw std::runtime_error("DSpark target feature dimensions do not match");
+            }
+            if (sample_from_anchor || causal_attn) {
+                throw std::runtime_error("Inkling2 DSpark requires a noncausal block with an anchor");
+            }
+            context_rows = (size_t) block_size + 1;
+            const size_t slots = (size_t) n_seq * context_rows;
+            context_embd.resize(slots * (size_t) n_embd_dec);
+            context_pos.assign(slots, -1);
+            rnn_rng.resize(n_seq);
+            rnn_seed.assign(n_seq, -1);
+        }
+
+        LOG_INF("%s: - sample_from_anchor=%s, markov_rank=%d\n", __func__, sample_from_anchor ? "true" : "false", markov_rank);
 
         // anchor-first DSpark yields a full block_size draft tokens
+        // the recurrent head reads the context features back from h_nextn after a host copy injection
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
-            /* .backend_sampling = */ true,
-            /* .dev_features     = */ true,
-            /* .nextn_masked     = */ true,
+            /* .backend_sampling = */ !has_rnn_context,
+            /* .dev_features     = */ !has_rnn_context,
+            /* .nextn_masked     = */ !has_rnn_context,
         });
+
+        if (has_rnn_context) {
+            // Inkling2 uses host sampling to keep the first-maximum tie rule.
+            for (auto & s : smpls) {
+                common_params_sampling sparams;
+                sparams.no_perf  = false;
+                sparams.temp     = 0.0f;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+                s.reset(common_sampler_init(model_dft, sparams));
+            }
+        }
     }
+
+protected:
+    void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
+        if (!has_rnn_context) {
+            return;
+        }
+        // Keep the committed boundary when the target rejects part of a verification batch.
+        const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
+        if (projected) {
+            const size_t seq_offset = (size_t) seq_id * context_rows;
+            const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos pos = batch_inject.tokens[i].pos[0];
+                if (pos < pos_min) {
+                    continue;
+                }
+                const size_t slot = seq_offset + (size_t) pos % context_rows;
+                std::memcpy(context_embd.data() + slot * (size_t) n_embd_dec,
+                        projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                context_pos[slot] = pos;
+            }
+        }
+    }
+
+public:
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
@@ -1428,11 +1501,21 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
+            // the recurrent head reads a full block
+            const int32_t n_block_tokens = has_rnn_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                if (has_rnn_context) {
+                    // the context features of the committed anchor condition the recurrent head
+                    const llama_pos pos = dp.pos0 - 1;
+                    const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
+                    if (pos < 0 || context_pos[slot] != pos) {
+                        throw std::runtime_error("DSpark committed context feature is missing");
+                    }
+                    batch.set_embd_state(idx, { context_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
+                }
             }
         }
 
@@ -1440,11 +1523,24 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             return;
         }
 
+        const bool sample_rnn = has_rnn_context && params.probabilistic;
         // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
+                             : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+        std::vector<float> hidden, base_logits;
+        if (sample_rnn) {
+            const float * rows = llama_get_embeddings_nextn(ctx_dft);
+            hidden.assign(rows, rows + size_t(batch.size())*n_embd_dec);
+            for (int32_t i = 0; i < batch.size(); ++i) {
+                const float * logits = llama_get_logits_ith(ctx_dft, i);
+                base_logits.insert(base_logits.end(), logits, logits + n_vocab);
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1460,18 +1556,77 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
             auto & result = *dp.result;
 
+            if (sample_rnn) {
+                if (rnn_seed[seq_id] != dp.seed) {
+                    rnn_seed[seq_id] = dp.seed;
+                    rnn_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+                const float temp = dp.temp > 0.0f ? dp.temp : 1.0f;
+                const size_t slot = size_t(seq_id)*context_rows + size_t(dp.pos0 - 1)%context_rows;
+                const llama_embd context = { context_embd.data() + slot*n_embd_dec, 1, size_t(n_embd_dec) };
+                std::vector<float> state(markov_rank, 0.0f), logits;
+                llama_token prev = dp.id_last;
+                for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
+                    const size_t row = beg + i;
+                    if (!llama_draft_step(ctx_dft, prev,
+                            { hidden.data() + row*n_embd_dec, 1, size_t(n_embd_dec) },
+                            { base_logits.data() + row*n_vocab, 1, size_t(n_vocab) }, context, state, logits)) {
+                        result.clear();
+                        if (dp.result_q) {
+                            dp.result_q->clear();
+                        }
+                        LOG_ERR("%s: DSpark recurrent head failed\n", __func__);
+                        break;
+                    }
+                    const float maximum = *std::max_element(logits.begin(), logits.end());
+                    std::vector<llama_token_data> q(n_vocab);
+                    double sum = 0.0;
+                    for (int32_t k = 0; k < n_vocab; ++k) {
+                        const float p = std::exp((logits[k] - maximum)/temp);
+                        q[k] = { k, logits[k], p };
+                        sum += p;
+                    }
+                    if (!std::isfinite(sum) || sum <= 0.0) {
+                        throw std::runtime_error("DSpark produced non-finite proposal probabilities");
+                    }
+                    for (auto & candidate : q) {
+                        candidate.p /= sum;
+                    }
+                    double u = std::uniform_real_distribution<double>(0.0, 1.0)(rnn_rng[seq_id]);
+                    prev = std::max_element(logits.begin(), logits.end()) - logits.begin();
+                    for (const auto & candidate : q) {
+                        u -= candidate.p;
+                        if (u < 0.0) {
+                            prev = candidate.id;
+                            break;
+                        }
+                    }
+                    result.push_back(prev);
+                    if (dp.result_q) {
+                        dp.result_q->push_back(std::move(q));
+                    }
+                }
+                continue;
+            }
+
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            for (int32_t i = i_draft_beg; i < std::min(n_block_tokens, i_draft_beg + params.n_max); ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                     break;
                 }
 
-                common_sampler_sample(smpl, ctx_dft, idx, true);
+                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
+                if (has_rnn_context) {
+                    // Use the first maximum, as in the RNN conditioning graph.
+                    common_sampler_accept(smpl, sampled, true);
+                    result.push_back(sampled);
+                    continue;
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1492,6 +1647,34 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 result.clear();
             }
         }
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!has_rnn_context || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        const size_t offset = (size_t) seq_id * context_rows;
+        const size_t n_pos = context_rows * sizeof(llama_pos);
+        const size_t n_embd = context_rows * n_embd_dec * sizeof(float);
+        data.resize(n_pos + n_embd);
+        std::memcpy(data.data(), context_pos.data() + offset, n_pos);
+        std::memcpy(data.data() + n_pos, context_embd.data() + offset*n_embd_dec, n_embd);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!has_rnn_context || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const size_t offset = (size_t) seq_id * context_rows;
+        const size_t n_pos = context_rows * sizeof(llama_pos);
+        const size_t n_embd = context_rows * n_embd_dec * sizeof(float);
+        if (data.size() != n_pos + n_embd) {
+            std::fill_n(context_pos.data() + offset, context_rows, -1);
+            return;
+        }
+        std::memcpy(context_pos.data() + offset, data.data(), n_pos);
+        std::memcpy(context_embd.data() + offset*n_embd_dec, data.data() + n_pos, n_embd);
     }
 };
 
@@ -3135,6 +3318,17 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        char rank_meta[32] = {};
+        if (llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", rank_meta, sizeof(rank_meta)) >= 0) {
+            char block_meta[32] = {};
+            llama_model_meta_val_str(model_dft, "dflash.block_size", block_meta, sizeof(block_meta));
+            const uint32_t block = std::stoul(block_meta);
+            cparams.n_outputs_max_per_seq = std::max(cparams.n_outputs_max_per_seq, block);
+            cparams.n_outputs_max = std::max(cparams.n_outputs_max, block * params.n_parallel);
+            cparams.n_batch = std::max(cparams.n_batch, block * params.n_parallel);
+            cparams.n_ubatch = std::max(cparams.n_ubatch, block);
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {

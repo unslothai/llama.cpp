@@ -698,6 +698,10 @@ struct llama_layer {
     struct ggml_tensor * attn_q_clip      = nullptr;
     struct ggml_tensor * attn_rel_clip    = nullptr;
     struct ggml_tensor * attn_sink_proj   = nullptr;
+    // inkling2 loop controllers: q, k, v, mlp
+    struct ggml_tensor * loop_down[4]     = {};
+    struct ggml_tensor * loop_gain[4]     = {};
+    struct ggml_tensor * loop_forget[4]   = {};
     struct ggml_tensor * attn_q_inp_norm  = nullptr;
     struct ggml_tensor * attn_k_inp_norm  = nullptr;
     struct ggml_tensor * attn_v_inp_norm  = nullptr;
@@ -709,6 +713,12 @@ struct llama_layer {
     struct ggml_tensor * attn_res_query   = nullptr;
     struct ggml_tensor * ffn_post_conv    = nullptr;
     struct ggml_tensor * ffn_res_query    = nullptr;
+
+    // inkling2 dspark
+    struct ggml_tensor * attn_k_ctx      = nullptr;
+    struct ggml_tensor * attn_v_ctx      = nullptr;
+    struct ggml_tensor * attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflare_norm     = nullptr;
 
     struct llama_layer_posnet posnet;
 
@@ -837,6 +847,8 @@ struct llama_model {
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix
+    struct ggml_tensor * loop_res_query    = nullptr; // inkling2 loop: cross-pass queries (attn, mlp per core layer)
+    struct ggml_tensor * loop_kv_res_query = nullptr; // inkling2 loop: cross-pass queries (k, v per core layer)
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
@@ -929,6 +941,10 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_fuse         = nullptr;
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_hidden_out   = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;
