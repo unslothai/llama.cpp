@@ -585,7 +585,7 @@ static __global__ void flash_attn_ext_banded_mma(
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     constexpr int BK     = fattn_banded_mma_bk;
     constexpr int BQ     = NW*16;
-    constexpr int stride = D + 8; // padded smem row (halfs): conflict-free ldmatrix
+    constexpr int stride = D + 8; // padding keeps ldmatrix bank-conflict free
     constexpr int ND     = D/8;
     constexpr int NK     = D/16;
 
@@ -755,7 +755,7 @@ static __global__ void flash_attn_ext_banded_mma(
             O[n][3] *= alpha[1];
         }
 
-        __syncthreads(); // every warp is done with K_s
+        __syncthreads();
         const int64_t kt_next = next_tile(kt + 1);
         if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW>(K_s, k_base, k_nb1, kt_next*BK, n_kv);
@@ -777,7 +777,7 @@ static __global__ void flash_attn_ext_banded_mma(
             }
         }
 
-        __syncthreads(); // every warp is done with V_s
+        __syncthreads();
         if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW>(V_s, v_base, v_nb1, kt_next*BK, n_kv);
         }

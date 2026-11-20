@@ -248,12 +248,12 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
-    // banded FA needs a position-contiguous cache; small ubatches stay dense so the graph can be reused while decoding
+    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
-    std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok; // per (swa, device)
+    std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
     const auto use_banded = [&](int il, bool swa) {
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
         const int64_t hd = hparams.n_embd_head_k(il);
@@ -420,27 +420,25 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
                 }
             } else {
-                // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+                // project before gathering: only the gathered bias is n_kv x n_tokens x n_head
                 ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
-                // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+                // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
                 table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
                 table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
                 sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
-                // the dense bias is n_kv x n_tokens x n_head: past the budget, attend in chunks of query rows
+                // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
                 const int64_t n_seq_tokens = n_tokens/n_stream;
                 // sized for a full cache so the chunking does not change while it fills
                 const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
                 int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
                         (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
                 if (n_rows_max < n_seq_tokens) {
-                    // equal chunks of whole 64-row tiles
                     const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
                     n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
                 }
-                // rows [r0, r0 + nr) of every stream along dim d
                 auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                     int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
                     ne[d] = nr;

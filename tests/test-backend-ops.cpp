@@ -13393,7 +13393,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
-    // Inkling-2-Small shapes with per-query sinks
+    // Inkling-2-Small shapes
     for (int64_t n_q : { 1, 3, 8, 512 }) {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, n_q, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
     }
