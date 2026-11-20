@@ -405,6 +405,10 @@ class Inkling2DSparkModel(TextModel):
               "final_logit_softcapping": text["final_logit_softcapping"]}
         super().__init__(dir_model, *args, hparams=hp, **kwargs)
 
+    def dequant_model(self):
+        # hf_quant_config.json describes the trunk experts, the draft tensors are BF16
+        return
+
     def index_tensors(self, remote_hf_model_id=None):
         if remote_hf_model_id is not None:
             raise ValueError("Inkling2 DSpark requires a local mtp.safetensors")
