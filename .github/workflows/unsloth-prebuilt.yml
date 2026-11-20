@@ -1127,7 +1127,8 @@ jobs:
           fi
           PAYLOAD="$(jq -cn --arg t "$TAG" --arg g "$GGML_TREE" --arg r "$GITHUB_RUN_ID" \
             '{event_type: "llama-published", client_payload: {llama_tag: $t, ggml_tree: $g, run_id: $r}}')"
-          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+          # -L: once the org is renamed the unslothai path answers 307, which curl follows only when asked.
+          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/unslothai/whisper.cpp/dispatches \
@@ -1160,7 +1161,8 @@ jobs:
           fi
           PAYLOAD="$(jq -cn --arg t "$TAG" --arg r "$GITHUB_RUN_ID" \
             '{event_type: "llama-published", client_payload: {llama_tag: $t, run_id: $r}}')"
-          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+          # -L: once the org is renamed the unslothai path answers 307, which curl follows only when asked.
+          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/unslothai/audio.cpp/dispatches \
