@@ -808,7 +808,7 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
-    // [base, swa] device copies, made once per graph when attention is chunked over query rows
+    // [base, swa] device copies, made once per graph
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
