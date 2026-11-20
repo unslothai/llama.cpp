@@ -416,6 +416,10 @@ class Inkling2DSparkModel(TextModel):
             raise ValueError("Inkling2 DSpark requires mtp.safetensors")
         return self.index_local_tensors("mtp")
 
+    def dequant_model(self):
+        # mtp.safetensors is BF16; hf_quant_config.json only describes the target checkpoint
+        return
+
     def get_vocab_base(self):
         tokens, types, pre = super().get_vocab_base()
         n = self.hparams["unpadded_vocab_size"]
