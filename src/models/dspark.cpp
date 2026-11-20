@@ -996,7 +996,11 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     const int64_t rank = hparams.dspark_markov_rank;
     const int64_t ntarget = model.target_layer_ids.size();
     const auto mix = [&](ggml_tensor * features, int row, ggml_tensor * norm) {
-        auto * weights = ggml_soft_max(ctx0, ggml_view_1d(ctx0, model.dspark_fuse, ntarget, row*model.dspark_fuse->nb[1]));
+        auto * fuse = ggml_view_1d(ctx0, model.dspark_fuse, ntarget, row*model.dspark_fuse->nb[1]);
+        if (fuse->type != GGML_TYPE_F32) {
+            fuse = ggml_cast(ctx0, fuse, GGML_TYPE_F32);
+        }
+        auto * weights = ggml_soft_max(ctx0, fuse);
         auto * x = ggml_reshape_3d(ctx0, features, n_embd, ntarget, n_tokens);
         x = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3));
         x = ggml_sum_rows(ctx0, ggml_mul(ctx0, x, weights));
