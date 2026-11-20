@@ -216,6 +216,11 @@ uint32_t llama_hparams::n_embd_r() const {
         return n_sconv_channels * (n_shortconv_l_cache - 1);
     }
 
+    if (n_embd_r_impl != 0) {
+        // for Inkling (attention conv state set by the model)
+        return n_embd_r_impl;
+    }
+
     if (n_shortconv_l_cache != 0) {
         // for LFM2 models
         return n_embd * (n_shortconv_l_cache - 1);
