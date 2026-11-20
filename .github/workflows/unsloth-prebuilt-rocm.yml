@@ -269,6 +269,17 @@ jobs:
           } else {
             Write-Host "Auto-detecting latest ROCm version for target: $currentTarget"
           }
+          # Windows TheRock nightlies after 20261107 regress multi-GPU systems under PAL: pinned host
+          # allocations stall for seconds or fail with error 719 once a second AMD GPU is visible
+          # (ROCm/rocm-systems#15959: 20261104 ok, 20261112-20261113 stall, 20261115 fails), and split
+          # model loads crawl then TDR the driver (unslothai/unsloth#18563 on b12540-mix-c4017f9, built
+          # on 10.3.0a20261114). Hold weekly/latest at the last nightly b12347-mix-241a0f3 shipped
+          # until a newer one is verified on a multi-GPU Windows host. Linux uses ROCr and is unchanged.
+          $windowsMaxNightly = "20261107"
+          if ($cutoff -gt $windowsMaxNightly) {
+            Write-Host "Windows ROCm held at nightly $windowsMaxNightly (multi-GPU PAL regression, unslothai/unsloth#18563)"
+            $cutoff = $windowsMaxNightly
+          }
           $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
           $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
           if (-not $filesMatch.Success) {
@@ -304,6 +315,10 @@ jobs:
 
           $rocmUrl = "$baseUrl/$latestFile"
         } else {
+          $explicitDate = [regex]::Match($rocmVersion, '(\d{8})$').Groups[1].Value
+          if ($explicitDate -and $explicitDate -gt "20261107") {
+            Write-Warning "ROCm $rocmVersion is newer than the Windows hold (20261107): multi-GPU loads may regress (unslothai/unsloth#18563)"
+          }
           $rocmUrl = "$baseUrl/therock-dist-windows-$archiveTarget-$rocmVersion.tar.gz"
         }
 
