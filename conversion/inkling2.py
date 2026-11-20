@@ -386,8 +386,11 @@ class Inkling2DSparkModel(TextModel):
         if not mtp:
             raise ValueError("Inkling2 DSpark requires mtp_config")
         targets = mtp["target_layer_ids"]
+        # the taps of a looped trunk count layer visits, the last one is the final normed hidden state
+        loop = text.get("loop_config")
+        n_visits = text["num_hidden_layers"] + ((loop["num_passes"] - 1)*(loop["core_end"] - loop["core_start"]) if loop else 0)
         if (len(targets) < 2 or targets != sorted(set(targets)) or targets[0] < 0 or
-                targets[-1] != text["num_hidden_layers"] or mtp["hidden_size"] != text["hidden_size"] or
+                targets[-1] != n_visits or mtp["hidden_size"] != text["hidden_size"] or
                 mtp["markov_head_type"] != "rnn_hidden" or mtp.get("q_bias") or mtp.get("o_bias")):
             raise ValueError("Unsupported Inkling2 DSpark configuration")
         if (mtp["block_size"] != 8 or not 0 < mtp["markov_rank"] <= mtp["hidden_size"] or
