@@ -4489,7 +4489,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        int64_t       i_row) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4502,7 +4503,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
+    if (kq_b->ne[1] != kq_mask->ne[1]) {
+        ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
+        if (!dev) {
+            dev = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_view_4d(ctx0, dev, dev->ne[0], kq_b->ne[1], dev->ne[2], dev->ne[3],
+                dev->nb[1], dev->nb[2], dev->nb[3], i_row*dev->nb[1]);
+    } else if (kq_mask->type != GGML_TYPE_F32) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);

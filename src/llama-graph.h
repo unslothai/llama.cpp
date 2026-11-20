@@ -808,6 +808,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // [base, swa] device copies, made once per graph when attention is chunked over query rows
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+    ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1550,10 +1554,11 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * kq_b,  // [n_kv, n_rows, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   i_row = 0) const; // first mask row of q_cur and kq_b
 
     //
     // pooling
