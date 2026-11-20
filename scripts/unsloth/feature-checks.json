@@ -58,6 +58,12 @@
         { "kind": "mtmd",       "projector": "inkling2v" }
       ]
     },
+    "inkling2-banded-attn": {
+      "owner": "unslothai#386",
+      "checks": [
+        { "kind": "backend-op", "op": "FLASH_ATTN_EXT_BANDED", "params": "sinks=" }
+      ]
+    },
     "glm5next": {
       "owner": "unslothai#239",
       "checks": [
@@ -160,6 +166,7 @@
     "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe",
     "ggml-org#32218": "Inkling 2 DSpark draft (DFLASH arch with the Inkling 2 backbone and recurrent Markov head); test-llama-archs has no DFlash case because a draft needs a target context, and an end-to-end check needs the Inkling-2-Small DSpark draft GGUF and a GPU host the pipeline does not have",
     "unslothai#389": "repeating (looped) layers; the looped config in test-llama-archs runs in the CPU gate build, and an end-to-end check needs a looped GGUF the pipeline does not have",
-    "unslothai#390": "DSpark draft conversion fixes and llama-quantize keeping the DSpark fuse weights F32; needs a DSpark draft checkpoint and a GPU host the pipeline does not have"
+    "unslothai#390": "DSpark draft conversion fixes and llama-quantize keeping the DSpark fuse weights F32; needs a DSpark draft checkpoint and a GPU host the pipeline does not have",
+    "unslothai#385": "Inkling 2 attention chunked over query rows once the dense relative bias for a full cache passes 2^29 elements; it only engages with a large context window (a cache above about 21K cells at -ub 512 for 48 heads), which the small synthetic test-llama-archs context never reaches, and below that budget the graph is unchanged"
   }
 }
