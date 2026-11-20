@@ -786,6 +786,8 @@ class TestInkling2DSparkConversion(unittest.TestCase):
                   "text_config": {"hidden_size": 16, "num_hidden_layers": 2, "vocab_size": 64,
                                   "unpadded_vocab_size": 60, "final_logit_softcapping": 30.0}, "mtp_config": mtp}
         (path / "config.json").write_text(json.dumps(config))
+        # the released checkpoint ships the target's precision map next to mtp.safetensors
+        (path / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": []}}))
         shapes = {"norm.weight": (16,), "mask_embed": (16,), "fuse_weight": (6, 2),
                   "markov_head.markov_w1.weight": (64, 4), "markov_head.rnn_proj.weight": (12, 40),
                   "markov_head.rnn_proj.bias": (12,), "markov_head.hidden_out.weight": (16, 4),
