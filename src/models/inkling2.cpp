@@ -338,18 +338,16 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
             sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
-            // the dense bias is n_kv x n_tokens x n_head: past the budget, attend in chunks of query rows
+            // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
             const int64_t n_seq_tokens = n_tokens/n_stream;
             // sized for a full cache so the chunking does not change while it fills
             const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
             int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
                     (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_seq_tokens) {
-                // equal chunks of whole 64-row tiles
                 const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
                 n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
             }
-            // rows [r0, r0 + nr) of every stream along dim d
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                 int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
                 ne[d] = nr;
