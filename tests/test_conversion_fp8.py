@@ -832,6 +832,27 @@ class TestInkling2DSparkConversion(unittest.TestCase):
                                        ("dflash.rope.freq_base", 1000000.0), ("dflash.attention.sliding_window", 16)):
                         self.assertEqual(kv[key].value, value)
 
+    def test_dspark_looped_taps_and_quant_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            config, _ = self.fixture(path)
+            # 2 layers, core [1, 2) run 3 times: 4 visits, the final normed hidden state is tap 4
+            config["text_config"]["loop_config"] = {"core_start": 1, "core_end": 2, "num_passes": 3}
+            (path / "hf_quant_config.json").write_text(json.dumps({"quant_method": "inkling2", "model": {"parameter_groups": []}}))
+            for targets, ok in (([0, 4], True), ([0, 2], False)):
+                with self.subTest(targets=targets):
+                    config["mtp_config"]["target_layer_ids"] = targets
+                    (path / "config.json").write_text(json.dumps(config))
+                    if not ok:
+                        with self.assertRaises(ValueError):
+                            Inkling2DSparkModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf")
+                        continue
+                    model = Inkling2DSparkModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf")
+                    model.set_gguf_parameters()
+                    model.prepare_tensors()
+                    self.assertEqual(len(model.gguf_writer.tensors[0]), 84)
+                    self.assertEqual(list(model.gguf_writer.kv_data[0]["dflash.target_layers"].value), targets)
+
     def test_dspark_invalid_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
