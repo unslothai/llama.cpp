@@ -37,7 +37,6 @@ struct mtmd_image_preprocessor {
     virtual mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const = 0;
     // frames of a video, which the video helper may have already sized
     virtual mtmd_image_preproc_out preprocess_video_frame(const mtmd_image_u8 & img) const { return preprocess(img); }
-    virtual mtmd_image_preproc_out preprocess_video_frames(const std::vector<mtmd_image_u8> & frames) const;
     // frame size of a video with n_frames sampled frames, as the reference video processor; false if none
     virtual bool get_video_frame_size(int /*n_frames*/, int /*width*/, int /*height*/, mtmd_image_size & /*out*/) const { return false; }
 };
@@ -354,12 +353,8 @@ struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 
-// no resize: pad bottom-right to a multiple of patch_size*n_merge; a pair of video frames is averaged into one image
-struct mtmd_image_preprocessor_inkling2 : mtmd_image_preprocessor {
+// pad bottom-right to a multiple of patch_size*n_merge; resize only if the image is above image_max_pixels
+struct mtmd_image_preprocessor_inkling2v : mtmd_image_preprocessor {
     using mtmd_image_preprocessor::mtmd_image_preprocessor;
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
-    mtmd_image_preproc_out preprocess_video_frames(const std::vector<mtmd_image_u8> & frames) const override;
-
-private:
-    mtmd_image_preproc_out preprocess_pair(const mtmd_image_u8 & img, const mtmd_image_u8 * next) const;
 };

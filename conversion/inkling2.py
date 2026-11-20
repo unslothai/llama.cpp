@@ -121,7 +121,7 @@ class Inkling2Model(TextModel):
                 raise ValueError(f"Inkling2: unsupported {name}={hp[name]!r}")
         types = hp.get("layer_types")
         if types is None:
-            local = hp.get("local_layer_ids", [i for i in range(self.block_count) if (i + 1) % 6])
+            local = hp["local_layer_ids"]
             types = ["hybrid_sliding" if i in local else "hybrid" for i in range(self.block_count)]
         if len(types) != self.block_count or set(types) - {"hybrid", "hybrid_sliding"}:
             raise ValueError("Inkling2: invalid layer_types")
@@ -156,9 +156,9 @@ class Inkling2Model(TextModel):
             weight_dtype, scale_dtype = (torch.uint8, torch.float8_e4m3fn) if nvfp4 else (torch.float8_e4m3fn, torch.uint8)
             if tensor.dtype != weight_dtype or scale_tensor.dtype != scale_dtype:
                 raise ValueError(f"Inkling2: {name}: expected {weight_dtype} weights and {scale_dtype} scales, got {tensor.dtype} and {scale_tensor.dtype}")
-            experts = self.hparams.get("n_routed_experts", 384)
+            experts = self.hparams["n_routed_experts"]
             hidden = self.hparams["hidden_size"]
-            inter = self.hparams.get("moe_intermediate_size", self.hparams.get("intermediate_size", 2304))
+            inter = self.find_hparam(["moe_intermediate_size", "intermediate_size"])
             w13 = name.endswith(".w13_weight")
             rows, cols = (2 * inter, hidden) if w13 else (hidden, inter)
             shape = (experts, rows, cols)
@@ -210,7 +210,7 @@ class Inkling2Model(TextModel):
 
     def get_vocab_base(self):
         tokens, types, pre = super().get_vocab_base()
-        n = self.hparams.get("unpadded_vocab_size", 200058)
+        n = self.hparams["unpadded_vocab_size"]
         return tokens[:n], types[:n], pre
 
     def set_vocab(self):
@@ -218,37 +218,33 @@ class Inkling2Model(TextModel):
 
     def set_gguf_parameters(self):
         hp = self.hparams
-        hp["intermediate_size"] = hp.get("moe_intermediate_size", hp.get("intermediate_size", 2304))
         hp["num_attention_heads"] = [hp.get("swa_num_attention_heads", hp["num_attention_heads"]) if s else hp["num_attention_heads"] for s in self.is_swa]
         hp["num_key_value_heads"] = [hp.get("swa_num_key_value_heads", hp["num_key_value_heads"]) if s else hp["num_key_value_heads"] for s in self.is_swa]
-        hp.setdefault("n_routed_experts", 384)
-        hp.setdefault("num_experts_per_tok", 8)
+        for name in ("n_routed_experts", "num_experts_per_tok"):
+            if name not in hp:
+                raise KeyError(f"Inkling2: missing {name}")
         super().set_gguf_parameters()
         w = self.gguf_writer
         w.add_vocab_size(hp["vocab_size"])
+        w.add_vocab_size_unpadded(hp["unpadded_vocab_size"])
+        w.add_expert_feed_forward_length(self.find_hparam(["moe_intermediate_size", "intermediate_size"]))
         w.add_key_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
         w.add_value_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
         w.add_rope_dimension_count(0)
-        w.add_sliding_window(hp.get("sliding_window_size", 1024))
+        w.add_sliding_window(hp["sliding_window_size"])
         w.add_sliding_window_pattern(self.is_swa)
-        w.add_shortconv_l_cache(hp.get("conv_kernel_size", hp.get("sconv_kernel_size", 4)))
-        w.add_expert_weights_scale(hp.get("route_scale", 8.0))
-        w.add_activation_situ_beta(hp.get("mlp_gate_softcap", 4.0))
-        w.add_activation_situ_linear_beta(hp.get("mlp_up_softcap", 25.0))
-        w.add_attn_res_block_size(hp.get("n_layers_per_attn_res_block", 6))
-        w.add_final_logit_softcapping(hp.get("final_logit_softcapping", 30.0))
-        for key, field, default in (
-            (gguf.Keys.Attention.RELATIVE_LENGTH, "d_rel", 16),
-            (gguf.Keys.Attention.RELATIVE_EXTENT, "rel_extent", 1024),
-            (gguf.Keys.Attention.QK_CLIP, "qk_l2_clip_threshold", 22.627416997969522),
-            (gguf.Keys.Attention.RELATIVE_CLIP, "rel_l2_clip_threshold", 8.0),
-            (gguf.Keys.Attention.LOG_SCALE_FLOOR, "log_scaling_n_floor", 128000),
-            (gguf.Keys.Attention.LOG_SCALE_ALPHA, "log_scaling_alpha", 0.1),
-            (gguf.Keys.LLM.VOCAB_SIZE_UNPADDED, "unpadded_vocab_size", 200058),
-        ):
-            value = hp.get(field, default)
-            add = w.add_float32 if isinstance(default, float) else w.add_uint32
-            add(key.format(arch="inkling2"), value)
+        w.add_shortconv_l_cache(self.find_hparam(["conv_kernel_size", "sconv_kernel_size"]))
+        w.add_expert_weights_scale(hp["route_scale"])
+        w.add_activation_situ_beta(hp["mlp_gate_softcap"])
+        w.add_activation_situ_linear_beta(hp["mlp_up_softcap"])
+        w.add_attn_res_block_size(hp["n_layers_per_attn_res_block"])
+        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
+        w.add_relative_length(hp["d_rel"])
+        w.add_relative_extent(hp["rel_extent"])
+        w.add_qk_clip(hp["qk_l2_clip_threshold"])
+        w.add_relative_clip(hp["rel_l2_clip_threshold"])
+        w.add_log_scale_floor(hp["log_scaling_n_floor"])
+        w.add_log_scale_alpha(hp["log_scaling_alpha"])
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if new_name.endswith(("_conv.weight", "_clip.weight", "_res_query.weight", "attn_rel_bias.weight")):
@@ -373,16 +369,16 @@ class Inkling2VisionModel(MmprojModel):
         super().set_gguf_parameters()
         config = self.hparams
         rope = config.get("rope_parameters") or {"rope_type": "axial", "rope_theta": 10000.0}
-        if rope["rope_type"] != "axial":
-            raise ValueError("Inkling2 vision requires axial RoPE")
+        if rope["rope_type"] != "axial" or rope["rope_theta"] != 10000.0:
+            raise ValueError("Inkling2 vision requires axial RoPE with theta 10000")
         w = self.gguf_writer
-        w.add_clip_vision_projector_type(gguf.VisionProjectorType.INKLING2)
+        w.add_clip_vision_projector_type(gguf.VisionProjectorType.INKLING2V)
         w.add_vision_attention_layernorm_eps(config["layer_norm_eps"])
         w.add_vision_spatial_merge_size(config["spatial_merge_size"])
-        w.add_uint32(gguf.Keys.ClipVision.POSITION_GRID_SIZE, config["posemb_grid_size"])
-        w.add_uint32(gguf.Keys.ClipVision.Projector.HIDDEN_SIZE, config["projection_hidden_dim"])
-        w.add_bool(gguf.Keys.ClipVision.Projector.USE_BIAS, config.get("projector_bias", False))
-        w.add_float32(gguf.Keys.ClipVision.ROPE_FREQ_BASE, float(rope["rope_theta"]))
+
+    def dequant_model(self):
+        # vision tensors are BF16, only the text experts are quantized
+        return
 
     @classmethod
     def filter_tensors(cls, item):
@@ -399,6 +395,10 @@ class Inkling2VisionModel(MmprojModel):
         if module in self._projector_layers:
             yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, self._projector_layers[module], "." + suffix), data_torch
             return
+        # lay out the linear patch embedding (HWC patches) as a conv2d for build_inp()
+        if name.endswith(".patch_embedding.weight"):
+            ps = self.hparams["patch_size"]
+            data_torch = data_torch.reshape(data_torch.shape[0], ps, ps, 3).permute(0, 3, 1, 2)
         # these are bare parameters, they have no .weight
         if name.endswith(("position_embedding", ".lambda_1", ".lambda_2", ".gamma")):
             name = name.removesuffix(".gamma") + ".weight"

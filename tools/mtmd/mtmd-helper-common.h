@@ -1,7 +1,7 @@
 #pragma once
 
 // shared internal utilities for the mtmd-helper-*.cpp translation units
-// (mtmd-helper.cpp, mtmd-helper-gen.cpp)
+// (mtmd-helper.cpp, mtmd-helper-gen.cpp, mtmd-helper-video-ffmpeg.cpp)
 // NOT part of the public mtmd-helper.h API
 
 #include "ggml.h"
@@ -64,6 +64,15 @@ inline mtmd_helper_logger g_logger;
 #define LOG_INF(...) g_logger.log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
 #define LOG_WRN(...) g_logger.log(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
 #define LOG_ERR(...) g_logger.log(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+
+//
+// video
+//
+
+struct mtmd_helper_video_decoder;
+
+// only with MTMD_VIDEO; the user_data of open() is ffmpeg_bin_dir
+const mtmd_helper_video_decoder * mtmd_helper_video_decoder_ffmpeg();
 
 //
 // embd batch
@@ -170,7 +179,3 @@ struct decode_embd_batch {
         return batch.get();
     }
 };
-
-// Internal image-loader bridge; the public bitmap API accepts RGB.
-bool mtmd_image_needs_alpha(const mtmd_context * ctx);
-mtmd_bitmap * mtmd_bitmap_init_from_rgba(const mtmd_context * ctx, uint32_t nx, uint32_t ny, const unsigned char * data);

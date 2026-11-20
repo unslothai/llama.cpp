@@ -20,11 +20,12 @@ from safetensors.torch import save_file
 
 from conversion.base import LazyTorchTensor, gguf
 from conversion.deepseek import DeepseekV2Model
-from conversion.inkling2 import Inkling2Model, Inkling2VisionModel, Inkling2DSparkModel, _E4M3, _E2M1
+from conversion.inkling2 import Inkling2Model, Inkling2DSparkModel, _E4M3, _E2M1
 from conversion.llama import LlamaModel
 from conversion.nemotron import NemotronHModel
 from conversion.phi import PhiMoeModel
 from conversion.qwen import Qwen2MoeModel, Qwen3NextModel
+from conversion.qwen4exp import Qwen4ExpTextModel
 
 
 class ForcedF16Model(Qwen2MoeModel):
@@ -366,6 +367,27 @@ class TestFP8Conversion(unittest.TestCase):
         self.assertEqual(dtype, gguf.GGMLQuantizationType.Q8_0)
         np.testing.assert_allclose(gguf.dequantize(data, dtype), np.full((4, 32), 0.25), atol=1e-4)
 
+    def test_modelopt_block_scale_inv(self):
+        name = "model.layers.0.self_attn.q_proj.weight"
+        weight = (torch.arange(32, dtype=torch.float32).reshape(4, 8) - 16).to(torch.float8_e4m3fn)
+        scale = torch.tensor([[0.25, 0.5], [1.0, 2.0]])
+        expected = weight.float() * scale.repeat_interleave(2, 0).repeat_interleave(4, 1)
+        for eager in (False, True):
+            with self.subTest(eager=eager):
+                result = self.convert(Qwen2MoeModel, {name: weight, name + "_scale_inv": scale}, eager=eager, check_lazy=not eager)
+                self.assertEqual(set(result), {"blk.0.attn_q.weight"})
+                dtype, data = result["blk.0.attn_q.weight"]
+                self.assertEqual(dtype, gguf.GGMLQuantizationType.F16)
+                np.testing.assert_array_equal(data, expected.numpy())
+
+        with self.assertRaisesRegex(ValueError, "not tiled"):
+            self.convert(Qwen2MoeModel, {name: weight, name + "_scale_inv": torch.ones((3, 2))})
+
+        # a scalar scale keeps the FP8 bytes, as with weight_scale
+        result = self.convert(Qwen2MoeModel, {name: weight, name + "_scale_inv": torch.tensor([0.25])}, check_lazy=True)
+        self.assertEqual(result["blk.0.attn_q.weight"][0], gguf.GGMLQuantizationType.F8_E4M3)
+        np.testing.assert_array_equal(result["blk.0.attn_q.scale"][1], [0.25])
+
 
 class TestInkling2PackedConversion(unittest.TestCase):
     """Conversion of the packed Inkling2 expert weights (see _dequant_expert_chunk in conversion/inkling2.py).
@@ -453,7 +475,7 @@ class TestInkling2PackedConversion(unittest.TestCase):
 
     def converter(self, path, tensors, quant_groups, ftype=gguf.LlamaFileType.ALL_F32, eager=False):
         """Writes the checkpoint to path and returns an Inkling2Model on it."""
-        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": self.N_EMBD, "moe_intermediate_size": self.N_FF, "n_routed_experts": self.N_EXPERT}
+        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": self.N_EMBD, "moe_intermediate_size": self.N_FF, "n_routed_experts": self.N_EXPERT, "layer_types": ["hybrid_sliding", "hybrid"]}
         (path / "config.json").write_text(json.dumps(hp))
         (path / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": quant_groups}}))
         save_file(tensors, path / "model.safetensors")
@@ -629,14 +651,17 @@ class TestInkling2TextNames(unittest.TestCase):
     ))
 
     def convert(self, tensors):
-        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": 8}
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "config.json").write_text(json.dumps(hp))
-            save_file(tensors, path / "model.safetensors")
-            model = Inkling2Model(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=hp)
-            model.prepare_tensors()
-            return {name: gguf.LazyNumpyTensor.to_eager(info.tensor) for name, info in model.gguf_writer.tensors[0].items()}
+            return self._convert(Path(directory), tensors)
+
+    def _convert(self, path, tensors):
+        hp = {"model_type": "inkling2_text", "architectures": ["Inkling2ForCausalLM"], "num_hidden_layers": 2, "hidden_size": 8, "layer_types": ["hybrid_sliding", "hybrid"]}
+        (path / "config.json").write_text(json.dumps(hp))
+        save_file(tensors, path / "model.safetensors")
+        model = Inkling2Model(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=hp)
+        model.prepare_tensors()
+        # copy: the tensors are views of the mmapped checkpoint, which must be closed before the directory is removed
+        return {name: gguf.LazyNumpyTensor.to_eager(info.tensor).copy() for name, info in model.gguf_writer.tensors[0].items()}
 
     def test_checkpoint_and_transformers_names(self):
         checkpoint, transformers = {}, {}
@@ -672,77 +697,83 @@ class TestInkling2TextNames(unittest.TestCase):
             np.testing.assert_array_equal(renamed[name], actual[name], name)
 
 
-class TestInkling2VisionConversion(unittest.TestCase):
-    def test_original_names_and_hwc_weights(self):
-        from conversion import get_model_class
-        self.assertIs(get_model_class("Inkling2ForConditionalGeneration", mmproj=True), Inkling2VisionModel)
-        shapes = {
-            "backbone.embeddings.class_embedding": (8,),
-            "backbone.embeddings.cls_position_embedding": (8,),
-            "backbone.embeddings.position_embedding": (9, 8),
-            "backbone.embeddings.patch_embedding.weight": (8, 1200),
-            "backbone.ln_pre.weight": (8,),
-            "backbone.ln_pre.bias": (8,),
-            "backbone.layers.0.ls_1.gamma": (8,),
-            "backbone.layers.0.ls_2.gamma": (8,),
-            "proj_in.weight": (12, 32),
-            "proj_out.weight": (16, 12),
+class TestQwen4ExpPleScale(unittest.TestCase):
+    """FP8 checkpoints store the n-gram table as shards with one shared scale under the parent module name."""
+
+    PREFIX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+    SHARDS = (torch.tensor([[1., -2.], [3., 4.]]), torch.tensor([[5., 6.], [-7., 8.]]))
+    TABLE = "per_layer_token_embd.weight"
+    SCALE = "per_layer_token_embd.scale"
+
+    def convert(self, ftype=gguf.LlamaFileType.GUESSED, scaled=True, quant_method="modelopt", **kwargs):
+        # shard 1 first: the row order must follow the shard index
+        tensors = {self.PREFIX + f"shard_{i}.weight": self.SHARDS[i].to(torch.float8_e4m3fn) for i in (1, 0)}
+        if scaled:
+            tensors[self.PREFIX + "weight_scale"] = torch.tensor([0.25], dtype=torch.bfloat16)
+        hparams = {
+            "model_type": "qwen4exp",
+            "architectures": ["Qwen4ExpForCausalLM"],
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
+            "split_ngram_parts": 2,
+            "quantization_config": {"quant_method": quant_method},
         }
-        for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
-            shapes[f"backbone.layers.0.self_attn.{name}.weight"] = (8, 8)
-            shapes[f"backbone.layers.0.self_attn.{name}.bias"] = (8,)
-        for name, shape in (("ln_1", (8,)), ("ln_2", (8,)), ("mlp.c_fc", (32, 8)), ("mlp.c_proj", (8, 32))):
-            shapes[f"backbone.layers.0.{name}.weight"] = shape
-            shapes[f"backbone.layers.0.{name}.bias"] = (shape[0],)
-        tensors = {"model.visual." + name: torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape) / 100 for name, shape in shapes.items()}
-        tensors["model.llm.embed.weight"] = torch.ones(16, 16)
-        tensors["model.mtp.dummy.weight"] = torch.ones(2)
-        config = {"model_type": "inkling2", "architectures": ["Inkling2ForConditionalGeneration"], "text_config": {"hidden_size": 16}, "vision_config": {
-            "hidden_size": 8, "native_patch_size": 20, "adapter_merge_size": 2, "num_hidden_layers": 1,
-            "num_attention_heads": 2, "mlp_ratio": 4.0, "posemb_grid_size": 3, "projection_hidden_dim": 12,
-            "projector_bias": False, "layer_norm_eps": 1e-5, "temporal_patch_size": 2}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps(hparams))
+            save_file(tensors, str(path / "model.safetensors"))
+            model = Qwen4ExpTextModel(path, ftype, path / "out.gguf", hparams=hparams, **kwargs)
+            model.prepare_tensors()
+            result = {}
+            for name, info in model.gguf_writer.tensors[0].items():
+                if isinstance(info.tensor, gguf.LazyChunkedTensor):
+                    # written like the GGUF writer does, a chunked tensor has no other read path
+                    with (path / "tensor.bin").open("wb") as f:
+                        info.tensor.tofile(f)
+                    data = np.frombuffer((path / "tensor.bin").read_bytes(), dtype=info.tensor.dtype).reshape(info.tensor.shape)
+                else:
+                    data = np.asarray(gguf.LazyNumpyTensor.to_eager(info.tensor))
+                result[name] = (info.dtype, data)
+            return result
 
-        def convert(tensors):
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory)
-                (path / "config.json").write_text(json.dumps(config))
-                save_file(tensors, path / "model.safetensors")
-                model = Inkling2VisionModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf", hparams=config)
-                model.set_gguf_parameters()
-                model.prepare_tensors()
-                return {name: gguf.LazyNumpyTensor.to_eager(info.tensor) for name, info in model.gguf_writer.tensors[0].items()}, model.gguf_writer.kv_data[0]
+    def test_fp8_table_keeps_bytes_and_scale(self):
+        raw = torch.cat(self.SHARDS).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+        for kwargs, names in (
+            ({}, {self.TABLE, self.SCALE}),
+            ({"quant_method": "fp8"}, {self.TABLE, self.SCALE}),
+            ({"ple_only": True}, {self.TABLE}),
+            ({"no_ple": True}, {self.SCALE}),
+        ):
+            with self.subTest(**kwargs):
+                result = self.convert(**kwargs)
+                self.assertEqual(set(result), names)
+                if self.TABLE in result:
+                    dtype, data = result[self.TABLE]
+                    self.assertEqual(dtype, gguf.GGMLQuantizationType.F8_E4M3)
+                    np.testing.assert_array_equal(data, raw)
+                if self.SCALE in result:
+                    dtype, data = result[self.SCALE]
+                    self.assertEqual(dtype, gguf.GGMLQuantizationType.F32)
+                    np.testing.assert_array_equal(data, [0.25])
 
-        actual, kv = convert(tensors)
-        self.assertEqual(len(actual), len(shapes))
-        self.assertTrue(all(name.startswith(("v.", "mm.")) for name in actual))
-        for target, source in (("v.patch_embd.weight", "backbone.embeddings.patch_embedding.weight"),
-                               ("v.class_embd", "backbone.embeddings.class_embedding"),
-                               ("v.class_position_embd.weight", "backbone.embeddings.cls_position_embedding"),
-                               ("v.blk.0.ls1.weight", "backbone.layers.0.ls_1.gamma"),
-                               ("v.blk.0.ffn_up.weight", "backbone.layers.0.mlp.c_fc.weight"),
-                               ("mm.2.weight", "proj_out.weight")):
-            np.testing.assert_array_equal(actual[target], tensors["model.visual." + source].numpy())
-        for key, value in ((gguf.Keys.ClipVision.PROJECTOR_TYPE, "inkling2"),
-                           (gguf.Keys.ClipVision.PATCH_SIZE, 20), (gguf.Keys.ClipVision.SPATIAL_MERGE_SIZE, 2),
-                           (gguf.Keys.ClipVision.POSITION_GRID_SIZE, 3), (gguf.Keys.ClipVision.Projector.HIDDEN_SIZE, 12),
-                           (gguf.Keys.ClipVision.Projector.USE_BIAS, False)):
-            self.assertEqual(kv[key].value, value)
+        result = self.convert(scaled=False)
+        self.assertEqual(set(result), {self.TABLE})
+        np.testing.assert_array_equal(result[self.TABLE][1], raw)
 
-        # the same checkpoint under the transformers names gives the same tensors
-        def transformers_name(name):
-            if name.endswith(".embeddings.position_embedding"):
-                name += ".weight"
-            for old, new in (("visual.backbone.ln_pre.", "vision_tower.pre_layernorm."), ("visual.backbone.", "vision_tower."),
-                             ("visual.proj_in.", "vision_tower.merger.linear_1."), ("visual.proj_out.", "vision_tower.merger.linear_2."),
-                             (".ln_1.", ".layernorm_before."), (".ln_2.", ".layernorm_after."), (".mlp.c_fc.", ".mlp.fc1."),
-                             (".mlp.c_proj.", ".mlp.fc2."), (".ls_1.gamma", ".lambda_1"), (".ls_2.gamma", ".lambda_2")):
-                name = name.replace(old, new)
-            return name
-
-        renamed, _ = convert({transformers_name(name): tensor for name, tensor in tensors.items()})
-        self.assertEqual(renamed.keys(), actual.keys())
-        for name in actual:
-            np.testing.assert_array_equal(renamed[name], actual[name], name)
+    def test_scale_is_folded_into_other_types(self):
+        values = torch.cat(self.SHARDS).numpy()
+        for kwargs, qtype in (
+            ({"ftype": gguf.LlamaFileType.ALL_F32}, gguf.GGMLQuantizationType.F32),
+            ({"ftype": gguf.LlamaFileType.MOSTLY_F16}, gguf.GGMLQuantizationType.F16),
+            ({"fp8_as_q8": True}, gguf.GGMLQuantizationType.F16),
+        ):
+            for scaled in (False, True):
+                with self.subTest(scaled=scaled, **kwargs):
+                    result = self.convert(scaled=scaled, **kwargs)
+                    self.assertEqual(set(result), {self.TABLE})
+                    dtype, data = result[self.TABLE]
+                    self.assertEqual(dtype, qtype)
+                    np.testing.assert_array_equal(data, values * (0.25 if scaled else 1.))
 
 
 class TestInkling2DSparkConversion(unittest.TestCase):

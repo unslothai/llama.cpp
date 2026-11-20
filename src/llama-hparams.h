@@ -137,6 +137,8 @@ struct llama_hparams {
     float    expert_group_scale   = 0.05f;
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
+    float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped
+    bool     expert_router_f32    = false;   // compute the router logits in F32
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
@@ -218,6 +220,12 @@ struct llama_hparams {
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
     bool     kda_safe_gate = false;
+
+    // for ZAYA1 CCA layers: q + k channels in the conv state
+    uint32_t n_cca_qk = 0;
+
+    // for ZAYA1: width of the router MLP
+    uint32_t n_router_hidden = 0;
 
     // kimi-k3
     uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
