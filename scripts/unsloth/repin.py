@@ -33,7 +33,8 @@ import sys
 from pathlib import Path
 
 # Branches we may push to. Anything else gets a report line and no write.
-OWNED = ("unslothai/", "danielhanchen/")
+# "unsloth/" is what GitHub reports for our branches once the org is renamed from unslothai.
+OWNED = ("unslothai/", "unsloth/", "danielhanchen/")
 
 PIN_RE = re.compile(
     r"^https://github\.com/([^/]+)/llama\.cpp/pull/(\d+)/commits/([0-9a-f]{40})/?$"
