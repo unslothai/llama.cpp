@@ -111,28 +111,28 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/1
-          key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 2
         if: ${{ matrix.shards >= 3 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/2
-          key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 3
         if: ${{ matrix.shards >= 4 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/3
-          key: ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
         if: ${{ matrix.shards >= 1 }}
@@ -189,7 +189,7 @@ jobs:
         with:
           path: shards/${{ matrix.shard }}
           # Shard index ahead of the profile so the generation prefix restore never picks a shard.
-          key: ccache-shard${{ matrix.shard }}-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-shard${{ matrix.shard }}-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build:
     name: ${{ matrix.arch }}/${{ matrix.profile }}
@@ -257,28 +257,28 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/1
-          key: ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard1-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard1-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 2
         if: ${{ matrix.shards >= 3 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/2
-          key: ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard2-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard2-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
       - name: Restore warm shard 3
         if: ${{ matrix.shards >= 4 }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: shards/3
-          key: ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+          key: ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
           restore-keys: |
-            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
-            ccache-shard3-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
+            ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-
+            ccache-shard3-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-
 
       - name: Merge warm shards into the ccache
         if: ${{ matrix.shards >= 2 }}
@@ -413,4 +413,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cuda-depend-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
