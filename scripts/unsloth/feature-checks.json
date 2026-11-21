@@ -154,6 +154,25 @@
       "checks": [
         { "kind": "arch", "arch": "minimax-m3" }
       ]
+    },
+    "cuda-mmvf-rows": {
+      "owner": "unslothai#400",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=bf16,type_b=f32" },
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=f16,type_b=f32" }
+      ]
+    },
+    "cuda-clip-rows-fusion": {
+      "owner": "unslothai#401",
+      "checks": [
+        { "kind": "backend-op", "op": "CLIP_ROWS_FUSE" }
+      ]
+    },
+    "cuda-situ-fusion": {
+      "owner": "unslothai#402",
+      "checks": [
+        { "kind": "backend-op", "op": "SITU_FUSE" }
+      ]
     }
   },
   "unchecked": {
