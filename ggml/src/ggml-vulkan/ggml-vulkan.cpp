@@ -3922,6 +3922,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(swiglu, SWIGLU)
     CREATE_GLU(swiglu_oai, SWIGLU_OAI)
     CREATE_GLU(swiglu_clamp, SWIGLU_CLAMP)
+    CREATE_GLU(situ, SITU)
     CREATE_GLU(geglu_erf, GEGLU_ERF)
     CREATE_GLU(geglu_quick, GEGLU_QUICK)
 #undef CREATE_GLU
@@ -13708,6 +13709,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
         case GGML_GLU_OP_SWIGLU_CLAMP:
+        case GGML_GLU_OP_SITU:
             ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
             break;
         default:
@@ -16674,6 +16676,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     return ggml_vk_is_float_elementwise(op) && (!op->src[1] || op->src[1]->type == op->type);
+                case GGML_GLU_OP_SITU:
+                    return ggml_vk_is_float_elementwise(op) && op->src[1] && op->src[1]->type == op->type;
                 default:
                     return false;
             }

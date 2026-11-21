@@ -1005,7 +1005,7 @@ void process_shaders() {
                                      "elu", "xielu", "sgn", "softplus", "step", "round", "ceil", "floor", "trunc"}) {
             string_to_spv(op + "_" + t, "unary.comp", merge_maps(dict, {{"OP", "op_" + op}}));
         }
-        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "geglu_erf", "geglu_quick"}) {
+        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "situ", "geglu_erf", "geglu_quick"}) {
             string_to_spv(op + "_" + t, op + ".comp", dict);
         }
         string_to_spv("log_" + t, "log.comp", dict);

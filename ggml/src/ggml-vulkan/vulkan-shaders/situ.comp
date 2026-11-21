@@ -1,0 +1,18 @@
+#version 450
+
+#include "glu_head.glsl"
+
+// overflow-safe tanh, as in unary.comp
+float situ_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+// p.alpha = beta, p.limit = linear beta
+float op(float a, float b) {
+    const float act = p.alpha * situ_tanh(a / p.alpha) / (1.0f + exp(-a));
+    const float up  = p.limit > 0.0f ? p.limit * situ_tanh(b / p.limit) : b;
+
+    return act * up;
+}
+
+#include "glu_main.glsl"

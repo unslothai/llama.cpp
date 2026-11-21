@@ -808,6 +808,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // the dense masks in F32, cast once for all layers to add the per-head bias to
+    ggml_tensor * self_kq_mask_f32     = nullptr;
+    ggml_tensor * self_kq_mask_f32_swa = nullptr;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 

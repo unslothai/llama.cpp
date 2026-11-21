@@ -2495,6 +2495,67 @@ struct test_swiglu_clamp : public test_case {
     }
 };
 
+// GGML_OP_GLU (SITU)
+struct test_situ : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    int v; // view (1 : a and b are the two halves of one tensor, as for a fused gate_up)
+    float beta;
+    float linear_beta;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne_a, v, beta, linear_beta);
+    }
+
+    test_situ(ggml_type type = GGML_TYPE_F32,
+              std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+              int v = 0,
+              float beta = 4.0f,
+              float linear_beta = 25.0f)
+        : type(type), ne_a(ne_a), v(v), beta(beta), linear_beta(linear_beta) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        ggml_tensor * b;
+        if (v & 1) {
+            auto ne = ne_a; ne[0] *= 2;
+            ggml_tensor * gate_up = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(gate_up);
+            ggml_set_name(gate_up, "gate_up");
+
+            a = ggml_view_4d(ctx, gate_up, ne_a[0], ne_a[1], ne_a[2], ne_a[3], gate_up->nb[1], gate_up->nb[2], gate_up->nb[3], 0);
+            ggml_set_name(a, "gate");
+            b = ggml_view_4d(ctx, gate_up, ne_a[0], ne_a[1], ne_a[2], ne_a[3], gate_up->nb[1], gate_up->nb[2], gate_up->nb[3],
+                    ne_a[0]*ggml_element_size(gate_up));
+            ggml_set_name(b, "up");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+
+            b = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(b);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * out = ggml_situ(ctx, a, b, beta, linear_beta);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // wide enough to saturate both tanh terms
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -60.f, 60.f);
+        }
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_F32 ? 1e-7 : 5e-6;
+    }
+};
+
 // GGML_OP_GET_ROWS
 struct test_get_rows : public test_case {
     const ggml_type type;
@@ -10855,7 +10916,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
+                // these take parameters, tested below
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
                     continue;
                 }
 
@@ -10884,6 +10946,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int v : {0, 1}) {
             for (float limit : {2.0f, 10.0f}) {
                 test_cases.emplace_back(new test_swiglu_clamp(type, { 128, 2, 2, 2 }, v, limit));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int v : {0, 1}) {
+            for (float linear_beta : {0.0f, 25.0f}) {
+                test_cases.emplace_back(new test_situ(type, { 128, 2, 2, 2 }, v, 4.0f, linear_beta));
             }
         }
     }
