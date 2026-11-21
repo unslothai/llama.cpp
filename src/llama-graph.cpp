@@ -4421,6 +4421,20 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
+    if (cparams.flash_attn && kq_b->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16 && hparams.f_max_alibi_bias == 0.0f) {
+        // convert the bias to F16 in one copy, from the source of its contiguous copy when it is one (the same values),
+        // and add the mask in F16: the mask is 0 or -inf, so this rounds the same as adding in F32 and converting
+        ggml_tensor * src = kq_b->op == GGML_OP_CONT ? kq_b->src[0] : kq_b;
+        ggml_tensor * bias = ggml_cpy(ctx0, src, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, kq_b->ne[0], kq_b->ne[1], kq_b->ne[2], kq_b->ne[3]));
+        if (kq_b->ne[1] != kq_mask->ne[1]) {
+            kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_b->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]);
+        }
+        kq_mask = ggml_add(ctx0, bias, kq_mask);
+        cb(kq_mask, "kq_mask_rel_pos", il);
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
     if (kq_b->ne[1] != kq_mask->ne[1]) {
         ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
         if (!dev) {
