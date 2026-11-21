@@ -1346,13 +1346,23 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
         }
     }
 
+    // the sequence must be one run of cells c0 + pos, pos = 0..pos_max; the cells before c0 hold other sequences
+    // (several slots in a unified cache) and are masked, so the distances stay cell differences
+    uint32_t c0 = 0;
+    while (c0 < cells.size() && (cells.is_empty(c0) || !cells.seq_has(c0, seq_id))) {
+        ++c0;
+    }
+    if ((uint64_t) c0 + pos_max + 1 > cells.size()) {
+        return 0;
+    }
     for (llama_pos pos = 0; pos <= pos_max; ++pos) {
-        if (cells.is_empty(pos) || cells.pos_get(pos) != pos || !cells.seq_has(pos, seq_id)) {
+        const uint32_t i = c0 + pos;
+        if (cells.is_empty(i) || cells.pos_get(i) != pos || !cells.seq_has(i, seq_id)) {
             return 0;
         }
     }
 
-    return pos_max + 1;
+    return c0 + pos_max + 1;
 }
 
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
