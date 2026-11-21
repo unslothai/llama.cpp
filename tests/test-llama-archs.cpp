@@ -1435,27 +1435,24 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (int cfg = 0; cfg < 3; ++cfg) {
-            const bool moe    = cfg > 0;
-            const bool looped = cfg == 2;
+        for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
-            if (!moe && moe_mandatory(arch)) {
-                continue;
-            }
-            if (looped && arch != LLM_ARCH_INKLING2) {
+            // inkling2 has no dense config, that pass runs the earlier looped layout
+            const bool looped = !moe && arch == LLM_ARCH_INKLING2;
+            if (!moe && moe_mandatory(arch) && !looped) {
                 continue;
             }
             const std::string config_name = looped ? "Looped" : moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, 0, looped);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe || looped, 0, looped);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                if (dc.host_experts && (!(moe || looped) || !host_experts_test(arch))) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
