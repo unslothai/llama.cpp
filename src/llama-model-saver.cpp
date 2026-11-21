@@ -179,6 +179,9 @@ void llama_model_saver::add_kv_from_model() {
         tensor_names.reserve(model->prec_policy.prec_src1.size());
         values.reserve(model->prec_policy.prec_src1.size());
         for (const auto & [w, prec] : model->prec_policy.prec_src1) {
+            if (w->view_src != nullptr) {
+                continue; // a view of a shared layer weight, saved with the weight
+            }
             tensor_names.push_back(ggml_get_name(w));
             values.push_back(prec == GGML_PREC_Q8 ? 0 : 1);
         }
@@ -589,7 +592,8 @@ void llama_model_saver::add_tensors_from_model() {
     for (const struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             const struct ggml_tensor * tensor = reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i];
-            if (tensor == nullptr || !seen.insert(tensor).second) {
+            // the later users of a shared host weight hold views of it
+            if (tensor == nullptr || !seen.insert(tensor->view_src ? tensor->view_src : tensor).second) {
                 continue;
             }
             add_tensor(tensor);
