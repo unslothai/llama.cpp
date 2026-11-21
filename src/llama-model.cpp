@@ -423,6 +423,11 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
+    // the earlier looped Inkling 2 layout is stored as inkling2 with one block per visit, load it as inkling2_loop
+    if (arch == LLM_ARCH_INKLING2 && gguf_find_key(ml.metadata, ml.llm_kv(LLM_KV_NUM_LOOPS).c_str()) >= 0) {
+        arch = LLM_ARCH_INKLING2_LOOP;
+    }
+
     return llama_model_create(arch, params);
 }
 
