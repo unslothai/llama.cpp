@@ -4544,11 +4544,22 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
         if (fill->src[0] != scl || div->src[0] != fill) {
             return 0;
         }
+        // ggml_fill_inplace(norm) overwrites the denominator before DIV reads it, so the chain divides the
+        // threshold by itself: keep the separate ops
+        if (fill->view_src == scl || fill->data == scl->data) {
+            return 0;
+        }
         memcpy(&limit_value, fill->op_params, sizeof(float));
     } else {
         limit = div->src[0];
         if (limit->type != GGML_TYPE_F32 || !ggml_is_contiguous(limit) || !ggml_are_same_shape(limit, scl)) {
             return 0;
+        }
+        // the fused kernel never writes the chain's intermediates, so the limit must not be one of them
+        for (const ggml_tensor * t : { sqr, sum, sqrtn, scl }) {
+            if (limit == t || limit->view_src == t) {
+                return 0;
+            }
         }
     }
 

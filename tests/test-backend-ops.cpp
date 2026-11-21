@@ -4618,6 +4618,7 @@ struct test_clip_rows_fuse : public test_case {
     const std::array<int64_t, 4> ne; // [D, H, T, 1]
     const bool with_w;
     const bool shared_limit; // threshold tensor filled outside the chain
+    const bool inplace_fill; // ggml_fill_inplace on the norm: overwrites the denominator, must not fuse
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4627,11 +4628,12 @@ struct test_clip_rows_fuse : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, with_w, shared_limit);
+        return VARS_TO_STR4(ne, with_w, shared_limit, inplace_fill);
     }
 
-    test_clip_rows_fuse(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_w = true, bool shared_limit = false)
-        : ne(ne), with_w(with_w), shared_limit(shared_limit) {}
+    test_clip_rows_fuse(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_w = true, bool shared_limit = false,
+                        bool inplace_fill = false)
+        : ne(ne), with_w(with_w), shared_limit(shared_limit), inplace_fill(inplace_fill) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
@@ -4650,7 +4652,10 @@ struct test_clip_rows_fuse : public test_case {
         }
         ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, c)));
         norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
-        ggml_tensor * factor = ggml_div(ctx, limit ? limit : ggml_fill(ctx, norm, 1.5f), norm);
+        if (!limit) {
+            limit = inplace_fill ? ggml_fill_inplace(ctx, norm, 1.5f) : ggml_fill(ctx, norm, 1.5f);
+        }
+        ggml_tensor * factor = ggml_div(ctx, limit, norm);
         ggml_tensor * out = ggml_mul(ctx, c, ggml_clamp(ctx, factor, 0.0f, 1.0f));
         ggml_set_name(out, "out");
         return out;
@@ -10829,6 +10834,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_clip_rows_fuse({  16,  24,  33, 1}, with_w, shared_limit));
             test_cases.emplace_back(new test_clip_rows_fuse({1100,   3,   5, 1}, with_w, shared_limit));
         }
+        // an in-place fill of the norm overwrites the denominator: the chain must run unfused
+        test_cases.emplace_back(new test_clip_rows_fuse({ 128,  24,   7, 1}, with_w, false, true));
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
