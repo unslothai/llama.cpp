@@ -1506,7 +1506,9 @@ public:
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                // the greedy recurrent head only chains the rows that are read: the anchor and the first n_max masks
+                const bool output = !has_rnn_context || params.probabilistic || i <= params.n_max;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (has_rnn_context) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;

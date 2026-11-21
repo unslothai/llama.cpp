@@ -1103,7 +1103,9 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
-    for (int64_t i = 1; i < block; ++i) {
+    // only the output rows are chained: the caller marks the anchor and the masks it reads (a prefix of each block)
+    const int64_t n_out = n_outputs % nb == 0 && n_outputs/nb >= 2 ? std::min<int64_t>(n_outputs/nb, block) : block;
+    for (int64_t i = 1; i < n_out; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);
@@ -1113,13 +1115,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
     }
-    const auto block_order = [&](ggml_tensor * t) {
-        t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
-        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], n_tokens);
+    const auto block_order = [&](ggml_tensor * t, int64_t n) {
+        t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, n);
+        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], nb*n);
     };
-    res->t_h_nextn = block_order(states);
+    if (n_out < block) {
+        // h_nextn is read at every row
+        states = ggml_concat(ctx0, states, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb*(block - n_out)), 0.0f), 1);
+    }
+    res->t_h_nextn = block_order(states, block);
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
-    logits = block_order(logits);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
+    logits = block_order(logits, n_out);
+    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*n_out, logits->nb[1], 0));
 }
