@@ -227,6 +227,39 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
     };
 
+    // a quantized cache takes the banded op only where the layer's device runs it, else the dense path
+    std::vector<std::pair<ggml_backend_dev_t, bool>> banded_quant_dev_ok;
+    const auto banded_cache_types_ok = [&](int il, ggml_type type_k, ggml_type type_v) {
+        if (banded_cache_type_supported(type_k) && banded_cache_type_supported(type_v)) {
+            return true;
+        }
+        if (!(banded_cache_type_supported(type_k) || ggml_is_quantized(type_k)) ||
+            !(banded_cache_type_supported(type_v) || ggml_is_quantized(type_v))) {
+            return false;
+        }
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (!dev) {
+            return false;
+        }
+        for (const auto & [d, ok] : banded_quant_dev_ok) {
+            if (d == dev) {
+                return ok;
+            }
+        }
+        const int64_t nh  = hparams.n_head(il);
+        const int64_t nkv = hparams.n_head_kv(il);
+        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_dim, 1, nh, 1);
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, type_k, head_dim, 1, nkv, 1);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, type_v, head_dim, 1, nkv, 1);
+        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
+        ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+        ggml_prec_set_acc(op, GGML_PREC_F32);
+        const bool ok = ggml_backend_dev_supports_op(dev, op);
+        banded_quant_dev_ok.push_back({ dev, ok });
+        return ok;
+    };
+
     const auto use_banded_flash = [&](int il) {
         const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
         const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_flash_swa : n_kv_flash_base;
@@ -237,8 +270,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             (head_dim == 64 || head_dim == 128) &&
             hparams.n_embd_head_v(il) == head_dim &&
             hparams.n_head(il) % hparams.n_head_kv(il) == 0 &&
-            banded_cache_type_supported(cache->type_k()) &&
-            banded_cache_type_supported(cache->type_v());
+            banded_cache_types_ok(il, cache->type_k(), cache->type_v());
     };
 
     for (int il = 0; il < n_layer; ++il) {

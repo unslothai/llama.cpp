@@ -943,8 +943,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!fattn_banded_type_supported(k->type) ||
-        !fattn_banded_type_supported(v->type) ||
+    // quantized K/V: only the delegated FA kernel reads them, it converts them to F16
+    const bool kv_quant_ok = (ggml_is_quantized(k->type) || ggml_is_quantized(v->type)) &&
+        ggml_cuda_flash_attn_ext_banded_use_mma(device, dst);
+    if (!(fattn_banded_type_supported(k->type) || (kv_quant_ok && ggml_is_quantized(k->type))) ||
+        !(fattn_banded_type_supported(v->type) || (kv_quant_ok && ggml_is_quantized(v->type))) ||
         !fattn_banded_type_supported(rel->type)) {
         return false;
     }
