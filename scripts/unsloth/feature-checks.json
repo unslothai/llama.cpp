@@ -58,6 +58,12 @@
         { "kind": "mtmd",       "projector": "inkling2v" }
       ]
     },
+    "inkling2-loop": {
+      "owner": null,
+      "checks": [
+        { "kind": "arch",       "arch": "inkling2_loop" }
+      ]
+    },
     "inkling2-banded-attn": {
       "owner": "unslothai#386",
       "checks": [
@@ -165,8 +171,10 @@
     "unslothai#266": "MADV_POPULATE_READ on the non-lazy ranges when MAP_POPULATE is skipped; a page-fault and load-time change with no observable output difference, so there is no feature surface to probe",
     "unslothai#311": "harmony-xml parser ends a Beam analysis message on <|constrain|> header variants; covered by test-chat, and there is no feature surface of its own to probe",
     "ggml-org#32218": "Inkling 2 DSpark draft (DFLASH arch with the Inkling 2 backbone and recurrent Markov head); test-llama-archs has no DFlash case because a draft needs a target context, and an end-to-end check needs the Inkling-2-Small DSpark draft GGUF and a GPU host the pipeline does not have",
-    "unslothai#389": "repeating (looped) layers; the looped config in test-llama-archs runs in the CPU gate build, and an end-to-end check needs a looped GGUF the pipeline does not have",
-    "unslothai#390": "DSpark draft conversion fixes and llama-quantize keeping the DSpark fuse weights F32; needs a DSpark draft checkpoint and a GPU host the pipeline does not have",
+    "ggml-org#32704": "inkling2_loop loop slots take the per-expert NVFP4 scales; needs an NVFP4 inkling2_loop GGUF the pipeline does not have, and test-llama-archs has no per-expert scales",
+    "unslothai#395": "earlier looped inkling2 layout loaded as inkling2_loop; the legacy looped config in test-llama-archs runs in the CPU gate build, and an end-to-end check needs a looped GGUF the pipeline does not have",
+    "unslothai#396": "looped layers placed by the layers that hold weights, with per-visit host weight views; it only differs with partial offload or several GPUs on a looped GGUF, which the pipeline does not have",
+    "unslothai#397": "llama-quantize keeps the DSpark fuse weights F32; needs a DSpark draft GGUF the pipeline does not have",
     "unslothai#385": "Inkling 2 attention chunked over query rows once the dense relative bias for a full cache passes 2^29 elements; it only engages with a large context window (a cache above about 21K cells at -ub 512 for 48 heads), which the small synthetic test-llama-archs context never reaches, and below that budget the graph is unchanged"
   }
 }
