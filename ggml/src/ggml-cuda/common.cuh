@@ -65,6 +65,9 @@
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
 
+// datacenter Blackwell (sm_100 / sm_103: B200, B300); consumer Blackwell is GGML_CUDA_CC_BLACKWELL
+#define GGML_CUDA_CC_IS_BLACKWELL_DC(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000 && cc < 1100)
+
 // AMD
 // GCN/CDNA, wave size is 64
 #define GGML_CUDA_CC_GCN4       (GGML_CUDA_CC_OFFSET_AMD + 0x803)  // Tonga, Fiji, Polaris, minimum for fast fp16
