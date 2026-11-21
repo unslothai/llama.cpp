@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-# The ROCm copy step flattens soname links into full copies, so a bundle carries each large
-# library three times. Turn identical copies back into links to the longest name.
+# The ROCm copy step keeps soname links (cp -P), so a bundle normally holds one copy of each
+# library. Any identical copies that remain are turned into links to the longest name.
 #
 # Usage: link_bundle_copies.sh <bundle-dir>
 set -euo pipefail
