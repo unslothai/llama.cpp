@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <string>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -528,6 +529,24 @@ struct llama_mmap::impl {
         mapped_fragments.emplace_back(0, file->size());
     }
 
+    size_t populate(const llama_mmap::ranges & rs) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+        size_t n = 0;
+        for (const auto & run : llama_mmap::page_runs(rs, size, sysconf(_SC_PAGESIZE))) {
+            if (madvise((char *) addr + run.first, run.second - run.first, MADV_POPULATE_READ)) {
+                // EINVAL before Linux 5.14: the pages fault in on demand instead
+                LLAMA_LOG_DEBUG("%s: madvise(.., MADV_POPULATE_READ) failed: %s\n", __func__, strerror(errno));
+                break;
+            }
+            n += run.second - run.first;
+        }
+        return n;
+#else
+        GGML_UNUSED(rs);
+        return 0;
+#endif
+    }
+
     static void align_range(size_t * first, size_t * last, size_t page_size) {
         size_t offset_in_page = *first & (page_size - 1);
         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
@@ -640,6 +659,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+        return 0;
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -670,6 +694,12 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -684,6 +714,148 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+size_t llama_mmap::populate(const ranges & rs) { return pimpl->populate(rs); }
+
+llama_mmap::ranges llama_mmap::page_runs(ranges rs, size_t limit, size_t page_size) {
+    rs.erase(std::remove_if(rs.begin(), rs.end(), [](const auto & r) { return r.first >= r.second; }), rs.end());
+    for (auto & r : rs) {
+        r.first  = r.first & ~(page_size - 1);
+        r.second = std::min((r.second + page_size - 1) & ~(page_size - 1), limit);
+    }
+    std::sort(rs.begin(), rs.end());
+
+    ranges res;
+    for (const auto & r : rs) {
+        if (r.first >= r.second) {
+            continue;
+        }
+        if (!res.empty() && r.first <= res.back().second) {
+            res.back().second = std::max(res.back().second, r.second);
+        } else {
+            res.push_back(r);
+        }
+    }
+
+    return res;
+}
+
+#ifdef __linux__
+// the number at the start of path, false if missing, unreadable or not a number ("max")
+static bool llama_read_u64(const std::string & path, unsigned long long & v) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fscanf(f, "%llu", &v) == 1;
+    fclose(f);
+    return ok;
+}
+
+// mountinfo octal-escapes space, tab, newline and backslash in its path fields (a systemd "\x2d" name included)
+static std::string llama_mountinfo_unescape(const char * s) {
+    std::string res;
+    for (; *s; s++) {
+        if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' && s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+            const char c = (char) ((s[1] - '0')*64 + (s[2] - '0')*8 + (s[3] - '0'));
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\\') {
+                res += c;
+                s += 3;
+                continue;
+            }
+        }
+        res += *s;
+    }
+    return res;
+}
+
+// a cgroup mount whose root is a subtree (a container without a cgroup namespace) still shows the host path in
+// /proc/self/cgroup: strip the mount root so the path is relative to the mount point, else it is left as it is
+static std::string llama_cgroup_mount_relative(const std::string & path, const char * mountinfo, const std::string & mnt, bool v2) {
+    FILE * f = fopen(mountinfo, "r");
+    if (!f) {
+        return path;
+    }
+    std::string res = path;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        // "id parent maj:min root mount-point options [optional...] - fstype source super-options"
+        char mroot[4096];
+        char mpoint[4096];
+        char fstype[64];
+        const char * sep = strstr(line, " - ");
+        if (!sep || sscanf(line, "%*s %*s %*s %4095s %4095s", mroot, mpoint) != 2 ||
+                sscanf(sep + 3, "%63s", fstype) != 1 || strcmp(fstype, v2 ? "cgroup2" : "cgroup") != 0 || mnt != llama_mountinfo_unescape(mpoint)) {
+            continue;
+        }
+        const std::string r = llama_mountinfo_unescape(mroot);
+        if (r != "/" && path.compare(0, r.size(), r) == 0 && (path.size() == r.size() || path[r.size()] == '/')) {
+            res = path.size() == r.size() ? "/" : path.substr(r.size());
+        }
+        break;
+    }
+    fclose(f);
+    return res;
+}
+#endif
+
+size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * root, const char * mountinfo) {
+#ifdef __linux__
+    // v2 "0::/path": the tightest of memory.max and memory.high, less memory.current
+    // v1 "N:..,memory,..:/path": memory.limit_in_bytes less memory.usage_in_bytes, under the memory mount
+    // each less the same reserve as the host budget, max(2 GiB, limit/16); over the cgroup and its ancestors, as the limits
+    // are hierarchical. a path under a subtree mount is made relative to it (mountinfo), and the cgroups above the mount
+    // root are not there, so the missing files are skipped: what cannot be read leaves the budget as it is
+    FILE * f = fopen(self, "r");
+    if (!f) {
+        return budget;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        const char * c1 = strchr(line, ':');
+        const char * c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) {
+            continue;
+        }
+        const std::string ctrls = "," + std::string(c1 + 1, c2) + ",";
+        std::string path(c2 + 1);
+        path.erase(path.find_last_not_of("\r\n") + 1);
+        const bool v2 = ctrls == ",," && strncmp(line, "0:", 2) == 0;
+        const bool v1 = ctrls.find(",memory,") != std::string::npos;
+        if ((!v1 && !v2) || path.empty() || path[0] != '/' || path.find("/..") != std::string::npos) {
+            continue;
+        }
+        const std::string base = std::string(root) + (v1 ? "/memory" : "");
+        path = llama_cgroup_mount_relative(path, mountinfo, base, v2);
+        const char * used_name = v1 ? "/memory.usage_in_bytes" : "/memory.current";
+        const char * lim_names[2] = { v1 ? "/memory.limit_in_bytes" : "/memory.max", v1 ? nullptr : "/memory.high" };
+        for (;;) {
+            const std::string dir = base + (path == "/" ? "" : path);
+            unsigned long long used = 0;
+            if (llama_read_u64(dir + used_name, used)) {
+                for (const char * name : lim_names) {
+                    unsigned long long lim = 0;
+                    if (name && llama_read_u64(dir + name, lim)) {
+                        const unsigned long long reserve = std::max(2ull << 30, lim/16);
+                        const unsigned long long left = lim > used && lim - used > reserve ? lim - used - reserve : 0;
+                        budget = (size_t) std::min<unsigned long long>(budget, left);
+                    }
+                }
+            }
+            if (path == "/") {
+                break;
+            }
+            path.erase(std::max<size_t>(path.find_last_of('/'), 1));
+        }
+    }
+    fclose(f);
+#else
+    GGML_UNUSED(self);
+    GGML_UNUSED(root);
+    GGML_UNUSED(mountinfo);
+#endif
+    return budget;
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
