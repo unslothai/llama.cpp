@@ -517,7 +517,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
             table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            // zero sinks, filled once per graph and layer device
+            ggml_tensor *& zero = clip_limits[{ { model.dev_layer(il), -n_head }, 0.0f }];
+            if (!zero) {
+                zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            }
+            sinks = zero;
 
             // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
             const int64_t n_seq_tokens = n_tokens/n_stream;

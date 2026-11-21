@@ -2553,7 +2553,7 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> mix_states;
         const block_stack * stack(const std::vector<ggml_tensor *> & blocks, int il);
 
-        // the clip thresholds, per layer device, row count and threshold
+        // the clip thresholds, per layer device, row count and threshold (and the zero sinks, keyed by -n_head)
         std::map<std::pair<std::pair<ggml_backend_dev_t, int64_t>, float>, ggml_tensor *> clip_limits;
     };
 
