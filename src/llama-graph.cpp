@@ -2665,17 +2665,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 } break;
             case LLM_FFN_SITU:
                 {
-                    // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+                    // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), one op on the strided gate/up views
                     GGML_ASSERT(has_gate);
-                    const float beta = hparams.situ_beta;
-                    const float lb   = hparams.situ_linear_beta;
-
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    cur = ggml_situ(ctx0, cur, up, hparams.situ_beta, hparams.situ_linear_beta);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -4475,6 +4467,12 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    auto to_f32 = [&](ggml_tensor * mask) {
+        return mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
+    };
+    inp->self_kq_mask_f32     = to_f32(inp->inp_attn->self_attn_mask.raw);
+    inp->self_kq_mask_f32_swa = to_f32(inp->inp_attn->self_attn_mask_swa.raw);
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4501,11 +4499,7 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    ggml_tensor * kq_mask = ggml_add(ctx0, kq_b, is_swa ? inp->self_kq_mask_f32_swa : inp->self_kq_mask_f32);
     if (cparams.flash_attn) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }

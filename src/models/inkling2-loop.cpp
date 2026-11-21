@@ -77,22 +77,34 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const int end   = m.core_end;
 
     auto * cur = build_inputs();
-    std::vector<ggml_tensor *> blocks;
+    depth blocks;
     for (int il = 0; il < start; ++il) {
         cur = build_layer(il, il, cur, blocks);
     }
 
+    // the message queries of the core layers side by side, [n_embd, LOOP_CTRL_COUNT*(end - start)]
+    ggml_tensor * msg_queries = nullptr;
+    if (m.n_passes > 1) {
+        for (const auto & loop : m.loop_layers) {
+            msg_queries = msg_queries ? ggml_concat(ctx0, msg_queries, loop.msg_query, 1) : loop.msg_query;
+        }
+    }
+
     // every pass starts from the prelude output
     auto * prelude = cur;
-    const auto prelude_blocks = blocks;
+    const depth prelude_blocks = blocks;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
-        // the bank of the previous pass: its blocks after the first core block, and its output
-        std::vector<ggml_tensor *> bank;
-        ggml_tensor * bank_out = nullptr;
+        ggml_tensor * msgs   = nullptr;
+        ggml_tensor * msgs_n = nullptr;
         if (pass > 0) {
-            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-            bank_out = cur;
-            cur = prelude;
+            // the messages of all core layers, mixed from the bank of the previous pass: its blocks after the first core block, and its output
+            depth bank;
+            for (size_t i = prelude_blocks.rows.size() + 1; i < blocks.rows.size(); ++i) {
+                push(bank, blocks.rows[i]);
+            }
+            msgs   = mix(bank, ggml_rms_norm(ctx0, cur, 1e-6f), msg_queries);
+            msgs_n = ggml_rms_norm(ctx0, msgs, 1e-6f);
+            cur    = prelude;
             blocks = prelude_blocks;
         }
         for (int ip = start; ip < end; ++ip) {
@@ -101,8 +113,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
             }
-            const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            const size_t offs = (ip - start)*LOOP_CTRL_COUNT*msgs->nb[1];
+            ggml_tensor * messages   = ggml_view_3d(ctx0, msgs,   n_embd, LOOP_CTRL_COUNT, n_tokens, msgs->nb[1],   msgs->nb[2],   offs);
+            ggml_tensor * messages_n = ggml_view_3d(ctx0, msgs_n, n_embd, LOOP_CTRL_COUNT, n_tokens, msgs_n->nb[1], msgs_n->nb[2], offs);
+            cur = build_layer(il, ip, cur, blocks, messages, messages_n, &m.loop_layers[ip - start]);
         }
     }
 

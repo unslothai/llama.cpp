@@ -2507,8 +2507,17 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+
+        // the block outputs mixed over the depth, rms-normalized once and concatenated as they come
+        struct depth {
+            std::vector<ggml_tensor *> rows; // [n_embd, n_tokens] each
+            ggml_tensor * norm = nullptr;    // [n_embd, n_rows, n_tokens]
+        };
+        void push(depth & blocks, ggml_tensor * cur_n);
+        // cur_n is the rms-normalized cur
+        ggml_tensor * mix(const depth & blocks, ggml_tensor * cur_n, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        // the residual sum, before the conv_scale() of its taps
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
@@ -2517,7 +2526,10 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        float conv_scale(bool dynamic) const;
+        // cur_n and message_n are the rms-normalized cur and message
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_n, ggml_tensor * message, ggml_tensor * message_n,
+                const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2526,10 +2538,11 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
-        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs,
+        // messages_n is their rms norm
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, depth & blocks,
+                ggml_tensor * messages = nullptr, ggml_tensor * messages_n = nullptr, const loop_layer * loop = nullptr);
+        void build_output(ggml_tensor * cur, const depth & blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
@@ -2537,6 +2550,8 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * tau_r       = nullptr; // tau times the relative clip threshold
+        ggml_tensor * zero_sinks  = nullptr; // [n_head], shared by the layers
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
