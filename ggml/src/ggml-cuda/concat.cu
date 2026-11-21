@@ -139,6 +139,69 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// GGML_CUDA_DISABLE_CONCAT_FLAT=1 keeps the one-block-per-row kernel for non-contiguous sources
+static bool concat_flat_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONCAT_FLAT") != nullptr;
+    return disabled;
+}
+
+// measured faster on NVIDIA Blackwell (cc 10.x: 4/8-sequence decode +3-7%; cc 12.x: prefill +0.2-0.8%), a tie on
+// Ampere / Ada and 2-3% slower on Turing (T4), so older GPUs and other vendors keep the one-block-per-row kernel
+static bool concat_flat_cc_ok() {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000;
+}
+
+// non-contiguous sources: one thread per element of the contiguous dst instead of one block per row, which leaves
+// most threads idle for short rows (e.g. a convolution window per channel) and most SMs idle for few long rows
+// (e.g. one token of a view)
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0,
+        const char * src1,
+              T    * dst,
+        const uint3  ne0_fd,
+        const uint3  ne1_fd,
+        const uint3  ne2_fd,
+        const int    n,
+        const int    ne00,
+        const int    ne01,
+        const int    ne02,
+        const int    ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (i >= n) {
+        return;
+    }
+
+    const uint2 d0 = fast_div_modulo(i,    ne0_fd);
+    const uint2 d1 = fast_div_modulo(d0.x, ne1_fd);
+    const uint2 d2 = fast_div_modulo(d1.x, ne2_fd);
+    const int i0 = d0.y;
+    const int i1 = d1.y;
+    const int i2 = d2.y;
+    const int i3 = d2.x;
+
+    const char * x;
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00;
+    } else if constexpr (dim == 0) {
+        x = src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
+    } else if constexpr (dim == 1) {
+        x = src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10;
+    } else if constexpr (dim == 2) {
+        x = src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10;
+    } else {
+        x = src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10;
+    }
+
+    dst[i] = *(const T *) x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +223,26 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (ggml_is_contiguous(dst) && ggml_nelements(dst) < INT_MAX && !ggml_is_quantized(src0->type) &&
+               concat_flat_cc_ok() && !concat_flat_disabled()) {
+        const int n = (int) ggml_nelements(dst);
+        const int num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+        auto launch_kernel = [&](auto dim) {
+            ggml_cuda_kernel_launch(concat_non_cont_flat<T, dim>, launch_params,
+                (const char *) src0->data, (const char *) src1->data, (T *) dst->data,
+                init_fastdiv_values(dst->ne[0]), init_fastdiv_values(dst->ne[1]), init_fastdiv_values(dst->ne[2]), n,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src0->ne[2], (int) src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+        };
+        switch (dim) {
+            case 0: launch_kernel(std::integral_constant<int, 0>{}); break;
+            case 1: launch_kernel(std::integral_constant<int, 1>{}); break;
+            case 2: launch_kernel(std::integral_constant<int, 2>{}); break;
+            case 3: launch_kernel(std::integral_constant<int, 3>{}); break;
+            default: GGML_ABORT("Invalid dim: %d", dim);
+        }
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
