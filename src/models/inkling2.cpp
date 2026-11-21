@@ -1,6 +1,13 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <algorithm>
+#include <vector>
+
+// max elements of the dense relative bias per attention call, and max chunks per layer
+static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+static constexpr int64_t n_kq_chunk_max = 64;
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -360,16 +367,66 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
-
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
-        cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+        // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
+        const int64_t n_seq_tokens = n_tokens/n_stream;
+        // sized for a full cache so the chunking does not change while it fills
+        const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
+        int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
+                (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
+        if (n_rows_max < n_seq_tokens) {
+            const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
+            n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+        }
+        auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
+            int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+            ne[d] = nr;
+            return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
+        };
+        std::vector<ggml_tensor *> outs;
+        for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
+            const int64_t nr = std::min(n_rows_max, n_seq_tokens - r0);
+            const bool all = nr == n_seq_tokens;
+            ggml_tensor * q_c = Qcur;
+            ggml_tensor * kq_b = nullptr;
+            if (all) {
+                kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
+                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+            } else {
+                q_c = ggml_reshape_3d(ctx0, rows(ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_seq_tokens, n_stream), 2, r0, nr),
+                        n_embd_head, n_head, nr*n_stream);
+                ggml_tensor * table_c = ggml_reshape_4d(ctx0, table, table->ne[0], table->ne[1], n_seq_tokens, n_stream);
+                table_c = ggml_view_4d(ctx0, table_c, table_c->ne[0], table_c->ne[1], nr, n_stream,
+                        table_c->nb[1], table_c->nb[2], table_c->nb[3], r0*table_c->nb[2]);
+                ggml_tensor *& rel_pos_dev = inp->self_rel_pos_dev[is_swa];
+                if (!rel_pos_dev) {
+                    rel_pos_dev = ggml_cont(ctx0, rel_pos);
+                }
+                ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
+                        rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
+                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, ggml_get_rows(ctx0, table_c, rel_pos_c), 2, 0, 1, 3));
+            }
+            cb(kq_b, "kq_b", il);
+
+            // only the first chunk stores K and V
+            ggml_tensor * out = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
+            outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
+        }
+        while (outs.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t c = 0; c + 1 < outs.size(); c += 2) {
+                next.push_back(ggml_concat(ctx0, outs[c], outs[c + 1], 1));
+            }
+            if (outs.size() % 2) {
+                next.push_back(outs.back());
+            }
+            outs = std::move(next);
+        }
+        cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
