@@ -273,6 +273,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             banded_cache_types_ok(il, cache->type_k(), cache->type_v());
     };
 
+    // [base, swa] contiguous mask of the banded attention, shared by the layers of the graph
+    ggml_tensor * mask_banded[2] = { nullptr, nullptr };
+
     for (int il = 0; il < n_layer; ++il) {
         if (hparams.is_swa(il)) {
             needs_rel_idx_local |= !use_banded_flash(il);
@@ -478,10 +481,14 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
             ggml_tensor * rel_fa = ggml_reshape_4d(ctx0, rel,
                     rel_extent, n_head, n_tokens/n_stream, n_stream);
-            ggml_tensor * mask = is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw;
-            mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
-                    n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
-                    mask->nb[1], mask->nb[2], mask->nb[3], 0));
+            // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
+            ggml_tensor *& mask = mask_banded[is_swa];
+            if (!mask) {
+                ggml_tensor * mask_raw = is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw;
+                mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask_raw,
+                        n_kv_flash, mask_raw->ne[1], mask_raw->ne[2], mask_raw->ne[3],
+                        mask_raw->nb[1], mask_raw->nb[2], mask_raw->nb[3], 0));
+            }
 
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
                     1.0f/float(head_dim), rel_extent);
