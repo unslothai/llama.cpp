@@ -1611,6 +1611,28 @@ public:
                 continue;
             }
 
+            if (has_rnn_context && !params.probabilistic && params.p_min <= 0.0f) {
+                // greedy read of the chained block: take the first maximum directly (as in the RNN conditioning graph)
+                // instead of running the sampler over the whole vocabulary
+                const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                for (int32_t i = 1; i < std::min(n_block_tokens, 1 + params.n_max); ++i) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, beg + i);
+                    llama_token best = 0;
+                    float maximum = logits[0];
+                    for (int32_t k = 1; k < n_vocab_dft; ++k) {
+                        if (logits[k] > maximum) {
+                            maximum = logits[k];
+                            best    = k;
+                        }
+                    }
+                    result.push_back(best);
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            }
+
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
