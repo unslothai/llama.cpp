@@ -61,6 +61,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
+#include "ggml-cuda/situ.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
@@ -4150,6 +4151,61 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// returns the number of nodes after node i taken by a fused SiTU gate, 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const ggml_op ops[10] = {
+        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+        GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    const int n = 10;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if (t->op != ops[k] || t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    ggml_tensor ** nd = cgraph->nodes + i;
+    if (ggml_get_unary_op(nd[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nd[3]) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(nd[7]) != GGML_UNARY_OP_TANH) {
+        return 0;
+    }
+    const ggml_tensor * g = nd[0]->src[0];
+    const ggml_tensor * u = nd[5];
+    // a = nd[2], sigmoid(g) = nd[3], sigmoid(g)*a = nd[4], b = nd[8], out = nd[9]
+    if (nd[1]->src[0] != nd[0] || nd[2]->src[0] != nd[1] || nd[3]->src[0] != g ||
+        nd[4]->src[0] != nd[2] || nd[4]->src[1] != nd[3] || nd[6]->src[0] != u || nd[7]->src[0] != nd[6] ||
+        nd[8]->src[0] != nd[7] || nd[9]->src[0] != nd[4] || nd[9]->src[1] != nd[8]) {
+        return 0;
+    }
+    // g and u: same-shape row views of one tensor, rows contiguous, the rows evenly strided
+    if (g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, u) || !ggml_are_same_shape(g, nd[9]) ||
+        g->nb[0] != sizeof(float) || u->nb[0] != sizeof(float) || g->nb[1] != u->nb[1] ||
+        g->nb[2] != g->nb[1]*g->ne[1] || u->nb[2] != u->nb[1]*u->ne[1] || g->ne[3] != 1 || !ggml_is_contiguous(nd[9])) {
+        return 0;
+    }
+    float scales[8];
+    memcpy(scales + 0, nd[0]->op_params, 2*sizeof(float));
+    memcpy(scales + 2, nd[2]->op_params, 2*sizeof(float));
+    memcpy(scales + 4, nd[6]->op_params, 2*sizeof(float));
+    memcpy(scales + 6, nd[8]->op_params, 2*sizeof(float));
+
+    // the u view reads the gate_up product outside the chain, so it is checked here and left out of the subgraph test
+    if (ggml_node_get_use_count(cgraph, i + 5) != 1) {
+        return 0;
+    }
+    const int idxs[9]   = { i, i + 1, i + 2, i + 3, i + 4, i + 6, i + 7, i + 8, i + 9 };
+    const ggml_op ops9[9] = { ops[0], ops[1], ops[2], ops[3], ops[4], ops[6], ops[7], ops[8], ops[9] };
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops9, &out_idx, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_situ_fused(*cuda_ctx, g, u, scales, nd[9]);
+    return n - 1;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4609,6 +4665,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // SiTU gate: SCALE, TANH, SCALE, SIGMOID, MUL, VIEW, SCALE, TANH, SCALE, MUL
+    if (node->op == GGML_OP_SCALE) {
+        static const bool situ_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SITU_FUSION");
+        const int n_fused = situ_disabled ? 0 : ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 

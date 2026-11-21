@@ -4525,6 +4525,45 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// SiTU gate fusion (Inkling 2 MoE): beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), g and u the halves of gate_up
+// CUDA matches scale, tanh, scale, sigmoid, mul, view, scale, tanh, scale, mul
+struct test_situ_fuse : public test_case {
+    const std::array<int64_t, 3> ne; // [n_ff, n_expert_used, n_tokens]
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_situ_fuse(std::array<int64_t, 3> ne = {64, 8, 3}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2]);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * g = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * u = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], ne[0]*gate_up->nb[0]);
+        const float beta = 4.0f, lb = 25.0f;
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, g, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, g));
+        u = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, u, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, u);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -30.0f, 30.0f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL with the ADD's bias and
 // the MUL's scale broadcast over dim 0: the delta-net alpha gate, softplus(alpha + dt) * a_coeff.
 struct test_add_unary_mul : public test_case {
@@ -10773,6 +10812,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }, false, "bcast", "reuse"));
         test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F16, { 32, 7, 1, 1 }));
     }
+    // SiTU gate fusion: decode, prefill-sized and odd row lengths
+    test_cases.emplace_back(new test_situ_fuse({1152, 8,   1}));
+    test_cases.emplace_back(new test_situ_fuse({1152, 8, 512}));
+    test_cases.emplace_back(new test_situ_fuse({  33, 3,   7}));
+
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
 
