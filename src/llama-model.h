@@ -1058,6 +1058,12 @@ struct llama_model {
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
 
+    // the layer whose weights layer il uses (looped layers share the weights of their first visit)
+    virtual int32_t layer_weights(int32_t il) const { return il; }
+
+    // layers that hold weights: the unit of n_gpu_layers and of the device splits
+    uint32_t n_layer_weights() const;
+
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;

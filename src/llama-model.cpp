@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1386,6 +1387,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // views of host weights shared between layers, for the later layers (see llama_model_shared_host_views)
+    ggml_context_ptr ctx_shared_views;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1715,6 +1719,69 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// layers that share weights (looped layers): the later users of a shared weight in host memory get views of it.
+// The backend scheduler keys the device copy of a host weight (op offload) by tensor, so with one tensor for every
+// visit the later visits read the copy of the first one, which is wrong once its memory is reused, and the copies of
+// all the shared layers stay alive at once. A view per visit gets its own short-lived copy. Views keep the name (LoRA
+// adapters look weights up by name) and the buffer (the scheduler places ops by the weights' buffer); the state keyed
+// by tensor (Hadamard transforms, activation precision) is given to the views as well.
+static void llama_model_shared_host_views(std::vector<llama_layer> & layers, ggml_context_ptr & ctx_views,
+        llama_hadamard_rotations & rot, llama_prec_policy & prec_policy) {
+    static_assert(sizeof(llama_layer) % sizeof(ggml_tensor *) == 0, "llama_layer must hold only tensor pointers");
+    constexpr size_t n_ptr = sizeof(llama_layer) / sizeof(ggml_tensor *);
+
+    std::unordered_set<const ggml_tensor *> seen;
+    std::vector<ggml_tensor **> later;
+    for (auto & layer : layers) {
+        ggml_tensor ** w = reinterpret_cast<ggml_tensor **>(&layer);
+        for (size_t k = 0; k < n_ptr; ++k) {
+            if (w[k] != nullptr && !seen.insert(w[k]).second && w[k]->buffer != nullptr && ggml_backend_buffer_is_host(w[k]->buffer)) {
+                later.push_back(&w[k]);
+            }
+        }
+    }
+    if (later.empty()) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ later.size() * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_views.reset(ggml_init(params));
+    if (!ctx_views) {
+        throw std::runtime_error("failed to create the context for the shared weight views");
+    }
+
+    // copy the entry of w, if any, to its view (by value: inserting may rehash)
+    auto copy_state = [](auto & map, const ggml_tensor * w, const ggml_tensor * view) {
+        const auto it = map.find(w);
+        if (it != map.end()) {
+            auto value = it->second;
+            map.emplace(view, std::move(value));
+        }
+    };
+
+    for (ggml_tensor ** pw : later) {
+        ggml_tensor * w    = *pw;
+        ggml_tensor * view = ggml_view_tensor(ctx_views.get(), w);
+        ggml_set_name(view, w->name);
+        if (w->data != nullptr) {
+            if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error(format("failed to create a view of %s", w->name));
+            }
+        } else {
+            // memory-fit pass: the weights have a dummy buffer and no data
+            view->buffer = w->buffer;
+        }
+        copy_state(rot,                   w, view);
+        copy_state(prec_policy.prec_src1, w, view);
+        copy_state(prec_policy.prec_acc,  w, view);
+        *pw = view;
+    }
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1804,15 +1871,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // n_gpu_layers and the splits count the layers that hold weights, a layer that shares them goes with their owner
+    std::vector<int> layer_rank(n_layer_all + 1);
+    int n_layer_weights = 0;
+    for (int il = 0; il < n_layer_all; ++il) {
+        const int iw = layer_weights(il);
+        GGML_ASSERT(iw >= 0 && iw <= il);
+        layer_rank[il] = iw == il ? n_layer_weights++ : layer_rank[iw];
+    }
+    layer_rank[n_layer_all] = n_layer_weights;
+
+    const int i_gpu_start = std::max(n_layer_weights + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_weights + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
-        if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+        const int  ir     = layer_rank[il];
+        if (ir < i_gpu_start || (ir - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(ir - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2153,7 +2231,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
+        const int n_gpu = std::min(n_gpu_layers, n_layer_weights);
 
         int n_repeating = n_gpu;
         if (n_repeating > 0) {
@@ -2162,8 +2240,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
-        const int max_backend_supported_layers = n_layer_all + 1;
-        const int max_offloadable_layers       = n_layer_all + 1;
+        const int max_backend_supported_layers = n_layer_weights + 1;
+        const int max_offloadable_layers       = n_layer_weights + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
@@ -2177,6 +2255,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy);
         return true;
     }
 
@@ -2206,6 +2285,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy);
 
     return true;
 }
@@ -2586,7 +2667,15 @@ const float * llama_model::tensor_split() const {
 
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
-    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : n_layer_weights() + 1;
+}
+
+uint32_t llama_model::n_layer_weights() const {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        n += layer_weights(il) == (int32_t) il;
+    }
+    return n;
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -3643,6 +3732,10 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+int32_t llama_model_n_layer_weights(const llama_model * model) {
+    return model->n_layer_weights() - model->hparams.n_layer_nextn;
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
