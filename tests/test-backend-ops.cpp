@@ -4612,6 +4612,51 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// Row L2 clip fusion (Inkling 2 q/k/r clip): y = c*clamp(t/(sqrt(sum(c^2)) + eps), 0, 1), c = x (* w)
+// CUDA matches the chain [mul,] sqr, sum_rows, sqrt, scale, [fill,] div, clamp, mul
+struct test_clip_rows_fuse : public test_case {
+    const std::array<int64_t, 4> ne; // [D, H, T, 1]
+    const bool with_w;
+    const bool shared_limit; // threshold tensor filled outside the chain
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLIP_ROWS_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_w, shared_limit);
+    }
+
+    test_clip_rows_fuse(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_w = true, bool shared_limit = false)
+        : ne(ne), with_w(with_w), shared_limit(shared_limit) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * limit = nullptr;
+        if (shared_limit) {
+            limit = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]), 1.5f);
+        }
+
+        ggml_tensor * c = x;
+        if (with_w) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(w, "w");
+            c = ggml_mul(ctx, x, w);
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, c)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, limit ? limit : ggml_fill(ctx, norm, 1.5f), norm);
+        ggml_tensor * out = ggml_mul(ctx, c, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10775,6 +10820,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    // row L2 clip fusion: short and long rows, decode (few rows) and prefill (many rows) block sizes
+    for (bool with_w : { true, false }) {
+        for (bool shared_limit : { false, true }) {
+            test_cases.emplace_back(new test_clip_rows_fuse({ 128,  24,   1, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({ 128,   8, 512, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({  16,  24,  33, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({1100,   3,   5, 1}, with_w, shared_limit));
+        }
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
