@@ -9347,6 +9347,31 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+// large rel values, so the online softmax has to rescale the partial results
+struct test_flash_attn_ext_banded_large_rel : public test_flash_attn_ext_banded_sinks {
+    static constexpr int rel_range = 20;
+
+    using test_flash_attn_ext_banded_sinks::test_flash_attn_ext_banded_sinks;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",rel_range=" + std::to_string(rel_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded_sinks::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "rel_logits"), -(float) rel_range, (float) rel_range);
+    }
+};
+
+// small extent and a tight tolerance, so that per-query sinks and the band edges are visible
+struct test_flash_attn_ext_banded_tight : public test_flash_attn_ext_banded_sinks {
+    using test_flash_attn_ext_banded_sinks::test_flash_attn_ext_banded_sinks;
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13533,6 +13558,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 2048, 4096, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512, 3000, 1024, 2, GGML_TYPE_BF16, GGML_TYPE_F32, 2));
+    // Inkling-2-Mini shapes
+    for (int64_t n_q : { 33, 512 }) {
+        for (int64_t n_kv : { 4096, 32785 }) {
+            for (int mask_kind : { 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_large_rel(128, 24, 8, 512, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+    for (int64_t n_q : { 33, 100 }) {
+        for (int64_t n_kv : { 300, 1000 }) {
+            for (int mask_kind : { 0, 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, n_q, n_kv, 96, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_BF16, GGML_TYPE_F32,  2));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
@@ -14327,6 +14370,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (int64_t nq : {512, 1024}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 4096, nq, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    }
+
+    // banded attention, Inkling-2-Mini prompt processing
+    for (int64_t n_kv : { 4096, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
     }
 
     // q8_0 KV cases with long context (decode and prompt)

@@ -6,6 +6,18 @@ constant bool FC_flash_attn_ext_tensor_has_mask  [[function_constant(FC_FLASH_AT
 constant bool FC_flash_attn_ext_tensor_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 1)]];
 constant bool FC_flash_attn_ext_tensor_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 2)]];
 constant bool FC_flash_attn_ext_tensor_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 3)]];
+constant bool FC_flash_attn_ext_tensor_has_rel   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 4)]];
+constant bool FC_flash_attn_ext_tensor_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 5)]];
+
+// rel type: 0 - F32, 1 - F16
+constant int32_t FC_flash_attn_ext_tensor_rel_type [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 6)]];
+
+static inline float flash_attn_ext_tensor_rel_load(device const char * rel, int32_t i) {
+    if (FC_flash_attn_ext_tensor_rel_type == 1) {
+        return ((device const half *) rel)[i];
+    }
+    return ((device const float *) rel)[i];
+}
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -25,6 +37,8 @@ kernel void kernel_flash_attn_ext_tensor(
         device const char * sinks,
         device const char * blk,
         device       char * dst,
+        device const char * pad,
+        device const char * rel,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -37,6 +51,7 @@ kernel void kernel_flash_attn_ext_tensor(
     static_assert(DK % 4 == 0,  "DK must be divisible by 4");
     static_assert(Q % NSG == 0, "Q must be divisible by NSG");
     static_assert(C % NW == 0,  "C must be divisible by NW");
+    static_assert(C == OP_FLASH_ATTN_EXT_TENSOR_NCPSG, "the pad pass fills chunks of OP_FLASH_ATTN_EXT_TENSOR_NCPSG");
 
     const int iq3 = tgpig[2];
     const int iq2 = tgpig[1];
@@ -142,8 +157,30 @@ kernel void kernel_flash_attn_ext_tensor(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // the host guarantees ne11 % C == 0
+    // the host guarantees ne11 % C == 0, unless has_kvpad
     for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += C) {
+        // the last partial chunk uses the pad buffer as source, read from offset 0
+        const bool is_pad = FC_flash_attn_ext_tensor_has_kvpad && ic + C > args.ne11;
+        const int  icr    = is_pad ? 0 : ic;
+
+        if (is_pad) {
+            k    = pad;
+            v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+            mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+            const int ikv2 = iq2/(args.ne02/args.ne_12_2);
+            const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+            k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+            v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+
+                pm[jj] = (device const half *) mask + (iq1 + j)*C + (iq2%args.ne32)*(C*args.ne31) + (iq3%args.ne33)*(C*args.ne31*args.ne32);
+            }
+        }
+
         char blk_cur = 1;
 
         if (FC_flash_attn_ext_tensor_has_mask) {
@@ -156,7 +193,7 @@ kernel void kernel_flash_attn_ext_tensor(
 
         // Q*K^T
         {
-            auto tk = tensor((device T *) (k + (uint64_t) ic*args.nb11), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
+            auto tk = tensor((device T *) (k + (uint64_t) icr*args.nb11), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
 
             mm_qk.run(tq, tk, ts);
         }
@@ -179,9 +216,36 @@ kernel void kernel_flash_attn_ext_tensor(
                 }
             }
 
+            // banded: the distance of column ic + ii*NW + tiisg is dmax - ii*NW - tiisg
+            // add rel before the row max, else exp(s - M) can overflow
+            if (FC_flash_attn_ext_tensor_has_rel) {
+                const int dmax = iq1 + j + args.q_off - ic;
+
+                if (iq1 + j < args.ne01 && dmax >= 0 && dmax - (C - 1) < args.ne_r0) {
+                    device const char * pr = rel + iq2*args.nb_r1 + (iq1 + j)*args.nb_r2 + iq3*args.nb_r3;
+
+                    FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                        const int d = dmax - ii*NW - tiisg;
+
+                        if (d >= 0 && d < args.ne_r0) {
+                            s[ii] += flash_attn_ext_tensor_rel_load(pr, d);
+                        }
+                    }
+                }
+            }
+
             if (FC_flash_attn_ext_tensor_has_mask && blk_cur != 2 && iq1 + j < args.ne31) {
                 FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
-                    s[ii] += slope*(float) pm[jj][ic + ii*NW + tiisg];
+                    s[ii] += slope*(float) pm[jj][icr + ii*NW + tiisg];
+                }
+            }
+
+            // the pad rows of K are zero - mask the columns past ne11 (the blk value does not cover them)
+            if (is_pad) {
+                FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                    if (ic + ii*NW + tiisg >= args.ne11) {
+                        s[ii] = -FLT_MAX/2;
+                    }
                 }
             }
 
@@ -235,7 +299,7 @@ kernel void kernel_flash_attn_ext_tensor(
         }
 
         {
-            auto tv = tensor((device T *) (v + (uint64_t) ic*args.nb21), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
+            auto tv = tensor((device T *) (v + (uint64_t) icr*args.nb21), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
 
             mm_pv.run(tp, tv, co);
         }
@@ -250,7 +314,9 @@ kernel void kernel_flash_attn_ext_tensor(
         float ms = 1.0f;
 
         if (FC_flash_attn_ext_tensor_has_sinks) {
-            const float s = ((device const float *) sinks)[iq2];
+            // per-query sinks use non-zero strides
+            const int jq = min(iq1 + j, args.ne01 - 1);
+            const float s = *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2));
             const float m = max(M[jj], s);
 
             ms = exp(M[jj] - m);

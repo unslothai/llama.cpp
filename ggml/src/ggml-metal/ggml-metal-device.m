@@ -1824,6 +1824,50 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
+            {
+                // no vec kernel: the half8x8 or tensor kernel runs for any number of queries
+                const struct ggml_tensor * mask  = op->src[3];
+                const struct ggml_tensor * sinks = op->src[4];
+                const struct ggml_tensor * rel   = op->src[6];
+
+                if (op->src[0]->ne[0] != 64 && op->src[0]->ne[0] != 128) {
+                    return false;
+                }
+                if (op->src[2]->ne[0] != op->src[1]->ne[0]) {
+                    return false;
+                }
+                if (op->src[1]->type != op->src[2]->type) {
+                    return false;
+                }
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                        break;
+                    case GGML_TYPE_BF16:
+                        if (!has_bfloat) {
+                            return false;
+                        }
+                        break;
+                    default:
+                        return false;
+                }
+                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (rel->nb[0] != ggml_type_size(rel->type)) {
+                    return false;
+                }
+                if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[1] < op->src[0]->ne[1])) {
+                    return false;
+                }
+                if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float) ||
+                        (sinks->ne[1] != 1 && sinks->ne[1] != op->src[0]->ne[1]) ||
+                        (sinks->ne[2] != 1 && sinks->ne[2] != op->src[0]->ne[3]))) {
+                    return false;
+                }
+                return has_simdgroup_mm;
+            }
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;
