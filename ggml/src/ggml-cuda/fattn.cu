@@ -832,6 +832,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    // the banded kernels read or convert K/V themselves; only the delegated FA kernel uses the F16 extra
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+        return ggml_nbytes(dst);
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;

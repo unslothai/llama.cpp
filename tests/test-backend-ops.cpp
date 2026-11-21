@@ -13517,6 +13517,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
     }
+    // quantized K/V cache: q8_0 / q4_0 tiles, other types via an F16 copy, scalar kernels for small n_q
+    for (ggml_type kv_type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  64,  300,   16, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  4, 1,  77, 1000,    8, 1, kv_type, GGML_TYPE_F32, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  65,  333,   32, 2, kv_type, GGML_TYPE_F32, 2, true));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,   1, 4096, 1024, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 512, 3000, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64, 8, 2, kv_type, GGML_TYPE_F32));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
     // Inkling-2-Small shapes
     for (int64_t n_q : { 1, 3, 8, 512 }) {
