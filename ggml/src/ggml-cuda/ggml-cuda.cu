@@ -2824,6 +2824,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_tensor dst_slice;
         memset(&dst_slice, 0, sizeof(dst_slice));
         memcpy(dst_slice.op_params, dst->op_params, sizeof(dst_slice.op_params));
+        dst_slice.op     = GGML_OP_MUL_MAT; // ggml_prec_get_acc/ggml_prec_get_src check the op
         dst_slice.buffer = dst->buffer;
         dst_slice.type   = type_dst_sorted;
         dst_slice.ne[0]  = ne0;
@@ -6845,7 +6846,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return true;
+            return ggml_are_same_stride(op->src[0], op->src[1]);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
