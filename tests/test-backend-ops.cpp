@@ -9436,8 +9436,7 @@ struct test_flash_attn_ext_banded_tight : public test_flash_attn_ext_banded_sink
     }
 };
 
-// banded attention over the shapes the op admits beyond the cache layout: several sequences (ne3), per-head and
-// per-sequence masks, broadcast rel tables, padded mask rows, a mask wider than K, a permuted Q, per-sequence sinks
+// banded attention over shapes beyond the cache layout: sequences, mask/rel broadcast, padded or wide masks, permuted Q, sinks
 struct test_flash_attn_ext_banded_shapes : public test_case {
     const int64_t d, n_head, n_head_kv, n_q, n_kv, rel_extent;
     const int mask_kind; // 0: all visible, 1: causal, 2: causal sliding window with dist < rel_extent

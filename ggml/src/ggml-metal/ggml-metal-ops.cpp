@@ -3514,8 +3514,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //    return 0;
     //}
 
-    // banded: supports_op refuses quantized K/V, so the F16 copy of K and V is never made; reserving it
-    // would cost 4 bytes per cell, KV head and head dim (781 MiB at 200K cells for 8 KV heads of 128)
+    // banded: supports_op refuses quantized K/V, so the F16 copy of K and V is never made
+    // reserving it would cost 781 MiB at 200K cells for 8 KV heads of 128
     if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
         return 0;
     }
