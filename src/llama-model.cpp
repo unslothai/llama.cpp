@@ -1733,9 +1733,11 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 // visit the later visits read the copy of the first one, which is wrong once its memory is reused, and the copies of
 // all the shared layers stay alive at once. A view per visit gets its own short-lived copy. Views keep the name (LoRA
 // adapters look weights up by name) and the buffer (the scheduler places ops by the weights' buffer); the state keyed
-// by tensor (Hadamard transforms, activation precision) is given to the views as well.
+// by tensor (Hadamard transforms, activation precision) is given to the views as well. The weight scale of a view
+// (llama_model::w_scales) is the view of the scale in the same layer, so every visit reads its own copy of both.
 static void llama_model_shared_host_views(std::vector<llama_layer> & layers, ggml_context_ptr & ctx_views,
-        llama_hadamard_rotations & rot, llama_prec_policy & prec_policy) {
+        llama_hadamard_rotations & rot, llama_prec_policy & prec_policy,
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> & w_scales) {
     static_assert(sizeof(llama_layer) % sizeof(ggml_tensor *) == 0, "llama_layer must hold only tensor pointers");
     constexpr size_t n_ptr = sizeof(llama_layer) / sizeof(ggml_tensor *);
 
@@ -1772,6 +1774,10 @@ static void llama_model_shared_host_views(std::vector<llama_layer> & layers, ggm
         }
     };
 
+    // the views of each layer, by the weight they view
+    std::vector<std::unordered_map<const ggml_tensor *, ggml_tensor *>> layer_views(layers.size());
+    ggml_tensor ** const w0 = reinterpret_cast<ggml_tensor **>(layers.data());
+
     for (ggml_tensor ** pw : later) {
         ggml_tensor * w    = *pw;
         ggml_tensor * view = ggml_view_tensor(ctx_views.get(), w);
@@ -1787,7 +1793,20 @@ static void llama_model_shared_host_views(std::vector<llama_layer> & layers, ggm
         copy_state(rot,                   w, view);
         copy_state(prec_policy.prec_src1, w, view);
         copy_state(prec_policy.prec_acc,  w, view);
+        layer_views[(pw - w0) / n_ptr].emplace(w, view);
         *pw = view;
+    }
+
+    for (const auto & views : layer_views) {
+        for (const auto & [w, view] : views) {
+            const auto it = w_scales.find(w);
+            if (it == w_scales.end()) {
+                continue;
+            }
+            const auto iv = views.find(it->second);
+            ggml_tensor * scale = iv != views.end() ? iv->second : it->second;
+            w_scales.emplace(view, scale);
+        }
     }
 }
 
@@ -2301,7 +2320,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
-        llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy);
+        llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy, w_scales);
         return true;
     }
 
@@ -2332,7 +2351,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
-    llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy);
+    llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy, w_scales);
 
     return true;
 }
