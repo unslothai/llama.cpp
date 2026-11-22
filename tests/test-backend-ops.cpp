@@ -4930,6 +4930,108 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// short convolution chain of Inkling 2 (convolve): CONCAT(past, transpose(cur)), the state store (CPY, or the rollback
+// SET_ROWS after ARANGE, SCALE, CAST), SSM_CONV, optional dynamic taps (CONT, MUL, ADD per lag), ADD(cur, out), SCALE
+struct test_conv_chain_fuse : public test_case {
+    const int64_t C;
+    const int64_t T;      // tokens per sequence
+    const int64_t ns;     // sequences
+    const int64_t nc;     // conv width
+    const int64_t n_head; // 0: no dynamic taps
+    const int64_t K;      // 0: CPY store, else SET_ROWS into K rollback slots
+
+    ggml_tensor * store = nullptr;
+    ggml_tensor * res   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_CHAIN_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { store, res }; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(C, T, ns, nc, n_head, K);
+    }
+
+    test_conv_chain_fuse(int64_t C = 256, int64_t T = 1, int64_t ns = 1, int64_t nc = 4, int64_t n_head = 0, int64_t K = 0)
+        : C(C), T(T), ns(ns), nc(nc), n_head(n_head), K(K) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // the windows of the rollback store overlap: only the tensors that own their data
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->view_src) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cols = nc - 1;
+        const int64_t n_ch   = C + 64; // channels of the whole state row, this conv at channel offset 32
+
+        ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_cols, n_ch, ns);
+        ggml_set_name(hist, "hist");
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T*ns);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * dyn = nullptr;
+        if (n_head > 0) {
+            dyn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc*n_head, T*ns);
+            ggml_set_name(dyn, "dyn");
+        }
+
+        ggml_tensor * past = ggml_view_3d(ctx, hist, n_cols, C, ns, hist->nb[1], hist->nb[2], 32*hist->nb[1]);
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, T, ns)), 0);
+
+        // the state: rows of n_cols*n_ch floats, this ubatch at cell 1, this conv at byte offset 32*n_cols*4
+        const int64_t size = ns + 2;
+        const size_t  offs = ggml_row_size(GGML_TYPE_F32, n_ch*n_cols) + 32*n_cols*sizeof(float);
+        if (K == 0) {
+            ggml_tensor * s    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols*n_ch, size);
+            ggml_set_name(s, "state");
+            ggml_tensor * last = ggml_view_3d(ctx, x, n_cols, C, ns, x->nb[1], x->nb[2], ggml_row_size(x->type, T));
+            ggml_tensor * cell = ggml_view_2d(ctx, s, n_cols*C, ns, s->nb[1], offs);
+            store = ggml_cpy(ctx, last, cell);
+        } else {
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols*n_ch, size*K);
+            ggml_set_name(s, "state");
+            const int64_t Kw = std::min(T, K);
+            ggml_tensor * rev = ggml_arange(ctx, 0.0f, (float) K, 1.0f);
+            rev = ggml_scale_bias(ctx, rev, -1.0f, (float) (K - 1));
+            rev = ggml_cast(ctx, rev, GGML_TYPE_I32);
+            ggml_tensor * order = ggml_view_1d(ctx, rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+            ggml_tensor * wins  = ggml_view_4d(ctx, x, n_cols, Kw, C, ns, ggml_element_size(x), x->nb[1], x->nb[2],
+                    ggml_row_size(x->type, T - (Kw - 1)));
+            ggml_tensor * slots = ggml_view_4d(ctx, s, n_cols, K, C, ns, (size_t) size*s->nb[1], ggml_row_size(s->type, n_cols),
+                    s->nb[1], offs);
+            store = ggml_set_rows(ctx, slots, wins, order);
+        }
+        ggml_set_name(store, "store");
+        if (gf) {
+            ggml_build_forward_expand(gf, store);
+        }
+
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), C, T*ns);
+        if (dyn) {
+            ggml_tensor * d3 = ggml_reshape_3d(ctx, dyn, nc, n_head, T*ns);
+            ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+            for (int64_t lag = 0; lag < nc; ++lag) {
+                ggml_tensor * tap = ggml_view_4d(ctx, d3, 1, n_head, T, ns, d3->nb[1], d3->nb[2], T*d3->nb[2], lag*d3->nb[0]);
+                ggml_tensor * win = ggml_view_4d(ctx, xt, C/n_head, n_head, T, ns, (C/n_head)*xt->nb[0], xt->nb[1], xt->nb[2],
+                        (nc - 1 - lag)*xt->nb[1]);
+                out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, win, tap), C, T*ns));
+            }
+        }
+        res = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf((dyn ? 2 : 1)*nc + 1));
+        ggml_set_name(res, "out");
+        return res;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11864,6 +11966,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    // conv chain fusion: decode, batched decode, verify, several sequences, prefill (unfused), rollback slots
+    for (int64_t n_head : { 0, 8 }) {
+        for (int64_t K : { 0, 3 }) {
+            for (int64_t T : { 1, 2, 3, 4, 8, 32 }) {
+                test_cases.emplace_back(new test_conv_chain_fuse(1024, T, 1, 4, n_head, K));
+            }
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 1, 4, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 3, 2, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(2304, 4, 2, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse( 384, 2, 3, 3, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 512, 1, 4, n_head, K));
         }
     }
 
