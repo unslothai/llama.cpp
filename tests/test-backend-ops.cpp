@@ -13626,6 +13626,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  6, 1,   17, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512,  4096, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  512,  4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        // Inkling-2-Mini shapes: GQA 3 (24/8), SWA and full-attention n_kv, odd n_q, F16 and Q8_0 caches (AMD WMMA banded path)
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  1536, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  509,  1536, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,    1,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   37,  2048, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
     }
@@ -14058,6 +14064,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini banded attention, one prefill ubatch: SWA (n_kv 1536) and full attention (n_kv 8704), Q8_0 cache
+    for (int64_t n_kv : {1536, 8704}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

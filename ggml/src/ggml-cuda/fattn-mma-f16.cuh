@@ -1624,7 +1624,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const int jc = (threadIdx.y/np)*cols_per_warp + (cols_per_warp == 8 ? T_C_KQ::get_j(col) : T_C_KQ::get_i(2*col));
-            const float sink = sinks_f[jc % ncols2];
+            float sink;
+            if (rel_f) {
+                // banded: one sink per query and head; padding columns get a finite floor to avoid NaN
+                const int64_t q_idx = int64_t(jt)*ncols1 + jc/ncols2;
+                const int     head  = head_q0 + jc % ncols2;
+                sink = q_idx < ne01.z && head < ne02 ? sinks_f[q_idx*ne02 + head] : -1e30f;
+            } else {
+                sink = sinks_f[jc % ncols2];
+            }
 
             const float KQ_max_new = fmaxf(KQ_max[col], sink);
             const float KQ_max_diff = KQ_max[col] - KQ_max_new;
@@ -2029,6 +2037,8 @@ static __global__ void flash_attn_ext_f16(
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
     const bool banded_bias = max_bias < 0.0f;
     const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
+    // banded with sinks: a dense [n_seq, n_q, n_head] sink block follows rel (see launch_fattn)
+    const bool banded_sinks = banded_bias && m1 > 1.5f;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -2135,7 +2145,8 @@ static __global__ void flash_attn_ext_f16(
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
-        const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
+        const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q :
+            (banded_sinks ? (const float *) sinks + int64_t(ne03)*ne01.z*ne02*rel_extent + int64_t(sequence)*ne01.z*ne02 : nullptr);
         const float * rel_f = banded_bias ?
             (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
         const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
@@ -2192,7 +2203,8 @@ static __global__ void flash_attn_ext_f16(
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
-    const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
+    const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q :
+            (banded_sinks ? (const float *) sinks + int64_t(ne03)*ne01.z*ne02*rel_extent + int64_t(sequence)*ne01.z*ne02 : nullptr);
     const float * rel_f = banded_bias ?
         (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
     const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :

@@ -590,8 +590,18 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
         return false;
     }
 
-    // the MMA kernel passes rel in the sinks slot
-    if (dst->src[4]) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+    // AMD RDNA: the banded branch of the MMA kernel indexes rel through the portable tile layout (get_i/get_j),
+    // so it runs on WMMA too; sinks are appended after rel by launch_fattn. GGML_CUDA_BANDED_AMD_MMA=0 keeps the
+    // scalar banded kernels.
+    static const bool amd_enabled = [] {
+        const char * env = getenv("GGML_CUDA_BANDED_AMD_MMA");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const bool amd = amd_enabled && amd_wmma_available(cc) && !turing_mma_available(cc);
+
+    // the MMA kernel passes rel in the sinks slot; only the AMD path appends sinks after rel
+    if (dst->src[4] && !amd) {
         return false;
     }
 
@@ -609,7 +619,30 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
         return false;
     }
 
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+    if (turing_mma_available(cc)) {
+        return true;
+    }
+    if (!amd) {
+        return false;
+    }
+    // the WMMA kernel has device code only for ncols2 >= 2, i.e. when the GQA optimization applies
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t n_kv = dst->src[5] ? dst->src[5]->ne[0] : K->ne[1];
+    if (!mask || mask->ne[2] != 1 || n_kv % FATTN_KQ_STRIDE != 0 || Q->ne[2] / K->ne[2] < 2) {
+        return false;
+    }
+    for (const ggml_tensor * t : {Q, K, V, mask}) {
+        if (ggml_is_quantized(t->type)) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    const ggml_tensor * sinks = dst->src[4];
+    return !sinks || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == Q->ne[2]);
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {

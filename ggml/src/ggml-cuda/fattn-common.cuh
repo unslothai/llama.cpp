@@ -1028,6 +1028,19 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// banded MMA on AMD: expand sinks [n_head, n_q or 1, n_seq or 1] to a dense [n_seq, n_q, n_head] block after rel
+static __global__ void fattn_banded_sinks_expand(const float * __restrict__ src, float * __restrict__ dst,
+        const int n_head, const int64_t n_q, const int64_t n, const int64_t s1, const int64_t s2) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t h = i % n_head;
+    const int64_t q = (i / n_head) % n_q;
+    const int64_t b = i / (int64_t(n_head)*n_q);
+    dst[i] = src[h + q*s1 + b*s2];
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1302,6 +1315,24 @@ void launch_fattn(
         max_bias = -float(rel->ne[0]);
     }
 
+    // banded with sinks (AMD MMA path): rel then sinks in one pool buffer, m1 > 1.5 tells the kernel
+    const char * sinks_data = sinks ? (const char *) sinks->data : nullptr;
+    const ggml_tensor * banded_sinks = rel ? dst->src[4] : nullptr;
+    ggml_cuda_pool_alloc<float> rel_sinks(pool);
+    if (banded_sinks) {
+        GGML_ASSERT(banded_sinks->type == GGML_TYPE_F32 && banded_sinks->ne[0] == Q->ne[2]);
+        const int64_t n_rel = ggml_nelements(rel);
+        const int64_t n_snk = Q->ne[1]*Q->ne[2]*Q->ne[3];
+        rel_sinks.alloc(n_rel + n_snk);
+        CUDA_CHECK(cudaMemcpyAsync(rel_sinks.ptr, rel->data, n_rel*sizeof(float), cudaMemcpyDeviceToDevice, main_stream));
+        const int64_t s1 = banded_sinks->ne[1] > 1 ? int64_t(banded_sinks->nb[1] / sizeof(float)) : 0;
+        const int64_t s2 = banded_sinks->ne[2] > 1 ? int64_t(banded_sinks->nb[2] / sizeof(float)) : 0;
+        fattn_banded_sinks_expand<<<(n_snk + 255)/256, 256, 0, main_stream>>>(
+            (const float *) banded_sinks->data, rel_sinks.ptr + n_rel, int(Q->ne[2]), Q->ne[1], n_snk, s1, s2);
+        CUDA_CHECK(cudaGetLastError());
+        sinks_data = (const char *) rel_sinks.ptr;
+    }
+
     if (logit_softcap != 0.0f) {
         scale /= logit_softcap;
     }
@@ -1311,7 +1342,7 @@ void launch_fattn(
 
     // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
     const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = rel ? 1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    const float m1 = rel ? (banded_sinks ? 2.0f : 1.0f) : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
@@ -1324,7 +1355,7 @@ void launch_fattn(
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
+        sinks_data,
         KV_max.ptr,
         kv_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
