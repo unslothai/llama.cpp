@@ -1365,6 +1365,52 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return c0 + pos_max + 1;
 }
 
+uint32_t llama_kv_cache::get_n_kv_pos_ring(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & rot) const {
+    rot = 0;
+    const uint32_t n_contiguous = get_n_kv_pos_contiguous(sinfo, ubatch);
+    if (n_contiguous > 0) {
+        return n_contiguous;
+    }
+
+    // same preconditions as the contiguous case: one stream, one sequence, the ubatch is its monotonic tail
+    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
+        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
+        return 0;
+    }
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+    const auto & cells = v_cells[stream];
+    const uint32_t  size    = cells.size();
+    const llama_pos pos_max = cells.seq_pos_max(seq_id);
+    // a ring only exists once the sequence is longer than the cache
+    if (size == 0 || pos_max < (llama_pos) size || (uint32_t) pos_max + 1 < ubatch.n_tokens) {
+        return 0;
+    }
+    const llama_pos pos_start = pos_max + 1 - ubatch.n_tokens;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
+            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return 0;
+        }
+    }
+    // every one of the last size positions must sit in cell pos % size, so the cells hold nothing else
+    for (llama_pos pos = pos_max + 1 - (llama_pos) size; pos <= pos_max; ++pos) {
+        const uint32_t i = (uint32_t) (pos % (llama_pos) size);
+        if (cells.is_empty(i) || cells.pos_get(i) != pos || !cells.seq_has(i, seq_id)) {
+            return 0;
+        }
+    }
+    rot = (uint32_t) ((pos_max + 1) % (llama_pos) size);
+    return size;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -3155,6 +3201,19 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
     return result <= (uint32_t) n_kv ? result : 0;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pos_ring(uint32_t & rot) const {
+    rot = 0;
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        return get_n_kv_pos_contiguous(); // reserve: no ring
+    }
+    const uint32_t result = kv->get_n_kv_pos_ring(sinfos[i_cur], ubatches[i_cur], rot);
+    if (result > (uint32_t) n_kv) {
+        rot = 0;
+        return 0;
+    }
+    return result;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {

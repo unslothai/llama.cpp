@@ -1341,7 +1341,8 @@ void launch_fattn(
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
     // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
-    const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
+    // banded: m0 carries the ring rotation of the K/V cells (exact as float below 2^24)
+    const float m0 = rel ? float(ggml_get_op_params_i32(dst, 6)) : powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = rel ? (banded_sinks ? 2.0f : 1.0f) : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:

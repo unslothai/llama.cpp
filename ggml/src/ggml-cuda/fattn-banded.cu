@@ -915,6 +915,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         return false;
     }
 
+    // ring-rotated K/V cells: only the MMA kernel maps cells to their logical distance
+    if (ggml_get_op_params_i32(dst, 6) != 0 && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+        return false;
+    }
+
     // quantized K/V are read as F16: check the op with F16 K/V of the same shape
     if (dst->src[1] && dst->src[2] &&
         (fattn_banded_kv_f16_convertible(dst->src[1]->type) || fattn_banded_kv_f16_convertible(dst->src[2]->type))) {
@@ -932,6 +937,8 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         }
         op.src[1] = &k16;
         op.src[2] = &v16;
+        // the rotation was checked against the real (quantized) K/V above; the F16 stand-ins keep quantized strides
+        ggml_set_op_params_i32(&op, 6, 0);
         return ggml_cuda_flash_attn_ext_banded_supported(device, &op);
     }
 

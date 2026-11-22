@@ -813,6 +813,8 @@ public:
 
     // [base, swa] K/V cells of the banded attention, 0 = dense
     uint32_t n_kv_banded[2] = { 0, 0 };
+    // [base, swa] ring rotation of the banded K/V cells, 0 = position order
+    uint32_t kv_rot_banded[2] = { 0, 0 };
     bool     banded         = false;
 
     const uint32_t extent;

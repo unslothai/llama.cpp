@@ -333,11 +333,17 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     const int64_t nh  = hparams.n_head(il);
     const int64_t nkv = hparams.n_head_kv(il);
     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
-    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
-    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+    // a ring-rotated cache needs a kernel that maps cells to logical distances: probe with a rotation then,
+    // at a padded cell count (256) so the probe meets the layout conditions of such kernels
+    const int64_t pn  = inp->kv_rot_banded[swa] ? 256 : 1;
+    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, pn, nkv, 1);
+    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, pn, nkv, 1);
+    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+    if (inp->kv_rot_banded[swa]) {
+        ggml_flash_attn_ext_banded_set_kv_rot(op, 1);
+    }
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
     ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = ggml_backend_dev_supports_op(dev, op);
@@ -353,7 +359,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_ring(inp->kv_rot_banded[i]);
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -515,6 +521,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+            if (inp->kv_rot_banded[is_swa]) {
+                ggml_flash_attn_ext_banded_set_kv_rot(cur, inp->kv_rot_banded[is_swa]);
+            }
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

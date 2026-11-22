@@ -5537,6 +5537,14 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_set_kv_rot(
+        struct ggml_tensor * a,
+        int32_t              kv_rot) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(kv_rot >= 0 && kv_rot < a->src[1]->ne[1]);
+    ggml_set_op_params_i32(a, 6, kv_rot);
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
