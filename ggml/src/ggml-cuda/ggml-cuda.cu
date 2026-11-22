@@ -994,6 +994,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_cache_mem != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_cache_mem));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5266,7 +5269,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * mul_w = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+        if (cuda_ctx->q8_1_cache_enabled && cuda_ctx->curr_stream_no == 0 && cuda_ctx->q8_1_cache_mem != nullptr &&
+                x && mul_w && x->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32 &&
+                ggml_nrows(x) == 1 && ggml_nrows(mul_w) == 1 && ggml_nrows(mul_node) == 1 &&
+                x->ne[0] >= QK8_1 && (x->ne[0] % QK8_1 == 0) &&
+                mul_w->ne[0] == x->ne[0] && mul_node->ne[0] == x->ne[0] &&
+                ggml_is_contiguous(x) && ggml_is_contiguous(mul_w) && ggml_is_contiguous(mul_node)) {
+            const int64_t ne0 = x->ne[0];
+            const int64_t ne0_padded = GGML_PAD(ne0, MATRIX_ROW_PADDING);
+            const size_t q8_1_nbytes = (size_t) ne0_padded * sizeof(block_q8_1) / QK8_1;
+            if (q8_1_nbytes <= ggml_backend_cuda_context::Q8_1_CACHE_SLOT_BYTES) {
+                cuda_ctx->q8_1_cache_invalidate_range(mul_node->data, ggml_nbytes(mul_node));
+                const int slot = cuda_ctx->q8_1_cache_next;
+                cuda_ctx->q8_1_cache_next = (slot + 1) % ggml_backend_cuda_context::Q8_1_CACHE_SLOTS;
+                char * q8_1_ptr = cuda_ctx->q8_1_cache_mem + slot * ggml_backend_cuda_context::Q8_1_CACHE_SLOT_BYTES;
+                float eps = 0.0f;
+                memcpy(&eps, node->op_params, sizeof(float));
+                ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, x, mul_w, mul_node, q8_1_ptr, ne0_padded, eps);
+                auto & e = cuda_ctx->q8_1_cache[slot];
+                e.src_ptr     = mul_node->data;
+                e.src_bytes   = ggml_nbytes(mul_node);
+                e.ne10        = ne0;
+                e.ne11        = 1;
+                e.ne12        = 1;
+                e.ne13        = 1;
+                e.s11         = ne0;
+                e.s12         = ne0;
+                e.s13         = ne0;
+                e.ne10_padded = ne0_padded;
+                e.valid       = true;
+                cuda_ctx->q8_1_skip_invalidate_ptr = mul_node->data;
+                return 1;
+            }
+        }
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
         return 1;
     }
 
@@ -5415,12 +5454,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->q8_1_cache_clear();
+            cuda_ctx->q8_1_cache_enabled = true;
+            auto invalidate_tensor_q8_1 = [&](const ggml_tensor * t) {
+                if (!t || !t->data) {
+                    return;
+                }
+                size_t span = ggml_nbytes(t);
+                if (t->ne[0] > 0 && t->ne[1] > 0 && t->ne[2] > 0 && t->ne[3] > 0) {
+                    const size_t s = (size_t) (t->ne[3] - 1) * t->nb[3] + (size_t) (t->ne[2] - 1) * t->nb[2] +
+                                     (size_t) (t->ne[1] - 1) * t->nb[1] + ggml_row_size(t->type, t->ne[0]);
+                    if (s > span) {
+                        span = s;
+                    }
+                }
+                cuda_ctx->q8_1_cache_invalidate_range(t->data, span);
+                if ((t->op == GGML_OP_CPY || t->op == GGML_OP_SET_ROWS) && t->src[1] && t->src[1]->data) {
+                    cuda_ctx->q8_1_cache_invalidate_range(t->src[1]->data, ggml_nbytes(t->src[1]));
+                }
+            };
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                    cuda_ctx->q8_1_cache_clear();
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                     chunk_end = i + chunk_size;
@@ -5440,6 +5500,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                         is_concurrent_event_active = false;
                         concurrent_event           = nullptr;
+                        cuda_ctx->q8_1_cache_clear();
+                        cuda_ctx->q8_1_cache_enabled = true;
                     } else {
                         GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
                         cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
@@ -5451,6 +5513,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(prev_node);
 
                     if (is_concurrent_event_active) {
+                        cuda_ctx->q8_1_cache_clear();
+                        cuda_ctx->q8_1_cache_enabled = false;
                         cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
                         GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
                     }
@@ -5466,6 +5530,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                cuda_ctx->q8_1_skip_invalidate_ptr = nullptr;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -5475,6 +5540,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        if (cuda_ctx->q8_1_skip_invalidate_ptr && cgraph->nodes[k]->data == cuda_ctx->q8_1_skip_invalidate_ptr) {
+                            continue;
+                        }
+                        invalidate_tensor_q8_1(cgraph->nodes[k]);
+                    }
+                    cuda_ctx->q8_1_skip_invalidate_ptr = nullptr;
                     i += nodes_to_skip;
                     continue;
                 }
@@ -5500,11 +5572,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                invalidate_tensor_q8_1(node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
-               }
+                    if (is_concurrent_event_active) {
+                        cuda_ctx->q8_1_cache_clear();
+                        cuda_ctx->q8_1_cache_enabled = false;
+                    }
+                }
             }
+            cuda_ctx->q8_1_cache_clear();
+            cuda_ctx->q8_1_cache_enabled = false;
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -5560,6 +5639,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->ensure_q8_1_cache();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

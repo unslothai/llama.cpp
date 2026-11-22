@@ -1621,12 +1621,52 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    const size_t q8_1_nbytes = (size_t) ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const int64_t s11_q = src1->nb[1] / ts_src1;
+    const int64_t s12_q = src1->nb[2] / ts_src1;
+    const int64_t s13_q = src1->nb[3] / ts_src1;
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+    char * src1_q8_1_ptr = nullptr;
+    if (ctx.q8_1_cache_enabled && ctx.curr_stream_no == 0 && ctx.q8_1_cache_mem != nullptr &&
+            q8_1_nbytes <= ggml_backend_cuda_context::Q8_1_CACHE_SLOT_BYTES) {
+        int hit = -1;
+        for (int s = 0; s < ggml_backend_cuda_context::Q8_1_CACHE_SLOTS; ++s) {
+            const auto & e = ctx.q8_1_cache[s];
+            if (e.valid && e.src_ptr == src1_d &&
+                    e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+                    (ne11 == 1 || e.s11 == s11_q) && (ne12 == 1 || e.s12 == s12_q) && (ne13 == 1 || e.s13 == s13_q) &&
+                    e.ne10_padded == ne10_padded) {
+                hit = s;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            src1_q8_1_ptr = ctx.q8_1_cache_mem + hit * ggml_backend_cuda_context::Q8_1_CACHE_SLOT_BYTES;
+        } else {
+            const int slot = ctx.q8_1_cache_next;
+            ctx.q8_1_cache_next = (slot + 1) % ggml_backend_cuda_context::Q8_1_CACHE_SLOTS;
+            src1_q8_1_ptr = ctx.q8_1_cache_mem + slot * ggml_backend_cuda_context::Q8_1_CACHE_SLOT_BYTES;
+            quantize_row_q8_1_cuda(src1_d, src1_q8_1_ptr, ne10, s11_q, s12_q, s13_q, ne10_padded, ne11, ne12, ne13, stream);
+            const size_t src1_span = (size_t) (ne13 - 1) * src1->nb[3] + (size_t) (ne12 - 1) * src1->nb[2] +
+                                     (size_t) (ne11 - 1) * src1->nb[1] + (size_t) ne10 * ts_src1;
+            auto & e = ctx.q8_1_cache[slot];
+            e.src_ptr     = src1_d;
+            e.src_bytes   = src1_span;
+            e.ne10        = ne10;
+            e.ne11        = ne11;
+            e.ne12        = ne12;
+            e.ne13        = ne13;
+            e.s11         = s11_q;
+            e.s12         = s12_q;
+            e.s13         = s13_q;
+            e.ne10_padded = ne10_padded;
+            e.valid       = true;
+        }
+    } else {
+        src1_q8_1_pool.alloc(q8_1_nbytes);
+        src1_q8_1_ptr = src1_q8_1_pool.get();
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1_ptr, ne10, s11_q, s12_q, s13_q, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1652,7 +1692,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

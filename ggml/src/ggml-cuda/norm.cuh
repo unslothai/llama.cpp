@@ -11,6 +11,15 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
+void ggml_cuda_op_rms_norm_mul_q8_1(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x,
+        const ggml_tensor * mul_w,
+        ggml_tensor * dst,
+        void * q8_1_dst,
+        int64_t ne0_padded,
+        float eps);
+
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

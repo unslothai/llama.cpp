@@ -919,3 +919,119 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+static __global__ void rms_norm_mul_q8_1_f32_1024(
+        const float * __restrict__ x,
+        const float * __restrict__ w,
+        float * __restrict__ dst,
+        block_q8_1 * __restrict__ y,
+        const int ne0,
+        const int n_blocks,
+        const int n_blocks_padded,
+        const float eps) {
+    constexpr int NWARPS = 32; // 1024 threads
+    const int tid  = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid >> 5;
+
+    float xv[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int ib = warp + k * NWARPS;
+        if (ib < n_blocks) {
+            const float v = x[ib * QK8_1 + lane];
+            xv[k] = v;
+            ss += v * v;
+        }
+    }
+    for (int ib = warp + 4 * NWARPS; ib < n_blocks; ib += NWARPS) {
+        const float v = x[ib * QK8_1 + lane];
+        ss += v * v;
+    }
+    ss = warp_reduce_sum(ss);
+
+    __shared__ float s_red[NWARPS];
+    if (lane == 0) {
+        s_red[warp] = ss;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float tot = s_red[lane];
+        tot = warp_reduce_sum(tot);
+        if (lane == 0) {
+            s_red[0] = rsqrtf(tot / float(ne0) + eps);
+        }
+    }
+    __syncthreads();
+    const float inv_rms = s_red[0];
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int ib = warp + k * NWARPS;
+        if (ib < n_blocks_padded) {
+            if (ib < n_blocks) {
+                const int idx = ib * QK8_1 + lane;
+                const float xi = (xv[k] * inv_rms) * w[idx];
+                dst[idx] = xi;
+
+                float amax = fabsf(xi);
+                amax = warp_reduce_max<QK8_1>(amax);
+                const float d = amax / 127.0f;
+                const int8_t q = (amax == 0.0f) ? 0 : (int8_t) roundf(xi / d);
+                const int sum = warp_reduce_sum<QK8_1>((int) q);
+
+                y[ib].qs[lane] = q;
+                if (lane == 0) {
+                    y[ib].ds = make_half2(d, d * sum);
+                }
+            } else {
+                y[ib].qs[lane] = 0;
+                if (lane == 0) {
+                    y[ib].ds = make_half2(0.0f, 0.0f);
+                }
+            }
+        }
+    }
+    for (int ib = warp + 4 * NWARPS; ib < n_blocks_padded; ib += NWARPS) {
+        if (ib < n_blocks) {
+            const int idx = ib * QK8_1 + lane;
+            const float xi = (x[idx] * inv_rms) * w[idx];
+            dst[idx] = xi;
+
+            float amax = fabsf(xi);
+            amax = warp_reduce_max<QK8_1>(amax);
+            const float d = amax / 127.0f;
+            const int8_t q = (amax == 0.0f) ? 0 : (int8_t) roundf(xi / d);
+            const int sum = warp_reduce_sum<QK8_1>((int) q);
+
+            y[ib].qs[lane] = q;
+            if (lane == 0) {
+                y[ib].ds = make_half2(d, d * sum);
+            }
+        } else {
+            y[ib].qs[lane] = 0;
+            if (lane == 0) {
+                y[ib].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_q8_1(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x,
+        const ggml_tensor * mul_w,
+        ggml_tensor * dst,
+        void * q8_1_dst,
+        const int64_t ne0_padded,
+        const float eps) {
+    const int ne0             = (int) x->ne[0];
+    const int n_blocks        = ne0 / QK8_1;
+    const int n_blocks_padded = (int) (ne0_padded / QK8_1);
+    rms_norm_mul_q8_1_f32_1024<<<1, 1024, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) mul_w->data,
+        (float *) dst->data, (block_q8_1 *) q8_1_dst,
+        ne0, n_blocks, n_blocks_padded, eps);
+}

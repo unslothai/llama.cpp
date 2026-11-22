@@ -1488,6 +1488,61 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // Small persistent Q8_1 cache to avoid redundant quantize_q8_1 launches when multiple
+    // quantized matvecs share the exact same F32 activation vector (CUDA-graph safe).
+    static constexpr int    Q8_1_CACHE_SLOTS      = 4;
+    static constexpr size_t Q8_1_CACHE_SLOT_BYTES = 64 * 1024;
+    struct q8_1_cache_slot {
+        const void * src_ptr     = nullptr;
+        size_t       src_bytes   = 0;
+        int64_t      ne10        = 0;
+        int64_t      ne11        = 0;
+        int64_t      ne12        = 0;
+        int64_t      ne13        = 0;
+        int64_t      s11         = 0;
+        int64_t      s12         = 0;
+        int64_t      s13         = 0;
+        int64_t      ne10_padded = 0;
+        bool         valid       = false;
+    };
+    char *          q8_1_cache_mem     = nullptr;
+    q8_1_cache_slot q8_1_cache[Q8_1_CACHE_SLOTS];
+    int             q8_1_cache_next    = 0;
+    bool            q8_1_cache_enabled = false;
+    const void *    q8_1_skip_invalidate_ptr = nullptr;
+
+    void ensure_q8_1_cache() {
+        if (q8_1_cache_mem == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&q8_1_cache_mem, Q8_1_CACHE_SLOTS * Q8_1_CACHE_SLOT_BYTES));
+        }
+    }
+
+    void q8_1_cache_clear() {
+        for (int s = 0; s < Q8_1_CACHE_SLOTS; ++s) {
+            q8_1_cache[s].valid = false;
+        }
+        q8_1_cache_next = 0;
+    }
+
+    void q8_1_cache_invalidate_range(const void * ptr, size_t nbytes) {
+        if (!ptr || nbytes == 0) {
+            return;
+        }
+        const uintptr_t w0 = (uintptr_t) ptr;
+        const uintptr_t w1 = w0 + nbytes;
+        for (int s = 0; s < Q8_1_CACHE_SLOTS; ++s) {
+            if (!q8_1_cache[s].valid) {
+                continue;
+            }
+            const uintptr_t s0 = (uintptr_t) q8_1_cache[s].src_ptr;
+            const uintptr_t s1 = s0 + q8_1_cache[s].src_bytes;
+            if (w0 < s1 && s0 < w1) {
+                q8_1_cache[s].valid = false;
+            }
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
