@@ -3486,6 +3486,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 
     size_t res = 0;
 
+    // banded: never runs the vec kernel, so there are no per-workgroup results to reduce
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return res;
+    }
+
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
@@ -3508,6 +3513,12 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
     //    return 0;
     //}
+
+    // banded: supports_op refuses quantized K/V, so the F16 copy of K and V is never made; reserving it
+    // would cost 4 bytes per cell, KV head and head dim (781 MiB at 200K cells for 8 KV heads of 128)
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
+        return 0;
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
