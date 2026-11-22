@@ -12567,3 +12567,86 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+void ggml_compute_forward_attn_res_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    float eps = 1e-6f;
+    float scale = 1.0f;
+    int32_t n_states = 0;
+    memcpy(&eps,      (const char *) dst->op_params + 0, sizeof(float));
+    memcpy(&scale,    (const char *) dst->op_params + 4, sizeof(float));
+    memcpy(&n_states, (const char *) dst->op_params + 8, sizeof(int32_t));
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_q      = dst->ne[1];
+    const int64_t n_tokens = dst->ne[2];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dt = (n_tokens + nth - 1) / nth;
+    const int64_t t0 = dt * ith;
+    const int64_t t1 = MIN(t0 + dt, n_tokens);
+
+    auto load_q = [&](const char * row, int64_t d) -> float {
+        if (query->type == GGML_TYPE_F32) {
+            return ((const float *) row)[d];
+        } else if (query->type == GGML_TYPE_F16) {
+            return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[d]);
+        } else {
+            return GGML_BF16_TO_FP32(((const ggml_bf16_t *) row)[d]);
+        }
+    };
+
+    float inv_rms[GGML_MAX_SRC];
+    float logits[GGML_MAX_SRC];
+    float eff_w[GGML_MAX_SRC];
+
+    for (int64_t t = t0; t < t1; ++t) {
+        for (int s = 0; s < n_states; ++s) {
+            const ggml_tensor * st = dst->src[1 + s];
+            const float * s_row = (const float *) ((const char *) st->data + t * st->nb[1]);
+            float sq = 0.0f;
+            for (int64_t d = 0; d < n_embd; ++d) {
+                sq += s_row[d] * s_row[d];
+            }
+            inv_rms[s] = 1.0f / sqrtf(sq / (float) n_embd + eps);
+        }
+
+        char * dst_tok = (char *) dst->data + t * dst->nb[2];
+        for (int64_t q = 0; q < n_q; ++q) {
+            const char * q_row = (const char *) query->data + q * query->nb[1];
+            float m = -INFINITY;
+            for (int s = 0; s < n_states; ++s) {
+                const ggml_tensor * st = dst->src[1 + s];
+                const float * s_row = (const float *) ((const char *) st->data + t * st->nb[1]);
+                float dot = 0.0f;
+                for (int64_t d = 0; d < n_embd; ++d) {
+                    dot += s_row[d] * load_q(q_row, d);
+                }
+                logits[s] = dot * inv_rms[s] * scale;
+                if (logits[s] > m) {
+                    m = logits[s];
+                }
+            }
+            float sum_e = 0.0f;
+            for (int s = 0; s < n_states; ++s) {
+                logits[s] = expf(logits[s] - m);
+                sum_e += logits[s];
+            }
+            const float inv_e = 1.0f / sum_e;
+            for (int s = 0; s < n_states; ++s) {
+                eff_w[s] = (logits[s] * inv_e) * inv_rms[s];
+            }
+            float * dst_row = (float *) (dst_tok + q * dst->nb[1]);
+            for (int64_t d = 0; d < n_embd; ++d) {
+                float acc = 0.0f;
+                for (int s = 0; s < n_states; ++s) {
+                    const ggml_tensor * st = dst->src[1 + s];
+                    const float * s_row = (const float *) ((const char *) st->data + t * st->nb[1]);
+                    acc += eff_w[s] * s_row[d];
+                }
+                dst_row[d] = acc;
+            }
+        }
+    }
+}

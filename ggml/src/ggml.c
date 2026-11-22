@@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "ATTN_RES_MIX",
 
     "UNARY",
 
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "attn_res_mix(query, states...)",
 
     "unary(x)",
 
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6664,6 +6666,48 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_attn_res_mix
+
+struct ggml_tensor * ggml_attn_res_mix(
+        struct ggml_context  * ctx,
+        struct ggml_tensor   * query,
+        struct ggml_tensor  ** states,
+        int                    n_states,
+        float                  eps,
+        float                  scale) {
+    GGML_ASSERT(query != NULL);
+    GGML_ASSERT(states != NULL);
+    GGML_ASSERT(n_states >= 1 && n_states <= GGML_MAX_SRC - 1);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 || query->type == GGML_TYPE_F16 || query->type == GGML_TYPE_BF16);
+    GGML_ASSERT(query->nb[0] == ggml_type_size(query->type));
+
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_q      = query->ne[1];
+    const int64_t n_tokens = states[0]->ne[1];
+
+    for (int s = 0; s < n_states; ++s) {
+        GGML_ASSERT(states[s] != NULL);
+        GGML_ASSERT(states[s]->type == GGML_TYPE_F32);
+        GGML_ASSERT(states[s]->ne[0] == n_embd);
+        GGML_ASSERT(states[s]->ne[1] == n_tokens);
+        GGML_ASSERT(states[s]->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, n_tokens);
+
+    result->op     = GGML_OP_ATTN_RES_MIX;
+    result->src[0] = query;
+    for (int s = 0; s < n_states; ++s) {
+        result->src[1 + s] = states[s];
+    }
+
+    memcpy((char *) result->op_params + 0, &eps,      sizeof(float));
+    memcpy((char *) result->op_params + 4, &scale,    sizeof(float));
+    memcpy((char *) result->op_params + 8, &n_states, sizeof(int32_t));
 
     return result;
 }

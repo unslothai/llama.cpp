@@ -418,6 +418,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_ATTN_RES_MIX,
 
         GGML_OP_UNARY,
 
@@ -2533,6 +2534,18 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // Block attention-residual mix: RMSNorm each state, attend over states with query, weighted sum of normalized states.
+    // query:  [n_embd, n_q] (F32/F16/BF16)
+    // states: n_states tensors of [n_embd, n_tokens] (F32), 1 <= n_states <= GGML_MAX_SRC - 1
+    // res:    [n_embd, n_q, n_tokens] (F32)
+    GGML_API struct ggml_tensor * ggml_attn_res_mix(
+            struct ggml_context  * ctx,
+            struct ggml_tensor   * query,
+            struct ggml_tensor  ** states,
+            int                    n_states,
+            float                  eps,
+            float                  scale);
 
     // custom operators
 
