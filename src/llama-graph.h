@@ -815,6 +815,10 @@ public:
     uint32_t n_kv_banded[2] = { 0, 0 };
     // [base, swa] ring rotation of the banded K/V cells, 0 = position order
     uint32_t kv_rot_banded[2] = { 0, 0 };
+    // [base, swa] what the cache reported before padding; the graph-reuse check compares these
+    uint32_t n_kv_banded_raw[2]  = { 0, 0 };
+    uint32_t kv_rot_banded_raw[2] = { 0, 0 };
+    uint32_t n_kv_banded_mask[2]  = { 0, 0 }; // mask width (cells) the padding was decided against
     bool     banded         = false;
 
     const uint32_t extent;

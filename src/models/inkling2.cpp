@@ -359,7 +359,31 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_ring(inp->kv_rot_banded[i]);
+        const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
+        inp->n_kv_banded[i] = inp->n_kv_banded_raw[i] = cache->get_n_kv_pos_ring(inp->kv_rot_banded_raw[i]);
+        inp->kv_rot_banded[i] = inp->kv_rot_banded_raw[i];
+        inp->n_kv_banded_mask[i] = cache->get_n_kv();
+        // pad an unrotated cell count to the FA KV stride: kernels that need it (the WMMA path) can then run. The
+        // extra cells hold no position of this sequence, so the mask hides them, and a rotation of n keeps the
+        // queries aligned to the tail of the real cells: logical index (cell - n) mod n_pad = cell + n_pad - n.
+        const uint32_t n   = inp->n_kv_banded[i];
+        const uint32_t pad = GGML_PAD(n, 256u);
+        if (n > 0 && inp->kv_rot_banded[i] == 0 && pad != n && pad <= inp->n_kv_banded_mask[i]) {
+            inp->n_kv_banded[i]   = pad;
+            inp->kv_rot_banded[i] = n;
+            // a backend without rotated banded attention keeps the unpadded layout instead of falling back to dense
+            int il_rep = -1;
+            for (int il = 0; il < n_layer && il_rep < 0; ++il) {
+                if (hparams.is_swa(il) == (i == 1)) {
+                    il_rep = il;
+                }
+            }
+            if (il_rep >= 0 && !use_banded(il_rep, i == 1)) {
+                inp->n_kv_banded[i]   = n;
+                inp->kv_rot_banded[i] = 0;
+                banded_dev_ok.clear();
+            }
+        }
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
