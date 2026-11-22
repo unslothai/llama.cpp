@@ -269,6 +269,43 @@ static __global__ void rms_norm_f32(const T *     x,
     }
 }
 
+// sum = a + b and dst = rms_norm(sum): the vector path of rms_norm_f32 with one float4 per thread (no mul, add or
+// scale) over rows of the sum; a, b, sum and dst contiguous and 16-byte aligned. The sum is rounded as in the ADD kernel,
+// the reduction is the same, and the mean and the eps add are rounded separately like that rms_norm_f32 instantiation.
+template <int block_size>
+static __global__ void add_rms_norm_f32(const float * a, const float * b, float * sum_dst, float * dst, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    const int ncols4 = ncols / 4;
+
+    const float4 * a4   = (const float4 *) (a       + row*ncols);
+    const float4 * b4   = (const float4 *) (b       + row*ncols);
+    float4       * sum4 = (float4 *)       (sum_dst + row*ncols);
+    float4       * dst4 = (float4 *)       (dst     + row*ncols);
+
+    float4 x   = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  tmp = 0.0f;
+    if (tid < ncols4) {
+        const float4 av = a4[tid];
+        const float4 bv = b4[tid];
+        x = make_float4(__fadd_rn(av.x, bv.x), __fadd_rn(av.y, bv.y), __fadd_rn(av.z, bv.z), __fadd_rn(av.w, bv.w));
+        sum4[tid] = x;
+        tmp += x.x*x.x + x.y*x.y + x.z*x.z + x.w*x.w;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(__fadd_rn(tmp / ncols, eps));
+
+    if (tid < ncols4) {
+        dst4[tid] = make_float4(scale*x.x, scale*x.y, scale*x.z, scale*x.w);
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -700,6 +737,71 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_launch_typed(dst, [&](auto * dst_d) {
         rms_norm_f32_cuda(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     });
+}
+
+bool ggml_cuda_add_rms_norm_supported(const ggml_tensor * add, const ggml_tensor * rms) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+        !ggml_is_contiguous(add) || !ggml_is_contiguous(rms) || ggml_nelements(rms) != ggml_nelements(add) ||
+        rms->src[0]->ne[0] != rms->ne[0] || add->ne[0] % rms->ne[0] != 0 || rms->ne[0] > INT_MAX ||
+        ggml_nelements(add) / rms->ne[0] > INT_MAX) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    if (!(eps >= 0.0f)) {
+        return false;
+    }
+    // the vector path of rms_norm_f32 for its input (the sum) must also be the vector path for a and b
+    const int  ncols = rms->ne[0];
+    const bool vec   = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) rms->data % 16) == 0 && ggml_cuda_is_aligned(add, 16);
+    // the fused kernel covers the vector path with one float4 per thread (ncols <= 4096)
+    return vec && ncols/4 <= 1024 && ggml_cuda_is_aligned(a, 16) && ggml_cuda_is_aligned(b, 16);
+}
+
+void ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms) {
+    const float * a       = (const float *) add->src[0]->data;
+    const float * b       = (const float *) add->src[1]->data;
+    float       * sum_dst = (float *) add->data;
+    float       * dst     = (float *) rms->data;
+    cudaStream_t  stream  = ctx.stream();
+
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    const int     ncols = rms->ne[0];
+    const int64_t nrows = ggml_nelements(add) / ncols;
+    const dim3    blocks_num(nrows, 1, 1);
+
+    // the launch rule of rms_norm_f32_dispatch for the sum as its input (vector path, ggml_cuda_add_rms_norm_supported)
+    const bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst % 16) == 0 && ggml_cuda_is_aligned(add, 16);
+
+#define ADD_RMS_NORM_LAUNCH(BLOCK_SIZE) \
+    do { \
+        const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+        const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        ggml_cuda_kernel_launch(add_rms_norm_f32<BLOCK_SIZE>, launch_params, a, b, sum_dst, dst, ncols, eps); \
+    } while (0)
+
+    // only the launches of rms_norm_f32 whose rounding is replicated: the vector path with one value per thread
+    const int n4 = ncols / 4;
+    GGML_ASSERT(vec && n4 <= 1024);
+    if (n4 <= 32) {
+        ADD_RMS_NORM_LAUNCH(32);
+    } else if (n4 <= 128) {
+        ADD_RMS_NORM_LAUNCH(128);
+    } else if (n4 <= 256) {
+        ADD_RMS_NORM_LAUNCH(256);
+    } else if (n4 <= 512) {
+        ADD_RMS_NORM_LAUNCH(512);
+    } else {
+        ADD_RMS_NORM_LAUNCH(1024);
+    }
+#undef ADD_RMS_NORM_LAUNCH
 }
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
