@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1389,6 +1390,49 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
+// a MUL_MAT src1 quantized for MMVQ or MMQ, kept from one MUL_MAT node to the next one that reads the same tensor
+// (GGML_CUDA_DISABLE_Q8_1_REUSE=1 turns it off). The graph evaluation loop enables it for MUL_MAT nodes on one stream
+// and drops it at the start and end of a graph and after any node whose output overlaps the quantized tensor.
+// The buffer is a pool allocation: it is freed only between nodes, when it is the top of the pool stack.
+struct ggml_cuda_src1_cache {
+    bool                enabled = false;
+    const ggml_tensor * src1    = nullptr;
+    const void        * data    = nullptr;
+    int64_t             ne[GGML_MAX_DIMS] = {};
+    size_t              nb[GGML_MAX_DIMS] = {};
+    int                 layout  = -1;
+    ggml_cuda_pool    * pool    = nullptr;
+    void              * ptr     = nullptr;
+    size_t              size    = 0;
+    int64_t             n_hit   = 0;
+    int64_t             n_miss  = 0;
+
+    void release() {
+        if (ptr) {
+            pool->free(ptr, size);
+        }
+        src1 = nullptr;
+        data = nullptr;
+        pool = nullptr;
+        ptr  = nullptr;
+        size = 0;
+    }
+
+    // after a node ran: drop the cache when the node wrote memory of the quantized tensor
+    void invalidate_if_written(const ggml_tensor * node) {
+        if (!src1 || !node->data) {
+            return;
+        }
+        const char * lo  = (const char *) data;
+        const char * hi  = lo + ggml_nbytes(src1);
+        const char * nlo = (const char *) node->data;
+        const char * nhi = nlo + ggml_nbytes(node);
+        if (nlo < hi && lo < nhi) {
+            release();
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1473,6 +1517,8 @@ struct ggml_backend_cuda_context {
     }
 #endif
 
+    ggml_cuda_src1_cache src1_cache;
+
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
@@ -1489,6 +1535,32 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// the buffer for src1 quantized with `layout` (nbytes or more) when the src1 cache is on, else nullptr;
+// *hit is set when the buffer already holds src1 in that layout, so that the quantization can be skipped
+static inline void * ggml_cuda_src1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t nbytes, bool * hit) {
+    ggml_cuda_src1_cache & c = ctx.src1_cache;
+    *hit = false;
+    if (!c.enabled || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (c.src1 == src1 && c.data == src1->data && c.layout == layout && c.size >= nbytes && c.pool == &ctx.pool() &&
+            memcmp(c.ne, src1->ne, sizeof(c.ne)) == 0 && memcmp(c.nb, src1->nb, sizeof(c.nb)) == 0) {
+        *hit = true;
+        c.n_hit++;
+        return c.ptr;
+    }
+    c.release();
+    c.pool   = &ctx.pool();
+    c.ptr    = c.pool->alloc(nbytes, &c.size);
+    c.src1   = src1;
+    c.data   = src1->data;
+    c.layout = layout;
+    memcpy(c.ne, src1->ne, sizeof(c.ne));
+    memcpy(c.nb, src1->nb, sizeof(c.nb));
+    c.n_miss++;
+    return c.ptr;
+}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

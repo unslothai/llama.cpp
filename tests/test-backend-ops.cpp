@@ -4612,6 +4612,66 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// several MUL_MATs of quantized weights that read the same src1, as the projections of one layer input do
+// CUDA quantizes such a src1 once; mode 1 runs an unrelated MUL_MAT in between, mode 2 overwrites src1 in place between
+// the first and the second MUL_MAT, so that its quantization must be redone
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, m, n, k, mode);
+    }
+
+    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, ggml_type type_b = GGML_TYPE_Q4_0,
+            int64_t m = 64, int64_t n = 1, int64_t k = 256, int mode = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_b, k, m);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * y  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+        ggml_set_name(a2, "a2");
+        ggml_set_name(y,  "y");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a0, y);
+        if (mode == 1) {
+            // another src1 in between
+            ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(z, "z");
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, a1, ggml_scale(ctx, z, 0.5f)));
+        } else if (mode == 2) {
+            // y overwritten in place after the first MUL_MAT read it
+            ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(z, "z");
+            ggml_tensor * w = ggml_cpy(ctx, ggml_scale(ctx, z, -2.0f), y);
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, w));
+        }
+        out = ggml_add(ctx, out, ggml_mul_mat(ctx, a1, y));
+        out = ggml_add(ctx, out, ggml_mul_mat(ctx, a2, y));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10787,6 +10847,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 1}));   // ne[2] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
+    }
+
+    // MUL_MATs that share one src1: MMVQ (1-8 columns) and MMQ (64 columns), mixed weight types and q8_1 layouts
+    for (int mode : { 0, 1, 2 }) {
+        for (int64_t n : { 1, 2, 3, 4, 5, 8, 64 }) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 64, n, 256, mode));
+        }
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, 128, 1, 512, mode));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 128, 64, 512, mode));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 64, 128, 256, mode));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
