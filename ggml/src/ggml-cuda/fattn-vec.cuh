@@ -17,7 +17,9 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 // with has_rel the mask is the F16 mask that the relative bias in rel was added to (fattn_rel_bias)
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool has_rel> // D == head size
+// with skip_masked a warp skips the 32 KV columns of an iteration when the mask is -inf in all of them for every query
+// column: their scores would be -inf, so the maximum, the sum and VKQ would come out unchanged (exp(-inf) == 0)
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool has_rel, bool skip_masked> // D == head size
 static __device__ __forceinline__ void flash_attn_ext_vec_impl(
         const char * Q_ptr,
         const char * K_ptr,
@@ -276,9 +278,33 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
+    int n_chunks_skipped = 0;
+    int n_chunks = 0;
+    GGML_UNUSED(n_chunks_skipped);
+    GGML_UNUSED(n_chunks);
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        if constexpr (skip_masked) {
+            // the warp's KV columns are threadIdx.y*WARP_SIZE + [0, WARP_SIZE) for the scores and for V;
+            // -inf + a finite bias (has_rel) is -inf, and slope > 0, so these scores are -inf as well
+            if (mask && slope > 0.0f) {
+                bool all_masked = true;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                        const half m = maskh[j*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x];
+                        all_masked = all_masked && __half_as_ushort(m) == 0xFC00u;
+                    }
+                }
+                n_chunks++;
+                if (__all_sync(0xFFFFFFFF, all_masked)) {
+                    n_chunks_skipped++;
+                    continue;
+                }
+            }
+        }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -542,6 +568,12 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
+    if constexpr (has_rel && skip_masked) {
+        if (rel.skip_debug && blockIdx.x == 0 && head == 0 && threadIdx.x == 0) {
+            printf("fa_vec_mask_skip seq %d ne11 %d split %d/%d warp %d skipped %d of %d\n",
+                sequence, ne11, blockIdx.y, gridDim.y, threadIdx.y, n_chunks_skipped, n_chunks);
+        }
+    }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -556,7 +588,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -581,11 +613,11 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int64_t nb32, const int64_t nb33) {
-    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, false>(
+    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, false, skip_masked>(
         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, fattn_rel_bias{});
 }
 
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec_rel(
         const char * Q_ptr,
@@ -611,12 +643,28 @@ static __global__ void flash_attn_ext_vec_rel(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int64_t nb32, const int64_t nb33,
         const fattn_rel_bias rel) {
-    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, true>(
+    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, true, skip_masked>(
         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, rel);
 }
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif // __clang__
+
+// GGML_CUDA_DISABLE_FA_VEC_MASK_SKIP=1: the vector kernel computes the fully masked KV chunks too
+static inline bool ggml_cuda_fattn_vec_env_flag(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
+static inline bool ggml_cuda_fattn_vec_mask_skip_enabled() {
+    static const bool enabled = !ggml_cuda_fattn_vec_env_flag("GGML_CUDA_DISABLE_FA_VEC_MASK_SKIP");
+    return enabled;
+}
+
+static inline bool ggml_cuda_fattn_vec_mask_skip_debug() {
+    static const bool enabled = ggml_cuda_fattn_vec_env_flag("GGML_CUDA_FA_VEC_MASK_SKIP_DEBUG");
+    return enabled;
+}
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -628,7 +676,11 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+    // the skipping variant runs with the split of the kernel without it
+    fattn_kernel_t exec_kernel = ggml_cuda_fattn_vec_mask_skip_enabled() ?
+        flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true> : nullptr;
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false,
+        WARP_SIZE, false, nullptr, nullptr, nullptr, exec_kernel);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -676,15 +728,23 @@ void ggml_cuda_flash_attn_ext_vec_rel_case(ggml_backend_cuda_context & ctx, ggml
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
 
+    const bool skip = ggml_cuda_fattn_vec_mask_skip_enabled();
+    fattn_rel_bias rel_k = rel;
+    rel_k.skip_debug = skip && ggml_cuda_fattn_vec_mask_skip_debug();
+
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         launch_fattn<D, cols_per_block, 1>(ctx, dst, flash_attn_ext_vec<D, cols_per_block, type_K, type_V, false>, nwarps, nbytes_shared, D,
-            need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel, flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false>);
+            need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel_k, skip ?
+            flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false, true> :
+            flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false, false>);
         return;
     }
     constexpr int cols_per_block = 2;
     launch_fattn<D, cols_per_block, 1>(ctx, dst, flash_attn_ext_vec<D, cols_per_block, type_K, type_V, false>, nwarps, nbytes_shared, D,
-        need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel, flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false>);
+        need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel_k, skip ?
+        flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false, true> :
+        flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false, false>);
 }
 
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \

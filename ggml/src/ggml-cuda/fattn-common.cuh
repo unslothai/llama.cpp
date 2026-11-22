@@ -54,6 +54,7 @@ struct fattn_rel_bias {
     int64_t tab_h, tab_r, tab_q, tab_s;
     int64_t sub_h, sub_q, sub_s;
     int64_t rp_kv, rp_q, rp_s;
+    int skip_debug; // GGML_CUDA_FA_VEC_MASK_SKIP_DEBUG: print the KV chunks the vector kernel skipped
 };
 
 typedef void (* fattn_rel_kernel_t)(
@@ -1083,7 +1084,8 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    const ggml_tensor * rel_mask = nullptr, const fattn_rel_bias * rel_bias = nullptr, fattn_rel_kernel_t rel_kernel = nullptr
+    const ggml_tensor * rel_mask = nullptr, const fattn_rel_bias * rel_bias = nullptr, fattn_rel_kernel_t rel_kernel = nullptr,
+    fattn_kernel_t exec_kernel = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1387,7 +1389,8 @@ void launch_fattn(
             *rel_bias
         );
     } else
-    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+    // exec_kernel: a variant of fattn_kernel with the same results; the occupancy and the split still come from fattn_kernel
+    ggml_cuda_kernel_launch(exec_kernel ? exec_kernel : fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
