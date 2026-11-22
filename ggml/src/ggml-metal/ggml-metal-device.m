@@ -1837,6 +1837,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[2]->ne[0] != op->src[1]->ne[0]) {
                     return false;
                 }
+                // both kernels take the V head from the K broadcast factor (iq2/(ne02/ne12))
+                if (op->src[2]->ne[2] != op->src[1]->ne[2]) {
+                    return false;
+                }
                 if (op->src[1]->type != op->src[2]->type) {
                     return false;
                 }
