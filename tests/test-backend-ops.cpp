@@ -4612,6 +4612,63 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// depth mix fusion (Inkling 2 attention residuals): normalize cur, append it to the block stacks, softmax over
+// the scores of nq queries, mix the stack rows; extra_use keeps the intermediates alive outside the chain
+struct test_depth_mix_fuse : public test_case {
+    const int64_t ncols;
+    const int64_t n;   // stack rows including cur
+    const int64_t nq;
+    const int64_t T;
+    const bool extra_use;
+    const bool plain; // the transposed rows as a CONT of the permuted plain rows instead of their own CONCAT
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // 4 queries run the first product as a cuBLAS GEMM on Ampere+, a little above the default 1e-7 at times
+    double max_nmse_err() override { return 1e-6; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(ncols, n, nq, T, extra_use, plain);
+    }
+
+    test_depth_mix_fuse(int64_t ncols = 2304, int64_t n = 8, int64_t nq = 1, int64_t T = 1, bool extra_use = false, bool plain = false)
+        : ncols(ncols), n(n), nq(nq), T(T), extra_use(extra_use), plain(plain) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, 1, T);
+        ggml_tensor * prev   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, n - 1, T);
+        ggml_tensor * prev_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n - 1, ncols, T);
+        ggml_tensor * q      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, nq);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(prev, "prev");
+        ggml_set_name(prev_t, "prev_t");
+        ggml_set_name(q, "q");
+
+        ggml_tensor * normed   = ggml_rms_norm(ctx, cur, 1e-6f);
+        ggml_tensor * normed_t = ggml_reshape_3d(ctx, normed, 1, ncols, T);
+        ggml_tensor * states   = ggml_concat(ctx, prev,   normed,   1);
+        ggml_tensor * states_t = plain ? ggml_cont(ctx, ggml_permute(ctx, states, 1, 0, 2, 3)) : ggml_concat(ctx, prev_t, normed_t, 0);
+
+        ggml_tensor * queries = T == 1 ? q : ggml_repeat(ctx, q, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nq, T));
+        ggml_tensor * scores  = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(ncols), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, states_t, scores);
+        if (extra_use) {
+            out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_reshape_1d(ctx, states, ggml_nelements(states)), 0);
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, states_t, ggml_nelements(states_t)), 0);
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, normed, ggml_nelements(normed)), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10787,6 +10844,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 1}));   // ne[2] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
+    }
+
+    // depth mix fusion: decode (1-8 tokens) and prefill rows, odd stacks (second product not MMVF), 1/3/4 queries
+    // (4: the first product is not MMVF on Ampere+), row lengths for every rms_norm launch and MMVF block size
+    for (int64_t T : { 1, 2, 3, 4, 8 }) {
+        for (int64_t n : { 2, 3, 6, 12, 19, 20, 32 }) {
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, n, 1, T, false));
+        }
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 3, T, false));
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 11, 3, T, false));
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 4, T, false));
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 1, T, true));
+        test_cases.emplace_back(new test_depth_mix_fuse(2304,  9, 3, T, true));
+    }
+    // the transposed rows as a copy of the plain ones (Inkling 2 graphs that drop the second stack)
+    for (int64_t T : { 1, 2, 3, 4, 8 }) {
+        for (int64_t n : { 2, 7, 8, 14, 20 }) {
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, n, 1, T, false, true));
+        }
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 3, T, false, true));
+        test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 1, T, true, true));
+    }
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 1, 512, false, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 3, 77, true, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(1002, 9, 1, 3, false, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 1, 512, false));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 3, 512, false));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 3, 77, true));
+    for (int64_t ncols : { 130, 1000, 1002, 6000 }) {
+        test_cases.emplace_back(new test_depth_mix_fuse(ncols, 6, 1, 1, false));
+        test_cases.emplace_back(new test_depth_mix_fuse(ncols, 7, 3, 3, true));
+        test_cases.emplace_back(new test_depth_mix_fuse(ncols, 20, 3, 8, false));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));

@@ -23,6 +23,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
+#include "ggml-cuda/depth-mix.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -4473,6 +4474,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // depth mix after an RMS_NORM: CONCAT, CONCAT, [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
+    {
+        static const bool depth_mix_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_DEPTH_MIX_FUSION");
+        const int n_fused = depth_mix_disabled ? 0 : ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i,
+            [](const ggml_cgraph * g, int idx, int cnt, const int * outs, int n_outs) {
+                return ggml_cuda_check_fusion_memory_ranges(g, idx, cnt, outs, n_outs);
+            });
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
