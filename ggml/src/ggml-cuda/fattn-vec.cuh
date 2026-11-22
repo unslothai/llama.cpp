@@ -16,9 +16,9 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
-static __global__ void flash_attn_ext_vec(
+// with has_rel the mask is the F16 mask that the relative bias in rel was added to (fattn_rel_bias)
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool has_rel> // D == head size
+static __device__ __forceinline__ void flash_attn_ext_vec_impl(
         const char * Q_ptr,
         const char * K_ptr,
         const char * V_ptr,
@@ -40,7 +40,9 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_bias & rel) {
+    GGML_UNUSED(rel);
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -301,7 +303,11 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    if constexpr (has_rel) {
+                        sum += slope*__half2float(fattn_rel_bias_value(rel, head, ic0 + j, sequence, k_VKQ_0 + i_KQ, maskh[j*ne11 + i_KQ]));
+                    } else {
+                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    }
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -549,6 +555,65 @@ static __global__ void flash_attn_ext_vec(
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }
+
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+static __global__ void flash_attn_ext_vec(
+        const char * Q_ptr,
+        const char * K_ptr,
+        const char * V_ptr,
+        const char * mask_ptr,
+        const char * sinks_ptr,
+        const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
+        float      * dst_ptr,
+        float2     * dst_meta_ptr,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, false>(
+        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, fattn_rel_bias{});
+}
+
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+static __global__ void flash_attn_ext_vec_rel(
+        const char * Q_ptr,
+        const char * K_ptr,
+        const char * V_ptr,
+        const char * mask_ptr,
+        const char * sinks_ptr,
+        const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
+        float      * dst_ptr,
+        float2     * dst_meta_ptr,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_bias rel) {
+    flash_attn_ext_vec_impl<D, ncols, type_K, type_V, use_logit_softcap, true>(
+        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, rel);
+}
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif // __clang__
@@ -594,6 +659,32 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         constexpr bool use_logit_softcap = true;
         ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
     }
+}
+
+// the vector kernel with the relative bias of rel read in the kernel (no logit softcap); the split over the KV cache
+// is the one of the kernel without it, so the result is bit-identical to adding the materialized bias to rel_mask
+template <int D, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_rel_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * rel_mask, const fattn_rel_bias & rel) {
+    const ggml_tensor * Q = dst->src[0];
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+    const int nwarps   = nthreads / WARP_SIZE;
+    const bool need_f16_K = type_K == GGML_TYPE_F16;
+    const bool need_f16_V = type_V == GGML_TYPE_F16;
+    constexpr size_t nbytes_shared = 0;
+
+    if (Q->ne[1] == 1) {
+        constexpr int cols_per_block = 1;
+        launch_fattn<D, cols_per_block, 1>(ctx, dst, flash_attn_ext_vec<D, cols_per_block, type_K, type_V, false>, nwarps, nbytes_shared, D,
+            need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel, flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false>);
+        return;
+    }
+    constexpr int cols_per_block = 2;
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, flash_attn_ext_vec<D, cols_per_block, type_K, type_V, false>, nwarps, nbytes_shared, D,
+        need_f16_K, need_f16_V, false, false, WARP_SIZE, false, rel_mask, &rel, flash_attn_ext_vec_rel<D, cols_per_block, type_K, type_V, false>);
 }
 
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \

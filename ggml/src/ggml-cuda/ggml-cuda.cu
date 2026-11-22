@@ -40,6 +40,7 @@
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
+#include "ggml-cuda/fattn-rel.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -4619,6 +4620,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
+    }
+
+    // relative-position bias gathered into the F16 mask of a flash attention: read in the vector kernel
+    if (node->op == GGML_OP_SUB || node->op == GGML_OP_CONT || node->op == GGML_OP_GET_ROWS) {
+        static const bool rel_bias_fa_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_REL_BIAS_FA_FUSION");
+        const int n_fused = rel_bias_fa_disabled || !cuda_ctx->stream_context().concurrent_events.empty() ? 0 :
+            ggml_cuda_try_fuse_rel_bias_fa(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (n_fused > 0) {
+            return n_fused;
+        }
     }
 
     // Snake activation: y = x + sin(a*x)^2 * inv_b

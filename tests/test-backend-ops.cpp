@@ -9080,6 +9080,116 @@ struct test_leaky_relu : public test_case {
 };
 
 // GGML_OP_FLASH_ATTN_EXT
+// relative-position bias gathered into the F16 mask of a flash attention (the dense decode path of Inkling 2):
+// T = CONT(PERMUTE(A - sinks)), G = GET_ROWS(T, rel_pos), mask = CPY(PERMUTE(G), F16) + m, FLASH_ATTN_EXT(q, k, v, mask)
+// the CUDA backend reads the bias in the vector kernel instead of materializing it
+struct test_fa_rel_bias_fuse : public test_case {
+    const int64_t hs;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_rel;   // rows of the table
+    const int64_t kv;
+    const int64_t nr;      // queries per stream
+    const int64_t ns;      // streams
+    const bool    with_sub;
+    const ggml_type type_KV;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_REL_BIAS_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, n_head, n_head_kv, n_rel, kv, nr, ns, with_sub, type_KV);
+    }
+
+    test_fa_rel_bias_fuse(int64_t hs = 128, int64_t n_head = 24, int64_t n_head_kv = 8, int64_t n_rel = 129, int64_t kv = 256,
+            int64_t nr = 1, int64_t ns = 1, bool with_sub = true, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_rel(n_rel), kv(kv), nr(nr), ns(ns), with_sub(with_sub), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = nr*ns;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n_head, nr, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, kv, ns);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_set_name(a, "a");
+        ggml_tensor * table = a;
+        if (with_sub) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+            ggml_set_name(b, "b");
+            table = ggml_sub(ctx, a, ggml_reshape_3d(ctx, b, 1, n_head, n_tokens));
+        }
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_tokens);
+        ggml_set_name(rel_pos, "rel_pos");
+
+        ggml_tensor * bias = ggml_get_rows(ctx, table, rel_pos);
+        bias = ggml_reshape_4d(ctx, bias, n_head, kv, nr, ns);
+        bias = ggml_permute(ctx, bias, 2, 0, 1, 3);
+        bias = ggml_cpy(ctx, bias, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, n_head, ns));
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, 1, ns);
+        ggml_set_name(m, "m");
+        ggml_tensor * mask = ggml_add(ctx, bias, m);
+
+        ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_set_name(sinks, "s");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, k, 0, 2, 1, 3),
+                ggml_permute(ctx, v, 0, 2, 1, 3), mask, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rel_pos") == 0) {
+                // distances clamp to the last (far) row, as the KV cache fills them
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        const int64_t d = (t->ne[0] - 1 - i0) + (i1 % nr);
+                        data[i1*t->ne[0] + i0] = (int32_t) std::min<int64_t>(d, n_rel - 1);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // 0 or -inf: a causal mask with a few holes, and the end of the cache unused
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        const int64_t n_vis = std::max<int64_t>(1, t->ne[0] - 17*(i3 + 1) - (nr - 1 - i1));
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const bool vis = i0 < n_vis && (i0 % 13 != 5 || i0 == 0);
+                            data[(i3*t->ne[1] + i1)*t->ne[0] + i0] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "a") == 0 || strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -13239,6 +13349,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // the relative bias read inside the flash attention: decode, verify and batched rows, multiple streams
+    for (int64_t hs : { 128, 64 }) {
+        for (int64_t kv : { 256, 1024, 4096 }) {
+            for (int64_t nr : { 1, 2, 3, 4, 8 }) {
+                for (int64_t ns : { 1, 2 }) {
+                    test_cases.emplace_back(new test_fa_rel_bias_fuse(hs, 24, 8, 129, kv, nr, ns, true));
+                }
+            }
+        }
+    }
+    for (int64_t nr : { 1, 3 }) {
+        test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 8, 129,  512, nr, 1, false));
+        test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 8, 129,  512, nr, 4, true, GGML_TYPE_BF16));
+        test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 24, 4097, 4096, nr, 1, true));
+        test_cases.emplace_back(new test_fa_rel_bias_fuse(256,  8, 8,  33,  256, nr, 1, true));
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
