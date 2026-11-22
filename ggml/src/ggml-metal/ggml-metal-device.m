@@ -1862,7 +1862,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (rel->nb[0] != ggml_type_size(rel->type)) {
                     return false;
                 }
-                if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[1] < op->src[0]->ne[1])) {
+                // the kernels load Q rows as float4 and K/V rows with an element stride of nb1/nb0
+                if (op->src[0]->nb[0] != sizeof(float) || op->src[0]->nb[1] % 16 != 0 ||
+                        op->src[0]->nb[2] % 16 != 0 || op->src[0]->nb[3] % 16 != 0) {
+                    return false;
+                }
+                for (int i = 1; i <= 2; ++i) {
+                    const struct ggml_tensor * t = op->src[i];
+                    if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % t->nb[0] != 0) {
+                        return false;
+                    }
+                }
+                // the mask blocks are classified over the mask width but read over the K length
+                if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] != op->src[1]->ne[1] ||
+                        mask->ne[1] < op->src[0]->ne[1])) {
                     return false;
                 }
                 if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float) ||
