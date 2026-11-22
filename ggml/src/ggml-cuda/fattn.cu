@@ -697,7 +697,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // datacenter Blackwell: with a mask per head (no GQA packing) the vector kernel beats the MMA kernel up to 4 rows,
         // e.g. 4 sequences of batched decode (B200: 16 us vs 28 us incl. the combine/fixup kernels); at 8 rows it loses
         static const bool dc_tuning_disabled = getenv("GGML_CUDA_DISABLE_BLACKWELL_DC_DECODE_TUNING") != nullptr;
-        if (!dc_tuning_disabled && GGML_CUDA_CC_IS_BLACKWELL_DC(cc) && can_use_vector_kernel && !gqa_opt_applies &&
+        if (!dc_tuning_disabled && GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) && can_use_vector_kernel && !gqa_opt_applies &&
                 Q->ne[1] <= 4 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             return BEST_FATTN_KERNEL_VEC;
         }

@@ -872,7 +872,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 // 1024 x 4) and loses from 8192 (1024 x 8, 3072 x 4); below 64 rows the existing rules already pick the faster kernel.
 static bool ggml_cuda_mmvf_blackwell_dc_small_rows(const int cc, const int64_t nrows, const int64_t ne11) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_BLACKWELL_DC_DECODE_TUNING") != nullptr;
-    return !disabled && GGML_CUDA_CC_IS_BLACKWELL_DC(cc) && ne11 >= 2 && ne11 <= MMVF_MAX_BATCH_SIZE &&
+    return !disabled && GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) && ne11 >= 2 && ne11 <= MMVF_MAX_BATCH_SIZE &&
         nrows >= 64 && nrows*ne11 <= 4096;
 }
 

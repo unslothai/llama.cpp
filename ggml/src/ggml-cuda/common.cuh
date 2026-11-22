@@ -67,6 +67,11 @@
 
 // datacenter Blackwell (sm_100 / sm_103: B200, B300); consumer Blackwell is GGML_CUDA_CC_BLACKWELL
 #define GGML_CUDA_CC_IS_BLACKWELL_DC(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000 && cc < 1100)
+// GPUs with the small-batch decode tuning (MMVF / vector FA at 2-8 tokens): NVIDIA from Turing on, except Hopper.
+// Measured faster on T4 (7.5), A100 (8.0), L4 (8.9), B200 (10.0), RTX PRO 6000 (12.0); Hopper (9.x) is not measured,
+// so it keeps the previous choice.
+#define GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && \
+    !(cc >= GGML_CUDA_CC_HOPPER && cc < 1000))
 
 // AMD
 // GCN/CDNA, wave size is 64
