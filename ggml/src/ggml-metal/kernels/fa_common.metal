@@ -15,7 +15,6 @@ constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
 
-// rel type: 0 - F32, 1 - F16
 constant int32_t FC_flash_attn_ext_rel_type [[function_constant(FC_FLASH_ATTN_EXT + 23)]];
 
 static inline float flash_attn_ext_rel_load(device const char * rel, int32_t i) {
@@ -434,7 +433,6 @@ void kernel_flash_attn_ext_impl(
                 }
 
                 // banded: the distance of column ic0*C + 2*tiisg is d0, of the next column d0 - 1
-                // note: the blk value classifies the mask only, so this does not depend on it
                 if (FC_flash_attn_ext_has_rel) {
                     const int32_t dmax = iq1 + j + args.q_off - ic0*C;
 
@@ -642,7 +640,6 @@ void kernel_flash_attn_ext_impl(
 
                 const float m = M[jj];
 
-                // per-query sinks use non-zero strides
                 const int32_t jq = min(iq1 + j, args.ne01 - 1);
                 const float s = tiisg == 0 ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2)) : -FLT_MAX/2;
 

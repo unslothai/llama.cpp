@@ -9,7 +9,6 @@ constant bool FC_flash_attn_ext_tensor_has_scap  [[function_constant(FC_FLASH_AT
 constant bool FC_flash_attn_ext_tensor_has_rel   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 4)]];
 constant bool FC_flash_attn_ext_tensor_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 5)]];
 
-// rel type: 0 - F32, 1 - F16
 constant int32_t FC_flash_attn_ext_tensor_rel_type [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 6)]];
 
 static inline float flash_attn_ext_tensor_rel_load(device const char * rel, int32_t i) {
@@ -159,7 +158,6 @@ kernel void kernel_flash_attn_ext_tensor(
 
     // the host guarantees ne11 % C == 0, unless has_kvpad
     for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += C) {
-        // the last partial chunk uses the pad buffer as source, read from offset 0
         const bool is_pad = FC_flash_attn_ext_tensor_has_kvpad && ic + C > args.ne11;
         const int  icr    = is_pad ? 0 : ic;
 
@@ -216,7 +214,6 @@ kernel void kernel_flash_attn_ext_tensor(
                 }
             }
 
-            // banded: the distance of column ic + ii*NW + tiisg is dmax - ii*NW - tiisg
             // add rel before the row max, else exp(s - M) can overflow
             if (FC_flash_attn_ext_tensor_has_rel) {
                 const int dmax = iq1 + j + args.q_off - ic;
@@ -314,7 +311,6 @@ kernel void kernel_flash_attn_ext_tensor(
         float ms = 1.0f;
 
         if (FC_flash_attn_ext_tensor_has_sinks) {
-            // per-query sinks use non-zero strides
             const int jq = min(iq1 + j, args.ne01 - 1);
             const float s = *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2));
             const float m = max(M[jj], s);

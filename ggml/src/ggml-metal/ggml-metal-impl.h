@@ -417,8 +417,8 @@ typedef struct {
     uint64_t nb31;
     uint64_t nb32;
     uint64_t nb33;
-    uint64_t nbk_row; // bytes of one K row (ne10 elements); nb11 can be larger, e.g. for an interleaved [D, Hkv, Nkv] cache
-    uint64_t nbv_row; // bytes of one V row (ne20 elements)
+    uint64_t nbk_row; // bytes of one K row; nb11 can be larger for an interleaved cache
+    uint64_t nbv_row;
 } ggml_metal_kargs_flash_attn_ext_pad;
 
 typedef struct {
@@ -465,12 +465,12 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
-    int32_t  ne_r0;   // rel extent (banded)
-    int32_t  q_off;   // ne11 - ne01
+    int32_t  ne_r0;
+    int32_t  q_off;
     uint64_t nb_r1;
     uint64_t nb_r2;
-    uint64_t nb_r3;   // 0 when rel is broadcast over ne03
-    uint64_t nb_s1;   // 0 when sinks are per head only
+    uint64_t nb_r3;
+    uint64_t nb_s1;
     uint64_t nb_s2;
 } ggml_metal_kargs_flash_attn_ext;
 

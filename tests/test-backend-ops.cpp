@@ -9296,7 +9296,7 @@ struct test_flash_attn_ext_banded : public test_case {
     const ggml_type rel_type;
     const bool strided;
     const bool interleaved; // K/V as a permuted [d, n_head_kv, n_kv] cache view: the row stride spans all KV heads
-    const int64_t n_head_v; // V heads when they differ from the K heads (0: same as n_head_kv)
+    const int64_t n_head_v;
 
     std::string vars() override {
         return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided) +
@@ -9411,7 +9411,6 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
-// large rel values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_banded_large_rel : public test_flash_attn_ext_banded_sinks {
     static constexpr int rel_range = 20;
 
@@ -9427,7 +9426,6 @@ struct test_flash_attn_ext_banded_large_rel : public test_flash_attn_ext_banded_
     }
 };
 
-// small extent and a tight tolerance, so that per-query sinks and the band edges are visible
 struct test_flash_attn_ext_banded_tight : public test_flash_attn_ext_banded_sinks {
     using test_flash_attn_ext_banded_sinks::test_flash_attn_ext_banded_sinks;
 
@@ -9442,13 +9440,13 @@ struct test_flash_attn_ext_banded_shapes : public test_case {
     const int mask_kind; // 0: all visible, 1: causal, 2: causal sliding window with dist < rel_extent
     const ggml_type kv_type;
     const int64_t n_seq;
-    const bool rel_bcast;       // rel_logits ne3 = 1
-    const bool mask_heads;      // mask ne2 = n_head (else 1)
-    const bool mask_seq_bcast;  // mask ne3 = 1 (else n_seq)
-    const int64_t mask_rows;    // mask ne1 (>= n_q)
-    const int64_t mask_cols;    // mask ne0 (>= n_kv)
-    const bool q_perm;          // Q as a permuted [d, n_head, n_q, n_seq] view
-    const bool sinks_seq;       // sinks ne2 = n_seq (else 1)
+    const bool rel_bcast;
+    const bool mask_heads;
+    const bool mask_seq_bcast;
+    const int64_t mask_rows;
+    const int64_t mask_cols;
+    const bool q_perm;
+    const bool sinks_seq;
 
     std::string vars() override {
         return VARS_TO_STR8(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type) + "," +
@@ -9501,7 +9499,6 @@ struct test_flash_attn_ext_banded_shapes : public test_case {
                                 const int64_t rel_dist = iq + (n_kv - n_q) - ik;
                                 bool visible = iq < n_q && ik < n_kv &&
                                     (mask_kind == 0 || (rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent)));
-                                // per head / sequence pattern, so that a wrong mask slice changes the result
                                 if (visible && rel_dist != 0 && (ik + 3*i2 + 5*i3) % 7 == 0) {
                                     visible = false;
                                 }
@@ -13736,7 +13733,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
-    // interleaved [d, n_head_kv, n_kv] K/V views (the KV cache layout) with a ragged n_kv: the pad pass must stay inside K/V
+    // interleaved K/V cache views with a ragged n_kv: the pad pass must stay inside K/V
     for (int64_t n_kv : { 72, 1000 }) {
         for (int mask_kind : { 0, 1 }) {
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 33, n_kv, 96, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2, false, true));
@@ -13755,7 +13752,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mask wider than K (the mask block classification must not use the mask width as the K length)
     test_cases.emplace_back(new test_flash_attn_ext_banded_shapes( 64, 1, 1, 16,   64,  8, 0, GGML_TYPE_F16, 1, false, false, false,  16,  128, false, false));
     test_cases.emplace_back(new test_flash_attn_ext_banded_shapes(128, 8, 2, 100, 1000, 96, 1, GGML_TYPE_F16, 1, false, false, false, 100, 1037, false, false));
-    // K and V with different head counts (each broadcast to the Q heads on its own); backends may refuse these
     test_cases.emplace_back(new test_flash_attn_ext_banded      ( 64, 8, 2,  8,  64,  8, 1, GGML_TYPE_F16, GGML_TYPE_F32, false, false, 1));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 4, 33, 100, 16, 2, GGML_TYPE_F16, GGML_TYPE_F32, 2, false, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 33, 100, 16, 1, GGML_TYPE_F16, GGML_TYPE_F32, 1, false, false, 4));

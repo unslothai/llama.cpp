@@ -3201,7 +3201,6 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    // banded attention runs on the half8x8 or the tensor kernel
     if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;
     }
@@ -3277,7 +3276,6 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
         return false;
     }
 
-    // banded attention handles a partial last chunk with the pad buffer
     if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return true;
     }
@@ -3486,7 +3484,6 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 
     size_t res = 0;
 
-    // banded: never runs the vec kernel, so there are no per-workgroup results to reduce
     if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return res;
     }
@@ -3514,8 +3511,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //    return 0;
     //}
 
-    // banded: supports_op refuses quantized K/V, so the F16 copy of K and V is never made
-    // reserving it would cost 781 MiB at 200K cells for 8 KV heads of 128
+    // banded: supports_op refuses quantized K/V, so no F16 copy of K/V is needed
     if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
         return 0;
     }
@@ -3649,7 +3645,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(!has_rel || rel->type == GGML_TYPE_F32 || rel->type == GGML_TYPE_F16);
     GGML_ASSERT(!has_rel || rel->nb[0] == ggml_type_size(rel->type));
 
-    // 0 - F32, 1 - F16
     const int32_t rel_type = has_rel && rel->type == GGML_TYPE_F16 ? 1 : 0;
 
     const int32_t  ne_r0 = has_rel ? (int32_t) rel->ne[0] : 0;
@@ -3657,7 +3652,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const uint64_t nb_r2 = has_rel ? rel->nb[2] : 0;
     const uint64_t nb_r3 = has_rel && rel->ne[3] > 1 ? rel->nb[3] : 0;
 
-    // per-query sinks (banded); a zero stride broadcasts
     const uint64_t nb_s1 = has_sinks && op->src[4]->ne[1] > 1 ? op->src[4]->nb[1] : 0;
     const uint64_t nb_s2 = has_sinks && op->src[4]->ne[2] > 1 ? op->src[4]->nb[2] : 0;
 
@@ -3730,7 +3724,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     uint64_t nb22_attn = nb22;
     uint64_t nb23_attn = nb23;
 
-    // element types of the K/V the pad and attention kernels read (F16 after a dequant or a row gather)
     ggml_type type_k_attn = op->src[1]->type;
     ggml_type type_v_attn = op->src[2]->type;
 
@@ -3892,7 +3885,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    // copy the last partial chunk of K, V and the mask to the pad buffer
     auto encode_pad = [&](int32_t ncpsg) {
         assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
 
@@ -3942,7 +3934,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const int ncpsg = OP_FLASH_ATTN_EXT_TENSOR_NCPSG; // cache values per threadgroup
         const int nsg   = OP_FLASH_ATTN_EXT_TENSOR_NSG;
 
-        // the pad buffer is sized for OP_FLASH_ATTN_EXT_NCPSG items
         static_assert(OP_FLASH_ATTN_EXT_TENSOR_NCPSG == OP_FLASH_ATTN_EXT_NCPSG, "pad buffer size");
 
         bool need_sync = false;

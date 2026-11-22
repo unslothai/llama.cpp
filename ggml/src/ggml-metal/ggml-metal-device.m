@@ -1826,7 +1826,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
-                // no vec kernel: the half8x8 or tensor kernel runs for any number of queries
                 const struct ggml_tensor * mask  = op->src[3];
                 const struct ggml_tensor * sinks = op->src[4];
                 const struct ggml_tensor * rel   = op->src[6];
@@ -1837,7 +1836,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[2]->ne[0] != op->src[1]->ne[0]) {
                     return false;
                 }
-                // both kernels take the V head from the K broadcast factor (iq2/(ne02/ne12))
                 if (op->src[2]->ne[2] != op->src[1]->ne[2]) {
                     return false;
                 }
