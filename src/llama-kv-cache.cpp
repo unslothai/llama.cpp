@@ -1346,6 +1346,12 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
         }
     }
 
+    // fast O(1) amortized check for the common single-slot case (c0 == 0)
+    if (!cells.is_empty(0) && cells.seq_has(0, seq_id)) {
+        const uint32_t need = (uint32_t) pos_max + 1;
+        return cells.seq_contig_prefix(seq_id, need) < need ? 0 : need;
+    }
+
     // the sequence must be one run of cells c0 + pos, pos = 0..pos_max; the cells before c0 hold other sequences
     // (several slots in a unified cache) and are masked, so the distances stay cell differences
     uint32_t c0 = 0;

@@ -92,6 +92,7 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
             std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
+            seq_contig_len[s] = 0;
         }
     }
 
@@ -442,6 +443,19 @@ public:
         return seq_pos[seq_id].size();
     }
 
+    // O(1) amortized check: largest prefix N <= limit where cell i has pos[i] == i and contains seq_id
+    uint32_t seq_contig_prefix(llama_seq_id seq_id, uint32_t limit) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+        const uint32_t cap = std::min<uint32_t>(limit, (uint32_t) pos.size());
+        uint32_t n = seq_contig_len[seq_id];
+        while (n < cap && pos[n] == (llama_pos) n && seq[n].test(seq_id)) {
+            ++n;
+        }
+        seq_contig_len[seq_id] = n;
+        return n;
+    }
+
     // number of cells that contain seq_id at a position >= p_min
     uint32_t seq_n_cells(llama_seq_id seq_id, llama_pos p_min) const {
         assert(seq_id >= 0);
@@ -658,6 +672,9 @@ private:
     // allocated on the first cell of the sequence, so the copies made by cp() never allocate it
     std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
 
+    // cached prefix length where cells [0..n) satisfy pos[i] == i and seq[i].test(s)
+    mutable uint32_t seq_contig_len[LLAMA_MAX_SEQ] = {};
+
     // helper functions for updating `seq_pos` and `seq_bits`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
@@ -666,6 +683,9 @@ private:
         GGML_UNUSED(n);
 
         seq_bits[s][i/64] &= ~(1ull << (i%64));
+        if (i < seq_contig_len[s]) {
+            seq_contig_len[s] = i;
+        }
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
@@ -676,6 +696,11 @@ private:
         }
 
         seq_bits[s][i/64] |= 1ull << (i%64);
+        if (i == seq_contig_len[s] && pos[i] == (llama_pos) i) {
+            ++seq_contig_len[s];
+        } else if (i < seq_contig_len[s] && pos[i] != (llama_pos) i) {
+            seq_contig_len[s] = i;
+        }
     }
 
     // remove cell i

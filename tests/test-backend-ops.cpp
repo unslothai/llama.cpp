@@ -9445,6 +9445,57 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded_sinks {
+    const ggml_type v_type;
+    const int32_t   q_pos_val;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",v_type=" + ggml_type_name(v_type) + ",q_pos=" + std::to_string(q_pos_val);
+    }
+
+    test_flash_attn_ext_banded_pos(
+            int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_kv, int64_t rel_extent,
+            ggml_type k_type, ggml_type v_type, int32_t q_pos_val)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, 1, n_kv, rel_extent, 0, k_type, GGML_TYPE_F32, 2, false),
+          v_type(v_type), q_pos_val(q_pos_val) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, 1, n_head, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, v_type,  d, n_kv, n_head_kv, 1);
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, 1, 1);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, 1);
+        ggml_tensor * p = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(r, "rel_logits");
+        ggml_set_name(s, "sinks");
+        ggml_set_name(p, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, nullptr, r, 1.0f/float(d), rel_extent);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_banded_add_pos(out, p);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, &q_pos_val, 0, sizeof(q_pos_val));
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13653,6 +13704,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    // single-token decode with device q_pos over padded KV (mask == nullptr; tail past q_pos must be ignored)
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 8192, 1024, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 5123));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_F16,  GGML_TYPE_F16,  3000));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_BF16, GGML_TYPE_BF16, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 24, 8, 4096, 1024, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1, 3000));
+    // small-batch (n_q = 2, 8) quantized banded MMA at >= 4096 KV
+    for (int64_t n_q : { 2, 8 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 1, GGML_TYPE_Q4_0, GGML_TYPE_F32, 2));
+    }
 
     // mask broadcast over Q heads and batches
     for (bool sinks : { false, true }) {

@@ -1,9 +1,11 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "fattn-common.cuh"
 #include "fattn-banded.cuh"
 #include "fattn.cuh"
 
 #include <algorithm>
+#include <cfloat>
 #include <cstdint>
 
 static __device__ __forceinline__ float fattn_banded_load(
@@ -30,6 +32,7 @@ static __global__ void flash_attn_ext_banded_f32(
         const char * __restrict__ v,
         const char * __restrict__ mask,
         const char * __restrict__ rel,
+        const int32_t * __restrict__ q_pos_d,
         float      * __restrict__ dst,
         float scale,
         int type_k,
@@ -93,9 +96,11 @@ static __global__ void flash_attn_ext_banded_f32(
 
     float row_max = -INFINITY;
     float row_sum = 0.0f;
-    const int64_t q_offset = n_kv - n_q;
+    const int64_t q_pos_val = (q_pos_d && n_q == 1) ? int64_t(q_pos_d[0]) : -1;
+    const int64_t q_offset  = (q_pos_val >= 0) ? q_pos_val : (n_kv - n_q);
+    const int64_t k_end     = (q_pos_val >= 0 && q_pos_val + 1 < n_kv) ? (q_pos_val + 1) : n_kv;
 
-    for (int64_t ik = 0; ik < n_kv; ++ik) {
+    for (int64_t ik = 0; ik < k_end; ++ik) {
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
@@ -184,6 +189,7 @@ static __global__ void flash_attn_ext_banded_f32_split(
         const char * __restrict__ v,
         const char * __restrict__ mask,
         const char * __restrict__ rel,
+        const int32_t * __restrict__ q_pos_d,
         float      * __restrict__ part,
         float scale,
         int type_k,
@@ -241,9 +247,11 @@ static __global__ void flash_attn_ext_banded_f32_split(
 
     float row_max = -INFINITY;
     float row_sum = 0.0f;
-    const int64_t q_offset = n_kv - n_q;
+    const int64_t q_pos_val = (q_pos_d && n_q == 1) ? int64_t(q_pos_d[0]) : -1;
+    const int64_t q_offset  = (q_pos_val >= 0) ? q_pos_val : (n_kv - n_q);
+    const int64_t k_end     = (q_pos_val >= 0 && q_pos_val + 1 < n_kv) ? (q_pos_val + 1) : n_kv;
     const int64_t ik0 = ic*chunk;
-    const int64_t ik1 = ik0 + chunk < n_kv ? ik0 + chunk : n_kv;
+    const int64_t ik1 = ik0 + chunk < k_end ? ik0 + chunk : k_end;
 
     for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
@@ -972,9 +980,21 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
         return false;
     }
+    const ggml_tensor * q_pos = dst->src[7];
+    if (q_pos && (q_pos->type != GGML_TYPE_I32 || q->ne[1] != 1 || q->ne[3] != 1)) {
+        return false;
+    }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
+}
+
+static bool fattn_banded_decode_disabled() {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_BANDED_DECODE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
 }
 
 static constexpr int64_t fattn_banded_mma_min_q = 16;
@@ -997,7 +1017,9 @@ static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
-    if (q->ne[1] < fattn_banded_mma_min_q) {
+    const bool quant_tiles = k->type == v->type && fattn_banded_mma_tile_type(k->type);
+    const int64_t min_q = (!fattn_banded_decode_disabled() && quant_tiles && k->ne[1] >= 4096) ? 2 : fattn_banded_mma_min_q;
+    if (q->ne[1] < min_q) {
         return false;
     }
     for (const ggml_tensor * t : {k, v}) {
@@ -1171,6 +1193,515 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 }
 
+// ---------------------------------------------------------------------------
+// High-occupancy GQA-grouped dp4a + half2 single-token banded decode kernel (D == 128)
+// - Full 32-key tiles use #pragma unroll with zero mask/rel branches on old global KV tiles
+// - Loads each K and V row ONCE for all GQA query heads (3x less KV DRAM traffic!)
+// - Uses half2 VKQ accumulators + FATTN_KQ_MAX_OFFSET (matching fattn-vec.cuh) for hfma2 speed
+// - Bounds KV dynamically via device q_pos[0] for CUDA graph reuse on padded KV caches
+// ---------------------------------------------------------------------------
+
+template <ggml_type type_K, int GQA>
+static __device__ __forceinline__ void fattn_banded_vec_dot_k_gqa(
+        const char * __restrict__ k_row,
+        const half2 (&Q_reg)[GQA][2],
+        const int   (&Q_i32)[GQA],
+        const float2 (&Q_ds)[GQA],
+        float (&dots)[GQA]) {
+    const int lane = threadIdx.x;
+    if constexpr (type_K == GGML_TYPE_Q8_0) {
+        const block_q8_0 * K_q8 = (const block_q8_0 *) k_row;
+        const int ib  = lane / QI8_0;
+        const int iqs = lane % QI8_0;
+        int v;
+        ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K_q8[ib].qs + 4 * iqs);
+        const float kd = __half2float(K_q8[ib].d);
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            const int sumi = ggml_cuda_dp4a(v, Q_i32[g], 0);
+            dots[g] = float(sumi) * (kd * Q_ds[g].x);
+        }
+    } else if constexpr (type_K == GGML_TYPE_Q4_0) {
+        const block_q4_0 * K_q4 = (const block_q4_0 *) k_row;
+        const int ib    = lane / QI8_1;
+        const int iqs4  = lane % QI4_0;
+        const int shift = lane & (QI8_1 / 2);
+        int v;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4[ib].qs + sizeof(int) * iqs4);
+        v = (v >> shift) & 0x0F0F0F0F;
+        const float kd = __half2float(K_q4[ib].d);
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            const int sumi = ggml_cuda_dp4a(v, Q_i32[g], 0);
+            dots[g] = kd * (float(sumi) * Q_ds[g].x - (8.0f / float(QI8_1)) * Q_ds[g].y);
+        }
+    } else {
+        // F16 K
+        const half2 * K_h2 = (const half2 *) k_row;
+        __align__(16) half2 kv[2];
+        ggml_cuda_memcpy_1<sizeof(kv)>(kv, K_h2 + lane * 2);
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            float s = 0.0f;
+            ggml_cuda_mad(s, kv[0], Q_reg[g][0]);
+            ggml_cuda_mad(s, kv[1], Q_reg[g][1]);
+            dots[g] = s;
+        }
+    }
+}
+
+template <int D, int GQA, ggml_type type_K, ggml_type type_V, bool has_chunks, bool has_mask>
+__launch_bounds__(128, 4)
+static __global__ void flash_attn_ext_banded_vec_gqa(
+        const char  * __restrict__ Q,
+        const char  * __restrict__ K,
+        const char  * __restrict__ V,
+        const half  * __restrict__ maskh,
+        const float * __restrict__ rel_f,
+        const float * __restrict__ sinks_f,
+        const int32_t * __restrict__ q_pos_d,
+        float       * __restrict__ dst,
+        float       * __restrict__ part,
+        const float scale,
+        const int32_t n_kv,
+        const int32_t n_head_q,
+        const int32_t n_head_kv,
+        const int32_t n_chunks,
+        const int32_t rel_extent,
+        const int64_t q_nb2,
+        const int64_t k_nb1,
+        const int64_t k_nb2,
+        const int64_t v_nb1,
+        const int64_t v_nb2,
+        const int64_t rel_s1) {
+    static_assert(D == 128, "banded vec GQA kernel specialized for D == 128");
+    constexpr int nthreads = 128;
+    constexpr int nwarps   = 4;
+    constexpr int V_rows_per_thread = 4; // 32 * 4 = 128
+
+    constexpr bool Q_q8_1 = (type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && type_K != GGML_TYPE_F8_E4M3);
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half, V_rows_per_thread>();
+#else
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+#endif
+
+    const int lane = threadIdx.x; // 0..31
+    const int warp = threadIdx.y; // 0..3
+    const int tid  = warp * WARP_SIZE + lane;
+
+    const int kv_head = (GQA == 1) ? ((int) blockIdx.z / (n_head_q / n_head_kv)) : (int) blockIdx.z;
+    const int head0   = (GQA == 1) ? (int) blockIdx.z : (kv_head * GQA);
+
+    const int q_pos_val = q_pos_d ? q_pos_d[0] : (n_kv - 1);
+    const int k_end_raw = q_pos_val + 1;
+    const int k_end     = k_end_raw < 0 ? 0 : (k_end_raw < n_kv ? k_end_raw : n_kv);
+
+    K += int64_t(kv_head) * k_nb2;
+    V += int64_t(kv_head) * v_nb2;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    __shared__ half  KQ_s[GQA * nthreads];
+#else
+    __shared__ float KQ_s[GQA * nthreads];
+#endif
+    __shared__ float s_vkq[nwarps][D];
+    __shared__ float s_max[GQA][nwarps];
+    __shared__ float s_sum[GQA][nwarps];
+
+    half2  Q_reg[GQA][2];
+    int    Q_i32[GQA];
+    float2 Q_ds[GQA];
+
+    if constexpr (Q_q8_1) {
+        if (warp < GQA) {
+            int    * tmp_i32 = (int    *) &s_vkq[warp][0];
+            float2 * tmp_ds  = (float2 *) (tmp_i32 + D / sizeof(int));
+            const float * Q_f = (const float *) (Q + int64_t(head0 + warp) * q_nb2);
+            quantize_q8_1_to_shared<float2, WARP_SIZE>(Q_f, scale, tmp_i32, tmp_ds);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            const int    * tmp_i32 = (const int    *) &s_vkq[g][0];
+            const float2 * tmp_ds  = (const float2 *) (tmp_i32 + D / sizeof(int));
+            Q_i32[g] = tmp_i32[lane];
+            Q_ds[g]  = tmp_ds[lane / QI8_1];
+        }
+        __syncthreads();
+    } else {
+        const half2 scale_h2 = make_half2(scale, scale);
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            const float2 * Q_f2 = (const float2 *) (Q + int64_t(head0 + g) * q_nb2);
+            const float2 q0 = Q_f2[lane * 2 + 0];
+            const float2 q1 = Q_f2[lane * 2 + 1];
+            Q_reg[g][0] = __hmul2(make_half2(q0.x, q0.y), scale_h2);
+            Q_reg[g][1] = __hmul2(make_half2(q1.x, q1.y), scale_h2);
+        }
+    }
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    half2  VKQ[GQA][2];
+#else
+    float2 VKQ[GQA][2];
+#endif
+    float  KQ_max[GQA];
+    float  KQ_sum[GQA];
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        VKQ[g][0] = make_half2(0.0f, 0.0f);
+        VKQ[g][1] = make_half2(0.0f, 0.0f);
+#else
+        VKQ[g][0] = make_float2(0.0f, 0.0f);
+        VKQ[g][1] = make_float2(0.0f, 0.0f);
+#endif
+        KQ_max[g] = -FLT_MAX / 2.0f;
+        KQ_sum[g] = 0.0f;
+    }
+
+    const int k_step = (int) gridDim.y * nthreads;
+    for (int k_VKQ_0 = (int) blockIdx.y * nthreads; k_VKQ_0 < k_end; k_VKQ_0 += k_step) {
+        const int k_base = k_VKQ_0 + warp * WARP_SIZE;
+        if (k_base >= k_end) {
+            break;
+        }
+
+        float KQ_reg[GQA];
+        float KQ_max_new[GQA];
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            KQ_reg[g]     = -FLT_MAX / 2.0f;
+            KQ_max_new[g] = KQ_max[g];
+        }
+
+        const bool full_tile = (k_base + WARP_SIZE <= k_end);
+        const bool tile_has_rel = (q_pos_val - (k_base + WARP_SIZE - 1) < rel_extent) && (q_pos_val - k_base >= 0);
+
+        if (full_tile && !tile_has_rel && !has_mask) {
+            // Fast path: 99%+ of all global KV tiles at 32K-512K! Zero branches, fully unrolled!
+            const char * k_ptr = K + int64_t(k_base) * k_nb1;
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < WARP_SIZE; ++i_KQ_0) {
+                float dots[GQA];
+                fattn_banded_vec_dot_k_gqa<type_K, GQA>(k_ptr + int64_t(i_KQ_0) * k_nb1, Q_reg, Q_i32, Q_ds, dots);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    const float sum = warp_reduce_sum<WARP_SIZE>(dots[g]);
+                    KQ_max_new[g] = fmaxf(KQ_max_new[g], sum + FATTN_KQ_MAX_OFFSET);
+                    if (lane == i_KQ_0) {
+                        KQ_reg[g] = sum;
+                    }
+                }
+            }
+        } else {
+            const int k_tile_end = full_tile ? WARP_SIZE : (k_end - k_base);
+            for (int i_KQ_0 = 0; i_KQ_0 < k_tile_end; ++i_KQ_0) {
+                const int ik = k_base + i_KQ_0;
+                float mval = 0.0f;
+                if constexpr (has_mask) {
+                    mval = __half2float(maskh[ik]);
+                    if (mval <= -FLT_MAX / 4.0f) {
+                        continue;
+                    }
+                }
+                float dots[GQA];
+                fattn_banded_vec_dot_k_gqa<type_K, GQA>(K + int64_t(ik) * k_nb1, Q_reg, Q_i32, Q_ds, dots);
+                const int rel_dist = q_pos_val - ik;
+                const bool has_rel = tile_has_rel && (rel_dist >= 0 && rel_dist < rel_extent);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    float sum = warp_reduce_sum<WARP_SIZE>(dots[g]);
+                    if (has_rel) {
+                        sum += rel_f[int64_t(head0 + g) * rel_s1 + rel_dist];
+                    }
+                    if constexpr (has_mask) {
+                        sum += mval;
+                    }
+                    KQ_max_new[g] = fmaxf(KQ_max_new[g], sum + FATTN_KQ_MAX_OFFSET);
+                    if (lane == i_KQ_0) {
+                        KQ_reg[g] = sum;
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            const float KQ_max_scale = (KQ_max_new[g] > KQ_max[g]) ? __expf(KQ_max[g] - KQ_max_new[g]) : 1.0f;
+            KQ_max[g] = KQ_max_new[g];
+            const float p = (KQ_reg[g] > -FLT_MAX / 4.0f) ? __expf(KQ_reg[g] - KQ_max[g]) : 0.0f;
+            KQ_sum[g] = KQ_sum[g] * KQ_max_scale + p;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            KQ_s[g * nthreads + tid] = __float2half(p);
+            const half2 sc_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+            VKQ[g][0] = __hmul2(VKQ[g][0], sc_h2);
+            VKQ[g][1] = __hmul2(VKQ[g][1], sc_h2);
+#else
+            KQ_s[g * nthreads + tid] = p;
+            VKQ[g][0].x *= KQ_max_scale; VKQ[g][0].y *= KQ_max_scale;
+            VKQ[g][1].x *= KQ_max_scale; VKQ[g][1].y *= KQ_max_scale;
+#endif
+        }
+
+        ggml_cuda_syncwarp();
+
+        if (full_tile && !has_mask) {
+            const char * v_ptr = V + int64_t(k_base) * v_nb1;
+#pragma unroll
+            for (int k0 = 0; k0 < WARP_SIZE; ++k0) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                half2 tmp[2];
+                dequantize_V(v_ptr + int64_t(k0) * v_nb1, tmp, lane * 4);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    const half2 wg = __half2half2(KQ_s[g * nthreads + warp * WARP_SIZE + k0]);
+                    VKQ[g][0] = __hfma2(tmp[0], wg, VKQ[g][0]);
+                    VKQ[g][1] = __hfma2(tmp[1], wg, VKQ[g][1]);
+                }
+#else
+                float2 tmp[2];
+                dequantize_V(v_ptr + int64_t(k0) * v_nb1, tmp, lane * 4);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    const float wg = KQ_s[g * nthreads + warp * WARP_SIZE + k0];
+                    VKQ[g][0].x = fmaf(tmp[0].x, wg, VKQ[g][0].x);
+                    VKQ[g][0].y = fmaf(tmp[0].y, wg, VKQ[g][0].y);
+                    VKQ[g][1].x = fmaf(tmp[1].x, wg, VKQ[g][1].x);
+                    VKQ[g][1].y = fmaf(tmp[1].y, wg, VKQ[g][1].y);
+                }
+#endif
+            }
+        } else {
+            const int k_tile_end = full_tile ? WARP_SIZE : (k_end - k_base);
+            for (int k0 = 0; k0 < k_tile_end; ++k0) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                half2 tmp[2];
+                dequantize_V(V + int64_t(k_base + k0) * v_nb1, tmp, lane * 4);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    const half2 wg = __half2half2(KQ_s[g * nthreads + warp * WARP_SIZE + k0]);
+                    VKQ[g][0] = __hfma2(tmp[0], wg, VKQ[g][0]);
+                    VKQ[g][1] = __hfma2(tmp[1], wg, VKQ[g][1]);
+                }
+#else
+                float2 tmp[2];
+                dequantize_V(V + int64_t(k_base + k0) * v_nb1, tmp, lane * 4);
+#pragma unroll
+                for (int g = 0; g < GQA; ++g) {
+                    const float wg = KQ_s[g * nthreads + warp * WARP_SIZE + k0];
+                    VKQ[g][0].x = fmaf(tmp[0].x, wg, VKQ[g][0].x);
+                    VKQ[g][0].y = fmaf(tmp[0].y, wg, VKQ[g][0].y);
+                    VKQ[g][1].x = fmaf(tmp[1].x, wg, VKQ[g][1].x);
+                    VKQ[g][1].y = fmaf(tmp[1].y, wg, VKQ[g][1].y);
+                }
+#endif
+            }
+        }
+
+        ggml_cuda_syncwarp();
+    }
+
+    // Reduce across the 4 warps per Q head
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+        const float sum_w = warp_reduce_sum(KQ_sum[g]);
+        if (lane == 0) {
+            s_max[g][warp] = (KQ_max[g] <= -FLT_MAX / 4.0f) ? -INFINITY : KQ_max[g];
+            s_sum[g][warp] = (KQ_max[g] <= -FLT_MAX / 4.0f) ? 0.0f : sum_w;
+        }
+    }
+
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 v0 = __half22float2(VKQ[g][0]);
+        const float2 v1 = __half22float2(VKQ[g][1]);
+        s_vkq[warp][lane * 4 + 0] = v0.x;
+        s_vkq[warp][lane * 4 + 1] = v0.y;
+        s_vkq[warp][lane * 4 + 2] = v1.x;
+        s_vkq[warp][lane * 4 + 3] = v1.y;
+#else
+        s_vkq[warp][lane * 4 + 0] = VKQ[g][0].x;
+        s_vkq[warp][lane * 4 + 1] = VKQ[g][0].y;
+        s_vkq[warp][lane * 4 + 2] = VKQ[g][1].x;
+        s_vkq[warp][lane * 4 + 3] = VKQ[g][1].y;
+#endif
+        __syncthreads();
+
+        if (warp == 0) {
+            float m = -INFINITY;
+#pragma unroll
+            for (int w = 0; w < nwarps; ++w) {
+                m = fmaxf(m, s_max[g][w]);
+            }
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            float sum = 0.0f;
+            if (m != -INFINITY) {
+#pragma unroll
+                for (int w = 0; w < nwarps; ++w) {
+                    if (s_max[g][w] == -INFINITY) {
+                        continue;
+                    }
+                    const float f = __expf(s_max[g][w] - m);
+                    sum  += s_sum[g][w] * f;
+                    acc0 += s_vkq[w][lane * 4 + 0] * f;
+                    acc1 += s_vkq[w][lane * 4 + 1] * f;
+                    acc2 += s_vkq[w][lane * 4 + 2] * f;
+                    acc3 += s_vkq[w][lane * 4 + 3] * f;
+                }
+            }
+            const int ih = head0 + g;
+            if constexpr (!has_chunks) {
+                if (sinks_f) {
+                    const float sink = sinks_f[ih];
+                    if (sink > m) {
+                        const float f = (m == -INFINITY) ? 0.0f : __expf(m - sink);
+                        acc0 *= f; acc1 *= f; acc2 *= f; acc3 *= f;
+                        sum = sum * f + 1.0f;
+                        m = sink;
+                    } else {
+                        sum += __expf(sink - m);
+                    }
+                }
+                const float inv_sum = (sum == 0.0f) ? 0.0f : (1.0f / sum);
+                float * dst_row = dst + int64_t(ih) * D;
+                dst_row[lane * 4 + 0] = acc0 * inv_sum;
+                dst_row[lane * 4 + 1] = acc1 * inv_sum;
+                dst_row[lane * 4 + 2] = acc2 * inv_sum;
+                dst_row[lane * 4 + 3] = acc3 * inv_sum;
+            } else {
+                float * p = part + (int64_t(ih) * n_chunks + (int64_t) blockIdx.y) * (D + 2);
+                if (lane == 0) {
+                    p[0] = m;
+                    p[1] = sum;
+                }
+                p[2 + lane * 4 + 0] = acc0;
+                p[2 + lane * 4 + 1] = acc1;
+                p[2 + lane * 4 + 2] = acc2;
+                p[2 + lane * 4 + 3] = acc3;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+static bool fattn_banded_vec_gqa_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+    if (fattn_banded_decode_disabled()) {
+        return false;
+    }
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * m     = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rel   = dst->src[6];
+    const ggml_tensor * q_pos = dst->src[7];
+
+    if (q->ne[0] != 128 || q->ne[1] != 1 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float) ||
+            rel->type != GGML_TYPE_F32 || rel->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (m && (m->type != GGML_TYPE_F16 || m->ne[2] != 1 || m->ne[3] != 1)) {
+        return false;
+    }
+    if (q->ne[2] % k->ne[2] != 0) {
+        return false;
+    }
+    const bool kv_ok =
+        (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0) ||
+        (k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0) ||
+        (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0) ||
+        (k->type == GGML_TYPE_F16  && v->type == GGML_TYPE_F16);
+    if (!kv_ok) {
+        return false;
+    }
+
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_q  = q->ne[2];
+    const int64_t n_head_kv = k->ne[2];
+    const int64_t gqa       = n_head_q / n_head_kv;
+    const int     use_gqa   = (gqa == 3) ? 3 : 1;
+    const int64_t n_z       = (use_gqa == 3) ? n_head_kv : n_head_q;
+
+    // Split KV aggressively to saturate all SMs (target ~6 blocks/SM for deep contexts,
+    // and 1 chunk for tiny <= 256 contexts to avoid merge launch overhead).
+    const int64_t nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    int64_t n_chunks = 1;
+    if (n_kv > 256) {
+        const int64_t target_blocks = 6 * nsm;
+        n_chunks = std::max<int64_t>(1, (target_blocks + n_z - 1) / n_z);
+        n_chunks = std::min<int64_t>(n_chunks, std::max<int64_t>(1, n_kv / 256));
+        n_chunks = std::min<int64_t>(n_chunks, 64);
+    }
+
+    ggml_cuda_pool_alloc<float> part(ctx.pool());
+    if (n_chunks > 1) {
+        part.alloc(n_head_q * n_chunks * (128 + 2));
+    }
+
+    const half    * maskh   = m     ? (const half    *) m->data     : nullptr;
+    const float   * rel_f   = (const float *) rel->data;
+    const float   * sinks_f = sinks ? (const float   *) sinks->data : nullptr;
+    const int32_t * q_pos_d = q_pos ? (const int32_t *) q_pos->data : nullptr;
+    const int64_t   rel_s1  = (int64_t) (rel->nb[1] / sizeof(float));
+
+    const dim3 grid(1, (unsigned int) n_chunks, (unsigned int) n_z);
+    const dim3 block(32, 4, 1);
+    cudaStream_t stream = ctx.stream();
+
+#define LAUNCH_VEC_GQA(G, TK, TV, HC, HM) \
+    flash_attn_ext_banded_vec_gqa<128, G, TK, TV, HC, HM><<<grid, block, 0, stream>>>( \
+        (const char *) q->data, (const char *) k->data, (const char *) v->data, \
+        maskh, rel_f, sinks_f, q_pos_d, (float *) dst->data, part.get(), \
+        scale, (int32_t) n_kv, (int32_t) n_head_q, (int32_t) n_head_kv, (int32_t) n_chunks, (int32_t) rel_extent, \
+        (int64_t) q->nb[2], (int64_t) k->nb[1], (int64_t) k->nb[2], \
+        (int64_t) v->nb[1], (int64_t) v->nb[2], rel_s1)
+
+#define DISPATCH_VEC_KV(G, HC, HM) \
+    if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0) { \
+        LAUNCH_VEC_GQA(G, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, HC, HM); \
+    } else if (k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0) { \
+        LAUNCH_VEC_GQA(G, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, HC, HM); \
+    } else if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0) { \
+        LAUNCH_VEC_GQA(G, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, HC, HM); \
+    } else { \
+        LAUNCH_VEC_GQA(G, GGML_TYPE_F16,  GGML_TYPE_F16,  HC, HM); \
+    }
+
+#define DISPATCH_VEC_MASK(G, HC) \
+    if (maskh != nullptr) { DISPATCH_VEC_KV(G, HC, true);  } \
+    else                  { DISPATCH_VEC_KV(G, HC, false); }
+
+    if (use_gqa == 3) {
+        if (n_chunks > 1) { DISPATCH_VEC_MASK(3, true);  }
+        else              { DISPATCH_VEC_MASK(3, false); }
+    } else {
+        if (n_chunks > 1) { DISPATCH_VEC_MASK(1, true);  }
+        else              { DISPATCH_VEC_MASK(1, false); }
+    }
+#undef DISPATCH_VEC_MASK
+#undef DISPATCH_VEC_KV
+#undef LAUNCH_VEC_GQA
+    CUDA_CHECK(cudaGetLastError());
+
+    if (n_chunks > 1) {
+        constexpr int merge_warps = 4;
+        const dim3 mblocks((n_head_q + merge_warps - 1) / merge_warps, 1, 1);
+        const dim3 mthreads(merge_warps * WARP_SIZE, 1, 1);
+        flash_attn_ext_banded_f32_merge<128><<<mblocks, mthreads, 0, stream>>>(
+            part.get(), (float *) dst->data, n_head_q, n_head_q, 1, n_chunks,
+            sinks_f,
+            sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0,
+            sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0);
+    }
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_flash_attn_ext_banded_supported(ctx.device, dst));
 
@@ -1182,7 +1713,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * sinks = dst->src[4];
 
     // only the MMA kernel reads src[6]; delegating otherwise drops the bias
-    if (ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
+    if (!dst->src[7] && ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
         ggml_cuda_flash_attn_ext(ctx, dst);
         return;
     }
@@ -1192,7 +1723,11 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     // the tensor extent (not op_params) is authoritative after graph cloning
     const int64_t rel_extent = rel->ne[0];
 
-    if (sinks && fattn_banded_mma_usable(ctx.device, dst)) {
+    if (q->ne[1] == 1 && q->ne[3] == 1 && fattn_banded_vec_gqa_launch(ctx, dst, scale, rel_extent)) {
+        return;
+    }
+
+    if (!dst->src[7] && sinks && fattn_banded_mma_usable(ctx.device, dst)) {
         fattn_banded_mma_launch(ctx, dst, scale, rel_extent);
         return;
     }
@@ -1208,6 +1743,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     if (!fattn_banded_type_supported(v->type)) {
         v = fattn_banded_kv_to_f16_tensor(ctx, v, v_f16, v_f16_t);
     }
+
+    const ggml_tensor * q_pos = dst->src[7];
+    const int32_t * q_pos_d = q_pos ? (const int32_t *) q_pos->data : nullptr;
 
     {
         constexpr int split_warps   = 4;
@@ -1231,7 +1769,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
 #define LAUNCH_SPLIT(DD) \
             flash_attn_ext_banded_f32_split<DD, split_warps><<<sblocks, sthreads, 0, stream>>>( \
                 (const char *) q->data, (const char *) k->data, (const char *) v->data, \
-                m ? (const char *) m->data : nullptr, (const char *) rel->data, part.get(), \
+                m ? (const char *) m->data : nullptr, (const char *) rel->data, q_pos_d, part.get(), \
                 scale, k->type, v->type, rel->type, q->ne[1], n_kv, q->ne[2], k->ne[2], n_chunks, chunk, \
                 rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
                 q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
@@ -1261,7 +1799,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
 #define LAUNCH_BANDED(D) \
     flash_attn_ext_banded_f32<D, warps_per_block><<<blocks, threads, 0, stream>>>( \
         (const char *) q->data, (const char *) k->data, (const char *) v->data, \
-        m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
+        m ? (const char *) m->data : nullptr, (const char *) rel->data, q_pos_d, (float *) dst->data, \
         scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
         rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
