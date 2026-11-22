@@ -417,6 +417,8 @@ typedef struct {
     uint64_t nb31;
     uint64_t nb32;
     uint64_t nb33;
+    uint64_t nbk_row; // bytes of one K row (ne10 elements); nb11 can be larger, e.g. for an interleaved [D, Hkv, Nkv] cache
+    uint64_t nbv_row; // bytes of one V row (ne20 elements)
 } ggml_metal_kargs_flash_attn_ext_pad;
 
 typedef struct {

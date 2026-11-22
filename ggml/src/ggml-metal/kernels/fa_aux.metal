@@ -156,19 +156,21 @@ kernel void kernel_flash_attn_ext_pad(
         device char * k_dst = k_pad + args.nb11*i1 + args.nb11*C*i2 + args.nb11*C*args.ne_12_2*i3;
         device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
 
+        // copy only the row itself: the row stride nb11/nb21 can span all the heads (interleaved cache views),
+        // and the last head's row would then be read past the end of K/V; the attention reads ne10/ne20 elements per row
         if (i1 >= icp) {
             // here it is not important the exact value that will be used as we rely on masking out the scores in the attention
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.nbk_row; i += ntg.x) {
                 k_dst[i] = 0;
             }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.nbv_row; i += ntg.x) {
                 v_dst[i] = 0;
             }
         } else {
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.nbk_row; i += ntg.x) {
                 k_dst[i] = k_src[i];
             }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.nbv_row; i += ntg.x) {
                 v_dst[i] = v_src[i];
             }
         }

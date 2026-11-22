@@ -3730,6 +3730,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     uint64_t nb22_attn = nb22;
     uint64_t nb23_attn = nb23;
 
+    // element types of the K/V the pad and attention kernels read (F16 after a dequant or a row gather)
+    ggml_type type_k_attn = op->src[1]->type;
+    ggml_type type_v_attn = op->src[2]->type;
+
     if (dequant_kv) {
         assert(ggml_metal_op_flash_attn_ext_extra_kv_f16(op) != 0);
 
@@ -3797,6 +3801,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         bid_k = bid_kv_f16;
         bid_v = v_is_view_of_k ? bid_k : bid_v_f16;
 
+        type_k_attn = GGML_TYPE_F16;
+        type_v_attn = GGML_TYPE_F16;
+
         // contiguous F16 layout of the dequantized K
         nb10_attn = sizeof(ggml_fp16_t);
         nb11_attn = nb10_attn*ne10;
@@ -3858,6 +3865,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // contiguous F16 layout of the gathered rows: [DK, n_rows, n_head_kv, n_streams]
         bid_k = bid_rows;
 
+        type_k_attn = GGML_TYPE_F16;
+        type_v_attn = GGML_TYPE_F16;
+
         nb10_attn = sizeof(ggml_fp16_t);
         nb11_attn = nb10_attn*ne10;
         nb12_attn = nb11_attn*ne11_attn;
@@ -3886,6 +3896,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     auto encode_pad = [&](int32_t ncpsg) {
         assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
 
+        const uint64_t nbk_row = ggml_row_size(type_k_attn, ne10);
+        const uint64_t nbv_row = ggml_row_size(type_v_attn, ne20);
+
+        GGML_ASSERT(nbk_row <= nb11_attn && nbv_row <= nb21_attn);
+
         ggml_metal_kargs_flash_attn_ext_pad args0 = {
             /*.ne11    =*/ne11,
             /*.ne_12_2 =*/ne12,
@@ -3902,6 +3917,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.nb31    =*/nb31,
             /*.nb32    =*/nb32,
             /*.nb33    =*/nb33,
+            /*.nbk_row =*/nbk_row,
+            /*.nbv_row =*/nbv_row,
         };
 
         auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
