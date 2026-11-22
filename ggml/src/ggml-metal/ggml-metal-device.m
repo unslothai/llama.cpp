@@ -1839,6 +1839,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[2]->ne[2] != op->src[1]->ne[2]) {
                     return false;
                 }
+                // the launcher asserts ne01 < 65536 and ne11 == ne21
+                if (op->src[0]->ne[1] >= 65536 || op->src[2]->ne[1] != op->src[1]->ne[1]) {
+                    return false;
+                }
                 if (op->src[1]->type != op->src[2]->type) {
                     return false;
                 }
