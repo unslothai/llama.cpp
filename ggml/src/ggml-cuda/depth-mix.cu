@@ -394,6 +394,11 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (warp_size != WARP_SIZE) {
         DEPTH_MIX_DECLINE("warp size");
     }
+    // decode-size mixes (up to 8 tokens) before Ada (cc < 8.9) keep the separate kernels: measured ~1% slower fused
+    // at batch-1 decode on A100 (cc 8.0), within noise on T4 (cc 7.5), while prefill gains everywhere (5-12%)
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_ADA_LOVELACE && T <= 8) {
+        DEPTH_MIX_DECLINE("decode-size mix before Ada");
+    }
     auto takes_mmvf = [&](const ggml_tensor * mm) {
         const ggml_tensor * src0 = mm->src[0];
         const ggml_tensor * src1 = mm->src[1];
