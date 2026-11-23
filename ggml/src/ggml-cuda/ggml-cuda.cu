@@ -177,6 +177,11 @@ static bool ggml_cuda_register_host_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_flat_batch_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FLAT_BATCH");
+    return disabled;
+}
+
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
@@ -2548,6 +2553,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+
+#if defined(GGML_USE_HIP)
+    // a 2D src0 broadcast over the batch of a contiguous src1 is one product over all src1 columns. Batched,
+    // such small per-batch products go to batched hipBLASLt GEMMs that leave the GPU mostly idle
+    if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        !ggml_cuda_flat_batch_disabled()) {
+        ggml_tensor src1_2d = *src1;
+        ggml_tensor dst_2d  = *dst;
+        src1_2d.ne[1] = ne11*ne12*ne13;
+        dst_2d.ne[1]  = ne1*ne2*ne3;
+        src1_2d.ne[2] = src1_2d.ne[3] = 1;
+        dst_2d.ne[2]  = dst_2d.ne[3]  = 1;
+        // contiguous: the row strides follow from the row sizes (a size-1 dim may carry any stride)
+        src1_2d.nb[1] = ggml_row_size(src1->type, ne10);
+        dst_2d.nb[1]  = ggml_row_size(dst->type,  ne0);
+        src1_2d.nb[2] = src1_2d.nb[3] = src1_2d.nb[1]*src1_2d.ne[1];
+        dst_2d.nb[2]  = dst_2d.nb[3]  = dst_2d.nb[1]*dst_2d.ne[1];
+        ggml_cuda_mul_mat(ctx, src0, &src1_2d, &dst_2d);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;

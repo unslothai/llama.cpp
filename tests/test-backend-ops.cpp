@@ -12025,6 +12025,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a 2D src0 broadcast over many small batches (Inkling 2 relative bias table: 1024 x 24 x 16 per token)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 24, 32, {1, 1}, {512, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 24, 32, {1, 1}, {7, 3}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 1, 32, {1, 1}, {4, 1}, {0, 2, 1, 3}));
+    }
+
 #if 0
     // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.
     // kernel_mul_mm dst offset of the last batch is past INT32_MAX: rows 0-31 use full tiles, rows 32-39 use edge tiles.
