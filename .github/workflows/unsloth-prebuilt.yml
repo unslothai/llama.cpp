@@ -544,9 +544,11 @@ jobs:
       # here would otherwise cost another line inside the capped block, and going over silently disables the whole workflow.
       - name: Check the merged tree for silently wrong resolutions
         if: ${{ env.MERGED_PINS == '1' }}
+        env:
+          BASE: ${{ steps.m.outputs.base }}
         run: |
           set -euo pipefail
-          if ! python3 "${RUNNER_TEMP}/us/merge_checks.py" --root . ; then
+          if ! python3 "${RUNNER_TEMP}/us/merge_checks.py" --root . --base "$BASE" ; then
             echo "::error::the pinned PRs merged, but merge_checks.py found a resolution that is silently wrong; see the log for file and line" >&2
             exit 1
           fi
@@ -575,14 +577,16 @@ jobs:
       # mtmd is in the gate because `llama` alone is not enough: observed 09-04, ggml-org#25731 built `llama` clean while tools/mtmd did not compile at all,
       # upstream having made mtmd_image_preprocessor::preprocess const while the pin's Inkling subclass stayed non-const, so it overrode nothing and the
       # vision and audio towers were abstract. Every vision pin lands in mtmd, so a gate that skips it cannot see the whole class.
-      - name: Compile gate (CPU, llama and mtmd targets)
+      # ggml-rpc is in the gate because the CPU, Vulkan, ROCm and macOS legs build with GGML_RPC=ON and ggml-rpc.h holds a
+      # static_assert(GGML_OP_COUNT == N) no other target compiles: observed 11-23, a pin-added op left it one behind and four legs died hours in.
+      - name: Compile gate (CPU, llama, mtmd and ggml-rpc targets)
         if: ${{ env.MERGED_PINS == '1' }}
         run: |
           set -euo pipefail
           cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DGGML_CUDA=OFF -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF > /dev/null
-          if ! cmake --build "${RUNNER_TEMP}/gate" --target llama mtmd -j "$(nproc)" ; then
+          if ! cmake --build "${RUNNER_TEMP}/gate" --target llama mtmd ggml-rpc ggml-rpc-server -j "$(nproc)" ; then
             echo "::error::the pinned PRs merged cleanly and the merged tree does not compile; fix or drop the pin rather than letting the build matrix find this" >&2
             exit 1
           fi
