@@ -12861,6 +12861,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // short rows with strided sources: a convolution window per channel and sequence
+    for (int v : { 0, 4, 8, 16 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 1024, 8, 1}, 1, 0, v));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 2304, 4, 1}, 1, 0, v));
+    }
+
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
