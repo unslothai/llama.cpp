@@ -145,16 +145,15 @@ static bool concat_flat_disabled() {
     return disabled;
 }
 
-// measured faster on NVIDIA Blackwell (cc 10.x: 4/8-sequence decode +3-7%; cc 12.x: prefill +0.2-0.8%), a tie on
-// Ampere / Ada and 2-3% slower on Turing (T4), so older GPUs and other vendors keep the one-block-per-row kernel
+// faster on NVIDIA Blackwell (cc 10.x: 4/8-sequence decode +3-7%, cc 12.x: prefill +0.2-0.8%)
+// a tie on Ampere / Ada and 2-3% slower on Turing (T4), so older GPUs and other vendors keep the one-block-per-row kernel
 static bool concat_flat_cc_ok() {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000;
 }
 
-// non-contiguous sources: one thread per element of the contiguous dst instead of one block per row, which leaves
-// most threads idle for short rows (e.g. a convolution window per channel) and most SMs idle for few long rows
-// (e.g. one token of a view)
+// non-contiguous sources: one thread per element of the contiguous dst instead of one block per row
+// one block per row leaves most threads idle for short rows (e.g. a convolution window per channel) and most SMs idle for few long rows (e.g. one token of a view)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     concat_non_cont_flat(
@@ -226,7 +225,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else if (ggml_is_contiguous(dst) && ggml_nelements(dst) < INT_MAX && !ggml_is_quantized(src0->type) &&
                concat_flat_cc_ok() && !concat_flat_disabled()) {
         const int n = (int) ggml_nelements(dst);
-        const int num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        const int num_blocks = (int) ((ggml_nelements(dst) + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
         auto launch_kernel = [&](auto dim) {
             ggml_cuda_kernel_launch(concat_non_cont_flat<T, dim>, launch_params,
