@@ -413,6 +413,18 @@ rc, out = run_tree({"ggml/include/ggml.h": OPS,
                     "ggml/src/x.cpp": "static_assert(MAX_PARAMETER_COUNT == 12);\n"})
 check("a COUNT that is not an enum member is not checked", rc == 0 and "0 enum count asserts" in out, out)
 
+rc, out = run_tree({"ggml/include/ggml.h": "#ifdef X\nenum e { A, E_COUNT };\n#else\nenum e { A, B, E_COUNT };\n#endif\n",
+                    "ggml/src/x.c": "#ifdef X\nstatic_assert(E_COUNT == 1, \"\");\n#else\n"
+                                    "static_assert(E_COUNT == 2, \"\");\n#endif\n"})
+check("a COUNT defined twice in one header (#ifdef / #else) is ambiguous, never compared",
+      rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A, B, C, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 1 + 2, \"\");\nstatic_assert(1 + 2 == E_COUNT);\n"})
+check("an expression operand is not read as its first literal", rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A, B, C, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 2);\n"})
+check("a literal operand ending at ) is still checked", rc == 1 and "counts 3" in out, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all merge_checks tests passed")
 sys.exit(1 if FAILS else 0)

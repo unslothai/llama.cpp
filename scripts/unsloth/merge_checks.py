@@ -291,7 +291,8 @@ def unreachable_arch_arms(path: Path) -> list[str]:
 # Checked statically here so it costs well under a second and does not depend on which backends a build enables.
 
 _COUNT_ASSERT = re.compile(
-    r"static_assert\s*\(\s*(?:([A-Za-z_]\w*_COUNT)\s*==\s*(\d+)|(\d+)\s*==\s*([A-Za-z_]\w*_COUNT))\b")
+    # both operands must be complete: `E_COUNT == 1 + 2` is an expression, not the literal 1, and is not read
+    r"static_assert\s*\(\s*(?:([A-Za-z_]\w*_COUNT)\s*==\s*(\d+)|(\d+)\s*==\s*([A-Za-z_]\w*_COUNT))\s*[,)]")
 _ENUM = re.compile(r"\benum\s+(?:class\s+)?(\w+)?\s*(?::\s*[\w:\s]+)?\{")
 _SCAN_DIRS = ("ggml", "src", "common", "tools")
 _SCAN_EXT = {".c", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".m", ".mm"}
@@ -338,7 +339,8 @@ def enum_members(code: str) -> dict[str, tuple[str, int | None]]:
                     value = int(lit)
                 else:
                     known = False
-            out[ident] = (name, value if known else None)
+            # a member repeated in one file (#ifdef / #else alternatives) has no single value
+            out[ident] = (name, None) if ident in out else (name, value if known else None)
             if known:
                 value += 1
     return out
