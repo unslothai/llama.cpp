@@ -12188,6 +12188,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32,  16, 4, true,  72, 13, 2048, 80));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 72, 16, 2048));
 
+    // NVFP4 experts at decode batch sizes (MUL_MAT_ID vector kernel, row counts divisible by 4 and not)
+    for (int n : {2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 8, false, 256, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 8, false, 258, n, 512));
+    }
+
 #if 0
     {
         // Test paths in OpenCL

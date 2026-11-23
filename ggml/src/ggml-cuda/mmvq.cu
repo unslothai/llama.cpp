@@ -1147,8 +1147,8 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-template <ggml_type type>
-static void mul_mat_vec_q_moe_launch(
+template <ggml_type type, int rows_per_block>
+static void mul_mat_vec_q_moe_launch_rows(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -1156,7 +1156,6 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1178,6 +1177,34 @@ static void mul_mat_vec_q_moe_launch(
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
     }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_moe_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, const int nchannels_dst, const int cc, cudaStream_t stream) {
+
+    // 2 rows per block gives best perf based on tuning; on NVIDIA Turing to Ada and on datacenter Blackwell (cc 10.x) 4 rows
+    // give each warp more independent loads (NVFP4 experts at 4 and 8 tokens: -8% kernel time). Each row is reduced exactly
+    // as before. Hopper is not measured; consumer Blackwell (cc 12.x) measured 0.2-0.5% slower at 4 sequences, so both keep 2.
+    // The kernel reads whole row groups, so only a row count that 4 divides takes 4.
+#define MMVQ_MOE_LAUNCH(R) mul_mat_vec_q_moe_launch_rows<type, R>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, \
+        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+        ncols_dst, ids_stride, warp_size, nchannels_dst, stream)
+    // GGML_CUDA_DISABLE_MOE_VEC_ROWS4=1 keeps 2 rows per block everywhere
+    static const bool rows4_disabled = getenv("GGML_CUDA_DISABLE_MOE_VEC_ROWS4") != nullptr;
+    const bool rows4_cc = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        ((cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_HOPPER) || (cc >= 1000 && cc < 1100));
+    if (!rows4_disabled && rows4_cc && nrows_x % 4 == 0) {
+        MMVQ_MOE_LAUNCH(4);
+    } else {
+        MMVQ_MOE_LAUNCH(2);
+    }
+#undef MMVQ_MOE_LAUNCH
 }
 
 template <ggml_type type>
@@ -1276,7 +1303,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, cc, stream);
         return;
     }
 
