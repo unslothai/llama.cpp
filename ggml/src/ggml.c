@@ -5537,6 +5537,12 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_add_pos(struct ggml_tensor * a, struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(q_pos != NULL && q_pos->type == GGML_TYPE_I32);
+    a->src[7] = q_pos;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

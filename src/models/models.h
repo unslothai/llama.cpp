@@ -2555,6 +2555,7 @@ struct llama_model_inkling2 : public llama_model_base {
         llm_graph_input_rs                  * recr = nullptr;
 
         ggml_tensor * inp_out_ids = nullptr;
+        ggml_tensor * inp_pos_t   = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
 
         // the normalized block stacks of mix(), per block list

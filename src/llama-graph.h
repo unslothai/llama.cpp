@@ -812,8 +812,10 @@ public:
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
     // [base, swa] K/V cells of the banded attention, 0 = dense
-    uint32_t n_kv_banded[2] = { 0, 0 };
-    bool     banded         = false;
+    uint32_t n_kv_banded[2]    = { 0, 0 };
+    bool     banded            = false;
+    bool     banded_decode     = false;
+    bool     banded_small_long = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;

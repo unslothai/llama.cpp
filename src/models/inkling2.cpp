@@ -7,8 +7,22 @@
 // max elements of the dense relative bias per attention call, and max chunks per layer
 static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
 static constexpr int64_t n_kq_chunk_max = 64;
-// ubatches up to this many tokens keep the dense path
+// ubatches up to this many tokens keep the dense path on unquantized or short KV caches
 static constexpr int64_t n_tokens_banded_min = 32;
+
+static bool inkling2_banded_decode_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_BANDED_DECODE");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return enabled;
+}
+
+static bool inkling2_banded_decode_kv_ok(ggml_type tk, ggml_type tv) {
+    return (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q8_0) ||
+           (tk == GGML_TYPE_Q4_0 && tv == GGML_TYPE_Q4_0) ||
+           (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0);
+}
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -335,10 +349,13 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
     ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
     ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * pm = (inp->banded_decode && !swa) ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
+    if (inp->banded_decode && !swa) {
+        ggml_flash_attn_ext_banded_add_pos(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1));
+    }
     ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = ggml_backend_dev_supports_op(dev, op);
     banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -350,13 +367,33 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     attn = inp->get_attn();
     recr = inp->get_recr();
 
-    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
-    inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+    // banded FA needs a position-contiguous cache; for quantized global KV caches once n_kv >= 4096:
+    // - single-token decode (c0 == 0) uses padded n_kv + device inp_pos for GQA-3 dp4a banded decode
+    //   without materializing a dense kq_b or invalidating CUDA graphs on position changes;
+    // - small/medium batches (2..32 tokens) route to quantized banded MMA to avoid multi-GiB dense kq_b.
+    // Unquantized (F16/BF16) caches stay on the dense/vector-FA path.
+    const auto * base_kv = attn->mctx->get_base();
+    const bool banded_opt = cparams.flash_attn && inkling2_banded_decode_enabled();
+    inp->banded_decode = banded_opt && n_tokens == 1 && ubatch.n_seqs == 1 &&
+        inkling2_banded_decode_kv_ok(base_kv->type_k(), base_kv->type_v());
+    inp->banded_small_long = banded_opt && n_tokens > 1 && n_tokens <= n_tokens_banded_min &&
+        (ggml_is_quantized(base_kv->type_k()) || ggml_is_quantized(base_kv->type_v()));
+    inp->banded = cparams.flash_attn && (n_tokens > n_tokens_banded_min || inp->banded_decode || inp->banded_small_long);
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        const auto * kv = i ? attn->mctx->get_swa() : base_kv;
+        const uint32_t n_contig = kv->get_n_kv_pos_contiguous();
+        if (inp->banded_decode) {
+            const bool c0_zero = ubatch.pos != nullptr && ubatch.pos[0] >= 0 && n_contig == (uint32_t) ubatch.pos[0] + 1;
+            inp->n_kv_banded[i] = (i == 0 && c0_zero && kv->get_n_kv() >= 4096) ? kv->get_n_kv() : 0;
+        } else if (inp->banded_small_long) {
+            inp->n_kv_banded[i] = (i == 0 && n_contig >= 4096) ? n_contig : 0;
+        } else {
+            inp->n_kv_banded[i] = n_contig;
+        }
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
+    inp_pos_t = inp_pos;
     inp_out_ids = build_inp_out_ids();
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
@@ -505,17 +542,26 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
             ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-            // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
-            ggml_tensor *& m = mask_banded[is_swa];
-            if (!m) {
-                m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
+            ggml_tensor * m = nullptr;
+            if (!(inp->banded_decode && !is_swa)) {
+                // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
+                ggml_tensor *& mb = mask_banded[is_swa];
+                if (!mb) {
+                    mb = (n_kv_b == mask->ne[0] && ggml_is_contiguous(mask))
+                        ? mask
+                        : ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                                mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                }
+                m = mb;
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
             ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+            if (inp->banded_decode) {
+                ggml_flash_attn_ext_banded_add_pos(cur, inp_pos_t);
+            }
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

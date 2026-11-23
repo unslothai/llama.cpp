@@ -1477,8 +1477,21 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        if (banded_decode) {
+            const uint32_t n_contig = attn_ctx->get_base()->get_n_kv_pos_contiguous();
+            const uint32_t k0       = attn_ctx->get_base()->get_n_kv();
+            const bool     c0_zero  = params.ubatch.pos != nullptr && params.ubatch.pos[0] >= 0 &&
+                                      n_contig == (uint32_t) params.ubatch.pos[0] + 1;
+            res &= ((c0_zero && k0 >= 4096) ? k0 : 0u) == n_kv_banded[0];
+            res &= 0u == n_kv_banded[1];
+        } else if (banded_small_long) {
+            const uint32_t n_contig = attn_ctx->get_base()->get_n_kv_pos_contiguous();
+            res &= (n_contig >= 4096 ? n_contig : 0u) == n_kv_banded[0];
+            res &= 0u == n_kv_banded[1];
+        } else {
+            res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
+            res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
