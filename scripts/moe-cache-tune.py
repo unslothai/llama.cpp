@@ -45,7 +45,7 @@ def pad(x, n):
 
 class Group:
     n_expert: int
-    layers: list
+    layers: dict  # layer -> owner, the layer whose cache slots it shares (itself unless it reads the experts of an earlier layer)
     split: float
     split_sum: float
     host_bytes: int
@@ -58,7 +58,8 @@ class Group:
 def read_trace(path):
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"MCT1":
+    version = data[:4]
+    if version not in (b"MCT1", b"MCT2"):
         sys.exit(f"{path}: not a MoE cache trace")
     pos = 4
 
@@ -73,7 +74,10 @@ def read_trace(path):
     for _ in range(n_group):
         g = Group()
         _, g.n_expert, n_layers = take("3I")
-        g.layers = list(take(f"{n_layers}I"))
+        if version == b"MCT2":
+            g.layers = dict(take("2I") for _ in range(n_layers))
+        else:
+            g.layers = {il: il for il in take(f"{n_layers}I")}
         g.split, g.split_sum = take("2d")
         g.host_bytes, g.dev_host_bytes, g.alignment = take("3Q")
         (n_tensors,) = take("I")
@@ -103,6 +107,11 @@ def trace_tokens(trace):
 
 # cache simulation, mirrors src/llama-moe-cache.cpp
 
+def n_owners(g):
+    """layers with their own experts, the cache holds each of their experts once"""
+    return len(set(g.layers.values()))
+
+
 def n_slots_of(g, size_mib, n_zero, n_expert_used):
     budget = int(float(size_mib * 1024 * 1024) * g.split / g.split_sum * float(g.host_bytes) / float(g.dev_host_bytes))
 
@@ -111,7 +120,7 @@ def n_slots_of(g, size_mib, n_zero, n_expert_used):
 
     if alloc(0) > budget:
         return 0
-    lo, hi = 0, len(g.layers) * g.n_expert
+    lo, hi = 0, n_owners(g) * g.n_expert
     while lo < hi:
         mid = (lo + hi + 1) // 2
         if alloc(mid) <= budget:
@@ -127,7 +136,7 @@ def full_mib(trace, share):
     n_zero = min(n_expert_used, 64) if f32(share) > 0.0 else 0
     res = 0.0
     for g in groups:
-        alloc = sum(pad(nb2 * (len(g.layers) * g.n_expert + n_zero + 1), g.alignment) for nb2 in g.nb2)
+        alloc = sum(pad(nb2 * (n_owners(g) * g.n_expert + n_zero + 1), g.alignment) for nb2 in g.nb2)
         res = max(res, alloc / (g.split / g.split_sum * g.host_bytes / g.dev_host_bytes))
     return math.ceil(res / 2**20) + 1
 
@@ -211,8 +220,8 @@ class ClassLRU:
             raise RuntimeError("no MoE cache victim")
         return res
 
-    def plan(self, il, ids, n_used, n_zero, n_cpu):
-        """returns (uploaded, computed on the CPU)"""
+    def plan(self, il, ids, n_used, n_zero, n_cpu, tick=True):
+        """returns (uploaded, computed on the CPU); tick: advance the clock of il (only the owner's lookup does)"""
         self.seen_gen += 1
         seen, gen = self.seen, self.seen_gen
         uniq = []
@@ -274,7 +283,8 @@ class ClassLRU:
             self.key_of[s] = key
             slots[e] = s
             self.move(s, self.class_of(key))
-        self.clock[il] += n_tokens
+        if tick:
+            self.clock[il] += n_tokens
         return len(misses), n_cpu_done
 
 
@@ -287,7 +297,7 @@ def replay(trace, size_mib, share, skip_tokens):
     caches, group_of = [], {}
     for ig, g in enumerate(groups):
         n = n_slots_of(g, size_mib, n_zero, n_expert_used)
-        caches.append(ClassLRU(g.layers, g.n_expert, n) if n > 0 else None)
+        caches.append(ClassLRU(set(g.layers.values()), g.n_expert, n) if n > 0 else None)
         group_of.update((il, ig) for il in g.layers)
 
     first = min(il for il, _, _ in records)
@@ -311,7 +321,8 @@ def replay(trace, size_mib, share, skip_tokens):
             acc[il] = v & 0xFFFF
             return v >> 16
 
-        n_fill, n_c = c.plan(il, ids, n_used, n_zero, n_cpu)
+        owner = g.layers[il]  # the layers that share the experts of an owner plan in its slots
+        n_fill, n_c = c.plan(owner, ids, n_used, n_zero, n_cpu, tick=owner == il)
         if count:
             up += n_fill * g.expert_bytes
             cpu += n_c * g.expert_bytes

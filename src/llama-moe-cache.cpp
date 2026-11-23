@@ -702,15 +702,17 @@ struct llama_moe_cache::impl {
         return devices[groups[layers[il].ig].id].backend;
     }
 
-    // trace format, little endian: "MCT1", then u32 n_layer, n_expert_used, n_group
-    // per group: u32 device, n_expert, n_layers, the layers (u32), f64 split, split_sum, u64 group host bytes, device host bytes, alignment,
+    // trace format, little endian: "MCT1", or "MCT2" if some layers share the experts of another layer, then u32 n_layer, n_expert_used, n_group
+    // per group: u32 device, n_expert, n_layers, the layers (u32; MCT2: u32 layer and u32 owner, the layer whose slots it shares),
+    //            f64 split, split_sum, u64 group host bytes, device host bytes, alignment,
     //            u32 n_tensors, the bytes of one expert of each tensor (u64)
     // then one record per slot lookup: i32 layer, experts per token, n_ids, the ids (i32)
     void write_trace_header(double split_sum) {
         auto u32 = [&](uint32_t v) { fwrite(&v, sizeof(v), 1, trace); };
         auto u64 = [&](uint64_t v) { fwrite(&v, sizeof(v), 1, trace); };
         auto f64 = [&](double   v) { fwrite(&v, sizeof(v), 1, trace); };
-        fwrite("MCT1", 1, 4, trace);
+        const bool shared = std::any_of(devices.begin(), devices.end(), [](const device & d) { return d.shared; });
+        fwrite(shared ? "MCT2" : "MCT1", 1, 4, trace);
         u32(layers.size());
         u32(n_expert_used);
         u32(groups.size());
@@ -721,6 +723,9 @@ struct llama_moe_cache::impl {
             u32(g.layers.size());
             for (int32_t il : g.layers) {
                 u32(il);
+                if (shared) {
+                    u32(layers[il].owner);
+                }
             }
             f64(d.split);
             f64(split_sum);
