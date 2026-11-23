@@ -57,12 +57,13 @@ runs:
       run: |
         $ErrorActionPreference = 'Continue'
         $haveSecrets = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)
-        $canonical = ($env:GITHUB_REPOSITORY -eq 'unslothai/llama.cpp')
+        # The org is moving from unslothai to unsloth; both names are the canonical repo.
+        $canonical = ($env:GITHUB_REPOSITORY -in @('unslothai/llama.cpp', 'unsloth/llama.cpp'))
         if ($haveSecrets) {
           Add-Content -Path $env:GITHUB_OUTPUT -Value 'signed=true'
           Write-Host 'Azure Trusted Signing credentials present; signing.'
         } elseif ($canonical) {
-          Write-Host '::error::Azure Trusted Signing secrets are missing on unslothai/llama.cpp.'
+          Write-Host "::error::Azure Trusted Signing secrets are missing on $env:GITHUB_REPOSITORY."
           Write-Host 'Add AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID,'
           Write-Host 'AZURE_TRUSTED_SIGNING_ACCOUNT_NAME and AZURE_CERTIFICATE_PROFILE_NAME'
           Write-Host 'to the release-signing environment. Refusing to publish unsigned binaries.'
