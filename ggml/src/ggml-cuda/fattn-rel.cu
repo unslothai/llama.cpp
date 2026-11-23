@@ -118,6 +118,13 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
             (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
+    // the CPY is not run, so its destination must not be seen anywhere else: not an output, not a view of another
+    // tensor, and read by nothing but the CPY (a view of it read elsewhere counts as a use as well)
+    const ggml_tensor * cpy_dst = cpy->src[1];
+    if (cpy_dst != cpy && (!cpy_dst || cpy_dst->view_src || (cpy_dst->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_rel_use_count(cgraph, cpy_dst) != 1)) {
+        return 0;
+    }
 
     // G[h, kv, t] = T[h, rp[kv, t], t]
     const ggml_tensor * T  = G->src[0];
@@ -150,6 +157,12 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
                 S->src[0]->type == GGML_TYPE_F32 && S->src[1]->type == GGML_TYPE_F32 && S->ne[3] == 1 &&
                 S->src[1]->ne[0] == 1 && S->src[1]->ne[1] == S->ne[1] && S->src[1]->ne[2] == S->ne[2] && S->src[1]->ne[3] == 1 &&
                 ggml_cuda_rel_use_count(cgraph, S) == 1 && !(S->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            // B is indexed by (head, token) of the view, so the view must be exactly the [head, rel row, token]
+            // permutation of all of S; a slice or another stride order would subtract the wrong entries of B
+            if (view->data != S->data || view->ne[0] != S->ne[1] || view->ne[1] != S->ne[0] || view->ne[2] != S->ne[2] ||
+                    view->nb[0] != S->nb[1] || view->nb[1] != S->nb[0] || view->nb[2] != S->nb[2]) {
+                return 0;
+            }
             sub = S;
         }
     }
@@ -213,9 +226,22 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
         others.push_back(t);
     }
 
-    // the output must not overlap what the kernel reads (the skipped nodes do not write)
+    // nothing written before or by the fused kernel may overlap what it reads (the skipped nodes do not write): the
+    // independent nodes run first here, but the allocator may have placed them over a table input that it freed after
+    // the chain's first node, and the attention output may share memory with the inputs as well
     for (const ggml_tensor * t : { tab, (const ggml_tensor *) (sub ? sub->src[1] : nullptr), rp, mask }) {
-        if (t && ggml_cuda_rel_overlap(fa, t)) {
+        if (!t) {
+            continue;
+        }
+        for (const ggml_tensor * w : others) {
+            if (ggml_cuda_rel_overlap(w, t)) {
+                if (getenv("GGML_CUDA_REL_BIAS_FA_DEBUG")) {
+                    fprintf(stderr, "%s: %s (in between) overlaps %s, not fused\n", __func__, w->name, t->name);
+                }
+                return 0;
+            }
+        }
+        if (ggml_cuda_rel_overlap(fa, t)) {
             if (getenv("GGML_CUDA_REL_BIAS_FA_DEBUG")) {
                 fprintf(stderr, "%s: %s overlaps %s, not fused\n", __func__, fa->name, t->name);
             }

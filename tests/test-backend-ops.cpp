@@ -9094,6 +9094,10 @@ struct test_fa_rel_bias_fuse : public test_case {
     const bool    with_sub;
     const ggml_type type_KV;
     const int     mask_mode; // 0: causal with holes and an unused tail, 1: a ring window with fully masked 32-column runs
+    // graphs the fusion must leave alone or handle (with_sub): 1 / 2 an in-place write of a / b between the table and the
+    // attention, 3 the F16 bias destination read again after the attention, 4 the table taken from the last n_head heads
+    // of a 2*n_head subtraction
+    const int     hazard;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9105,13 +9109,13 @@ struct test_fa_rel_bias_fuse : public test_case {
     double max_nmse_err() override { return 5e-4; }
 
     std::string vars() override {
-        return VARS_TO_STR10(hs, n_head, n_head_kv, n_rel, kv, nr, ns, with_sub, type_KV, mask_mode);
+        return VARS_TO_STR10(hs, n_head, n_head_kv, n_rel, kv, nr, ns, with_sub, type_KV, mask_mode) + "," + VAR_TO_STR(hazard);
     }
 
     test_fa_rel_bias_fuse(int64_t hs = 128, int64_t n_head = 24, int64_t n_head_kv = 8, int64_t n_rel = 129, int64_t kv = 256,
-            int64_t nr = 1, int64_t ns = 1, bool with_sub = true, ggml_type type_KV = GGML_TYPE_F16, int mask_mode = 0)
+            int64_t nr = 1, int64_t ns = 1, bool with_sub = true, ggml_type type_KV = GGML_TYPE_F16, int mask_mode = 0, int hazard = 0)
         : hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_rel(n_rel), kv(kv), nr(nr), ns(ns), with_sub(with_sub), type_KV(type_KV),
-          mask_mode(mask_mode) {}
+          mask_mode(mask_mode), hazard(hazard) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_tokens = nr*ns;
@@ -9123,15 +9127,25 @@ struct test_fa_rel_bias_fuse : public test_case {
         ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, kv, ns);
         ggml_set_name(v, "v");
 
-        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        const int64_t n_head_tab = hazard == 4 ? 2*n_head : n_head;
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head_tab, n_tokens);
         ggml_set_name(a, "a");
+        ggml_tensor * b = nullptr;
         ggml_tensor * table = a;
         if (with_sub) {
-            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head_tab, n_tokens);
             ggml_set_name(b, "b");
-            table = ggml_sub(ctx, a, ggml_reshape_3d(ctx, b, 1, n_head, n_tokens));
+            table = ggml_sub(ctx, a, ggml_reshape_3d(ctx, b, 1, n_head_tab, n_tokens));
+        }
+        if (hazard == 4) {
+            table = ggml_view_3d(ctx, table, n_rel, n_head, n_tokens, table->nb[1], table->nb[2], n_head*table->nb[1]);
         }
         table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        if ((hazard == 1 || hazard == 2) && mode == MODE_TEST) {
+            // the table first, then an independent node writing an input of the table, then the rest
+            ggml_build_forward_expand(gf, table);
+            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx, hazard == 1 ? a : b, 0.5f));
+        }
 
         ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_tokens);
         ggml_set_name(rel_pos, "rel_pos");
@@ -9139,7 +9153,9 @@ struct test_fa_rel_bias_fuse : public test_case {
         ggml_tensor * bias = ggml_get_rows(ctx, table, rel_pos);
         bias = ggml_reshape_4d(ctx, bias, n_head, kv, nr, ns);
         bias = ggml_permute(ctx, bias, 2, 0, 1, 3);
-        bias = ggml_cpy(ctx, bias, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, n_head, ns));
+        ggml_tensor * bias_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, n_head, ns);
+        ggml_set_name(bias_f16, "bias_f16");
+        bias = ggml_cpy(ctx, bias, bias_f16);
 
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, 1, ns);
         ggml_set_name(m, "m");
@@ -9152,6 +9168,11 @@ struct test_fa_rel_bias_fuse : public test_case {
                 ggml_permute(ctx, v, 0, 2, 1, 3), mask, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_sinks(out, sinks);
         ggml_prec_set_acc(out, GGML_PREC_F32);
+        if (hazard == 3) {
+            // the copy's destination is read after the attention, so its write must happen
+            ggml_tensor * again = ggml_cpy(ctx, bias_f16, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv, nr, n_head, ns));
+            out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_reshape_1d(ctx, again, ggml_nelements(again)), 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -13453,6 +13474,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 8, 129,  512, nr, 4, true, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 24, 4097, 4096, nr, 1, true));
         test_cases.emplace_back(new test_fa_rel_bias_fuse(256,  8, 8,  33,  256, nr, 1, true));
+        for (int hazard : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_fa_rel_bias_fuse(64, 24, 8, 129, 256, nr, 1, true, GGML_TYPE_F16, 0, hazard));
+        }
     }
 
     // fully masked runs of KV columns (skipped by the vector kernel), with and without the relative bias read in the kernel
