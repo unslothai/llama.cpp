@@ -263,6 +263,44 @@ static void llama_log_softmax(float * array, size_t size) {
 }
 */
 
+// the max logit as the loop `max_l = std::max(max_l, data[i].logit)` over i = 1 .. size - 1 returns it, from 8
+// independent running maxima: (a < b ? b : a) skips a NaN like the loop does, a NaN at data[0] stays the result, and
+// equal non-NaN floats are the same bits except +0 and -0, so a zero result is recomputed with the loop
+static float llama_token_data_max_logit(const llama_token_data * data, size_t size) {
+    static const bool disabled = getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") != nullptr;
+    float max_l = data[0].logit;
+    if (disabled || size < 64 || std::isnan(max_l)) {
+        for (size_t i = 1; i < size; ++i) {
+            max_l = std::max(max_l, data[i].logit);
+        }
+        return max_l;
+    }
+    float m[8];
+    for (int j = 0; j < 8; ++j) {
+        m[j] = max_l;
+    }
+    size_t i = 1;
+    for (; i + 8 <= size; i += 8) {
+        for (int j = 0; j < 8; ++j) {
+            m[j] = std::max(m[j], data[i + j].logit);
+        }
+    }
+    for (; i < size; ++i) {
+        m[0] = std::max(m[0], data[i].logit);
+    }
+    float r = m[0];
+    for (int j = 1; j < 8; ++j) {
+        r = std::max(r, m[j]);
+    }
+    if (r == 0.0f) {
+        for (size_t k = 1; k < size; ++k) {
+            max_l = std::max(max_l, data[k].logit);
+        }
+        return max_l;
+    }
+    return r;
+}
+
 static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) {
     if (cur_p->size == 0) {
         return;
@@ -286,6 +324,11 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
         return;
     }
 
+    // x / 1.0f is x for every float
+    if (temp == 1.0f && getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") == nullptr) {
+        return;
+    }
+
     for (size_t i = 0; i < cur_p->size; ++i) {
         cur_p->data[i].logit /= temp;
     }
@@ -301,9 +344,7 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s
 
     float max_l = cur_p->data[0].logit;
     if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
-        }
+        max_l = llama_token_data_max_logit(cur_p->data, cur_p->size);
     }
 
     float cum_sum = 0.0f;
@@ -1139,6 +1180,9 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // running sums of the probabilities at every DIST_PREFIX_BLOCK-th candidate, scratch of llama_sampler_dist_apply
+    std::vector<double> buf_prefix;
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1174,12 +1218,75 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         return;
     }
 
+    static const bool fast_disabled = getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") != nullptr;
+
     // max logit for numerical stability
     float max_l = cur_p->data[0].logit;
     if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
+        max_l = llama_token_data_max_logit(cur_p->data, cur_p->size);
+    }
+
+    if (!fast_disabled) {
+        // the same arithmetic as the two passes below in fewer steps: the running sum of the selection pass is the
+        // running sum of the softmax pass (the same double additions in the same order), so the softmax pass keeps it
+        // at every DIST_PREFIX_BLOCK-th candidate, the selection searches those (they never decrease) and rescans one
+        // block, and the normalization is a loop of its own
+        constexpr size_t DIST_PREFIX_BLOCK = 64;
+        const size_t n  = cur_p->size;
+        const size_t nb = (n + DIST_PREFIX_BLOCK - 1)/DIST_PREFIX_BLOCK;
+        auto & prefix = ctx->buf_prefix;
+        prefix.resize(nb + 1);
+
+        double sum_cum = 0.0f;
+        for (size_t b = 0, i = 0; b < nb; ++b) {
+            prefix[b] = sum_cum; // the sum of the candidates before block b
+            const size_t e = std::min(n, i + DIST_PREFIX_BLOCK);
+            for (; i < e; ++i) {
+                float p = expf(cur_p->data[i].logit - max_l);
+                cur_p->data[i].p = p;
+                sum_cum += p;
+            }
         }
+        prefix[nb] = sum_cum;
+
+        const double rnd = dist(ctx->rng);
+        const double sum_tgt = sum_cum*rnd;
+
+        // the first block end whose running sum reaches the target; NaN sums reach nothing, as in the selection pass
+        size_t lo = 1;
+        size_t hi = nb;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo)/2;
+            if (prefix[mid] >= sum_tgt) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        bool found = false;
+        {
+            const size_t b = lo - 1;
+            double sum_run = prefix[b];
+            for (size_t i = b*DIST_PREFIX_BLOCK; i < std::min(n, (b + 1)*DIST_PREFIX_BLOCK); ++i) {
+                sum_run += cur_p->data[i].p;
+                if (sum_run >= sum_tgt) {
+                    cur_p->selected = i;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        // normalize probs
+        for (size_t i = 0; i < n; ++i) {
+            cur_p->data[i].p /= sum_cum;
+        }
+
+        assert(found);
+        if (!found) {
+            cur_p->selected = n - 1;
+        }
+        return;
     }
 
     // apply softmax to obtain the probabilities
@@ -1417,6 +1524,7 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .n_backend_draws_generated = */ 0,
             /* .n_backend_draws_committed = */ 0,
             /* .inp_uniforms              = */ {},
+            /* .buf_prefix                = */ {},
         }
     );
 }
