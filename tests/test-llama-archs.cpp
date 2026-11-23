@@ -200,6 +200,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 static bool host_experts_test(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_INKLING2_LOOP: // looped layers: the visits of a layer read the same experts, the MoE cache shares their slots
             return true;
         default:
             return false;
