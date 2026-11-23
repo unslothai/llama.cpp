@@ -367,6 +367,12 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             normed_t->ne[0] != 1 || normed_t->ne[1] != ncols || normed_t->ne[2] != T))) {
         DEPTH_MIX_DECLINE("shapes");
     }
+    // the scores read the earlier rows of the stack as float2: an F32 view at an odd float offset or with an odd row or
+    // token stride is left to the separate kernels (CONCAT copies it into an aligned stack first)
+    if ((uintptr_t) prev->data % (2*sizeof(float)) != 0 || prev->nb[1] % (2*sizeof(float)) != 0 ||
+        prev->nb[2] % (2*sizeof(float)) != 0) {
+        DEPTH_MIX_DECLINE("unaligned stack rows");
+    }
     if (n < 2 || n > DEPTH_MIX_MAX_N || nq < 1 || nq > DEPTH_MIX_MAX_NQ || ncols % 2 != 0 || ncols > DEPTH_MIX_MAX_NCOLS ||
         mm1->ne[0] != n || mm1->ne[2] != T) {
         DEPTH_MIX_DECLINE("sizes");

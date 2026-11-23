@@ -4621,6 +4621,7 @@ struct test_depth_mix_fuse : public test_case {
     const int64_t T;
     const bool extra_use;
     const bool plain; // the transposed rows as a CONT of the permuted plain rows instead of their own CONCAT
+    const int prev_offs; // earlier rows as an F32 view at this float offset, with an odd row stride when > 0
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4633,15 +4634,22 @@ struct test_depth_mix_fuse : public test_case {
     double max_nmse_err() override { return 1e-6; }
 
     std::string vars() override {
-        return VARS_TO_STR6(ncols, n, nq, T, extra_use, plain);
+        return VARS_TO_STR7(ncols, n, nq, T, extra_use, plain, prev_offs);
     }
 
-    test_depth_mix_fuse(int64_t ncols = 2304, int64_t n = 8, int64_t nq = 1, int64_t T = 1, bool extra_use = false, bool plain = false)
-        : ncols(ncols), n(n), nq(nq), T(T), extra_use(extra_use), plain(plain) {}
+    test_depth_mix_fuse(int64_t ncols = 2304, int64_t n = 8, int64_t nq = 1, int64_t T = 1, bool extra_use = false, bool plain = false,
+            int prev_offs = 0)
+        : ncols(ncols), n(n), nq(nq), T(T), extra_use(extra_use), plain(plain), prev_offs(prev_offs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, 1, T);
         ggml_tensor * prev   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, n - 1, T);
+        if (prev_offs > 0) {
+            const int64_t row = ncols + 1;
+            ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, prev_offs + row*(n - 1)*T);
+            ggml_set_name(base, "prev_base");
+            prev = ggml_view_3d(ctx, base, ncols, n - 1, T, row*sizeof(float), row*(n - 1)*sizeof(float), prev_offs*sizeof(float));
+        }
         ggml_tensor * prev_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n - 1, ncols, T);
         ggml_tensor * q      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, nq);
         ggml_set_name(cur, "cur");
@@ -10872,6 +10880,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 1, 512, false));
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 3, 512, false));
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 3, 77, true));
+    // earlier rows as a view at an odd float offset with an odd row stride: no float2 loads from it
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 8, 1, 1, false, false, 1));
+    test_cases.emplace_back(new test_depth_mix_fuse(1002, 9, 3, 77, false, true, 1));
     for (int64_t ncols : { 130, 1000, 1002, 6000 }) {
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 6, 1, 1, false));
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 7, 3, 3, true));
