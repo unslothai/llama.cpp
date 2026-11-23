@@ -1477,8 +1477,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        uint32_t rot[2];
+        res &= attn_ctx->get_base()->get_n_kv_pos_ring(rot[0]) == n_kv_banded_raw[0] && rot[0] == kv_rot_banded_raw[0];
+        res &= attn_ctx->get_swa()->get_n_kv_pos_ring(rot[1])  == n_kv_banded_raw[1] && rot[1] == kv_rot_banded_raw[1];
+        res &= attn_ctx->get_base()->get_n_kv() == n_kv_banded_mask[0];
+        res &= attn_ctx->get_swa()->get_n_kv()  == n_kv_banded_mask[1];
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();

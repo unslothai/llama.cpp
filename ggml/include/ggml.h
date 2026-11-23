@@ -2277,6 +2277,13 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // the K/V cells are a ring rotated by kv_rot: cell (kv_rot + j) % n_kv holds the j-th oldest position.
+    // The relative distance uses that logical index. 0 = cells in position order.
+    GGML_API void ggml_flash_attn_ext_banded_set_kv_rot(
+            struct ggml_tensor * a,
+            int32_t              kv_rot);
+
+
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]
     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices

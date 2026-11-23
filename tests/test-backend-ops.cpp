@@ -9445,6 +9445,26 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+// ring-rotated K/V cells (wrapped SWA cache): the relative distance uses the logical cell index
+struct test_flash_attn_ext_banded_rot : public test_flash_attn_ext_banded_sinks {
+    const int32_t kv_rot;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",kv_rot=" + std::to_string(kv_rot);
+    }
+
+    test_flash_attn_ext_banded_rot(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, int sinks, int32_t kv_rot)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, GGML_TYPE_F32, sinks),
+          kv_rot(kv_rot) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded_sinks::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_kv_rot(out, kv_rot);
+        return out;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13626,6 +13646,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  6, 1,   17, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512,  4096, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  512,  4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        // Inkling-2-Mini shapes: GQA 3 (24/8), SWA and full-attention n_kv, odd n_q, F16 and Q8_0 caches (AMD WMMA banded path)
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  1536, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  509,  1536, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,    1,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   37,  2048, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+        for (int32_t rot : {1, 511, 1024, 1535}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, rot));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_F16,  sinks, rot));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 100, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, 700));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
     }
@@ -14058,6 +14089,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini banded attention, one prefill ubatch: SWA (n_kv 1536) and full attention (n_kv 8704), Q8_0 cache
+    for (int64_t n_kv : {1536, 8704}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

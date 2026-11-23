@@ -9008,6 +9008,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel     = dst->src[6];
     const ggml_tensor * kv_rows = dst->src[5];
+    const int32_t       kv_rot  = rel ? ggml_get_op_params_i32(dst, 6) : 0;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9140,7 +9141,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                // ring cells: the logical (position-ordered) index of cell ic
+                const int64_t ic_log   = ic >= kv_rot ? ic - kv_rot : ic - kv_rot + nek1;
+                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic_log;
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }
