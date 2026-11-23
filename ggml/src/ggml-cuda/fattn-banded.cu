@@ -915,9 +915,13 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         return false;
     }
 
-    // ring-rotated K/V cells: only the MMA kernel maps cells to their logical distance
-    if (ggml_get_op_params_i32(dst, 6) != 0 && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
-        return false;
+    // ring-rotated K/V cells: only the MMA kernel maps cells to their logical distance, and the rotation is only
+    // enabled where that path is the one validated for it (AMD WMMA); other devices keep the dense fallback
+    if (ggml_get_op_params_i32(dst, 6) != 0) {
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (!GGML_CUDA_CC_IS_AMD(cc) || !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+            return false;
+        }
     }
 
     // quantized K/V are read as F16: check the op with F16 K/V of the same shape

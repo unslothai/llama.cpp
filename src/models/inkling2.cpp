@@ -335,13 +335,14 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
     // a ring-rotated cache needs a kernel that maps cells to logical distances: probe with a rotation then,
     // at a padded cell count (256) so the probe meets the layout conditions of such kernels
-    const int64_t pn  = inp->kv_rot_banded[swa] ? 256 : 1;
+    const bool    rot = inp->kv_rot_banded[swa] || ring_banded[swa];
+    const int64_t pn  = rot ? 256 : 1;
     ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, pn, nkv, 1);
     ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, pn, nkv, 1);
     ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
-    if (inp->kv_rot_banded[swa]) {
+    if (rot) {
         ggml_flash_attn_ext_banded_set_kv_rot(op, 1);
     }
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
@@ -361,6 +362,9 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     for (int i = 0; i < 2 && inp->banded; ++i) {
         const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
         inp->n_kv_banded[i] = inp->n_kv_banded_raw[i] = cache->get_n_kv_pos_ring(inp->kv_rot_banded_raw[i]);
+        // a wrapped cache at rotation 0 is in position order, but backends without rotated banded attention used the
+        // dense fallback there before: keep that, so their output does not change
+        ring_banded[i] = inp->n_kv_banded[i] > 0 && cache->get_n_kv_pos_contiguous() == 0;
         inp->kv_rot_banded[i] = inp->kv_rot_banded_raw[i];
         inp->n_kv_banded_mask[i] = cache->get_n_kv();
         // pad an unrotated cell count to the FA KV stride: kernels that need it (the WMMA path) can then run. The
