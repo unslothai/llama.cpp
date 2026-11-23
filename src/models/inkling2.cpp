@@ -353,7 +353,10 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        // a ubatch of several sequences is dense at runtime, so the reserved worst case (a ubatch
+        // of every sequence) must be dense too, else the dense graph outgrows the reserved buffer
+        inp->n_kv_banded[i] = ubatch.n_seqs_unq != 1 ? 0 :
+            (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
