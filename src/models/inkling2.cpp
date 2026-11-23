@@ -371,14 +371,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
         const int64_t n_seq_tokens = n_tokens/n_stream;
-        // sized for a full cache so the chunking does not change while it fills
+        // sized for a full cache, and the chunk never shrinks as n_tokens grows, so the graph reserved
+        // at load (full cache, full ubatch) has the largest chunk any later ubatch builds
         const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-        int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
-                (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
-        if (n_rows_max < n_seq_tokens) {
-            const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-            n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
-        }
+        // query rows per chunk over all streams: whole 64-row tiles in the budget, at most n_kq_chunk_max chunks
+        const int64_t n_rows_all = std::max({ int64_t(64), n_kq_bias_max/(n_kv_max*n_head)/64*64,
+                GGML_PAD((n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max, 64) });
+        const int64_t n_rows_max = std::min(n_seq_tokens, (n_rows_all + n_stream - 1)/n_stream);
         auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
             int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
             ne[d] = nr;
