@@ -210,9 +210,9 @@ void llama_model_dflash::load_tensors_inkling2_head() {
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
         layer.dflare_norm     = create_tensor(tn(LLM_TENSOR_DFLARE_NORM,     "weight", il), {n_embd}, 0);
-        layer.attn_k_ctx      = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX,      "weight", il), {n_embd, n_embd_k_gqa}, 0);
-        layer.attn_v_ctx      = create_tensor(tn(LLM_TENSOR_ATTN_V_CTX,      "weight", il), {n_embd, n_embd_v_gqa}, 0);
-        layer.attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX_NORM, "weight", il), {n_embd_head_k}, 0);
+        layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", il), {n_embd, n_embd_k_gqa}, 0);
+        layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", il), {n_embd, n_embd_v_gqa}, 0);
+        layer.dflash_attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM, "weight", il), {n_embd_head_k}, 0);
     }
 }
 
@@ -233,6 +233,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_inkling2_embd(ggml_tensor * 
         throw std::runtime_error("Inkling2 DSpark requires a matching Inkling2 target");
     }
     const int64_t n_seq = ubatch.n_seqs_unq;
+    GGML_ASSERT(n_seq > 0 && n_tokens % n_seq == 0 && "Inkling2 DSpark requires equal-size blocks");
     const int64_t rows = n_tokens/n_seq;
     auto * anchor = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, inp_tokens, 1, n_seq, rows*inp_tokens->nb[0], 0), n_seq);
     auto * inpL = ggml_get_rows(ctx0, target.tok_embd, anchor);

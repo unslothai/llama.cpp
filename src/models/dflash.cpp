@@ -55,8 +55,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     // the fused Inkling2 DSpark drafter (dspark_hidden_out, padded markov_w1) predates the f_rnn layout above
     if (ml.get_tensor_meta("dspark_hidden_out.weight")) {
-        if (hparams.dspark_f_rnn || ml.get_tensor_meta("markov_ctx_mix.weight") || ml.get_tensor_meta("markov_w2.weight")) {
-            throw std::runtime_error("Inkling2 DSpark draft mixes the fused (dspark_hidden_out) and f_rnn (markov_ctx_*) layouts");
+        // any tensor of the f_rnn (markov_ctx_*, per-layer ctx_mix) or fc-based DFlash layouts means a mixed file
+        bool mixed = hparams.dspark_f_rnn;
+        for (const char * name : { "markov_ctx_mix.weight", "markov_ctx_norm.weight", "markov_w2.weight",
+                                   "token_embd_norm.weight", "fc.weight", "enc.output_norm.weight" }) {
+            mixed = mixed || ml.get_tensor_meta(name) != nullptr;
+        }
+        for (uint32_t il = 0; il < hparams.n_layer() && !mixed; ++il) {
+            for (const char * suffix : { "ctx_mix", "ctx_norm" }) {
+                mixed = mixed || ml.get_tensor_meta(("blk." + std::to_string(il) + "." + suffix + ".weight").c_str()) != nullptr;
+            }
+        }
+        if (mixed) {
+            throw std::runtime_error("Inkling2 DSpark draft mixes the fused (dspark_hidden_out) layout with f_rnn or fc tensors");
         }
         const auto rank = ml.require_tensor_meta("markov_w1.weight")->ne[0];
         ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab_padded);
@@ -98,7 +109,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
 
     if (hparams.dspark_context_rank) {
-        if (backbone != BACKBONE_BASE || !hparams.n_swa || hparams.n_swa >= INT32_MAX) {
+        if (backbone != BACKBONE_BASE || !hparams.n_swa || hparams.n_swa >= INT32_MAX || !hparams.is_swa_any()) {
             throw std::runtime_error("Inkling2 DSpark requires sliding-window attention");
         }
         ++hparams.n_swa; // include the anchor and the preceding window
@@ -394,12 +405,12 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
         ggml_tensor * Kcur;
         ggml_tensor * Vcur;
         ggml_tensor * k_norm = layer.attn_k_norm;
-        const bool shared_kv = !layer.wv && !layer.attn_v_ctx;
+        const bool shared_kv = !model.dspark_fuse && layer.wv == nullptr;
         if (model.dspark_fuse) {
             ggml_tensor * context = mix_target_features(inp_g, il, layer.dflare_norm);
-            Kcur = build_lora_mm(layer.attn_k_ctx, context);
-            Vcur = build_lora_mm(layer.attn_v_ctx, context);
-            k_norm = layer.attn_k_ctx_norm;
+            Kcur = build_lora_mm(layer.dflash_wk_ctx, context);
+            Vcur = build_lora_mm(layer.dflash_wv_ctx, context);
+            k_norm = layer.dflash_attn_k_ctx_norm;
         } else {
             Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
             Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);

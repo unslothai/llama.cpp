@@ -1428,6 +1428,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 
 // only for warmup and probe decodes, fill zeros as dummy input
 static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
+    // the fused Inkling2 DSpark draft takes a 3*n_embd state that only drafting fills: its probe and warmup decodes run without one
+    if (llama_model_dflash_variant(model) == LLAMA_DFLASH_VARIANT_DSPARK_INKLING2) {
+        return;
+    }
     zeros.assign(llama_model_n_embd_out(model), 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
         batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
