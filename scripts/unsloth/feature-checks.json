@@ -224,6 +224,12 @@
       "checks": [
         { "kind": "backend-op", "op": "MUL_MAT_SHARED_SRC1" }
       ]
+    },
+    "moe-cache-shared-experts": {
+      "owner": "unslothai#421",
+      "checks": [
+        { "kind": "arch", "arch": "inkling2_loop" }
+      ]
     }
   },
   "unchecked": {
