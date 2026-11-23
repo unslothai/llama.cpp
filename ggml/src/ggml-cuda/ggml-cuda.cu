@@ -4563,6 +4563,14 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
         }
     }
 
+    // the fused kernel writes only out and reads the original x, w and limit
+    // an in-place node of the chain (e.g. ggml_sqr_inplace(ctx, c)) overwrites a tensor that later nodes read, so keep the separate ops
+    for (int k = 0; k < n - 1; ++k) {
+        if (cgraph->nodes[i + k]->view_src != nullptr) {
+            return 0;
+        }
+    }
+
     const int out_idx = i + n - 1;
     if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1) ||
         !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
