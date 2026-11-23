@@ -4425,7 +4425,9 @@ ggml_tensor * llm_graph_context::build_attn(
         // convert the bias to F16 in one copy, from the source of its contiguous copy when it is one (the same values),
         // and add the mask in F16: the mask is 0 or -inf, so this rounds the same as adding in F32 and converting
         ggml_tensor * src = kq_b->op == GGML_OP_CONT ? kq_b->src[0] : kq_b;
-        ggml_tensor * bias = ggml_cpy(ctx0, src, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, kq_b->ne[0], kq_b->ne[1], kq_b->ne[2], kq_b->ne[3]));
+        // a cast, not a copy into a new tensor: that tensor would be a graph leaf, which the allocator keeps
+        // for the whole graph, so the bias of every chunk and layer would stay allocated at once
+        ggml_tensor * bias = ggml_cast(ctx0, src, GGML_TYPE_F16);
         if (kq_b->ne[1] != kq_mask->ne[1]) {
             kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_b->ne[1], kq_mask->ne[2], kq_mask->ne[3],
                     kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]);
