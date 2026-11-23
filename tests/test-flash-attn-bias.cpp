@@ -300,7 +300,9 @@ static void error_stats(const std::vector<float> & got, const std::vector<float>
     max_abs = 0.0;
     max_rel = 0.0;
     for (size_t i = 0; i < got.size(); ++i) {
-        const double ae = std::abs(double(got[i]) - ref[i]);
+        // std::max drops NaN, so count a non-finite value as an infinite error
+        const bool finite = std::isfinite(got[i]) && std::isfinite(ref[i]);
+        const double ae = finite ? std::abs(double(got[i]) - ref[i]) : INFINITY;
         const double re = ae/std::max(1e-5, std::abs(double(ref[i])));
         max_abs = std::max(max_abs, ae);
         max_rel = std::max(max_rel, re);
