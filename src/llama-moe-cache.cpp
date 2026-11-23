@@ -891,8 +891,24 @@ static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backe
     const size_t  alignment     = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev));
 
     // same grouping as the constructor, the budget is split by the size of the experts
+    // the layers that read the same expert weights (looped layers, a whole view of a weight is the weight) count them once,
+    // as the cache does unless LLAMA_MOE_CACHE_DEDUPE=0
+    const char * dedupe_env = getenv("LLAMA_MOE_CACHE_DEDUPE");
+    const bool   dedupe     = dedupe_env == nullptr || strcmp(dedupe_env, "0") != 0;
+    auto weights_of = [](const std::vector<ggml_tensor *> & experts) {
+        std::vector<const ggml_tensor *> res;
+        for (const ggml_tensor * t : experts) {
+            while (t->view_src != nullptr && t->view_offs == 0 && t->view_src->type == t->type &&
+                    ggml_are_same_shape(t, t->view_src) && ggml_are_same_stride(t, t->view_src)) {
+                t = t->view_src;
+            }
+            res.push_back(t);
+        }
+        return res;
+    };
     std::vector<std::vector<ggml_tensor *>> refs;
     std::vector<size_t> group_bytes;
+    std::vector<std::vector<const ggml_tensor *>> counted; // the expert weights already counted
     size_t host_bytes = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         auto experts = llama_moe_cache_layer_experts(model.layers[il]);
@@ -905,6 +921,13 @@ static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backe
             refs.push_back(experts);
             group_bytes.push_back(0);
             it = refs.end() - 1;
+        }
+        if (dedupe) {
+            auto weights = weights_of(experts);
+            if (std::find(counted.begin(), counted.end(), weights) != counted.end()) {
+                continue;
+            }
+            counted.push_back(std::move(weights));
         }
         for (const ggml_tensor * t : experts) {
             group_bytes[it - refs.begin()] += ggml_nbytes(t);
