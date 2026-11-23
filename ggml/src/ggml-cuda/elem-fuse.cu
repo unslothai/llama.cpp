@@ -10,11 +10,15 @@
 
 template <bool sub>
 static __global__ void tanh_mul_addsub_f32(
-        const char * __restrict__ a, const char * __restrict__ b, const char * __restrict__ c, float * __restrict__ dst,
+        const char * a_ptr, const char * b_ptr, const char * c_ptr, float * dst_ptr,
         const int ne0, const int ne1, const int ne2,
         const int64_t a1, const int64_t a2, const int64_t a3,
         const int64_t b1, const int64_t b2, const int64_t b3,
         const int64_t c1, const int64_t c2, const int64_t c3) {
+    const char * GGML_CUDA_RESTRICT a   = a_ptr;
+    const char * GGML_CUDA_RESTRICT b   = b_ptr;
+    const char * GGML_CUDA_RESTRICT c   = c_ptr;
+    float      * GGML_CUDA_RESTRICT dst = dst_ptr;
     ggml_cuda_pdl_lc();
     const int i0 = blockIdx.x*blockDim.x + threadIdx.x;
     const int i1 = blockIdx.y;
@@ -168,8 +172,10 @@ void ggml_cuda_op_tanh_mul_addsub(ggml_backend_cuda_context & ctx, const ggml_cu
 // SCALE as scale_f32's FMA, the division as op_div's a / b
 
 template <bool clamp, bool has_scale>
-static __global__ void row_norm_div_f32(const float * __restrict__ x, float * __restrict__ dst, const int ncols,
+static __global__ void row_norm_div_f32(const float * x_ptr, float * dst_ptr, const int ncols,
         const float p0, const float p1, const float out_scale, const float out_bias) {
+    const float * GGML_CUDA_RESTRICT x   = x_ptr;
+    float       * GGML_CUDA_RESTRICT dst = dst_ptr;
     const int64_t row = blockIdx.x;
 
     const float * xr = x + row*ncols;
