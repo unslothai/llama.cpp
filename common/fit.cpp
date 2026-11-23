@@ -29,8 +29,7 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// --moe-cache-mib auto keeps the layer split instead of a MoE cache when the split would hold at least this share of the
-// expert weights in device memory (calibrated in the measurements on the pull request)
+// --moe-cache-mib auto keeps the layer split instead of a MoE cache when the split would hold at least this share of the expert weights in device memory (calibrated in the measurements on the pull request)
 static constexpr double MOE_CACHE_AUTO_MAX_RESIDENT = 0.80;
 
 // RAII: send llama logs below min_level to the debug log
@@ -297,8 +296,7 @@ static void common_params_fit_impl(
     uint32_t    n_ctx_extra = 0;  // context that memory was measured at
     std::string placement_extra;  // main model placement that memory was measured at, for a shared model
 
-    // a context that shares the main model runs on its weights wherever the fit puts them,
-    // so its memory follows the placement of the main model as well as the context size
+    // a context that shares the main model runs on its weights wherever the fit puts them, so its memory follows the placement of the main model as well as the context size
     auto placement_key = [&](const llama_model_params * mp) {
         std::string key = std::to_string(mp->n_gpu_layers);
         for (const llama_model_tensor_buft_override * o = mp->tensor_buft_overrides; o && o->pattern; o++) {
@@ -789,9 +787,7 @@ static void common_params_fit_impl(
     // MoE cache: every routed expert stays in system memory and the device memory that is left over caches the used ones
     // all sizes are relative to the free memory measured at the start, as for the layers below
     //
-    // the cache gets the same device memory the layer split below would spend on resident expert layers, so when that
-    // memory already holds most of the experts the split wins: its resident layers cost nothing per token, while the
-    // cache pays an upload for every miss
+    // the cache gets the same device memory the layer split below would spend on resident expert layers, so when that memory already holds most of the experts the split wins: its resident layers cost nothing per token, while the cache pays an upload for every miss
     const int64_t target_moe     = dmds_full[0].free - margins[0];
     // compare model memory only: dmds_full can be measured at a larger context than the one the fit settled on
     const int64_t mem_experts    = int64_t(dmds_full[0].mb.model) - mem_cpu_moe_model;

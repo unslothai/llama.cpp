@@ -1282,8 +1282,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     common_fit_apply(params, mparams, cparams);
 
     if (params.fit_params && params.moe_cache_auto) {
-        // the fit writes its expert placement into params, keep the cache size it chose with it,
-        // so that a reload from params (e.g. the server waking from sleep) gets the same cache
+        // the fit writes its expert placement into params, keep the cache size it chose with it, so that a reload from params (e.g. the server waking from sleep) gets the same cache
         params.moe_cache_size = cparams.moe_cache_size;
         params.moe_cache_auto = false;
     } else if (params.moe_cache_auto) {

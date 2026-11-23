@@ -891,8 +891,7 @@ static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backe
     const size_t  alignment     = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev));
 
     // same grouping as the constructor, the budget is split by the size of the experts
-    // the layers that read the same expert weights (looped layers, a whole view of a weight is the weight) count them once,
-    // as the cache does unless LLAMA_MOE_CACHE_DEDUPE=0
+    // the layers that read the same expert weights (looped layers, a whole view of a weight is the weight) count them once, as the cache does unless LLAMA_MOE_CACHE_DEDUPE=0
     const char * dedupe_env = getenv("LLAMA_MOE_CACHE_DEDUPE");
     const bool   dedupe     = dedupe_env == nullptr || strcmp(dedupe_env, "0") != 0;
     auto weights_of = [](const std::vector<ggml_tensor *> & experts) {
