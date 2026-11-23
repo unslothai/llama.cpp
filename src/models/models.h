@@ -1617,11 +1617,6 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_dflash2();
     void load_tensors_dflash2_conv();
     void load_tensors_dspark(int64_t n_vocab_draft);
-    void load_tensors_inkling2_head();
-
-    struct graph_inkling2_head : public llm_graph_context {
-        graph_inkling2_head(const llm_graph_params & params);
-    };
     void load_tensors_lilicorr();
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
@@ -1648,10 +1643,11 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
+        ggml_tensor * build_inp_block(ggml_tensor * inp_tokens);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
-        ggml_tensor * build_inkling2_embd(ggml_tensor * inp_tokens);
-        ggml_tensor * mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
     };
@@ -1666,7 +1662,6 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dspark : public graph_base {
         graph_dspark(const llm_graph_params & params);
-        void build_inkling2_block(ggml_tensor * tokens, ggml_tensor * hidden);
     };
 
     struct graph_lilicorr : public graph_base {
@@ -2935,7 +2930,7 @@ struct llama_model_clef : public llama_model_qwen35 {
                  input_decision * inp);
 
         ggml_tensor * build_head_norm(ggml_tensor * cur, const norm & n);
-        ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a);
+        ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a, ggml_tensor * kq_mask = nullptr);
         ggml_tensor * build_head_ffn (ggml_tensor * cur, const head_layer & layer);
 
         const llama_model_clef & model;

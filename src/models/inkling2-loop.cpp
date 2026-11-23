@@ -80,7 +80,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
 
     auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
+
+    // DSpark target features are indexed by layer visit, not by cache slot
     int visit = 0;
+
     for (int il = 0; il < start; ++il) {
         res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
@@ -115,5 +118,6 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
+    GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
 }
