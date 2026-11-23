@@ -299,7 +299,9 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
                     }
                 }
                 n_chunks++;
-                if (__all_sync(0xFFFFFFFF, all_masked)) {
+                // vote over the whole physical warp: on 64-lane wavefronts (HIP GCN / CDNA) two 32-thread logical warps
+                // share it, and a vote over the lower 32 lanes would let the upper one skip visible columns
+                if (ggml_cuda_all(all_masked)) {
                     n_chunks_skipped++;
                     continue;
                 }
