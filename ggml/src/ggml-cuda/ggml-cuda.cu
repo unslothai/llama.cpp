@@ -4556,8 +4556,8 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
             return 0;
         }
         // the fused kernel never writes the chain's intermediates, so the limit must not be one of them
-        for (const ggml_tensor * t : { sqr, sum, sqrtn, scl }) {
-            if (limit == t || limit->view_src == t) {
+        for (const ggml_tensor * t : { m0, sqr, sum, sqrtn, scl }) {
+            if (t && (limit == t || limit->view_src == t)) {
                 return 0;
             }
         }
