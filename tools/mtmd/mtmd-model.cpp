@@ -1634,6 +1634,7 @@ struct mtmd_model_loader {
         const bool has_patch_embd = (
             model.modality  == MTMD_MODALITY_VISION &&
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_INKLING &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR2);
 
