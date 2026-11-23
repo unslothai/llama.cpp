@@ -173,6 +173,57 @@
       "checks": [
         { "kind": "backend-op", "op": "SITU_FUSE" }
       ]
+    },
+    "cuda-concat-flat": {
+      "owner": "unslothai#418",
+      "checks": [
+        { "kind": "backend-op", "op": "CONCAT", "params": "ne_a=\\[3,1024,8,1\\]" }
+      ]
+    },
+    "cuda-blackwell-dc-decode": {
+      "owner": "unslothai#415",
+      "checks": [
+        { "kind": "backend-op", "op": "FLASH_ATTN_EXT", "params": "mask_heads=24" },
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "m=384,n=8,k=2304" }
+      ]
+    },
+    "cuda-moe-vec-rows": {
+      "owner": "unslothai#417",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT_ID", "params": "type_a=nvfp4,type_b=f32,n_mats=16,n_used=8,b=0,m=25[68],n=[248],k=(1152|512)," }
+      ]
+    },
+    "cuda-short-conv-fusion": {
+      "owner": "unslothai#411",
+      "checks": [
+        { "kind": "backend-op", "op": "CONV_CHAIN_FUSE" }
+      ]
+    },
+    "cuda-elem-fusions": {
+      "owner": "unslothai#412",
+      "checks": [
+        { "kind": "backend-op", "op": "TANH_MUL_ADDSUB_FUSE" },
+        { "kind": "backend-op", "op": "ROW_NORM_DIV_FUSE" },
+        { "kind": "backend-op", "op": "ADD_RMS_NORM_FUSE" }
+      ]
+    },
+    "cuda-depth-mix-fusion": {
+      "owner": "unslothai#414",
+      "checks": [
+        { "kind": "backend-op", "op": "DEPTH_MIX_FUSE" }
+      ]
+    },
+    "cuda-rel-bias-fa-fusion": {
+      "owner": "unslothai#413",
+      "checks": [
+        { "kind": "backend-op", "op": "FA_REL_BIAS_FUSE" }
+      ]
+    },
+    "cuda-q8-1-reuse": {
+      "owner": "unslothai#416",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT_SHARED_SRC1" }
+      ]
     }
   },
   "unchecked": {
