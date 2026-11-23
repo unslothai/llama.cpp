@@ -383,7 +383,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ne[d] = nr;
             return ggml_cont(ctx0, ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]));
         };
-        std::vector<ggml_tensor *> outs;
+        // the chunks write their rows into one output made before their biases: outputs that stayed live until
+        // a final concatenation split the region the next chunk's bias reuses, and the buffer grew with each chunk
+        ggml_tensor * out_all = nullptr;
+        if (n_rows_max < n_seq_tokens) {
+            out_all = ggml_cont(ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head*n_head, n_seq_tokens, n_stream));
+            ggml_build_forward_expand(gf, out_all);
+        }
         for (int64_t r0 = 0; r0 < n_seq_tokens; r0 += n_rows_max) {
             const int64_t nr = std::min(n_rows_max, n_seq_tokens - r0);
             const bool all = nr == n_seq_tokens;
@@ -413,19 +419,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_tensor * out = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
-            outs.push_back(all ? out : ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream));
-        }
-        while (outs.size() > 1) {
-            std::vector<ggml_tensor *> next;
-            for (size_t c = 0; c + 1 < outs.size(); c += 2) {
-                next.push_back(ggml_concat(ctx0, outs[c], outs[c + 1], 1));
+            if (all) {
+                cur = out;
+                break;
             }
-            if (outs.size() % 2) {
-                next.push_back(outs.back());
-            }
-            outs = std::move(next);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream),
+                    ggml_view_3d(ctx0, out_all, out_all->ne[0], nr, n_stream, out_all->nb[1], out_all->nb[2], r0*out_all->nb[1])));
         }
-        cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
+        if (out_all) {
+            cur = ggml_reshape_2d(ctx0, out_all, out_all->ne[0], n_tokens);
+        }
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
