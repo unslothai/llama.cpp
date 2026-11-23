@@ -1728,13 +1728,11 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
-// layers that share weights (looped layers): the later users of a shared weight in host memory get views of it.
-// The backend scheduler keys the device copy of a host weight (op offload) by tensor, so with one tensor for every
-// visit the later visits read the copy of the first one, which is wrong once its memory is reused, and the copies of
-// all the shared layers stay alive at once. A view per visit gets its own short-lived copy. Views keep the name (LoRA
-// adapters look weights up by name) and the buffer (the scheduler places ops by the weights' buffer); the state keyed
-// by tensor (Hadamard transforms, activation precision) is given to the views as well. The weight scale of a view
-// (llama_model::w_scales) is the view of the scale in the same layer, so every visit reads its own copy of both.
+// Looped layers share weights: later users of a shared host weight get a view of it.
+// The scheduler keys the device copy of an offloaded host weight by tensor, so one tensor for all visits makes later visits read a stale copy and keeps all copies alive.
+// A view per visit gets its own short-lived copy.
+// Views keep the name (for LoRA lookup) and the buffer (for op placement).
+// Per-tensor state (Hadamard rotations, precision, weight scales) is copied to the views, and a view's scale is the view of the scale in the same layer.
 static void llama_model_shared_host_views(std::vector<llama_layer> & layers, ggml_context_ptr & ctx_views,
         llama_hadamard_rotations & rot, llama_prec_policy & prec_policy,
         std::unordered_map<const ggml_tensor *, ggml_tensor *> & w_scales) {
