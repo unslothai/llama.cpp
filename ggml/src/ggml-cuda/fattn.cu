@@ -577,6 +577,12 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 }
 
 bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    // with GGML_CUDA_FA=OFF there is no MMA kernel to delegate to, use the standalone banded kernel
+    GGML_UNUSED(device); GGML_UNUSED(dst);
+    return false;
+#endif // FLASH_ATTN_AVAILABLE
+
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;
     }
