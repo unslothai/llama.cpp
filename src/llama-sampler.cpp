@@ -21,6 +21,11 @@
 #include <unordered_set>
 #include <stdexcept>
 
+#if defined(__x86_64__) && defined(__GLIBC__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define LLAMA_SAMPLER_EXPF4 1
+#endif
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
 struct ring_buffer {
@@ -300,6 +305,97 @@ static float llama_token_data_max_logit(const llama_token_data * data, size_t si
     }
     return r;
 }
+
+#ifdef LLAMA_SAMPLER_EXPF4
+// glibc's expf (sysdeps/ieee754/flt-32/e_expf.c, the FMA variant its ifunc picks on x86-64 with AVX2 and FMA) for 4
+// floats: the same double operations with the same constants and table, so the same bits. Lanes with |x| >= 88 or NaN
+// (special) are left to expf. It is used only when this matches the expf of the process (llama_sampler_expf4_ok).
+static const uint64_t llama_exp2f_tab[32] = {
+    0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
+    0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
+    0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d,
+    0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585,
+    0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13,
+    0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+    0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069,
+    0x3fef5818dcfba487, 0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+};
+
+__attribute__((target("avx2,fma")))
+static inline __m128 llama_expf4(__m128 x, int & special) {
+    const __m128i abstop = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(x), 20), _mm_set1_epi32(0x7ff));
+    special = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(abstop, _mm_set1_epi32(0x42a))));
+
+    const __m256d xd  = _mm256_cvtps_pd(x);
+    const __m256d inv = _mm256_set1_pd(0x1.71547652b82fep+5);  // N/ln2, N = 32
+    const __m256d sh  = _mm256_set1_pd(0x1.8p+52);
+    __m256d kd = _mm256_fmadd_pd(inv, xd, sh);
+    const __m256i ki = _mm256_castpd_si256(kd);
+    kd = _mm256_sub_pd(kd, sh);
+    const __m256d r = _mm256_fmsub_pd(inv, xd, kd);
+    __m256i t = _mm256_i64gather_epi64((const long long *) llama_exp2f_tab, _mm256_and_si256(ki, _mm256_set1_epi64x(31)), 8);
+    t = _mm256_add_epi64(t, _mm256_slli_epi64(ki, 47));
+    const __m256d z  = _mm256_fmadd_pd(r, _mm256_set1_pd(0x1.c6af84b912394p-20), _mm256_set1_pd(0x1.ebfce50fac4f3p-13));
+    const __m256d r2 = _mm256_mul_pd(r, r);
+    __m256d y = _mm256_fmadd_pd(r, _mm256_set1_pd(0x1.62e42ff0c52d6p-6), _mm256_set1_pd(1.0));
+    y = _mm256_fmadd_pd(z, r2, y);
+    y = _mm256_mul_pd(y, _mm256_castsi256_pd(t));
+    return _mm256_cvtpd_ps(y);
+}
+
+// expf(x) for the candidates' x = logit - max_l, 4 at a time; p receives the probabilities
+__attribute__((target("avx2,fma")))
+static void llama_expf4_logits(const llama_token_data * data, size_t n, float max_l, float * p) {
+    const __m128 m = _mm_set1_ps(max_l);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m128 x = _mm_sub_ps(_mm_setr_ps(data[i].logit, data[i + 1].logit, data[i + 2].logit, data[i + 3].logit), m);
+        int special;
+        _mm_storeu_ps(p + i, llama_expf4(x, special));
+        if (special) {
+            alignas(16) float xs[4];
+            _mm_store_ps(xs, x);
+            for (int j = 0; j < 4; ++j) {
+                if (special & (1 << j)) {
+                    p[i + j] = expf(xs[j]);
+                }
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        p[i] = expf(data[i].logit - max_l);
+    }
+}
+
+// whether llama_expf4 gives the bits of this process's expf: the CPU has AVX2 and FMA, and a sample of the inputs the
+// softmax sees (every 2053rd float in [-104, 0], and the edges) agrees; every float was checked against glibc 2.39
+static bool llama_sampler_expf4_ok() {
+    static const bool ok = [] {
+        if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
+            return false;
+        }
+        std::vector<llama_token_data> d;
+        for (uint32_t u = 0x80000000u; u <= 0xc2d00000u; u += 2053) {
+            float x;
+            memcpy(&x, &u, sizeof(x));
+            d.push_back({0, x, 0.0f});
+        }
+        for (float x : { 0.0f, -0.0f, -87.99f, -88.0f, -88.72f, -103.0f, -103.97f, -104.0f, -1e-30f, -INFINITY }) {
+            d.push_back({0, x, 0.0f});
+        }
+        std::vector<float> p(d.size());
+        llama_expf4_logits(d.data(), d.size(), 0.0f, p.data());
+        for (size_t i = 0; i < d.size(); ++i) {
+            const float ref = expf(d[i].logit - 0.0f);
+            if (memcmp(&ref, &p[i], sizeof(float)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }();
+    return ok;
+}
+#endif
 
 static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) {
     if (cur_p->size == 0) {
@@ -1238,6 +1334,20 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         prefix.resize(nb + 1);
 
         double sum_cum = 0.0f;
+#ifdef LLAMA_SAMPLER_EXPF4
+        if (llama_sampler_expf4_ok()) {
+            float pb[DIST_PREFIX_BLOCK];
+            for (size_t b = 0, i = 0; b < nb; ++b) {
+                prefix[b] = sum_cum;
+                const size_t e = std::min(n, i + DIST_PREFIX_BLOCK);
+                llama_expf4_logits(cur_p->data + i, e - i, max_l, pb);
+                for (size_t k = 0; i < e; ++i, ++k) {
+                    cur_p->data[i].p = pb[k];
+                    sum_cum += pb[k];
+                }
+            }
+        } else
+#endif
         for (size_t b = 0, i = 0; b < nb; ++b) {
             prefix[b] = sum_cum; // the sum of the candidates before block b
             const size_t e = std::min(n, i + DIST_PREFIX_BLOCK);
