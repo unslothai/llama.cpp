@@ -9427,11 +9427,13 @@ struct test_flash_attn_ext_banded : public test_case {
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
-    const ggml_type v_type; // GGML_TYPE_COUNT: kv_type
+    ggml_type v_type = GGML_TYPE_COUNT; // the V type when it differs from K, set by the mixed constructor
 
     std::string vars() override {
-        std::string s = VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
-        return v_type == GGML_TYPE_COUNT ? s : s + ",v_type=" + ggml_type_name(v_type);
+        if (v_type != GGML_TYPE_COUNT) {
+            return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, v_type);
+        }
+        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
     }
 
     double max_nmse_err() override {
@@ -9449,26 +9451,46 @@ struct test_flash_attn_ext_banded : public test_case {
     test_flash_attn_ext_banded(
             int64_t d, int64_t n_head, int64_t n_head_kv,
             int64_t n_q, int64_t n_kv, int64_t rel_extent,
-            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false, ggml_type v_type = GGML_TYPE_COUNT)
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
-          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided), v_type(v_type) {}
+          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided) {}
+
+    // K of kv_type, V of v_type (GGML_TYPE_COUNT: kv_type)
+    test_flash_attn_ext_banded(
+            int64_t d, int64_t n_head, int64_t n_head_kv,
+            int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided, ggml_type v_type)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided) {
+        this->v_type = v_type;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
         ggml_tensor * k;
         ggml_tensor * v;
         ggml_tensor * r;
-        const ggml_type vt = v_type == GGML_TYPE_COUNT ? kv_type : v_type;
-        if (strided) {
+        if (strided && v_type != GGML_TYPE_COUNT) {
+            // a V cache type that differs from K
             ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
-            ggml_tensor * vb = ggml_new_tensor_4d(ctx, vt, 2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, v_type,  2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
+            k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0);
+            v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0);
+            r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, 1, rb->nb[1], rb->nb[2], rb->nb[3], 0);
+        } else if (strided) {
+            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
             ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
             k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0);
             v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0);
             r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, 1, rb->nb[1], rb->nb[2], rb->nb[3], 0);
         } else {
             k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
-            v = ggml_new_tensor_4d(ctx, vt, d, n_kv, n_head_kv, 1);
+            if (v_type == GGML_TYPE_COUNT) {
+                v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+            } else {
+                v = ggml_new_tensor_4d(ctx, v_type, d, n_kv, n_head_kv, 1);
+            }
             r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
         }
         ggml_set_name(q, "q");
@@ -9496,7 +9518,8 @@ struct test_flash_attn_ext_banded : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m_wide") == 0) {
+            if (strcmp(t->name, "m_wide") == 0 || (strcmp(t->name, "m") == 0 && mask_kind == 3)) {
+                // padded n_kv (mask_kind 3): the last cells are empty, the queries are the tail of the cells before them
                 const int64_t nw = t->ne[0];
                 const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
                 std::vector<ggml_fp16_t> data(n_q*nw);
@@ -9508,14 +9531,12 @@ struct test_flash_attn_ext_banded : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
-            } else if (strcmp(t->name, "m") == 0) {
+            } else if (strcmp(t->name, "m") == 0 && mask_kind != 3) {
                 std::vector<ggml_fp16_t> data(n_q*n_kv);
-                // padded n_kv: the last cells are empty, the queries are the tail of the cells before them
-                const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
-                        const int64_t rel_dist = iq + (n_kv - n_empty - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && ik < n_kv - n_empty && (mask_kind != 2 || rel_dist < rel_extent);
+                        const int64_t rel_dist = iq + (n_kv - n_q) - ik;
+                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }

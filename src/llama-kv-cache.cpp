@@ -3167,9 +3167,12 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
         return 0;
     }
 
+    // memoized per ubatch: every layer of the graph asks
     if (i_pos_contiguous != i_cur) {
-        const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
-        n_pos_contiguous = result <= (uint32_t) n_kv ? result : 0;
+        n_pos_contiguous = [&]() -> uint32_t {
+            const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
+            return result <= (uint32_t) n_kv ? result : 0;
+        }();
         i_pos_contiguous = i_cur;
     }
     return n_pos_contiguous;

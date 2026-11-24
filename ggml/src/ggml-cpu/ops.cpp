@@ -8999,7 +8999,10 @@ static inline int64_t ggml_flash_attn_ext_banded_dist(const ggml_tensor * dst, i
     const ggml_tensor * k_pos = dst->src[7];
     const ggml_tensor * q_pos = dst->src[8];
     if (!k_pos) {
-        return iq1 + (dst->src[1]->ne[1] - dst->src[0]->ne[1]) - ic;
+        const int64_t nek1 = dst->src[1]->ne[1];
+        const int64_t neq1 = dst->src[0]->ne[1];
+        const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+        return rel_dist;
     }
     const int32_t kp = *(const int32_t *) ((const char *) k_pos->data + ic*k_pos->nb[0] + (iq3 % k_pos->ne[1])*k_pos->nb[1]);
     const int32_t qp = *(const int32_t *) ((const char *) q_pos->data + iq1*q_pos->nb[0] + (iq3 % q_pos->ne[1])*q_pos->nb[1]);

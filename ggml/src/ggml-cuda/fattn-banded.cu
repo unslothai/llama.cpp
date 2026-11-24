@@ -31,7 +31,8 @@ static __device__ __forceinline__ int64_t fattn_banded_dist(
         const int32_t kp = k_pos[ik];
         return kp < 0 ? -1 : int64_t(q_pos[iq]) - kp;
     }
-    return iq + q_offset - ik;
+    const int64_t rel_dist = iq + q_offset - ik;
+    return rel_dist;
 }
 
 template<int D, int WARPS_PER_BLOCK>
@@ -71,15 +72,15 @@ static __global__ void flash_attn_ext_banded_f32(
         const float * __restrict__ sinks,
         int64_t sinks_s1,
         int64_t sinks_s2,
+        const int32_t * __restrict__ k_pos,
+        const int32_t * __restrict__ q_pos,
+        int64_t kpos_s1,
+        int64_t qpos_s1,
         uint64_t r_nb0,
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3,
-        const int32_t * __restrict__ k_pos,
-        const int32_t * __restrict__ q_pos,
-        int64_t kpos_s1,
-        int64_t qpos_s1) {
+        int64_t rel_ne3) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
@@ -229,15 +230,15 @@ static __global__ void flash_attn_ext_banded_f32_split(
         uint64_t m_nb1,
         uint64_t m_nb2,
         uint64_t m_nb3,
+        const int32_t * __restrict__ k_pos,
+        const int32_t * __restrict__ q_pos,
+        int64_t kpos_s1,
+        int64_t qpos_s1,
         uint64_t r_nb0,
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3,
-        const int32_t * __restrict__ k_pos,
-        const int32_t * __restrict__ q_pos,
-        int64_t kpos_s1,
-        int64_t qpos_s1) {
+        int64_t rel_ne3) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
 
@@ -1653,7 +1654,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
             (k_pos->ne[1] != 1 && k_pos->ne[1] != q->ne[3]) || (q_pos->ne[1] != 1 && q_pos->ne[1] != q->ne[3]))) {
         return false;
     }
-    return !m || (m->type == GGML_TYPE_F16 && m->nb[0] == sizeof(half) &&
+    if (m && m->type == GGML_TYPE_F16 && m->nb[0] == sizeof(half) && !ggml_is_contiguous(m)) {
+        // the first n_kv cells of a wider mask, as the model views it: the rows are read with their stride
+        return q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0;
+    }
+    return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
 }
@@ -1944,8 +1949,8 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
                 q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
                 v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
                 m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
-                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], \
-                k_pos_d, q_pos_d, kpos_s1, qpos_s1); \
+                k_pos_d, q_pos_d, kpos_s1, qpos_s1, \
+                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3]); \
             flash_attn_ext_banded_f32_merge<DD><<<mblocks, mthreads, 0, stream>>>( \
                 part.get(), (float *) dst->data, n_rows, q->ne[2], q->ne[1], n_chunks, \
                 sinks ? (const float *) sinks->data : nullptr, \
@@ -1978,8 +1983,8 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         sinks ? (const float *) sinks->data : nullptr, \
         sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \
         sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0, \
-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], \
-        k_pos_d, q_pos_d, kpos_s1, qpos_s1)
+        k_pos_d, q_pos_d, kpos_s1, qpos_s1, \
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
 
     if (q->ne[0] == 64) {
         LAUNCH_BANDED(64);
