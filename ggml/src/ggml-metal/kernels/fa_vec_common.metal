@@ -434,7 +434,8 @@ kernel void kernel_flash_attn_ext_vec(
 
                         mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty];
 
-                        ss[qq*C + NE*tx + ty] = mqk[qq][tx];
+                        // the padded keys past ne11 are out of the softmax whatever the band adds (the pad mask is finite)
+                        ss[qq*C + NE*tx + ty] = ic0*C + NE*tx + ty < args.ne11 ? mqk[qq][tx] : -FLT_MAX/2;
                     } else if (FC_flash_attn_ext_vec_has_mask &&
                        !FC_flash_attn_ext_vec_has_scap &&
                        !FC_flash_attn_ext_vec_has_bias) {

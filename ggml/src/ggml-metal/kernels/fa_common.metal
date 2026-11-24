@@ -464,6 +464,17 @@ void kernel_flash_attn_ext_impl(
                     }
                 }
 
+                // banded: the padded keys past ne11 are out of the softmax whatever the band adds (the pad mask is finite)
+                if (FC_flash_attn_ext_has_rel && FC_flash_attn_ext_has_kvpad) {
+                    const int32_t ik = ic0*C + 2*tiisg;
+                    if (ik >= args.ne11) {
+                        s2[0] = -FLT_MAX/2;
+                    }
+                    if (ik + 1 >= args.ne11) {
+                        s2[1] = -FLT_MAX/2;
+                    }
+                }
+
                 M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
 
                 const float  ms  = exp(m  - M[jj]);
