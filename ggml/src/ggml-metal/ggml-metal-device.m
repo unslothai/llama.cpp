@@ -129,6 +129,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(MUL_MV,          mul_mv)         \
     X(MUL_MV_MMA,      mul_mv_mma)     \
     X(MUL_MM,          mul_mm)         \
+    X(MUL_MM_TENSOR,   mul_mm_tensor)  \
     X(QUANTIZE,        quantize)       \
     X(SOFTMAX,         softmax)        \
     X(NORM,            norm)           \
@@ -1510,14 +1511,16 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
-static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op, bool has_tensor) {
+static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op, bool has_bfloat) {
+    GGML_ASSERT(op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID);
+
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
     if (prec == GGML_PREC_F32) {
-        return false;
+        return true;
     }
     if (prec == GGML_PREC_BF16) {
-        return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;
+        return has_bfloat && op->src[1]->type == GGML_TYPE_F32;
     }
     return true;
 }
@@ -1713,7 +1716,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32 && (ggml_is_contiguous_rows(op->src[0]));
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
-            return ggml_rope_get_truncate(op);
+            return ggml_rope_get_truncate(op) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D:
@@ -1907,7 +1910,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
-            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
+            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_bfloat)) {
                 return false;
             }
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
@@ -1920,7 +1923,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
-            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
+            if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_bfloat)) {
                 return false;
             }
             return ggml_metal_supports_mul_mat_op(
@@ -2375,7 +2378,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
