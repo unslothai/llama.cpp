@@ -778,19 +778,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
     float KQ_max_new[cols_per_thread];
+    // the banded op only delegates DKQ == DV in {64, 128}: keep rel_f out of the other head sizes
+    constexpr bool banded_ok = (DKQ == 64 || DKQ == 128) && DV == DKQ;
 #pragma unroll
     for (int col = 0; col < cols_per_thread; ++col) {
         KQ_max_new[col] = KQ_max[col];
         // banded only: large V overflows the fp16 VKQ accumulator, so bump the running max to rescale
         // by 2^-8 (cancelled by the final normalization); bumps are logarithmic in n_kv
-        if (rel_f && KQ_rowsum[col] > 4.0f) {
+        if (banded_ok && rel_f && KQ_rowsum[col] > 4.0f) {
             KQ_max_new[col] += 8.0f*0.6931f;
         }
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (rel_f) {
+        if (banded_ok && rel_f) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -873,7 +875,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (rel_f) {
+        if (banded_ok && rel_f) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
