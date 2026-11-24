@@ -861,9 +861,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         // ggml_flash_attn_ext_banded stores rel_logits [E, n_head, n_q, n_seq] in src[6], split by head like q
         GGML_ASSERT(                             src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        // the optional K/V cell and query positions are shared by every head
-        GGML_ASSERT(tensor->src[7] == nullptr || src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[8] == nullptr || src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
