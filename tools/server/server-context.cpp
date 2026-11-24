@@ -1651,7 +1651,7 @@ private:
             }
             const server_host_memory mem = server_get_host_memory(host_weights);
             params_base.cache_ram_mib = server_cache_ram_auto_mib(mem.avail, mem.total);
-            SRV_INF("--cache-ram auto: prompt cache size limit %d MiB (host RAM: %" PRId64 " MiB available, %" PRId64 " MiB total, %" PRId64 " MiB of mmap-ed weights not counted as available)\n",
+            SRV_INF("--cache-ram auto: prompt cache size limit %d MiB (host RAM: %" PRId64 " MiB available, %" PRId64 " MiB total, %" PRId64 " MiB of mmap-ed weights, taken off the available figure on Linux only)\n",
                     params_base.cache_ram_mib,
                     mem.avail < 0 ? (int64_t) -1 : mem.avail / (1024 * 1024),
                     mem.total < 0 ? (int64_t) -1 : mem.total / (1024 * 1024),

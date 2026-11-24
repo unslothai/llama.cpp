@@ -846,7 +846,7 @@ struct server_host_memory {
     int64_t avail = -1; // RAM available to new allocations, or the cgroup headroom when it is lower
 };
 
-// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in; ignored on Windows, where resident mapped pages are not counted as available
+// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in; ignored on Windows and macOS, where resident mapped pages are not counted as available
 server_host_memory server_get_host_memory(int64_t page_cache_bytes = 0);
 
 // smallest headroom (limit - usage) of the memory cgroup in proc_cgroup (the text of /proc/self/cgroup) and its ancestors, -1 if no limit; limit_out gets the smallest limit

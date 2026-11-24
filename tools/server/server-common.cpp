@@ -2557,8 +2557,9 @@ server_host_memory server_get_host_memory(int64_t page_cache_bytes) {
     vm_size_t page_size = 0;
     if (host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS &&
         host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vmstat, &count) == KERN_SUCCESS) {
+        // free + inactive + purgeable leaves out active pages, where the mapped weights sit after warmup, so page_cache_bytes is not taken off again
+        (void) page_cache_bytes;
         mem.avail = (int64_t) (vmstat.free_count + vmstat.inactive_count + vmstat.purgeable_count) * (int64_t) page_size;
-        mem.avail = std::max<int64_t>(0, mem.avail - page_cache_bytes);
     }
 #else
     std::ifstream f("/proc/meminfo");
