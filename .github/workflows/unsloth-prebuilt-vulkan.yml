@@ -137,14 +137,28 @@ jobs:
           }
 
       - name: Install Ninja
-        run: choco install ninja --no-progress
+        # Retried: the community feed has outages. The image ships a ninja too, which is only a build
+        # driver (it does not change the binaries), so it is the fallback once the feed stays down.
+        run: |
+          foreach ($i in 1..3) {
+            choco install ninja --no-progress
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Output "::warning::choco install ninja failed ($LASTEXITCODE), attempt $i of 3"
+            if ($i -lt 3) { Start-Sleep -Seconds (20 * $i) }
+          }
+          if ($LASTEXITCODE -ne 0) {
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "choco install ninja failed and the image has no ninja" }
+            Write-Output "::warning::using the image's ninja $(ninja --version)"
+          }
+          exit 0
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
 
       - name: Install Vulkan SDK
         run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          curl.exe -fL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK ${env:VULKAN_VERSION} download failed ($LASTEXITCODE)" }
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
@@ -356,7 +370,20 @@ jobs:
       - name: Install Ninja
         id: ninja
         continue-on-error: true
-        run: choco install ninja --no-progress
+        # Retried: the community feed has outages. The image ships a ninja too, which is only a build
+        # driver (it does not change the binaries), so it is the fallback once the feed stays down.
+        run: |
+          foreach ($i in 1..3) {
+            choco install ninja --no-progress
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Output "::warning::choco install ninja failed ($LASTEXITCODE), attempt $i of 3"
+            if ($i -lt 3) { Start-Sleep -Seconds (20 * $i) }
+          }
+          if ($LASTEXITCODE -ne 0) {
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "choco install ninja failed and the image has no ninja" }
+            Write-Output "::warning::using the image's ninja $(ninja --version)"
+          }
+          exit 0
 
       # The ARM64 component supplies the vulkan-1.lib to link; shaders compile with the host glslc.
       - name: Install Vulkan SDK
@@ -364,7 +391,8 @@ jobs:
         if: steps.src.outcome == 'success' && steps.ninja.outcome == 'success'
         continue-on-error: true
         run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          curl.exe -fL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK ${env:VULKAN_VERSION} download failed ($LASTEXITCODE)" }
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.arm64
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"

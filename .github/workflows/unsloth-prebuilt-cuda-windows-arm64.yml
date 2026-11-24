@@ -170,7 +170,7 @@ jobs:
           foreach ($component in $components) {
             $name = Split-Path $component -Leaf
             $zip = Join-Path $stage "$name.zip"
-            curl.exe -fsSL --retry 3 -o $zip "$pool/$component.zip"
+            curl.exe -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o $zip "$pool/$component.zip"
             if ($LASTEXITCODE -ne 0) { throw "download failed: $component" }
             tar.exe -xf $zip -C $stage
             if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }

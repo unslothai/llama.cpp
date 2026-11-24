@@ -322,6 +322,8 @@ jobs:
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             PHASE='fetch base + merge pins'
             git remote add upstream https://github.com/ggml-org/llama.cpp.git
+            # 3 tries, 15/30 s apart: one dropped fetch must not cost the whole nightly.
+            retry() { local i; for i in 1 2 3; do "$@" && return 0; [ "$i" = 3 ] || sleep $((15 * i)); done; return 1; }
             # The upstream checkout below takes scripts/unsloth/ away. Copy the
             # whole dir out, not file by file: see the note above the step.
             cp -r scripts/unsloth "${RUNNER_TEMP}/us"
@@ -329,9 +331,9 @@ jobs:
             if [ "$(jq length <<<"$PRS")" != 0 ]; then
               # Merges need a merge-base, so unshallow first.
               if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-                git fetch -q --unshallow --no-tags origin
+                retry git fetch -q --unshallow --no-tags origin
               fi
-              git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
+              retry git fetch -q --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
               git checkout -q --detach "refs/tags/${BASE}"
               # Each pin is fetched from the repo its PR lives in (repo/number/
               # sha are machine fields, so the space-delimited read is safe;
@@ -341,8 +343,8 @@ jobs:
                 # the only copy left once an author force-pushes the reviewed
                 # commit out of the PR. That is what took the nightly down on
                 # 07-31, and it is unrecoverable without a ref of our own.
-                git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null \
-                  || git fetch -q --no-tags origin "refs/pins/${SHA}" 2>/dev/null \
+                retry git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null \
+                  || retry git fetch -q --no-tags origin "refs/pins/${SHA}" 2>/dev/null \
                   || { echo "could not fetch commit ${SHA} for ${SRC}#${NUM}; it is gone from ${SRC} and was never mirrored to refs/pins -- update or remove the pin in scripts/unsloth/pr-set.json" >&2; exit 1; }
                 if ! git rev-parse --verify -q "${SHA}^{commit}" >/dev/null; then
                   echo "fetched something for ${SRC}#${NUM} but ${SHA} is still missing" >&2; exit 1
@@ -373,7 +375,7 @@ jobs:
             else
               # Plain build: only the base tree is needed. Shallow is fine -- the
               # build number is baked below, so no git history is needed at build time.
-              git fetch -q --depth 1 --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
+              retry git fetch -q --depth 1 --no-tags upstream "refs/tags/${BASE}:refs/tags/${BASE}"
               git checkout -q --detach "refs/tags/${BASE}"
             fi
             COMMIT="$(git rev-parse HEAD)"
@@ -1127,6 +1129,8 @@ jobs:
           fi
           PAYLOAD="$(jq -cn --arg t "$TAG" --arg g "$GGML_TREE" --arg r "$GITHUB_RUN_ID" \
             '{event_type: "llama-published", client_payload: {llama_tag: $t, ggml_tree: $g, run_id: $r}}')"
+          # lint:network-retry-allow a best-effort POST in a continue-on-error step after publish; a
+          # retried POST could double-dispatch, and the receiver's own schedule is the fallback.
           CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -1160,6 +1164,8 @@ jobs:
           fi
           PAYLOAD="$(jq -cn --arg t "$TAG" --arg r "$GITHUB_RUN_ID" \
             '{event_type: "llama-published", client_payload: {llama_tag: $t, run_id: $r}}')"
+          # lint:network-retry-allow a best-effort POST in a continue-on-error step after publish; a
+          # retried POST could double-dispatch, and the receiver's own schedule is the fallback.
           CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \

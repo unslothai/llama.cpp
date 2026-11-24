@@ -210,7 +210,13 @@ jobs:
         # host that was timing out and failing these builds. It ships preinstalled
         # on the windows-2022 image, so this is normally a fast no-op.
         Write-Host "Installing Strawberry Perl via Chocolatey..."
-        choco install strawberryperl -y --no-progress
+        foreach ($i in 1..3) {
+          choco install strawberryperl -y --no-progress
+          if ($LASTEXITCODE -eq 0) { break }
+          Write-Host "choco install strawberryperl failed ($LASTEXITCODE), attempt $i of 3"
+          if ($i -eq 3) { throw "choco install strawberryperl failed ($LASTEXITCODE)" }
+          Start-Sleep -Seconds (20 * $i)
+        }
 
         # Verify installations
         $env:PATH = "C:\ninja;C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
@@ -280,7 +286,15 @@ jobs:
             Write-Host "Windows ROCm held at nightly $windowsMaxNightly (multi-GPU PAL regression, unslothai/unsloth#18563)"
             $cutoff = $windowsMaxNightly
           }
-          $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing).Content
+          # Same catch-all retry as Invoke-DownloadWithRetry: the index host times out like the tarball host.
+          foreach ($i in 1..3) {
+            try { $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing -ErrorAction Stop).Content; break }
+            catch {
+              Write-Host "Index fetch attempt $i/3 failed: $($_.Exception.Message)"
+              if ($i -eq 3) { throw }
+              Start-Sleep -Seconds (20 * $i)
+            }
+          }
           $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
           if (-not $filesMatch.Success) {
             Write-Error "Failed to parse file index from $baseUrl/"
@@ -696,7 +710,7 @@ jobs:
     - name: Check the bundle carries every ROCm DLL it imports
       if: ${{ (matrix.slice || 0) == 0 }}
       run: |
-        python -m pip install --quiet --disable-pip-version-check pefile
+        python -m pip install --quiet --disable-pip-version-check --retries 5 --timeout 60 pefile
         @'
         import os, sys, pefile
         bundle, rocm = r"llama.cpp\build\bin", r"C:\opt\rocm\bin"
@@ -855,8 +869,8 @@ jobs:
     - name: Install build dependencies
       run: |
         echo "Installing build dependencies..."
-        sudo apt update
-        sudo apt install -y cmake ninja-build unzip curl
+        sudo apt -o Acquire::Retries=5 update
+        sudo apt -o Acquire::Retries=5 install -y cmake ninja-build unzip curl
 
         # Verify installations
         echo "Verifying installations..."
@@ -892,7 +906,7 @@ jobs:
             echo "Auto-detecting latest ROCm version for target: $current_target"
           fi
           prefix="therock-dist-linux-${archive_target}-"
-          files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+          files_json=$(curl -fsS --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
           if [ -z "$files_json" ]; then
             echo "Failed to parse file index from $base_url/"
             exit 1
@@ -930,8 +944,17 @@ jobs:
         # Create directory if it doesn't exist
         sudo mkdir -p /opt/rocm
 
-        # Stream download directly into tar extraction (no intermediate file)
-        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+        # Stream download directly into tar extraction (no intermediate file). A stream cannot be
+        # resumed, so the whole download + extract is retried from an empty /opt/rocm; pipefail
+        # makes a dropped connection fail the attempt instead of leaving a truncated tree.
+        set -o pipefail
+        for i in 1 2 3; do
+          curl -fsSL --connect-timeout 30 "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1 && break
+          if [ "$i" -eq 3 ]; then echo "::error::ROCm download failed 3 times: $rocm_url"; exit 1; fi
+          echo "::warning::ROCm download attempt $i of 3 failed; retrying"
+          sudo find /opt/rocm -mindepth 1 -delete
+          sleep $((30 * i))
+        done
 
     - name: Set ROCm environment variables
       run: |
@@ -1147,7 +1170,7 @@ jobs:
         # library, not shipped under /opt/rocm. Bundle it so the runtime stays
         # self-contained on hosts that lack it. lemonade-sdk/lemonade#1349 hit
         # exactly this ("libatomic.so.1: cannot open shared object file").
-        sudo apt-get install -y libatomic1 >/dev/null 2>&1 || true
+        sudo apt-get -o Acquire::Retries=5 install -y libatomic1 >/dev/null 2>&1 || true
         libatomic_path="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"
         cp -v "$libatomic_path" "$build_bin_path/" 2>/dev/null || echo "libatomic.so.1 not found"
 
@@ -1181,7 +1204,11 @@ jobs:
         git init -q "$src"
         git -C "$src" remote add origin https://github.com/ROCm/rocm-systems
         git -C "$src" sparse-checkout set projects/rocr-runtime
-        git -C "$src" fetch -q --depth 1 --filter=blob:none origin "$sha"
+        for i in 1 2 3; do
+          git -C "$src" fetch -q --depth 1 --filter=blob:none origin "$sha" && break
+          [ "$i" -lt 3 ] || exit 1
+          sleep $((20 * i))
+        done
         git -C "$src" checkout -q FETCH_HEAD
         # TheRock's own rocm-systems patches for this pin, so only the wave count differs.
         if [ -n "$therock_sha" ]; then
@@ -1249,7 +1276,7 @@ jobs:
 
     - name: Set RPATH for portable distribution
       run: |
-        sudo apt-get install -y patchelf
+        sudo apt-get -o Acquire::Retries=5 install -y patchelf
         cd llama.cpp/build/bin
         # Set RPATH to $ORIGIN so all libraries (including the comgr stub loader) find deps locally
         for file in *.so* llama-*; do

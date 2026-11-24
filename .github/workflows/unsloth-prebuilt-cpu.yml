@@ -90,8 +90,8 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev ninja-build
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y build-essential libssl-dev ninja-build
 
       # arm64 builds on ubuntu-22.04-arm so the bundle keeps the x64 leg's
       # loader floor (a 24.04 build needs GLIBC_2.38 and fails to load on
@@ -102,10 +102,15 @@ jobs:
         if: matrix.arch == 'arm64'
         run: |
           set -eux
-          wget -q https://apt.llvm.org/llvm.sh
+          wget -q --tries=5 --waitretry=15 --retry-connrefused https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 19
-          sudo apt-get install -y libomp-19-dev
+          # llvm.sh runs its own apt-get update/install, so retry the whole script (it is idempotent).
+          for i in 1 2 3; do
+            sudo ./llvm.sh 19 && break
+            [ "$i" -lt 3 ] || exit 1
+            sleep $((20 * i))
+          done
+          sudo apt-get -o Acquire::Retries=5 install -y libomp-19-dev
           {
             echo "CC=clang-19"
             echo "CXX=clang++-19"
@@ -277,13 +282,13 @@ jobs:
         run: |
           set -eux
           if [ "${{ matrix.arch }}" = x64 ]; then
-            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
-            sudo apt-get update -y
-            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
+            wget -q --tries=5 --waitretry=15 --retry-connrefused -O - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -q --tries=5 --waitretry=15 --retry-connrefused -O /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get -o Acquire::Retries=5 update -y
+            sudo apt-get -o Acquire::Retries=5 install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build
           else
-            sudo apt-get update -y
-            sudo apt-get install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
+            sudo apt-get -o Acquire::Retries=5 update -y
+            sudo apt-get -o Acquire::Retries=5 install -y build-essential libvulkan-dev spirv-headers libssl-dev ninja-build
           fi
 
       - name: ccache (Vulkan)
@@ -530,7 +535,20 @@ jobs:
           }
 
       - name: Install Ninja
-        run: choco install ninja --no-progress
+        # Retried: the community feed has outages. The image ships a ninja too, which is only a build
+        # driver (it does not change the binaries), so it is the fallback once the feed stays down.
+        run: |
+          foreach ($i in 1..3) {
+            choco install ninja --no-progress
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Output "::warning::choco install ninja failed ($LASTEXITCODE), attempt $i of 3"
+            if ($i -lt 3) { Start-Sleep -Seconds (20 * $i) }
+          }
+          if ($LASTEXITCODE -ne 0) {
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "choco install ninja failed and the image has no ninja" }
+            Write-Output "::warning::using the image's ninja $(ninja --version)"
+          }
+          exit 0
 
       # LLVM 22.1.8, as ggml-org release.yml windows-cpu does since #32548: the image's LLVM 20
       # fails against the VS 18 STL from MSVC 14.52 on (yvals_core.h STL1000, "expected Clang 22

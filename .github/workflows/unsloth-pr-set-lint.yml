@@ -29,9 +29,12 @@ on:
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
+      - scripts/unsloth/check_workflow_network_retries.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
+      # The composite actions the prebuilt calls download toolkits too (check_workflow_network_retries.py).
+      - .github/actions/*/action.yml
   pull_request:
     paths:
       - scripts/unsloth/pr-set.json
@@ -49,9 +52,12 @@ on:
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
+      - scripts/unsloth/check_workflow_network_retries.py
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
+      # The composite actions the prebuilt calls download toolkits too (check_workflow_network_retries.py).
+      - .github/actions/*/action.yml
 
 # Latest-only on a pull request, and per-commit on master.
 #
@@ -161,6 +167,7 @@ jobs:
                    scripts/unsloth/test_pin_contract.py \
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py \
+                   scripts/unsloth/test_check_workflow_network_retries.py \
                    scripts/unsloth/test_relocate_kpack.py \
                    scripts/unsloth/test_slim_source_archive.py \
                    scripts/unsloth/test_link_bundle_copies.py \
@@ -217,4 +224,9 @@ jobs:
       # as a JSONDecodeError inside pin_contract.py. See check_workflow_outputs.py.
       - name: Check every steps.*.outputs reference is actually produced
         run: python3 scripts/unsloth/check_workflow_outputs.py .
+
+      # ~60 prebuilt legs and publish needs every one, so one feed 5xx used to cost the release
+      # (run 45410618008: a Chocolatey 504 on `choco install llvm`). See check_workflow_network_retries.py.
+      - name: Every prebuilt download step retries
+        run: python3 scripts/unsloth/check_workflow_network_retries.py --root .
 

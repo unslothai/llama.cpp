@@ -92,7 +92,7 @@ runs:
           $comp, $ver = $cv.Split(':')
           $name = "$comp-windows-x86_64-$ver-archive"
           $zip = Join-Path $stage "$name.zip"
-          curl.exe -fsSL --retry 3 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
+          curl.exe -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
           if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
           tar.exe -xf $zip -C $stage
           if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }
@@ -119,7 +119,22 @@ runs:
         }
 
     # See unsloth-cuda-linux-setup for the ccache setup and why not sccache.
+    # The action downloads the ccache binary (a 92-byte reply once killed two legs): one retry.
     - name: ccache
+      id: ccache
+      continue-on-error: true
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+      with:
+        key: cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}-${{ inputs.tag }}
+        restore-keys: |
+          cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}
+        append-timestamp: false
+        variant: ccache
+        max-size: ${{ inputs.max-size }}
+        save: false
+
+    - name: ccache (retry)
+      if: steps.ccache.outcome == 'failure'
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
         key: cuda-${{ inputs.cuda }}-windows-${{ inputs.profile }}-${{ inputs.tag }}

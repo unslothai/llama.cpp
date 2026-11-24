@@ -51,15 +51,15 @@ runs:
       shell: bash
       run: |
         set -eux
-        sudo apt-get update
-        sudo apt-get install -y build-essential libssl-dev
+        sudo apt-get -o Acquire::Retries=5 update
+        sudo apt-get -o Acquire::Retries=5 install -y build-essential libssl-dev
 
     - name: Install ARM64 host compiler (gcc-14)
       if: inputs.arch == 'arm64'
       shell: bash
       run: |
         set -eux
-        sudo apt-get install -y gcc-14 g++-14
+        sudo apt-get -o Acquire::Retries=5 install -y gcc-14 g++-14
         {
           echo "CC=gcc-14"
           echo "CXX=g++-14"
@@ -94,7 +94,7 @@ runs:
         for cv in $COMPONENTS; do
           comp="${cv%:*}"; ver="${cv#*:}"
           name="${comp}-${PLAT}-${ver}-archive"
-          curl -fsSL --retry 3 -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
           tar -xf comp.tar.xz
           cp -a "${name}/." "$PREFIX"/
           rm -rf comp.tar.xz "${name}"
@@ -115,7 +115,23 @@ runs:
     # ccache 4.13 from the action's binary (apt ships 4.5.1); save: false because the calling job
     # saves under its own key. Not sccache: measured 2026-09-08, no faster on the churn rebuild,
     # 111 s vs 1 s warm, and 0% per-arch sharing (nvcc passes __CUDA_ARCH_LIST__ into every preprocess).
+    # The action downloads the ccache binary (a 92-byte reply once killed two legs): one retry.
     - name: ccache
+      id: ccache
+      continue-on-error: true
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+      with:
+        key: cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
+        restore-keys: |
+          cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}
+        append-timestamp: false
+        variant: ccache
+        install: binary
+        max-size: ${{ inputs.max-size }}
+        save: false
+
+    - name: ccache (retry)
+      if: steps.ccache.outcome == 'failure'
       uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
       with:
         key: cuda-${{ inputs.cuda }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ inputs.tag }}
