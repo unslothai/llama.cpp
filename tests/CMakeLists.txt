@@ -371,13 +371,8 @@ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
-add_executable(test-flash-attn-bias test-flash-attn-bias.cpp)
-target_link_libraries(test-flash-attn-bias PRIVATE ggml)
-add_test(NAME test-flash-attn-bias COMMAND test-flash-attn-bias)
-
-add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
-target_link_libraries(test-flash-attn-generic-hash PRIVATE ggml)
-add_test(NAME test-flash-attn-generic-hash COMMAND test-flash-attn-generic-hash)
+llama_build_and_test(test-flash-attn-bias.cpp LINK ggml)
+llama_build_and_test(test-flash-attn-generic-hash.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
