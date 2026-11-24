@@ -9391,6 +9391,12 @@ struct test_flash_attn_ext_banded : public test_case {
         if (mask_kind != 0) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
             ggml_set_name(m, "m");
+            if (strided) {
+                // the first n_kv cells of a wider mask, as the model views it
+                ggml_tensor * mb = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv + 64, n_q, 1, 1);
+                ggml_set_name(mb, "m_wide");
+                m = ggml_view_4d(ctx, mb, n_kv, n_q, 1, 1, mb->nb[1], mb->nb[2], mb->nb[3], 0);
+            }
         }
 
         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
@@ -9401,7 +9407,19 @@ struct test_flash_attn_ext_banded : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m_wide") == 0) {
+                const int64_t nw = t->ne[0];
+                const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
+                std::vector<ggml_fp16_t> data(n_q*nw);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < nw; ++ik) {
+                        const int64_t rel_dist = iq + (n_kv - n_empty - n_q) - ik;
+                        const bool visible = ik < n_kv - n_empty && rel_dist >= 0 && (mask_kind != 2 || rel_dist < rel_extent);
+                        data[iq*nw + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> data(n_q*n_kv);
                 // padded n_kv: the last cells are empty, the queries are the tail of the cells before them
                 const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
@@ -13647,6 +13665,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kv_type, GGML_TYPE_F32, 2));
         }
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 256, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+        for (int64_t n_q : { 3, 8, 48 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kv_type, GGML_TYPE_F32, 2, true));
+        }
     }
     // Inkling-2-Small shapes
     for (int64_t n_q : { 1, 3, 8, 512 }) {

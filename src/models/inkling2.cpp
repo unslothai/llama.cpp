@@ -525,11 +525,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
             ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-            // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
+            // one banded mask per graph and cache, the first n_kv_b cells of each row read in place
             ggml_tensor *& m = mask_banded[is_swa];
             if (!m) {
-                m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                m = ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                        mask->nb[1], mask->nb[2], mask->nb[3], 0);
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
             ggml_tensor * rel_bias = layer.attn_rel_bias;

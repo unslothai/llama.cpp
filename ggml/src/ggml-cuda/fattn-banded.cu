@@ -1494,7 +1494,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
         return false;
     }
-    return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
+    return !m || (m->type == GGML_TYPE_F16 && m->nb[0] == sizeof(half) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
 }
