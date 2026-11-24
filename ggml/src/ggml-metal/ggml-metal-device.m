@@ -1549,6 +1549,19 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+// mixed K/V cache types (e.g. -ctk q8_0 -ctv q4_0): the half8x8 and vec kernels are instantiated for
+// these pairs at head sizes 64 and 128 and dequantize K and V inline, without an F16 copy of the cache
+static bool ggml_metal_fa_kv_mixed_ok(const struct ggml_tensor * op) {
+    const enum ggml_type tk = op->src[1]->type;
+    const enum ggml_type tv = op->src[2]->type;
+
+    const bool tk_ok = tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_Q4_0;
+    const bool tv_ok = tv == GGML_TYPE_F16 || tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0;
+
+    return tk != tv && tk_ok && tv_ok && op->src[5] == NULL &&
+        op->src[1]->ne[0] == op->src[2]->ne[0] && (op->src[1]->ne[0] == 64 || op->src[1]->ne[0] == 128);
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1804,7 +1817,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                return false;
+                return ggml_metal_fa_kv_mixed_ok(op) && has_simdgroup_mm;
             }
             switch (op->src[1]->type) {
                 case GGML_TYPE_F32:
@@ -1843,7 +1856,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[0]->ne[1] >= 65536 || op->src[2]->ne[1] != op->src[1]->ne[1]) {
                     return false;
                 }
-                if (op->src[1]->type != op->src[2]->type) {
+                if (op->src[1]->type != op->src[2]->type && !ggml_metal_fa_kv_mixed_ok(op)) {
                     return false;
                 }
                 switch (op->src[1]->type) {

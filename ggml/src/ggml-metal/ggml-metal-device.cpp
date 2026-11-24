@@ -1952,7 +1952,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
+    // mixed K/V cache types: kernel_..._<K type>_<V type>_dk*_dv*
+    char type[32];
+    if (use_kv_f16) {
+        snprintf(type, sizeof(type), "f16");
+    } else if (op->src[1]->type != op->src[2]->type) {
+        snprintf(type, sizeof(type), "%s_%s", ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type));
+    } else {
+        snprintf(type, sizeof(type), "%s", ggml_type_name(op->src[1]->type));
+    }
 
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
@@ -2067,7 +2075,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
+    // mixed K/V cache types: kernel_..._<K type>_<V type>_dk*_dv*
+    char type[32];
+    if (use_kv_f16) {
+        snprintf(type, sizeof(type), "f16");
+    } else if (op->src[1]->type != op->src[2]->type) {
+        snprintf(type, sizeof(type), "%s_%s", ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type));
+    } else {
+        snprintf(type, sizeof(type), "%s", ggml_type_name(op->src[1]->type));
+    }
 
     char qne_suffix[16] = {0};
     if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {

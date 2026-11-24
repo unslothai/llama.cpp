@@ -3216,7 +3216,8 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
     // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
     // banded: the kernels dequantize the KV inline, an F16 copy of the whole cache would grow with n_kv
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    // mixed K/V types: dequantized inline too (the F16 pass converts K and V with one kernel type)
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED || op->src[1]->type != op->src[2]->type) {
         return false;
     }
 
@@ -3242,7 +3243,7 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
 static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op)) {
+    if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op) || op->src[1]->type != op->src[2]->type) {
         return false;
     }
 
@@ -3294,7 +3295,7 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     // K/V row lists are handled by the dense kernels, not by the sparse path
-    if (op->src[5] != nullptr) {
+    if (op->src[5] != nullptr || op->src[1]->type != op->src[2]->type) {
         return 0;
     }
 
@@ -3513,8 +3514,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //    return 0;
     //}
 
-    // banded: supports_op refuses quantized K/V, so no F16 copy of K/V is needed
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
+    // banded and mixed K/V types: the kernels dequantize inline, no F16 copy of K/V is made
+    if ((op->op == GGML_OP_FLASH_ATTN_EXT_BANDED || op->src[1]->type != op->src[2]->type) &&
+        !ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
         return 0;
     }
 
@@ -3599,7 +3601,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne00 % 4 == 0);
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[1]->type == op->src[2]->type);
+    // mixed K/V types are dequantized inline only (no F16 pass)
+    GGML_ASSERT(op->src[1]->type == op->src[2]->type || !ggml_metal_op_flash_attn_ext_use_kv_f16(op));
 
     //GGML_ASSERT(ggml_are_same_shape (src1, src2));
     GGML_ASSERT(ne11 == ne21);
@@ -4102,7 +4105,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        const int is_q = !use_kv_f16 && ggml_is_quantized(op->src[1]->type) ? 1 : 0;
+        const int is_q = !use_kv_f16 && (ggml_is_quantized(op->src[1]->type) || ggml_is_quantized(op->src[2]->type)) ? 1 : 0;
 
         // shared memory layout (halfs unless noted):
         //   queries/attn/result: Q*(DK + 2*PAD2(DV,64) + 4*C)
@@ -4186,7 +4189,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     } else {
         // half4x4 kernel
         // sparse: the index lists are per query row, so a threadgroup can share KV with Q == 1 only
-        auto cfg = use_sparse
+        // mixed K/V types: only the baseline vec configuration is instantiated
+        auto cfg = use_sparse || op->src[1]->type != op->src[2]->type
                 ? ggml_metal_tuning::fa_vec_baseline_cfg((int) ne00, (int) ne20)
                 : ggml_metal_tuning::fa_vec_pick(
                           props_dev->gpu_family,
