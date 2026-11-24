@@ -14177,18 +14177,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 2, 1000, 96, 1, GGML_TYPE_F16, GGML_TYPE_BF16, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 33, 300, 16, 1, GGML_TYPE_F16, GGML_TYPE_BF16, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2, 4,  300, 16, 0, GGML_TYPE_F16, GGML_TYPE_F32,  1));
+    // the other inline-dequant cache types (q4_1, q5_0): prefill, decode and a ragged small batch
+    for (ggml_type kv_type : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, 1100, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   1, 4096, 1024, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2,   3,  333,   16, 2, kv_type, GGML_TYPE_F32, 1));
+    }
     // mixed K/V cache types (-ctk != -ctv), banded and dense, decode / small batches / prefill
     for (auto [type_k, type_v] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
             { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_F16 },
-            { GGML_TYPE_F16,  GGML_TYPE_Q8_0 }, { GGML_TYPE_Q4_0, GGML_TYPE_F16 } }) {
+            { GGML_TYPE_F16,  GGML_TYPE_Q8_0 }, { GGML_TYPE_Q4_0, GGML_TYPE_F16 },
+            { GGML_TYPE_F16,  GGML_TYPE_Q4_0 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 } }) {
         for (int64_t n_q : { 1, 4, 33, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext_banded_kv2(128, 24, 8, n_q, 1100, 1024, type_k, type_v));
         }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_kv2(128, 24, 8, 33, 1024, 1024, type_k, type_v)); // n_kv % 64 == 0: no pad
         test_cases.emplace_back(new test_flash_attn_ext_banded_kv2(64, 8, 2, 3, 333, 16, type_k, type_v));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_kv2(64, 8, 2, 33, 333, 16, type_k, type_v)); // head size 64, half8x8
         for (int64_t nb : { 1, 4, 33 }) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1100, nb, true, true, 0, 0, GGML_PREC_F32, type_k, type_v));
         }
         test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, 333, 3, true, false, 0, 0, GGML_PREC_F32, type_k, type_v));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, 333, 33, true, false, 0, 0, GGML_PREC_F32, type_k, type_v));
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
