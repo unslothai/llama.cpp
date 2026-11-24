@@ -846,7 +846,9 @@ struct server_host_memory {
     int64_t avail = -1; // RAM available to new allocations, or the cgroup headroom when it is lower
 };
 
-server_host_memory server_get_host_memory();
+// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken
+// off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in
+server_host_memory server_get_host_memory(int64_t page_cache_bytes = 0);
 
 // --cache-ram auto: min(8192, (avail - max(2 GiB, total/8)) / 4) MiB, 0 below 256 MiB, 8192 if avail or total is unknown
 int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes);

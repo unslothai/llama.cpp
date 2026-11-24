@@ -2479,14 +2479,14 @@ static int64_t server_cgroup_headroom(int64_t & limit_out) {
 }
 #endif
 
-server_host_memory server_get_host_memory() {
+server_host_memory server_get_host_memory(int64_t page_cache_bytes) {
     server_host_memory mem;
 #if defined(_WIN32)
     MEMORYSTATUSEX status;
     status.dwLength = sizeof(status);
     if (GlobalMemoryStatusEx(&status)) {
         mem.total = (int64_t) status.ullTotalPhys;
-        mem.avail = (int64_t) status.ullAvailPhys;
+        mem.avail = std::max<int64_t>(0, (int64_t) status.ullAvailPhys - page_cache_bytes);
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     uint64_t memsize = 0;
@@ -2500,6 +2500,7 @@ server_host_memory server_get_host_memory() {
     if (host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS &&
         host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vmstat, &count) == KERN_SUCCESS) {
         mem.avail = (int64_t) (vmstat.free_count + vmstat.inactive_count + vmstat.purgeable_count) * (int64_t) page_size;
+        mem.avail = std::max<int64_t>(0, mem.avail - page_cache_bytes);
     }
 #else
     std::ifstream f("/proc/meminfo");
@@ -2511,7 +2512,7 @@ server_host_memory server_get_host_memory() {
         if (key == "MemTotal:") {
             mem.total = kb * 1024;
         } else if (key == "MemAvailable:") {
-            mem.avail = kb * 1024;
+            mem.avail = std::max<int64_t>(0, kb * 1024 - page_cache_bytes);
         }
     }
     int64_t cg_limit = -1;

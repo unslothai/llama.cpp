@@ -1623,8 +1623,6 @@ private:
 
         // --cache-ram auto: size the prompt cache from the host RAM left after the model and the context are loaded
         if (params_base.cache_ram_auto && decision.type == COMMON_DECISION_TYPE_NONE) {
-            const server_host_memory mem = server_get_host_memory();
-            int64_t avail = mem.avail;
             // mmap-ed weights sit in the page cache, which counts as available but has to stay resident,
             // so they are not free room for the cache (weights held in host buffers already are not available)
             int64_t host_weights = 0;
@@ -1634,12 +1632,10 @@ private:
                         host_weights += (int64_t) row.model;
                     }
                 }
-                if (avail >= 0) {
-                    avail = std::max<int64_t>(0, avail - host_weights);
-                }
             }
-            params_base.cache_ram_mib = server_cache_ram_auto_mib(avail, mem.total);
-            SRV_INF("--cache-ram auto: prompt cache size limit %d MiB (host RAM available %" PRId64 " MiB, total %" PRId64 " MiB, mmap-ed host weights %" PRId64 " MiB)\n",
+            const server_host_memory mem = server_get_host_memory(host_weights);
+            params_base.cache_ram_mib = server_cache_ram_auto_mib(mem.avail, mem.total);
+            SRV_INF("--cache-ram auto: prompt cache size limit %d MiB (host RAM: %" PRId64 " MiB available, %" PRId64 " MiB total, %" PRId64 " MiB of mmap-ed weights not counted as available)\n",
                     params_base.cache_ram_mib,
                     mem.avail < 0 ? (int64_t) -1 : mem.avail / (1024 * 1024),
                     mem.total < 0 ? (int64_t) -1 : mem.total / (1024 * 1024),
