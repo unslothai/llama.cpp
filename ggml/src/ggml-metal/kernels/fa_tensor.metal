@@ -12,11 +12,10 @@ constant bool FC_flash_attn_ext_tensor_has_kvpad [[function_constant(FC_FLASH_AT
 constant int32_t FC_flash_attn_ext_tensor_rel_type [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 6)]];
 
 static inline float flash_attn_ext_tensor_rel_load(device const char * rel, int32_t i) {
-#if defined(GGML_METAL_HAS_BF16)
     if (FC_flash_attn_ext_tensor_rel_type == 2) {
-        return (float) ((device const bfloat *) rel)[i];
+        // BF16 by bit shift: exact, and independent of GGML_METAL_HAS_BF16, which a precompiled library or Metal < 3.1 lacks
+        return as_type<float>(((uint) ((device const ushort *) rel)[i]) << 16);
     }
-#endif
     if (FC_flash_attn_ext_tensor_rel_type == 1) {
         return ((device const half *) rel)[i];
     }
