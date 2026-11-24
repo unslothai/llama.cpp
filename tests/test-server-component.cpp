@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <regex>
 #include <string>
 #include <thread>
@@ -861,6 +863,70 @@ static void test_cache_ram_auto(testing & t) {
     t.assert_equal("below the reserve", 0, server_cache_ram_auto_mib(1 * gib, 16 * gib));
 }
 
+static void test_cgroup_headroom(testing & t) {
+    namespace fs = std::filesystem;
+    const int64_t mib = 1024 * 1024;
+    const fs::path root = fs::temp_directory_path() / ("test-cgroup-headroom-" + std::to_string(std::rand()));
+    auto put = [](const fs::path & file, int64_t value) {
+        fs::create_directories(file.parent_path());
+        std::ofstream(file) << value << "\n";
+    };
+    int64_t limit = 0;
+
+    // v2: the parent's memory.max is tighter than the leaf's
+    put(root / "v2" / "a" / "b" / "memory.current", 1024 * mib);
+    put(root / "v2" / "a" / "b" / "memory.max",     4096 * mib);
+    put(root / "v2" / "a" / "memory.current",       2560 * mib);
+    put(root / "v2" / "a" / "memory.max",           3072 * mib);
+    t.assert_equal("v2 ancestor headroom", 512 * mib, server_cgroup_headroom("0::/a/b\n", (root / "v2").string(), limit));
+    t.assert_equal("v2 ancestor limit",   3072 * mib, limit);
+
+    // v2 line plus v1 lines without the memory controller: v2
+    t.assert_equal("v1 without memory uses v2", 512 * mib, server_cgroup_headroom("3:cpu,cpuacct:/a/b\n0::/a/b\n", (root / "v2").string(), limit));
+
+    // v1: the leaf has no limit (a value near INT64_MAX), its parent has one
+    put(root / "v1" / "memory" / "x" / "y" / "memory.usage_in_bytes", 1024 * mib);
+    put(root / "v1" / "memory" / "x" / "y" / "memory.limit_in_bytes", INT64_C(9223372036854771712));
+    put(root / "v1" / "memory" / "x" / "memory.usage_in_bytes",       1536 * mib);
+    put(root / "v1" / "memory" / "x" / "memory.limit_in_bytes",       2048 * mib);
+    t.assert_equal("v1 ancestor headroom", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n", (root / "v1").string(), limit));
+    t.assert_equal("v1 ancestor limit",   2048 * mib, limit);
+
+    // hybrid: a 0:: line and a v1 memory line, the v1 hierarchy holds the controller even when a v2 tree has a tighter limit
+    put(root / "v1" / "x" / "y" / "memory.current", 0);
+    put(root / "v1" / "x" / "y" / "memory.max",     256 * mib);
+    t.assert_equal("hybrid uses v1", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n1:name=systemd:/x/y\n0::/x/y\n", (root / "v1").string(), limit));
+
+    // no limit anywhere, or no cgroup at all
+    put(root / "none" / "memory.current", 1024 * mib);
+    t.assert_equal("no limit", (int64_t) -1, server_cgroup_headroom("0::/\n", (root / "none").string(), limit));
+    t.assert_equal("no limit, limit_out", (int64_t) -1, limit);
+    t.assert_equal("no cgroup", (int64_t) -1, server_cgroup_headroom("", (root / "none").string(), limit));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+static void test_cache_ram_auto_reload(testing & t) {
+    // a reload where auto now resolves to 0: the old cache goes and idle slots are no longer saved
+    std::unique_ptr<server_prompt_cache> cache = std::make_unique<server_prompt_cache>(8192, 4096);
+    bool idle = true;
+    server_cache_ram_auto_reload(cache, idle, true, 0);
+    t.assert_true("cache dropped at 0", cache == nullptr);
+    t.assert_true("idle slots off at 0", !idle);
+
+    // a later reload with room again: idle slots come back as asked, load_model makes the new cache at the new size
+    server_cache_ram_auto_reload(cache, idle, true, 512);
+    t.assert_true("cache made again by load_model", cache == nullptr);
+    t.assert_true("idle slots back", idle);
+
+    // idle slots that were not asked for stay off
+    cache = std::make_unique<server_prompt_cache>(8192, 4096);
+    server_cache_ram_auto_reload(cache, idle, false, 1024);
+    t.assert_true("cache dropped on resize", cache == nullptr);
+    t.assert_true("idle slots stay off", !idle);
+}
+
 static void test_glob_match(testing & t) {
     t.test("patterns", [](testing & t) {
         t.assert_true("literal", glob_match("src/main.cpp", "src/main.cpp"));
@@ -982,6 +1048,8 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("cache_ram_auto",  test_cache_ram_auto);
+    t.test("cgroup_headroom", test_cgroup_headroom);
+    t.test("cache_ram_auto_reload", test_cache_ram_auto_reload);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
     t.test("stop_strings",    test_stop_strings);
     t.test("speech_convert",  test_speech_convert);

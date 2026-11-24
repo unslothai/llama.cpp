@@ -846,9 +846,20 @@ struct server_host_memory {
     int64_t avail = -1; // RAM available to new allocations, or the cgroup headroom when it is lower
 };
 
-// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken
-// off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in
+// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in
 server_host_memory server_get_host_memory(int64_t page_cache_bytes = 0);
+
+// smallest headroom (limit - usage) of the memory cgroup in proc_cgroup (the text of /proc/self/cgroup) and its ancestors under root, -1 if no limit; limit_out gets the smallest limit
+// the hierarchy that holds the memory controller is used: v1 when a v1 line lists it, else v2
+int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::string & root, int64_t & limit_out);
+
+// true if the loader memory-maps the model file for this load_mode (mmap-mlock pages are locked, so they do not count)
+bool server_model_uses_mmap(const llama_model * model, llama_load_mode load_mode);
+
+struct server_prompt_cache;
+
+// --cache-ram auto on a reload after sleep: init() does not run again, so drop the old cache (load_model makes a new one when the limit is not 0) and make idle-slot caching follow the new limit
+void server_cache_ram_auto_reload(std::unique_ptr<server_prompt_cache> & cache, bool & cache_idle_slots, bool cache_idle_slots_requested, int32_t cache_ram_mib);
 
 // --cache-ram auto: min(8192, (avail - max(2 GiB, total/8)) / 4) MiB, 0 below 256 MiB, 8192 if avail or total is unknown
 int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes);

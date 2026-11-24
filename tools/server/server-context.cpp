@@ -1133,6 +1133,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // --cache-ram auto: the --cache-idle-slots setting asked for, the limit can change on each reload
+    bool cache_idle_slots_requested = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1623,10 +1626,12 @@ private:
 
         // --cache-ram auto: size the prompt cache from the host RAM left after the model and the context are loaded
         if (params_base.cache_ram_auto && decision.type == COMMON_DECISION_TYPE_NONE) {
-            // mmap-ed weights sit in the page cache, which counts as available but has to stay resident,
-            // so they are not free room for the cache (weights held in host buffers already are not available)
+            if (!is_resume) {
+                cache_idle_slots_requested = params_base.cache_idle_slots;
+            }
+            // mmap-ed weights sit in the page cache, which counts as available but has to stay resident, so they are not free room for the cache (weights read into host buffers already are not available)
             int64_t host_weights = 0;
-            if (params_base.load_mode == LLAMA_LOAD_MODE_AUTO || params_base.load_mode == LLAMA_LOAD_MODE_MMAP) {
+            if (server_model_uses_mmap(model_tgt, params_base.load_mode)) {
                 for (const auto & row : common_memory_breakdown_rows(ctx_tgt)) {
                     if (row.kind == common_memory_breakdown_row::HOST) {
                         host_weights += (int64_t) row.model;
@@ -1640,6 +1645,9 @@ private:
                     mem.avail < 0 ? (int64_t) -1 : mem.avail / (1024 * 1024),
                     mem.total < 0 ? (int64_t) -1 : mem.total / (1024 * 1024),
                     host_weights / (1024 * 1024));
+            if (is_resume) {
+                server_cache_ram_auto_reload(prompt_cache, params_base.cache_idle_slots, cache_idle_slots_requested, params_base.cache_ram_mib);
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
