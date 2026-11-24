@@ -9423,7 +9423,8 @@ struct test_flash_attn_ext_banded : public test_case {
     const int64_t n_q;
     const int64_t n_kv;
     const int64_t rel_extent;
-    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent
+    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal over a padded n_kv,
+                         // 4: causal with the first query fully masked
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
@@ -9492,7 +9493,7 @@ struct test_flash_attn_ext_banded : public test_case {
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
                         const int64_t rel_dist = iq + (n_kv - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
+                        const bool visible = rel_dist >= 0 && (mask_kind != 2 || rel_dist < rel_extent) && (mask_kind != 4 || iq != 0);
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
