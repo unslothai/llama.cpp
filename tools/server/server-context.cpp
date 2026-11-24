@@ -1133,6 +1133,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // --cache-ram auto: the --cache-idle-slots setting asked for, the limit can change on each reload
+    bool cache_idle_slots_requested = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1619,6 +1622,43 @@ private:
             SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
+        }
+
+        // --cache-ram auto: size the prompt cache from the host RAM left after the model and the context are loaded
+        if (params_base.cache_ram_auto && decision.type == COMMON_DECISION_TYPE_NONE) {
+            if (!is_resume) {
+                cache_idle_slots_requested = params_base.cache_idle_slots;
+            } else {
+                // free the states of the old cache before RAM is sampled, the new limit must not count the cache it replaces
+                prompt_cache.reset();
+            }
+            // mmap-ed weights sit in the page cache, which counts as available but has to stay resident, so they are not free room for the cache (weights read into host buffers already are not available)
+            auto mmap_host_weights = [&](llama_context * ctx, const llama_model * model) {
+                int64_t bytes = 0;
+                if (ctx != nullptr && model != nullptr && server_model_uses_mmap(model, params_base.load_mode)) {
+                    for (const auto & row : common_memory_breakdown_rows(ctx)) {
+                        if (row.kind == common_memory_breakdown_row::HOST) {
+                            bytes += (int64_t) row.model;
+                        }
+                    }
+                }
+                return bytes;
+            };
+            int64_t host_weights = mmap_host_weights(ctx_tgt, model_tgt);
+            // a separate draft model maps its own file; an MTP draft context runs on the target model, whose weights are counted already
+            if (model_dft != nullptr && model_dft != model_tgt) {
+                host_weights += mmap_host_weights(ctx_dft, model_dft);
+            }
+            const server_host_memory mem = server_get_host_memory(host_weights);
+            params_base.cache_ram_mib = server_cache_ram_auto_mib(mem.avail, mem.total);
+            SRV_INF("--cache-ram auto: prompt cache size limit %d MiB (host RAM: %" PRId64 " MiB available, %" PRId64 " MiB total, %" PRId64 " MiB of mmap-ed weights, taken off the available figure on Linux only)\n",
+                    params_base.cache_ram_mib,
+                    mem.avail < 0 ? (int64_t) -1 : mem.avail / (1024 * 1024),
+                    mem.total < 0 ? (int64_t) -1 : mem.total / (1024 * 1024),
+                    host_weights / (1024 * 1024));
+            if (is_resume) {
+                server_cache_ram_auto_reload(prompt_cache, params_base.cache_idle_slots, cache_idle_slots_requested, params_base.cache_ram_mib);
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {

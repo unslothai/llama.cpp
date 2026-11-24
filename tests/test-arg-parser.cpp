@@ -256,6 +256,23 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
 
+    // --cache-ram: N, -1 and 0 are explicit sizes, auto is sized by the server and keeps the decision-model default
+    {
+        common_params cram_params;
+        assert(cram_params.cache_ram_mib == 8192 && !cram_params.cache_ram_auto && !cram_params.cache_ram_explicit);
+        argv = {"binary_name", "--cache-ram", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cram_params, LLAMA_EXAMPLE_SERVER));
+        assert(cram_params.cache_ram_auto && !cram_params.cache_ram_explicit && cram_params.cache_ram_mib == 8192);
+        for (const auto & [value, expected] : std::vector<std::pair<std::string, int>>{{"512", 512}, {"-1", -1}, {"0", 0}}) {
+            common_params p;
+            argv = {"binary_name", "-cram", value};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+            assert(!p.cache_ram_auto && p.cache_ram_explicit && p.cache_ram_mib == expected);
+        }
+        argv = {"binary_name", "--cache-ram", "lots"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cram_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     {
         auto parse_shards = [&list_str_to_char](std::vector<std::string> args) {
             common_params shard_params;

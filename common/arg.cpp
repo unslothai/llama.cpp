@@ -1696,11 +1696,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
+        {"-cram", "--cache-ram"}, "N|auto",
+        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable; "
+            "auto sizes it from host RAM available after the model loads: min(8192, (available - max(2 GiB, total/8)) / 4), "
+            "0 below 256 MiB, 8192 if host RAM is unknown)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
-        [](common_params & params, int value) {
-            params.cache_ram_mib = value;
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                // auto only sizes the cache, decision models keep it disabled
+                params.cache_ram_auto     = true;
+                params.cache_ram_explicit = false;
+                return;
+            }
+            params.cache_ram_mib      = std::stoi(value);
+            params.cache_ram_auto     = false;
             params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));

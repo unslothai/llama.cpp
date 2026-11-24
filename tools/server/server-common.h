@@ -840,6 +840,31 @@ static inline server_state server_state_from_str(const std::string & str) {
 // the model name reported by the server: the first alias, else the model's repo or path
 std::string server_get_model_name(const common_params & params);
 
+// host memory for --cache-ram auto, in bytes, -1 if unknown
+struct server_host_memory {
+    int64_t total = -1; // physical RAM, or the cgroup limit when it is lower
+    int64_t avail = -1; // RAM available to new allocations, or the cgroup headroom when it is lower
+};
+
+// page_cache_bytes: file-backed memory (mmap-ed weights) that counts as available but has to stay resident, it is taken off the system figure only, the cgroup headroom already charges the pages this cgroup faulted in; ignored on Windows and macOS, where resident mapped pages are not counted as available
+server_host_memory server_get_host_memory(int64_t page_cache_bytes = 0);
+
+// smallest headroom (limit - usage) of the memory cgroup in proc_cgroup (the text of /proc/self/cgroup) and its ancestors, -1 if no limit; limit_out gets the smallest limit
+// the hierarchy that holds the memory controller is used: v1 when a v1 line lists it, else v2
+// its mount point and mount root come from mountinfo (the text of /proc/self/mountinfo), root (v2) or root/memory (v1) when it has no such mount
+int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::string & mountinfo, const std::string & root, int64_t & limit_out);
+
+// true if the loader memory-maps the model file for this load_mode (mmap-mlock pages are locked, so they do not count)
+bool server_model_uses_mmap(const llama_model * model, llama_load_mode load_mode);
+
+struct server_prompt_cache;
+
+// --cache-ram auto on a reload after sleep: init() does not run again, so drop the old cache (load_model makes a new one when the limit is not 0) and make idle-slot caching follow the new limit
+void server_cache_ram_auto_reload(std::unique_ptr<server_prompt_cache> & cache, bool & cache_idle_slots, bool cache_idle_slots_requested, int32_t cache_ram_mib);
+
+// --cache-ram auto: min(8192, (avail - max(2 GiB, total/8)) / 4) MiB, 0 below 256 MiB, 8192 if avail or total is unknown
+int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes);
+
 // the role of this process and, when it is a child of a router, its side of the protocol
 struct server_role {
     // serializes the notify_to_router writes

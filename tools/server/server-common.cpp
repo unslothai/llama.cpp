@@ -10,6 +10,8 @@
 #include "hash/hash.h"
 
 #include "server-common.h"
+#include "server-slot-sched.h"
+#include "../../src/llama-ext.h" // staging API: llama_model_n_devices, llama_model_get_device
 
 #include <cpp-httplib/httplib.h>
 
@@ -51,6 +53,8 @@
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <mach-o/dyld.h>
 #include <limits.h>
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #else
 #include <unistd.h>
 #endif
@@ -2401,6 +2405,206 @@ std::string server_get_model_name(const common_params & params) {
     }
     // fallback: derive model name from file name
     return std::filesystem::path(params.model.path).filename().string();
+}
+
+int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::string & mountinfo, const std::string & root, int64_t & limit_out) {
+    limit_out = -1;
+    // a controller is bound to one hierarchy only: a v1 line that lists "memory" means v2 has no memory accounting
+    std::istringstream lines(proc_cgroup);
+    std::string line;
+    std::string v2_path;
+    std::string v1_path;
+    bool v1_memory = false;
+    while (std::getline(lines, line)) {
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) {
+            continue;
+        }
+        const std::string ctrl = line.substr(a + 1, b - a - 1);
+        if (line.substr(0, a) == "0" && ctrl.empty()) {
+            v2_path = line.substr(b + 1);
+        } else if (("," + ctrl + ",").find(",memory,") != std::string::npos) {
+            v1_path   = line.substr(b + 1);
+            v1_memory = true;
+        }
+    }
+    if (!v1_memory && v2_path.empty()) {
+        return -1;
+    }
+    auto read_i64 = [](const std::filesystem::path & path, int64_t & out) {
+        std::ifstream in(path);
+        std::string v;
+        if (!(in >> v) || v == "max") {
+            return false;
+        }
+        try {
+            out = std::stoll(v);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+    int64_t headroom = -1;
+    auto consider = [&](int64_t limit, int64_t usage) {
+        // v1 reports no limit as a value near INT64_MAX
+        if (limit <= 0 || limit >= (int64_t(1) << 60)) {
+            return;
+        }
+        const int64_t h = std::max<int64_t>(0, limit - usage);
+        headroom  = headroom  < 0 ? h     : std::min(headroom, h);
+        limit_out = limit_out < 0 ? limit : std::min(limit_out, limit);
+    };
+    // find where the hierarchy is mounted (hybrid systems mount v2 at /sys/fs/cgroup/unified) and which cgroup is its mount root (a container sees its own cgroup there)
+    std::filesystem::path base = v1_memory ? std::filesystem::path(root) / "memory" : std::filesystem::path(root);
+    std::string cg_path = v1_memory ? v1_path : v2_path;
+    std::istringstream mounts(mountinfo);
+    while (std::getline(mounts, line)) {
+        // id parent major:minor root mount_point options [optional fields] - fstype source super_options
+        std::istringstream fields(line);
+        std::string id, parent, dev, mnt_root, mnt_point, opts, field;
+        if (!(fields >> id >> parent >> dev >> mnt_root >> mnt_point >> opts)) {
+            continue;
+        }
+        while (fields >> field && field != "-") {
+        }
+        std::string fstype, source, super_opts;
+        if (!(fields >> fstype >> source >> super_opts)) {
+            continue;
+        }
+        const bool match = v1_memory ? fstype == "cgroup" && ("," + super_opts + ",").find(",memory,") != std::string::npos : fstype == "cgroup2";
+        if (!match) {
+            continue;
+        }
+        base = mnt_point;
+        if (mnt_root != "/") {
+            // the process cgroup relative to the mount root, the mount point itself when it is not below it
+            const bool below = cg_path.compare(0, mnt_root.size(), mnt_root) == 0 && (cg_path.size() == mnt_root.size() || cg_path[mnt_root.size()] == '/');
+            cg_path = below ? cg_path.substr(mnt_root.size()) : "/";
+        }
+        break;
+    }
+    // walk from the cgroup of this process up to the root of the hierarchy, a limit on any ancestor applies too
+    const std::filesystem::path rel = std::filesystem::path(cg_path).relative_path();
+    std::vector<std::filesystem::path> dirs = { base };
+    for (const auto & part : rel) {
+        dirs.push_back(dirs.back() / part);
+    }
+    for (const auto & dir : dirs) {
+        int64_t usage = 0;
+        if (v1_memory) {
+            int64_t limit = 0;
+            if (read_i64(dir / "memory.usage_in_bytes", usage) && read_i64(dir / "memory.limit_in_bytes", limit)) {
+                consider(limit, usage);
+            }
+        } else if (read_i64(dir / "memory.current", usage)) {
+            for (const char * name : { "memory.max", "memory.high" }) {
+                int64_t limit = 0;
+                if (read_i64(dir / name, limit)) {
+                    consider(limit, usage);
+                }
+            }
+        }
+    }
+    return headroom;
+}
+
+bool server_model_uses_mmap(const llama_model * model, llama_load_mode load_mode) {
+    if (!llama_supports_mmap()) {
+        return false;
+    }
+    if (load_mode == LLAMA_LOAD_MODE_MMAP) {
+        return true;
+    }
+    if (load_mode != LLAMA_LOAD_MODE_AUTO) {
+        return false;
+    }
+    // same rule as llama_model_base::load_tensors: auto turns mmap off when a device of the model has no mmap support
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(llama_model_get_device(model, i), &props);
+        if (!props.caps.mmap_support) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void server_cache_ram_auto_reload(std::unique_ptr<server_prompt_cache> & cache, bool & cache_idle_slots, bool cache_idle_slots_requested, int32_t cache_ram_mib) {
+    cache.reset();
+    cache_idle_slots = cache_idle_slots_requested && cache_ram_mib != 0;
+}
+
+server_host_memory server_get_host_memory(int64_t page_cache_bytes) {
+    server_host_memory mem;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        mem.total = (int64_t) status.ullTotalPhys;
+        // ullAvailPhys counts the standby and free lists only, mapped pages in a working set (the weights after warmup) are not in it, so page_cache_bytes is not taken off again
+        (void) page_cache_bytes;
+        mem.avail = (int64_t) status.ullAvailPhys;
+    }
+#elif defined(__APPLE__) && defined(__MACH__)
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        mem.total = (int64_t) memsize;
+    }
+    vm_statistics64_data_t vmstat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS &&
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vmstat, &count) == KERN_SUCCESS) {
+        // free + inactive + purgeable leaves out active pages, where the mapped weights sit after warmup, so page_cache_bytes is not taken off again
+        (void) page_cache_bytes;
+        mem.avail = (int64_t) (vmstat.free_count + vmstat.inactive_count + vmstat.purgeable_count) * (int64_t) page_size;
+    }
+#else
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    int64_t     kb = 0;
+    std::string unit;
+    while (f >> key >> kb) {
+        std::getline(f, unit);
+        if (key == "MemTotal:") {
+            mem.total = kb * 1024;
+        } else if (key == "MemAvailable:") {
+            mem.avail = std::max<int64_t>(0, kb * 1024 - page_cache_bytes);
+        }
+    }
+    auto read_text = [](const char * path) {
+        std::ifstream in(path);
+        std::stringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
+    int64_t cg_limit = -1;
+    const int64_t cg_headroom = server_cgroup_headroom(read_text("/proc/self/cgroup"), read_text("/proc/self/mountinfo"), "/sys/fs/cgroup", cg_limit);
+    if (cg_limit >= 0) {
+        mem.total = mem.total < 0 ? cg_limit : std::min(mem.total, cg_limit);
+    }
+    if (cg_headroom >= 0) {
+        mem.avail = mem.avail < 0 ? cg_headroom : std::min(mem.avail, cg_headroom);
+    }
+#endif
+    return mem;
+}
+
+int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes) {
+    const int32_t cap_mib = 8192; // the --cache-ram default, auto never raises it
+    if (avail_bytes < 0 || total_bytes <= 0) {
+        return cap_mib;
+    }
+    // keep max(2 GiB, 1/8 of RAM) for the OS and other programs, then give the prompt cache a quarter of the rest: context checkpoints, speculative decoding and the HTTP layer also grow after the model loads
+    const int64_t mib     = 1024 * 1024;
+    const int64_t reserve = std::max<int64_t>(2048 * mib, total_bytes / 8);
+    const int64_t size    = std::max<int64_t>(0, avail_bytes - reserve) / 4 / mib;
+    if (size < 256) {
+        return 0; // too small to hold a useful prompt state
+    }
+    return (int32_t) std::min<int64_t>(cap_mib, size);
 }
 
 bool server_role::is_managed_by_router() {
