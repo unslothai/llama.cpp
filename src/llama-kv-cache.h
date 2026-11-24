@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -489,6 +490,11 @@ private:
 
     // the index of the cur ubatch to process
     size_t i_cur = 0;
+
+    // get_n_kv_pos_contiguous() of ubatch i_cur once applied: the check scans the cells of the sequence, and the
+    // graph build or reuse check and set_input each ask for it
+    mutable size_t   i_pos_contiguous = SIZE_MAX;
+    mutable uint32_t n_pos_contiguous = 0;
 
     slot_info_vec_t sinfos;
 
