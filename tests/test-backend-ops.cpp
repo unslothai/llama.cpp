@@ -9746,6 +9746,90 @@ struct test_flash_attn_ext_banded_shapes : public test_case {
 };
 
 // banded attention with different K and V cache types (e.g. -ctk q8_0 -ctv q4_0), causal mask, per-query sinks
+// banded attention with every relative bias at the bottom of the F16 range: the padded keys of a ragged n_kv
+// must stay out of the softmax, they would otherwise tie the real keys
+struct test_flash_attn_ext_banded_rel_floor : public test_flash_attn_ext_banded {
+    using test_flash_attn_ext_banded::test_flash_attn_ext_banded;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded::vars() + ",rel_floor=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "rel_logits"), -65504.0f, -65500.0f);
+    }
+};
+
+// K/V layouts and masks the Metal banded / mixed K/V kernels cannot address (backends may refuse them):
+// K and V with their own types and head counts, K/V rows padded to a stride the 4-vector loads would round down,
+// a mask wider than K
+struct test_flash_attn_ext_kv_layout : public test_case {
+    const bool banded;
+    const int64_t d, n_head, n_q, n_kv;
+    const ggml_type type_k, type_v;
+    const int64_t n_head_k, n_head_v, row_pad, mask_cols;
+
+    std::string vars() override {
+        return VARS_TO_STR10(banded, d, n_head, n_q, n_kv, type_k, type_v, n_head_k, n_head_v, row_pad) +
+            ",mask_cols=" + std::to_string(mask_cols);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_layout(bool banded, int64_t d, int64_t n_head, int64_t n_q, int64_t n_kv, ggml_type type_k, ggml_type type_v,
+            int64_t n_head_k, int64_t n_head_v, int64_t row_pad, int64_t mask_cols)
+        : banded(banded), d(d), n_head(n_head), n_q(n_q), n_kv(n_kv), type_k(type_k), type_v(type_v),
+          n_head_k(n_head_k), n_head_v(n_head_v), row_pad(row_pad), mask_cols(mask_cols) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        // the row padding applies to the non-quantized side(s) only (a quantized row is whole blocks)
+        const int64_t pad_k = ggml_is_quantized(type_k) ? 0 : row_pad;
+        const int64_t pad_v = ggml_is_quantized(type_v) ? 0 : row_pad;
+        ggml_tensor * kb = ggml_new_tensor_4d(ctx, type_k, d + pad_k, n_kv, n_head_k, 1);
+        ggml_tensor * vb = ggml_new_tensor_4d(ctx, type_v, d + pad_v, n_kv, n_head_v, 1);
+        ggml_tensor * k  = pad_k ? ggml_view_4d(ctx, kb, d, n_kv, n_head_k, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0) : kb;
+        ggml_tensor * v  = pad_v ? ggml_view_4d(ctx, vb, d, n_kv, n_head_v, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0) : vb;
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_cols, n_q, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(kb, "kb");
+        ggml_set_name(vb, "vb");
+        ggml_set_name(m, "m");
+        ggml_tensor * out;
+        if (banded) {
+            ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, n_head, n_q, 1);
+            ggml_set_name(r, "rel_logits");
+            out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), 16);
+        } else {
+            out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/float(d), 0.0f, 0.0f);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // causal over the first n_kv columns, the rest masked
+                std::vector<ggml_fp16_t> data(n_q*mask_cols);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < mask_cols; ++ik) {
+                        const bool visible = ik < n_kv && iq + (n_kv - n_q) - ik >= 0;
+                        data[iq*mask_cols + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (t->view_src == nullptr) {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 struct test_flash_attn_ext_banded_kv2 : public test_case {
     const int64_t d;
     const int64_t n_head;
@@ -14405,6 +14489,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   1, 4096, 1024, 2, kv_type, GGML_TYPE_F32, 2));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2,   3,  333,   16, 2, kv_type, GGML_TYPE_F32, 1));
     }
+    // padded keys of a ragged n_kv out of the softmax when the band pushes every score to the F16 floor
+    for (int64_t n_q : { 1, 4, 33 }) {
+        for (int mask_kind : { 0, 1 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_rel_floor(128, 8, 2, n_q, 333, 512, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32));
+        }
+    }
+    // layouts and masks backends may refuse: K rows padded off a 4-element boundary, a mask wider than K, and (banded)
+    // K/V head counts that differ. Left out: plain mixed FA with K/V head counts that differ and banded F16/F16 with
+    // padded rows, which CUDA accepts and gets wrong today (Metal refuses both)
+    //                                                   banded,   d, nh, n_q, n_kv, type_k,          type_v,     hk, hv, pad, mask_cols
+    for (bool banded : { false, true }) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0, 128));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0,  64));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, 1, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 1, 0, 64));
     // mixed K/V cache types (-ctk != -ctv), banded and dense, decode / small batches / prefill
     for (auto [type_k, type_v] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
             { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_F16 },
