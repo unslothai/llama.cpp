@@ -1295,11 +1295,9 @@ void launch_fattn(
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    // banded op reuses the MMA ABI: negative max_bias tags the branch, sinks_ptr carries rel_logits, -max_bias is E
     if (rel) {
         GGML_ASSERT(rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel));
         GGML_ASSERT(rel->ne[0] <= (1 << 20)); // exactly representable in float
-        max_bias = -float(rel->ne[0]);
     }
 
     if (logit_softcap != 0.0f) {
@@ -1309,8 +1307,9 @@ void launch_fattn(
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
-    // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
-    const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
+    // banded op reuses the MMA ABI: negative m0 tags the branch, sinks_ptr carries rel_logits, -m0 is E
+    // an ordinary m0 is a power of 2 and never negative, whatever max_bias is
+    const float m0 = rel ? -float(rel->ne[0]) : powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = rel ? 1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:

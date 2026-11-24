@@ -2027,8 +2027,8 @@ static __global__ void flash_attn_ext_f16(
     const int  * GGML_CUDA_RESTRICT KV_max         = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
-    const bool banded_bias = max_bias < 0.0f;
-    const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
+    const bool banded_bias = m0 < 0.0f;
+    const int  rel_extent  = banded_bias ? int(-m0) : 0;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
