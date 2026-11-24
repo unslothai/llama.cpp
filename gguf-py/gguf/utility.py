@@ -143,6 +143,11 @@ class SafetensorRemote:
             for file in all_files:
                 url = f"{cls.BASE_DOMAIN}/{model_id}/resolve/main/{file}"
                 for key, val in cls.get_list_tensors(url).items():
+                    # the index maps each tensor to one shard; a duplicate would silently overwrite it
+                    if weight_map.get(key) != file:
+                        raise ValueError(
+                            f"tensor '{key}' found in '{file}' but the index assigns "
+                            f"it to '{weight_map.get(key)}'; refusing to load a wrong-shard copy")
                     tensors[key] = val
             return tensors
 

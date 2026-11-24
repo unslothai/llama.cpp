@@ -243,6 +243,10 @@ class ModelBase:
                 self._source_tensor_names[name] = titem[0] if titem else None
                 if titem:
                     tname, tgen = titem
+                    if tname in tensors:
+                        raise ValueError(
+                            f"duplicate tensor '{tname}' found in the remote model; "
+                            f"refusing to silently overwrite")
                     tensors[tname] = tgen
 
             return tensors
