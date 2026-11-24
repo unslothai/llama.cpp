@@ -114,7 +114,9 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
             !ggml_cuda_rel_private_chain(cgraph, bias, G)) {
         return 0;
     }
-    if (ggml_cuda_rel_use_count(cgraph, cpy) != 1 || ggml_cuda_rel_use_count(cgraph, add) != 1 ||
+    // ggml_cast makes the CPY its own destination (src[1] is the CPY itself), and the graph counts that as a use
+    const int32_t cpy_self_use = cpy->src[1] == cpy ? 1 : 0;
+    if (ggml_cuda_rel_use_count(cgraph, cpy) - cpy_self_use != 1 || ggml_cuda_rel_use_count(cgraph, add) != 1 ||
             (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }

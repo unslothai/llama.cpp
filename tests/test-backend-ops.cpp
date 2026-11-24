@@ -9096,7 +9096,7 @@ struct test_fa_rel_bias_fuse : public test_case {
     const int     mask_mode; // 0: causal with holes and an unused tail, 1: a ring window with fully masked 32-column runs
     // graphs the fusion must leave alone or handle (with_sub): 1 / 2 an in-place write of a / b between the table and the
     // attention, 3 the F16 bias destination read again after the attention, 4 the table taken from the last n_head heads
-    // of a 2*n_head subtraction
+    // of a 2*n_head subtraction, 5 the F16 bias made with ggml_cast (its own destination, as llama-graph builds it)
     const int     hazard;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9153,9 +9153,14 @@ struct test_fa_rel_bias_fuse : public test_case {
         ggml_tensor * bias = ggml_get_rows(ctx, table, rel_pos);
         bias = ggml_reshape_4d(ctx, bias, n_head, kv, nr, ns);
         bias = ggml_permute(ctx, bias, 2, 0, 1, 3);
-        ggml_tensor * bias_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, n_head, ns);
-        ggml_set_name(bias_f16, "bias_f16");
-        bias = ggml_cpy(ctx, bias, bias_f16);
+        ggml_tensor * bias_f16 = nullptr;
+        if (hazard == 5) {
+            bias = ggml_cast(ctx, bias, GGML_TYPE_F16);
+        } else {
+            bias_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, n_head, ns);
+            ggml_set_name(bias_f16, "bias_f16");
+            bias = ggml_cpy(ctx, bias, bias_f16);
+        }
 
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nr, 1, ns);
         ggml_set_name(m, "m");
@@ -13474,8 +13479,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 8, 129,  512, nr, 4, true, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 24, 4097, 4096, nr, 1, true));
         test_cases.emplace_back(new test_fa_rel_bias_fuse(256,  8, 8,  33,  256, nr, 1, true));
-        for (int hazard : {1, 2, 3, 4}) {
+        for (int hazard : {1, 2, 3, 4, 5}) {
             test_cases.emplace_back(new test_fa_rel_bias_fuse(64, 24, 8, 129, 256, nr, 1, true, GGML_TYPE_F16, 0, hazard));
+        }
+    }
+    // the bias cast to F16 with ggml_cast, as llama-graph builds it: decode and verify rows, multiple streams
+    for (int64_t kv : { 256, 4096 }) {
+        for (int64_t nr : { 1, 4 }) {
+            for (int64_t ns : { 1, 2 }) {
+                test_cases.emplace_back(new test_fa_rel_bias_fuse(128, 24, 8, 129, kv, nr, ns, true, GGML_TYPE_F16, 0, 5));
+            }
         }
     }
 
