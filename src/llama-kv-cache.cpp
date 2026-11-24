@@ -2109,6 +2109,18 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    GGML_ASSERT(n_kv <= (int64_t) cells.size());
+    std::vector<int32_t> data(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        data[j] = cells.is_empty(j) ? -1 : cells.pos_get(j);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3123,6 +3135,8 @@ bool llama_kv_cache_context::apply() {
     n_kv      = kv->get_n_kv(sinfos[i_cur]);
     n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
 
+    i_pos_contiguous = SIZE_MAX;
+
     return true;
 }
 
@@ -3153,8 +3167,15 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
         return 0;
     }
 
-    const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
-    return result <= (uint32_t) n_kv ? result : 0;
+    // memoized per ubatch: every layer of the graph asks
+    if (i_pos_contiguous != i_cur) {
+        n_pos_contiguous = [&]() -> uint32_t {
+            const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
+            return result <= (uint32_t) n_kv ? result : 0;
+        }();
+        i_pos_contiguous = i_cur;
+    }
+    return n_pos_contiguous;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
@@ -3235,6 +3256,10 @@ void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const lla
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_cell_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

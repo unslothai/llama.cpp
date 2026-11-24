@@ -2547,11 +2547,12 @@ struct llama_model_inkling2 : public llama_model_base {
         // banded flash attention for layer il on its device and cache
         bool use_banded(int il, bool swa);
         std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+        // single-token ubatch over a cache type that the dense path converts to F16 whole
+        bool decode_banded = false;
         // [base, swa] contiguous mask of the banded attention, shared by the layers of a graph
         ggml_tensor * mask_banded[2] = { nullptr, nullptr };
-        // query rows of the dense bias the first banded full-attention layer also builds in the reserve graph:
-        // the small ubatches that stay dense take that bias at runtime, the reserve must hold it
-        int64_t n_rows_dense_reserve = 0;
+        // I32 [n_tokens] query positions of the banded attention, used when it takes the cell positions
+        ggml_tensor * q_pos_banded = nullptr;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;

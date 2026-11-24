@@ -596,8 +596,13 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
         return false;
     }
 
-    // the MMA kernel passes rel in the sinks slot
-    if (dst->src[4]) {
+    // the MMA kernel passes rel in the sinks slot, and indexes it by cell distance only
+    if (dst->src[4] || dst->src[7]) {
+        return false;
+    }
+
+    // flash attention reads a contiguous mask
+    if (dst->src[3] && !ggml_is_contiguous(dst->src[3])) {
         return false;
     }
 

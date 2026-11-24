@@ -8993,6 +8993,22 @@ static inline float ggml_flash_attn_ext_banded_load(
     }
 }
 
+// distance of query iq1 to cell ic: q_pos - k_pos with the positions (src[7], src[8]), else the cell distance
+// aligned to the tail of K (FA4 seqlen_k - seqlen_q convention); -1 for an empty cell
+static inline int64_t ggml_flash_attn_ext_banded_dist(const ggml_tensor * dst, int64_t iq1, int64_t iq3, int64_t ic) {
+    const ggml_tensor * k_pos = dst->src[7];
+    const ggml_tensor * q_pos = dst->src[8];
+    if (!k_pos) {
+        const int64_t nek1 = dst->src[1]->ne[1];
+        const int64_t neq1 = dst->src[0]->ne[1];
+        const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+        return rel_dist;
+    }
+    const int32_t kp = *(const int32_t *) ((const char *) k_pos->data + ic*k_pos->nb[0] + (iq3 % k_pos->ne[1])*k_pos->nb[1]);
+    const int32_t qp = *(const int32_t *) ((const char *) q_pos->data + iq1*q_pos->nb[0] + (iq3 % q_pos->ne[1])*q_pos->nb[1]);
+    return kp < 0 ? -1 : int64_t(qp) - kp;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9154,7 +9170,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                const int64_t rel_dist = ggml_flash_attn_ext_banded_dist(dst, iq1, iq3, ic);
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }

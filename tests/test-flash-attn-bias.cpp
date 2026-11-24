@@ -29,6 +29,11 @@ struct bias_test_config {
     bool strided_rel = false;
     float v_scale = 1.0f;
     float v_bias = 0.0f;
+    // 0: the cells are the positions; 1: n_seq sequences interleaved in one cache; 2: a wrapped ring of one sequence
+    int layout = 0;
+    int64_t n_seq = 1;
+    // layout 1: empty cells after the last query, as the cache pads n_kv (a cell offset would shift every distance)
+    int64_t n_pad = 0;
 };
 
 struct test_data {
@@ -44,7 +49,52 @@ struct test_data {
     std::vector<float> v_rounded;
     std::vector<float> rel_rounded;
     std::vector<float> dense_bias;
+    // cell and query positions of the banded op (layout != 0), -1 = empty cell
+    std::vector<int32_t> k_pos;
+    std::vector<int32_t> q_pos;
 };
+
+// cell -> (sequence, position), query -> (sequence, position) of a layout; empty cells have position -1
+static void make_layout(const bias_test_config & c, std::vector<int32_t> & k_seq, std::vector<int32_t> & k_pos,
+        std::vector<int32_t> & q_seq, std::vector<int32_t> & q_pos) {
+    k_seq.assign(c.nkv, -1);
+    k_pos.assign(c.nkv, -1);
+    q_seq.assign(c.nq, 0);
+    q_pos.assign(c.nq, 0);
+    if (c.layout == 0) {
+        for (int64_t j = 0; j < c.nkv; ++j) {
+            k_seq[j] = 0;
+            k_pos[j] = int32_t(j);
+        }
+        for (int64_t i = 0; i < c.nq; ++i) {
+            q_pos[i] = int32_t(i + c.nkv - c.nq);
+        }
+    } else if (c.layout == 1) {
+        const int64_t n_used = c.nkv - c.n_pad;
+        for (int64_t j = 0; j < n_used; ++j) {
+            if (j % 7 != 3 || j >= n_used - c.nq) {
+                k_seq[j] = int32_t(j % c.n_seq);
+                k_pos[j] = int32_t(j / c.n_seq);
+            }
+        }
+        for (int64_t i = 0; i < c.nq; ++i) {
+            const int64_t j = n_used - c.nq + i;
+            q_seq[i] = int32_t(j % c.n_seq);
+            q_pos[i] = int32_t(j / c.n_seq);
+        }
+    } else {
+        const int64_t n_total = 3*c.nkv + c.nkv/3 + 1;
+        for (int64_t p = 0; p < n_total; ++p) {
+            k_seq[p % c.nkv] = 0;
+            k_pos[p % c.nkv] = int32_t(p);
+        }
+        k_seq[(n_total + 5) % c.nkv] = -1;
+        k_pos[(n_total + 5) % c.nkv] = -1;
+        for (int64_t i = 0; i < c.nq; ++i) {
+            q_pos[i] = int32_t(n_total - c.nq + i);
+        }
+    }
+}
 
 struct run_result {
     std::vector<float> output;
@@ -102,9 +152,20 @@ static test_data make_data(const bias_test_config & c) {
             }
         }
     }
+    std::vector<int32_t> k_seq, q_seq;
+    make_layout(c, k_seq, data.k_pos, q_seq, data.q_pos);
+    // the distance of a query to a cell, -1 if the cell is empty
+    auto distance = [&](int64_t iq, int64_t ik) -> int64_t {
+        if (c.layout == 0) {
+            const int64_t dist = iq + (c.nkv - c.nq) - ik;
+            return dist;
+        }
+        return data.k_pos[ik] < 0 ? -1 : int64_t(data.q_pos[iq]) - data.k_pos[ik];
+    };
     for (int64_t iq = 0; iq < c.nq; ++iq) {
         for (int64_t ik = 0; ik < c.nkv; ++ik) {
-            const int64_t dist = iq + (c.nkv - c.nq) - ik;
+            // a cell of another sequence is as invisible as an empty one
+            const int64_t dist = k_seq[ik] == q_seq[iq] ? distance(iq, ik) : -1;
             const bool visible = !c.use_mask || (dist >= 0 && (!c.sliding || dist < c.extent));
             data.mask[iq*c.nkv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
         }
@@ -120,7 +181,7 @@ static test_data make_data(const bias_test_config & c) {
         for (int64_t ih = 0; ih < c.hq; ++ih) {
             for (int64_t iq = 0; iq < c.nq; ++iq) {
                 for (int64_t ik = 0; ik < c.nkv; ++ik) {
-                    const int64_t dist = iq + (c.nkv - c.nq) - ik;
+                    const int64_t dist = distance(iq, ik);
                     if (dist >= 0 && dist < c.extent) {
                         data.dense_bias[((ib*c.hq + ih)*c.nq + iq)*c.nkv + ik] =
                             data.rel_rounded[((irb*c.nq + iq)*c.hq + ih)*c.extent + dist];
@@ -137,6 +198,7 @@ static run_result run_graph(
         const bias_test_config & c,
         const test_data & data,
         bool dense,
+        bool with_pos,
         int repeats) {
     ggml_init_params params = {
         /* .mem_size = */ ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(64, false),
@@ -171,8 +233,15 @@ static run_result run_graph(
 
     ggml_tensor * out;
     ggml_tensor * bias = nullptr;
+    ggml_tensor * kp = nullptr;
+    ggml_tensor * qp = nullptr;
     if (!dense) {
         out = ggml_flash_attn_ext_banded(ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent);
+        if (with_pos || c.layout != 0) {
+            kp = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, c.nkv);
+            qp = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, c.nq);
+            ggml_flash_attn_ext_banded_set_pos(out, kp, qp);
+        }
     } else {
         bias = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, c.nkv, c.nq, c.hq, c.n_batch);
         ggml_set_name(bias, "dense_bias");
@@ -217,6 +286,10 @@ static run_result run_graph(
     if (bias) {
         ggml_backend_tensor_set(bias, data.dense_bias.data(), 0, data.dense_bias.size()*sizeof(float));
     }
+    if (kp) {
+        ggml_backend_tensor_set(kp, data.k_pos.data(), 0, data.k_pos.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(qp, data.q_pos.data(), 0, data.q_pos.size()*sizeof(int32_t));
+    }
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 64, false);
     ggml_build_forward_expand(graph, out);
@@ -236,6 +309,10 @@ static run_result run_graph(
     result.allocated_bytes = ggml_backend_buffer_get_size(buffer.get());
     result.ms = double(elapsed)/1000.0/repeats;
     return result;
+}
+
+static run_result run_graph(ggml_backend_t backend, const bias_test_config & c, const test_data & data, bool dense, int repeats) {
+    return run_graph(backend, c, data, dense, false, repeats);
 }
 
 static std::vector<float> naive_materialized(const bias_test_config & c, const test_data & data) {
@@ -506,6 +583,19 @@ int main(int argc, char ** argv) {
             {"decode_8k_e1024",  128,    1, 8192, 8, 1, 1024, GGML_TYPE_F16,  true, false},
             {"large_v_16k",      128,   16, 16384, 8, 1, 1024, GGML_TYPE_F16, true, false, 1, 1, false, 512.0f, 1.0f},
         };
+    } else if (suite == "pos") {
+        // the cells are not the positions: several sequences in one unified cache, a wrapped SWA ring
+        configs = {
+            {"multiseq_decode",   128,    4, 1024, 8, 2,  256, GGML_TYPE_F16,  true, false, 1, 1, false, 1.0f, 0.0f, 1, 4},
+            {"multiseq_prefill",  128,   64, 1024, 8, 2,  256, GGML_TYPE_F16,  true, false, 1, 1, false, 1.0f, 0.0f, 1, 4},
+            {"multiseq_f32",       64,   17,  700, 8, 2,   64, GGML_TYPE_F32,  true, true,  1, 1, false, 1.0f, 0.0f, 1, 3},
+            {"multiseq_bf16",     128,  130, 2048, 8, 1,  512, GGML_TYPE_BF16, true, false, 1, 1, false, 1.0f, 0.0f, 1, 2},
+            {"padded_decode",     128,    4,  512, 8, 2,  256, GGML_TYPE_F16,  true, false, 1, 1, false, 1.0f, 0.0f, 1, 4, 255},
+            {"padded_prefill",    128,   64, 1280, 8, 2,  512, GGML_TYPE_F16,  true, false, 1, 1, false, 1.0f, 0.0f, 1, 2, 250},
+            {"wrapped_decode",    128,    1,  768, 8, 2,  512, GGML_TYPE_F16,  true, true,  1, 1, false, 1.0f, 0.0f, 2, 1},
+            {"wrapped_prefill",   128,  256, 1024, 8, 2,  512, GGML_TYPE_F16,  true, true,  1, 1, false, 1.0f, 0.0f, 2, 1},
+            {"wrapped_f32",        64,   33,  300, 8, 2,   64, GGML_TYPE_F32,  true, true,  1, 1, false, 1.0f, 0.0f, 2, 1},
+        };
     } else if (suite == "hard") {
         configs = {
             {"heads64_gqa",       64, 1024, 1024, 64, 8, 512, GGML_TYPE_F16, true, false},
@@ -513,6 +603,7 @@ int main(int argc, char ** argv) {
     } else {
         fprintf(stderr, "unknown suite: %s (expected small, medium, hard, perf, memory, or overflow)\n",
                 suite.c_str());
+        fprintf(stderr, "or pos: the cells are not the positions\n");
         return 2;
     }
 
@@ -530,6 +621,28 @@ int main(int argc, char ** argv) {
         error_stats(flash.output, naive, abs_naive, mean_abs_naive, rel_naive, mean_rel_naive, rmse_naive);
         const double tol = (c.type == GGML_TYPE_F32 ? 2e-5 : 2e-3)*std::max(1.0f, c.v_scale);
         const bool pass = abs_naive <= tol;
+        // the position checks print their own verdict and fail the run like the naive check
+        bool pass_pos = true;
+        if (c.layout != 0) {
+            // the outputs are small: relative to their scale, so that a bias at the wrong distances fails
+            double scale = 0.0;
+            for (float x : naive) {
+                scale = std::max(scale, (double) std::fabs(x));
+            }
+            pass_pos = abs_naive <= 1e-4*scale;
+            printf("%s naive_scale=%.9g naive_max_abs_rel=%.9g %s\n", c.name, scale, abs_naive/scale, pass_pos ? "PASS" : "FAIL");
+        }
+        if (c.layout == 0) {
+            // the positions of cells that are the positions: bit for bit on the CPU, where both run the same loop;
+            // a GPU may pick another kernel for the cell distance (the delegated FA kernel), so within tol there
+            const run_result with_pos = run_graph(backend.get(), c, data, false, true, 1);
+            double abs_pos, mean_abs_pos, rel_pos, mean_rel_pos, rmse_pos;
+            error_stats(with_pos.output, flash.output, abs_pos, mean_abs_pos, rel_pos, mean_rel_pos, rmse_pos);
+            const bool same = backend_kind == "cpu" ? abs_pos == 0.0 : abs_pos <= tol;
+            printf("%s identity_positions_max_abs=%.9g %s\n", c.name, abs_pos, same ? "SAME" : "DIFFER");
+            pass_pos = same;
+        }
+        ok = ok && pass_pos;
         ok = ok && pass;
         printf("%s type=%s D=%lld nq=%lld nkv=%lld hq=%lld hkv=%lld E=%lld mask=%d sliding=%d "
                "batch=%lld rel_batch=%lld strided_rel=%d "
