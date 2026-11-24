@@ -2277,6 +2277,15 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // banded attention over a cache whose cells are not the positions (several sequences, a wrapped ring):
+    //   k_pos: [n_kv,    1 or ne3] I32, position of each K/V cell, negative = no bias
+    //   q_pos: [n_batch, 1 or ne3] I32, position of each query
+    //   rel_dist = q_pos[q_idx] - k_pos[kv_idx] replaces the cell distance; the mask still separates sequences
+    GGML_API void ggml_flash_attn_ext_banded_set_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_pos,
+            struct ggml_tensor * q_pos);
+
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]
     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices

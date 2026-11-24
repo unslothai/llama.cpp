@@ -1401,16 +1401,6 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     return res;
 }
 
-uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(const llama_kv_cache_context * kv_ctx) const {
-    const uint32_t n_used = kv_ctx->get_n_kv_pos_contiguous();
-    if (!banded_pad || n_used == 0) {
-        return n_used;
-    }
-    // the shift table covers a padding of less than n_rel_pad cells, one sequence alone in the cache always fits
-    const uint32_t n_kv = kv_ctx->get_n_kv();
-    return n_used <= n_kv && n_kv - n_used < n_rel_pad ? n_kv : 0;
-}
-
 void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
@@ -1426,6 +1416,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (self_k_pos[i] && self_k_pos[i]->buffer) {
+            (i ? attn_ctx->get_swa() : attn_ctx->get_base())->set_input_cell_pos(self_k_pos[i], ubatch);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1475,6 +1471,27 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 }
 
+uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(
+        const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const {
+    // one sequence whose cells are its positions: the cell distance is the position distance
+    const uint32_t n_used = ubatch.n_seqs_unq == 1 ? kv->get_n_kv_pos_contiguous() : 0;
+    use_pos = banded_pos != 0 && (n_used == 0 || banded_pos == 2);
+    if (use_pos) {
+        return kv->get_n_kv();
+    }
+    if (!banded_pad || n_used == 0) {
+        return n_used;
+    }
+    // padded: the shift table covers a padding of less than n_rel_pad cells, one sequence alone in the cache always
+    // fits; else the positions, if allowed
+    const uint32_t n_kv = kv->get_n_kv();
+    if (n_used <= n_kv && n_kv - n_used < n_rel_pad) {
+        return n_kv;
+    }
+    use_pos = banded_pos != 0;
+    return use_pos ? n_kv : 0;
+}
+
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
 
@@ -1507,8 +1524,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= get_n_kv_banded(attn_ctx->get_base()) == n_kv_banded[0];
-        res &= (banded_swa_dense ? 0 : get_n_kv_banded(attn_ctx->get_swa())) == n_kv_banded[1];
+        for (int i = 0; i < 2; ++i) {
+            bool use_pos = false;
+            const uint32_t n = i == 1 && banded_swa_dense ? 0 :
+                get_n_kv_banded(i ? attn_ctx->get_swa() : attn_ctx->get_base(), params.ubatch, use_pos);
+            res &= n == n_kv_banded[i];
+            res &= use_pos == (self_k_pos[i] != nullptr);
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();

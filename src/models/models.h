@@ -2551,6 +2551,8 @@ struct llama_model_inkling2 : public llama_model_base {
         bool decode_banded = false;
         // [base, swa] contiguous mask of the banded attention, shared by the layers of a graph
         ggml_tensor * mask_banded[2] = { nullptr, nullptr };
+        // I32 [n_tokens] query positions of the banded attention, used when it takes the cell positions
+        ggml_tensor * q_pos_banded = nullptr;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;

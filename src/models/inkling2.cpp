@@ -11,6 +11,17 @@ static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens take the banded path over the padded n_kv
 static constexpr int64_t n_tokens_banded_min = 32;
 
+// the banded attention takes the distances from the positions when the cells are not the positions
+// (several sequences in a unified cache, a wrapped SWA cache); LLAMA_INKLING_BANDED_POS=0 keeps those dense,
+// =2 takes the positions for every banded ubatch (a check: the cells that are the positions give the same result)
+static int inkling2_banded_pos_mode() {
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_INKLING_BANDED_POS");
+        return env == nullptr ? 1 : std::clamp(atoi(env), 0, 2);
+    }();
+    return mode;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -343,6 +354,9 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
+    if (inp->self_k_pos[swa]) {
+        ggml_flash_attn_ext_banded_set_pos(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1), ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1));
+    }
     ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = ggml_backend_dev_supports_op(dev, op);
     banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -354,11 +368,11 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     attn = inp->get_attn();
     recr = inp->get_recr();
 
-    // banded FA needs a position-contiguous cache. Ubatches of 2 to n_tokens_banded_min tokens (drafts, prompt tails)
-    // span the padded n_kv, which changes only every 256 cells, so that their graph is reused. A decode step stays
-    // dense: the FA vec kernel is faster there, and the reserved tg graph (one token over the whole cache) holds its bias
-    // except with a cache type that dense CUDA FA converts to F16 whole every step (it reads F16 / BF16 / q8_0 / q4_0
-    // in place): then the full-attention layers of a single-sequence context take the banded kernel
+    // banded FA. Ubatches of 2 to n_tokens_banded_min tokens (drafts, prompt tails) span the padded n_kv, which changes
+    // only every 256 cells, so that their graph is reused. A decode step stays dense: the FA vec kernel is faster there,
+    // and the reserved tg graph (one token over the whole cache) holds its bias, except with a cache type that dense
+    // CUDA FA converts to F16 whole every step (it reads F16 / BF16 / q8_0 / q4_0 in place): then the full-attention
+    // layers of a single-sequence context take the banded kernel
     const auto * base = attn->mctx->get_base();
     const ggml_type tk = base->type_k();
     const ggml_type tv = base->type_v();
@@ -367,25 +381,46 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
         tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q4_0 || tv == GGML_TYPE_F16));
     inp->banded     = cparams.flash_attn && (n_tokens > 1 || decode_banded);
     inp->banded_pad = n_tokens <= n_tokens_banded_min;
-    for (int i = 0; i < 2 && inp->banded; ++i) {
-        // a ubatch of several sequences is dense at runtime, so the reserved worst case (a ubatch
-        // of every sequence) must be dense too, else the dense graph outgrows the reserved buffer
-        inp->n_kv_banded[i] = ubatch.n_seqs_unq != 1 ? 0 : inp->get_n_kv_banded(i ? attn->mctx->get_swa() : base);
-    }
-    // the SWA view is small, and once it wraps a decode step is dense anyway: keep it dense in the reserve too
-    if (decode_banded) {
-        inp->banded_swa_dense = true;
-        inp->n_kv_banded[1]   = 0;
+    // the cells of several sequences, or of a wrapped cache, are not the positions: the banded attention then
+    // takes the distances from the positions of the cells and the queries; disabled, those ubatches are dense
+    inp->banded_pos = inp->banded ? inkling2_banded_pos_mode() : 0;
+    // the positions of the n_kv_banded cells of a cache, filled at set_input
+    auto k_pos = [&](int i) {
+        inp->self_k_pos[i] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_kv_banded[i]);
+        ggml_set_input(inp->self_k_pos[i]);
+        ggml_set_name(inp->self_k_pos[i], i ? "attn_inp_k_pos_swa" : "attn_inp_k_pos");
+    };
+    // that decode step keeps the small SWA view dense, in the reserve too
+    inp->banded_swa_dense = decode_banded;
+    for (int i = 0; i < (decode_banded ? 1 : 2) && inp->banded; ++i) {
+        // without the positions a ubatch of several sequences is dense at runtime, so the reserved worst case
+        // (a ubatch of every sequence) is dense too, else the dense graph outgrows the reserved buffer
+        bool use_pos = false;
+        inp->n_kv_banded[i] = inp->get_n_kv_banded(i ? attn->mctx->get_swa() : base, ubatch, use_pos);
+        if (use_pos) {
+            k_pos(i);
+        }
     }
     // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
-    // while at runtime it does so only for consecutive ones. Once the positions pass the SWA cache it wraps
-    // and its layers take the dense bias for every ubatch
-    if (inp->n_kv_banded[1] > 0 && n_tokens > 1 && ubatch.pos[0] == ubatch.pos[n_tokens - 1] &&
-            attn->mctx->get_swa()->get_size() < attn->mctx->get_base()->get_size()) {
-        inp->n_kv_banded[1] = 0;
+    // while at runtime it does so only for consecutive ones
+    if (inp->n_kv_banded[0] > 0 && n_tokens > 1 && ubatch.pos[0] == ubatch.pos[n_tokens - 1]) {
+        if (inp->banded_pos) {
+            // a gap, several sequences or a wrapped SWA cache take the positions at runtime: reserve that graph,
+            // it holds the contiguous one
+            for (int i = 0; i < 2; ++i) {
+                if (!inp->self_k_pos[i]) {
+                    inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : base)->get_n_kv();
+                    k_pos(i);
+                }
+            }
+        } else if (attn->mctx->get_swa()->get_size() < base->get_size()) {
+            // once the positions pass the SWA cache it wraps and its layers take the dense bias for every ubatch
+            inp->n_kv_banded[1] = 0;
+        }
     }
+    // the band of a padded span is shifted by the padding; with the positions the distances need no shift
     for (int i = 0; i < 2 && inp->banded_pad; ++i) {
-        if (inp->n_kv_banded[i] > 0) {
+        if (inp->n_kv_banded[i] > 0 && !inp->self_k_pos[i]) {
             ggml_tensor *& shift = inp->self_rel_shift[i];
             shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (i ? hparams.n_swa : hparams.n_relative_extent) + inp->n_rel_pad);
             ggml_set_input(shift);
@@ -394,6 +429,8 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
+    // the query positions of the banded attention
+    q_pos_banded = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
     inp_out_ids = build_inp_out_ids();
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
@@ -558,6 +595,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+            if (inp->self_k_pos[is_swa]) {
+                ggml_flash_attn_ext_banded_set_pos(cur, inp->self_k_pos[is_swa], q_pos_banded);
+            }
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

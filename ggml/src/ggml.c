@@ -5538,6 +5538,25 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_set_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_pos,
+        struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT((k_pos == NULL) == (q_pos == NULL));
+    if (k_pos) {
+        const struct ggml_tensor * q = a->src[0];
+        const struct ggml_tensor * k = a->src[1];
+        GGML_ASSERT(k_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(k_pos));
+        GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos));
+        GGML_ASSERT(k_pos->ne[0] == k->ne[1] && (k_pos->ne[1] == 1 || k_pos->ne[1] == q->ne[3]));
+        GGML_ASSERT(q_pos->ne[0] == q->ne[1] && (q_pos->ne[1] == 1 || q_pos->ne[1] == q->ne[3]));
+        GGML_ASSERT(k_pos->ne[2] == 1 && k_pos->ne[3] == 1 && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
+    }
+    a->src[7] = k_pos;
+    a->src[8] = q_pos;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

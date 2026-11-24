@@ -824,8 +824,16 @@ public:
 
     static constexpr uint32_t n_rel_pad = 256;
 
-    // the n_kv_banded a graph built for this memory context takes
-    uint32_t get_n_kv_banded(const llama_kv_cache_context * kv_ctx) const;
+    // [base, swa] I32 [n_kv] position of each cell (-1 if empty), when the banded attention takes the distances
+    // from the positions: the cells of several sequences, or a wrapped cache. Null when the cells are the positions
+    ggml_tensor * self_k_pos[2] = { nullptr, nullptr };
+    // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
+    // banded ubatch, also when the cells are the positions (a check: the result must not change)
+    int banded_pos = 0;
+
+    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes,
+    // and whether it takes the positions
+    uint32_t get_n_kv_banded(const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const;
 
     const uint32_t extent;
     const uint32_t extent_swa;
