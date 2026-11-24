@@ -51,6 +51,8 @@
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <mach-o/dyld.h>
 #include <limits.h>
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #else
 #include <unistd.h>
 #endif
@@ -2401,6 +2403,143 @@ std::string server_get_model_name(const common_params & params) {
     }
     // fallback: derive model name from file name
     return std::filesystem::path(params.model.path).filename().string();
+}
+
+#if !defined(_WIN32) && !(defined(__APPLE__) && defined(__MACH__))
+// smallest headroom (limit - usage) of this process's cgroup and its ancestors, -1 if there is no limit
+static int64_t server_cgroup_headroom(int64_t & limit_out) {
+    limit_out = -1;
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    std::string v2_path;
+    std::string v1_path;
+    while (std::getline(f, line)) {
+        if (line.rfind("0::", 0) == 0) {
+            v2_path = line.substr(3);
+        } else {
+            const size_t a = line.find(':');
+            const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+            if (b != std::string::npos) {
+                const std::string ctrl = "," + line.substr(a + 1, b - a - 1) + ",";
+                if (ctrl.find(",memory,") != std::string::npos) {
+                    v1_path = line.substr(b + 1);
+                }
+            }
+        }
+    }
+    auto read_i64 = [](const std::string & path, int64_t & out) {
+        std::ifstream in(path);
+        std::string v;
+        if (!(in >> v) || v == "max") {
+            return false;
+        }
+        try {
+            out = std::stoll(v);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+    int64_t headroom = -1;
+    auto consider = [&](int64_t limit, int64_t usage) {
+        // v1 reports "no limit" as a huge value
+        if (limit <= 0 || limit >= (int64_t(1) << 60)) {
+            return;
+        }
+        const int64_t h = std::max<int64_t>(0, limit - usage);
+        headroom  = headroom  < 0 ? h     : std::min(headroom, h);
+        limit_out = limit_out < 0 ? limit : std::min(limit_out, limit);
+    };
+    if (!v2_path.empty()) {
+        std::filesystem::path dir = std::filesystem::path("/sys/fs/cgroup") / std::filesystem::path(v2_path).relative_path();
+        for (;;) {
+            int64_t usage = 0;
+            if (read_i64((dir / "memory.current").string(), usage)) {
+                for (const char * name : { "memory.max", "memory.high" }) {
+                    int64_t limit = 0;
+                    if (read_i64((dir / name).string(), limit)) {
+                        consider(limit, usage);
+                    }
+                }
+            }
+            if (dir == "/sys/fs/cgroup" || !dir.has_parent_path() || dir.parent_path() == dir) {
+                break;
+            }
+            dir = dir.parent_path();
+        }
+    } else if (!v1_path.empty()) {
+        const std::filesystem::path dir = std::filesystem::path("/sys/fs/cgroup/memory") / std::filesystem::path(v1_path).relative_path();
+        int64_t limit = 0;
+        int64_t usage = 0;
+        if (read_i64((dir / "memory.limit_in_bytes").string(), limit) && read_i64((dir / "memory.usage_in_bytes").string(), usage)) {
+            consider(limit, usage);
+        }
+    }
+    return headroom;
+}
+#endif
+
+server_host_memory server_get_host_memory() {
+    server_host_memory mem;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        mem.total = (int64_t) status.ullTotalPhys;
+        mem.avail = (int64_t) status.ullAvailPhys;
+    }
+#elif defined(__APPLE__) && defined(__MACH__)
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        mem.total = (int64_t) memsize;
+    }
+    vm_statistics64_data_t vmstat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS &&
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vmstat, &count) == KERN_SUCCESS) {
+        mem.avail = (int64_t) (vmstat.free_count + vmstat.inactive_count + vmstat.purgeable_count) * (int64_t) page_size;
+    }
+#else
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    int64_t     kb = 0;
+    std::string unit;
+    while (f >> key >> kb) {
+        std::getline(f, unit);
+        if (key == "MemTotal:") {
+            mem.total = kb * 1024;
+        } else if (key == "MemAvailable:") {
+            mem.avail = kb * 1024;
+        }
+    }
+    int64_t cg_limit = -1;
+    const int64_t cg_headroom = server_cgroup_headroom(cg_limit);
+    if (cg_limit >= 0) {
+        mem.total = mem.total < 0 ? cg_limit : std::min(mem.total, cg_limit);
+    }
+    if (cg_headroom >= 0) {
+        mem.avail = mem.avail < 0 ? cg_headroom : std::min(mem.avail, cg_headroom);
+    }
+#endif
+    return mem;
+}
+
+int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes) {
+    const int32_t cap_mib = 8192; // the --cache-ram default, auto never raises it
+    if (avail_bytes < 0 || total_bytes <= 0) {
+        return cap_mib;
+    }
+    // keep max(2 GiB, 1/8 of RAM) for the OS and other programs, then give the prompt cache a quarter of the rest:
+    // context checkpoints, speculative decoding and the HTTP layer also grow after the model loads
+    const int64_t mib     = 1024 * 1024;
+    const int64_t reserve = std::max<int64_t>(2048 * mib, total_bytes / 8);
+    const int64_t size    = std::max<int64_t>(0, avail_bytes - reserve) / 4 / mib;
+    if (size < 256) {
+        return 0; // too small to hold a useful prompt state
+    }
+    return (int32_t) std::min<int64_t>(cap_mib, size);
 }
 
 bool server_role::is_managed_by_router() {

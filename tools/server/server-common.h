@@ -840,6 +840,17 @@ static inline server_state server_state_from_str(const std::string & str) {
 // the model name reported by the server: the first alias, else the model's repo or path
 std::string server_get_model_name(const common_params & params);
 
+// host memory for --cache-ram auto, in bytes, -1 if unknown
+struct server_host_memory {
+    int64_t total = -1; // physical RAM, or the cgroup limit when it is lower
+    int64_t avail = -1; // RAM available to new allocations, or the cgroup headroom when it is lower
+};
+
+server_host_memory server_get_host_memory();
+
+// --cache-ram auto: min(8192, (avail - max(2 GiB, total/8)) / 4) MiB, 0 below 256 MiB, 8192 if avail or total is unknown
+int32_t server_cache_ram_auto_mib(int64_t avail_bytes, int64_t total_bytes);
+
 // the role of this process and, when it is a child of a router, its side of the protocol
 struct server_role {
     // serializes the notify_to_router writes

@@ -841,6 +841,26 @@ static void test_stop_strings(testing & t) {
 // glob_match
 //
 
+static void test_cache_ram_auto(testing & t) {
+    const int64_t mib = 1024 * 1024;
+    const int64_t gib = 1024 * mib;
+    // unknown host RAM keeps the --cache-ram default
+    t.assert_equal("unknown avail",  8192, server_cache_ram_auto_mib(-1, 16 * gib));
+    t.assert_equal("unknown total",  8192, server_cache_ram_auto_mib(8 * gib, -1));
+    // big host: capped at the default, never raised
+    t.assert_equal("64 GiB host, 40 GiB free", 8192, server_cache_ram_auto_mib(40 * gib, 64 * gib));
+    t.assert_equal("1 TiB host, 900 GiB free", 8192, server_cache_ram_auto_mib(900 * gib, 1024 * gib));
+    // 16 GiB laptop with 7 GiB of pinned weights: reserve 2 GiB, a quarter of the rest
+    t.assert_equal("16 GiB host, 6 GiB free", 1024, server_cache_ram_auto_mib(6 * gib, 16 * gib));
+    // 32 GiB host: reserve is total/8 = 4 GiB
+    t.assert_equal("32 GiB host, 12 GiB free", 2048, server_cache_ram_auto_mib(12 * gib, 32 * gib));
+    // tight: below 256 MiB the cache is disabled
+    t.assert_equal("3 GiB free of 16",  256, server_cache_ram_auto_mib(3 * gib, 16 * gib));
+    t.assert_equal("3 GiB - 4 MiB free of 16", 0, server_cache_ram_auto_mib(3 * gib - mib * 4, 16 * gib));
+    t.assert_equal("nothing free",      0, server_cache_ram_auto_mib(0, 16 * gib));
+    t.assert_equal("below the reserve", 0, server_cache_ram_auto_mib(1 * gib, 16 * gib));
+}
+
 static void test_glob_match(testing & t) {
     t.test("patterns", [](testing & t) {
         t.assert_true("literal", glob_match("src/main.cpp", "src/main.cpp"));
@@ -961,6 +981,7 @@ int main(int argc, char ** argv) {
     t.test("decision_ocr_jev_validation", test_decision_ocr_jev_validation);
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
+    t.test("cache_ram_auto",  test_cache_ram_auto);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
     t.test("stop_strings",    test_stop_strings);
     t.test("speech_convert",  test_speech_convert);

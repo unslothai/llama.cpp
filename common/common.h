@@ -663,6 +663,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    bool    cache_ram_auto      = false; // --cache-ram auto: size the cache from the host RAM available after the model loads
 
     // llama-connect params
     bool        server_connect      = false;
