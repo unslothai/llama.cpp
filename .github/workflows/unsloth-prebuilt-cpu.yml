@@ -699,6 +699,8 @@ jobs:
           name: app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu
           path: dist/app-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip
           if-no-files-found: error
+          # Artifacts persist across attempts: a rerun of a leg that uploaded and then failed must not 409 on its own bundle.
+          overwrite: true
 
       - name: Evict stale ccache files
         # !cancelled(), unlike the save below: on a timeout the job gets a

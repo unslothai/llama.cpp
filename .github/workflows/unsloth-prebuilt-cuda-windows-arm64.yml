@@ -404,6 +404,8 @@ jobs:
           name: app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}
           path: dist/app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}.zip
           if-no-files-found: error
+          # Artifacts persist across attempts: a rerun of a leg that uploaded and then failed must not 409 on its own bundle.
+          overwrite: true
 
       - name: Evict stale ccache files
         if: ${{ !cancelled() && env.CCACHE_LAUNCHER != '' }}
