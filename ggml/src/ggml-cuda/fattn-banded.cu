@@ -424,6 +424,528 @@ static __global__ void flash_attn_ext_banded_f32_merge(
     }
 }
 
+// decode: few queries. A block takes one KV head, a chunk of cells and NR (query, Q head) rows of that KV head (the
+// GQA groups of up to 8 / G queries), so K and V are read once per group. Groups of D/8 lanes take one cell at a
+// time, every lane holding 8 dimensions of Q, K, V and the output. Per tile, each group first issues the K, V and
+// mask loads of all its cells, then reduces K.Q in the group; one warp per row takes the softmax of the tile, and
+// each group accumulates P.V of its cells. The groups are merged at the end.
+static constexpr int fattn_banded_vec_threads = 128;
+static constexpr int fattn_banded_vec_cpg     = 8;   // cells per group and tile
+
+// 8 consecutive K/V elements [d0, d0 + 8) of a row, loaded raw and converted on use
+template<ggml_type type> struct fattn_banded_kv8;
+
+template<> struct fattn_banded_kv8<GGML_TYPE_F16> {
+    int4 raw;
+    __device__ __forceinline__ void load(const char * row, const int d0) { raw = *(const int4 *) (row + d0*2); }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const half2 * h = (const half2 *) &raw;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __half22float2(h[j]);
+            x[2*j + 0] = f.x;
+            x[2*j + 1] = f.y;
+        }
+    }
+};
+
+template<> struct fattn_banded_kv8<GGML_TYPE_BF16> {
+    int4 raw;
+    __device__ __forceinline__ void load(const char * row, const int d0) { raw = *(const int4 *) (row + d0*2); }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const uint32_t * w = (const uint32_t *) &raw;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            x[2*j + 0] = __uint_as_float(w[j] << 16);
+            x[2*j + 1] = __uint_as_float(w[j] & 0xFFFF0000u);
+        }
+    }
+};
+
+template<> struct fattn_banded_kv8<GGML_TYPE_Q8_0> {
+    uint32_t q[2];
+    half     d;
+    __device__ __forceinline__ void load(const char * row, const int d0) {
+        const block_q8_0 * b = (const block_q8_0 *) row + d0/QK8_0;
+        const uint16_t * qs = (const uint16_t *) (b->qs + d0 % QK8_0); // 2-byte aligned in the 34-byte block
+        q[0] = uint32_t(qs[0]) | (uint32_t(qs[1]) << 16);
+        q[1] = uint32_t(qs[2]) | (uint32_t(qs[3]) << 16);
+        d    = b->d;
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float scale = __half2float(d);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = scale*float(int8_t((q[j/4] >> (8*(j % 4))) & 0xFF));
+        }
+    }
+};
+
+template<> struct fattn_banded_kv8<GGML_TYPE_Q4_0> {
+    uint32_t q[2];
+    half     d;
+    __device__ __forceinline__ void load(const char * row, const int d0) {
+        // elements 0..15 are the low nibbles of qs[0..15], 16..31 the high ones
+        const block_q4_0 * b = (const block_q4_0 *) row + d0/QK4_0;
+        const uint16_t * qs = (const uint16_t *) (b->qs + d0 % (QK4_0/2));
+        const int shift = d0 % QK4_0 >= QK4_0/2 ? 4 : 0;
+        q[0] = ((uint32_t(qs[0]) | (uint32_t(qs[1]) << 16)) >> shift) & 0x0F0F0F0Fu;
+        q[1] = ((uint32_t(qs[2]) | (uint32_t(qs[3]) << 16)) >> shift) & 0x0F0F0F0Fu;
+        d    = b->d;
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float scale = __half2float(d);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = scale*float(int((q[j/4] >> (8*(j % 4))) & 0xFF) - 8);
+        }
+    }
+};
+
+template<int D, int NR, ggml_type type_kv>
+__launch_bounds__(fattn_banded_vec_threads)
+static __global__ void flash_attn_ext_banded_vec(
+        const char * __restrict__ q,
+        const char * __restrict__ k,
+        const char * __restrict__ v,
+        const char * __restrict__ mask,
+        const char * __restrict__ rel,
+        const float * __restrict__ sinks,
+        float      * __restrict__ dst,
+        float      * __restrict__ part,
+        const float scale,
+        const int type_rel,
+        const int n_q,
+        const int64_t n_kv,
+        const int n_head_q,
+        const int n_head_kv,
+        const int64_t n_chunks,
+        const int64_t chunk,
+        const int64_t rel_extent,
+        const int64_t mask_ne2,
+        const int64_t mask_ne3,
+        const uint64_t q_nb1, const uint64_t q_nb2, const uint64_t q_nb3,
+        const uint64_t k_nb1, const uint64_t k_nb2, const uint64_t k_nb3,
+        const uint64_t v_nb1, const uint64_t v_nb2, const uint64_t v_nb3,
+        const uint64_t m_nb1, const uint64_t m_nb2, const uint64_t m_nb3,
+        const uint64_t r_nb0, const uint64_t r_nb1, const uint64_t r_nb2, const uint64_t r_nb3,
+        const int64_t rel_ne3,
+        const int64_t sinks_s1,
+        const int64_t sinks_s2) {
+    constexpr int NT  = fattn_banded_vec_threads;
+    constexpr int E   = 8;                 // dimensions per lane
+    constexpr int T   = D / E;             // lanes per cell
+    constexpr int NG  = NT / T;            // cell groups
+    constexpr int CPG = fattn_banded_vec_cpg;
+    constexpr int TC  = NG*CPG;            // cells per tile
+    static_assert(WARP_SIZE % T == 0 && T >= NR, "banded vec tiling");
+
+    __shared__ float S[TC][NR + 1];        // scores, then probabilities
+    __shared__ float alpha_s[NR];
+    __shared__ float max_s[NR];
+    __shared__ float sum_s[NR];
+    __shared__ float o_s[NG][NR][D + 1];
+
+    const int tid = threadIdx.x;
+    const int t   = tid % T;
+    const int grp = tid / T;
+
+    // the KV heads of a chunk are neighbours in the launch order: they share the DRAM pages of the cells
+    const int     ih_kv = blockIdx.x;
+    const int64_t ic    = blockIdx.y;
+    const int     G     = n_head_q / n_head_kv;
+    const int     n_rb  = (n_q*G + NR - 1)/NR;
+    const int     rb    = blockIdx.z % n_rb;
+    const int     ib    = blockIdx.z / n_rb;
+    const int     n_rows = min(NR, n_q*G - rb*NR);
+
+    // row r: (query, Q head) number rb*NR + r of this KV head; rows past n_rows repeat the last one
+    int iq_r[NR];
+    int ih_r[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const int f = rb*NR + min(r, n_rows - 1);
+        iq_r[r] = f / G;
+        ih_r[r] = ih_kv*G + f % G;
+    }
+
+    float qv[NR][E];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const float * qr = (const float *) (q + uint64_t(iq_r[r])*q_nb1 + uint64_t(ih_r[r])*q_nb2 + uint64_t(ib)*q_nb3) + t*E;
+        const float4 x0 = *(const float4 *) (qr + 0);
+        const float4 x1 = *(const float4 *) (qr + 4);
+        qv[r][0] = x0.x*scale; qv[r][1] = x0.y*scale; qv[r][2] = x0.z*scale; qv[r][3] = x0.w*scale;
+        qv[r][4] = x1.x*scale; qv[r][5] = x1.y*scale; qv[r][6] = x1.z*scale; qv[r][7] = x1.w*scale;
+    }
+    // lane t < NR of a group reads the mask and the bias of row t
+    const int rt = min(t, NR - 1);
+    const char * m_row = mask ? mask + uint64_t(iq_r[rt])*m_nb1 + uint64_t(ih_r[rt] % mask_ne2)*m_nb2 + uint64_t(ib % mask_ne3)*m_nb3 : nullptr;
+    const char * r_row = rel + uint64_t(ih_r[rt])*r_nb1 + uint64_t(iq_r[rt])*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3;
+    const int64_t q_pos = iq_r[rt] + (n_kv - n_q); // the cell the row's query is aligned to
+
+    if (tid < NR) {
+        max_s[tid] = -INFINITY;
+        sum_s[tid] = 0.0f;
+    }
+    float o[NR][E];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            o[r][e] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int64_t c_begin = ic*chunk;
+    const int64_t c_end   = min(c_begin + chunk, n_kv);
+    const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
+    const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
+
+    for (int64_t c0 = c_begin; c0 < c_end; c0 += TC) {
+        // every load of the tile first: group grp takes cells grp, grp + NG, ...
+        fattn_banded_kv8<type_kv> kr[CPG];
+        fattn_banded_kv8<type_kv> vr[CPG];
+        float bm[CPG]; // lane t < NR: mask + bias of row t, -inf when masked
+#pragma unroll
+        for (int j = 0; j < CPG; ++j) {
+            const int64_t c  = c0 + grp + j*NG;
+            const int64_t cc = c < c_end ? c : c_end - 1;
+            kr[j].load(k_base + uint64_t(cc)*k_nb1, t*E);
+            vr[j].load(v_base + uint64_t(cc)*v_nb1, t*E);
+            bm[j] = -INFINITY;
+            if (t < NR && c < c_end) {
+                bm[j] = m_row ? __half2float(*(const half *) (m_row + uint64_t(c)*sizeof(half))) : 0.0f;
+                const int64_t dist = q_pos - c;
+                if (bm[j] != -INFINITY && dist >= 0 && dist < rel_extent) {
+                    bm[j] += fattn_banded_load(r_row + uint64_t(dist)*r_nb0, type_rel);
+                }
+            }
+        }
+        // K.Q
+#pragma unroll
+        for (int j = 0; j < CPG; ++j) {
+            float kx[E];
+            kr[j].get(kx);
+            float sr[NR];
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                float s = 0.0f;
+#pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    s += qv[r][e]*kx[e];
+                }
+                sr[r] = warp_reduce_sum<T>(s);
+            }
+            // lane t writes row t
+            float s_t = sr[0];
+#pragma unroll
+            for (int r = 1; r < NR; ++r) {
+                s_t = t == r ? sr[r] : s_t;
+            }
+            if (t < NR) {
+                S[grp + j*NG][t] = bm[j] == -INFINITY ? -INFINITY : s_t + bm[j];
+            }
+        }
+        __syncthreads();
+
+        // online softmax: warp w takes rows w, w + 4, ...
+        {
+            const int lane = tid % WARP_SIZE;
+            const int warp = tid / WARP_SIZE;
+            for (int r = warp; r < n_rows; r += NT/WARP_SIZE) {
+                float m = -INFINITY;
+#pragma unroll
+                for (int j = lane; j < TC; j += WARP_SIZE) {
+                    m = fmaxf(m, S[j][r]);
+                }
+                m = warp_reduce_max(m);
+                const float m_old = max_s[r];
+                const float m_new = fmaxf(m_old, m);
+                const float m_sub = m_new == -INFINITY ? 0.0f : m_new;
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = lane; j < TC; j += WARP_SIZE) {
+                    const float p = expf(S[j][r] - m_sub);
+                    S[j][r] = p;
+                    sum += p;
+                }
+                sum = warp_reduce_sum(sum);
+                if (lane == 0) {
+                    const float a = expf(m_old - m_sub);
+                    alpha_s[r] = a;
+                    sum_s[r]   = sum_s[r]*a + sum;
+                    max_s[r]   = m_new;
+                }
+            }
+        }
+        __syncthreads();
+
+        // P.V of the group's cells
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const float a = alpha_s[r];
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                o[r][e] *= a;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < CPG; ++j) {
+            float vx[E];
+            vr[j].get(vx);
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                const float p = S[grp + j*NG][r];
+#pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    o[r][e] += p*vx[e];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // merge the groups
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            o_s[grp][r][t*E + e] = o[r][e];
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n_rows*D; idx += NT) {
+        const int r = idx / D;
+        const int d = idx % D;
+        float acc = 0.0f;
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            acc += o_s[g][r][d];
+        }
+        const float m  = max_s[r];
+        float       l  = sum_s[r];
+        const int f   = rb*NR + r;
+        const int iqr = f / G;
+        const int ihr = ih_kv*G + f % G;
+        const int64_t row = (int64_t(ib)*n_q + iqr)*n_head_q + ihr;
+        if (n_chunks == 1) {
+            float fs = 1.0f;
+            if (sinks) {
+                const float sink  = sinks[ihr + iqr*sinks_s1 + ib*sinks_s2];
+                const float m_new = fmaxf(m, sink);
+                fs = expf(m - m_new);
+                l  = l*fs + expf(sink - m_new);
+            }
+            dst[row*D + d] = l == 0.0f ? 0.0f : acc*fs/l;
+        } else {
+            float * p = part + (row*n_chunks + ic)*(D + 2);
+            if (d == 0) {
+                p[0] = m;
+                p[1] = l;
+            }
+            p[2 + d] = acc;
+        }
+    }
+}
+
+// merge of the chunk partials: a block per row, the chunk weights in parallel, then the dimensions
+template<int D>
+static __global__ void flash_attn_ext_banded_vec_merge(
+        const float * __restrict__ part,
+        float       * __restrict__ dst,
+        const int64_t n_head_q,
+        const int64_t n_q,
+        const int     n_chunks,
+        const float * __restrict__ sinks,
+        const int64_t sinks_s1,
+        const int64_t sinks_s2) {
+    constexpr int NT = 128;
+    extern __shared__ float w_s[]; // [n_chunks]
+    __shared__ float red[NT/WARP_SIZE];
+    __shared__ float m_all;
+    __shared__ float l_all;
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+    const float * p   = part + row*n_chunks*(D + 2);
+
+    float m = -INFINITY;
+    for (int c = tid; c < n_chunks; c += NT) {
+        m = fmaxf(m, p[c*(D + 2)]);
+    }
+    m = warp_reduce_max(m);
+    if (tid % WARP_SIZE == 0) {
+        red[tid / WARP_SIZE] = m;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float mm = red[0];
+        for (int w = 1; w < NT/WARP_SIZE; ++w) {
+            mm = fmaxf(mm, red[w]);
+        }
+        m_all = mm;
+    }
+    __syncthreads();
+    m = m_all;
+    float l = 0.0f;
+    for (int c = tid; c < n_chunks; c += NT) {
+        const float mc = p[c*(D + 2)];
+        const float f  = mc == -INFINITY || m == -INFINITY ? 0.0f : expf(mc - m);
+        w_s[c] = f;
+        l += f*p[c*(D + 2) + 1];
+    }
+    l = warp_reduce_sum(l);
+    __syncthreads();
+    if (tid % WARP_SIZE == 0) {
+        red[tid / WARP_SIZE] = l;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float ll = 0.0f;
+        for (int w = 0; w < NT/WARP_SIZE; ++w) {
+            ll += red[w];
+        }
+        l_all = ll;
+    }
+    __syncthreads();
+    l = l_all;
+
+    const int64_t ih = row % n_head_q;
+    const int64_t iq = (row / n_head_q) % n_q;
+    const int64_t ib = row / (n_head_q*n_q);
+    float f = 1.0f;
+    if (sinks) {
+        const float sink  = sinks[ih + iq*sinks_s1 + ib*sinks_s2];
+        const float m_new = fmaxf(m, sink);
+        f = m == -INFINITY ? 0.0f : expf(m - m_new);
+        l = l*f + expf(sink - m_new);
+    }
+    const float inv = l == 0.0f ? 0.0f : f/l;
+    for (int d = tid; d < D; d += NT) {
+        float acc = 0.0f;
+#pragma unroll 8
+        for (int c = 0; c < n_chunks; ++c) {
+            acc += w_s[c]*p[c*(D + 2) + 2 + d];
+        }
+        dst[row*D + d] = acc*inv;
+    }
+}
+
+// the decode kernel reads K and V once per block of rows: past 8 queries the MMA kernel is faster
+static constexpr int64_t fattn_banded_vec_max_q = 8;
+
+static bool fattn_banded_vec_usable(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    if (q->ne[1] > fattn_banded_vec_max_q || k->type != v->type) {
+        return false;
+    }
+    switch (k->type) {
+        case GGML_TYPE_F16: case GGML_TYPE_BF16: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0:
+            break;
+        default:
+            return false;
+    }
+    // 16-byte F16 / BF16 and 2-byte quantized loads, 16-byte Q loads
+    const size_t align = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ? 16 : 2;
+    for (const ggml_tensor * t : {k, v}) {
+        if (t->nb[1] % align != 0 || t->nb[2] % align != 0 || t->nb[3] % align != 0 || (uintptr_t) t->data % align != 0) {
+            return false;
+        }
+    }
+    return q->nb[1] % 16 == 0 && q->nb[2] % 16 == 0 && q->nb[3] % 16 == 0 && (uintptr_t) q->data % 16 == 0;
+}
+
+static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * m     = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rel   = dst->src[6];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t D    = q->ne[0];
+    const int64_t n_q  = q->ne[1];
+    const int64_t n_kv = k->ne[1];
+    const int64_t G    = q->ne[2]/k->ne[2];
+    // rows per block: the GQA groups of as many queries as fit 8 rows (one query: its group alone), else 8
+    // (Q heads of a KV head in steps of 8)
+    const int     NR   = G > 8 ? 8 : int(G*std::min<int64_t>(n_q, 8/G));
+    const int64_t n_rb = (n_q*G + NR - 1)/NR;
+
+    // split the cells so that the grid fills the GPU
+    constexpr int64_t tile      = fattn_banded_vec_threads/16*fattn_banded_vec_cpg; // D = 128
+    constexpr int64_t min_chunk = 4*tile;
+    const int64_t base_blocks = k->ne[2]*n_rb*q->ne[3];
+    // one wave of resident blocks, 3 per SM
+    const int64_t target      = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*3;
+    int64_t n_chunks = std::max<int64_t>(1, std::min<int64_t>(target/base_blocks, (n_kv + min_chunk - 1)/min_chunk));
+    n_chunks = std::min<int64_t>(n_chunks, 4096); // merge weights in shared memory
+    const int64_t chunk = GGML_PAD((n_kv + n_chunks - 1)/n_chunks, tile);
+    n_chunks = (n_kv + chunk - 1)/chunk;
+
+    const int64_t n_rows = n_q*q->ne[2]*q->ne[3];
+    ggml_cuda_pool_alloc<float> part(ctx.pool());
+    if (n_chunks > 1) {
+        part.alloc(n_rows*n_chunks*(D + 2));
+    }
+    const float * sinks_d  = sinks ? (const float *) sinks->data : nullptr;
+    const int64_t sinks_s1 = sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0;
+    const int64_t sinks_s2 = sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0;
+
+    const dim3 blocks(k->ne[2], n_chunks, n_rb*q->ne[3]);
+#define LAUNCH_BANDED_VEC_T(DD, NRR, T) \
+    flash_attn_ext_banded_vec<DD, NRR, T><<<blocks, fattn_banded_vec_threads, 0, stream>>>( \
+        (const char *) q->data, (const char *) k->data, (const char *) v->data, m ? (const char *) m->data : nullptr, \
+        (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(), \
+        scale, rel->type, int(n_q), n_kv, int(q->ne[2]), int(k->ne[2]), n_chunks, chunk, rel_extent, \
+        m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], k->nb[1], k->nb[2], k->nb[3], \
+        v->nb[1], v->nb[2], v->nb[3], m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2)
+#define LAUNCH_BANDED_VEC_NR(DD, T) \
+    switch (NR) { \
+        case 1:  LAUNCH_BANDED_VEC_T(DD, 1, T); break; \
+        case 2:  LAUNCH_BANDED_VEC_T(DD, 2, T); break; \
+        case 3:  LAUNCH_BANDED_VEC_T(DD, 3, T); break; \
+        case 4:  LAUNCH_BANDED_VEC_T(DD, 4, T); break; \
+        case 5:  LAUNCH_BANDED_VEC_T(DD, 5, T); break; \
+        case 6:  LAUNCH_BANDED_VEC_T(DD, 6, T); break; \
+        case 7:  LAUNCH_BANDED_VEC_T(DD, 7, T); break; \
+        default: LAUNCH_BANDED_VEC_T(DD, 8, T); break; \
+    }
+#define LAUNCH_BANDED_VEC(DD) \
+    switch (k->type) { \
+        case GGML_TYPE_F16:  LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_F16);  break; \
+        case GGML_TYPE_BF16: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_BF16); break; \
+        case GGML_TYPE_Q8_0: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q8_0); break; \
+        default:             LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q4_0); break; \
+    }
+    if (D == 64) {
+        LAUNCH_BANDED_VEC(64);
+    } else {
+        LAUNCH_BANDED_VEC(128);
+    }
+#undef LAUNCH_BANDED_VEC_NR
+#undef LAUNCH_BANDED_VEC
+#undef LAUNCH_BANDED_VEC_T
+    CUDA_CHECK(cudaGetLastError());
+
+    if (n_chunks > 1) {
+        const size_t smem = n_chunks*sizeof(float);
+        if (D == 64) {
+            flash_attn_ext_banded_vec_merge<64><<<n_rows, 128, smem, stream>>>(
+                part.get(), (float *) dst->data, q->ne[2], n_q, int(n_chunks), sinks_d, sinks_s1, sinks_s2);
+        } else {
+            flash_attn_ext_banded_vec_merge<128><<<n_rows, 128, smem, stream>>>(
+                part.get(), (float *) dst->data, q->ne[2], n_q, int(n_chunks), sinks_d, sinks_s1, sinks_s2);
+        }
+    }
+}
+
 #if defined(TURING_MMA_AVAILABLE)
 #define FATTN_BANDED_MMA_AVAILABLE
 #endif
@@ -977,7 +1499,8 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
 #endif
 }
 
-static constexpr int64_t fattn_banded_mma_min_q = 16;
+// below this the decode kernel or, without it, the MMA kernel beats the scalar kernels
+static constexpr int64_t fattn_banded_mma_min_q = 1;
 
 static bool fattn_banded_mma_aligned(const ggml_tensor * t) {
     return (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
@@ -1191,6 +1714,16 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     memcpy(&scale, dst->op_params, sizeof(scale));
     // the tensor extent (not op_params) is authoritative after graph cloning
     const int64_t rel_extent = rel->ne[0];
+
+    // decode: K and V read once per GQA group, quantized K/V read in place
+    static const bool no_vec = [] {
+        const char * env = getenv("GGML_CUDA_BANDED_NO_VEC");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!no_vec && fattn_banded_vec_usable(dst)) {
+        fattn_banded_vec_launch(ctx, dst, scale, rel_extent);
+        return;
+    }
 
     if (sinks && fattn_banded_mma_usable(ctx.device, dst)) {
         fattn_banded_mma_launch(ctx, dst, scale, rel_extent);

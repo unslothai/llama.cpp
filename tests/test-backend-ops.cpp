@@ -9337,7 +9337,7 @@ struct test_flash_attn_ext_banded : public test_case {
     const int64_t n_q;
     const int64_t n_kv;
     const int64_t rel_extent;
-    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent
+    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal over a padded n_kv
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
@@ -9403,10 +9403,12 @@ struct test_flash_attn_ext_banded : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> data(n_q*n_kv);
+                // padded n_kv: the last cells are empty, the queries are the tail of the cells before them
+                const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
-                        const int64_t rel_dist = iq + (n_kv - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
+                        const int64_t rel_dist = iq + (n_kv - n_empty - n_q) - ik;
+                        const bool visible = rel_dist >= 0 && ik < n_kv - n_empty && (mask_kind != 2 || rel_dist < rel_extent);
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
@@ -13639,6 +13641,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64, 8, 2, kv_type, GGML_TYPE_F32));
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+    // small ubatches over a padded n_kv (Inkling-2-Mini decode): empty cells past the sequence are masked
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 2, 3, 4, 8, 16, 32 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 256, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+    }
     // Inkling-2-Small shapes
     for (int64_t n_q : { 1, 3, 8, 512 }) {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, n_q, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
@@ -14058,6 +14067,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini decode: banded over a padded n_kv vs flash attention with a dense bias mask
+    {
+        const char * env = std::getenv("GGML_TEST_BANDED_PERF_KV");
+        const std::vector<int64_t> kvs = env ? std::vector<int64_t>{ atoll(env) } : std::vector<int64_t>{ 32768 };
+        for (int64_t kv : kvs) {
+            for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                for (int64_t n_q : { 1, 2, 3, 4, 8, 16, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, kv, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, n_q, true, true, 0, 0, GGML_PREC_F32, kv_type, kv_type));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
