@@ -9460,9 +9460,11 @@ struct test_flash_attn_ext_banded_pos : public test_case {
     const int mask_kind;
     const ggml_type kv_type;
     const ggml_type rel_type;
+    const ggml_type v_type; // V type when it differs from K, else kv_type
 
     std::string vars() override {
-        return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, layout, n_seq, mask_kind, kv_type, rel_type);
+        return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, layout, n_seq, mask_kind, kv_type, rel_type) +
+            (v_type != kv_type ? ",v_type=" + std::string(ggml_type_name(v_type)) : "");
     }
 
     double max_nmse_err() override {
@@ -9478,14 +9480,15 @@ struct test_flash_attn_ext_banded_pos : public test_case {
     }
 
     test_flash_attn_ext_banded_pos(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
-            int layout, int64_t n_seq, int mask_kind, ggml_type kv_type, ggml_type rel_type)
+            int layout, int64_t n_seq, int mask_kind, ggml_type kv_type, ggml_type rel_type, ggml_type v_type = GGML_TYPE_COUNT)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv), rel_extent(rel_extent),
-          layout(layout), n_seq(n_seq), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type) {}
+          layout(layout), n_seq(n_seq), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type),
+          v_type(v_type == GGML_TYPE_COUNT ? kv_type : v_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
         ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, v_type,  d, n_kv, n_head_kv, 1);
         ggml_tensor * r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_q);
@@ -13744,6 +13747,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nq : {4, 17, 64, 130}) {
             test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv_type, GGML_TYPE_F32));
             test_cases.emplace_back(new test_flash_attn_ext_banded_pos( 64, 8, 1, nq,  512,  64, 2, 1, 2, kv_type, GGML_TYPE_F32));
+        }
+    }
+    // every quantized K/V type of the cache, and mixed K/V types: decode (split-KV) and prefill (MMA)
+    for (ggml_type kv_type : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+        for (int64_t nq : {4, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv_type, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq,  512,  64, 2, 1, 2, kv_type, GGML_TYPE_F32));
+        }
+    }
+    for (auto kv : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_F16},
+            {GGML_TYPE_F16, GGML_TYPE_Q8_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0} }) {
+        for (int64_t nq : {4, 17, 64, 130}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv.first, GGML_TYPE_F32, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq,  512,  64, 2, 1, 2, kv.first, GGML_TYPE_F32, kv.second));
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 48, 8,   1, 4096, 1024, 1, 4, 1, GGML_TYPE_F16, GGML_TYPE_F32));
