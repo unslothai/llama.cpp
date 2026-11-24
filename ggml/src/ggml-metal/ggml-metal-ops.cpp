@@ -3662,7 +3662,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const uint64_t nb_s2 = has_sinks && op->src[4]->ne[2] > 1 ? op->src[4]->nb[2] : 0;
 
     GGML_ASSERT(!has_rows || has_mask);
-    const bool has_bias  = max_bias != 0.0f;
+    const bool has_bias  = max_bias > 0.0f; // max_bias <= 0 disables ALiBi (matches CPU and soft_max)
     const bool has_scap  = logit_softcap != 0.0f;
 
     const uint32_t n_head      = op->src[0]->ne[2];
