@@ -778,19 +778,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
     float KQ_max_new[cols_per_thread];
+    // the banded op only delegates DKQ == DV in {64, 128}: keep rel_f out of the other head sizes
+    constexpr bool banded_ok = (DKQ == 64 || DKQ == 128) && DV == DKQ;
 #pragma unroll
     for (int col = 0; col < cols_per_thread; ++col) {
         KQ_max_new[col] = KQ_max[col];
         // banded only: large V overflows the fp16 VKQ accumulator, so bump the running max to rescale
         // by 2^-8 (cancelled by the final normalization); bumps are logarithmic in n_kv
-        if (rel_f && KQ_rowsum[col] > 4.0f) {
+        if (banded_ok && rel_f && KQ_rowsum[col] > 4.0f) {
             KQ_max_new[col] += 8.0f*0.6931f;
         }
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (rel_f) {
+        if (banded_ok && rel_f) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -873,7 +875,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (rel_f) {
+        if (banded_ok && rel_f) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -1955,9 +1957,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         }
 
                         if (!needs_fixup && !is_fixup) {
+                            // a fully masked row has a zero rowsum, it is 0 like on the CPU
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            dstk_val.x = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.x / KQ_rowsum_j;
+                            dstk_val.y = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.y / KQ_rowsum_j;
                         }
 
                         if (is_fixup) {
@@ -2027,8 +2030,8 @@ static __global__ void flash_attn_ext_f16(
     const int  * GGML_CUDA_RESTRICT KV_max         = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
-    const bool banded_bias = max_bias < 0.0f;
-    const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
+    const bool banded_bias = m0 < 0.0f;
+    const int  rel_extent  = banded_bias ? int(-m0) : 0;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {

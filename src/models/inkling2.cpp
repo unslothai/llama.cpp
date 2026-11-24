@@ -413,8 +413,10 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
                     k_pos(i);
                 }
             }
-        } else if (attn->mctx->get_swa()->get_size() < base->get_size()) {
-            // once the positions pass the SWA cache it wraps and its layers take the dense bias for every ubatch
+        } else {
+            // without the positions a cache whose cells are not the positions is dense: a wrapped SWA cache,
+            // a sequence that does not start at cell 0
+            inp->n_kv_banded[0] = 0;
             inp->n_kv_banded[1] = 0;
         }
     }

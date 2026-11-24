@@ -583,7 +583,7 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
     return false;
 #endif // FLASH_ATTN_AVAILABLE
 
-    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED || ggml_cuda_banded_mma_disabled()) {
         return false;
     }
 
@@ -614,6 +614,14 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
 
     if (K->type == GGML_TYPE_F32 || V->type == GGML_TYPE_F32) {
         return false;
+    }
+
+    // F16 K/V are read in place with 16-byte loads, the banded kernels read other rows
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->type == GGML_TYPE_F16 &&
+                ((uintptr_t) t->data % 16 != 0 || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0)) {
+            return false;
+        }
     }
 
     if ((Q->ne[0] != 64 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0]) {

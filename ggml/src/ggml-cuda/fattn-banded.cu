@@ -1671,11 +1671,7 @@ static bool fattn_banded_mma_aligned(const ggml_tensor * t) {
 }
 
 static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_BANDED_MMA");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    if (disabled) {
+    if (ggml_cuda_banded_mma_disabled()) {
         return false;
     }
     if (!turing_mma_available(ggml_cuda_info().devices[device].cc)) {

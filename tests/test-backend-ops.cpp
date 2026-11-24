@@ -9423,7 +9423,8 @@ struct test_flash_attn_ext_banded : public test_case {
     const int64_t n_q;
     const int64_t n_kv;
     const int64_t rel_extent;
-    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal over a padded n_kv
+    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal over a padded n_kv,
+                         // 4: causal with the first query fully masked
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
@@ -9536,7 +9537,7 @@ struct test_flash_attn_ext_banded : public test_case {
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
                         const int64_t rel_dist = iq + (n_kv - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
+                        const bool visible = rel_dist >= 0 && (mask_kind != 2 || rel_dist < rel_extent) && (mask_kind != 4 || iq != 0);
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
@@ -14194,6 +14195,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // a negative max_bias disables ALiBi, it must not select the banded MMA branch
+    for (bool sinks : {true, false}) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 32, true, sinks, -2.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -14343,6 +14349,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 1, 64, 64, 512, 1, GGML_TYPE_F16,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 17, 33,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, true));
+    // a fully masked query is 0, also on the FA kernel the op delegates to without sinks
+    for (int64_t n_kv : {64, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2,  1, n_kv, 32, 4, GGML_TYPE_F16,  GGML_TYPE_F32));
+        test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 33, n_kv, 32, 4, GGML_TYPE_Q8_0, GGML_TYPE_F32));
+    }
+    // layouts and masks backends may refuse: K/V rows padded off a 4-element boundary, a mask wider than K, and (banded)
+    // K/V head counts that differ. Left out: plain FA with padded F16/F16 rows, which CUDA FA reads in place and gets wrong
+    //                                                   banded,   d, nh, n_q, n_kv, type_k,          type_v,     hk, hv, pad, mask_cols
+    for (int64_t n_q : { 1, 33 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, n_q, 64, GGML_TYPE_F16, GGML_TYPE_F16, 2, 2, 1, 64));
+    }
+    for (bool banded : { false, true }) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0, 128));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0,  64));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, 1, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 1, 0, 64));
     // cells that are not the positions: several sequences in a unified cache, a wrapped SWA ring
     for (ggml_type kv_type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         // decode (one token per sequence: the decode kernel up to 8 or 32 queries), short and long prefill (MMA tiles)
@@ -14495,17 +14519,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_banded_rel_floor(128, 8, 2, n_q, 333, 512, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32));
         }
     }
-    // layouts and masks backends may refuse: K rows padded off a 4-element boundary, a mask wider than K, and (banded)
-    // K/V head counts that differ. Left out: plain mixed FA with K/V head counts that differ and banded F16/F16 with
-    // padded rows, which CUDA accepts and gets wrong today (Metal refuses both)
-    //                                                   banded,   d, nh, n_q, n_kv, type_k,          type_v,     hk, hv, pad, mask_cols
-    for (bool banded : { false, true }) {
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0, 128));
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0,  64));
-    }
-    test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, 1, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 1, 0, 64));
     // mixed K/V cache types (-ctk != -ctv), banded and dense, decode / small batches / prefill
     for (auto [type_k, type_v] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
             { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_F16 },

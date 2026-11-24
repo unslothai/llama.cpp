@@ -216,8 +216,10 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    const uint32_t n_kv_flash_base = cparams.flash_attn ? mctx_attn->get_base()->get_n_kv_pos_contiguous() : 0;
-    const uint32_t n_kv_flash_swa  = cparams.flash_attn ? mctx_attn->get_swa ()->get_n_kv_pos_contiguous() : 0;
+    // one sequence: a ubatch of several is dense at runtime, so is the reserved one
+    const bool use_flash_banded = cparams.flash_attn && ubatch.n_seqs_unq == 1;
+    const uint32_t n_kv_flash_base = use_flash_banded ? mctx_attn->get_base()->get_n_kv_pos_contiguous() : 0;
+    const uint32_t n_kv_flash_swa  = use_flash_banded ? mctx_attn->get_swa ()->get_n_kv_pos_contiguous() : 0;
 
     bool has_global = false;
     bool needs_rel_idx_local  = false;
@@ -227,12 +229,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
     };
 
-    // a quantized cache takes the banded op only where the layer's device runs it, else the dense path
-    std::vector<std::pair<ggml_backend_dev_t, bool>> banded_quant_dev_ok;
+    // the banded op only where the layer's device runs it, else the dense path
+    std::vector<std::pair<ggml_backend_dev_t, bool>> banded_dev_ok;
     const auto banded_cache_types_ok = [&](int il, ggml_type type_k, ggml_type type_v) {
-        if (banded_cache_type_supported(type_k) && banded_cache_type_supported(type_v)) {
-            return true;
-        }
         if (!(banded_cache_type_supported(type_k) || ggml_is_quantized(type_k)) ||
             !(banded_cache_type_supported(type_v) || ggml_is_quantized(type_v))) {
             return false;
@@ -241,7 +240,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         if (!dev) {
             return false;
         }
-        for (const auto & [d, ok] : banded_quant_dev_ok) {
+        for (const auto & [d, ok] : banded_dev_ok) {
             if (d == dev) {
                 return ok;
             }
@@ -256,7 +255,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
         ggml_prec_set_acc(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
-        banded_quant_dev_ok.push_back({ dev, ok });
+        banded_dev_ok.push_back({ dev, ok });
         return ok;
     };
 
