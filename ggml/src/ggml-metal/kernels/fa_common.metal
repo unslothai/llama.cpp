@@ -656,8 +656,11 @@ void kernel_flash_attn_ext_impl(
 
                 const float m = M[jj];
 
+                // per-query sinks (banded only); plain FA keeps the per-head load
                 const int32_t jq = min(iq1 + j, args.ne01 - 1);
-                const float s = tiisg == 0 ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2)) : -FLT_MAX/2;
+                const float s = tiisg != 0 ? -FLT_MAX/2 : FC_flash_attn_ext_has_rel
+                    ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2))
+                    : ((device const float *) sinks)[iq2];
 
                 M[jj] = simd_max(max(M[jj], s));
 

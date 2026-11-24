@@ -316,8 +316,11 @@ kernel void kernel_flash_attn_ext_tensor(
         float ms = 1.0f;
 
         if (FC_flash_attn_ext_tensor_has_sinks) {
+            // per-query sinks (banded only); plain FA keeps the per-head load
             const int jq = min(iq1 + j, args.ne01 - 1);
-            const float s = *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2));
+            const float s = FC_flash_attn_ext_tensor_has_rel
+                ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2))
+                : ((device const float *) sinks)[iq2];
             const float m = max(M[jj], s);
 
             ms = exp(M[jj] - m);

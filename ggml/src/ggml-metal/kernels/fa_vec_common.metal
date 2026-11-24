@@ -611,9 +611,11 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                // per-query sinks (banded): nb_s1/nb_s2 are 0 for one sink per head
+                // per-query sinks (banded only): nb_s1/nb_s2 are 0 for one sink per head; plain FA keeps the per-head load
                 const int32_t jq = min(iq1*Q + qq, args.ne01 - 1);
-                const float s = tiisg == 0 ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2)) : -FLT_MAX/2;
+                const float s = tiisg != 0 ? -FLT_MAX/2 : FC_flash_attn_ext_vec_has_rel
+                    ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2))
+                    : ((device const float *) sinks)[iq2];
 
                 M[qq] = simd_max(max(M[qq], s));
 
