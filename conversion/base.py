@@ -388,6 +388,20 @@ class ModelBase:
             self.gguf_writer.add_tensor(new_name, scale.flatten().numpy())
 
     def dequant_model(self):
+        # stacked-expert NVFP4 (w13_weight/w2_weight) is silently skipped by the NVFP4 repack and the dequant below
+        quant_config = self.hparams.get("quantization_config")
+        if isinstance(quant_config, dict) and quant_config.get("quant_method") in ("modelopt", "modelopt_mixed"):
+            stacked_expert_aux = [
+                n for n in self.model_tensors
+                if n.endswith((".scale2", ".input_amax", ".original_shape"))
+            ]
+            if stacked_expert_aux:
+                raise NotImplementedError(
+                    "This checkpoint stores quantized experts in the stacked ModelOpt NVFP4 layout "
+                    f"({len(stacked_expert_aux)} auxiliary tensors like {stacked_expert_aux[0]!r}), "
+                    "which is not supported yet. Convert from the unquantized (BF16) checkpoint instead."
+                )
+
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
         if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv", ".input_scale", ".activation_scale", "_activation_scale", ".k_scale", ".v_scale")) for k in self.model_tensors):
             return
@@ -666,17 +680,6 @@ class ModelBase:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method in ("modelopt", "modelopt_mixed"):
                 dequant_fp8()
-                # stacked-expert NVFP4 (w13_weight/w2_weight) is silently skipped by the path above
-                stacked_expert_aux = [
-                    n for n in self.model_tensors
-                    if n.endswith((".scale2", ".input_amax", ".original_shape"))
-                ]
-                if stacked_expert_aux:
-                    raise NotImplementedError(
-                        "This checkpoint stores quantized experts in the stacked ModelOpt NVFP4 layout "
-                        f"({len(stacked_expert_aux)} auxiliary tensors like {stacked_expert_aux[0]!r}), "
-                        "which is not supported yet. Convert from the unquantized (BF16) checkpoint instead."
-                    )
                 # FP8_PB_WO: one scale per block, the block size follows from the two shapes
                 for name in self.model_tensors.keys():
                     if not name.endswith(".weight_scale_inv"):

@@ -123,6 +123,21 @@ class TestFP8Conversion(unittest.TestCase):
                         np.testing.assert_array_equal(gguf.dequantize(data, dtype), weight.float().numpy())
                         np.testing.assert_array_equal(result["blk.0.attn_q.scale"][1], [0.25])
 
+    def test_stacked_nvfp4_experts_rejected(self):
+        experts = "model.layers.0.mlp.experts.w13_weight"
+        stacked = {
+            experts: torch.zeros((2, 4, 2), dtype=torch.uint8),
+            experts + ".scale2": torch.ones(2),
+            experts + ".original_shape": torch.tensor([2, 4, 4]),
+        }
+        fp8 = "model.layers.0.self_attn.q_proj.weight"
+        # pure NVFP4 returns early from dequant_model, mixed with FP8 does not
+        for name, extra in (("pure", {}), ("mixed", {fp8: torch.ones((2, 2)).to(torch.float8_e4m3fn), fp8 + "_scale": torch.ones(1)})):
+            with self.subTest(name):
+                with self.assertRaisesRegex(NotImplementedError, "stacked ModelOpt NVFP4"):
+                    self.convert(Qwen2MoeModel, {**stacked, **extra}, ftype=gguf.LlamaFileType.MOSTLY_F16,
+                                 hparams_override={"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}})
+
     def test_mixed_compressed_fp8_block_scale(self):
         name = "model.layers.0.self_attn.q_proj.weight"
         scale = torch.tensor([[0.25, 0.5], [1.0, 2.0]])
