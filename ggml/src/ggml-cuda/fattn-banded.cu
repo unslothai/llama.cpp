@@ -1713,7 +1713,7 @@ static const ggml_tensor * fattn_banded_kv_to_f16_tensor(ggml_backend_cuda_conte
     uint64_t     nb[4];
     fattn_banded_kv_to_f16(ctx, t, buf, data, type, nb);
     t_f16      = *t;
-    t_f16.data = (void *) data;
+    t_f16.data = const_cast<char *>(data);
     t_f16.type = type;
     for (int i = 0; i < 4; ++i) {
         t_f16.nb[i] = nb[i];
