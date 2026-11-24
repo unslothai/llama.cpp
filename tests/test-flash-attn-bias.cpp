@@ -436,6 +436,25 @@ static void overflow_arithmetic_self_test() {
            (unsigned long long) offset, (long long) nq, (long long) rel_dist);
 }
 
+static void prec_round_trip_test() {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead()*8,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 64, 2, 2, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, 64, 2, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, 64, 2, 1, 1);
+    ggml_tensor * r = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 8, 2, 2, 1);
+    ggml_tensor * out = ggml_flash_attn_ext_banded(ctx.get(), q, k, v, nullptr, r, 0.125f, 8);
+    GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+    const bool pass = ggml_prec_get_acc(out) == GGML_PREC_F32 && ggml_flash_attn_ext_get_prec(out) == GGML_PREC_F32;
+    printf("prec_round_trip acc=%d %s\n", (int) ggml_prec_get_acc(out), pass ? "PASS" : "FAIL");
+    GGML_ASSERT(pass);
+}
+
 static bool overflow_kernel_test(ggml_backend_t backend, const char * backend_kind) {
     // rel-logits row for query 1 sits beyond INT32_MAX; only two small logical rows are touched
     const bias_test_config c = {
@@ -496,6 +515,7 @@ int main(int argc, char ** argv) {
     int repeats = argc > 3 ? std::max(1, atoi(argv[3])) : 1;
 
     overflow_arithmetic_self_test();
+    prec_round_trip_test();
     ggml_backend_load_all();
     ggml_backend_dev_t chosen = nullptr;
     const enum ggml_backend_dev_type wanted = backend_kind == "cuda" ?

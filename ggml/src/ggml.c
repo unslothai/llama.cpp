@@ -3352,6 +3352,7 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
