@@ -237,7 +237,6 @@
     "unslothai#149": "once-per-process HIP warning when GGML_CUDA_ENABLE_UNIFIED_MEMORY is on (=0 parsing is upstream since ggml-org#30327); needs a HIP host, and no runner in the pipeline has one",
     "unslothai#157": "cudaMemcpyDefault in the ggml_cuda_cpy 2D fast path; needs a CUDA host",
     "unslothai#328": "Vulkan top_k on a view off minStorageBufferOffsetAlignment (backend draft sampling over an odd vocab); covered by test-backend-ops TOP_K row cases, which need a Vulkan device, and no runner in the pipeline has one",
-    "unslothai#348": "Metal NVFP4 mul_mv, mul_mv_ext, mul_mv_id, mul_mv_mma, mul_mm, mul_mm_id and get_rows kernels; covered by test-backend-ops MUL_MAT, MUL_MAT_ID and GET_ROWS with -p nvfp4, which need a Metal device, and no runner in the pipeline has one. A backend-op check here would pass on CUDA, which has NVFP4 upstream, and so cannot tell the pin apart",
     "unslothai#335": "backend sampling chains of inactive sequences are flagged as outputs so the graph allocator cannot alias their buffers; only observable with a block draft (DFlash / DSpark) on a multi-slot server, which needs a draft model and a GPU host the pipeline does not have",
     "unslothai#376": "Windows only: unmap_fragment releases offloaded weight pages from the working set with VirtualUnlock; needs a Windows host, and no runner in the pipeline has one",
     "unslothai#158": "ROCm_Host compute buffer type on HIP integrated GPUs; needs a ROCm host",
@@ -250,6 +249,8 @@
     "unslothai#395": "earlier looped inkling2 layout loaded as inkling2_loop; the legacy looped config in test-llama-archs runs in the CPU gate build, and an end-to-end check needs a looped GGUF the pipeline does not have",
     "unslothai#396": "looped layers placed by the layers that hold weights, with per-visit host weight views; it only differs with partial offload or several GPUs on a looped GGUF, which the pipeline does not have",
     "unslothai#397": "llama-quantize keeps the DSpark fuse weights F32; needs a DSpark draft GGUF the pipeline does not have",
-    "unslothai#385": "Inkling 2 attention chunked over query rows once the dense relative bias for a full cache passes 2^29 elements; it only engages with a large context window (a cache above about 21K cells at -ub 512 for 48 heads), which the small synthetic test-llama-archs context never reaches, and below that budget the graph is unchanged"
+    "unslothai#385": "Inkling 2 attention chunked over query rows once the dense relative bias for a full cache passes 2^29 elements; it only engages with a large context window (a cache above about 21K cells at -ub 512 for 48 heads), which the small synthetic test-llama-archs context never reaches, and below that budget the graph is unchanged",
+    "unslothai#427": "mirror of ggml-org#32897: CUDA/HIP cooperative SOFT_MAX reduces every per-block partial when the grid has more blocks than threads (more than 256 SMs or CUs, e.g. MI300X); covered by test-backend-ops SOFT_MAX on wide rows, which needs such a device, and no runner in the pipeline has one. A backend-op check here would pass on any smaller GPU without the pin",
+    "unslothai#428": "mirror of ggml-org#32875: CUDA NVFP4 dequantize launch shape (8 blocks per CTA, the cuBLAS path at batch sizes MMQ does not take); covered by test-backend-ops MUL_MAT with -p nvfp4, which needs a CUDA device. A backend-op check here would pass without the pin, since upstream already ships a correct NVFP4 dequant, so it cannot tell the pin apart"
   }
 }
