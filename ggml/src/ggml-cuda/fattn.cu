@@ -583,10 +583,6 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
     return false;
 #endif // FLASH_ATTN_AVAILABLE
 
-    if (ggml_cuda_banded_mma_disabled()) {
-        return false;
-    }
-
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;
     }
@@ -597,6 +593,10 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
     const ggml_tensor * rel = dst->src[6];
 
     if (!Q || !K || !V || !rel) {
+        return false;
+    }
+
+    if (ggml_cuda_banded_mma_disabled()) {
         return false;
     }
 
