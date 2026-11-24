@@ -1846,6 +1846,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[0]->ne[0] != 64 && op->src[0]->ne[0] != 128) {
                     return false;
                 }
+                // K/V cell and query positions (src[7], src[8]): the kernels take the distance from the cell index
+                if (op->src[7] || op->src[8]) {
+                    return false;
+                }
                 if (op->src[2]->ne[0] != op->src[1]->ne[0]) {
                     return false;
                 }
