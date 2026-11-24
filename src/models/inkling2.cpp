@@ -2,6 +2,7 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
@@ -325,6 +326,9 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     if (!dev) {
         return false;
     }
+    if (decode_banded && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
+        return false;
+    }
     for (const auto & [key, ok] : banded_dev_ok) {
         if (key.first == swa && key.second == dev) {
             return ok;
@@ -353,12 +357,25 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     // banded FA needs a position-contiguous cache. Ubatches of 2 to n_tokens_banded_min tokens (drafts, prompt tails)
     // span the padded n_kv, which changes only every 256 cells, so that their graph is reused. A decode step stays
     // dense: the FA vec kernel is faster there, and the reserved tg graph (one token over the whole cache) holds its bias
-    inp->banded     = cparams.flash_attn && n_tokens > 1;
+    // except with a cache type that dense CUDA FA converts to F16 whole every step (it reads F16 / BF16 / q8_0 / q4_0
+    // in place): then the full-attention layers of a single-sequence context take the banded kernel
+    const auto * base = attn->mctx->get_base();
+    const ggml_type tk = base->type_k();
+    const ggml_type tv = base->type_v();
+    decode_banded = n_tokens == 1 && cparams.n_seq_max == 1 && (tk == tv ?
+        tk == GGML_TYPE_Q4_1 || tk == GGML_TYPE_Q5_0 || tk == GGML_TYPE_Q5_1 :
+        tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q4_0 || tv == GGML_TYPE_F16));
+    inp->banded     = cparams.flash_attn && (n_tokens > 1 || decode_banded);
     inp->banded_pad = n_tokens <= n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
         // a ubatch of several sequences is dense at runtime, so the reserved worst case (a ubatch
         // of every sequence) must be dense too, else the dense graph outgrows the reserved buffer
-        inp->n_kv_banded[i] = ubatch.n_seqs_unq != 1 ? 0 : inp->get_n_kv_banded(i ? attn->mctx->get_swa() : attn->mctx->get_base());
+        inp->n_kv_banded[i] = ubatch.n_seqs_unq != 1 ? 0 : inp->get_n_kv_banded(i ? attn->mctx->get_swa() : base);
+    }
+    // the SWA view is small, and once it wraps a decode step is dense anyway: keep it dense in the reserve too
+    if (decode_banded) {
+        inp->banded_swa_dense = true;
+        inp->n_kv_banded[1]   = 0;
     }
     // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
     // while at runtime it does so only for consecutive ones. Once the positions pass the SWA cache it wraps

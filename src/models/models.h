@@ -2547,6 +2547,8 @@ struct llama_model_inkling2 : public llama_model_base {
         // banded flash attention for layer il on its device and cache
         bool use_banded(int il, bool swa);
         std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+        // single-token ubatch over a cache type that the dense path converts to F16 whole
+        bool decode_banded = false;
         // [base, swa] contiguous mask of the banded attention, shared by the layers of a graph
         ggml_tensor * mask_banded[2] = { nullptr, nullptr };
 

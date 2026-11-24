@@ -502,7 +502,82 @@ template<> struct fattn_banded_kv8<GGML_TYPE_Q4_0> {
     }
 };
 
-template<int D, int NR, ggml_type type_kv>
+// 8 nibbles of a q4_x / q5_x block (elements e0..e0+7 of 32, e0 % 8 == 0) as bytes, 2-byte loads
+static __device__ __forceinline__ void fattn_banded_nib8(const uint8_t * qs, const int e0, uint32_t (&q)[2]) {
+    const uint16_t * p = (const uint16_t *) (qs + e0 % 16);
+    const int shift = e0 >= 16 ? 4 : 0;
+    q[0] = ((uint32_t(p[0]) | (uint32_t(p[1]) << 16)) >> shift) & 0x0F0F0F0Fu;
+    q[1] = ((uint32_t(p[2]) | (uint32_t(p[3]) << 16)) >> shift) & 0x0F0F0F0Fu;
+}
+
+// bits e0..e0+7 of the 32 high bits as bit 4 of each byte
+static __device__ __forceinline__ void fattn_banded_qh8(const uint8_t * qh, const int e0, uint32_t (&q)[2]) {
+    const uint32_t h = qh[e0/8];
+    // bit i of a nibble to bit 0 of byte i: the shifted copies do not overlap, so no carries
+    q[0] |= (((h & 0xF) * 0x00204081u) & 0x01010101u) << 4;
+    q[1] |= (((h >> 4)  * 0x00204081u) & 0x01010101u) << 4;
+}
+
+template<> struct fattn_banded_kv8<GGML_TYPE_Q4_1> {
+    uint32_t q[2];
+    half     d, m;
+    __device__ __forceinline__ void load(const char * row, const int d0) {
+        const block_q4_1 * b = (const block_q4_1 *) row + d0/QK4_1;
+        fattn_banded_nib8(b->qs, d0 % QK4_1, q);
+        const half * dm = (const half *) &b->dm; // 2-byte loads: rows are only 2-byte aligned
+        d = dm[0];
+        m = dm[1];
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float fd = __half2float(d);
+        const float fm = __half2float(m);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = fd*float((q[j/4] >> (8*(j % 4))) & 0xFF) + fm;
+        }
+    }
+};
+
+template<> struct fattn_banded_kv8<GGML_TYPE_Q5_0> {
+    uint32_t q[2];
+    half     d;
+    __device__ __forceinline__ void load(const char * row, const int d0) {
+        const block_q5_0 * b = (const block_q5_0 *) row + d0/QK5_0;
+        fattn_banded_nib8(b->qs, d0 % QK5_0, q);
+        fattn_banded_qh8(b->qh, d0 % QK5_0, q);
+        d = b->d;
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float scale = __half2float(d);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = scale*float(int((q[j/4] >> (8*(j % 4))) & 0xFF) - 16);
+        }
+    }
+};
+
+template<> struct fattn_banded_kv8<GGML_TYPE_Q5_1> {
+    uint32_t q[2];
+    half     d, m;
+    __device__ __forceinline__ void load(const char * row, const int d0) {
+        const block_q5_1 * b = (const block_q5_1 *) row + d0/QK5_1;
+        fattn_banded_nib8(b->qs, d0 % QK5_1, q);
+        fattn_banded_qh8(b->qh, d0 % QK5_1, q);
+        const half * dm = (const half *) &b->dm;
+        d = dm[0];
+        m = dm[1];
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float fd = __half2float(d);
+        const float fm = __half2float(m);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = fd*float((q[j/4] >> (8*(j % 4))) & 0xFF) + fm;
+        }
+    }
+};
+
+template<int D, int NR, ggml_type type_k, ggml_type type_v>
 __launch_bounds__(fattn_banded_vec_threads)
 static __global__ void flash_attn_ext_banded_vec(
         const char * __restrict__ q,
@@ -605,8 +680,8 @@ static __global__ void flash_attn_ext_banded_vec(
 
     for (int64_t c0 = c_begin; c0 < c_end; c0 += TC) {
         // every load of the tile first: group grp takes cells grp, grp + NG, ...
-        fattn_banded_kv8<type_kv> kr[CPG];
-        fattn_banded_kv8<type_kv> vr[CPG];
+        fattn_banded_kv8<type_k> kr[CPG];
+        fattn_banded_kv8<type_v> vr[CPG];
         float bm[CPG]; // lane t < NR: mask + bias of row t, -inf when masked
 #pragma unroll
         for (int j = 0; j < CPG; ++j) {
@@ -834,24 +909,42 @@ static __global__ void flash_attn_ext_banded_vec_merge(
 }
 
 // the decode kernel reads K and V once per block of rows: past 8 queries the MMA kernel is faster
-static constexpr int64_t fattn_banded_vec_max_q = 8;
+// K/V the MMA kernel reads directly (F16 / BF16, matching q8_0 / q4_0 tiles) take it from 9 queries on,
+// the others stay here up to 32 queries instead of an F16 copy of the whole cache
+static constexpr int64_t fattn_banded_vec_max_q      = 8;
+static constexpr int64_t fattn_banded_vec_max_q_conv = 32;
+
+static bool fattn_banded_vec_mma_direct(const ggml_type tk, const ggml_type tv) {
+    return tk == tv && (tk == GGML_TYPE_F16 || tk == GGML_TYPE_BF16 || tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_Q4_0);
+}
+
+// K/V type pairs with a decode kernel instance: q4_1 / q5_x and the mixed pairs only for D = 128
+static bool fattn_banded_vec_pair(const ggml_type tk, const ggml_type tv, const int64_t D) {
+    if (fattn_banded_vec_mma_direct(tk, tv)) {
+        return true;
+    }
+    if (D != 128) {
+        return false;
+    }
+    if (tk == tv) {
+        return tk == GGML_TYPE_Q4_1 || tk == GGML_TYPE_Q5_0 || tk == GGML_TYPE_Q5_1;
+    }
+    return tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q4_0 || tv == GGML_TYPE_F16);
+}
 
 static bool fattn_banded_vec_usable(const ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
-    if (q->ne[1] > fattn_banded_vec_max_q || k->type != v->type) {
+    if (!fattn_banded_vec_pair(k->type, v->type, q->ne[0])) {
         return false;
     }
-    switch (k->type) {
-        case GGML_TYPE_F16: case GGML_TYPE_BF16: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0:
-            break;
-        default:
-            return false;
+    if (q->ne[1] > (fattn_banded_vec_mma_direct(k->type, v->type) ? fattn_banded_vec_max_q : fattn_banded_vec_max_q_conv)) {
+        return false;
     }
     // 16-byte F16 / BF16 and 2-byte quantized loads, 16-byte Q loads
-    const size_t align = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ? 16 : 2;
     for (const ggml_tensor * t : {k, v}) {
+        const size_t align = t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16 ? 16 : 2;
         if (t->nb[1] % align != 0 || t->nb[2] % align != 0 || t->nb[3] % align != 0 || (uintptr_t) t->data % align != 0) {
             return false;
         }
@@ -898,39 +991,49 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t sinks_s2 = sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0;
 
     const dim3 blocks(k->ne[2], n_chunks, n_rb*q->ne[3]);
-#define LAUNCH_BANDED_VEC_T(DD, NRR, T) \
-    flash_attn_ext_banded_vec<DD, NRR, T><<<blocks, fattn_banded_vec_threads, 0, stream>>>( \
+#define LAUNCH_BANDED_VEC_T(DD, NRR, TK, TV) \
+    flash_attn_ext_banded_vec<DD, NRR, TK, TV><<<blocks, fattn_banded_vec_threads, 0, stream>>>( \
         (const char *) q->data, (const char *) k->data, (const char *) v->data, m ? (const char *) m->data : nullptr, \
         (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(), \
         scale, rel->type, int(n_q), n_kv, int(q->ne[2]), int(k->ne[2]), n_chunks, chunk, rel_extent, \
         m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[1], v->nb[2], v->nb[3], m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2)
-#define LAUNCH_BANDED_VEC_NR(DD, T) \
+#define LAUNCH_BANDED_VEC_NR(DD, TK, TV) \
     switch (NR) { \
-        case 1:  LAUNCH_BANDED_VEC_T(DD, 1, T); break; \
-        case 2:  LAUNCH_BANDED_VEC_T(DD, 2, T); break; \
-        case 3:  LAUNCH_BANDED_VEC_T(DD, 3, T); break; \
-        case 4:  LAUNCH_BANDED_VEC_T(DD, 4, T); break; \
-        case 5:  LAUNCH_BANDED_VEC_T(DD, 5, T); break; \
-        case 6:  LAUNCH_BANDED_VEC_T(DD, 6, T); break; \
-        case 7:  LAUNCH_BANDED_VEC_T(DD, 7, T); break; \
-        default: LAUNCH_BANDED_VEC_T(DD, 8, T); break; \
+        case 1:  LAUNCH_BANDED_VEC_T(DD, 1, TK, TV); break; \
+        case 2:  LAUNCH_BANDED_VEC_T(DD, 2, TK, TV); break; \
+        case 3:  LAUNCH_BANDED_VEC_T(DD, 3, TK, TV); break; \
+        case 4:  LAUNCH_BANDED_VEC_T(DD, 4, TK, TV); break; \
+        case 5:  LAUNCH_BANDED_VEC_T(DD, 5, TK, TV); break; \
+        case 6:  LAUNCH_BANDED_VEC_T(DD, 6, TK, TV); break; \
+        case 7:  LAUNCH_BANDED_VEC_T(DD, 7, TK, TV); break; \
+        default: LAUNCH_BANDED_VEC_T(DD, 8, TK, TV); break; \
     }
-#define LAUNCH_BANDED_VEC(DD) \
+#define LAUNCH_BANDED_VEC_SAME(DD) \
     switch (k->type) { \
-        case GGML_TYPE_F16:  LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_F16);  break; \
-        case GGML_TYPE_BF16: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_BF16); break; \
-        case GGML_TYPE_Q8_0: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q8_0); break; \
-        default:             LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q4_0); break; \
+        case GGML_TYPE_F16:  LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_F16,  GGML_TYPE_F16);  break; \
+        case GGML_TYPE_BF16: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_BF16, GGML_TYPE_BF16); break; \
+        case GGML_TYPE_Q8_0: LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0); break; \
+        default:             LAUNCH_BANDED_VEC_NR(DD, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0); break; \
     }
     if (D == 64) {
-        LAUNCH_BANDED_VEC(64);
+        LAUNCH_BANDED_VEC_SAME(64);
+    } else if (fattn_banded_vec_mma_direct(k->type, v->type)) {
+        LAUNCH_BANDED_VEC_SAME(128);
+    } else if (k->type == v->type) {
+        switch (k->type) {
+            case GGML_TYPE_Q4_1: LAUNCH_BANDED_VEC_NR(128, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1); break;
+            case GGML_TYPE_Q5_0: LAUNCH_BANDED_VEC_NR(128, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0); break;
+            default:             LAUNCH_BANDED_VEC_NR(128, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1); break;
+        }
+    } else if (v->type == GGML_TYPE_Q4_0) {
+        LAUNCH_BANDED_VEC_NR(128, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
     } else {
-        LAUNCH_BANDED_VEC(128);
+        LAUNCH_BANDED_VEC_NR(128, GGML_TYPE_Q8_0, GGML_TYPE_F16);
     }
 #undef LAUNCH_BANDED_VEC_NR
-#undef LAUNCH_BANDED_VEC
+#undef LAUNCH_BANDED_VEC_SAME
 #undef LAUNCH_BANDED_VEC_T
     CUDA_CHECK(cudaGetLastError());
 

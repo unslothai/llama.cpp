@@ -819,6 +819,7 @@ public:
     // a small ubatch is reused. The empty cells past the sequence are masked, and the band is shifted by the padding
     // through self_rel_shift, the row of the relative bias for each band column, extent past the band (a zero row)
     bool          banded_pad        = false;
+    bool          banded_swa_dense  = false; // the graph keeps the SWA layers dense
     ggml_tensor * self_rel_shift[2] = { nullptr, nullptr }; // I32 [extent + n_rel_pad], [extent_swa + n_rel_pad]
 
     static constexpr uint32_t n_rel_pad = 256;

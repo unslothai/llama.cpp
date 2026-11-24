@@ -1508,7 +1508,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     if (banded) {
         res &= get_n_kv_banded(attn_ctx->get_base()) == n_kv_banded[0];
-        res &= get_n_kv_banded(attn_ctx->get_swa())  == n_kv_banded[1];
+        res &= (banded_swa_dense ? 0 : get_n_kv_banded(attn_ctx->get_swa())) == n_kv_banded[1];
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
