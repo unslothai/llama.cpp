@@ -1628,15 +1628,26 @@ private:
         if (params_base.cache_ram_auto && decision.type == COMMON_DECISION_TYPE_NONE) {
             if (!is_resume) {
                 cache_idle_slots_requested = params_base.cache_idle_slots;
+            } else {
+                // free the states of the old cache before RAM is sampled, the new limit must not count the cache it replaces
+                prompt_cache.reset();
             }
             // mmap-ed weights sit in the page cache, which counts as available but has to stay resident, so they are not free room for the cache (weights read into host buffers already are not available)
-            int64_t host_weights = 0;
-            if (server_model_uses_mmap(model_tgt, params_base.load_mode)) {
-                for (const auto & row : common_memory_breakdown_rows(ctx_tgt)) {
-                    if (row.kind == common_memory_breakdown_row::HOST) {
-                        host_weights += (int64_t) row.model;
+            auto mmap_host_weights = [&](llama_context * ctx, const llama_model * model) {
+                int64_t bytes = 0;
+                if (ctx != nullptr && model != nullptr && server_model_uses_mmap(model, params_base.load_mode)) {
+                    for (const auto & row : common_memory_breakdown_rows(ctx)) {
+                        if (row.kind == common_memory_breakdown_row::HOST) {
+                            bytes += (int64_t) row.model;
+                        }
                     }
                 }
+                return bytes;
+            };
+            int64_t host_weights = mmap_host_weights(ctx_tgt, model_tgt);
+            // a separate draft model maps its own file; an MTP draft context runs on the target model, whose weights are counted already
+            if (model_dft != nullptr && model_dft != model_tgt) {
+                host_weights += mmap_host_weights(ctx_dft, model_dft);
             }
             const server_host_memory mem = server_get_host_memory(host_weights);
             params_base.cache_ram_mib = server_cache_ram_auto_mib(mem.avail, mem.total);
