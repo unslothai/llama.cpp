@@ -5366,6 +5366,14 @@ struct test_gated_delta_net : public test_case {
     // lower bound of the log-gate; a mild gate keeps the state alive over the whole sequence
     const float   g_min;
 
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    // compare only the view returned by build_graph, not the full op output
+    bool run_whole_graph() override { return K > 1 && n_seq_tokens > K; }
+
     std::string vars() override {
         std::string s = VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, correlated, padded_v, padded_q, permuted_k);
         if (g_min != -20.0f) {
@@ -5423,6 +5431,10 @@ struct test_gated_delta_net : public test_case {
             k = ggml_cpy(ctx, k, k_permuted);
         }
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (K > 1 && n_seq_tokens > K) {
+            // n_tokens > K: only slot 0 is guaranteed, so keep the scores and slot 0
+            out = ggml_view_2d(ctx, out, out->ne[0], out->ne[1] - (K - 1) * head_size * n_seqs, out->nb[1], 0);
+        }
         return out;
     }
 
@@ -6146,6 +6158,79 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A8";
+    }
+};
+
+// src1 GGML_PREC_BF16: the implementation may keep src1 in F32 or BF16, but must not convert it down to F16
+struct test_mul_mat_id_prec_src1_bf16 : public test_mul_mat_id {
+    test_mul_mat_id_prec_src1_bf16(ggml_type type_a = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 32, int64_t k = 256)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT_ID) {
+                ggml_prec_set_src(t, GGML_PREC_BF16, 1);
+            }
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, -1e6f, 1e6f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        init_mul_mat_id_ids(ctx, n_mats, skip);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_PREC_SRC1_BF16";
+    }
+};
+
+struct test_mul_mat_id_prec_src1_f32 : public test_mul_mat_id {
+    test_mul_mat_id_prec_src1_f32(ggml_type type_a = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 32, int64_t k = 256)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k) {}
+    double max_nmse_err() override {
+        if (type_a == GGML_TYPE_F32 || type_a == GGML_TYPE_F16) {
+            return 1e-10;
+        }
+        return test_mul_mat_id::max_nmse_err();
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT_ID) {
+                ggml_prec_set_src(t, GGML_PREC_F32, 1);
+            }
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, -1e6f, 1e6f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        init_mul_mat_id_ids(ctx, n_mats, skip);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_PREC_SRC1_F32";
     }
 };
 
@@ -9075,17 +9160,18 @@ struct test_roll : public test_case {
     const int shift3;
     const int shift4;
     const bool permute;
+    const std::array<int64_t, 4> ne_a;
 
     std::string vars() override {
-        return VARS_TO_STR5(shift0, shift1, shift3, shift4, permute);
+        return VARS_TO_STR6(shift0, shift1, shift3, shift4, permute, ne_a);
     }
 
-    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1, bool permute = false)
-        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4), permute(permute) {}
+    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1, bool permute = false,
+            std::array<int64_t, 4> ne_a = {10, 5, 4, 3})
+        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4), permute(permute), ne_a(ne_a) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        int64_t ne[4] = {10, 5, 4, 3};
-        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
         ggml_set_name(a, "a");
 
         if (permute) {
@@ -12229,6 +12315,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_src1_bf16_src0(GGML_TYPE_F32,  67,  33, 100));
     test_cases.emplace_back(new test_mul_mat_prec_src1_bf16_src0(GGML_TYPE_F32,  64,  32, 256, {2, 3}, {2, 1}));
 
+    // src1 precision on the MoE path: mm_id (n >= 32) and mv_id (n < 32), broadcast and partial K
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_MXFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_bf16(type_a,  8, 2, false,  64,   1, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_bf16(type_a,  8, 2, false,  64,  32, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_bf16(type_a,  8, 2, false,  64, 512, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_bf16(type_a, 16, 4, true,   72,  33, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_bf16(type_a,  4, 2, false,  67, 100, 256));
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_MXFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_f32(type_a,  8, 2, false,  64,   1, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_f32(type_a,  8, 2, false,  64,  32, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_f32(type_a,  8, 2, false,  64, 512, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_f32(type_a, 16, 4, true,   72,  33, 256));
+        test_cases.emplace_back(new test_mul_mat_id_prec_src1_f32(type_a,  4, 2, false,  67, 100, 256));
+    }
+
     // FP4 activation precision (default = native W4A4, src1 GGML_PREC_Q8 = W4A8)
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 32, 256));
@@ -13288,6 +13391,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
+    test_cases.emplace_back(new test_roll(0, 0, 0, 0, false, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_roll(256, 0, 0, 0, false, {257, 1, 1, 1}));
+    test_cases.emplace_back(new test_roll(-16, 6, -2, 1, false, {17, 7, 3, 2}));
+    test_cases.emplace_back(new test_roll(4, 0, 0, 0, false, {42, 512, 1, 1}));
+    test_cases.emplace_back(new test_roll(4, 0, 0, 0, false, {380, 512, 1, 1}));
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 3.0f, 3.5f, 1.0f));
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, -10.0f, 10.0f, 0.3f));
@@ -14068,6 +14176,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
+
+    test_cases.emplace_back(new test_roll(4, 0, 0, 0, false, {42, 512, 1, 1}));
+    test_cases.emplace_back(new test_roll(4, 0, 0, 0, false, {380, 512, 1, 1}));
 
     // embedding lookups: one token (decode) and one batch of 2048 tokens (prefill)
     for (int r : {16, 32768}) {
