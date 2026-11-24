@@ -14,6 +14,26 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+constant bool    FC_flash_attn_ext_vec_has_rel    [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
+constant int32_t FC_flash_attn_ext_vec_rel_type   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
+
+// banded relative bias (FLASH_ATTN_EXT_BANDED): rel row of one (head, query), indexed by the distance
+static inline float flash_attn_ext_vec_rel_load(device const char * rel, int32_t i) {
+#if defined(GGML_METAL_HAS_BF16)
+    if (FC_flash_attn_ext_vec_rel_type == 2) {
+        return (float) ((device const bfloat *) rel)[i];
+    }
+#endif
+    if (FC_flash_attn_ext_vec_rel_type == 1) {
+        return ((device const half *) rel)[i];
+    }
+    return ((device const float *) rel)[i];
+}
+
+// the distance of query iq to key ik: queries align to the tail of K (FA4 seqlen_k - seqlen_q convention)
+static inline int32_t flash_attn_ext_vec_rel_dist(int32_t iq, int32_t ik, int32_t q_off) {
+    return iq + q_off - ik;
+}
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -44,6 +64,7 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const char * rel,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -393,7 +414,24 @@ kernel void kernel_flash_attn_ext_vec(
                 }
 
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                    if (FC_flash_attn_ext_vec_has_mask &&
+                    if (FC_flash_attn_ext_vec_has_rel) {
+                        // banded: score = scale*qk + rel[dist] (0 <= dist < ne_r0) + mask, the CPU reference order
+                        const int32_t iq = iq1*Q + qq;
+
+                        mqk[qq][tx] *= args.scale;
+
+                        if (iq < args.ne01) {
+                            const int32_t d = flash_attn_ext_vec_rel_dist(iq, ic0*C + NE*tx + ty, args.q_off);
+
+                            if (d >= 0 && d < args.ne_r0) {
+                                mqk[qq][tx] += flash_attn_ext_vec_rel_load(rel + iq2*args.nb_r1 + iq*args.nb_r2 + iq3*args.nb_r3, d);
+                            }
+                        }
+
+                        mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty];
+
+                        ss[qq*C + NE*tx + ty] = mqk[qq][tx];
+                    } else if (FC_flash_attn_ext_vec_has_mask &&
                        !FC_flash_attn_ext_vec_has_scap &&
                        !FC_flash_attn_ext_vec_has_bias) {
                         ss[qq*C + NE*tx + ty] = fma(mqk[qq][tx], args.scale, (qk_t) sm[qq*C + NE*tx + ty]);
@@ -568,7 +606,9 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                // per-query sinks (banded): nb_s1/nb_s2 are 0 for one sink per head
+                const int32_t jq = min(iq1*Q + qq, args.ne01 - 1);
+                const float s = tiisg == 0 ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2)) : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 

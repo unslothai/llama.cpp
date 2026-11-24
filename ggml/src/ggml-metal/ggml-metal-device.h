@@ -250,7 +250,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t nwg,
         bool    use_kv_f16,
         int32_t ns10,
-        int32_t ns20);
+        int32_t ns20,
+        bool    has_rel,
+        int32_t rel_type);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,

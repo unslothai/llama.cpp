@@ -3201,10 +3201,6 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
-        return false;
-    }
-
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
@@ -3219,6 +3215,11 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
 
     // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
     // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
+    // banded: the kernels dequantize the KV inline, an F16 copy of the whole cache would grow with n_kv
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return false;
+    }
+
     // TODO: tune per device
     // large heads need the upfront dequant to fit the non-vec threadgroup memory
     if (op->src[0]->ne[1] < 32 &&
@@ -3484,7 +3485,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 
     size_t res = 0;
 
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    // banded: only the vec kernel (small batches) writes per-workgroup partials
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
         return res;
     }
 
@@ -3642,10 +3644,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * rel = op->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? op->src[6] : nullptr;
     const bool has_rel = rel != nullptr;
 
-    GGML_ASSERT(!has_rel || rel->type == GGML_TYPE_F32 || rel->type == GGML_TYPE_F16);
+    GGML_ASSERT(!has_rel || rel->type == GGML_TYPE_F32 || rel->type == GGML_TYPE_F16 || rel->type == GGML_TYPE_BF16);
     GGML_ASSERT(!has_rel || rel->nb[0] == ggml_type_size(rel->type));
 
-    const int32_t rel_type = has_rel && rel->type == GGML_TYPE_F16 ? 1 : 0;
+    // 0: F32, 1: F16, 2: BF16
+    const int32_t rel_type = !has_rel ? 0 : rel->type == GGML_TYPE_F16 ? 1 : rel->type == GGML_TYPE_BF16 ? 2 : 0;
 
     const int32_t  ne_r0 = has_rel ? (int32_t) rel->ne[0] : 0;
     const uint64_t nb_r1 = has_rel ? rel->nb[1] : 0;
@@ -4338,9 +4341,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
+            /*.ne_r0         =*/ ne_r0,
+            /*.q_off         =*/ ne11 - ne01,
+            /*.nb_r1         =*/ nb_r1,
+            /*.nb_r2         =*/ nb_r2,
+            /*.nb_r3         =*/ nb_r3,
+            /*.nb_s1         =*/ nb_s1,
+            /*.nb_s2         =*/ nb_s2,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, has_rel, rel_type);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4352,6 +4362,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
+        ggml_metal_encoder_set_buffer  (enc, bid_rel,  9);
 
         const size_t smem = fa_vec_smem(nsg, nqptg);
 

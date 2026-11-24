@@ -508,6 +508,13 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  ne_r0;   // banded: rel extent, 0 for plain attention
+    int32_t  q_off;   // banded: ne11 - ne01
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_r3;
+    uint64_t nb_s1;   // per-query sinks, 0 for one sink per head
+    uint64_t nb_s2;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

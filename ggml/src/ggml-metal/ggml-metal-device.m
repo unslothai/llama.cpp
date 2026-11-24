@@ -1849,6 +1849,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 switch (op->src[1]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
+                    // quantized K/V: dequantized inline by the half8x8 and vec kernels, no F16 copy of the cache
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
                         break;
                     case GGML_TYPE_BF16:
                         if (!has_bfloat) {
@@ -1858,7 +1864,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     default:
                         return false;
                 }
-                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16) {
+                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16 &&
+                        !(rel->type == GGML_TYPE_BF16 && has_bfloat)) {
                     return false;
                 }
                 if (rel->nb[0] != ggml_type_size(rel->type)) {
