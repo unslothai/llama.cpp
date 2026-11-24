@@ -2552,6 +2552,8 @@ struct llama_model_inkling2 : public llama_model_base {
         // query rows of the dense bias the first banded full-attention layer also builds in the reserve graph:
         // the small ubatches that stay dense take that bias at runtime, the reserve must hold it
         int64_t n_rows_dense_reserve = 0;
+        // I32 [n_tokens] query positions of the banded attention, used when it takes the cell positions
+        ggml_tensor * q_pos_banded = nullptr;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;

@@ -1418,6 +1418,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    for (int i = 0; i < 2; ++i) {
+        if (self_k_pos[i] && self_k_pos[i]->buffer) {
+            (i ? attn_ctx->get_swa() : attn_ctx->get_base())->set_input_cell_pos(self_k_pos[i], ubatch);
+        }
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1443,6 +1449,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+}
+
+uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(
+        const llama_kv_cache_context * kv, const llama_ubatch & ubatch, int banded_pos, bool & use_pos) {
+    // one sequence whose cells are its positions: the cell distance is the position distance
+    const uint32_t n_kv_contiguous = ubatch.n_seqs_unq == 1 ? kv->get_n_kv_pos_contiguous() : 0;
+    use_pos = banded_pos != 0 && (n_kv_contiguous == 0 || banded_pos == 2);
+    return n_kv_contiguous > 0 ? n_kv_contiguous : (use_pos ? kv->get_n_kv() : 0);
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1477,8 +1491,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        for (int i = 0; i < 2; ++i) {
+            bool use_pos = false;
+            res &= get_n_kv_banded(i ? attn_ctx->get_swa() : attn_ctx->get_base(), params.ubatch, banded_pos, use_pos) == n_kv_banded[i];
+            res &= use_pos == (self_k_pos[i] != nullptr);
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
