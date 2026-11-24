@@ -936,6 +936,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+            // the optional K/V cell and query positions (src[7], src[8]) are shared by every head
+            GGML_ASSERT(tensor->src[7] == nullptr || src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[8] == nullptr || src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
