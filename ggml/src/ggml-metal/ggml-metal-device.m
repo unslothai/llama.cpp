@@ -1565,6 +1565,37 @@ static bool ggml_metal_fa_kv_mixed_ok(const struct ggml_tensor * op) {
         op->src[1]->ne[0] == op->src[2]->ne[0] && (op->src[1]->ne[0] == 64 || op->src[1]->ne[0] == 128);
 }
 
+// the layouts the banded and mixed K/V FA launches can address (the plain same-type path keeps upstream's rules):
+// K/V share rows and heads (the launcher asserts ne11 == ne21, ne12 == ne22), fewer than 65536 queries, Q rows
+// loaded as float4, F32/F16/BF16 K/V rows on 4-element boundaries (the vec kernels address them as 4-vectors and
+// divide the row stride by 4), and a mask exactly n_kv wide (the mask blocks are classified over its width but read
+// over the K length)
+static bool ggml_metal_fa_layout_ok(const struct ggml_tensor * op) {
+    const struct ggml_tensor * q    = op->src[0];
+    const struct ggml_tensor * k    = op->src[1];
+    const struct ggml_tensor * v    = op->src[2];
+    const struct ggml_tensor * mask = op->src[3];
+
+    if (q->type != GGML_TYPE_F32 || q->ne[1] >= 65536 || k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2]) {
+        return false;
+    }
+    if (q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0 || q->nb[3] % 16 != 0) {
+        return false;
+    }
+    for (int i = 1; i <= 2; ++i) {
+        const struct ggml_tensor * t = op->src[i];
+        const size_t ts = ggml_type_size(t->type);
+        if (t->nb[0] != ts || t->nb[1] % ts != 0 || t->nb[1] < ggml_row_size(t->type, t->ne[0])) {
+            return false;
+        }
+        if (!ggml_is_quantized(t->type) &&
+                ((t->view_offs | t->nb[1] | t->nb[2] | t->nb[3]) % (4*ts) != 0)) {
+            return false;
+        }
+    }
+    return !mask || (mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[1] >= q->ne[1]);
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1823,7 +1854,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                return ggml_metal_fa_kv_mixed_ok(op) && has_simdgroup_mm;
+                return ggml_metal_fa_kv_mixed_ok(op) && ggml_metal_fa_layout_ok(op) && has_simdgroup_mm;
             }
             switch (op->src[1]->type) {
                 case GGML_TYPE_F32:
@@ -1880,10 +1911,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q8_0:
                         break;
                     case GGML_TYPE_BF16:
+#if GGML_METAL_EMBED_LIBRARY
                         if (!has_bfloat) {
                             return false;
                         }
                         break;
+#else
+                        // a precompiled default.metallib is built without GGML_METAL_HAS_BF16: no BF16 K/V kernels
+                        return false;
+#endif
                     default:
                         return false;
                 }
@@ -1899,15 +1935,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         op->src[0]->nb[2] % 16 != 0 || op->src[0]->nb[3] % 16 != 0) {
                     return false;
                 }
-                for (int i = 1; i <= 2; ++i) {
-                    const struct ggml_tensor * t = op->src[i];
-                    if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % t->nb[0] != 0) {
-                        return false;
-                    }
-                }
-                // the mask blocks are classified over the mask width but read over the K length
-                if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] != op->src[1]->ne[1] ||
-                        mask->ne[1] < op->src[0]->ne[1])) {
+                if (!ggml_metal_fa_layout_ok(op)) {
                     return false;
                 }
                 if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float) ||
