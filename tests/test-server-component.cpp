@@ -878,30 +878,46 @@ static void test_cgroup_headroom(testing & t) {
     put(root / "v2" / "a" / "b" / "memory.max",     4096 * mib);
     put(root / "v2" / "a" / "memory.current",       2560 * mib);
     put(root / "v2" / "a" / "memory.max",           3072 * mib);
-    t.assert_equal("v2 ancestor headroom", 512 * mib, server_cgroup_headroom("0::/a/b\n", (root / "v2").string(), limit));
+    t.assert_equal("v2 ancestor headroom", 512 * mib, server_cgroup_headroom("0::/a/b\n", "", (root / "v2").string(), limit));
     t.assert_equal("v2 ancestor limit",   3072 * mib, limit);
 
     // v2 line plus v1 lines without the memory controller: v2
-    t.assert_equal("v1 without memory uses v2", 512 * mib, server_cgroup_headroom("3:cpu,cpuacct:/a/b\n0::/a/b\n", (root / "v2").string(), limit));
+    t.assert_equal("v1 without memory uses v2", 512 * mib, server_cgroup_headroom("3:cpu,cpuacct:/a/b\n0::/a/b\n", "", (root / "v2").string(), limit));
 
     // v1: the leaf has no limit (a value near INT64_MAX), its parent has one
     put(root / "v1" / "memory" / "x" / "y" / "memory.usage_in_bytes", 1024 * mib);
     put(root / "v1" / "memory" / "x" / "y" / "memory.limit_in_bytes", INT64_C(9223372036854771712));
     put(root / "v1" / "memory" / "x" / "memory.usage_in_bytes",       1536 * mib);
     put(root / "v1" / "memory" / "x" / "memory.limit_in_bytes",       2048 * mib);
-    t.assert_equal("v1 ancestor headroom", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n", (root / "v1").string(), limit));
+    t.assert_equal("v1 ancestor headroom", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n", "", (root / "v1").string(), limit));
     t.assert_equal("v1 ancestor limit",   2048 * mib, limit);
 
     // hybrid: a 0:: line and a v1 memory line, the v1 hierarchy holds the controller even when a v2 tree has a tighter limit
     put(root / "v1" / "x" / "y" / "memory.current", 0);
     put(root / "v1" / "x" / "y" / "memory.max",     256 * mib);
-    t.assert_equal("hybrid uses v1", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n1:name=systemd:/x/y\n0::/x/y\n", (root / "v1").string(), limit));
+    t.assert_equal("hybrid uses v1", 512 * mib, server_cgroup_headroom("4:memory:/x/y\n1:name=systemd:/x/y\n0::/x/y\n", "", (root / "v1").string(), limit));
+
+    // hybrid with memory on v2 mounted at unified (found in mountinfo), v1 holds other controllers only
+    put(root / "unified" / "a" / "memory.current", 3072 * mib);
+    put(root / "unified" / "a" / "memory.max",     4096 * mib);
+    const std::string mi_unified =
+        "30 1 0:26 / " + root.string() + "/tmpfs ro shared:9 - tmpfs tmpfs ro,mode=755\n"
+        "31 30 0:27 / " + root.string() + "/unified rw shared:10 - cgroup2 cgroup2 rw,nsdelegate\n"
+        "33 30 0:29 / " + root.string() + "/cpu rw shared:12 - cgroup cgroup rw,cpu,cpuacct\n";
+    t.assert_equal("v2 at unified", 1024 * mib, server_cgroup_headroom("3:cpu,cpuacct:/a\n0::/a\n", mi_unified, (root / "none").string(), limit));
+    t.assert_equal("v2 at unified limit", 4096 * mib, limit);
+
+    // v1 in a container: the memory mount root is the container cgroup, so its path is stripped off
+    put(root / "ctr" / "memory.usage_in_bytes", 1024 * mib);
+    put(root / "ctr" / "memory.limit_in_bytes", 1536 * mib);
+    const std::string mi_ctr = "40 30 0:35 /docker/abc " + root.string() + "/ctr rw shared:20 - cgroup cgroup rw,memory\n";
+    t.assert_equal("v1 mount root", 512 * mib, server_cgroup_headroom("4:memory:/docker/abc\n", mi_ctr, (root / "none").string(), limit));
 
     // no limit anywhere, or no cgroup at all
     put(root / "none" / "memory.current", 1024 * mib);
-    t.assert_equal("no limit", (int64_t) -1, server_cgroup_headroom("0::/\n", (root / "none").string(), limit));
+    t.assert_equal("no limit", (int64_t) -1, server_cgroup_headroom("0::/\n", "", (root / "none").string(), limit));
     t.assert_equal("no limit, limit_out", (int64_t) -1, limit);
-    t.assert_equal("no cgroup", (int64_t) -1, server_cgroup_headroom("", (root / "none").string(), limit));
+    t.assert_equal("no cgroup", (int64_t) -1, server_cgroup_headroom("", "", (root / "none").string(), limit));
 
     std::error_code ec;
     fs::remove_all(root, ec);

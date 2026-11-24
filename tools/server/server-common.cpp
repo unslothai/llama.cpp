@@ -2407,7 +2407,7 @@ std::string server_get_model_name(const common_params & params) {
     return std::filesystem::path(params.model.path).filename().string();
 }
 
-int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::string & root, int64_t & limit_out) {
+int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::string & mountinfo, const std::string & root, int64_t & limit_out) {
     limit_out = -1;
     // a controller is bound to one hierarchy only: a v1 line that lists "memory" means v2 has no memory accounting
     std::istringstream lines(proc_cgroup);
@@ -2455,9 +2455,37 @@ int64_t server_cgroup_headroom(const std::string & proc_cgroup, const std::strin
         headroom  = headroom  < 0 ? h     : std::min(headroom, h);
         limit_out = limit_out < 0 ? limit : std::min(limit_out, limit);
     };
+    // find where the hierarchy is mounted (hybrid systems mount v2 at /sys/fs/cgroup/unified) and which cgroup is its mount root (a container sees its own cgroup there)
+    std::filesystem::path base = v1_memory ? std::filesystem::path(root) / "memory" : std::filesystem::path(root);
+    std::string cg_path = v1_memory ? v1_path : v2_path;
+    std::istringstream mounts(mountinfo);
+    while (std::getline(mounts, line)) {
+        // id parent major:minor root mount_point options [optional fields] - fstype source super_options
+        std::istringstream fields(line);
+        std::string id, parent, dev, mnt_root, mnt_point, opts, field;
+        if (!(fields >> id >> parent >> dev >> mnt_root >> mnt_point >> opts)) {
+            continue;
+        }
+        while (fields >> field && field != "-") {
+        }
+        std::string fstype, source, super_opts;
+        if (!(fields >> fstype >> source >> super_opts)) {
+            continue;
+        }
+        const bool match = v1_memory ? fstype == "cgroup" && ("," + super_opts + ",").find(",memory,") != std::string::npos : fstype == "cgroup2";
+        if (!match) {
+            continue;
+        }
+        base = mnt_point;
+        if (mnt_root != "/") {
+            // the process cgroup relative to the mount root, the mount point itself when it is not below it
+            const bool below = cg_path.compare(0, mnt_root.size(), mnt_root) == 0 && (cg_path.size() == mnt_root.size() || cg_path[mnt_root.size()] == '/');
+            cg_path = below ? cg_path.substr(mnt_root.size()) : "/";
+        }
+        break;
+    }
     // walk from the cgroup of this process up to the root of the hierarchy, a limit on any ancestor applies too
-    const std::filesystem::path base = v1_memory ? std::filesystem::path(root) / "memory" : std::filesystem::path(root);
-    const std::filesystem::path rel  = std::filesystem::path(v1_memory ? v1_path : v2_path).relative_path();
+    const std::filesystem::path rel = std::filesystem::path(cg_path).relative_path();
     std::vector<std::filesystem::path> dirs = { base };
     for (const auto & part : rel) {
         dirs.push_back(dirs.back() / part);
@@ -2514,7 +2542,9 @@ server_host_memory server_get_host_memory(int64_t page_cache_bytes) {
     status.dwLength = sizeof(status);
     if (GlobalMemoryStatusEx(&status)) {
         mem.total = (int64_t) status.ullTotalPhys;
-        mem.avail = std::max<int64_t>(0, (int64_t) status.ullAvailPhys - page_cache_bytes);
+        // ullAvailPhys counts the standby and free lists only, mapped pages in a working set (the weights after warmup) are not in it, so page_cache_bytes is not taken off again
+        (void) page_cache_bytes;
+        mem.avail = (int64_t) status.ullAvailPhys;
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     uint64_t memsize = 0;
@@ -2543,11 +2573,14 @@ server_host_memory server_get_host_memory(int64_t page_cache_bytes) {
             mem.avail = std::max<int64_t>(0, kb * 1024 - page_cache_bytes);
         }
     }
-    std::ifstream cg_file("/proc/self/cgroup");
-    std::stringstream cg_text;
-    cg_text << cg_file.rdbuf();
+    auto read_text = [](const char * path) {
+        std::ifstream in(path);
+        std::stringstream text;
+        text << in.rdbuf();
+        return text.str();
+    };
     int64_t cg_limit = -1;
-    const int64_t cg_headroom = server_cgroup_headroom(cg_text.str(), "/sys/fs/cgroup", cg_limit);
+    const int64_t cg_headroom = server_cgroup_headroom(read_text("/proc/self/cgroup"), read_text("/proc/self/mountinfo"), "/sys/fs/cgroup", cg_limit);
     if (cg_limit >= 0) {
         mem.total = mem.total < 0 ? cg_limit : std::min(mem.total, cg_limit);
     }
