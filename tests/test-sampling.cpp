@@ -8,8 +8,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
+
+#if defined(__linux__) && defined(__GLIBC__)
+#include <fenv.h>
+#include <unistd.h>
+#define TEST_DIST_FP_TRAPS 1
+#endif
 
 extern struct llama_sampler * llama_sampler_init_dry_testing(float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
 
@@ -89,6 +96,88 @@ static void test_dist_singleton_rng() {
 
     llama_sampler_free(singleton);
     llama_sampler_free(control);
+}
+
+// dist on logits with -inf (grammar masking, zero temperature), as hex of every probability and the selected tokens
+static std::string dist_dump() {
+    std::string out;
+    llama_sampler * smpl = llama_sampler_init_dist(1234);
+    for (size_t n : { 7, 64, 257, 1000 }) {
+        for (int pass = 0; pass < 3; ++pass) {
+            std::vector<float> logits(n);
+            for (size_t i = 0; i < n; ++i) {
+                const bool masked = pass == 2 ? i != n/2 : (i + pass) % 3 == 0;
+                logits[i] = masked ? -INFINITY : 0.01f*(float) ((i*37 + pass) % 101) - 0.5f;
+            }
+            std::vector<llama_token_data> cur;
+            for (llama_token id = 0; id < (llama_token) n; ++id) {
+                cur.push_back({ id, logits[id], 0.0f });
+            }
+            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(smpl, &cur_p);
+            GGML_ASSERT(cur_p.selected >= 0 && (size_t) cur_p.selected < cur_p.size);
+            GGML_ASSERT(cur_p.data[cur_p.selected].logit != -INFINITY);
+            char buf[16];
+            snprintf(buf, sizeof(buf), "s%d\n", cur_p.data[cur_p.selected].id);
+            out += buf;
+            for (size_t i = 0; i < n; ++i) {
+                uint32_t u;
+                memcpy(&u, &cur_p.data[i].p, sizeof(u));
+                snprintf(buf, sizeof(buf), "%08x\n", u);
+                out += buf;
+            }
+        }
+    }
+    llama_sampler_free(smpl);
+    return out;
+}
+
+#ifdef TEST_DIST_FP_TRAPS
+static std::string run_self(const std::string & self, const char * env, const char * mode = "--dist-dump") {
+    const std::string cmd = std::string(env) + " '" + self + "' " + mode;
+    FILE * f = popen(cmd.c_str(), "r");
+    GGML_ASSERT(f != nullptr);
+    std::string out;
+    char buf[4096];
+    size_t k;
+    while ((k = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, k);
+    }
+    const int status = pclose(f);
+    if (status != 0) {
+        fprintf(stderr, "%s: '%s' exited with status %d\n", __func__, cmd.c_str(), status);
+    }
+    GGML_ASSERT(status == 0);
+    return out;
+}
+#endif
+
+// -inf logits with FE_INVALID traps on must not raise SIGFPE in dist, and the fast dist path gives the bits of the reference path (each run in a child process, since the switch is read once per process)
+static void test_dist_fp_traps() {
+#ifdef TEST_DIST_FP_TRAPS
+    feenableexcept(FE_INVALID);
+    const std::string in_process = dist_dump();
+    fedisableexcept(FE_INVALID);
+
+    char self[4096];
+    const ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    GGML_ASSERT(len > 0);
+    self[len] = 0;
+    const std::string fast = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST");
+    const std::string ref  = run_self(self, "env LLAMA_SAMPLER_DISABLE_FAST_DIST=1");
+    GGML_ASSERT(!fast.empty());
+    GGML_ASSERT(fast == ref);
+    if (getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") == nullptr) {
+        GGML_ASSERT(in_process == fast);
+    }
+
+    // with FE_UNDERFLOW traps on, dist on logits whose expf does not underflow must not raise SIGFPE either
+    const std::string uf_fast = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST", "--dist-underflow");
+    const std::string uf_ref  = run_self(self, "env LLAMA_SAMPLER_DISABLE_FAST_DIST=1", "--dist-underflow");
+    GGML_ASSERT(!uf_fast.empty());
+    GGML_ASSERT(uf_fast == uf_ref);
+    printf("%s: OK\n", __func__);
+#endif
 }
 
 static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
@@ -335,8 +424,30 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
-int main(void) {
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--dist-dump") {
+#ifdef TEST_DIST_FP_TRAPS
+        feenableexcept(FE_INVALID);
+#endif
+        fputs(dist_dump().c_str(), stdout);
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--dist-underflow") {
+#ifdef TEST_DIST_FP_TRAPS
+        feenableexcept(FE_UNDERFLOW | FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+#endif
+        llama_sampler * smpl = llama_sampler_init_dist(1234);
+        std::vector<llama_token_data> cur = { { 0, 0.0f, 0.0f }, { 1, 0.0f, 0.0f } };
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(smpl, &cur_p);
+        printf("s%d %a %a\n", cur_p.data[cur_p.selected].id, cur_p.data[0].p, cur_p.data[1].p);
+        llama_sampler_free(smpl);
+        return 0;
+    }
+
     ggml_time_init();
+
+    test_dist_fp_traps();
 
     test_dist_singleton_rng();
 
