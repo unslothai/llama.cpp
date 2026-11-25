@@ -9141,7 +9141,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
+        const bool causal = ggml_flash_attn_ext_banded_is_causal(dst);
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            // causal without a mask: the cells after the query (and the empty ones, with positions) are masked
+            if (causal && ggml_flash_attn_ext_banded_dist(dst, iq1, iq3, ic) < 0) {
+                continue;
+            }
             float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (bias) {
                 GGML_ASSERT(bins[ic] >= 0 && bins[ic] < n_bins);
