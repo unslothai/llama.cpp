@@ -417,6 +417,10 @@ jobs:
           SMS: ${{ matrix.sms }}
         run: python tooling/scripts/unsloth/package_bundle.py
 
+      # Report only (job summary): which of cudart64_N / cublas64_N / cublasLt64_N the zip ships.
+      - name: Report the bundle's CUDA runtime
+        run: python tooling/scripts/unsloth/check_cuda_runtime.py "dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip"
+
       # Verify the finished zip, not the build tree: packaging copies extra
       # runtimes in afterwards, and only the archive shows what actually ships.
       # Skipped on forks, which have no signing credentials and build unsigned.
