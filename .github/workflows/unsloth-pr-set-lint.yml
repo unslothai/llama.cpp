@@ -30,6 +30,9 @@ on:
       - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
       - scripts/unsloth/check_workflow_network_retries.py
+      # The retry helper, and every script the network lint scans (check_workflow_network_retries.py).
+      - scripts/unsloth/net_retry.sh
+      - scripts/unsloth/*.sh
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
@@ -53,6 +56,9 @@ on:
       - scripts/unsloth/check_workflow_triggers.py
       - scripts/unsloth/check_workflow_outputs.py
       - scripts/unsloth/check_workflow_network_retries.py
+      # The retry helper, and every script the network lint scans (check_workflow_network_retries.py).
+      - scripts/unsloth/net_retry.sh
+      - scripts/unsloth/*.sh
       # Every workflow, not just this one: the size guard only guards a file if editing it runs the guard.
       - .github/workflows/*.yml
       - .github/workflows/*.yaml
@@ -91,6 +97,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
       - run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh   # gh_retry: 3 retries, 15/30/60 s apart; a 404 fails at once
           FILE=scripts/unsloth/pr-set.json
           # Mirrors the resolve step's schema: a bare url string (required),
           # or {"url": ..., "required": false} for a pin the release may ship
@@ -110,7 +117,7 @@ jobs:
             fi
             SRC="${BASH_REMATCH[1]}/llama.cpp"; NUM="${BASH_REMATCH[2]}"; PIN="${BASH_REMATCH[3]}"
             # Don't let a 404 under set -e kill the collect-all-errors loop.
-            if ! PR_JSON="$(gh api "repos/${SRC}/pulls/${NUM}" --jq '{state: .state, commits: .commits, head: .head.sha}')"; then
+            if ! PR_JSON="$(gh_retry api "repos/${SRC}/pulls/${NUM}" --jq '{state: .state, commits: .commits, head: .head.sha}')"; then
               echo "::error file=$FILE::could not fetch ${SRC}#${NUM} (nonexistent PR number in '$url', or a transient API failure)"
               fail=1
               continue
@@ -131,7 +138,7 @@ jobs:
             if [ "$COMMITS" -gt 250 ]; then
               echo "::notice::${SRC}#${NUM} has ${COMMITS} commits (over the API listing cap); skipping pin membership check"
             # Listed into a variable, not piped, for the same SIGPIPE reason as unsloth-prebuilt.yml.
-            elif ! PR_SHAS="$(gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha')"; then
+            elif ! PR_SHAS="$(gh_retry api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha')"; then
               echo "::error file=$FILE::could not list the commits of ${SRC}#${NUM} (transient API failure); retry"
               fail=1
               continue
@@ -225,8 +232,8 @@ jobs:
       - name: Check every steps.*.outputs reference is actually produced
         run: python3 scripts/unsloth/check_workflow_outputs.py .
 
-      # ~60 prebuilt legs and publish needs every one, so one feed 5xx used to cost the release
+      # ~60 prebuilt legs and publish needs every one, so one feed or API 5xx used to cost the release
       # (run 45410618008: a Chocolatey 504 on `choco install llvm`). See check_workflow_network_retries.py.
-      - name: Every prebuilt download step retries
+      - name: Every network step retries (workflows, their actions and scripts)
         run: python3 scripts/unsloth/check_workflow_network_retries.py --root .
 
