@@ -5631,6 +5631,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+    ggml_cuda_depth_mix_shadow_flush(cuda_ctx, cgraph);
+
     return GGML_STATUS_SUCCESS;
 }
 

@@ -253,6 +253,13 @@ static void depth_mix_shadow_check(const ggml_cgraph * cgraph, int i, cudaStream
     pending = keep;
 }
 
+void ggml_cuda_depth_mix_shadow_flush(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
+    // a chain that ends at the last node has no later node to trigger its compare: compare and free it at the end of the graph
+    if (depth_mix_shadow() && !depth_mix_shadow_list().empty()) {
+        depth_mix_shadow_check(cgraph, cgraph->n_nodes, ctx->stream());
+    }
+}
+
 static void depth_mix_shadow_add(const ggml_cgraph * cgraph, int end, const ggml_tensor * real, float *& ptr, const char * desc) {
     depth_mix_shadow_entry e;
     e.graph = cgraph;
@@ -277,6 +284,12 @@ static bool depth_mix_rows_ok(const ggml_tensor * t) {
 
 int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, depth_mix_memory_check_t memory_ok) {
     if (depth_mix_shadow()) {
+        // a CUDA graph capture can neither wait on the stream nor keep the scratch buffers alive for its replays: leave the chain to the separate ops
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx->stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            return 0;
+        }
         depth_mix_shadow_check(cgraph, i, ctx->stream());
     }
 

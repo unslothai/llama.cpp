@@ -14,3 +14,6 @@
 // memory_ok(cgraph, i, count, outs, n_outs): the outputs of nodes [i, i + count) overlap no input of the chain
 typedef bool (*depth_mix_memory_check_t)(const ggml_cgraph * cgraph, int node_idx, int node_count, const int * out_nodes, int out_count);
 int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, depth_mix_memory_check_t memory_ok);
+
+// GGML_CUDA_DEPTH_MIX_SHADOW=1 only: compare and free the shadow outputs still pending at the end of a graph
+void ggml_cuda_depth_mix_shadow_flush(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph);
