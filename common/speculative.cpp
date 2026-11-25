@@ -3441,6 +3441,38 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+// a block drafter (DFlash / DSpark) decodes one block per sequence: unless --spec-draft-n-ubatch is given, the draft ubatch only has to hold those blocks.
+// The attention mask of the draft context has n_ctx columns per ubatch row, so the target's prompt ubatch (512 rows by default) costs about 1 GiB of device and pinned host memory at a context of 1M.
+// Every other use of the draft ubatch (the injection of target features, the head encodes) is split into ubatch-sized passes.
+static void common_speculative_size_block_ubatch(const common_params & params, const llama_model * model_dft, llama_context_params & cparams) {
+    const bool has_block_draft = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
+        });
+    if (!has_block_draft || params.speculative.draft.n_ubatch > 0) {
+        return;
+    }
+    char buf[32];
+    if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) < 0) {
+        return;
+    }
+    const int64_t block = std::atoi(buf);
+    if (block <= 0) {
+        return;
+    }
+    // the blocks of every sequence in one ubatch (block + 1 rows covers the anchor of the DFlash variants)
+    const int64_t n_ubatch = std::max<int64_t>(64, (int64_t) std::max(1, params.n_parallel)*(block + 1));
+    if (n_ubatch < (int64_t) cparams.n_ubatch) {
+        LOG_INF("%s: draft n_ubatch = %d (block %d, %d sequences), set --spec-draft-n-ubatch to override\n",
+                __func__, (int) n_ubatch, (int) block, std::max(1, params.n_parallel));
+        cparams.n_ubatch = (uint32_t) n_ubatch;
+    }
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -3487,6 +3519,8 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        common_speculative_size_block_ubatch(params, model_dft, cparams);
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
