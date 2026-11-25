@@ -1052,6 +1052,10 @@ jobs:
             PR_LIST="$(jq -r 'map("- \(.title) ([\(if .repo == "ggml-org/llama.cpp" then "" else .repo end)#\(.number)](https://github.com/\(.repo)/pull/\(.number)), commit [\(.sha[0:7])](\(.url)))") | join("\n")' <<<"$PRS")"
             NOTES="$(printf '%s, merged with:\n\n%s' "$NOTES" "$PR_LIST")"
           fi
+          # Every CUDA archive but windows-arm64 leaves the CUDA runtime to the host (BUILD_INFO.txt
+          # names the exact libraries); without it llama.cpp loads no CUDA device and runs on the CPU.
+          RUNTIME_NOTE='CUDA archives other than windows-arm64 do not include the CUDA runtime. Put libcudart, libcublas and libcublasLt of the same CUDA major as the archive (cudart64_N, cublas64_N, cublasLt64_N on Windows) on the library path, from a CUDA 12.x or 13.x toolkit or the NVIDIA CUDA runtime and cuBLAS pip wheels, or llama.cpp finds no CUDA device and runs on the CPU. Running llama-server --list-devices should list CUDA0. BUILD_INFO.txt in each archive names the libraries it needs.'
+          NOTES="$(printf '%s\n\n%s' "$NOTES" "$RUNTIME_NOTE")"
 
           # Atomic publish: upload as draft (hidden from the anon GitHub API
           # the installer uses), then flip draft=false only once every asset

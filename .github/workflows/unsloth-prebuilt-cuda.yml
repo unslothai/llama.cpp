@@ -378,6 +378,12 @@ jobs:
           SMS: ${{ matrix.sms }}
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
+      # Report only (job summary): the CUDA runtime libraries this bundle needs from the host, as
+      # ldd resolves them with LD_LIBRARY_PATH cleared. Fails only if BUILD_INFO claims a bundled runtime
+      # the archive does not carry. See check_cuda_runtime.py.
+      - name: Report the bundle's CUDA runtime
+        run: python3 tooling/scripts/unsloth/check_cuda_runtime.py "dist/app-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz"
+
       - name: Upload bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:

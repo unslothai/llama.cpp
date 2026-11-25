@@ -181,6 +181,7 @@ jobs:
                    scripts/unsloth/test_relocate_kpack.py \
                    scripts/unsloth/test_slim_source_archive.py \
                    scripts/unsloth/test_link_bundle_copies.py \
+                   scripts/unsloth/test_check_cuda_runtime.py \
                    scripts/unsloth/test_slicing.py; do
             echo "::group::$t"
             python3 "$t" || fail=1
