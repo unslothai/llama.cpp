@@ -1484,7 +1484,9 @@ static __global__ void flash_attn_ext_banded_mma(
         fattn_banded_mma_load_tile<D, NW, type_kv>(K_s, k_base, k_nb1, kt*BK, n_kv);
         fattn_banded_mma_load_tile<D, NW, type_kv>(V_s, v_base, v_nb1, kt*BK, n_kv);
     }
-    // quantized K/V: the tiles after the first are loaded into registers one step ahead (see fattn_banded_mma_issue_tile_q)
+    // quantized K/V: the tiles after the first are loaded into registers one step ahead (see fattn_banded_mma_issue_tile_q).
+    // Head size 128 only: at 64 the extra registers cost more than the overlap gains (B200, prefill batch), so it keeps the one-step load.
+    constexpr bool q_ahead = type_kv != GGML_TYPE_F16 && D >= 128;
     fattn_banded_mma_qregs<D, NW> kq;
     fattn_banded_mma_qregs<D, NW> vq;
     bool v_pending = false;
@@ -1517,7 +1519,7 @@ static __global__ void flash_attn_ext_banded_mma(
                 fattn_banded_mma_16816(S[j + 0], Q_a[kk][0], Q_a[kk][1], Q_a[kk][2], Q_a[kk][3], b[0], b[1]);
                 fattn_banded_mma_16816(S[j + 1], Q_a[kk][0], Q_a[kk][1], Q_a[kk][2], Q_a[kk][3], b[2], b[3]);
             }
-            if constexpr (type_kv != GGML_TYPE_F16) {
+            if constexpr (q_ahead) {
                 // the V tile of this iteration (V_s is free: the PV MMAs of the previous one ended before the barrier above), over
                 // the second half of the QK MMAs so that its loads, issued after the previous PV MMAs, have landed
                 if (v_pending && kk >= NK/2) {
@@ -1599,7 +1601,7 @@ static __global__ void flash_attn_ext_banded_mma(
 
         __syncthreads();
         const int64_t kt_next = next_tile(kt + 1);
-        if constexpr (type_kv != GGML_TYPE_F16) {
+        if constexpr (q_ahead) {
             if (kt_next < kt_end) {
                 fattn_banded_mma_issue_tile_q<D, NW, type_kv>(kq, k_base, k_nb1, kt_next*BK, n_kv);
             }
@@ -1621,7 +1623,7 @@ static __global__ void flash_attn_ext_banded_mma(
                 fattn_banded_mma_16816(O[n + 0], P_a[2*s][0], P_a[2*s][1], P_a[2*s + 1][0], P_a[2*s + 1][1], b[0], b[1]);
                 fattn_banded_mma_16816(O[n + 1], P_a[2*s][0], P_a[2*s][1], P_a[2*s + 1][0], P_a[2*s + 1][1], b[2], b[3]);
             }
-            if constexpr (type_kv != GGML_TYPE_F16) {
+            if constexpr (q_ahead) {
                 // the next K tile (K_s is free: every warp left the QK MMAs before the barrier above), over the second half of the PV
                 // MMAs so that its loads, issued before them, have landed
                 if (kt_next < kt_end && s >= (BK/16)/2) {
@@ -1630,7 +1632,7 @@ static __global__ void flash_attn_ext_banded_mma(
             }
         }
         __syncthreads();
-        if constexpr (type_kv != GGML_TYPE_F16) {
+        if constexpr (q_ahead) {
             v_pending = kt_next < kt_end;
             if (v_pending) {
                 fattn_banded_mma_issue_tile_q<D, NW, type_kv>(vq, v_base, v_nb1, kt_next*BK, n_kv);
