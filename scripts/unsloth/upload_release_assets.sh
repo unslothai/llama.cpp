@@ -38,6 +38,10 @@ file_size() { stat -c %s "$1"; }
 # newline is also outside the set and would become a phantom '.' on every name.
 asset_name() { printf '%s' "${1##*/}" | tr -c 'A-Za-z0-9._-' '.'; }
 
+# gh_retry: one 5xx on the verification read must not refuse a fully uploaded release.
+# shellcheck source-path=SCRIPTDIR source=net_retry.sh
+. "$(dirname "$(readlink -f "$0")")/net_retry.sh"
+
 # Worker mode. The parent fans out with xargs by re-invoking this script, which
 # is safer than `export -f`: an unexported function fails per file at runtime.
 if [ "${1:-}" = "--upload-one" ]; then
@@ -116,6 +120,7 @@ self="$(readlink -f "$0")"
 # The incident was 4 hours of silence, so report what the API has accepted.
 heartbeat() {
   while sleep "$HEARTBEAT_SECONDS"; do
+    # lint:network-retry-allow progress log only; a miss prints '?' and the next beat asks again.
     n="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '[.assets[]|select(.state=="uploaded")]|length' 2>/dev/null || echo '?')"
     log "heartbeat: ${n}/${#FILES[@]} assets uploaded, $(( (UPLOAD_DEADLINE_EPOCH - $(date +%s)) / 60 ))m left in budget"
   done
@@ -138,7 +143,7 @@ upload_pass "${FILES[@]}" || pass_rc=$?
 # and leaves BAD empty, i.e. publishes a release we never checked.
 verify() {
   local remote f
-  remote="$(gh release view "$TAG" --repo "$REPO" --json assets \
+  remote="$(gh_retry release view "$TAG" --repo "$REPO" --json assets \
     --jq '.assets[] | select(.state=="uploaded") | "\(.name)\t\(.size)"')" \
     || die "could not read release assets for verification"
   BAD=()

@@ -71,6 +71,7 @@ export PATH="$STUBDIR/bin:$PATH"
 
 export UPLOAD_GRACE_SECONDS=1 UPLOAD_MIN_RATE_MB_S=1000 UPLOAD_HEARTBEAT_SECONDS=3
 export UPLOAD_JOBS=4 UPLOAD_ATTEMPTS=3
+export NET_RETRY_SLEEP=0   # net_retry.sh backoff; the verify read retries 3 times
 
 FAILS=()
 

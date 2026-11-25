@@ -152,6 +152,8 @@ jobs:
             echo "resolve failed in phase '${PHASE}' at line ${line}: ${BASH_COMMAND} (exit ${rc})" >&2
           }
           trap 'on_err $LINENO' ERR
+          # gh_retry / net_retry: 3 retries, 15/30/60 s apart, so one API 5xx cannot cost the nightly.
+          . scripts/unsloth/net_retry.sh
 
           PHASE='read inputs'
           REQ='${{ github.event.inputs.tag || 'latest' }}'
@@ -184,7 +186,7 @@ jobs:
             # marks the b#### builds prerelease and keeps that flag clear only
             # for the semver v#.#.# releases, which are not what we build.
             CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
-            BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+            BASE="$(gh_retry api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
               | jq -r --argjson cutoff "$CUTOFF" '[.[] | select(.draft==false) | select(.tag_name|test("^b[0-9]+$")) | select((.published_at|fromdateiso8601) <= $cutoff)] | max_by(.published_at|fromdateiso8601) | .tag_name')"
             if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
               echo "refusing: no ggml-org b#### release older than ${AGE_H}h in the last 100 releases" >&2
@@ -223,7 +225,7 @@ jobs:
             # Abort naming the entry on a gh failure (typo'd numbers 404).
             # Title can contain spaces, so it can't ride a space-delimited
             # read -- pull each field out on its own.
-            PR_JSON="$(gh api "repos/${SRC}/pulls/${NUM}")" \
+            PR_JSON="$(gh_retry api "repos/${SRC}/pulls/${NUM}")" \
               || { echo "refusing ${SRC}#${NUM}: could not fetch PR metadata (nonexistent PR number in '$url', or a transient API failure); fix the pin in scripts/unsloth/pr-set.json or retry" >&2; exit 1; }
             STATE="$(jq -r '.state' <<<"$PR_JSON")"
             HEAD="$(jq -r '.head.sha' <<<"$PR_JSON")"
@@ -264,7 +266,7 @@ jobs:
             # fails whenever grep matches before gh has written its last page
             # (gh dies of SIGPIPE, 141), which refused #61's pin on every run once
             # that PR's commits spanned several pages and the pin sat on the first.
-            elif ! PR_SHAS="$(gh api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha')"; then
+            elif ! PR_SHAS="$(gh_retry api "repos/${SRC}/pulls/${NUM}/commits" --paginate --jq '.[].sha')"; then
               echo "refusing ${SRC}#${NUM}: could not list the PR's commits (transient API failure); retry" >&2
               exit 1
             elif ! grep -qxF -- "$SHA" <<<"$PR_SHAS"; then
@@ -305,7 +307,7 @@ jobs:
           # Only PUBLISHED releases count as "exists"; a leftover draft (from
           # a failed prior publish) should not block today's rebuild.
           EXISTS=false
-          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+          if [ "$(gh_retry release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
             EXISTS=true
           fi
 
@@ -1046,8 +1048,10 @@ jobs:
           # the installer uses), then flip draft=false only once every asset
           # landed. Leftover drafts from failed runs are detected as "not
           # exists" by resolve and rebuilt on the next run.
-          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
-            gh release delete "$TAG" --repo "$REPO" --yes
+          # gh_retry: 3 retries, 15/30/60 s apart; "release not found" is answered at once.
+          . tooling/scripts/unsloth/net_retry.sh
+          if [ "$(gh_retry release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh_retry release delete "$TAG" --repo "$REPO" --yes
           fi
           # Create the draft empty, then upload through the uploader instead of
           # passing dist/* here. `gh release create` uses a fixed 5-worker pool
@@ -1072,7 +1076,7 @@ jobs:
 
           # Reached only after the uploader verified every asset is present,
           # byte-identical and in state "uploaded".
-          gh release edit "$TAG" --repo "$REPO" --draft=false
+          gh_retry release edit "$TAG" --repo "$REPO" --draft=false
 
       # Debug fallback for a failed publish. This used to upload on EVERY run,
       # ahead of the publish gate, which cost ~688 MiB of Actions artifact
@@ -1260,11 +1264,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          . scripts/unsloth/net_retry.sh
           # --require: until assemble's record exists the visible list can be complete but partial.
           if bash scripts/unsloth/wait_for_jobs.sh --exclude 'Finalize: prune, reclaim, report' \
                --require 'Assemble metadata + publish' --deadline-min 335 --poll 120 --out "$RUNNER_TEMP/jobs.tsv"; then
             # A failed lookup is `unknown`, never `false`: false takes the unpublished delete path.
-            if steps="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100&filter=latest" \
+            if steps="$(gh_retry api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100&filter=latest" \
                   --jq '.jobs[] | select(.name == "Assemble metadata + publish") | .steps[] | select(.name == "Publish GitHub release") | .conclusion')"; then
               if [ "$(printf '%s\n' "$steps" | head -1)" = success ]; then published=true; else published=false; fi
             else
@@ -1287,6 +1292,7 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh
           repo="$GITHUB_REPOSITORY"
 
           if [ -z "${TAG:-}" ]; then
@@ -1295,19 +1301,19 @@ jobs:
           fi
 
           # Gate 1: the release must exist and be published, not a draft.
-          draft="$(gh release view "$TAG" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          draft="$(gh_retry release view "$TAG" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
           if [ "$draft" != "false" ]; then
             echo "release $TAG is '$draft', not a published release; leaving artifacts untouched"
             exit 0
           fi
           assets="$RUNNER_TEMP/reclaim-assets.txt"
           arts="$RUNNER_TEMP/reclaim-arts.tsv"
-          gh release view "$TAG" --repo "$repo" --json assets -q '.assets[].name' | sort > "$assets"
+          gh_retry release view "$TAG" --repo "$repo" --json assets -q '.assets[].name' | sort > "$assets"
           echo "release $TAG has $(wc -l < "$assets") assets"
 
           # Gate 2: only THIS run's artifacts are even considered, so the step
           # cannot reach another run's -- including a concurrent build's.
-          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+          gh_retry api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
             -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
           echo "this run has $(grep -c . "$arts" || true) live artifacts"
 
@@ -1327,7 +1333,7 @@ jobs:
             if grep -qxF -- "${name}.tar.gz" "$assets" || grep -qxF -- "${name}.zip" "$assets"; then
               # < /dev/null so the command can never consume the loop's stdin
               # and silently truncate the sweep to one artifact.
-              if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+              if err="$(gh_retry api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
                 freed=$(( freed + size )); deleted=$(( deleted + 1 ))
               else
                 # Keep the reason: a 403 from a permissions regression and a
@@ -1376,12 +1382,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh
           repo="$GITHUB_REPOSITORY"
           arts="$RUNNER_TEMP/reclaim-unpublished.tsv"
 
           # Same containment as the published path: only THIS run's artifacts
           # are listed, so the step cannot reach a concurrent build's.
-          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+          gh_retry api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
             -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
           n="$(grep -c . "$arts" || true)"
           echo "run published nothing; deleting its $n live artifact(s)"
@@ -1389,7 +1396,7 @@ jobs:
           freed=0; deleted=0; failed=0
           while IFS="$(printf '\t')" read -r id size name; do
             [ -z "${id:-}" ] && continue
-            if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+            if err="$(gh_retry api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
               freed=$(( freed + size )); deleted=$(( deleted + 1 ))
             else
               printf '  could not delete %s: %s\n' "$name" "$err"
@@ -1453,6 +1460,8 @@ jobs:
           echo "status=failure" >> "$GITHUB_OUTPUT"
 
           # Quote the actual refusal so the issue says why, not just that a job failed.
+          # lint:network-retry-allow best effort: an empty REASON only shortens the alert body; the
+          # failed-jobs list above comes from the waiter's jobs.tsv, not from this call.
           REASON="$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed 2>/dev/null \
             | grep -aE 'refusing |does not merge cleanly onto |could not fetch commit |ERROR: ' \
             | sed -E 's/^[0-9-]+T[0-9:.]+Z //' | cut -c1-300 | head -5 || true)"
