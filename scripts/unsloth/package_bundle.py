@@ -14,7 +14,9 @@ script.
 
 The installer normally uses PyTorch's CUDA runtime, selected by runtime_line.
 BUNDLE_CUDA_RUNTIME=1 includes cudart/cublas DLLs for Windows ARM64, where
-PyTorch has no CUDA build.
+PyTorch has no CUDA build. Every other CUDA bundle needs the runtime from the
+host; BUILD_INFO.txt and UNSLOTH_PREBUILT_INFO.json say which case a bundle is
+and name the libraries it needs.
 
 Linux is the CI-validated path. macOS/Windows strategies follow the correct
 platform conventions (otool/@loader_path/tar.gz; dir-local DLLs/zip) but have
@@ -53,8 +55,17 @@ def _run(cmd: list[str]) -> str:
     return r.stdout
 
 
+# CUDA toolkit libraries a ggml-cuda build can link; the driver (libcuda.so.1) is not one.
+CUDA_RUNTIME_SONAME_RE = re.compile(
+    r"^lib(cudart|cublas|cublasLt|nvrtc|nvJitLink|cufft|curand|cusparse|cusolver)\.so\.\d+$"
+)
+
+
 class PlatformStrategy:
     name = "generic"
+    # Whether BUNDLE_CUDA_RUNTIME=1 makes this strategy ship the runtime (local_needed).
+    honours_bundle_cuda_runtime = False
+    runtime_search_path = "on the library path"
     exe_suffix = ""
     archive_ext = ".tar.gz"
     rpath = ""
@@ -85,6 +96,10 @@ class PlatformStrategy:
     def supports_symlinks(self) -> bool:
         return True
 
+    def cuda_runtime_names(self, stage: Path, major: str) -> list[str]:
+        """CUDA runtime libraries the staged ggml-cuda backend loads; empty without one."""
+        return []
+
     def archive(self, stage: Path, out_path: Path) -> None:
         raise NotImplementedError
 
@@ -100,6 +115,15 @@ class LinuxStrategy(PlatformStrategy):
 
     def backend_patterns(self) -> list[str]:
         return ["libggml-cpu-*.so*", "libggml-cuda.so*", "libggml-rpc.so*"]
+
+    def cuda_runtime_names(self, stage: Path, major: str) -> list[str]:
+        names: list[str] = []
+        for backend in sorted(stage.glob("libggml-cuda.so*")):
+            if backend.is_file() and not backend.is_symlink():
+                for n in re.findall(r"\(NEEDED\)[^\[]*\[([^\]]+)\]", _run(["readelf", "-d", str(backend)])):
+                    if CUDA_RUNTIME_SONAME_RE.match(n) and n not in names:
+                        names.append(n)
+        return names
 
     def archive(self, stage: Path, out_path: Path) -> None:
         with tarfile.open(out_path, "w:gz") as tar:
@@ -146,6 +170,8 @@ class WindowsStrategy(PlatformStrategy):
     # ggml-cpu.dll imports it by name, so a curated bundle built from that tree
     # (the arm64 CUDA leg) has to keep it or nothing in the bundle loads.
     LOCAL_DLL_PREFIXES = ("ggml", "llama", "mtmd", "libomp")
+    honours_bundle_cuda_runtime = True
+    runtime_search_path = "on PATH or beside the binaries"
     CUDA_RUNTIME_DLL_PREFIXES = ("cudart64_", "cublas64_", "cublaslt64_")
 
     def local_needed(self, path: Path, bin_dir: Path) -> list[str]:
@@ -159,6 +185,12 @@ class WindowsStrategy(PlatformStrategy):
 
     def backend_patterns(self) -> list[str]:
         return ["ggml-cpu-*.dll", "ggml-cuda.dll", "ggml-rpc.dll"]
+
+    def cuda_runtime_names(self, stage: Path, major: str) -> list[str]:
+        # No PE import walk here: what ggml-cuda.dll loads for a CUDA `major` build.
+        if not (stage / "ggml-cuda.dll").is_file():
+            return []
+        return [f"cudart64_{major}.dll", f"cublas64_{major}.dll", f"cublasLt64_{major}.dll"]
 
     def supports_symlinks(self) -> bool:
         return False
@@ -223,6 +255,28 @@ def curate(strategy: PlatformStrategy, bin_dir: Path, stage: Path) -> None:
                 queue.append(stage / need)
 
 
+def cuda_runtime_record(strategy: PlatformStrategy, cfg: dict, stage: Path) -> dict:
+    """Whether this bundle ships its CUDA runtime and, if not, what the host must provide."""
+    m = re.fullmatch(r"cuda(\d+)", cfg["line"])
+    names = strategy.cuda_runtime_names(stage, m.group(1)) if m else []
+    if not names:
+        return {}
+    major = m.group(1)
+    bundled = strategy.honours_bundle_cuda_runtime and os.environ.get("BUNDLE_CUDA_RUNTIME") == "1"
+    libs = ", ".join(names)
+    if bundled:
+        present = {p.name.lower() for p in stage.iterdir()}
+        missing = [n for n in names if n.lower() not in present]
+        if missing:
+            sys.exit(f"ERROR: BUNDLE_CUDA_RUNTIME=1 but the bundle lacks {', '.join(missing)}")
+        text = f"bundled ({libs})"
+    else:
+        text = (f"not bundled; requires {libs} (a CUDA {major}.x toolkit, or NVIDIA's CUDA {major} "
+                f"runtime and cuBLAS pip wheels as PyTorch installs them) {strategy.runtime_search_path}")
+    print(f"cuda runtime: {text}")
+    return {"bundled": bundled, "libraries": names, "text": text}
+
+
 def detect_nvcc_sms() -> tuple[str, list[str], str]:
     if not shutil.which("nvcc"):
         return "unavailable", [], "nvcc not found"
@@ -233,7 +287,8 @@ def detect_nvcc_sms() -> tuple[str, list[str], str]:
     return "available", sms, f"detected {len(sms)} SM targets"
 
 
-def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list[str]) -> None:
+def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list[str],
+                   runtime: dict | None = None) -> None:
     short = cfg["commit"][:7]
     min_sm, max_sm = min(map(int, sms)), max(map(int, sms))
     nvcc_status, nvcc_sms, nvcc_msg = detect_nvcc_sms()
@@ -286,6 +341,10 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
         "ggml_cpu_all_variants": True,
         "rpath": strategy.rpath,
     }
+    if runtime:
+        info["cuda_runtime_bundled"] = runtime["bundled"]
+        info["cuda_runtime_libraries"] = runtime["libraries"]
+        info["cuda_runtime"] = runtime["text"]
     (stage / "UNSLOTH_PREBUILT_INFO.json").write_text(json.dumps(info, indent=2))
 
     build_info = [
@@ -322,6 +381,8 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
     fallback = Path(cfg["src_dir"]) / "UNSLOTH_BASE_FALLBACK.txt"
     if fallback.is_file():
         build_info.append(f"base-tag fallback: {fallback.read_text().strip()}")
+    if runtime:
+        build_info.append(f"cuda runtime: {runtime['text']}")
     (stage / "BUILD_INFO.txt").write_text("\n".join(build_info) + "\n")
 
 
@@ -375,7 +436,7 @@ def main() -> int:
     stage = Path(tempfile.mkdtemp())
     try:
         curate(strategy, bin_dir, stage)
-        write_metadata(stage, strategy, cfg, sms)
+        write_metadata(stage, strategy, cfg, sms, cuda_runtime_record(strategy, cfg, stage))
 
         asset = f"app-{cfg['tag']}-{strategy.name}-{cfg['arch']}-{cfg['profile']}{strategy.archive_ext}"
         out_path = out_dir / asset
