@@ -233,6 +233,8 @@
     }
   },
   "unchecked": {
+    "unslothai#447": "dist sampler softmax with the same arithmetic in fewer passes (bit-identical probabilities and sampled tokens); behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
+    "unslothai#448": "batch-1 Q8_0 x F32 mat-vec on NVIDIA cc >= 10.0 only; covered by test-backend-ops MUL_MAT on a Blackwell device, and no pipeline runner has one",
     "unslothai#431": "Metal FLASH_ATTN_EXT_BANDED (prefill, vec and split-KV decode) and inline-dequant quantized and mixed K/V FA kernels; needs a Metal device, and no runner in the pipeline has one. Covered by the macOS CI job (macos-15 and macos-26: test-backend-ops FLASH_ATTN_EXT_BANDED and FLASH_ATTN_EXT, a tiny Inkling 2 KLD against CPU on every cache type, banded engaged in the pinned tree only). The CPU and CUDA paths of the op belong to #386, so a backend-op check here would pass without this pin",
     "unslothai#95": "sampling penalties indexed by token id; behaviour is covered by test-sampling, and there is no feature surface of its own to probe",
     "unslothai#149": "once-per-process HIP warning when GGML_CUDA_ENABLE_UNIFIED_MEMORY is on (=0 parsing is upstream since ggml-org#30327); needs a HIP host, and no runner in the pipeline has one",
