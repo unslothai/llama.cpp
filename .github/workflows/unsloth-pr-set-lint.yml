@@ -18,6 +18,9 @@ on:
       - scripts/unsloth/additive_merge.py
       - scripts/unsloth/pin_merge.py
       - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/reconcile_op_count.py
+      - scripts/unsloth/pin_contract.py
+      - scripts/unsloth/repin.py
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
@@ -45,6 +48,9 @@ on:
       - scripts/unsloth/additive_merge.py
       - scripts/unsloth/pin_merge.py
       - scripts/unsloth/merge_checks.py
+      - scripts/unsloth/reconcile_op_count.py
+      - scripts/unsloth/pin_contract.py
+      - scripts/unsloth/repin.py
       - scripts/unsloth/carry_vintage.py
       - scripts/unsloth/sync_deletes.py
       - scripts/unsloth/relocate_kpack.py
@@ -171,9 +177,11 @@ jobs:
           for t in scripts/unsloth/test_additive_merge.py \
                    scripts/unsloth/test_pin_merge.py \
                    scripts/unsloth/test_merge_checks.py \
+                   scripts/unsloth/test_reconcile_op_count.py \
                    scripts/unsloth/test_sync_deletes.py \
                    scripts/unsloth/test_carry_vintage.py \
                    scripts/unsloth/test_pin_contract.py \
+                   scripts/unsloth/test_repin.py \
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py \
                    scripts/unsloth/test_check_workflow_network_retries.py \
