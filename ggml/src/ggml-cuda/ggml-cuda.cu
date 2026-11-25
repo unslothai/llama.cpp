@@ -50,6 +50,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/clip-rows.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -4466,6 +4467,206 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// returns the number of nodes after node i taken by a fused row L2 clip, 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_op ops[9];
+    int n = 0;
+
+    const ggml_tensor * w  = nullptr;
+    const ggml_tensor * m0 = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        m0 = cgraph->nodes[i];
+        ops[n++] = GGML_OP_MUL;
+    }
+    if (i + n + 6 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const int i_sqr = i + n;
+    ops[n++] = GGML_OP_SQR;
+    ops[n++] = GGML_OP_SUM_ROWS;
+    ops[n++] = GGML_OP_SQRT;
+    ops[n++] = GGML_OP_SCALE;
+    const bool has_fill = cgraph->nodes[i + n]->op == GGML_OP_FILL;
+    if (has_fill) {
+        ops[n++] = GGML_OP_FILL;
+    }
+    ops[n++] = GGML_OP_DIV;
+    ops[n++] = GGML_OP_CLAMP;
+    ops[n++] = GGML_OP_MUL;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * sqr   = cgraph->nodes[i_sqr];
+    const ggml_tensor * sum   = cgraph->nodes[i_sqr + 1];
+    const ggml_tensor * sqrtn = cgraph->nodes[i_sqr + 2];
+    const ggml_tensor * scl   = cgraph->nodes[i_sqr + 3];
+    const ggml_tensor * fill  = has_fill ? cgraph->nodes[i_sqr + 4] : nullptr;
+    const ggml_tensor * div   = cgraph->nodes[i + n - 3];
+    const ggml_tensor * clamp = cgraph->nodes[i + n - 2];
+    ggml_tensor       * out   = cgraph->nodes[i + n - 1];
+
+    const ggml_tensor * x = sqr->src[0];
+    if (sum->src[0] != sqr || sqrtn->src[0] != sum || scl->src[0] != sqrtn || clamp->src[0] != div ||
+        div->src[1] != scl || out->src[0] != x || out->src[1] != clamp) {
+        return 0;
+    }
+    if (m0) {
+        // c = x*w, w one row per head broadcast over the tokens
+        w = m0->src[1];
+        if (x != m0 || !ggml_are_same_shape(m0, m0->src[0]) || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            w->ne[0] != m0->ne[0] || m0->ne[1] % w->ne[1] != 0 || w->ne[1] != m0->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+            return 0;
+        }
+        x = m0->src[0];
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out)) {
+        return 0;
+    }
+
+    float scale_bias[2];
+    memcpy(scale_bias, scl->op_params, sizeof(scale_bias));
+    float lo_hi[2];
+    memcpy(lo_hi, clamp->op_params, sizeof(lo_hi));
+    if (scale_bias[0] != 1.0f) {
+        return 0;
+    }
+
+    // the limit: a FILL of this chain, or one value per row
+    const ggml_tensor * limit = nullptr;
+    float limit_value = 0.0f;
+    if (fill) {
+        if (fill->src[0] != scl || div->src[0] != fill) {
+            return 0;
+        }
+        // ggml_fill_inplace(norm) overwrites the denominator before DIV reads it, so the chain divides the
+        // threshold by itself: keep the separate ops
+        if (fill->view_src == scl || fill->data == scl->data) {
+            return 0;
+        }
+        memcpy(&limit_value, fill->op_params, sizeof(float));
+    } else {
+        limit = div->src[0];
+        if (limit->type != GGML_TYPE_F32 || !ggml_is_contiguous(limit) || !ggml_are_same_shape(limit, scl)) {
+            return 0;
+        }
+        // the fused kernel never writes the chain's intermediates, so the limit must not be one of them
+        for (const ggml_tensor * t : { m0, sqr, sum, sqrtn, scl }) {
+            if (t && (limit == t || limit->view_src == t)) {
+                return 0;
+            }
+        }
+    }
+
+    // the fused kernel writes only out and reads the original x, w and limit
+    // an in-place node of the chain (e.g. ggml_sqr_inplace(ctx, c)) overwrites a tensor that later nodes read, so keep the separate ops
+    for (int k = 0; k < n - 1; ++k) {
+        if (cgraph->nodes[i + k]->view_src != nullptr) {
+            return 0;
+        }
+    }
+
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
+        return 0;
+    }
+
+    ggml_cuda_op_clip_rows_fused(*cuda_ctx, x, w, limit, limit_value, scale_bias[1], lo_hi[0], lo_hi[1], out);
+    return n - 1;
+}
+
+// returns the number of nodes after node i taken by a fused row L2 clip written as [MUL,] L2_NORM, SCALE,
+// 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_l2_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_op ops[3];
+    int n = 0;
+
+    const ggml_tensor * m0 = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        m0 = cgraph->nodes[i];
+        ops[n++] = GGML_OP_MUL;
+    }
+    ops[n++] = GGML_OP_L2_NORM;
+    ops[n++] = GGML_OP_SCALE;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * l2n = cgraph->nodes[i + n - 2];
+    ggml_tensor       * out = cgraph->nodes[i + n - 1];
+    if (out->src[0] != l2n) {
+        return 0;
+    }
+
+    const ggml_tensor * x = l2n->src[0];
+    const ggml_tensor * w = nullptr;
+    if (m0) {
+        // c = x*w, w one row per head broadcast over the tokens
+        w = m0->src[1];
+        if (x != m0 || !ggml_are_same_shape(m0, m0->src[0]) || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            w->ne[0] != m0->ne[0] || w->ne[1] != m0->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+            return 0;
+        }
+        x = m0->src[0];
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out) ||
+        x->ne[0] > INT_MAX || ggml_nrows(x) > INT_MAX) {
+        return 0;
+    }
+
+    float eps;
+    memcpy(&eps, l2n->op_params, sizeof(float));
+    float scale_bias[2];
+    memcpy(scale_bias, out->op_params, sizeof(scale_bias));
+
+    // an in-place node of the chain keeps the separate ops
+    for (int k = 0; k < n - 1; ++k) {
+        if (cgraph->nodes[i + k]->view_src != nullptr) {
+            return 0;
+        }
+    }
+
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1)) {
+        return 0;
+    }
+    // the only inputs from outside the chain are x and w. The allocator may give out the buffer of x, which is dead
+    // after the chain: that is safe, a block reads its whole row before it writes, and then each thread reads an
+    // element before it writes the same element. Any other overlap keeps the separate ops
+    auto range = [](const ggml_tensor * t) {
+        const int64_t a = (int64_t) t->data;
+        return std::make_pair(a, a + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
+    };
+    auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto ra = range(a);
+        const auto rb = range(b);
+        return ra.first < rb.second && rb.first < ra.second;
+    };
+    if (!out->buffer || !x->buffer || (w && !w->buffer)) {
+        return 0;
+    }
+    if (overlaps(out, x) && !(out->data == x->data && ggml_nbytes(out) == ggml_nbytes(x))) {
+        return 0;
+    }
+    if (w && overlaps(out, w)) {
+        return 0;
+    }
+
+    ggml_cuda_op_l2_clip_rows_fused(*cuda_ctx, x, w, eps, scale_bias[0], scale_bias[1], out);
+    return n - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4665,6 +4866,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // row L2 clip: [MUL,] SQR, SUM_ROWS, SQRT, SCALE, [FILL,] DIV, CLAMP, MUL
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        static const bool clip_rows_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CLIP_ROWS_FUSION");
+        const int n_fused = clip_rows_disabled ? 0 : ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    // row L2 clip as an L2 norm: [MUL,] L2_NORM, SCALE
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
+        static const bool clip_rows_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CLIP_ROWS_FUSION");
+        const int n_fused = clip_rows_disabled ? 0 : ggml_cuda_try_fuse_l2_clip_rows(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
