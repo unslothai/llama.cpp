@@ -22,7 +22,8 @@ struct depth_mix_params {
     float * states;       int64_t states_s1, states_s2;     // CONCAT outputs, if used outside the chain
     float * states_t;     int64_t states_t_s1, states_t_s2;
     float * scores;       int64_t scores_s1, scores_s2;     // SOFT_MAX output, if used outside the chain
-    float * out;          int64_t out_s1,    out_s2;        // the second MUL_MAT, if fused
+    float * out;          int64_t out_se, out_sj, out_s2;   // the second MUL_MAT, if fused: element (e, j) of token t at
+                                                            // e*out_se + j*out_sj + t*out_s2 ([ncols, nq] or [nq, ncols])
     int   ncols;
     int   n;                                                // rows of the mix, the earlier blocks + x
     float scale;
@@ -187,7 +188,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
                         v[j][l] = __fadd_rn(v[j][l], v[j][l + o]);
                     }
                 }
-                p.out[e + j*p.out_s1 + t*p.out_s2] = v[j][0];
+                p.out[e*p.out_se + j*p.out_sj + t*p.out_s2] = v[j][0];
             }
         }
     }
@@ -287,11 +288,16 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     //   (a) CONCAT (prev_t, RESHAPE(normed), dim 0), CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
     //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]: the transposed rows are a
     //       copy of the plain ones made right before the product, in any order the graph puts these nodes
+    // In (b) the transposed rows may also be their own CONCAT (prev_t, RESHAPE(normed), dim 0) placed after the plain one,
+    // with the RESHAPE right before it (the graph order when the last product reads the scores first).
+    // The last MUL_MAT is either mul_mat(states_t, scores), out [ncols, nq, T], or mul_mat(scores, states_t) with the
+    // scores as src0, out [nq, ncols, T]: the same products and sums, only the layout of the output differs
     ggml_tensor * first = cgraph->nodes[i];
     const bool form_b = first->op == GGML_OP_CONCAT && ggml_get_op_params_i32(first, 0) == 1 &&
         first->src[1]->op == GGML_OP_RMS_NORM;
     ggml_tensor * cat_t    = nullptr; // form (a): the transposed CONCAT; form (b): the CONT of the permuted rows
     ggml_tensor * perm     = nullptr; // form (b) only
+    bool cat_t_concat      = !form_b; // the transposed rows are a CONCAT of their own (form (a), or (b) with a later CONCAT)
     const ggml_tensor * normed_t = nullptr;
     const ggml_tensor * rms      = nullptr;
     if (form_b) {
@@ -333,7 +339,13 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             perm = node; ok = true;
         } else if (form_b && perm && !cat_t && node->op == GGML_OP_CONT && node->src[0] == perm) {
             cat_t = node; ok = true;
-        } else if (sm && cat_t && node->op == GGML_OP_MUL_MAT && node->src[0] == cat_t && node->src[1] == sm) {
+        } else if (form_b && !perm && !cat_t && !normed_t && node->op == GGML_OP_RESHAPE && node->src[0] == rms) {
+            normed_t = node; ok = true; // the view the later CONCAT of the transposed rows reads
+        } else if (form_b && !perm && !cat_t && node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
+                node->src[1]->op == GGML_OP_RESHAPE && node->src[1]->src[0] == rms) {
+            cat_t = node; cat_t_concat = true; normed_t = node->src[1]; ok = true;
+        } else if (sm && cat_t && node->op == GGML_OP_MUL_MAT &&
+                ((node->src[0] == cat_t && node->src[1] == sm) || (node->src[0] == sm && node->src[1] == cat_t))) {
             mm2 = node; ok = true;
         }
         if (!ok) {
@@ -351,10 +363,11 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         // no product to fuse: keep the chain up to the SOFT_MAX, unless the copy of the rows sits inside it
         cat_t = nullptr;
         perm  = nullptr;
+        cat_t_concat = false;
     }
 
     const ggml_tensor * prev   = cat_s->src[0];
-    const ggml_tensor * prev_t = form_b ? nullptr : cat_t->src[0];
+    const ggml_tensor * prev_t = cat_t_concat ? cat_t->src[0] : nullptr;
     const int64_t n  = cat_s->ne[1];
     const int64_t nq = mm1->ne[1];
 
@@ -363,7 +376,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         prev->ne[0] != ncols || prev->ne[1] != n - 1 || prev->ne[2] != T ||
         (cat_t && (!depth_mix_rows_ok(cat_t) || cat_t->ne[0] != n || cat_t->ne[1] != ncols || cat_t->ne[2] != T)) ||
         (form_b && cat_t && !ggml_is_contiguous(cat_t)) ||
-        (!form_b && (!depth_mix_rows_ok(prev_t) || prev_t->ne[0] != n - 1 || prev_t->ne[1] != ncols || prev_t->ne[2] != T ||
+        (cat_t_concat && (!depth_mix_rows_ok(prev_t) || prev_t->ne[0] != n - 1 || prev_t->ne[1] != ncols || prev_t->ne[2] != T ||
             normed_t->ne[0] != 1 || normed_t->ne[1] != ncols || normed_t->ne[2] != T))) {
         DEPTH_MIX_DECLINE("shapes");
     }
@@ -416,7 +429,10 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (!takes_mmvf(mm1)) {
         DEPTH_MIX_DECLINE("first product not MMVF");
     }
-    if (mm2 && !(takes_mmvf(mm2) && n % 2 == 0 && sm->nb[1] == n*sizeof(float))) {
+    // scores as src0: the separate product is not a MMVF (src1 has ncols columns); fused, it is computed as MMVF
+    // computes the states_t-first order, so both operand orders give the same output values
+    const bool mm2_flipped = mm2 && mm2->src[0] == sm;
+    if (mm2 && !((mm2_flipped || takes_mmvf(mm2)) && n % 2 == 0 && sm->nb[1] == n*sizeof(float))) {
         // the second product stays a separate op
         mm2 = nullptr;
         if (form_b) {
@@ -442,14 +458,22 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         end = k_sm;
     }
 
-    // the nodes of the chain, and which of them are used outside it
+    // the nodes of the chain, and which of them are used outside it. A RESHAPE of the normed rows inside the chain
+    // (form (b) with a later CONCAT of the transposed rows) is a view of a tensor computed before the chain: it is
+    // skipped with the chain but left out of the fused set, since it computes nothing
     const int count = end - i + 1;
     ggml_op ops[16];
+    int     idxs[16];
     int     outs[16];
+    int     n_idx  = 0;
     int     n_outs = 0;
     for (int k = 0; k < count; ++k) {
         const ggml_tensor * node = cgraph->nodes[i + k];
-        ops[k] = node->op;
+        if (node == normed_t && node->op == GGML_OP_RESHAPE && node != first) {
+            continue;
+        }
+        idxs[n_idx] = i + k;
+        ops[n_idx++] = node->op;
         int uses = 0;
         for (int l = k + 1; l < count; ++l) {
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -477,7 +501,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             DEPTH_MIX_DECLINE("intermediate used outside the chain");
         }
     }
-    if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, outs, n_outs)) {
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_idx, ops, outs, n_outs)) {
         DEPTH_MIX_DECLINE("subgraph");
     }
     // an output may reuse the memory of the RMS_NORM output, which the separate CONCATs have consumed by then;
@@ -525,7 +549,9 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         p.scores = (float *) sm->data;            p.scores_s1 = sm->nb[1] / sizeof(float);      p.scores_s2 = sm->nb[2] / sizeof(float);
     }
     if (mm2) {
-        p.out = (float *) mm2->data;              p.out_s1 = mm2->nb[1] / sizeof(float);        p.out_s2 = mm2->nb[2] / sizeof(float);
+        p.out = (float *) mm2->data;              p.out_s2 = mm2->nb[2] / sizeof(float);
+        p.out_se = mm2_flipped ? mm2->nb[1] / sizeof(float) : 1;
+        p.out_sj = mm2_flipped ? 1 : mm2->nb[1] / sizeof(float);
     }
     p.ncols = ncols;
     p.n     = n;

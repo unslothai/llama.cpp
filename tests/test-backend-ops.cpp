@@ -4622,6 +4622,7 @@ struct test_depth_mix_fuse : public test_case {
     const bool extra_use;
     const bool plain; // the transposed rows as a CONT of the permuted plain rows instead of their own CONCAT
     const int prev_offs; // earlier rows as an F32 view at this float offset, with an odd row stride when > 0
+    const bool flipped; // the weighted sum as mul_mat(scores, states_t), out [nq, ncols, T]
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4634,12 +4635,12 @@ struct test_depth_mix_fuse : public test_case {
     double max_nmse_err() override { return 1e-6; }
 
     std::string vars() override {
-        return VARS_TO_STR7(ncols, n, nq, T, extra_use, plain, prev_offs);
+        return VARS_TO_STR8(ncols, n, nq, T, extra_use, plain, prev_offs, flipped);
     }
 
     test_depth_mix_fuse(int64_t ncols = 2304, int64_t n = 8, int64_t nq = 1, int64_t T = 1, bool extra_use = false, bool plain = false,
-            int prev_offs = 0)
-        : ncols(ncols), n(n), nq(nq), T(T), extra_use(extra_use), plain(plain), prev_offs(prev_offs) {}
+            int prev_offs = 0, bool flipped = false)
+        : ncols(ncols), n(n), nq(nq), T(T), extra_use(extra_use), plain(plain), prev_offs(prev_offs), flipped(flipped) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, 1, T);
@@ -4666,7 +4667,7 @@ struct test_depth_mix_fuse : public test_case {
         ggml_tensor * scores  = ggml_mul_mat(ctx, states, queries);
         scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(ncols), 0.0f);
 
-        ggml_tensor * out = ggml_mul_mat(ctx, states_t, scores);
+        ggml_tensor * out = flipped ? ggml_mul_mat(ctx, scores, states_t) : ggml_mul_mat(ctx, states_t, scores);
         if (extra_use) {
             out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_reshape_1d(ctx, states, ggml_nelements(states)), 0);
             out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, states_t, ggml_nelements(states_t)), 0);
@@ -10883,6 +10884,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // earlier rows as a view at an odd float offset with an odd row stride: no float2 loads from it
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 8, 1, 1, false, false, 1));
     test_cases.emplace_back(new test_depth_mix_fuse(1002, 9, 3, 77, false, true, 1));
+    // the weighted sum with the scores as src0 (out [nq, ncols, T]), both stack forms
+    for (int64_t T : { 1, 2, 3, 8, 77 }) {
+        for (bool plain : { false, true }) {
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 8,  1, T, false, plain, 0, true));
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 1, T, false, plain, 0, true));
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 3, T, false, plain, 0, true));
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 4, T, false, plain, 0, true));
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 10, 1, T, true,  plain, 0, true));
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, 20, 3, T, true,  plain, 0, true));
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 1, 512, false, false, 0, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(1002, 9,  3, 77,  false, true,  1, true));
     for (int64_t ncols : { 130, 1000, 1002, 6000 }) {
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 6, 1, 1, false));
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 7, 3, 3, true));
