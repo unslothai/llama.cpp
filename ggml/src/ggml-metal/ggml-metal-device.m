@@ -1882,6 +1882,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[0]->ne[0] != 64 && op->src[0]->ne[0] != 128) {
                     return false;
                 }
+                // causal without a mask (ggml_flash_attn_ext_banded_set_causal): the kernels do not mask the cells
+                // after each query, so this falls back to the CPU until they do
+                if (ggml_flash_attn_ext_banded_is_causal(op)) {
+                    return false;
+                }
                 // K/V cell and query positions (src[7], src[8]): the kernels take the distance from the cell index
                 if (op->src[7] || op->src[8]) {
                     return false;
