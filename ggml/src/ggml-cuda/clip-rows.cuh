@@ -13,3 +13,11 @@
 // limit (if not null) holds one value per row.
 void ggml_cuda_op_clip_rows_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
         const ggml_tensor * limit, float limit_value, float bias, float lo, float hi, ggml_tensor * dst);
+
+// The same clip written as an L2 norm, the chain
+//   c = x (* w)                                  (MUL, optional, w as above)
+//   y = scale*(c/max(|c|, eps)) + bias           (L2_NORM with eps, SCALE)
+// in one kernel, with the reduction and rounding of l2_norm_f32_cuda and scale_f32 for the same row length.
+// For a clip to threshold t the graph uses eps = scale = t, bias 0: y = t*c/max(|c|, t).
+void ggml_cuda_op_l2_clip_rows_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        float eps, float scale, float bias, ggml_tensor * dst);

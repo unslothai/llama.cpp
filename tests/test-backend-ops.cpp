@@ -4668,6 +4668,46 @@ struct test_clip_rows_fuse : public test_case {
     }
 };
 
+// The same row L2 clip written as an L2 norm: y = t*c/max(|c|, t), c = x (* w)
+// CUDA matches the chain [mul,] l2_norm, scale
+struct test_l2_clip_rows_fuse : public test_case {
+    const std::array<int64_t, 4> ne; // [D, H, T, 1]
+    const bool  with_w;
+    const float threshold; // large: rows with a norm below it pass unchanged
+    const bool  inplace_norm; // ggml_l2_norm_inplace: a view in the chain, must not fuse
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLIP_ROWS_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, with_w, threshold, inplace_norm);
+    }
+
+    test_l2_clip_rows_fuse(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_w = true, float threshold = 1.5f,
+                           bool inplace_norm = false)
+        : ne(ne), with_w(with_w), threshold(threshold), inplace_norm(inplace_norm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * c = x;
+        if (with_w) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(w, "w");
+            c = ggml_mul(ctx, x, w);
+        }
+        ggml_tensor * n = inplace_norm ? ggml_l2_norm_inplace(ctx, c, threshold) : ggml_l2_norm(ctx, c, threshold);
+        ggml_tensor * out = ggml_scale(ctx, n, threshold);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10847,6 +10887,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a one-column limit that is c = x*w itself is an intermediate of the chain: the chain must run unfused
     test_cases.emplace_back(new test_clip_rows_fuse({   1,  24,   7, 1}, true, false, false, false, true));
+    // the clip as an L2 norm and a scale: rows above the threshold (1.5) and below it (50, every row unchanged)
+    for (bool with_w : { true, false }) {
+        for (float threshold : { 1.5f, 50.0f }) {
+            test_cases.emplace_back(new test_l2_clip_rows_fuse({ 128,  24,   1, 1}, with_w, threshold));
+            test_cases.emplace_back(new test_l2_clip_rows_fuse({ 128,   8, 512, 1}, with_w, threshold));
+            test_cases.emplace_back(new test_l2_clip_rows_fuse({  16,  24,  33, 1}, with_w, threshold));
+            test_cases.emplace_back(new test_l2_clip_rows_fuse({1100,   3,   5, 1}, with_w, threshold));
+        }
+        // an in-place l2_norm makes the chain hold a view: the chain must run unfused
+        test_cases.emplace_back(new test_l2_clip_rows_fuse({ 128,  24,   7, 1}, with_w, 1.5f, true));
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {

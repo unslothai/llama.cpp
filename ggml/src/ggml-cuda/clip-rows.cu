@@ -76,3 +76,63 @@ void ggml_cuda_op_clip_rows_fused(ggml_backend_cuda_context & ctx, const ggml_te
             ncols, w_rows, limit_value, bias, lo, hi);
     }
 }
+
+// one block per row; the same loop, reduction and rounding as l2_norm_f32 (norm.cu) and scale_f32 (scale.cu) for this
+// block size, so the result matches L2_NORM then SCALE run as separate ops
+template <int block_size, bool has_w>
+static __global__ void l2_clip_rows_f32(const float * __restrict__ x, const float * __restrict__ w,
+        float * __restrict__ dst, const int ncols, const int w_rows, const float eps, const float scale, const float bias) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    const float * xr = x + row*ncols;
+    const float * wr = has_w ? w + int64_t(row % w_rows)*ncols : nullptr;
+
+    auto value = [&](int i) {
+        return has_w ? __fmul_rn(xr[i], wr[i]) : xr[i];
+    };
+
+    __shared__ float s_sum[32];
+
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = value(col);
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    const float rs = rsqrtf(fmaxf(tmp, eps * eps));
+    for (int col = tid; col < ncols; col += block_size) {
+        const float y = rs * value(col);
+        dst[row*ncols + col] = scale * y + bias;
+    }
+}
+
+void ggml_cuda_op_l2_clip_rows_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        float eps, float scale, float bias, ggml_tensor * dst) {
+    const int     ncols  = x->ne[0];
+    const int64_t nrows  = ggml_nrows(x);
+    const float * w_d    = w ? (const float *) w->data : nullptr;
+    const int     w_rows = w ? (int) ggml_nrows(w) : 1;
+    const float * x_d    = (const float *) x->data;
+    float       * dst_d  = (float *) dst->data;
+
+    // the block size of l2_norm_f32_cuda for this row length
+    if (ncols < 1024) {
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(WARP_SIZE, 1, 1), 0, ctx.stream());
+        if (w) {
+            ggml_cuda_kernel_launch(l2_clip_rows_f32<WARP_SIZE, true>,  lp, x_d, w_d, dst_d, ncols, w_rows, eps, scale, bias);
+        } else {
+            ggml_cuda_kernel_launch(l2_clip_rows_f32<WARP_SIZE, false>, lp, x_d, w_d, dst_d, ncols, w_rows, eps, scale, bias);
+        }
+    } else {
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(1024, 1, 1), 0, ctx.stream());
+        if (w) {
+            ggml_cuda_kernel_launch(l2_clip_rows_f32<1024, true>,  lp, x_d, w_d, dst_d, ncols, w_rows, eps, scale, bias);
+        } else {
+            ggml_cuda_kernel_launch(l2_clip_rows_f32<1024, false>, lp, x_d, w_d, dst_d, ncols, w_rows, eps, scale, bias);
+        }
+    }
+}
