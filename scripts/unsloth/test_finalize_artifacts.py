@@ -154,7 +154,10 @@ def evaluate(expr: str, ctx: dict) -> bool:
 def finalize(published: str, attempt: int, tsv: str, event: str = "schedule", keep_req: bool = False) -> dict:
     """Which Finalize steps run, and whether the job ends red."""
     ctx = {"steps.wait.outputs.published": published, "needs.resolve.outputs.exists": "false",
-           "github.event_name": event, "inputs.publish": event != "schedule", "inputs.keep_artifacts": keep_req}
+           "github.event_name": event, "inputs.publish": event != "schedule", "inputs.keep_artifacts": keep_req,
+           # The base-tag fallback alert's condition; it only reports, so it never changes what Finalize deletes.
+           "needs.resolve.result": "success", "inputs.tag": "" if event == "schedule" else "latest",
+           "needs.resolve.outputs.base_fallback": ""}
     ran = []
     for s in STEPS:
         cond = s.get("if")
