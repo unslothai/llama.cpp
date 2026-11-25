@@ -9,6 +9,13 @@
 #include <algorithm>
 #include <cmath>
 
+// vendors/hip.h maps only cudaStreamCaptureModeRelaxed of the capture API (vendors/musa.h maps these three as well)
+#if defined(GGML_USE_HIP) && !defined(cudaStreamIsCapturing)
+#define cudaStreamCaptureStatus     hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing       hipStreamIsCapturing
+#endif
+
 #define DEPTH_MIX_BLOCK 1024
 #define DEPTH_MIX_MAX_N 32
 #define DEPTH_MIX_MAX_NQ 3
