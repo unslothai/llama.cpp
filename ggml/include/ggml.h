@@ -2286,6 +2286,13 @@ extern "C" {
             struct ggml_tensor * k_pos,
             struct ggml_tensor * q_pos);
 
+    // causal banded attention without a mask: a cell is visible to a query iff its distance (the cell distance, or
+    //   q_pos - k_pos with the positions, -1 for an empty cell) is >= 0; the op must have no mask. This is the causal
+    //   mask of one sequence whose cells are its positions, or, with the positions, of a cache that holds one sequence
+    GGML_API void ggml_flash_attn_ext_banded_set_causal(
+            struct ggml_tensor * a,
+            bool                 causal);
+
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]
     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices

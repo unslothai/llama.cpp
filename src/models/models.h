@@ -2583,6 +2583,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * mask_banded[2] = { nullptr, nullptr };
         // I32 [n_tokens] query positions of the banded attention, used when it takes the cell positions
         ggml_tensor * q_pos_banded = nullptr;
+        // one sequence in the cache: the full-attention layers take the causal mask from the distances, no mask input
+        bool banded_causal = false;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;

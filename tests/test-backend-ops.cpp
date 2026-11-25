@@ -11515,6 +11515,23 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// banded attention without a mask, causal by the sign of the distance (ggml_flash_attn_ext_banded_set_causal)
+struct test_flash_attn_ext_banded_causal : public test_flash_attn_ext_banded_sinks {
+    test_flash_attn_ext_banded_causal(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            ggml_type kv_type, int sinks, bool strided = false)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 0, kv_type, GGML_TYPE_F32, sinks, strided) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",causal=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded_sinks::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_causal(out, true);
+        return out;
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -14364,6 +14381,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 3, 4096, 1280, 3, kt, GGML_TYPE_F32, 2, true, vt));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2, 3, 1000,    8, 1, kt, GGML_TYPE_F32, 2, false, vt));
     }
+    // causal without a mask (a cache of one sequence): decode, small, scalar, split and tensor-core shapes, every cache type
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
+        for (int64_t n_q : { 1, 3, 17, 64, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128, 24, 8, n_q, 4096, 1280, kv_type, 2));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal( 64,  8, 2,  77,  1000,    8, kv_type, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 1, 511, 16403, 1024, kv_type, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 2,  65,   333,   32, kv_type, 2, true));
+    }
+
     // Inkling-2-Small shapes
     for (int64_t n_q : { 1, 3, 8, 512 }) {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, n_q, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));

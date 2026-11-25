@@ -14,6 +14,15 @@ static constexpr int64_t n_tokens_banded_min = 32;
 // the banded attention takes the distances from the positions when the cells are not the positions
 // (several sequences in a unified cache, a wrapped SWA cache); LLAMA_INKLING_BANDED_POS=0 keeps those dense,
 // =2 takes the positions for every banded ubatch (a check: the cells that are the positions give the same result)
+// LLAMA_INKLING_BANDED_CAUSAL=0 keeps the mask input of the full-attention layers when the cache holds one sequence
+static bool inkling2_banded_causal_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_INKLING_BANDED_CAUSAL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static int inkling2_banded_pos_mode() {
     static const int mode = [] {
         const char * env = getenv("LLAMA_INKLING_BANDED_POS");
@@ -420,6 +429,13 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
         }
     }
 
+    // a cache of one sequence: a cell is visible iff its distance to the query is not negative (empty cells have no
+    // position), so the full-attention layers need no mask, an n_kv x n_tokens F16 input (1 GiB at 1M cells and 512
+    // tokens, on the host and on the device); padded spans without the positions measure the distance from the padded
+    // tail, they keep it
+    banded_causal = inp->banded && cparams.n_seq_max == 1 && cparams.causal_attn && inp->n_kv_banded[0] > 0 && n_tokens <= 65535 &&
+        (inp->self_k_pos[0] || !inp->banded_pad) && inkling2_banded_causal_enabled();
+
     ggml_tensor * inp_pos = build_inp_pos();
     // the query positions of the banded attention
     q_pos_banded = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
@@ -572,12 +588,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
-            ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-            // one banded mask per graph and cache, the first n_kv_b cells of each row read in place
-            ggml_tensor *& m = mask_banded[is_swa];
-            if (!m) {
-                m = ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0);
+            // the causal attention without a mask runs on the CUDA and CPU kernels only
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+            const bool causal = !is_swa && banded_causal && (strcmp(reg, "CUDA") == 0 || strcmp(reg, "CPU") == 0);
+            ggml_tensor * m = nullptr;
+            if (!causal) {
+                ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+                // one banded mask per graph and cache, the first n_kv_b cells of each row read in place
+                ggml_tensor *& mb = mask_banded[is_swa];
+                if (!mb) {
+                    mb = ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0);
+                }
+                m = mb;
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
             ggml_tensor * rel_bias = layer.attn_rel_bias;
@@ -591,6 +615,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
             if (inp->self_k_pos[is_swa]) {
                 ggml_flash_attn_ext_banded_set_pos(cur, inp->self_k_pos[is_swa], q_pos_banded);
+            }
+            if (causal) {
+                ggml_flash_attn_ext_banded_set_causal(cur, true);
             }
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
