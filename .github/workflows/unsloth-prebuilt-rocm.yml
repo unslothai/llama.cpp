@@ -796,6 +796,8 @@ jobs:
         name: app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}
         path: dist/app-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip
         if-no-files-found: error
+        # Artifacts persist across attempts: a rerun of a leg that uploaded and then failed must not 409 on its own bundle.
+        overwrite: true
 
     # ROCm is the first backend here to run device code through ccache, so log
     # the hit rate: a non-zero "unsupported source language" would mean the
@@ -1350,6 +1352,8 @@ jobs:
         name: app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}
         path: dist/app-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz
         if-no-files-found: error
+        # Artifacts persist across attempts: a rerun of a leg that uploaded and then failed must not 409 on its own bundle.
+        overwrite: true
 
     # See the Windows job: logs whether the HIP-language TUs actually cache.
     - name: ccache stats

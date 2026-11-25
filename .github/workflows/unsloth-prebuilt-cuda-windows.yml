@@ -431,6 +431,8 @@ jobs:
           name: app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
           path: dist/app-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
           if-no-files-found: error
+          # Artifacts persist across attempts: a rerun of a leg that uploaded and then failed must not 409 on its own bundle.
+          overwrite: true
 
       - name: Evict stale ccache files
         if: ${{ !cancelled() }}

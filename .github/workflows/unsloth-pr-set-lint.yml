@@ -25,6 +25,7 @@ on:
       - scripts/unsloth/slim_source_archive.sh
       - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
+      - scripts/unsloth/finalize_artifacts.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
@@ -48,6 +49,7 @@ on:
       - scripts/unsloth/slim_source_archive.sh
       - scripts/unsloth/link_bundle_copies.sh
       - scripts/unsloth/wait_for_jobs.sh
+      - scripts/unsloth/finalize_artifacts.py
       - scripts/unsloth/test_*.py
       - scripts/unsloth/check_workflow_scalars.py
       - scripts/unsloth/check_workflow_triggers.py
@@ -168,6 +170,7 @@ jobs:
                    scripts/unsloth/test_feature_matrix.py \
                    scripts/unsloth/test_check_workflow_triggers.py \
                    scripts/unsloth/test_check_workflow_network_retries.py \
+                   scripts/unsloth/test_finalize_artifacts.py \
                    scripts/unsloth/test_relocate_kpack.py \
                    scripts/unsloth/test_slim_source_archive.py \
                    scripts/unsloth/test_link_bundle_copies.py \

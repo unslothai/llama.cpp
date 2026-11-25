@@ -1239,6 +1239,9 @@ jobs:
       actions: write   # prune caches, delete this run's artifacts, read the jobs list
       contents: read   # read the release asset list
       issues: write    # the health report
+    env:
+      # An unpublished run keeps its artifacts for `gh run rerun --failed` on attempts below this one.
+      RERUN_MAX_ATTEMPT: '3'
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
@@ -1277,6 +1280,29 @@ jobs:
           echo "wait_rc=${rc:-0}" >> "$GITHUB_OUTPUT"
           echo "published=$published"
           echo "published=$published" >> "$GITHUB_OUTPUT"
+
+      # Run 45410618008: a Chocolatey 504 failed one leg, this job deleted every artifact, and the
+      # automatic rerun of that leg died on the missing app-source-*. See finalize_artifacts.py.
+      - name: Decide whether a rerun of the failed jobs still needs the artifacts
+        id: keep
+        if: ${{ steps.wait.outputs.published == 'false' }}
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+          KEEP_REQUESTED: ${{ inputs.keep_artifacts == true }}
+        run: |
+          set -euo pipefail
+          out="$(python3 scripts/unsloth/finalize_artifacts.py --jobs "$RUNNER_TEMP/jobs.tsv" \
+                   --attempt "$ATTEMPT" --max-attempt "$RERUN_MAX_ATTEMPT" --keep-requested "$KEEP_REQUESTED")"
+          printf '%s\n' "$out"
+          rerun="$(sed -n 's/^rerun=//p' <<<"$out")"
+          keep="$(sed -n 's/^keep=//p' <<<"$out")"
+          [ "$rerun" = true ] || [ "$rerun" = false ] || { echo "bad rerun='$rerun'" >&2; exit 1; }
+          [ "$keep" = true ] || [ "$keep" = false ] || { echo "bad keep='$keep'" >&2; exit 1; }
+          echo "rerun=$rerun" >> "$GITHUB_OUTPUT"
+          echo "keep=$keep" >> "$GITHUB_OUTPUT"
+          if [ "$keep" = true ]; then
+            echo "### Artifacts kept: $(sed -n 's/^reason=//p' <<<"$out")" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Delete artifacts already published as release assets
         if: ${{ steps.wait.outputs.published == 'true' }}
@@ -1361,16 +1387,14 @@ jobs:
       - name: Delete artifacts of a run that published nothing
         # The other step's name-match against release assets is meaningless
         # here: either no release was written, or the tag belongs to a DIFFERENT
-        # run's release. So the rule is simply that nothing will ever consume
-        # these -- a publish:false dispatch is a test, and a cancelled or failed
-        # run is not resumable past the missing legs -- and they are deleted.
-        #
-        # Accepted: unsloth-prebuilt-retry.yml can rerun a cancelled run whose
-        # artifacts this step deleted. That rerun fails loudly at assemble's
-        # coverage gate rather than publishing a partial set, which is the
-        # failure mode this pipeline already prefers. Pass keep_artifacts:true
-        # on a dispatch whose bundles you intend to download by hand.
-        if: ${{ steps.wait.outputs.published == 'false' && inputs.keep_artifacts != true }}
+        # run's release. So this deletes outright, but only once the `keep` step
+        # has found nothing left to retry (resolve failed, no job failed or was
+        # cancelled, or the last kept attempt). A run with a failed or cancelled
+        # job keeps everything so `gh run rerun --failed` can finish it; a
+        # missing or broken decision also keeps, since `keep` must read 'false'.
+        # Pass keep_artifacts:true on a dispatch whose bundles you intend to
+        # download by hand.
+        if: ${{ steps.wait.outputs.published == 'false' && steps.keep.outputs.keep == 'false' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1482,3 +1506,12 @@ jobs:
           title: 'Nightly llama.cpp prebuilt is failing'
           details: ${{ steps.s.outputs.details }}
           token: ${{ github.token }}
+
+      # Last, so the report above runs first. A green Finalize is not rerun by
+      # `gh run rerun --failed` (it needs only resolve), and then the rerun's
+      # publish is never reclaimed and attempt 1's alert never clears.
+      - name: Fail so a rerun of the failed jobs reruns Finalize too
+        if: ${{ always() && steps.keep.outputs.rerun == 'true' }}
+        run: |
+          echo "::error::nothing was published; this run's artifacts are kept for \`gh run rerun $GITHUB_RUN_ID --failed\` (attempt $GITHUB_RUN_ATTEMPT of $RERUN_MAX_ATTEMPT), and Finalize fails so that rerun includes it"
+          exit 1
