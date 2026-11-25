@@ -11780,6 +11780,76 @@ struct test_flash_attn_ext_banded_causal : public test_flash_attn_ext_banded_sin
     }
 };
 
+// the causal attention without a mask over cell positions (a cache of one sequence: padded spans, decode-banded steps,
+// the reserve graph): a cell is visible iff its position is not -1 and not after the query's. One sequence with a few
+// empty cells, a gap of positions, empty cells after the queries and two cells of later positions
+struct test_flash_attn_ext_banded_causal_pos : public test_flash_attn_ext_banded_pos {
+    test_flash_attn_ext_banded_causal_pos(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            ggml_type kv_type)
+        : test_flash_attn_ext_banded_pos(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 3, 1, 0, kv_type, GGML_TYPE_F32) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_pos::vars() + ",causal=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, v_type,  d, n_kv, n_head_kv, 1);
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_q);
+        ggml_tensor * kp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * qp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(r, "rel_logits");
+        ggml_set_name(s, "sinks");
+        ggml_set_name(kp, "k_pos");
+        ggml_set_name(qp, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, nullptr, r, 1.0f/float(d), rel_extent);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_banded_set_pos(out, kp, qp);
+        ggml_flash_attn_ext_banded_set_causal(out, true);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // the queries are cells [q0, q0 + n_q); cell j < q0 + n_q holds position j, plus 9 from n_kv/2 on (a gap), every
+        // 13th cell before the queries is empty; after the queries two cells of later positions, then empty cells
+        const int64_t q0 = n_kv - n_q - 4;
+        std::vector<int32_t> k_pos(n_kv, -1);
+        std::vector<int32_t> q_pos(n_q);
+        auto pos_of = [&](int64_t j) { return int32_t(j + (j >= n_kv/2 ? 9 : 0)); };
+        for (int64_t j = 0; j < q0 + n_q; ++j) {
+            if (j % 13 != 7 || j >= q0) {
+                k_pos[j] = pos_of(j);
+            }
+        }
+        k_pos[q0 + n_q + 0] = pos_of(q0 + n_q) + 3;
+        k_pos[q0 + n_q + 1] = pos_of(q0 + n_q) + 4;
+        for (int64_t i = 0; i < n_q; ++i) {
+            q_pos[i] = pos_of(q0 + i);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "k_pos") == 0) {
+                ggml_backend_tensor_set(t, k_pos.data(), 0, k_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, q_pos.data(), 0, q_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -14637,6 +14707,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_causal( 64,  8, 2,  77,  1000,    8, kv_type, 1));
         test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 1, 511, 16403, 1024, kv_type, 2));
         test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 2,  65,   333,   32, kv_type, 2, true));
+    }
+    // causal without a mask over cell positions: decode (vec), MMA and split shapes
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 17, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, n_q, n_q == 512 ? 2048 : 1000, 1280, kv_type));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(64, 8, 2, 17, 700, 64, kv_type));
+    }
+    // K/V the MMA kernel does not read take the split kernel
+    for (ggml_type kv_type : { GGML_TYPE_F32, GGML_TYPE_Q5_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, 17, 1000, 1280, kv_type));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, 300, 1000, 1280, kv_type));
     }
 
     // Inkling-2-Small shapes

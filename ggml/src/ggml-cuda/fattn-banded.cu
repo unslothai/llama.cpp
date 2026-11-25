@@ -1212,7 +1212,8 @@ static __device__ __forceinline__ void fattn_banded_mma_issue_tile_q(
         const int c   = i*nthreads + threadIdx.x;
         const int row = c / chunks;
         const int col = (c % chunks)*8;
-        r.q[i] = make_uint2(0, 0);
+        // zero quants (byte 0 for q8_0, nibble 8 for q4_0) and a zero scale store +0, as the one-step load does
+        r.q[i] = type_kv == GGML_TYPE_Q8_0 ? make_uint2(0u, 0u) : make_uint2(0x88888888u, 0x88888888u);
         r.d[i] = __float2half(0.0f);
         if (kv0 + row < n_kv) {
             const char * s = src + uint64_t(kv0 + row)*nb1;
@@ -1427,11 +1428,18 @@ static __global__ void flash_attn_ext_banded_mma(
 
     const int64_t n_kt     = (n_kv + BK - 1)/BK;
     const int64_t kt_begin = ic*tiles_per_chunk;
-    const int64_t kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
+    int64_t       kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
 
     const int64_t iq_w = qt*BQ + warp*16;
     const int64_t iq_r[2] = {iq_w + g, iq_w + g + 8};
     const int64_t q_offset = n_kv - n_q;
+
+    // causal without a mask and with cell distances: the tiles after the last cell the last query of this block sees
+    // are masked whole, skip them (with positions the cells are not in order)
+    if (causal && !k_pos) {
+        const int64_t last = ((qt + 1)*BQ < n_q ? (qt + 1)*BQ : n_q) - 1 + q_offset;
+        kt_end = last < 0 ? kt_begin : (last/BK + 1 < kt_end ? last/BK + 1 : kt_end);
+    }
 
     const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
     const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
@@ -1718,6 +1726,12 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     return false;
 #else
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return false;
+    }
+
+    // the causal attention without a mask runs in the decode, MMA or split kernel; the split kernel puts the queries of
+    // all streams on grid z (at most 65535), so larger ubatches are left to another backend rather than abort
+    if (ggml_flash_attn_ext_banded_is_causal(dst) && dst->src[0] && dst->src[0]->ne[1]*dst->src[0]->ne[3] > 65535) {
         return false;
     }
 
