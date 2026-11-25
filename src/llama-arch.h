@@ -498,6 +498,7 @@ enum llm_kv {
     LLM_KV_DFLASH_CONV_GROUP_SIZE,
     LLM_KV_DFLASH_SELECTOR_RANK,
     LLM_KV_DFLASH_SELECTOR_TOP_K,
+    LLM_KV_DFLASH_HAS_MARKOV_CONTEXT,
     LLM_KV_LILICORR_HIDDEN_SIZE,
     LLM_KV_LILICORR_CANDIDATE_TOPK,
     LLM_KV_LILICORR_NUM_HEADS,
@@ -1048,3 +1049,4 @@ bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);
+bool llm_arch_mmid_down_bf16(const llm_arch & arch);

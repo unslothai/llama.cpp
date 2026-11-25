@@ -41,7 +41,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     if (has_markov) {
         variant = VARIANT_DSPARK;
-        hparams.dspark_f_rnn = ml.get_tensor_meta("markov_ctx_norm.weight") != nullptr;
+        ml.get_key(LLM_KV_DFLASH_HAS_MARKOV_CONTEXT, hparams.dspark_f_rnn, false);
+        if (!hparams.dspark_f_rnn && ml.get_tensor_meta("markov_ctx_norm.weight")) {
+            throw std::runtime_error("DSpark model has 'markov_ctx_norm.weight' but 'has_markov_context' is not true in GGUF metadata");
+        }
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
     } else if (has_lilicorr) {
@@ -391,7 +394,7 @@ void llama_model_dflash::graph_base::store_inject_kv(ggml_tensor * Kcur, ggml_te
 // KV cache injection
 ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     // drafts without fc: each layer mixes the raw target features itself
-    if (!model.fc && !model.dspark_fuse) {
+    if (!model.fc && model.layers[0].dflash_ctx_mix) {
         build_inject_ctx_mix();
         return nullptr;
     }
@@ -497,40 +500,11 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
     return inp_tokens;
 }
 
-// DSpark block [anchor, mask_1, ..., mask_k] per sequence: slot k > 0 uses mask row k - 1, the anchor uses its (normed) token embedding
-ggml_tensor * llama_model_dflash::graph_base::build_inp_block(ggml_tensor * inp_tokens) {
-    ggml_tensor * tok_embd = get_tok_embd(*this, model);
-
-    const int64_t n_blocks     = ubatch.n_seqs_unq;
-    const int64_t block_drafts = n_blocks > 0 ? n_tokens / n_blocks : 0;
-
-    if (block_drafts == 0 || n_tokens % n_blocks != 0 || block_drafts > (int64_t) hparams.dflash_block_size) {
-        // not a draft block (e.g. graph reserve)
-        return ggml_get_rows(ctx0, tok_embd, inp_tokens);
-    }
-
-    ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
-    anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
-    if (model.tok_norm) {
-        anchors = build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
-    }
-
-    ggml_tensor * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
-    if (block_drafts > 1) {
-        ggml_tensor * masks = ggml_view_3d(ctx0, model.dspark_mask_embd, n_embd, block_drafts - 1, 1,
-                model.dspark_mask_embd->nb[1], model.dspark_mask_embd->nb[2], 0);
-        masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, masks, GGML_TYPE_F32), n_embd, block_drafts - 1, n_blocks, 1);
-        cur = ggml_concat(ctx0, cur, masks, 1);
-    }
-
-    return ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
-}
-
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
     ggml_tensor * inpL = model.dspark_fuse      ? build_inkling2_embd(inp_tokens) :
-                         model.dspark_mask_embd ? build_inp_block(inp_tokens) :
+                         model.dspark_mask_embd ? build_dspark_inp_block(*this, model, inp_tokens) :
                                                   ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
