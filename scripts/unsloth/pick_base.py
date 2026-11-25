@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -212,9 +213,18 @@ def main() -> int:
     first = cands[0][0]
     log(f"pick_base: candidates {' '.join(c[0] for c in cands)} (floor b{floor if floor is not None else '?'})")
 
+    # Every trial checks out another tree with --force, so tracked edits would be lost: refuse them up front.
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+    if dirty:
+        ap.error(f"{repo} has uncommitted changes to tracked files; commit them or run in a clean clone")
     orig = git(repo, "rev-parse", "HEAD").stdout.strip()
     tmp = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"pick_base_{os.getpid()}"
     tmp.mkdir(parents=True, exist_ok=True)
+    # The trials check out upstream trees that lack scripts/unsloth/, so run the helpers from a copy.
+    global HERE
+    helpers = tmp / "helpers"
+    shutil.copytree(HERE, helpers, dirs_exist_ok=True)
+    HERE = helpers
     refused: list[dict] = []
     chosen = None
     try:

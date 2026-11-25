@@ -183,6 +183,17 @@ def main():
                         "--candidates", f"b9={b4}", "b3", "--note", str(tmp / "n")],
                        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(tmp), "HOME": str(tmp)})
     check("--candidates NAME=REF dry run", p.stdout.strip() == "b3" and "b9 refused" in (tmp / "n").read_text(), p.stderr)
+
+    # A checkout with edits to tracked files is refused before any trial, and the edits survive.
+    tracked = git(repo, "ls-files").split()[0]
+    before = (repo / tracked).read_text()
+    (repo / tracked).write_text(before + "local edit\n")
+    p = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(repo), "--prs-json", json.dumps(prs),
+                        "--candidates", "b5", "b3"],
+                       capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(tmp), "HOME": str(tmp)})
+    check("dirty tracked files are refused and kept", p.returncode != 0 and "uncommitted changes" in p.stderr
+          and (repo / tracked).read_text() == before + "local edit\n", p.stderr)
+    (repo / tracked).write_text(before)
     check("checkout restored after a dry run", restored(repo, head))
 
     # The workflow side of strictness: an explicit tag defaults to 0 (strict), "latest" to the env depth, and the
