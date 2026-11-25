@@ -23,6 +23,7 @@
 
 #if defined(__x86_64__) && defined(__GLIBC__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+#include <cfenv>
 #define LLAMA_SAMPLER_EXPF4 1
 #endif
 
@@ -370,30 +371,32 @@ static void llama_expf4_logits(const llama_token_data * data, size_t n, float ma
 }
 
 // whether llama_expf4 gives the bits of this process's expf: the CPU has AVX2 and FMA, and a sample of the inputs the softmax sees (every 2053rd float in [-104, 0], and the edges) agrees; every float was checked against glibc 2.39
+// the sample underflows, so it runs once with the FP environment saved and all exceptions masked: caller traps and flags stay as they were
+__attribute__((noinline))
+static bool llama_sampler_expf4_probe() {
+    std::vector<llama_token_data> d;
+    for (uint32_t u = 0x80000000u; u <= 0xc2d00000u; u += 2053) {
+        float x;
+        memcpy(&x, &u, sizeof(x));
+        d.push_back({0, x, 0.0f});
+    }
+    for (float x : { 0.0f, -0.0f, -87.99f, -88.0f, -88.72f, -103.0f, -103.97f, -104.0f, -1e-30f, -INFINITY }) {
+        d.push_back({0, x, 0.0f});
+    }
+    std::vector<float> p(d.size());
+    std::vector<float> ref(d.size());
+    fenv_t env;
+    feholdexcept(&env);
+    llama_expf4_logits(d.data(), d.size(), 0.0f, p.data());
+    for (size_t i = 0; i < d.size(); ++i) {
+        ref[i] = expf(d[i].logit - 0.0f);
+    }
+    fesetenv(&env);
+    return memcmp(ref.data(), p.data(), p.size()*sizeof(float)) == 0;
+}
+
 static bool llama_sampler_expf4_ok() {
-    static const bool ok = [] {
-        if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
-            return false;
-        }
-        std::vector<llama_token_data> d;
-        for (uint32_t u = 0x80000000u; u <= 0xc2d00000u; u += 2053) {
-            float x;
-            memcpy(&x, &u, sizeof(x));
-            d.push_back({0, x, 0.0f});
-        }
-        for (float x : { 0.0f, -0.0f, -87.99f, -88.0f, -88.72f, -103.0f, -103.97f, -104.0f, -1e-30f, -INFINITY }) {
-            d.push_back({0, x, 0.0f});
-        }
-        std::vector<float> p(d.size());
-        llama_expf4_logits(d.data(), d.size(), 0.0f, p.data());
-        for (size_t i = 0; i < d.size(); ++i) {
-            const float ref = expf(d[i].logit - 0.0f);
-            if (memcmp(&ref, &p[i], sizeof(float)) != 0) {
-                return false;
-            }
-        }
-        return true;
-    }();
+    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && llama_sampler_expf4_probe();
     return ok;
 }
 #endif

@@ -133,8 +133,8 @@ static std::string dist_dump() {
 }
 
 #ifdef TEST_DIST_FP_TRAPS
-static std::string run_self(const std::string & self, const char * env) {
-    const std::string cmd = std::string(env) + " '" + self + "' --dist-dump";
+static std::string run_self(const std::string & self, const char * env, const char * mode = "--dist-dump") {
+    const std::string cmd = std::string(env) + " '" + self + "' " + mode;
     FILE * f = popen(cmd.c_str(), "r");
     GGML_ASSERT(f != nullptr);
     std::string out;
@@ -170,6 +170,12 @@ static void test_dist_fp_traps() {
     if (getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") == nullptr) {
         GGML_ASSERT(in_process == fast);
     }
+
+    // with FE_UNDERFLOW traps on, dist on logits whose expf does not underflow must not raise SIGFPE either
+    const std::string uf_fast = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST", "--dist-underflow");
+    const std::string uf_ref  = run_self(self, "env LLAMA_SAMPLER_DISABLE_FAST_DIST=1", "--dist-underflow");
+    GGML_ASSERT(!uf_fast.empty());
+    GGML_ASSERT(uf_fast == uf_ref);
     printf("%s: OK\n", __func__);
 #endif
 }
@@ -424,6 +430,18 @@ int main(int argc, char ** argv) {
         feenableexcept(FE_INVALID);
 #endif
         fputs(dist_dump().c_str(), stdout);
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--dist-underflow") {
+#ifdef TEST_DIST_FP_TRAPS
+        feenableexcept(FE_UNDERFLOW | FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+#endif
+        llama_sampler * smpl = llama_sampler_init_dist(1234);
+        std::vector<llama_token_data> cur = { { 0, 0.0f, 0.0f }, { 1, 0.0f, 0.0f } };
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(smpl, &cur_p);
+        printf("s%d %a %a\n", cur_p.data[cur_p.selected].id, cur_p.data[0].p, cur_p.data[1].p);
+        llama_sampler_free(smpl);
         return 0;
     }
 
