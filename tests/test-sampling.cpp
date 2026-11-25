@@ -152,8 +152,7 @@ static std::string run_self(const std::string & self, const char * env) {
 }
 #endif
 
-// -inf logits with FE_INVALID traps on must not raise SIGFPE in dist, and the fast dist path gives the bits of the
-// reference path (each run in a child process, since the switch is read once per process)
+// -inf logits with FE_INVALID traps on must not raise SIGFPE in dist, and the fast dist path gives the bits of the reference path (each run in a child process, since the switch is read once per process)
 static void test_dist_fp_traps() {
 #ifdef TEST_DIST_FP_TRAPS
     feenableexcept(FE_INVALID);

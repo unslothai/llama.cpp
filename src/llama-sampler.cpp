@@ -268,9 +268,8 @@ static void llama_log_softmax(float * array, size_t size) {
 }
 */
 
-// the max logit as the loop `max_l = std::max(max_l, data[i].logit)` over i = 1 .. size - 1 returns it, from 8
-// independent running maxima: (a < b ? b : a) skips a NaN like the loop does, a NaN at data[0] stays the result, and
-// equal non-NaN floats are the same bits except +0 and -0, so a zero result is recomputed with the loop
+// the max logit as the loop `max_l = std::max(max_l, data[i].logit)` over i = 1 .. size - 1 returns it, from 8 independent running maxima
+// (a < b ? b : a) skips a NaN like the loop does, a NaN at data[0] stays the result, and equal non-NaN floats are the same bits except +0 and -0, so a zero result is recomputed with the loop
 static float llama_token_data_max_logit(const llama_token_data * data, size_t size) {
     static const bool disabled = getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") != nullptr;
     float max_l = data[0].logit;
@@ -307,10 +306,9 @@ static float llama_token_data_max_logit(const llama_token_data * data, size_t si
 }
 
 #ifdef LLAMA_SAMPLER_EXPF4
-// glibc's expf (sysdeps/ieee754/flt-32/e_expf.c, the FMA variant its ifunc picks on x86-64 with AVX2 and FMA) for 4
-// floats: the same double operations with the same constants and table, so the same bits. Lanes with |x| >= 88 or NaN
-// (special) are left to expf, and the vector path sees 0 for them so it raises no FP exception expf would not. It is
-// used only when this matches the expf of the process (llama_sampler_expf4_ok).
+// glibc's expf (sysdeps/ieee754/flt-32/e_expf.c, the FMA variant its ifunc picks on x86-64 with AVX2 and FMA) for 4 floats: the same double operations with the same constants and table, so the same bits.
+// Lanes with |x| >= 88 or NaN (special) are left to expf, and the vector path sees 0 for them so it raises no FP exception expf would not.
+// It is used only when this matches the expf of the process (llama_sampler_expf4_ok).
 static const uint64_t llama_exp2f_tab[32] = {
     0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
     0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
@@ -327,9 +325,7 @@ static inline __m128 llama_expf4(__m128 x, int & special) {
     const __m128i abstop = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(x), 20), _mm_set1_epi32(0x7ff));
     const __m128 smask = _mm_castsi128_ps(_mm_cmpgt_epi32(abstop, _mm_set1_epi32(0x42a)));
     special = _mm_movemask_ps(smask);
-    // special lanes (-inf from masking, inf, NaN, |x| >= 88) are computed on 0 instead: their results are replaced
-    // by expf of the original input, and on -inf the range reduction would compute -inf - -inf, raising FE_INVALID
-    // where expf(-inf) raises nothing
+    // special lanes (-inf from masking, inf, NaN, |x| >= 88) are computed on 0 instead: their results are replaced by expf of the original input, and on -inf the range reduction would compute -inf - -inf, raising FE_INVALID where expf(-inf) raises nothing
     x = _mm_blendv_ps(x, _mm_setzero_ps(), smask);
 
     const __m256d xd  = _mm256_cvtps_pd(x);
@@ -373,8 +369,7 @@ static void llama_expf4_logits(const llama_token_data * data, size_t n, float ma
     }
 }
 
-// whether llama_expf4 gives the bits of this process's expf: the CPU has AVX2 and FMA, and a sample of the inputs the
-// softmax sees (every 2053rd float in [-104, 0], and the edges) agrees; every float was checked against glibc 2.39
+// whether llama_expf4 gives the bits of this process's expf: the CPU has AVX2 and FMA, and a sample of the inputs the softmax sees (every 2053rd float in [-104, 0], and the edges) agrees; every float was checked against glibc 2.39
 static bool llama_sampler_expf4_ok() {
     static const bool ok = [] {
         if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
@@ -1329,10 +1324,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     }
 
     if (!fast_disabled) {
-        // the same arithmetic as the two passes below in fewer steps: the running sum of the selection pass is the
-        // running sum of the softmax pass (the same double additions in the same order), so the softmax pass keeps it
-        // at every DIST_PREFIX_BLOCK-th candidate, the selection searches those (they never decrease) and rescans one
-        // block, and the normalization is a loop of its own
+        // the same arithmetic as the two passes below in fewer steps: the running sum of the selection pass is the running sum of the softmax pass (the same double additions in the same order), so the softmax pass keeps it at every DIST_PREFIX_BLOCK-th candidate, the selection searches those (they never decrease) and rescans one block, and the normalization is a loop of its own
         constexpr size_t DIST_PREFIX_BLOCK = 64;
         const size_t n  = cur_p->size;
         const size_t nb = (n + DIST_PREFIX_BLOCK - 1)/DIST_PREFIX_BLOCK;
