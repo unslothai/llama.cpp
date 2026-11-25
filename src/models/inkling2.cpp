@@ -419,6 +419,25 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
             inp->n_kv_banded[1] = 0;
         }
     }
+    // the causal attention without a mask (below) runs on the CUDA and CPU kernels only
+    bool causal_devs = true;
+    for (uint32_t il = 0; il < hparams.n_layer() && causal_devs; ++il) {
+        if (hparams.is_swa(il)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+        causal_devs = strcmp(reg, "CUDA") == 0 || strcmp(reg, "CPU") == 0;
+    }
+    const bool causal_ok = inp->banded && cparams.n_seq_max == 1 && cparams.causal_attn && n_tokens <= 65535 &&
+        causal_devs && inkling2_banded_causal_enabled();
+    // a padded span of 2 or more tokens (drafts, prompt tails) of the full-attention cache takes the positions when the
+    // causal attention applies: it then needs neither the shift table nor the n_kv x n_tokens mask, which the reserve graph
+    // (a full ubatch, causal) does not hold, so the first such span would grow the compute buffers
+    if (causal_ok && inp->banded_pad && n_tokens > 1 && inp->banded_pos != 0 && inp->n_kv_banded[0] > 0 && !inp->self_k_pos[0]) {
+        inp->n_kv_banded[0] = base->get_n_kv();
+        k_pos(0);
+    }
     // the band of a padded span is shifted by the padding; with the positions the distances need no shift
     for (int i = 0; i < 2 && inp->banded_pad; ++i) {
         if (inp->n_kv_banded[i] > 0 && !inp->self_k_pos[i]) {
@@ -431,10 +450,13 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
 
     // a cache of one sequence: a cell is visible iff its distance to the query is not negative (empty cells have no
     // position), so the full-attention layers need no mask, an n_kv x n_tokens F16 input (1 GiB at 1M cells and 512
-    // tokens, on the host and on the device); padded spans without the positions measure the distance from the padded
-    // tail, they keep it
-    banded_causal = inp->banded && cparams.n_seq_max == 1 && cparams.causal_attn && inp->n_kv_banded[0] > 0 && n_tokens <= 65535 &&
-        (inp->self_k_pos[0] || !inp->banded_pad) && inkling2_banded_causal_enabled();
+    // tokens, on the host and on the device). Without the positions the distance is a cell difference, which hides
+    // nothing before the sequence: it must start at cell 0 (n_kv_banded is then pos_max + 1, the cells before a later
+    // start are masked by the mask path); padded spans without the positions measure the distance from the padded tail
+    // and keep the mask
+    banded_causal = causal_ok && inp->n_kv_banded[0] > 0 &&
+        (inp->self_k_pos[0] || (!inp->banded_pad && ubatch.pos != nullptr &&
+            inp->n_kv_banded[0] == (uint32_t) ubatch.pos[n_tokens - 1] + 1));
 
     ggml_tensor * inp_pos = build_inp_pos();
     // the query positions of the banded attention
