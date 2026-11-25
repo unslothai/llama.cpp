@@ -22,8 +22,7 @@ struct depth_mix_params {
     float * states;       int64_t states_s1, states_s2;     // CONCAT outputs, if used outside the chain
     float * states_t;     int64_t states_t_s1, states_t_s2;
     float * scores;       int64_t scores_s1, scores_s2;     // SOFT_MAX output, if used outside the chain
-    float * out;          int64_t out_se, out_sj, out_s2;   // the second MUL_MAT, if fused: element (e, j) of token t at
-                                                            // e*out_se + j*out_sj + t*out_s2 ([ncols, nq] or [nq, ncols])
+    float * out;          int64_t out_se, out_sj, out_s2;   // the second MUL_MAT, if fused: element (e, j) of token t at e*out_se + j*out_sj + t*out_s2 ([ncols, nq] or [nq, ncols])
     int   ncols;
     int   n;                                                // rows of the mix, the earlier blocks + x
     float scale;
@@ -143,10 +142,8 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
     const int e0 = blockIdx.x*p.rows_per_block;
     const int e1 = min(ncols, e0 + p.rows_per_block);
 
-    // out = states_t^T scores as mul_mat_vec_f<float, float, nq, WARP_SIZE> computes it with one warp per row: lane l
-    // accumulates columns 2l and 2l + 1 (n <= 32, one iteration), then warp_reduce_sum adds lane l^o to lane l for
-    // o = 16, 8, 4, 2, 1. Here one thread per row forms the same 32 lane partials (zero past n/2) and the same additions
-    // that end in lane 0. Floating-point addition is commutative, so a + b and b + a round alike.
+    // out = states_t^T scores as mul_mat_vec_f<float, float, nq, WARP_SIZE> computes it with one warp per row: lane l accumulates columns 2l and 2l + 1 (n <= 32, one iteration), then warp_reduce_sum adds lane l^o to lane l for o = 16, 8, 4, 2, 1.
+    // Here one thread per row forms the same 32 lane partials (zero past n/2) and the same additions that end in lane 0. Floating-point addition is commutative, so a + b and b + a round alike.
     if (p.out) {
         const int nh = n / 2;
         for (int e = e0 + tid; e < e1; e += DEPTH_MIX_BLOCK) {
@@ -212,8 +209,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
     }
 }
 
-// GGML_CUDA_DEPTH_MIX_SHADOW=1 (debug only, with GGML_CUDA_DISABLE_GRAPHS=1): run the fused kernel into scratch
-// buffers, let the separate ops run, and compare the bytes of every output of the chain before the next node runs
+// GGML_CUDA_DEPTH_MIX_SHADOW=1 (debug only, with GGML_CUDA_DISABLE_GRAPHS=1): run the fused kernel into scratch buffers, let the separate ops run, and compare the bytes of every output of the chain before the next node runs
 struct depth_mix_shadow_entry {
     const ggml_cgraph * graph;
     int end;
@@ -286,12 +282,9 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
 
     // the chain starts after the RMS_NORM of the current state, which stays its own op, in one of two forms:
     //   (a) CONCAT (prev_t, RESHAPE(normed), dim 0), CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
-    //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]: the transposed rows are a
-    //       copy of the plain ones made right before the product, in any order the graph puts these nodes
-    // In (b) the transposed rows may also be their own CONCAT (prev_t, RESHAPE(normed), dim 0) placed after the plain one,
-    // with the RESHAPE right before it (the graph order when the last product reads the scores first).
-    // The last MUL_MAT is either mul_mat(states_t, scores), out [ncols, nq, T], or mul_mat(scores, states_t) with the
-    // scores as src0, out [nq, ncols, T]: the same products and sums, only the layout of the output differs
+    //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]: the transposed rows are a copy of the plain ones made right before the product, in any order the graph puts these nodes
+    // In (b) the transposed rows may also be their own CONCAT (prev_t, RESHAPE(normed), dim 0) placed after the plain one, with the RESHAPE right before it (the graph order when the last product reads the scores first).
+    // The last MUL_MAT is either mul_mat(states_t, scores), out [ncols, nq, T], or mul_mat(scores, states_t) with the scores as src0, out [nq, ncols, T]: the same products and sums, only the layout of the output differs
     ggml_tensor * first = cgraph->nodes[i];
     const bool form_b = first->op == GGML_OP_CONCAT && ggml_get_op_params_i32(first, 0) == 1 &&
         first->src[1]->op == GGML_OP_RMS_NORM;
@@ -380,8 +373,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             normed_t->ne[0] != 1 || normed_t->ne[1] != ncols || normed_t->ne[2] != T))) {
         DEPTH_MIX_DECLINE("shapes");
     }
-    // the scores read the earlier rows of the stack as float2: an F32 view at an odd float offset or with an odd row or
-    // token stride is left to the separate kernels (CONCAT copies it into an aligned stack first)
+    // the scores read the earlier rows of the stack as float2: an F32 view at an odd float offset or with an odd row or token stride is left to the separate kernels (CONCAT copies it into an aligned stack first)
     if ((uintptr_t) prev->data % (2*sizeof(float)) != 0 || prev->nb[1] % (2*sizeof(float)) != 0 ||
         prev->nb[2] % (2*sizeof(float)) != 0) {
         DEPTH_MIX_DECLINE("unaligned stack rows");
@@ -413,8 +405,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (warp_size != WARP_SIZE) {
         DEPTH_MIX_DECLINE("warp size");
     }
-    // decode-size mixes (up to 8 tokens) before Ada (cc < 8.9) keep the separate kernels: measured ~1% slower fused
-    // at batch-1 decode on A100 (cc 8.0), within noise on T4 (cc 7.5), while prefill gains everywhere (5-12%)
+    // decode-size mixes (up to 8 tokens) before Ada (cc < 8.9) keep the separate kernels: measured ~1% slower fused at batch-1 decode on A100 (cc 8.0), within noise on T4 (cc 7.5), while prefill gains everywhere (5-12%)
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_ADA_LOVELACE && T <= 8) {
         DEPTH_MIX_DECLINE("decode-size mix before Ada");
     }
@@ -429,8 +420,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (!takes_mmvf(mm1)) {
         DEPTH_MIX_DECLINE("first product not MMVF");
     }
-    // scores as src0: the separate product is not a MMVF (src1 has ncols columns); fused, it is computed as MMVF
-    // computes the states_t-first order, so both operand orders give the same output values
+    // scores as src0: the separate product is not a MMVF (src1 has ncols columns); fused, it is computed as MMVF computes the states_t-first order, so both operand orders give the same output values
     const bool mm2_flipped = mm2 && mm2->src[0] == sm;
     if (mm2 && !((mm2_flipped || takes_mmvf(mm2)) && n % 2 == 0 && sm->nb[1] == n*sizeof(float))) {
         // the second product stays a separate op
@@ -458,9 +448,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         end = k_sm;
     }
 
-    // the nodes of the chain, and which of them are used outside it. A RESHAPE of the normed rows inside the chain
-    // (form (b) with a later CONCAT of the transposed rows) is a view of a tensor computed before the chain: it is
-    // skipped with the chain but left out of the fused set, since it computes nothing
+    // the nodes of the chain, and which of them are used outside it. A RESHAPE of the normed rows inside the chain (form (b) with a later CONCAT of the transposed rows) is a view of a tensor computed before the chain: it is skipped with the chain but left out of the fused set, since it computes nothing
     const int count = end - i + 1;
     ggml_op ops[16];
     int     idxs[16];
@@ -504,9 +492,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_idx, ops, outs, n_outs)) {
         DEPTH_MIX_DECLINE("subgraph");
     }
-    // an output may reuse the memory of the RMS_NORM output, which the separate CONCATs have consumed by then;
-    // every block loads its token's normed row before it writes, so one block per token is safe when only this token's
-    // rows can overlap
+    // an output may reuse the memory of the RMS_NORM output, which the separate CONCATs have consumed by then; every block loads its token's normed row before it writes, so one block per token is safe when only this token's rows can overlap
     bool one_block = false;
     if (!memory_ok(cgraph, i, count, outs, n_outs)) {
         auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {

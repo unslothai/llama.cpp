@@ -4612,8 +4612,7 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
-// depth mix fusion (Inkling 2 attention residuals): normalize cur, append it to the block stacks, softmax over
-// the scores of nq queries, mix the stack rows; extra_use keeps the intermediates alive outside the chain
+// depth mix fusion (Inkling 2 attention residuals): normalize cur, append it to the block stacks, softmax over the scores of nq queries, mix the stack rows; extra_use keeps the intermediates alive outside the chain
 struct test_depth_mix_fuse : public test_case {
     const int64_t ncols;
     const int64_t n;   // stack rows including cur
@@ -10855,8 +10854,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
-    // depth mix fusion: decode (1-8 tokens) and prefill rows, odd stacks (second product not MMVF), 1/3/4 queries
-    // (4: the first product is not MMVF on Ampere+), row lengths for every rms_norm launch and MMVF block size
+    // depth mix fusion: decode (1-8 tokens) and prefill rows, odd stacks (second product not MMVF), 1/3/4 queries (4: the first product is not MMVF on Ampere+), row lengths for every rms_norm launch and MMVF block size
     for (int64_t T : { 1, 2, 3, 4, 8 }) {
         for (int64_t n : { 2, 3, 6, 12, 19, 20, 32 }) {
             test_cases.emplace_back(new test_depth_mix_fuse(2304, n, 1, T, false));
