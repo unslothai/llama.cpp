@@ -12789,9 +12789,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
-    // one column of Q8_0 with F32 activations (CUDA: MMVQ without the q8_1 quantize), the shapes of the Inkling 2 projections
+    // one column of Q8_0 with F32 activations (CUDA: MMVQ without the q8_1 quantize), the shapes of the Inkling 2 projections.
+    // At least 7 rows: the reference rounds the activations to 8 bits, and the NMSE over one or two dot products passes 5e-4
+    // in up to one draw of eight. 1185 rows leaves a partial block when two rows share one.
     for (int64_t k : {2304, 3072, 4096}) {
-        for (int64_t m : {1, 7, 384, 1024, 2304, 3072}) {
+        for (int64_t m : {7, 384, 1024, 1185, 2304, 3072}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
         }
     }
