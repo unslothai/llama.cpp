@@ -394,6 +394,10 @@ jobs:
           ARCHS: ${{ env.ARCHS }}
         run: python tooling/scripts/unsloth/package_bundle.py
 
+      # This bundle claims a bundled runtime (BUNDLE_CUDA_RUNTIME=1), so a missing DLL fails here.
+      - name: Report the bundle's CUDA runtime
+        run: python tooling/scripts/unsloth/check_cuda_runtime.py "dist/app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}.zip"
+
       - name: Verify every binary in the bundle is signed
         if: ${{ steps.sign_windows.outputs.signed == 'true' }}
         run: tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path 'dist/app-${{ inputs.tag }}-windows-arm64-${{ env.PROFILE }}.zip'
