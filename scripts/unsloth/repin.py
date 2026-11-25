@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Branches we may push to. Anything else gets a report line and no write.
@@ -50,8 +52,27 @@ def run(args, cwd=None, check=True, quiet=True):
     return r
 
 
+# Same contract as net_retry.sh: 3 retries 15/30/60 s apart, and a definitive answer is not retried.
+PERMANENT = re.compile(r"HTTP (?:400|401|404|410|422)\b|[Nn]ot [Ff]ound|Could not resolve to|not our ref|couldn.t find remote ref")
+
+
+def net(args, cwd=None, check=True):
+    """run() for a single network command (gh api, git clone/fetch), retried on transient failure."""
+    base = int(os.environ.get("NET_RETRY_SLEEP", "15"))
+    for attempt in range(4):
+        r = run(args, cwd=cwd, check=False)
+        if r.returncode == 0 or attempt == 3 or PERMANENT.search(r.stderr or ""):
+            break
+        print(f"retry: {' '.join(args[:3])} failed (exit {r.returncode}); "
+              f"attempt {attempt + 1}/4, retrying in {base << attempt}s", file=sys.stderr)
+        time.sleep(base << attempt)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(args[:4])}... failed: {r.stderr.strip()[:400]}")
+    return r
+
+
 def gh_json(path):
-    r = run(["gh", "api", path], check=False)
+    r = net(["gh", "api", path], check=False)
     if r.returncode != 0:
         return None
     try:
@@ -112,10 +133,10 @@ def repin_one(pin: dict, base: str, work: Path) -> dict:
         return out
 
     repo = work / f"r{pin['num']}"
-    run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
+    net(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
          f"https://github.com/{pin['src']}.git", str(repo)])
-    run(["git", "fetch", "-q", "--no-tags", "origin", pin["sha"]], cwd=repo, check=False)
-    r = run(["git", "fetch", "-q", "--no-tags",
+    net(["git", "fetch", "-q", "--no-tags", "origin", pin["sha"]], cwd=repo, check=False)
+    r = net(["git", "fetch", "-q", "--no-tags",
              "https://github.com/ggml-org/llama.cpp.git",
              f"refs/tags/{base}:refs/tags/{base}"], cwd=repo, check=False)
     if r.returncode != 0:

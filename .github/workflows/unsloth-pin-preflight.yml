@@ -65,11 +65,14 @@ jobs:
                   echo "details<<ALERT_EOF"
                   echo "The preflight script exited ${rc} before it finished probing, so the pins were not fully checked. See the run log for the last command it reached."
                   echo "ALERT_EOF"; } >> "$GITHUB_OUTPUT"; fi' EXIT
+          # gh_retry / net_retry: 3 retries, 15/30/60 s apart. A dropped fetch here used to report a
+          # pin as "force-pushed away", which is a false alarm the repin bot then acts on.
+          . scripts/unsloth/net_retry.sh
           AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
           # Same base tag the nightly resolves: newest aged b#### build.
           # Upstream marks those prerelease since 08-21, so match the tag shape.
-          BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+          BASE="$(gh_retry api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
             | jq -r --argjson cutoff "$CUTOFF" '[.[] | select(.draft==false) | select(.tag_name|test("^b[0-9]+$")) | select((.published_at|fromdateiso8601) <= $cutoff)] | max_by(.published_at|fromdateiso8601) | .tag_name')"
           if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
             echo "::warning::no aged upstream release found; skipping"
@@ -77,7 +80,7 @@ jobs:
           fi
           echo "base $BASE"
 
-          git clone -q https://github.com/ggml-org/llama.cpp.git scratch
+          net_retry git clone -q https://github.com/ggml-org/llama.cpp.git scratch
           cd scratch
           # GITHUB_TOKEN mirrors most pins, but GitHub refuses any ref that ADDS
           # a workflow file the repo does not already have. Observed on 08-03,
@@ -91,7 +94,7 @@ jobs:
           # can rather than nothing, and warn about the rest.
           MIRROR_TOKEN="${REPIN_TOKEN:-$GH_TOKEN}"
           MIRROR="https://x-access-token:${MIRROR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --no-tags origin "refs/tags/${BASE}:refs/tags/${BASE}"
+          net_retry git fetch -q --no-tags origin "refs/tags/${BASE}:refs/tags/${BASE}"
           git checkout -q --detach "refs/tags/${BASE}"
 
           # Mirror every pin to refs/pins/<sha> before probing anything. The
@@ -104,17 +107,26 @@ jobs:
           while read -r url; do
             SRC="$(sed -E 's|https://github.com/([^/]+)/llama.cpp/pull/.*|\1|' <<<"$url")/llama.cpp"
             SHA="$(sed -E 's|.*/commits/([0-9a-f]{40})/?$|\1|' <<<"$url")"
-            if git ls-remote --exit-code "$MIRROR" "refs/pins/${SHA}" >/dev/null 2>&1; then
+            # Not --exit-code: its "no such ref" exit 2 would be retried like an outage. A missing ref
+            # prints nothing; a remote that stays down also prints nothing and only re-mirrors.
+            if [ -n "$(net_retry git ls-remote "$MIRROR" "refs/pins/${SHA}" 2>/dev/null)" ]; then
               echo "mirrored already: ${SHA:0:10}"
               continue
             fi
-            if ! git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
+            if ! net_retry git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
               echo "::warning::cannot mirror ${SHA:0:10}; it is already unfetchable from ${SRC}"
               continue
             fi
             # Report git's own error. Guessing the cause hid a 403 behind a
             # workflow-scope message for a week.
-            if ERR="$(git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1)"; then
+            # Retry a dropped connection, not a refusal: a workflow-scope rejection is permanent.
+            PUSHED=""
+            for i in 1 2 3 4; do
+              if ERR="$(git push -q "$MIRROR" "${SHA}:refs/pins/${SHA}" 2>&1)"; then PUSHED=1; break; fi
+              if [ "$i" = 4 ] || grep -qiE 'rejected|denied|HTTP 40[134]|not found' <<<"$ERR"; then break; fi
+              sleep $(( 15 * (1 << (i - 1)) ))
+            done
+            if [ -n "$PUSHED" ]; then
               echo "mirrored ${SHA:0:10}"
             else
               echo "::warning::could not mirror refs/pins/${SHA:0:10}: $(sed "s|${MIRROR_TOKEN}|***|g" <<<"$ERR" | tr '\n' ' '). A ref adding a workflow file needs REPIN_TOKEN (workflow scope); that pin stays deletable by a force-push."
@@ -129,7 +141,7 @@ jobs:
             NUM="$(sed -E 's|.*/pull/([0-9]+)/commits/.*|\1|' <<<"$url")"
             SHA="$(sed -E 's|.*/commits/([0-9a-f]{40})/?$|\1|' <<<"$url")"
 
-            STATE="$(gh api "repos/${SRC}/pulls/${NUM}" --jq .state 2>/dev/null || echo unknown)"
+            STATE="$(gh_retry api "repos/${SRC}/pulls/${NUM}" --jq .state 2>/dev/null || echo unknown)"
             if [ "$STATE" != "open" ]; then
               # Non-open required pins are still merged by the nightly, so keep
               # probing them here rather than reporting them as a problem; an
@@ -139,7 +151,7 @@ jobs:
               fi
               echo "note: ${SRC}#${NUM} is ${STATE}; still probing because required pins are merged regardless of state"
             fi
-            if ! git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
+            if ! net_retry git fetch -q --no-tags "https://github.com/${SRC}.git" "$SHA" 2>/dev/null; then
               PROBLEMS="${PROBLEMS}- \`${SRC}#${NUM}\` pinned commit \`${SHA:0:10}\` cannot be fetched; it was probably force-pushed away.\n"
               continue
             fi
