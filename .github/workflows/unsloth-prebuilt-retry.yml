@@ -61,6 +61,14 @@ jobs:
            && github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     steps:
+      # Only for gh_retry: a jobs-API 5xx here used to strand a run this workflow exists to rescue.
+      - name: Checkout (net_retry.sh only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/unsloth/net_retry.sh
+          sparse-checkout-cone-mode: false
+
       - name: Rerun the run when nothing about the build actually failed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,8 +77,9 @@ jobs:
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -uo pipefail
+          . scripts/unsloth/net_retry.sh   # gh_retry: 3 retries, 15/30/60 s apart
 
-          JOBS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+          JOBS="$(gh_retry api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
                     --jq '.jobs[] | [.id, .conclusion, .name] | @tsv')"
 
           # A rerun of a run where nothing succeeded buys nothing: there is no
@@ -126,8 +135,9 @@ jobs:
           # a rerun is the entire fix: the legs have finished by then, so the reran waiter
           # sees them all green immediately and publishes. Before this, run 34538187859 had
           # all 42 builds pass and published nothing, because macOS/arm64 sat in the runner
-          # queue for 6h25m and the waiter had already exited.
-          INFRA_LOG='PUBLISH_DEFERRED_WAITER_DEADLINE|Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
+          # queue for 6h25m and the waiter had already exited. JOBS_API_OUTAGE is the same
+          # waiter giving up after 10 failed jobs-API polls in a row: an outage, not a build.
+          INFRA_LOG='PUBLISH_DEFERRED_WAITER_DEADLINE|JOBS_API_OUTAGE|Restoring cache failed|429 Too Many Requests|Connection reset by peer|TLS handshake timeout|Could not resolve host|The operation was canceled by the server'
 
           if [ "$CONCLUSION" = failure ]; then
             if [ -z "$FAILED" ]; then
@@ -137,7 +147,7 @@ jobs:
             fi
             while IFS=$'\t' read -r JOB_ID _ JOB_NAME; do
               [ -n "${JOB_ID:-}" ] || continue
-              NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs/${JOB_ID}/annotations" \
+              NOTES="$(gh_retry api "repos/${GITHUB_REPOSITORY}/check-runs/${JOB_ID}/annotations" \
                          --jq '.[].message' 2>/dev/null)"
               if grep -qF 'lost communication with the server' <<<"$NOTES"; then
                 echo "runner loss: ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -145,7 +155,7 @@ jobs:
               fi
               # Logs are only readable for a few days; a 410 here simply means
               # we cannot identify the cause, which fails closed as it should.
-              LOG="$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)"
+              LOG="$(gh_retry api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)"
               if MATCH="$(grep -oE "$INFRA_LOG" <<<"$LOG" | head -1)" && [ -n "$MATCH" ]; then
                 echo "transient infrastructure (\`${MATCH}\`): ${JOB_NAME}" | tee -a "$GITHUB_STEP_SUMMARY"
                 continue
@@ -156,7 +166,7 @@ jobs:
             done <<<"$FAILED"
           fi
 
-          if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
+          if gh_retry api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"; then
             echo "rerunning ${CONCLUSION} jobs of ${RUN_URL}" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::could not rerun ${RUN_URL}; rerun it by hand" | tee -a "$GITHUB_STEP_SUMMARY"

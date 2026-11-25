@@ -49,7 +49,24 @@ for bare in ("choco install ninja --no-progress",
              'git -C "$src" fetch -q --depth 1 origin "$sha"',
              "git clone https://github.com/a/b",
              'CODE="$(curl -sS -X POST https://api.example.com)"',
-             "gh release download v1 -R a/b"):
+             "gh release download v1 -R a/b",
+             "BASE=\"$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' | jq -r .)\"",
+             'if ! PR_SHAS="$(gh api "repos/$SRC/pulls/$N/commits" --paginate)"; then',
+             'gh release view "$TAG" --repo "$REPO" --json isDraft',
+             'gh release edit "$TAG" --draft=false',
+             'GH_TOKEN="$T" gh pr create --repo a/b --head x',
+             'done < <(gh issue list --repo "$REPO" --label x)',
+             'gh run view "$ID" --log-failed',
+             'git -C "$path" push "$url" "HEAD:refs/heads/x"',
+             "git push -q --force origin HEAD:refs/heads/x",
+             "hf download org/model --include '*.gguf'",
+             "huggingface-cli download org/model",
+             "docker pull ghcr.io/a/b:latest",
+             "npm ci",
+             "npx playwright install chromium",
+             "conda install -y cmake",
+             "rustup target add aarch64-apple-darwin",
+             "vcpkg install curl"):
     check(f"flags: {bare}", flagged(bare))
 
 # Inline retry constructs pass.
@@ -59,8 +76,20 @@ for ok in ("curl -fsSL --retry 5 --retry-all-errors -o x https://e.com/x",
            "wget -q --tries=5 https://apt.llvm.org/llvm.sh",
            "Invoke-WebRequest -Uri $u -OutFile $f -MaximumRetryCount 3",
            "retry git fetch -q origin main",
-           "Invoke-DownloadWithRetry -Uri $u -OutFile $f"):
+           "Invoke-DownloadWithRetry -Uri $u -OutFile $f",
+           "BASE=\"$(gh_retry api 'repos/ggml-org/llama.cpp/releases?per_page=100' | jq -r .)\"",
+           'GH_TOKEN="$T" gh_retry pr create --repo a/b --head x',
+           'net_retry git -C "$path" push "$url" "HEAD:refs/heads/x"',
+           'if [ -n "$(net_retry git ls-remote "$M" "refs/pins/$S")" ]; then'):
     check(f"passes: {ok}", not flagged(ok))
+
+# Local-only commands that share a word with a network one are not calls.
+for local in ("git log -1 --format=%H",
+              "gh auth status",
+              "echo 'gh api failed'",
+              "docker build -t x .",
+              "npm run build"):
+    check(f"not a network call: {local}", not flagged(local))
 
 # Quoted text and the bare word in a package list are not calls.
 check("throw message is not a call", not flagged('throw "choco install ninja failed"'))
@@ -137,6 +166,66 @@ root = Path(tempfile.mkdtemp())
 proc = subprocess.run([sys.executable, str(CHECK), "--root", str(root)], capture_output=True, text=True, check=False)
 check("a local composite action the workflow calls is checked too",
       proc.returncode == 1 and "actions/setup/action.yml" in proc.stdout, proc.stdout + proc.stderr)
+
+# Every unsloth-* workflow is in scope, not only the prebuilt ones, and so is a scripts/unsloth/*.sh a
+# step runs. An upstream workflow is not: it is replaced on every sync and never runs here.
+root = Path(tempfile.mkdtemp())
+(root / ".github" / "workflows").mkdir(parents=True)
+(root / "scripts" / "unsloth").mkdir(parents=True)
+(root / ".github" / "workflows" / "unsloth-guard.yml").write_text(
+    "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: bash tooling/scripts/unsloth/prune.sh\n")
+(root / ".github" / "workflows" / "build.yml").write_text(
+    "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+    "      - run: sudo apt-get update\n")
+(root / "scripts" / "unsloth" / "prune.sh").write_text("#!/bin/bash\ngh api repos/a/b/actions/caches\n")
+proc = subprocess.run([sys.executable, str(CHECK), "--root", str(root)], capture_output=True, text=True, check=False)
+check("a script an unsloth-* workflow runs is checked",
+      proc.returncode == 1 and "scripts/unsloth/prune.sh,line=2" in proc.stdout, proc.stdout + proc.stderr)
+check("an upstream workflow is out of scope", "build.yml" not in proc.stdout, proc.stdout)
+
+print("net_retry.sh: the helper the workflows source")
+HELPER = HERE / "net_retry.sh"
+stub = Path(tempfile.mkdtemp())
+# A fake gh: fails with the stderr in $GH_ERR until the attempt counter reaches $GH_OK_AT, printing a
+# partial page on each failure, so a caller that saw failed output would see it twice.
+(stub / "gh").write_text(
+    "#!/bin/bash\nn=$(( $(cat \"$GH_COUNT\" 2>/dev/null || echo 0) + 1 )); echo $n > \"$GH_COUNT\"\n"
+    "if [ \"$n\" -lt \"$GH_OK_AT\" ]; then echo partial; echo \"$GH_ERR\" >&2; exit 1; fi\necho page-all\n")
+(stub / "gh").chmod(0o755)
+
+
+def helper(cmd: str, ok_at: int, err: str = "HTTP 502: Bad Gateway") -> tuple[int, str, int]:
+    count = stub / "count"
+    count.unlink(missing_ok=True)
+    env = {"PATH": f"{stub}:/usr/bin:/bin", "NET_RETRY_SLEEP": "0", "GH_COUNT": str(count),
+           "GH_OK_AT": str(ok_at), "GH_ERR": err}
+    p = subprocess.run(["bash", "-c", f'. "{HELPER}"; {cmd}'], capture_output=True, text=True, env=env, check=False)
+    return p.returncode, p.stdout, int(count.read_text()) if count.exists() else 0
+
+
+rc, out, n = helper("gh_retry api x", ok_at=3)
+check("gh_retry recovers from two 502s", rc == 0 and n == 3, f"rc={rc} n={n} out={out!r}")
+check("gh_retry prints only the successful attempt's stdout", out == "page-all\n", repr(out))
+rc, out, n = helper("gh_retry api x", ok_at=99)
+check("gh_retry gives up after 4 attempts with gh's exit code", rc == 1 and n == 4 and out == "",
+      f"rc={rc} n={n} out={out!r}")
+rc, out, n = helper("gh_retry release view t", ok_at=99, err="release not found")
+check("gh_retry does not retry 'not found'", rc == 1 and n == 1, f"rc={rc} n={n}")
+rc, out, n = helper("gh_retry api x", ok_at=99, err="gh: Not Found (HTTP 404)")
+check("gh_retry does not retry a 404", rc == 1 and n == 1, f"rc={rc} n={n}")
+rc, out, n = helper("gh_retry api x", ok_at=2, err="HTTP 403: You have exceeded a secondary rate limit")
+check("gh_retry retries a 403 secondary rate limit", rc == 0 and n == 2, f"rc={rc} n={n}")
+rc, out, n = helper("net_retry gh api x", ok_at=3)
+check("net_retry recovers and returns 0", rc == 0 and n == 3, f"rc={rc} n={n}")
+rc, out, n = helper("set -e; net_retry gh api x; echo unreachable", ok_at=99)
+check("net_retry failure still fails a set -e script", rc != 0 and "unreachable" not in out and n == 4,
+      f"rc={rc} n={n} out={out!r}")
+rc, out, n = helper('set -euo pipefail; X="$(gh_retry api x)"; echo unreachable', ok_at=99)
+check("gh_retry failure inside $(...) still fails a set -euo pipefail script",
+      rc != 0 and "unreachable" not in out, f"rc={rc} out={out!r}")
+rc, out, n = helper('set -euo pipefail; [ "$(gh_retry api x | tr a-z A-Z)" = PAGE-ALL ] && echo piped', ok_at=2)
+check("gh_retry output pipes on success", rc == 0 and out == "piped\n", f"rc={rc} out={out!r}")
 
 if FAILS:
     print(f"{len(FAILS)} failure(s)")

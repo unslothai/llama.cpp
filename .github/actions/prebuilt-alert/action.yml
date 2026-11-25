@@ -46,6 +46,11 @@ runs:
         # explicitly; every gh call below is already individually tolerated.
         set +e
         set -uo pipefail
+        # gh_retry: 3 retries, 15/30/60 s apart. A failed issue list used to open a duplicate
+        # issue, and a failed create left a real failure unreported. The callers check this repo
+        # out at the workspace root; if the helper is somehow absent, alert without retries.
+        . "${GITHUB_ACTION_PATH}/../../../scripts/unsloth/net_retry.sh" 2>/dev/null \
+          || gh_retry() { gh "$@"; }
 
         case "$STATUS" in
           failure|success) ;;
@@ -59,17 +64,19 @@ runs:
         EXISTING=""
         while read -r num; do
           [ -n "$num" ] || continue
-          if gh issue view "$num" --repo "$REPO" --json body --jq .body 2>/dev/null | grep -qF "$MARKER"; then
+          # Read into a variable: `| grep -q` can close the pipe early, and pipefail then reads it as a miss.
+          ISSUE_BODY="$(gh_retry issue view "$num" --repo "$REPO" --json body --jq .body 2>/dev/null)"
+          if grep -qF "$MARKER" <<<"$ISSUE_BODY"; then
             EXISTING="$num"; break
           fi
-        done < <(gh issue list --repo "$REPO" --label "$LABEL" --state open \
+        done < <(gh_retry issue list --repo "$REPO" --label "$LABEL" --state open \
                    --limit 100 --json number --jq '.[].number' 2>/dev/null || true)
 
         if [ "$STATUS" = "success" ]; then
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$REPO" \
+            gh_retry issue comment "$EXISTING" --repo "$REPO" \
               --body "Recovered: [\`${GITHUB_WORKFLOW}\` run](${RUN_URL}) succeeded. Closing." >/dev/null 2>&1 || true
-            gh issue close "$EXISTING" --repo "$REPO" >/dev/null 2>&1 \
+            gh_retry issue close "$EXISTING" --repo "$REPO" >/dev/null 2>&1 \
               || echo "::warning::prebuilt-alert: could not close #${EXISTING}"
             echo "closed #${EXISTING} ($KEY)"
           fi
@@ -94,21 +101,21 @@ runs:
 
         if [ -n "$EXISTING" ]; then
           # Comment rather than open a second issue, so an outage is one thread.
-          gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY" >/dev/null 2>&1 \
+          gh_retry issue comment "$EXISTING" --repo "$REPO" --body "$BODY" >/dev/null 2>&1 \
             || echo "::warning::prebuilt-alert: could not comment on #${EXISTING}"
           echo "updated #${EXISTING} ($KEY)"
         else
           # gh refuses to create with a label that does not exist yet.
-          gh label create "$LABEL" --repo "$REPO" --color B60205 \
+          gh_retry label create "$LABEL" --repo "$REPO" --color B60205 \
             --description "Prebuilt release pipeline is failing" >/dev/null 2>&1 || true
-          NEW="$(gh issue create --repo "$REPO" --title "$TITLE" --label "$LABEL" \
+          NEW="$(gh_retry issue create --repo "$REPO" --title "$TITLE" --label "$LABEL" \
                    --body "$BODY" 2>&1 | tail -1)"
           case "$NEW" in
             https://*) echo "opened $NEW ($KEY)" ;;
             *)
               # The one case worth shouting about: a real failure went
               # unreported. Name the usual cause so it is actionable.
-              if [ "$(gh api "repos/${REPO}" --jq .has_issues 2>/dev/null)" = "false" ]; then
+              if [ "$(gh_retry api "repos/${REPO}" --jq .has_issues 2>/dev/null)" = "false" ]; then
                 echo "::error::prebuilt-alert: issues are disabled on ${REPO}, so ${KEY} cannot be tracked; see the run summary for details"
               else
                 echo "::error::prebuilt-alert: could not open an issue for ${KEY} (${NEW}); the failure at ${RUN_URL} is unreported"

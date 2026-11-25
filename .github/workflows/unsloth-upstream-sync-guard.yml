@@ -44,6 +44,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh   # gh_retry: 3 retries, 15/30/60 s apart
           FILE=scripts/unsloth/upstream-sync.json
           SHA="$(jq -r .commit "$FILE")"
           TAG="$(jq -r .tag "$FILE")"
@@ -54,7 +55,7 @@ jobs:
 
           # compare(base...head): 'ahead' or 'identical' means base is an ancestor of head.
           # 'diverged' or 'behind' means it is not, which is what a squash-merged sync looks like.
-          STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master" --jq .status)"
+          STATUS="$(gh_retry api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master" --jq .status)"
           echo "compare ${SHA:0:10} (${TAG}) ...master -> ${STATUS}"
           case "$STATUS" in
             ahead|identical) echo "ancestry OK" ;;
@@ -69,11 +70,12 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh   # gh_retry: 3 retries, 15/30/60 s apart
           FILE=scripts/unsloth/upstream-sync.json
           SHA="$(jq -r .commit "$FILE")"
 
           # The compare API caps its file list. Say so rather than pass on a truncated answer.
-          RESP="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master")"
+          RESP="$(gh_retry api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...master")"
           TOTAL="$(jq -r '.files | length' <<<"$RESP")"
           if [ "$TOTAL" -ge 300 ]; then
             echo "::error file=$FILE::compare returned ${TOTAL} files, at or over the API cap, so this check cannot be trusted. The fork delta should be well under 100 paths; if it is genuinely this large the invariant has already broken."

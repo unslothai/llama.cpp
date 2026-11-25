@@ -27,10 +27,14 @@ while [ $# -gt 0 ]; do
 done
 case "$KEEP" in [1-9]|[1-9][0-9]) ;; *) echo "invalid --keep $KEEP" >&2; exit 2 ;; esac
 
+# gh_retry: 3 retries, 15/30/60 s apart; a 404 on an already-deleted entry is answered at once.
+# shellcheck source-path=SCRIPTDIR source=net_retry.sh
+. "$(dirname "$(readlink -f "$0")")/net_retry.sh"
+
 repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 tmp="$(mktemp -d)"
 all="$tmp/caches.tsv"
-gh api --paginate "repos/$repo/actions/caches?per_page=100" \
+gh_retry api --paginate "repos/$repo/actions/caches?per_page=100" \
   -q '.actions_caches[] | "\(.id)\t\(.created_at)\t\(.size_in_bytes)\t\(.ref)\t\(.version)\t\(.key)"' > "$all" || true
 
 gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
@@ -64,7 +68,7 @@ while IFS=$'\t' read -r pre created id size; do
     freed=$(( freed + size )); deleted=$(( deleted + 1 )); continue
   fi
   # </dev/null or gh eats the loop's stdin and the sweep stops after one.
-  if gh api -X DELETE "repos/$repo/actions/caches/$id" --silent < /dev/null 2>/dev/null; then
+  if gh_retry api -X DELETE "repos/$repo/actions/caches/$id" --silent < /dev/null 2>/dev/null; then
     freed=$(( freed + size )); deleted=$(( deleted + 1 ))
   fi
 done < "$grouped"

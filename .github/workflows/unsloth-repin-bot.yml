@@ -56,11 +56,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          . scripts/unsloth/net_retry.sh   # gh_retry: 3 retries, 15/30/60 s apart
           AGE_H="${UNSLOTH_LLAMA_MIN_RELEASE_AGE_HOURS:-6}"
           CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
           # Same base tag the nightly resolves: newest aged b#### build.
           # Upstream marks those prerelease since 08-21, so match the tag shape.
-          BASE="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
+          BASE="$(gh_retry api 'repos/ggml-org/llama.cpp/releases?per_page=100' \
             | jq -r --argjson cutoff "$CUTOFF" '[.[] | select(.draft==false) | select(.tag_name|test("^b[0-9]+$")) | select((.published_at|fromdateiso8601) <= $cutoff)] | max_by(.published_at|fromdateiso8601) | .tag_name')"
           if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
             echo "::warning::no aged upstream release found; nothing to repin onto"
@@ -100,6 +101,9 @@ jobs:
           BASE: ${{ steps.base.outputs.base }}
         run: |
           set -uo pipefail
+          # net_retry / gh_retry: 3 retries, 15/30/60 s apart. Each push is of an exact sha and
+          # the rolling branch push is --force, so a repeat is a no-op.
+          . scripts/unsloth/net_retry.sh
           if [ -z "${REPIN_TOKEN:-}" ]; then
             echo "::warning::REPIN_TOKEN is not set; reporting the repin instead of pushing it"
             echo "mode=report" >> "$GITHUB_OUTPUT"
@@ -112,7 +116,7 @@ jobs:
           while read -r path head_repo head_ref new_sha; do
             echo "pushing ${new_sha:0:10} to ${head_repo}:${head_ref}"
             # No -x anywhere in this step; the URL carries the token.
-            if ! git -C "$path" push \
+            if ! net_retry git -C "$path" push \
                  "https://x-access-token:${REPIN_TOKEN}@github.com/${head_repo}.git" \
                  "HEAD:refs/heads/${head_ref}" 2>&1 | sed "s/${REPIN_TOKEN}/***/g"; then
               FAILED="${FAILED} ${head_repo}:${head_ref}"
@@ -134,7 +138,7 @@ jobs:
           git commit -qm "Repin PR set onto ${BASE}"
           # Force: the branch is a rolling proposal against whatever base tag is
           # current, so yesterday's version is not worth preserving.
-          git push -q --force \
+          net_retry git push -q --force \
             "https://x-access-token:${REPIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/${REPIN_BRANCH}" 2>&1 | sed "s/${REPIN_TOKEN}/***/g"
 
@@ -144,15 +148,15 @@ jobs:
             echo "Opened automatically after [pin preflight](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/unsloth-pin-preflight.yml) failed. Review the resolutions above before merging; the bot does not merge its own PRs."
           } > "${RUNNER_TEMP}/body.md"
 
-          EXISTING="$(GH_TOKEN="${REPIN_TOKEN}" gh pr list --repo "${GITHUB_REPOSITORY}" \
+          EXISTING="$(GH_TOKEN="${REPIN_TOKEN}" gh_retry pr list --repo "${GITHUB_REPOSITORY}" \
             --head "${REPIN_BRANCH}" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
           if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            GH_TOKEN="${REPIN_TOKEN}" gh pr edit "$EXISTING" --repo "${GITHUB_REPOSITORY}" \
+            GH_TOKEN="${REPIN_TOKEN}" gh_retry pr edit "$EXISTING" --repo "${GITHUB_REPOSITORY}" \
               --title "Repin PR set onto ${BASE}" --body-file "${RUNNER_TEMP}/body.md" >/dev/null
             echo "updated PR #${EXISTING}"
             echo "pr=${EXISTING}" >> "$GITHUB_OUTPUT"
           else
-            URL="$(GH_TOKEN="${REPIN_TOKEN}" gh pr create --repo "${GITHUB_REPOSITORY}" \
+            URL="$(GH_TOKEN="${REPIN_TOKEN}" gh_retry pr create --repo "${GITHUB_REPOSITORY}" \
               --base master --head "${REPIN_BRANCH}" \
               --title "Repin PR set onto ${BASE}" --body-file "${RUNNER_TEMP}/body.md" 2>&1 | tail -1)"
             echo "opened ${URL}"

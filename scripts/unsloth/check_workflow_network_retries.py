@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Fail when a prebuilt workflow step downloads something without a retry.
+"""Fail when an Unsloth workflow step reaches the network without a retry.
 
 The prebuilt nightly is ~60 legs and the publish job refuses if any one of them fails, so a
 single 5xx from a package feed costs the whole release. Run 45410618008 lost
 `CPU / windows/x64` to one Chocolatey 504 on `choco install llvm`. Every step that reaches a
 third-party host (package managers, toolkit CDNs, git remotes) therefore has to carry a
-bounded retry.
+bounded retry. The same holds for the GitHub API and git remotes: one 502 from `gh api` in the
+resolve step, or a dropped `git fetch` in the pin preflight, fails a run (or raises a false
+alarm) just as surely as a feed outage.
 
-Scope: `.github/workflows/unsloth-prebuilt*.yml` plus every local composite action those
-workflows call (`uses: ./.github/actions/X` or `./<checkout>/.github/actions/X`).
+Scope: every `.github/workflows/unsloth-*.yml`, every local composite action those workflows call
+(`uses: ./.github/actions/X` or `./<checkout>/.github/actions/X`), and every
+`scripts/unsloth/*.sh` they run. Upstream ggml-org workflows are deliberately out of scope: they
+are replaced wholesale on every upstream sync, and this fork does not run them.
 
 A `run:` line that calls one of NETWORK passes when
   * the line itself carries a retry construct (`--retry`, `--retries`, `--tries`,
@@ -54,7 +58,19 @@ NETWORK = [
     ("wget", re.compile(r"\bwget\s+(?=[-\"'$]|https?:)")),
     ("Invoke-WebRequest", re.compile(r"\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|Start-BitsTransfer)\b|\.DownloadFile\(")),
     ("git clone/fetch", re.compile(r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:clone|fetch|pull|ls-remote)\b")),
-    ("gh release download", re.compile(r"\bgh\s+release\s+download\b")),
+    ("git push", re.compile(r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:push|submodule\s+update)\b")),
+    # Every gh subcommand that talks to the API, reads and writes alike; gh itself does not retry
+    # a 5xx. `gh_retry api ...` does not match: the `_` after `gh` breaks the word.
+    ("gh", re.compile(r"\bgh\s+(?:api|release|issue|pr|run|workflow|cache|repo|label|search|"
+                      r"secret|variable|gist|attestation)\b")),
+    ("hf download/upload", re.compile(
+        r"\b(?:hf|huggingface-cli)\s+(?:download|upload|upload-large-folder)\b")),
+    ("docker", re.compile(r"\bdocker\s+(?:image\s+)?(?:pull|push|login)\b")),
+    ("npm/npx", re.compile(r"\b(?:npm|pnpm|yarn)\s+(?:install|ci|i|add)\b|\bnpx\s+\S")),
+    ("conda", re.compile(r"\b(?:conda|mamba|micromamba)\s+(?:install|create|update)\b")),
+    ("rustup/cargo", re.compile(r"\brustup\s+(?:install|toolchain|target|component|update)\b"
+                                r"|\bcargo\s+install\b")),
+    ("vcpkg", re.compile(r"\bvcpkg(?:\.exe)?\s+install\b")),
 ]
 RETRY_ON_LINE = re.compile(
     r"--retry\b|--retries\b|--tries\b|Acquire::Retries|-MaximumRetryCount\b|\b\w*[Rr]etry\w*\s+\S")
@@ -66,6 +82,8 @@ DOWNLOADING_ACTIONS = ("hendrikmuhs/ccache-action", "jimver/cuda-toolkit")
 # string holding a command substitution (`CODE="$(curl ...)"`) is kept, since that IS a call.
 QUOTED = re.compile(r"\"(?:[^\"\\$]|\\.|\$(?!\())*\"|'[^'\n]*'")
 LOCAL_ACTION = re.compile(r"^\./(?:[^/]+/)?\.github/actions/([^/@]+)$")
+# `bash scripts/unsloth/x.sh` or `bash tooling/scripts/unsloth/x.sh` from a run: line.
+LOCAL_SCRIPT = re.compile(r"(?:^|[\s/\"'])scripts/unsloth/([\w.-]+\.sh)\b")
 
 
 def _indent(line: str) -> int:
@@ -174,8 +192,9 @@ def check_doc(doc) -> list[str]:
 
 
 def targets(root: Path) -> list[Path]:
-    wfs = sorted((root / ".github" / "workflows").glob("unsloth-prebuilt*.yml"))
+    wfs = sorted((root / ".github" / "workflows").glob("unsloth-*.yml"))
     actions: set[Path] = set()
+    scripts: set[Path] = set()
     todo = list(wfs)
     seen: set[Path] = set()
     while todo:
@@ -183,14 +202,19 @@ def targets(root: Path) -> list[Path]:
         if path in seen:
             continue
         seen.add(path)
-        for m in re.finditer(r"uses:\s*['\"]?(\./[^\s'\"#]+)", path.read_text()):
+        text = path.read_text()
+        for m in re.finditer(r"uses:\s*['\"]?(\./[^\s'\"#]+)", text):
             local = LOCAL_ACTION.match(m.group(1).rstrip("/"))
             if local:
                 act = root / ".github" / "actions" / local.group(1) / "action.yml"
                 if act.is_file() and act not in actions:
                     actions.add(act)
                     todo.append(act)
-    return wfs + sorted(actions)
+        for m in LOCAL_SCRIPT.finditer(text):
+            sh = root / "scripts" / "unsloth" / m.group(1)
+            if sh.is_file():
+                scripts.add(sh)
+    return wfs + sorted(actions) + sorted(scripts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -200,11 +224,16 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root)
     files = targets(root)
     if not files:
-        print(f"::error::no unsloth-prebuilt*.yml under {root}/.github/workflows")
+        print(f"::error::no unsloth-*.yml under {root}/.github/workflows")
         return 1
     fail = 0
     for path in files:
         rel = path.relative_to(root)
+        if path.suffix == ".sh":
+            for n, what, text in check_script(path.read_text()):
+                print(f"::error file={rel},line={n}::{what} without a retry: {text}")
+                fail = 1
+            continue
         try:
             doc = yaml.safe_load(path.read_text())
         except yaml.YAMLError as e:

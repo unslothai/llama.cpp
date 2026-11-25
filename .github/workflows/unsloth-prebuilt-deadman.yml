@@ -35,7 +35,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          LATEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
+          # gh_retry: 3 retries, 15/30/60 s apart, before this gives up and skips.
+          . scripts/unsloth/net_retry.sh
+          LATEST="$(gh_retry api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
             --jq '[.[] | select(.draft==false and .prerelease==false)]
                   | max_by(.published_at|fromdateiso8601)
                   | "\(.tag_name)\t\(.published_at)"' 2>/dev/null || true)"
