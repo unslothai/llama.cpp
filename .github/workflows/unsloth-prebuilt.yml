@@ -777,18 +777,27 @@ jobs:
           # starts, so a missing prefix is only fatal once this has passed.
           STARTUP_DEADLINE=$(( $(date +%s) + 45 * 60 ))
           API_FAILS=0
+          API_ERR="$RUNNER_TEMP/jobs-api.err"
 
           while :; do
             if ! JOBS="$(gh api --paginate \
                   "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
-                  --jq '.jobs[] | [.name, .status, (.conclusion // "none")] | @tsv' 2>/dev/null)"; then
+                  --jq '.jobs[] | [.name, .status, (.conclusion // "none")] | @tsv' 2>"$API_ERR")"; then
+              # A definitive 4xx (bad token or permissions, a wrong path) repeats identically, so
+              # waiting 10 polls on it only delays the failure. 403 and 429 are rate limits: retried.
+              if grep -qE 'HTTP (400|401|404|410|422)\b' "$API_ERR"; then
+                echo "ERROR: the jobs API refused the request: $(head -c 300 "$API_ERR" | tr '\n' ' ')" >&2
+                exit 1
+              fi
               # A blip in the jobs API must not throw away a finished build.
               API_FAILS=$(( API_FAILS + 1 ))
               if [ "$API_FAILS" -ge 10 ]; then
-                echo "ERROR: the jobs API failed 10 times running; cannot confirm the build matrix finished" >&2
+                # JOBS_API_OUTAGE is a stable marker: unsloth-prebuilt-retry.yml's INFRA_LOG matches
+                # it and reruns, since the builds may all be green behind an API outage.
+                echo "ERROR: JOBS_API_OUTAGE: the jobs API failed 10 times running; cannot confirm the build matrix finished" >&2
                 exit 1
               fi
-              echo "jobs API call failed (${API_FAILS}/10); retrying in ${POLL}s"
+              echo "jobs API call failed (${API_FAILS}/10): $(head -c 200 "$API_ERR" | tr '\n' ' '); retrying in ${POLL}s"
               sleep "$POLL"
               continue
             fi
