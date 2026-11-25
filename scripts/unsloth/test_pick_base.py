@@ -194,6 +194,18 @@ def main():
     check("dirty tracked files are refused and kept", p.returncode != 0 and "uncommitted changes" in p.stderr
           and (repo / tracked).read_text() == before + "local edit\n", p.stderr)
     (repo / tracked).write_text(before)
+
+    # An untracked file a candidate tree would overwrite (here README.md, which b3 has) is refused and kept too.
+    note = repo / "README.md"
+    had = note.exists() and git(repo, "ls-files", "README.md").strip() != ""
+    if not had:
+        note.write_text("local notes\n")
+        p = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(repo), "--prs-json", json.dumps(prs),
+                            "--candidates", "b5", "b3"],
+                           capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(tmp), "HOME": str(tmp)})
+        check("untracked files are refused and kept", p.returncode != 0 and "untracked files" in p.stderr
+              and note.read_text() == "local notes\n", p.stderr)
+        note.unlink()
     check("checkout restored after a dry run", restored(repo, head))
 
     # The workflow side of strictness: an explicit tag defaults to 0 (strict), "latest" to the env depth, and the

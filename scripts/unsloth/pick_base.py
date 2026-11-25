@@ -213,10 +213,12 @@ def main() -> int:
     first = cands[0][0]
     log(f"pick_base: candidates {' '.join(c[0] for c in cands)} (floor b{floor if floor is not None else '?'})")
 
-    # Every trial checks out another tree with --force, so tracked edits would be lost: refuse them up front.
-    dirty = git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+    # Every trial checks out another tree with --force, which throws away tracked edits and overwrites untracked
+    # files a candidate tree also has: refuse both up front (ignored files, e.g. build dirs, are left alone).
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=normal").stdout.strip()
     if dirty:
-        ap.error(f"{repo} has uncommitted changes to tracked files; commit them or run in a clean clone")
+        ap.error(f"{repo} has uncommitted changes or untracked files; commit, stash or remove them, "
+                 f"or run in a clean clone:\n{dirty}")
     orig = git(repo, "rev-parse", "HEAD").stdout.strip()
     tmp = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"pick_base_{os.getpid()}"
     tmp.mkdir(parents=True, exist_ok=True)
