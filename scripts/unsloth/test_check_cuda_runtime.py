@@ -139,9 +139,13 @@ with tempfile.TemporaryDirectory() as d:
               summary.read_text() if summary.is_file() else "no summary")
     portable = package(root, binp, "portable")[1]
 
-    # A host runtime on the loader path is reported as such, still a pass.
+    # The check resolves with LD_LIBRARY_PATH cleared (what a host without a toolkit sees), so a runtime
+    # reachable only through the caller's LD_LIBRARY_PATH is not credited to the host, and it is still a pass.
     c = run_check(portable, ld_path=str(cuda))
-    check("runtime found on the host is reported, not failed", c.returncode == 0 and "from the host:" in c.stdout, c.stdout)
+    rows = [l for l in c.stdout.splitlines() if l.strip().startswith(tuple(NEED.split(", ")))]
+    check("LD_LIBRARY_PATH is ignored and the check still passes",
+          c.returncode == 0 and len(rows) == 3 and str(cuda) not in c.stdout
+          and all(("missing" in l) or ("from the host" in l) for l in rows), c.stdout)
 
     # Linux ignores BUNDLE_CUDA_RUNTIME, as before: the record stays truthful.
     r, arc = package(root, binp, "portable", {"BUNDLE_CUDA_RUNTIME": "1"})
