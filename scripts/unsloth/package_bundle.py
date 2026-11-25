@@ -318,6 +318,10 @@ def write_metadata(stage: Path, strategy: PlatformStrategy, cfg: dict, sms: list
         f"built at (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
         f"notes: {note}",
     ]
+    # Written by the resolve step only when it built an older base than the newest aged tag (pick_base.py).
+    fallback = Path(cfg["src_dir"]) / "UNSLOTH_BASE_FALLBACK.txt"
+    if fallback.is_file():
+        build_info.append(f"base-tag fallback: {fallback.read_text().strip()}")
     (stage / "BUILD_INFO.txt").write_text("\n".join(build_info) + "\n")
 
 

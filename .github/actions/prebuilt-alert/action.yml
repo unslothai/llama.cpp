@@ -18,6 +18,10 @@ inputs:
     description: 'Markdown describing what broke'
     required: false
     default: ''
+  headline:
+    description: 'First line of the issue body (default: the workflow failed on this event)'
+    required: false
+    default: ''
   label:
     description: 'Label applied to the issue'
     required: false
@@ -37,6 +41,7 @@ runs:
         KEY: ${{ inputs.key }}
         TITLE: ${{ inputs.title }}
         DETAILS: ${{ inputs.details }}
+        HEADLINE: ${{ inputs.headline }}
         LABEL: ${{ inputs.label }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         REPO: ${{ github.repository }}
@@ -85,7 +90,7 @@ runs:
 
         BODY="$(printf '%s\n\n%s\n\n**Run:** %s\n\n%s\n' \
           "$MARKER" \
-          "\`${GITHUB_WORKFLOW}\` failed on \`${GITHUB_EVENT_NAME}\`." \
+          "${HEADLINE:-\`${GITHUB_WORKFLOW}\` failed on \`${GITHUB_EVENT_NAME}\`.}" \
           "$RUN_URL" \
           "$DETAILS")"
 
