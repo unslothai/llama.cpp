@@ -1189,6 +1189,83 @@ static __device__ __forceinline__ void fattn_banded_mma_load_tile_q(
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// The quantized tiles of the main loop in two steps, so that the global loads overlap the MMAs as cp.async does for F16:
+// fattn_banded_mma_issue_tile_q only loads the quants and scales of this thread's chunks into registers, fattn_banded_mma_store_tile_q later
+// dequantizes them into the F16 tile with the values fattn_banded_mma_load_tile_q gives, bit for bit.
+// Rows past n_kv get zero quants and a zero scale, which store as +0 like the zero fill of the one-step load.
+template<int D, int NW>
+struct fattn_banded_mma_qregs {
+    static constexpr int n = fattn_banded_mma_bk*(D/8)/(NW*WARP_SIZE);
+    static_assert(n*NW*WARP_SIZE == fattn_banded_mma_bk*(D/8), "the tile chunks must split evenly over the threads");
+    uint2  q[n];
+    half   d[n];
+};
+
+template<int D, int NW, ggml_type type_kv>
+static __device__ __forceinline__ void fattn_banded_mma_issue_tile_q(
+        fattn_banded_mma_qregs<D, NW> & r, const char * __restrict__ src, const uint64_t nb1, const int64_t kv0, const int64_t n_kv) {
+    static_assert(type_kv == GGML_TYPE_Q8_0 || type_kv == GGML_TYPE_Q4_0, "unsupported banded K/V tile type");
+    constexpr int chunks   = D/8;
+    constexpr int nthreads = NW*WARP_SIZE;
+#pragma unroll
+    for (int i = 0; i < fattn_banded_mma_qregs<D, NW>::n; ++i) {
+        const int c   = i*nthreads + threadIdx.x;
+        const int row = c / chunks;
+        const int col = (c % chunks)*8;
+        r.q[i] = make_uint2(0, 0);
+        r.d[i] = __float2half(0.0f);
+        if (kv0 + row < n_kv) {
+            const char * s = src + uint64_t(kv0 + row)*nb1;
+            // the quants of a block start 2 bytes in: 16-bit loads
+            const uint16_t * q16;
+            if constexpr (type_kv == GGML_TYPE_Q8_0) {
+                const block_q8_0 * b = (const block_q8_0 *) s + col/QK8_0;
+                r.d[i] = b->d;
+                q16 = (const uint16_t *) (b->qs + col % QK8_0);
+            } else {
+                const block_q4_0 * b = (const block_q4_0 *) s + col/QK4_0;
+                r.d[i] = b->d;
+                q16 = (const uint16_t *) (b->qs + (col % QK4_0) % (QK4_0/2));
+            }
+            r.q[i].x = q16[0] | ((uint32_t) q16[1] << 16);
+            r.q[i].y = q16[2] | ((uint32_t) q16[3] << 16);
+        }
+    }
+}
+
+template<int D, int NW, ggml_type type_kv>
+static __device__ __forceinline__ void fattn_banded_mma_store_tile_q(half * __restrict__ tile, const fattn_banded_mma_qregs<D, NW> & r) {
+    constexpr int stride   = D + 8;
+    constexpr int chunks   = D/8;
+    constexpr int nthreads = NW*WARP_SIZE;
+    // a quant u in [0, 255] as the half 1024 + u (exponent byte 0x64), minus 1152 (q8_0, u = q + 128) or 1032 (q4_0, u = q + 8), is exact.
+    // q*d is exact in F32, so one half multiply rounds it as the F32 product rounded to half does.
+    const half2 off = __float2half2_rn(type_kv == GGML_TYPE_Q8_0 ? 1152.0f : 1032.0f);
+#pragma unroll
+    for (int i = 0; i < fattn_banded_mma_qregs<D, NW>::n; ++i) {
+        const int c   = i*nthreads + threadIdx.x;
+        const int row = c / chunks;
+        const int col = (c % chunks)*8;
+        const half2 d2 = __half2half2(r.d[i]);
+        const uint32_t w[2] = { r.q[i].x, r.q[i].y };
+        half2 h[4];
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            uint32_t u;
+            if constexpr (type_kv == GGML_TYPE_Q8_0) {
+                u = w[k] ^ 0x80808080u;
+            } else {
+                u = (w[k] >> (col % QK4_0 < QK4_0/2 ? 0 : 4)) & 0x0F0F0F0Fu;
+            }
+            const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+            const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+            h[2*k + 0] = __hmul2(__hsub2(*(const half2 *) &lo, off), d2);
+            h[2*k + 1] = __hmul2(__hsub2(*(const half2 *) &hi, off), d2);
+        }
+        *(int4 *) (tile + row*stride + col) = *(const int4 *) h;
+    }
+}
+
 template<int D, int NW, ggml_type type_kv = GGML_TYPE_F16>
 static __device__ __forceinline__ void fattn_banded_mma_load_tile(
         half * __restrict__ tile, const char * __restrict__ src, const uint64_t nb1, const int64_t kv0, const int64_t n_kv) {
@@ -1396,6 +1473,13 @@ static __global__ void flash_attn_ext_banded_mma(
         fattn_banded_mma_load_tile<D, NW, type_kv>(K_s, k_base, k_nb1, kt*BK, n_kv);
         fattn_banded_mma_load_tile<D, NW, type_kv>(V_s, v_base, v_nb1, kt*BK, n_kv);
     }
+    // quantized K/V: the tiles after the first are loaded into registers one step ahead (see fattn_banded_mma_issue_tile_q)
+    fattn_banded_mma_qregs<D, NW> kq;
+    fattn_banded_mma_qregs<D, NW> vq;
+    bool v_pending = false;
+    GGML_UNUSED(kq);
+    GGML_UNUSED(vq);
+    GGML_UNUSED(v_pending);
 
     while (kt < kt_end) {
         const int64_t kv0  = kt*BK;
@@ -1495,9 +1579,19 @@ static __global__ void flash_attn_ext_banded_mma(
             O[n][3] *= alpha[1];
         }
 
+        if constexpr (type_kv != GGML_TYPE_F16) {
+            // the V tile of this iteration, loaded during the QK MMAs; the PV MMAs of the previous one are done (barrier after them)
+            if (v_pending) {
+                fattn_banded_mma_store_tile_q<D, NW, type_kv>(V_s, vq);
+            }
+        }
         __syncthreads();
         const int64_t kt_next = next_tile(kt + 1);
-        if (kt_next < kt_end) {
+        if constexpr (type_kv != GGML_TYPE_F16) {
+            if (kt_next < kt_end) {
+                fattn_banded_mma_issue_tile_q<D, NW, type_kv>(kq, k_base, k_nb1, kt_next*BK, n_kv);
+            }
+        } else if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW, type_kv>(K_s, k_base, k_nb1, kt_next*BK, n_kv);
             fattn_banded_mma_wait<1>(); // V tile of this iteration landed
         } else {
@@ -1517,8 +1611,19 @@ static __global__ void flash_attn_ext_banded_mma(
             }
         }
 
+        if constexpr (type_kv != GGML_TYPE_F16) {
+            // the next K tile, loaded during the PV MMAs (which read only V_s; every warp left the QK MMAs before the barrier above)
+            if (kt_next < kt_end) {
+                fattn_banded_mma_store_tile_q<D, NW, type_kv>(K_s, kq);
+            }
+        }
         __syncthreads();
-        if (kt_next < kt_end) {
+        if constexpr (type_kv != GGML_TYPE_F16) {
+            v_pending = kt_next < kt_end;
+            if (v_pending) {
+                fattn_banded_mma_issue_tile_q<D, NW, type_kv>(vq, v_base, v_nb1, kt_next*BK, n_kv);
+            }
+        } else if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW, type_kv>(V_s, v_base, v_nb1, kt_next*BK, n_kv);
         }
         kt = kt_next;
