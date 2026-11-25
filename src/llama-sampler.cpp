@@ -309,7 +309,8 @@ static float llama_token_data_max_logit(const llama_token_data * data, size_t si
 #ifdef LLAMA_SAMPLER_EXPF4
 // glibc's expf (sysdeps/ieee754/flt-32/e_expf.c, the FMA variant its ifunc picks on x86-64 with AVX2 and FMA) for 4
 // floats: the same double operations with the same constants and table, so the same bits. Lanes with |x| >= 88 or NaN
-// (special) are left to expf. It is used only when this matches the expf of the process (llama_sampler_expf4_ok).
+// (special) are left to expf, and the vector path sees 0 for them so it raises no FP exception expf would not. It is
+// used only when this matches the expf of the process (llama_sampler_expf4_ok).
 static const uint64_t llama_exp2f_tab[32] = {
     0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
     0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
@@ -324,7 +325,12 @@ static const uint64_t llama_exp2f_tab[32] = {
 __attribute__((target("avx2,fma")))
 static inline __m128 llama_expf4(__m128 x, int & special) {
     const __m128i abstop = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(x), 20), _mm_set1_epi32(0x7ff));
-    special = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(abstop, _mm_set1_epi32(0x42a))));
+    const __m128 smask = _mm_castsi128_ps(_mm_cmpgt_epi32(abstop, _mm_set1_epi32(0x42a)));
+    special = _mm_movemask_ps(smask);
+    // special lanes (-inf from masking, inf, NaN, |x| >= 88) are computed on 0 instead: their results are replaced
+    // by expf of the original input, and on -inf the range reduction would compute -inf - -inf, raising FE_INVALID
+    // where expf(-inf) raises nothing
+    x = _mm_blendv_ps(x, _mm_setzero_ps(), smask);
 
     const __m256d xd  = _mm256_cvtps_pd(x);
     const __m256d inv = _mm256_set1_pd(0x1.71547652b82fep+5);  // N/ln2, N = 32
