@@ -1216,6 +1216,131 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+// GPT4O expression with combining marks (also used by Granite and Inkling 2).
+// Match it without std::regex's input-dependent recursion / stack limits.
+static std::vector<size_t> unicode_regex_split_custom_gpt4o_marks(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+    const auto cpts = unicode_cpts_from_utf8(text);
+    size_t start = 0;
+
+    for (size_t offset : offsets) {
+        const size_t end = start + offset;
+        assert(end <= cpts.size());
+
+        auto get_cpt = [&] (size_t pos) -> uint32_t {
+            return pos < end ? cpts[pos] : 0xFFFFFFFF;
+        };
+        auto get_flags = [&] (size_t pos) -> unicode_cpt_flags {
+            return pos < end ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        };
+        auto is_word = [&] (size_t pos) -> bool {
+            const auto flags = get_flags(pos);
+            return flags.is_letter || flags.is_accent_mark;
+        };
+        // The lookaheads use ASCII case exclusions, not Unicode upper/lowercase:
+        // every non-ASCII letter and combining mark belongs to BOTH classes.
+        auto is_upper = [&] (size_t pos) -> bool {
+            const auto cpt = get_cpt(pos);
+            return is_word(pos) && !(cpt >= 'a' && cpt <= 'z');
+        };
+        auto is_lower = [&] (size_t pos) -> bool {
+            const auto cpt = get_cpt(pos);
+            return is_word(pos) && !(cpt >= 'A' && cpt <= 'Z');
+        };
+
+        for (size_t pos = start; pos < end;) {
+            const size_t token_start = pos;
+            const auto cpt = get_cpt(pos);
+            const auto flags = get_flags(pos);
+
+            // [^\r\n\p{L}\p{N}]? U* L+ | [^\r\n\p{L}\p{N}]? U+ L*
+            size_t word_start = pos;
+            if (cpt != '\r' && cpt != '\n' && !flags.is_letter && !flags.is_number && is_word(pos + 1)) {
+                ++word_start;
+            }
+            if (is_word(word_start)) {
+                pos = word_start;
+                size_t last_lower = word_start;
+                while (is_upper(pos)) {
+                    if (is_lower(pos)) {
+                        last_lower = pos + 1;
+                    }
+                    ++pos;
+                }
+                if (is_lower(pos)) {
+                    while (is_lower(pos)) {
+                        ++pos;
+                    }
+                } else if (last_lower > word_start) {
+                    // U* must give its last overlapping character back to L+.
+                    pos = last_lower;
+                } else if (word_start > token_start && flags.is_accent_mark) {
+                    // The optional prefix backtracks before trying U+ L*.
+                    // A leading mark alone satisfies the FIRST alternative:
+                    // "\u0301A" splits into "\u0301", "A", not one word.
+                    pos = token_start + 1;
+                }
+                // Otherwise only ASCII uppercase letters matched: U+ L* wins.
+
+                // Optional ASCII case-insensitive contraction, part of the word.
+                if (get_cpt(pos) == '\'') {
+                    const auto next = get_cpt(pos + 1) | 0x20;
+                    const auto last = get_cpt(pos + 2) | 0x20;
+                    if (next == 's' || next == 't' || next == 'm' || next == 'd') {
+                        pos += 2;
+                    } else if ((next == 'r' && last == 'e') || (next == 'v' && last == 'e') ||
+                               (next == 'l' && last == 'l')) {
+                        pos += 3;
+                    }
+                }
+            } else if (flags.is_number) {
+                // \p{N}{1,3}
+                do {
+                    ++pos;
+                } while (pos - token_start < 3 && get_flags(pos).is_number);
+            } else {
+                //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+                size_t punct_start = pos + (cpt == ' ');
+                const auto punct = get_flags(punct_start);
+                if (punct_start < end && !punct.is_whitespace && !punct.is_letter && !punct.is_number) {
+                    pos = punct_start;
+                    do {
+                        ++pos;
+                        const auto next = get_flags(pos);
+                        if (pos == end || next.is_whitespace || next.is_letter || next.is_number) {
+                            break;
+                        }
+                    } while (true);
+                    while (get_cpt(pos) == '\r' || get_cpt(pos) == '\n' || get_cpt(pos) == '/') {
+                        ++pos;
+                    }
+                } else {
+                    // \s*[\r\n]+ | \s+(?!\S) | \s+
+                    size_t last_newline = pos;
+                    while (get_flags(pos).is_whitespace) {
+                        if (get_cpt(pos) == '\r' || get_cpt(pos) == '\n') {
+                            last_newline = pos + 1;
+                        }
+                        ++pos;
+                    }
+                    if (last_newline > token_start) {
+                        pos = last_newline;
+                    } else if (pos < end && pos - token_start > 1) {
+                        --pos;
+                    }
+                    if (pos == token_start) {
+                        ++pos;
+                    }
+                }
+            }
+            bpe_offsets.push_back(pos - token_start);
+        }
+        start = end;
+    }
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -1236,6 +1361,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
         // K2-Horizon: llama3 splitter with marks + ZWNJ/ZWJ inside letter runs
         // (the generic std::regex fallback cannot parse \p{..} on MSVC)
         bpe_offsets = unicode_regex_split_custom_k2_horizon(text, offsets);
+    } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_gpt4o_marks(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
