@@ -391,34 +391,6 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     };
     // that decode step keeps the small SWA view dense, in the reserve too
     inp->banded_swa_dense = decode_banded;
-    for (int i = 0; i < (decode_banded ? 1 : 2) && inp->banded; ++i) {
-        // without the positions a ubatch of several sequences is dense at runtime, so the reserved worst case
-        // (a ubatch of every sequence) is dense too, else the dense graph outgrows the reserved buffer
-        bool use_pos = false;
-        inp->n_kv_banded[i] = inp->get_n_kv_banded(i ? attn->mctx->get_swa() : base, ubatch, use_pos);
-        if (use_pos) {
-            k_pos(i);
-        }
-    }
-    // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
-    // while at runtime it does so only for consecutive ones
-    if (inp->n_kv_banded[0] > 0 && n_tokens > 1 && ubatch.pos[0] == ubatch.pos[n_tokens - 1]) {
-        if (inp->banded_pos) {
-            // a gap, several sequences or a wrapped SWA cache take the positions at runtime: reserve that graph,
-            // it holds the contiguous one
-            for (int i = 0; i < 2; ++i) {
-                if (!inp->self_k_pos[i]) {
-                    inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : base)->get_n_kv();
-                    k_pos(i);
-                }
-            }
-        } else {
-            // without the positions a cache whose cells are not the positions is dense: a wrapped SWA cache,
-            // a sequence that does not start at cell 0
-            inp->n_kv_banded[0] = 0;
-            inp->n_kv_banded[1] = 0;
-        }
-    }
     // the causal attention without a mask (below) runs on the CUDA and CPU kernels only
     bool causal_devs = true;
     for (uint32_t il = 0; il < hparams.n_layer() && causal_devs; ++il) {
@@ -431,12 +403,14 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     }
     const bool causal_ok = inp->banded && cparams.n_seq_max == 1 && cparams.causal_attn && n_tokens <= 65535 &&
         causal_devs && inkling2_banded_causal_enabled();
-    // a padded span of 2 or more tokens (drafts, prompt tails) of the full-attention cache takes the positions when the
-    // causal attention applies: it then needs neither the shift table nor the n_kv x n_tokens mask, which the reserve graph
-    // (a full ubatch, causal) does not hold, so the first such span would grow the compute buffers
-    if (causal_ok && inp->banded_pad && n_tokens > 1 && inp->banded_pos != 0 && inp->n_kv_banded[0] > 0 && !inp->self_k_pos[0]) {
-        inp->n_kv_banded[0] = base->get_n_kv();
-        k_pos(0);
+    inp->banded_causal_ok = causal_ok;
+    // the cells of each cache and whether they take the positions, the decision can_reuse() repeats
+    bool use_pos[2];
+    inp->get_n_kv_banded(attn->mctx, ubatch, inp->n_kv_banded, use_pos);
+    for (int i = 0; i < 2; ++i) {
+        if (use_pos[i]) {
+            k_pos(i);
+        }
     }
     // the band of a padded span is shifted by the padding; with the positions the distances need no shift
     for (int i = 0; i < 2 && inp->banded_pad; ++i) {
