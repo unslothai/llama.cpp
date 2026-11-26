@@ -1875,7 +1875,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
-                const struct ggml_tensor * mask  = op->src[3];
                 const struct ggml_tensor * sinks = op->src[4];
                 const struct ggml_tensor * rel   = op->src[6];
 
