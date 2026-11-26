@@ -46,6 +46,8 @@ jobs:
   preflight:
     name: Dry-run the pin merges
     runs-on: ubuntu-24.04
+    outputs:
+      status: ${{ steps.p.outputs.status }}
     env:
       GH_TOKEN: ${{ github.token }}
       REPIN_TOKEN: ${{ secrets.REPIN_TOKEN }}
@@ -266,6 +268,22 @@ jobs:
             echo 'ALERT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # The tree the pins just merged into, for the Metal job below. Not on the
+      # schedule: that job only runs when pr-set.json changes or on dispatch.
+      - name: Save the merged tree for the Metal build
+        if: ${{ steps.p.outputs.status == 'success' && github.event_name != 'schedule' }}
+        run: git -C scratch archive --format=tar.gz -o "${RUNNER_TEMP}/merged.tar.gz" HEAD
+
+      - name: Upload the merged tree
+        if: ${{ steps.p.outputs.status == 'success' && github.event_name != 'schedule' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: pin-preflight-merged-tree
+          path: ${{ runner.temp }}/merged.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
       - name: Alert
         if: ${{ steps.p.outputs.status != 'skip' }}
         uses: ./.github/actions/prebuilt-alert
@@ -286,3 +304,37 @@ jobs:
         run: |
           echo "::error::pins do not merge onto the current base tag; see the alert above"
           exit 1
+
+  # Everything above runs on Linux, so it cannot see the Metal backend. On 11-25
+  # #431 shipped an unused local in ggml-metal-device.m that only the nightly's
+  # macOS leg caught, under -Werror, after the schedule had fanned out. This
+  # builds just the ggml-metal target of the tree the preflight merged, with the
+  # flags the nightly's arm64 leg passes (unsloth-prebuilt-macos.yml). macOS
+  # runners are scarce, so not on the schedule: only when pr-set.json changes
+  # (a push to any branch, which covers pin-set PR branches) or on dispatch.
+  metal:
+    name: Build ggml-metal with -Werror
+    needs: preflight
+    if: ${{ github.event_name != 'schedule' && needs.preflight.outputs.status == 'success' }}
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Download the merged tree
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: pin-preflight-merged-tree
+          path: merged
+
+      - name: Build ggml-metal
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          tar -xzf merged/merged.tar.gz -C src
+          cmake -S src -B build \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" --target ggml-metal
