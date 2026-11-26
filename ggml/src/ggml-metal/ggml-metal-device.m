@@ -1552,6 +1552,15 @@ static bool ggml_metal_supports_mul_mat_op(
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    // MXFP8 has no Metal kernels: report it unsupported so the scheduler keeps these ops on the
+    // CPU instead of aborting in the pipeline lookup
+    for (int i = -1; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * t = i < 0 ? op : op->src[i];
+        if (t != NULL && t->type == GGML_TYPE_MXFP8) {
+            return false;
+        }
+    }
+
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
