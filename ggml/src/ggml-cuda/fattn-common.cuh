@@ -44,6 +44,57 @@ using fattn_kernel_t = void (*)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t s31,  const int64_t s32,  const int64_t s33);
 
+// a relative-position bias read inside the kernel instead of a materialized [n_kv, n_q, n_head, n_seq] F16 mask:
+//   idx  = rp[kv*rp_kv + q*rp_q + s*rp_s]                                       (I32)
+//   v    = tab[h*tab_h + idx*tab_r + q*tab_q + s*tab_s] (- sub[h*sub_h + q*sub_q + s*sub_s])   (F32)
+//   mask = half(float(half(v)) + float(mask))
+// which is the value of GET_ROWS, CPY to F16 and the F16 ADD of the mask (strides in bytes)
+struct fattn_rel_bias {
+    const char * tab;
+    const char * sub;
+    const char * rp;
+    int64_t tab_h, tab_r, tab_q, tab_s;
+    int64_t sub_h, sub_q, sub_s;
+    int64_t rp_kv, rp_q, rp_s;
+    int skip_debug; // GGML_CUDA_FA_VEC_MASK_SKIP_DEBUG: print the KV chunks the vector kernel skipped
+};
+
+using fattn_rel_kernel_t = void (*)(
+        const float2 * __restrict__ Q,
+        const char   * __restrict__ K,
+        const char   * __restrict__ V,
+        const half   * __restrict__ mask,
+        const float  * __restrict__ sinks,
+        const int    * __restrict__ KV_max,
+        const int    * __restrict__ KV_rows,
+        float        * __restrict__ dst,
+        float2       * __restrict__ dst_meta,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t s01,  const int32_t s02,  const int32_t s03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t s11,  const int32_t s12,  const int64_t s13,
+                            const int32_t s21,  const int32_t s22,  const int64_t s23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t s31,  const int64_t s32,  const int64_t s33,
+        const fattn_rel_bias rel);
+
+static __device__ __forceinline__ half fattn_rel_bias_value(
+        const fattn_rel_bias & rel, const int h, const int q, const int s, const int kv, const half m) {
+    const int idx = *(const int *) (rel.rp + kv*rel.rp_kv + q*rel.rp_q + s*rel.rp_s);
+    float v = *(const float *) (rel.tab + h*rel.tab_h + int64_t(idx)*rel.tab_r + q*rel.tab_q + s*rel.tab_s);
+    if (rel.sub) {
+        v = __fsub_rn(v, *(const float *) (rel.sub + h*rel.sub_h + q*rel.sub_q + s*rel.sub_s));
+    }
+    // CPY F32 -> F16, then the F16 ADD of the mask, which adds in F32 and rounds to F16
+    return __float2half(__fadd_rn(__half2float(__float2half(v)), __half2float(m)));
+}
+
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
@@ -1287,7 +1338,9 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel,
     const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
+    const ggml_tensor * rel_mask = nullptr, const fattn_rel_bias * rel_bias = nullptr, fattn_rel_kernel_t rel_kernel = nullptr,
+    fattn_kernel_t exec_kernel = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1315,6 +1368,12 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+
+    // the relative bias is read in the kernel: the mask is the F16 mask it was added to, without a head dimension
+    if (rel_bias) {
+        GGML_ASSERT(rel_kernel && rel_mask && rel_mask->type == GGML_TYPE_F16 && rel_mask->ne[2] == 1);
+        mask = rel_mask;
+    }
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1433,7 +1492,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    const bool scan_mask = !use_sparse && !rel_bias && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1573,7 +1632,32 @@ void launch_fattn(
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
-    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+    // the occupancy and with it the split above come from fattn_kernel, so that the result is the same as without rel_kernel
+    if (rel_kernel) {
+        ggml_cuda_kernel_launch(rel_kernel, launch_params,
+            (const float2 *) Q->data,
+            (const char *) K_data,
+            (const char *) V_data,
+            (const half *) mask->data,
+            sinks ? ((const float *) sinks->data) : nullptr,
+            KV_max.ptr,
+            kv_rows ? (const int *) kv_rows->data : nullptr,
+            !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+            scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+            Q->ne[0], ne01, Q->ne[2], Q->ne[3],
+            int32_t(Q->nb[1] / sizeof(float2)), int32_t(Q->nb[2] / sizeof(float2)), int32_t(Q->nb[3] / sizeof(float2)),
+            K->ne[0], n_kv, K->ne[2], K->ne[3],
+            int32_t(nb11 / sizeof(T_K_stride)), int32_t(nb12 / sizeof(T_K_stride)), int64_t(nb13 / sizeof(T_K_stride)),
+            int32_t(nb21 / sizeof(T_V_stride)), int32_t(nb22 / sizeof(T_V_stride)), int64_t(nb23 / sizeof(T_V_stride)),
+            mask->ne[1], mask->ne[2], mask->ne[3],
+            int32_t(mask->nb[1] / sizeof(half)),
+            int64_t(mask->nb[2] / sizeof(half)),
+            int64_t(mask->nb[3] / sizeof(half)),
+            *rel_bias
+        );
+    } else
+    // exec_kernel: a variant of fattn_kernel with the same results; the occupancy and the split still come from fattn_kernel
+    ggml_cuda_kernel_launch(exec_kernel ? exec_kernel : fattn_kernel, launch_params,
         (const float2 *) Q->data,
         (const char *) K_data,
         (const char *) V_data,

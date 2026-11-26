@@ -859,3 +859,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+bool ggml_cuda_flash_attn_ext_uses_vec(int device, const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_VEC &&
+        ggml_cuda_get_fattn_vec_case(dst->src[0]->ne[0], dst->src[1]->type, dst->src[2]->type) != nullptr;
+}
