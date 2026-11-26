@@ -1,5 +1,5 @@
 <script lang="ts">
-	import ContextGaugePopup from './ChatFormContextGauge/ContextGaugePopup.svelte';
+	import ContextGaugeDrawer from './ChatFormContextGauge/ContextGaugeDrawer.svelte';
 	import { microphoneUnavailableReason, warmUpVoiceCapture } from '@ggml-org/llama-voice';
 	import { VoiceRecorder } from '@ggml-org/llama-voice/svelte';
 	import { Maximize, Minimize } from '@lucide/svelte';
@@ -13,21 +13,25 @@
 		ChatFormInputFileInputInvisible,
 		ChatFormMcpResourcesList,
 		ChatFormPickers,
+		ChatFormSystemMessageAttachment,
+		ChatFormSystemMessageChip,
 		DialogMcpResourcesBrowser
 	} from '#lib/components/app/index.ts';
 	import {
-		CHAT_FORM_SINGLE_ROW_MAX_TEXT_PX,
+		CHAT_FORM_SINGLE_ROW_MAX_TEXT_LINES,
 		CLIPBOARD_CONTENT_QUOTE_PREFIX,
 		ICON_CLASS_DEFAULT,
 		INITIAL_FILE_SIZE,
 		PROMPT_CONTENT_SEPARATOR,
 		SETTING_CONFIG_DEFAULT,
+		SYSTEM_MESSAGE_PLACEHOLDER,
 		VOICE_EDITOR_SELECTOR
 	} from '#lib/constants/index.ts';
 	import {
 		ContentPartType,
 		FileExtensionText,
 		KeyboardKey,
+		MessageRole,
 		MimeTypeText,
 		SpecialFileType,
 		ToolSource
@@ -87,6 +91,8 @@
 		placeholder?: string;
 		showAddButton?: boolean;
 		showModelSelector?: boolean;
+		/** Writing the system message: the form takes the system message's dashed, muted look. */
+		systemMode?: boolean;
 
 		// Event Handlers
 		onAttachmentRemove?: (index: number) => void;
@@ -120,6 +126,7 @@
 		showAddButton = true,
 		showModelSelector = true,
 		singleRow = false,
+		systemMode = false,
 		uploadedFiles = $bindable([]),
 		value = $bindable(''),
 		voiceRecorder
@@ -147,6 +154,23 @@
 
 	let cwd = $derived(
 		conversationsStore.activeConversation?.cwd ?? conversationsStore.preferences.pendingCwd
+	);
+
+	let systemMessage = $derived(
+		conversationsStore.activeMessages.find((m) => m.role === MessageRole.SYSTEM)
+	);
+	// A new chat shows the system message written for it as an attachment, until the first
+	// message sends it. A conversation with one offers it in a chip under the form.
+	// A placeholder is one nobody has written yet
+	let systemMessageAttachment = $derived.by(() => {
+		if (conversationsStore.activeConversation) return null;
+
+		const content = chatStore.pendingSystemMessage;
+
+		return content && content.trim() && content !== SYSTEM_MESSAGE_PLACEHOLDER ? content : null;
+	});
+	let systemMessageChip = $derived(
+		conversationsStore.activeConversation ? systemMessage?.content : undefined
 	);
 
 	let showWorkingDirectory = $derived(conversationsStore.preferences.hasEnabledCwdTools());
@@ -289,12 +313,14 @@
 	// wrapped, as the wider row of its own would fit it again and flip it straight back
 	let textHeight = $state<number | null>(null);
 	let wrappedAtLength = Infinity;
+	let lastLength = 0;
 	let canBeSingleRow = $derived(
 		singleRow &&
 			!deviceStore.isMobile &&
 			!isExpanded &&
 			!voice.isActive &&
 			!hasAttachments &&
+			!systemMessageAttachment &&
 			!mcpStore.resources.hasAttachments &&
 			!value.includes('\n')
 	);
@@ -306,11 +332,16 @@
 	$effect(() => {
 		void textHeight;
 
-		const height = inputRef?.getContentDOM()?.offsetHeight ?? 0;
-		const fitsOneLine = height < CHAT_FORM_SINGLE_ROW_MAX_TEXT_PX;
+		const content = inputRef?.getContentDOM();
+		const lineHeight = content ? parseFloat(getComputedStyle(content).lineHeight) : 0;
+		const lines = content && lineHeight ? content.offsetHeight / lineHeight : 0;
+		const fitsOneLine = lines < CHAT_FORM_SINGLE_ROW_MAX_TEXT_LINES;
 		const length = value.length;
 
-		if (!length) wrappedAtLength = Infinity;
+		// an emptied form tries the one row again; one that wraps while empty keeps the two rows
+		if (!length && lastLength) wrappedAtLength = Infinity;
+
+		lastLength = length;
 
 		if (!canBeSingleRow) {
 			isSingleRow = false;
@@ -680,6 +711,12 @@
 
 <svelte:window onkeydown={handleWindowKeydown} />
 
+{#snippet systemMessageLeading()}
+	{#if systemMessageAttachment}
+		<ChatFormSystemMessageAttachment content={systemMessageAttachment} {disabled} />
+	{/if}
+{/snippet}
+
 <ChatFormInputFileInputInvisible bind:this={fileInputRef} onFileSelect={handleFileSelect} />
 
 <form
@@ -758,6 +795,7 @@
 				'max-md:border-transparent max-md:focus-within:border-transparent max-md:dark:border-transparent max-md:dark:focus-within:border-transparent',
 				EXPANDED_SHEET_FILL
 			],
+			systemMode && '!border-2 !border-dashed !border-border/50 !bg-muted',
 			disabled && 'cursor-not-allowed opacity-60'
 		]}
 		data-single-row={isSingleRow || undefined}
@@ -779,6 +817,7 @@
 			activeModelId={activeModelId ?? undefined}
 			{attachments}
 			class={isExpanded ? 'py-5 max-md:px-(--chat-form-side-inset)' : 'py-5'}
+			leading={systemMessageAttachment ? systemMessageLeading : undefined}
 			limitToSingleRow
 			onFileRemove={handleFileRemove}
 			style="scroll-padding: 1rem;"
@@ -870,7 +909,7 @@
 						voice={{
 							action: voice.label,
 							hint: voice.hint,
-							prepare: () => void voice.prepare(),
+							prepare: voice.prepare,
 							show: voice.showButton,
 							unavailableReason: voice.unavailableReason,
 							unprepare: voice.unprepare
@@ -882,7 +921,9 @@
 		</div>
 	</div>
 
-	<ContextGaugePopup />
+	{#if deviceStore.isMobile}
+		<ContextGaugeDrawer />
+	{/if}
 
 	<!-- iOS Safari tints its bottom toolbar from a solid fixed element at the screen's bottom
 	     edge: this strip carries the sheet's fill while it rests -->
@@ -896,21 +937,27 @@
 		></div>
 	{/if}
 
-	{#if showWorkingDirectory}
-		<!-- opened from the chip, the + menu, a phone chat's header or `/cwd` -->
-		<ChatFormCurrentWorkingDirectory
-			bind:query={pickers.workingDirectoryQuery}
-			class="self-start"
-			customAnchor={activePickerAnchor}
-			directory={cwd}
-			{disabled}
-			isOpen={pickers.isWorkingDirectoryPickerOpen}
-			onChange={handleWorkingDirectoryChange}
-			onClose={pickers.handleWorkingDirectoryClose}
-			onOpen={pickers.handleWorkingDirectoryOpen}
-			showChip={showWorkingDirectoryChip}
-		/>
-	{/if}
+	<div class="flex flex-wrap items-center gap-x-1 self-start">
+		{#if showWorkingDirectory}
+			<!-- opened from the chip, the + menu, a phone chat's header or `/cwd` -->
+			<ChatFormCurrentWorkingDirectory
+				bind:query={pickers.workingDirectoryQuery}
+				class="self-start"
+				customAnchor={activePickerAnchor}
+				directory={cwd}
+				{disabled}
+				isOpen={pickers.isWorkingDirectoryPickerOpen}
+				onChange={handleWorkingDirectoryChange}
+				onClose={pickers.handleWorkingDirectoryClose}
+				onOpen={pickers.handleWorkingDirectoryOpen}
+				showChip={showWorkingDirectoryChip}
+			/>
+		{/if}
+
+		{#if systemMessageChip}
+			<ChatFormSystemMessageChip content={systemMessageChip} {disabled} />
+		{/if}
+	</div>
 </form>
 
 <DialogMcpResourcesBrowser
