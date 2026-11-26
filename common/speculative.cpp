@@ -216,6 +216,12 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // set while process() runs from common_speculative_process_async: outputs may be read in sync() instead
+    bool defer_outputs = false;
+
+    // (optional) finish the work process() left in flight
+    virtual void sync() {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1148,7 +1154,35 @@ protected:
     // called after the injection of a chunk, while h_nextn still holds the context features of batch_inject
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
 
+    // the last injected chunk whose context features are not stored yet (defer_outputs)
+    // reading h_nextn waits for the draft decode, so it is put off until the next use of ctx_dft or sync()
+    llama_seq_id pending_seq_id  = -1;
+    int32_t      pending_n_chunk = 0;
+
+    void store_pending_context_features() {
+        if (pending_seq_id < 0) {
+            return;
+        }
+        const llama_seq_id seq_id = pending_seq_id;
+        pending_seq_id = -1;
+        store_context_features(seq_id, pending_n_chunk);
+    }
+
+    // after the decode of batch_inject: store now, or leave it for later; batch_inject must not change until then
+    void store_or_defer_context_features(llama_seq_id seq_id, int32_t n_chunk) {
+        if (defer_outputs) {
+            pending_seq_id  = seq_id;
+            pending_n_chunk = n_chunk;
+            return;
+        }
+        store_context_features(seq_id, n_chunk);
+    }
+
 public:
+    void sync() override {
+        store_pending_context_features();
+    }
+
     ~common_speculative_impl_draft_dflash() override {
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
@@ -1233,6 +1267,9 @@ public:
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
+                // batch_inject is rebuilt below and h_nextn overwritten by the decode
+                store_pending_context_features();
+
                 if (use_dev_features) {
                     // the features are the target batch rows in the target's device buffer
                     batch_inject.clear();
@@ -1249,7 +1286,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
-                    store_context_features(seq_id, n_chunk);
+                    store_or_defer_context_features(seq_id, n_chunk);
                     continue;
                 }
 
@@ -1280,7 +1317,7 @@ public:
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
-                store_context_features(seq_id, n_chunk);
+                store_or_defer_context_features(seq_id, n_chunk);
             }
         }
 
@@ -1288,6 +1325,8 @@ public:
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        store_pending_context_features();
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -1480,6 +1519,8 @@ public:
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        store_pending_context_features();
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -1694,6 +1735,8 @@ public:
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        store_pending_context_features();
+
         auto * ctx = params.ctx_dft;
         const size_t width = n_embd_dec;
         struct block_data {
@@ -1881,6 +1924,8 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        store_pending_context_features();
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -2061,6 +2106,8 @@ protected:
 
 public:
     void draft(common_speculative_draft_params_vec & dparams) override {
+        store_pending_context_features();
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -3854,6 +3901,36 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+bool common_speculative_process_async(common_speculative * spec, const common_batch & batch) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        struct defer_scope {
+            bool & flag;
+            explicit defer_scope(bool & f) : flag(f) { flag = true; }
+            ~defer_scope() { flag = false; }
+        } scope(impl->defer_outputs);
+
+        result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+void common_speculative_sync(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->sync();
+    }
 }
 
 void common_speculative_draft(common_speculative * spec) {
