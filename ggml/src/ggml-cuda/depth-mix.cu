@@ -555,7 +555,7 @@ static int depth_mix_try(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, 
         const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
             && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
         return !bad_padding_clear && src1->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
-            !ggml_cuda_op_mul_mat_use_fwht(mm) && ggml_cuda_should_use_mmvf(src0, cc, warp_size, src1->ne[1]);
+            !ggml_cuda_op_mul_mat_use_fwht(mm) && ggml_cuda_should_use_mmvf(src0, src1->type, cc, warp_size, src1->ne[1], /*mul_mat_id =*/ false);
     };
     if (!takes_mmvf(mm1)) {
         DEPTH_MIX_DECLINE("first product not MMVF");
