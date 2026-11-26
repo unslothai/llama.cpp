@@ -15038,14 +15038,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 33, n_kv, 32, 4, GGML_TYPE_Q8_0, GGML_TYPE_F32));
     }
     // layouts and masks backends may refuse: K/V rows padded off a 4-element boundary, a mask wider than K, and (banded)
-    // K/V head counts that differ. Left out: plain FA with padded F16/F16 rows, which CUDA FA reads in place and gets wrong
+    // K/V head counts that differ. Left out: plain FA with a padded F16 K or V, which CUDA FA reads in place: wrong for
+    // F16/F16, and an abort on rows off a 4-byte boundary since the FA loads take half2 strides (ggml-org#32901)
     //                                                   banded,   d, nh, n_q, n_kv, type_k,          type_v,     hk, hv, pad, mask_cols
     for (int64_t n_q : { 1, 33 }) {
         test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, n_q, 64, GGML_TYPE_F16, GGML_TYPE_F16, 2, 2, 1, 64));
     }
     for (bool banded : { false, true }) {
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
-        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        if (banded) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        }
         test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0, 128));
         test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0,  64));
     }
