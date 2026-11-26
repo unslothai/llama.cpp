@@ -366,6 +366,7 @@ struct common_params_speculative_draft {
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
+    bool threads_set = false; // -td / -tbd given: keep them, see common_speculative_size_block_threads
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 

@@ -4046,6 +4046,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during generation (default: same as --threads)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.n_threads = value;
+            params.speculative.draft.threads_set = true;
             if (params.speculative.draft.cpuparams.n_threads <= 0) {
                 params.speculative.draft.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -4056,6 +4057,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during batch and prompt processing (default: same as --threads-draft)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams_batch.n_threads = value;
+            params.speculative.draft.threads_set = true;
             if (params.speculative.draft.cpuparams_batch.n_threads <= 0) {
                 params.speculative.draft.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
             }

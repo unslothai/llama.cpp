@@ -3473,6 +3473,40 @@ static void common_speculative_size_block_ubatch(const common_params & params, c
     }
 }
 
+// a block drafter with every layer on the GPU leaves the CPU only the row gathers from host-resident weights (the
+// target's token embedding of the anchor). On the CPU backend such a split wakes every thread of the pool, which costs
+// more than the whole draft decode on the GPU: with 96 threads about 0.9-2 ms per draft step against about 0.1 ms with
+// one. Unless -td / -tbd are given, such a draft context runs its CPU splits on one thread.
+static void common_speculative_size_block_threads(const common_params & params, const llama_model * model_dft,
+        const llama_model_params & mparams, llama_context_params & cparams) {
+    const bool has_block_draft = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
+        });
+    const auto & draft = params.speculative.draft;
+    if (!has_block_draft || draft.threads_set || !draft.tensor_buft_overrides.empty() || !llama_supports_gpu_offload()) {
+        return;
+    }
+    // every repeating layer and the output layer offloaded, to a GPU when the draft devices are given
+    if (mparams.n_gpu_layers >= 0 && mparams.n_gpu_layers <= llama_model_n_layer(model_dft)) {
+        return;
+    }
+    if (!draft.devices.empty() && std::none_of(draft.devices.begin(), draft.devices.end(), [](ggml_backend_dev_t dev) {
+            return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        })) {
+        return;
+    }
+    if (cparams.n_threads > 1 || cparams.n_threads_batch > 1) {
+        LOG_INF("%s: draft n_threads = 1 (every draft layer is offloaded), set --spec-draft-threads to override\n", __func__);
+        cparams.n_threads       = 1;
+        cparams.n_threads_batch = 1;
+    }
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -3521,6 +3555,7 @@ common_speculative_init_result::common_speculative_init_result(
         pimpl->model.reset(model_dft);
 
         common_speculative_size_block_ubatch(params, model_dft, cparams);
+        common_speculative_size_block_threads(params, model_dft, mparams, cparams);
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
