@@ -334,6 +334,40 @@ llama_model_dflash::graph_inkling2_head::graph_inkling2_head(const llm_graph_par
 //   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
 //   each step draws its token at 1/temp (0: argmax) and packs [token, k, ids, probs] into h_nextn
 // softcap_after_bias: softcap(base + bias) instead of leaving the logits uncapped
+// true when no draft row of the ubatch asks for a draw: every draft row of the rnn state has 1/temp = 0 (the host
+// sets it only for probabilistic drafting). The chain then follows the argmax, which is the token a draw keeps on
+// greedy rows, so the top-k candidates and the packed draws can be skipped.
+static bool dspark_rnn_rows_greedy(const llama_ubatch & ubatch, int64_t n_embd, int64_t block_drafts, int64_t i_draft_beg) {
+    if (!ubatch.embd_state || block_drafts <= 0) {
+        return false;
+    }
+    for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+        if ((int64_t) t % block_drafts >= i_draft_beg && ubatch.embd_state[(size_t) t*n_embd + 1] > 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// a greedy and a drawing graph differ in topology
+struct dspark_draw_mode_input : llm_graph_input_i {
+    dspark_draw_mode_input(bool greedy, int64_t n_embd, int64_t block_drafts, int64_t i_draft_beg)
+        : greedy(greedy), n_embd(n_embd), block_drafts(block_drafts), i_draft_beg(i_draft_beg) {}
+
+    void set_input(const llama_ubatch * /*ubatch*/) override {}
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const int64_t n_blocks = params.ubatch.n_seqs_unq;
+        return n_blocks > 0 && (int64_t) params.ubatch.n_tokens == n_blocks*block_drafts &&
+            dspark_rnn_rows_greedy(params.ubatch, n_embd, block_drafts, i_draft_beg) == greedy;
+    }
+
+    const bool    greedy;
+    const int64_t n_embd;
+    const int64_t block_drafts;
+    const int64_t i_draft_beg;
+};
+
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
         ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false) {
     ggml_context * ctx0 = g.ctx0;
@@ -390,11 +424,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
     ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
     ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
+    bool greedy_rows = false;          // no row draws: follow the argmax and skip the draws
     if (rnn_state) {
         // the anchor row holds f_rnn, so it cannot be a draft row
         GGML_ASSERT(!has_conf && !sample_from_anchor && rnn_state->ne[0] == n_embd);
         f_rnn = state_rows(n_embd, 0, 0);
-        if (block_drafts > i_draft_beg) {
+        greedy_rows = dspark_rnn_rows_greedy(g.ubatch, n_embd, block_drafts, i_draft_beg);
+        res->add_input(std::make_unique<dspark_draw_mode_input>(greedy_rows, n_embd, block_drafts, i_draft_beg));
+        if (block_drafts > i_draft_beg && !greedy_rows) {
             inv_temp  = state_rows(1, 1, i_draft_beg);
             is_greedy = ggml_scale_bias(ctx0, ggml_step(ctx0, inv_temp), -1.0f, 1.0f);
         }
@@ -446,7 +483,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
-        if (rnn_state) {
+        if (rnn_state && !greedy_rows) {
             cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
         }
     }
@@ -523,7 +560,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (rnn_state) {
+        if (rnn_state && !greedy_rows) {
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
         } else if (i + 1 < block_drafts) {
