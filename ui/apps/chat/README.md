@@ -55,7 +55,7 @@ The app reaches the llama-server on its own origin by default (llama-server serv
 - **Rendering** - Markdown (GFM), code highlighting, KaTeX math and Mermaid diagrams
 - **Models** - in ROUTER mode, a selector and a models manager: load and unload, downloads, Discover from the Hugging Face Hub, favorites and hidden models
 - **Tools** - built-in browser tools, llama-server's tools and MCP servers, each behind a permission prompt
-- **Everywhere** - light and dark themes, phone layouts, installable as a PWA, keyboard shortcuts (`Ctrl/Cmd+K` search, `Shift+Ctrl/Cmd+O` new chat, `Ctrl/Cmd+B` sidebar)
+- **Everywhere** - light and dark themes, phone layouts, installable as a PWA, keyboard shortcuts (`Ctrl/Cmd+K` search, `Shift+Ctrl/Cmd+O` new chat, `Ctrl/Cmd+B` sidebar, `Esc` stop the reply)
 
 ## Development
 
@@ -161,7 +161,7 @@ llama-server serves the UI with `Cross-Origin-Embedder-Policy: require-corp` and
 
 llama-server embeds it: when llama-server is built, `scripts/ui-assets.cmake` takes `ui/apps/chat/dist` if it exists, runs `npm run build` if `LLAMA_BUILD_UI` is on, or downloads the release's prebuilt `dist.tar.gz` from Hugging Face, and compiles every file into the binary. The same `dist` is what `npx @ggml-org/llama-chat` serves.
 
-**Plain chat and agent mode.** Llama Chat is a plain chat, a message and its reply with reasoning when the model gives it, unless llama-server offers the agentic features: its built-in tools or its proxy, which `llama-server --agent` turns on together. The app reads this from `/props` and `/tools`. With them it shows the tools menu, the working folder, MCP and the Tools and Agentic settings, and runs the agentic loop; without them it shows none of these and sends the classic request. Tool calls in earlier conversations still display.
+**Plain chat and agent mode.** Llama Chat is a plain chat, a message and its reply with reasoning when the model gives it, unless llama-server offers the agentic features: its built-in tools or its proxy, which `llama-server --agent` turns on together. `llama-server --ui-agent` turns agent mode on with neither: the model gets only the tools that run in the browser, and MCP servers the browser reaches itself. The app reads this from `/props` and `/tools`. With them it shows the tools menu, the working folder, MCP and the Tools and Agentic settings, and runs the agentic loop; without them it shows none of these and sends the classic request. Tool calls in earlier conversations still display.
 
 **Chat-only build.** `VITE_PUBLIC_AGENTIC=false npm run build` builds an app that is a plain chat for every server, and `npm run dev:chat-only` runs the dev server the same way. Llama Harness's loop is left out of its bundle.
 
