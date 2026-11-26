@@ -21,17 +21,21 @@ enum htp_data_type {
     HTP_TYPE_F16    = 1,
     HTP_TYPE_Q4_0   = 2,
     HTP_TYPE_Q4_1   = 3,
+    HTP_TYPE_Q5_0   = 6,
+    HTP_TYPE_Q5_1   = 7,
     HTP_TYPE_Q8_0   = 8,
     HTP_TYPE_Q2_K   = 10,
     HTP_TYPE_Q3_K   = 11,
     HTP_TYPE_Q4_K   = 12,
     HTP_TYPE_Q5_K   = 13,
     HTP_TYPE_Q6_K   = 14,
+    HTP_TYPE_IQ2_XXS = 16,
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
     HTP_TYPE_I64    = 27,
     HTP_TYPE_BF16   = 30,
     HTP_TYPE_MXFP4  = 39,
+    HTP_TYPE_NVFP4  = 40,
     HTP_TYPE_Q1_0   = 41,
     HTP_TYPE_Q2_0   = 42,
 
@@ -123,7 +127,9 @@ enum htp_op_code {
     HTP_OP_DSV4_HC_POST,
     HTP_OP_TOP_K_MASK,
     HTP_OP_LIGHTNING_INDEXER,
-
+    HTP_OP_SSM_SCAN,
+    HTP_OP_TIMESTEP_EMBEDDING,
+    HTP_OP_MUL_MAT_NX_GLU,
     HTP_OP_INVALID
 };
 
@@ -149,10 +155,11 @@ enum htp_op_code {
 #define HTP_DDR_SPAD_SIZE  (512 * 1024)
 
 enum htp_tensor_flags {
-    HTP_TENSOR_WEIGHT   = (1U << 0), // Tensor buffer model weight data (not compute)
-    HTP_TENSOR_TILED    = (1U << 1), // Tensor is in tiled format
-    HTP_TENSOR_FENCE    = (1U << 2), // Tensor is synchronization fence (explicitly managed)
-    HTP_TENSOR_FUSEABLE = (1U << 3), // Tensor can be fused (host-only)
+    HTP_TENSOR_WEIGHT      = (1U << 0), // Tensor buffer model weight data (not compute)
+    HTP_TENSOR_TILED       = (1U << 1), // Tensor is in tiled format
+    HTP_TENSOR_FENCE       = (1U << 2), // Tensor is synchronization fence (explicitly managed)
+    HTP_TENSOR_FUSEABLE    = (1U << 3), // Tensor can be fused (host-only)
+    HTP_TENSOR_LOWERED_F16 = (1U << 4), // F32 tensor lowered in-place to F16 (host-only)
 };
 
 enum htp_buf_flags {
