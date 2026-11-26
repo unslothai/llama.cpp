@@ -1568,6 +1568,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
     }
 
+    // IQ1_XS/IQ1_XXS/IQ1_XXXS have no Metal kernels: report them unsupported so the scheduler
+    // keeps these ops on the CPU instead of aborting in the pipeline lookup
+    for (int i = -1; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * t = i < 0 ? op : op->src[i];
+        if (t != NULL && (t->type == GGML_TYPE_IQ1_XS || t->type == GGML_TYPE_IQ1_XXS || t->type == GGML_TYPE_IQ1_XXXS)) {
+            return false;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_SCALE:
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16);
