@@ -2305,6 +2305,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+            {
+                // as for GET_ROWS: waking the other threads costs more than a small copy, e.g. the cont of the
+                // anchor ids that a DSpark draft block gathers on the CPU in every draft step
+                n_tasks = ggml_nelements(node) >= 4096 ? n_threads : 1;
+            } break;
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ACC:
