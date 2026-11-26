@@ -257,6 +257,7 @@ jobs:
             -DGGML_CUDA=ON `
             -DGGML_CUDA_CUB_3DOT2=ON `
             "-DGGML_CUDA_CCCL_VERSION=v3.4.3" `
+            "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;q8_0-q4_0;f16-f16;bf16-bf16" `
             -DLLAMA_BUILD_TESTS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TOOLS=OFF `
