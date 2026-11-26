@@ -407,6 +407,27 @@ private:
 
     sched_params sched_params_cur;
 
+    // a draft context (an MTP context, or one that reads the target context, e.g. DFlash / DSpark) alternates between
+    // graphs of different kinds in every draft step, e.g. the injection of the target features (embd input) and the
+    // draft decode (token input)
+    // a graph can only be reused while the scheduler still holds its allocation, so each kind gets its own scheduler and
+    // graph results: sched, gf_res_prev and gf_res_prev_active belong to graph kind sched_kind, sched_slots[k] holds the
+    // ones of kind k while another kind is active
+    struct sched_slot {
+        ggml_backend_sched_ptr              sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active = nullptr;
+    };
+
+    std::array<sched_slot, 4> sched_slots; // kind = (embd input) | 2*(encoder graph)
+    int                       sched_kind = 0;
+
+    // make the scheduler and graph results of graph kind `kind` active, created on first use
+    void sched_select(int kind);
+
+    // make kind 0 active and free the other schedulers, before the scheduler is reserved or reset
+    void sched_slots_free();
+
     bool sched_need_reserve = true;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()

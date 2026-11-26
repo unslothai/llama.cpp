@@ -643,6 +643,8 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    sched_slots_free();
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -788,6 +790,55 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+void llama_context::sched_select(int kind) {
+    if (kind == sched_kind) {
+        return;
+    }
+
+    {
+        auto & slot = sched_slots[sched_kind];
+        std::swap(slot.sched,              sched);
+        std::swap(slot.gf_res_prev,        gf_res_prev);
+        std::swap(slot.gf_res_prev_active, gf_res_prev_active);
+    }
+    {
+        auto & slot = sched_slots[kind];
+        std::swap(slot.sched,              sched);
+        std::swap(slot.gf_res_prev,        gf_res_prev);
+        std::swap(slot.gf_res_prev_active, gf_res_prev_active);
+    }
+    sched_kind = kind;
+
+    if (!sched) {
+        const auto & params = sched_params_cur;
+
+        LLAMA_LOG_DEBUG("%s: new scheduler for graph kind %d\n", __func__, kind);
+
+        sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
+
+        ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+        for (auto & res : gf_res_prev) {
+            res = std::make_unique<llm_graph_result>(graph_max_nodes());
+        }
+        gf_res_prev_active = nullptr;
+    }
+}
+
+void llama_context::sched_slots_free() {
+    sched_select(0);
+
+    for (auto & slot : sched_slots) {
+        slot.gf_res_prev_active = nullptr;
+        for (auto & res : slot.gf_res_prev) {
+            res.reset();
+        }
+        slot.sched.reset();
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -798,6 +849,8 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    sched_slots_free();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1064,6 +1117,14 @@ bool llama_context::memory_update(bool optimize) {
             res->reset();
         }
         gf_res_prev_active = nullptr;
+        for (auto & slot : sched_slots) {
+            for (auto & res : slot.gf_res_prev) {
+                if (res) {
+                    res->reset();
+                }
+            }
+            slot.gf_res_prev_active = nullptr;
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1825,6 +1886,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // the graph kinds of a draft context alternate every draft step, see sched_slots
+    const bool is_draft = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.ctx_other != nullptr;
+    if (is_draft && !graph_reuse_disable && !sched_params_cur.parallel) {
+        sched_select(((ubatch.embd || ubatch.embd_row) ? 1 : 0) | (gtype == LLM_GRAPH_TYPE_ENCODER ? 2 : 0));
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3042,6 +3109,8 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    sched_slots_free();
+
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
@@ -4197,6 +4266,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            for (const auto & slot : sched_slots) {
+                if (slot.sched) {
+                    ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+                }
+            }
         }
     }
     return ret;
