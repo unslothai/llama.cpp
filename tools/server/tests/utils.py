@@ -141,6 +141,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     llama_cache: str | None = None
+    share_console: bool = False  # Windows: console control events only reach a server on the console of the tests
 
     # session variables
     process: subprocess.Popen | None = None
@@ -340,9 +341,10 @@ class ServerProcess:
 
         flags = 0
         if "nt" == os.name:
-            flags |= subprocess.DETACHED_PROCESS
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-            flags |= subprocess.CREATE_NO_WINDOW
+            if not self.share_console:
+                flags |= subprocess.DETACHED_PROCESS
+                flags |= subprocess.CREATE_NO_WINDOW
 
         if self.log_path:
             self._log = open(self.log_path, "w")
@@ -900,6 +902,11 @@ def get_lan_ip(server: ServerProcess) -> str | None:
 
 def is_slow_test_allowed():
     return os.environ.get("SLOW_TESTS") == "1" or os.environ.get("SLOW_TESTS") == "ON"
+
+
+# [TAG_MTMD_NO_REALLOC] TODO @ngxson : remove when mtmd side is fixed
+def is_no_realloc():
+    return os.environ.get("GGML_SCHED_NO_REALLOC") in ("1", "ON") or os.environ.get("GGML_SCHED_DEBUG_REALLOC", "0") != "0"
 
 
 def make_pcm16(seconds: float = 1.0, rate: int = 16000, freq: float = 440.0) -> bytes:
