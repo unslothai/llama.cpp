@@ -177,6 +177,7 @@ class Keys:
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
+        HAS_MARKOV_CONTEXT                = "{arch}.has_markov_context"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
@@ -778,6 +779,7 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
+    MOSHI            = auto()
     ZONOS3           = auto()
     KOKORO           = auto()
     TINY_VOCA        = auto()
@@ -1535,6 +1537,8 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_CONF_PROJ       = auto()  # confidence head
     DSPARK_JOINT_PROJ      = auto()  # rnn markov head
     DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
+    DSPARK_MARKOV_CTX_MIX  = auto()  # rnn markov head: target feature mix
+    DSPARK_MARKOV_CTX_NORM = auto()  # rnn markov head: target feature norm
     ENGRAM_KV              = auto()
     ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
@@ -1544,6 +1548,11 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_CTX_MIX         = auto()  # per-layer target feature mix
+    DFLASH_CTX_NORM        = auto()  # per-layer target feature norm
+    DFLASH_ATTN_K_CTX      = auto()  # per-layer context K projection
+    DFLASH_ATTN_V_CTX      = auto()  # per-layer context V projection
+    DFLASH_ATTN_K_CTX_NORM = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -1793,6 +1802,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
+    MODEL_ARCH.MOSHI:            "moshi",
     MODEL_ARCH.ZONOS3:           "zonos3",
     MODEL_ARCH.KOKORO:           "kokoro",
     MODEL_ARCH.TINY_VOCA:        "tiny-voca",
@@ -2588,6 +2598,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
     MODEL_TENSOR.DSPARK_MASK_EMBD:          "mask_embd",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX:     "markov_ctx_mix",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM:    "markov_ctx_norm",
     MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
     MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
     MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
@@ -2597,6 +2609,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_CTX_MIX:            "blk.{bid}.ctx_mix",
+    MODEL_TENSOR.DFLASH_CTX_NORM:           "blk.{bid}.ctx_norm",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX:         "blk.{bid}.attn_k_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_V_CTX:         "blk.{bid}.attn_v_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM:    "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -6459,6 +6476,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LAYER_OUT_SCALE,
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.ATTN_NORM,
@@ -6510,6 +6528,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_CONF_PROJ,
         MODEL_TENSOR.DSPARK_JOINT_PROJ,
         MODEL_TENSOR.DSPARK_MASK_EMBD,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
         MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
         MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
@@ -6517,6 +6537,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_CTX_MIX,
+        MODEL_TENSOR.DFLASH_CTX_NORM,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_V_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,
@@ -6954,6 +6979,20 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.MOSHI: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
@@ -7514,6 +7553,8 @@ class VisionProjectorType:
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
     POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
+    MOSHI = "moshi" # audio: streaming mimi encoder, input audio codes -> backbone rows
+    MOSHI_GEN = "moshi_gen" # audio generation: depformer + mimi decoder
     CHATTERBOX_SPKENC = "chatterbox_spkenc" # audio: CAMPPlus speaker encoder
     CHATTERBOX = "chatterbox" # audio generation: s3gen flow matching + HiFT vocoder
     SOPRANO = "soprano" # audio generation: Vocos decoder
