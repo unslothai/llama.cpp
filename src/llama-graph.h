@@ -843,10 +843,16 @@ public:
     // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
     // banded ubatch, also when the cells are the positions (a check: the result must not change)
     int banded_pos = 0;
+    // the graph may take the causal attention without a mask (one sequence, causal, CUDA or CPU layers)
+    bool banded_causal_ok = false;
 
-    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes,
-    // and whether it takes the positions
+    // cells of the banded attention of one cache for this memory context and ubatch, and whether it takes the positions
     uint32_t get_n_kv_banded(const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const;
+
+    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes, and whether it
+    // takes the positions: the graph build and can_reuse() take the same decision
+    void get_n_kv_banded(const llama_kv_cache_iswa_context * kv, const llama_ubatch & ubatch,
+            uint32_t (&n)[2], bool (&use_pos)[2]) const;
 
     const uint32_t extent;
     const uint32_t extent_swa;

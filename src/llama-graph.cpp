@@ -1526,6 +1526,49 @@ uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(
     return use_pos ? n_kv : 0;
 }
 
+void llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(const llama_kv_cache_iswa_context * kv,
+        const llama_ubatch & ubatch, uint32_t (&n)[2], bool (&use_pos)[2]) const {
+    for (int i = 0; i < 2; ++i) {
+        n[i]       = 0;
+        use_pos[i] = false;
+    }
+    if (!banded) {
+        return;
+    }
+    for (int i = 0; i < (banded_swa_dense ? 1 : 2); ++i) {
+        // without the positions a ubatch of several sequences is dense at runtime, so the reserved worst case
+        // (a ubatch of every sequence) is dense too, else the dense graph outgrows the reserved buffer
+        n[i] = get_n_kv_banded(i ? kv->get_swa() : kv->get_base(), ubatch, use_pos[i]);
+    }
+    const uint32_t n_tokens = ubatch.n_tokens;
+    // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
+    // while at runtime it does so only for consecutive ones
+    if (n[0] > 0 && n_tokens > 1 && ubatch.pos[0] == ubatch.pos[n_tokens - 1]) {
+        if (banded_pos) {
+            // a gap, several sequences or a wrapped SWA cache take the positions at runtime: reserve that graph,
+            // it holds the contiguous one
+            for (int i = 0; i < 2; ++i) {
+                if (!use_pos[i]) {
+                    n[i]       = (i ? kv->get_swa() : kv->get_base())->get_n_kv();
+                    use_pos[i] = true;
+                }
+            }
+        } else {
+            // without the positions a cache whose cells are not the positions is dense: a wrapped SWA cache,
+            // a sequence that does not start at cell 0
+            n[0] = 0;
+            n[1] = 0;
+        }
+    }
+    // a padded span of 2 or more tokens (drafts, prompt tails) of the full-attention cache takes the positions when the
+    // causal attention applies: it then needs neither the shift table nor the n_kv x n_tokens mask, which the reserve graph
+    // (a full ubatch, causal) does not hold, so the first such span would grow the compute buffers
+    if (banded_causal_ok && banded_pad && n_tokens > 1 && banded_pos != 0 && n[0] > 0 && !use_pos[0]) {
+        n[0]       = kv->get_base()->get_n_kv();
+        use_pos[0] = true;
+    }
+}
+
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
 
@@ -1558,12 +1601,12 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
+        uint32_t n[2];
+        bool     use_pos[2];
+        get_n_kv_banded(attn_ctx, params.ubatch, n, use_pos);
         for (int i = 0; i < 2; ++i) {
-            bool use_pos = false;
-            const uint32_t n = i == 1 && banded_swa_dense ? 0 :
-                get_n_kv_banded(i ? attn_ctx->get_swa() : attn_ctx->get_base(), params.ubatch, use_pos);
-            res &= n == n_kv_banded[i];
-            res &= use_pos == (self_k_pos[i] != nullptr);
+            res &= n[i] == n_kv_banded[i];
+            res &= use_pos[i] == (self_k_pos[i] != nullptr);
         }
     }
 
