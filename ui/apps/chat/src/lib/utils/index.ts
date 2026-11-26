@@ -112,6 +112,7 @@ export {
 	formatJsonPretty,
 	formatTime,
 	formatLocalIso,
+	formatElapsedTime,
 	formatPerformanceTime,
 	formatRelativeTime,
 	formatAttachmentText
@@ -227,6 +228,7 @@ export {
 // Working-directory picker search helpers
 export {
 	splitPathQuery,
+	toHomeRelativeQuery,
 	buildCaseInsensitiveGlob,
 	buildGlobSearchArgs,
 	rankEntries,

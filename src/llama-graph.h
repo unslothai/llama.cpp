@@ -822,7 +822,6 @@ public:
 
     // [base, swa] device copies, made once per graph
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
-    ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1353,7 +1352,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * bias_table = nullptr,   // [n_bins, n_head_q, n_tokens]
+            ggml_tensor * bias_indices = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1551,7 +1552,6 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1560,11 +1560,11 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_rows, n_head_q, n_stream]
+            ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il,
-                int64_t   i_row = 0) const; // first mask row of q_cur and kq_b
+                int64_t   i_row = 0) const; // first mask row of q_cur and bias_table
 
     //
     // pooling
