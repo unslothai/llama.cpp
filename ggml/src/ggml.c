@@ -5603,6 +5603,10 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
 }
 
 bool ggml_validate_flash_attn_ext_indexed_bias(const struct ggml_tensor * a) {
+    // the banded op shares the FA paths and never carries an indexed bias
+    if (a->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return true;
+    }
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     const struct ggml_tensor * table   = a->src[6];
     const struct ggml_tensor * indices = a->src[7];
