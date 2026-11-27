@@ -1864,8 +1864,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         if (!needs_fixup && !is_fixup) {
                             // a fully masked row has a zero rowsum, it is 0 like on the CPU
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.x / KQ_rowsum_j;
-                            dstk_val.y = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.y / KQ_rowsum_j;
+                            dstk_val.x = fattn_normalize(dstk_val.x, KQ_rowsum_j);
+                            dstk_val.y = fattn_normalize(dstk_val.y, KQ_rowsum_j);
                         }
 
                         if (is_fixup) {
@@ -1922,7 +1922,9 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t s11,  const int32_t s12,  const int64_t s13,
                             const int32_t s21,  const int32_t s22,  const int64_t s23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t s31,  const int64_t s32,  const int64_t s33) {
+                            const int32_t s31,  const int64_t s32,  const int64_t s33,
+        const fattn_indexed_bias bias) {
+    GGML_UNUSED(bias); // biased ops are never dispatched to the mma kernel
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     using T_K = decltype(ggml_cuda_fattn_kv_dtype<type_K>());
