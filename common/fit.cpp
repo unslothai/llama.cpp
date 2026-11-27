@@ -55,6 +55,100 @@ private:
     ggml_log_level min_level;
 };
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <cstdio>
+#endif
+
+// free host memory as seen by the OS, in bytes, -1 if unknown:
+//   phys:   available physical memory (Windows ullAvailPhys, Linux MemAvailable)
+//   commit: available commit charge (Windows ullAvailPageFile), -1 where it is not a limit
+static void common_fit_get_host_free(int64_t & phys, int64_t & commit) {
+    phys   = -1;
+    commit = -1;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        phys   = int64_t(status.ullAvailPhys);
+        commit = int64_t(status.ullAvailPageFile);
+    }
+#elif defined(__linux__)
+    // the CPU device reports free == total on Linux, MemAvailable is what can still be allocated
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        long long kb = 0;
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
+                phys = int64_t(kb) * 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
+#endif
+}
+
+// integrated GPUs allocate from the same memory as the host: their reported free memory can exceed it
+// (e.g. Windows WDDM reports dedicated + shared system memory), so cap it at the free host memory that is left after
+// the host buffers in dmds (dmds.back()); several integrated devices split that budget by their free memory
+//   Linux:   MemAvailable - host buffers
+//   Windows: available commit - host buffers - margin; every GPU allocation is charged to the commit limit, even
+//            those in a dedicated carve-out that does not lower ullAvailPhys, so commit is the binding limit
+//   other:   free memory of the CPU device - host buffers
+// margins == nullptr (measurement only) applies no margin; discrete GPUs are not changed;
+// applying it again after adding more host buffers only lowers the cap
+static void common_fit_cap_integrated_free(
+        std::vector<llama_device_memory_data> & dmds, const std::vector<ggml_backend_dev_t> & devs, const size_t * margins = nullptr) {
+    int64_t sum_free_igpu = 0;
+    for (size_t i = 0; i < devs.size(); i++) {
+        if (ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            sum_free_igpu += dmds[i].free;
+        }
+    }
+    if (sum_free_igpu <= 0) {
+        return;
+    }
+
+    const int64_t host_used = int64_t(dmds.back().mb.total());
+    int64_t phys   = -1;
+    int64_t commit = -1;
+    common_fit_get_host_free(phys, commit);
+    if (phys < 0) {
+        phys = dmds.back().free;
+    }
+    if (host_used > phys) {
+        LOG_WRN("%s: host buffers need %" PRId64 " MiB but only %" PRId64 " MiB of physical memory is available\n",
+                __func__, host_used/(1024*1024), phys/(1024*1024));
+    }
+    const bool    use_commit = commit >= 0;
+    const int64_t host_avail = std::max<int64_t>((use_commit ? commit : phys) - host_used, 0);
+
+    for (size_t i = 0; i < devs.size(); i++) {
+        if (ggml_backend_dev_type(devs[i]) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        int64_t budget = int64_t(double(host_avail) * double(dmds[i].free) / double(sum_free_igpu));
+        if (use_commit && margins != nullptr) {
+            budget = std::max<int64_t>(budget - int64_t(margins[i]), 0);
+        }
+        if (budget < dmds[i].free) {
+            LOG_TRC("%s: integrated device %s reports %" PRId64 " MiB free, capping to %" PRId64 " MiB of free %s\n",
+                    __func__, ggml_backend_dev_name(devs[i]), dmds[i].free/(1024*1024), budget/(1024*1024),
+                    use_commit ? "commit" : "host memory");
+            dmds[i].free = budget;
+        }
+    }
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
@@ -142,6 +236,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
         ret[i].free  = free;
         ret[i].total = total;
+    }
+
+    {
+        std::vector<ggml_backend_dev_t> devs_model;
+        for (size_t i = 0; i < nd; i++) {
+            devs_model.push_back(llama_model_get_device(model, i));
+        }
+        common_fit_cap_integrated_free(ret, devs_model);
     }
 
     devs.clear();
@@ -290,6 +392,8 @@ static void common_params_fit_impl(
     // its memory is measured again whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
         if (extra == nullptr) {
+            // apply the margin of the commit limit (Windows) to integrated GPUs
+            common_fit_cap_integrated_free(dmds, devs, margins_s);
             return;
         }
 
@@ -343,6 +447,9 @@ static void common_params_fit_impl(
             dmds[id].mb.context += dmds_extra[id].mb.context;
             dmds[id].mb.compute += dmds_extra[id].mb.compute;
         }
+
+        // the host buffers of the extra model come out of the same memory as those of an integrated GPU
+        common_fit_cap_integrated_free(dmds, devs, margins_s);
     };
 
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
