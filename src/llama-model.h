@@ -422,6 +422,7 @@ struct llama_layer {
     struct ggml_tensor * dflash_wk_ctx          = nullptr;
     struct ggml_tensor * dflash_wv_ctx          = nullptr;
     struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflare_norm            = nullptr; // fused Inkling2 DSpark: norm of the per-layer feature mix
 
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
@@ -935,6 +936,10 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2_b      = nullptr;
     struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
     struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
+    struct ggml_tensor * dspark_fuse         = nullptr;
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_hidden_out   = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

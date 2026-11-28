@@ -57,6 +57,34 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
+    // the fused Inkling2 DSpark drafter (dspark_hidden_out, padded markov_w1) predates the f_rnn layout above
+    if (ml.get_tensor_meta("dspark_hidden_out.weight")) {
+        // any tensor of the f_rnn (markov_ctx_*, per-layer ctx_mix) or fc-based DFlash layouts means a mixed file
+        bool mixed = hparams.dspark_f_rnn;
+        for (const char * name : { "markov_ctx_mix.weight", "markov_ctx_norm.weight", "markov_w2.weight",
+                                   "token_embd_norm.weight", "fc.weight", "enc.output_norm.weight" }) {
+            mixed = mixed || ml.get_tensor_meta(name) != nullptr;
+        }
+        for (uint32_t il = 0; il < hparams.n_layer() && !mixed; ++il) {
+            for (const char * suffix : { "ctx_mix", "ctx_norm" }) {
+                mixed = mixed || ml.get_tensor_meta(("blk." + std::to_string(il) + "." + suffix + ".weight").c_str()) != nullptr;
+            }
+        }
+        if (mixed) {
+            throw std::runtime_error("Inkling2 DSpark draft mixes the fused (dspark_hidden_out) layout with f_rnn or fc tensors");
+        }
+        const auto rank = ml.require_tensor_meta("markov_w1.weight")->ne[0];
+        ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab_padded);
+        ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
+        if (rank <= 0 || rank > hparams.n_embd ||
+                hparams.dflash_block_size != 8 || !(hparams.f_final_logit_softcapping > 0) ||
+                target_layer_ids.empty() || target_layer_ids.front() < 0 || target_layer_ids.back() > LLAMA_MAX_LAYERS ||
+                std::adjacent_find(target_layer_ids.begin(), target_layer_ids.end(), std::greater_equal<int32_t>()) != target_layer_ids.end() ||
+                target_layer_ids.size()*(uint64_t) hparams.n_embd > UINT32_MAX) {
+            throw std::runtime_error("invalid Inkling2 DSpark dimensions or target layers");
+        }
+        hparams.dspark_context_rank = (uint32_t) rank;
+    }
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
     std::string layers;
@@ -84,6 +112,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }
 
+    if (hparams.dspark_context_rank) {
+        if (backbone != BACKBONE_BASE || !hparams.n_swa || hparams.n_swa >= INT32_MAX || !hparams.is_swa_any()) {
+            throw std::runtime_error("Inkling2 DSpark requires sliding-window attention");
+        }
+        ++hparams.n_swa; // include the anchor and the preceding window
+    }
+
     ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
 
     type = LLM_TYPE_UNKNOWN;
@@ -91,6 +126,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
+
+    if (hparams.dspark_context_rank) {
+        load_tensors_layers_base();
+        load_tensors_inkling2_head();
+        return;
+    }
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
@@ -249,6 +290,10 @@ ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const 
 
     g.res->add_input(std::move(inp));
 
+    if (model.dspark_fuse) {
+        return inp_target;
+    }
+
     ggml_tensor * inp_g = g.build_lora_mm(model.fc, inp_target);
     return g.build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
 }
@@ -359,14 +404,24 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-        const bool shared_kv = layer.wv == nullptr;
-        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g);
+        ggml_tensor * Kcur;
+        ggml_tensor * Vcur;
+        ggml_tensor * k_norm = layer.attn_k_norm;
+        const bool shared_kv = !model.dspark_fuse && layer.wv == nullptr;
+        if (model.dspark_fuse) {
+            ggml_tensor * context = mix_target_features(inp_g, il, layer.dflare_norm);
+            Kcur = build_lora_mm(layer.dflash_wk_ctx, context);
+            Vcur = build_lora_mm(layer.dflash_wv_ctx, context);
+            k_norm = layer.dflash_attn_k_ctx_norm;
+        } else {
+            Kcur = build_lora_mm(layer.wk, inp_g);
+            Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g);
+        }
 
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+        Kcur = build_norm(Kcur, k_norm, NULL, LLM_NORM_RMS, il);
         if (shared_kv) {
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
         }
@@ -377,6 +432,10 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
         store_inject_kv(Kcur, Vcur, il);
     }
 
+    if (model.dspark_fuse) {
+        inp_g = mix_target_features(inp_g, n_layer, model.dspark_norm);
+        res->t_h_nextn = inp_g;
+    }
     res->t_embd = inp_g;
 
     ggml_build_forward_expand(gf, inp_g);
@@ -443,9 +502,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * inpL = model.dspark_mask_embd
-        ? build_dspark_inp_block(*this, model, inp_tokens)
-        : ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+    ggml_tensor * inpL = model.dspark_fuse      ? build_inkling2_embd(inp_tokens) :
+                         model.dspark_mask_embd ? build_dspark_inp_block(*this, model, inp_tokens) :
+                                                  ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
     if (model.tok_norm && !model.dspark_mask_embd) {
         inpL = build_norm(inpL, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
@@ -615,6 +674,9 @@ llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
+            if (dspark_fuse) {
+                return std::make_unique<graph_inkling2_head>(params);
+            }
             return std::make_unique<graph<true>>(params);
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:

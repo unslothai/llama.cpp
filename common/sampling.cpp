@@ -752,6 +752,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
     std::vector<llama_token_data> residual;
+    std::vector<float>            q_by_id;
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
@@ -760,7 +761,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // the test only reads p per candidate: sorting the whole vocabulary here cost about 10 ms per position
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
@@ -807,10 +809,26 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         }
 
         // rejected: tokens outside q's support keep all of p
+        // q indexed by token id (a sparse q, e.g. top-k candidates, would otherwise be scanned once per candidate)
+        const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        bool dense = q.size() == n_vocab;
+        for (size_t k = 0; dense && k < q.size(); ++k) {
+            dense = q[k].id == (llama_token) k;
+        }
+        if (!dense) {
+            q_by_id.assign(n_vocab, 0.0f);
+            for (const auto & e : q) {
+                if (e.id >= 0 && (size_t) e.id < n_vocab) {
+                    q_by_id[e.id] = e.p;
+                }
+            }
+        }
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const llama_token id = cur_p->data[k].id;
+            const float q_id = id < 0 || (size_t) id >= n_vocab ? 0.0f : dense ? q[id].p : q_by_id[id];
+            const float r = p_of(k) - q_id;
             if (r > 0.0f) {
                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
