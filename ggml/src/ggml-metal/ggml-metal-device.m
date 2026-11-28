@@ -1532,9 +1532,13 @@ static bool ggml_metal_supports_mul_mat_op(
         bool mm_path) {
     if (!has_simdgroup_reduction ||
         op->src[0]->type == GGML_TYPE_F8_E4M3 ||
-        op->src[0]->type == GGML_TYPE_NVFP4 ||
         op->src[0]->type == GGML_TYPE_TQ1_0) {
         return false;
+    }
+
+    // BF16 src1 kernels: mul_mv for F32 and BF16 src0, mul_mm for BF16 src0
+    if (op->src[1]->type == GGML_TYPE_BF16) {
+        return op->op == GGML_OP_MUL_MAT && (op->src[0]->type == GGML_TYPE_BF16 || (op->src[0]->type == GGML_TYPE_F32 && !mm_path));
     }
 
     if (op->src[1]->type != GGML_TYPE_F16) {
@@ -1747,6 +1751,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
+            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                return false;
+            }
             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
             if (op->src[5] != NULL) {
                 const struct ggml_tensor * kv_rows = op->src[5];
@@ -1978,6 +1985,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_TQ2_0:
+                    case GGML_TYPE_NVFP4:
                         switch (op->type) {
                             case GGML_TYPE_F32:
                             case GGML_TYPE_F16:
@@ -1992,8 +2000,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
+            return op->src[0]->type != GGML_TYPE_TQ1_0 &&
                    op->src[0]->type != GGML_TYPE_F8_E4M3;
         case GGML_OP_SET_ROWS:
             {
