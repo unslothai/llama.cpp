@@ -106,7 +106,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     output           = create_tensor(tn(LLM_TENSOR_OUTPUT,           "weight"), {n_embd, n_vocab_padded}, 0);
     prec_policy.set_acc(output, GGML_PREC_F32);
     output_norm      = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,      "weight"), {n_embd}, 0);
-    output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, 0);
+    output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, TENSOR_NO_SCALE);
 
     for (int i = 0; i < n_layer_phys(); ++i) {
         auto & layer = layers[i];
@@ -129,7 +129,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
 
         // relative-position bias
         layer.attn_rel      = create_tensor(tn(LLM_TENSOR_ATTN_REL,      "weight", i), {n_embd, n_rel*n_head}, 0);
-        layer.attn_rel_bias = create_tensor(tn(LLM_TENSOR_ATTN_REL_BIAS, "weight", i), {n_rel, n_extent}, 0);
+        layer.attn_rel_bias = create_tensor(tn(LLM_TENSOR_ATTN_REL_BIAS, "weight", i), {n_rel, n_extent}, TENSOR_NO_SCALE);
         layer.attn_rel_clip = create_tensor(tn(LLM_TENSOR_ATTN_REL_CLIP, "weight", i), {n_rel, n_head}, 0);
 
         // short convolutions
@@ -151,9 +151,9 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
 
         // block attention residuals
         if (i > 0) {
-            layer.attn_res_query = create_tensor(tn(LLM_TENSOR_ATTN_RES_QUERY, "weight", i), {n_embd, hparams.is_swa(i) ? 1 : 3}, 0);
+            layer.attn_res_query = create_tensor(tn(LLM_TENSOR_ATTN_RES_QUERY, "weight", i), {n_embd, hparams.is_swa(i) ? 1 : 3}, TENSOR_NO_SCALE);
         }
-        layer.ffn_res_query = create_tensor(tn(LLM_TENSOR_FFN_RES_QUERY, "weight", i), {n_embd}, 0);
+        layer.ffn_res_query = create_tensor(tn(LLM_TENSOR_FFN_RES_QUERY, "weight", i), {n_embd}, TENSOR_NO_SCALE);
 
         // MoE
         layer.ffn_norm         = create_tensor(tn(LLM_TENSOR_FFN_NORM,         "weight", i), {n_embd}, 0);
@@ -227,6 +227,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    // add the taps input first and the result right after the state store, so the conv ops are consecutive and backends can fuse them
+    if (dynamic) {
+        ggml_build_forward_expand(gf, dynamic);
+    }
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -255,7 +260,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    out = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    ggml_build_forward_expand(gf, out);
+
+    return out;
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
@@ -283,6 +291,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+    ggml_build_forward_expand(gf, tau);
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 
@@ -397,7 +406,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_rows_max = std::min(n_seq_tokens, (n_rows_all + n_stream - 1)/n_stream);
         if (n_rows_max == n_seq_tokens) {
             cur = build_attn(inp,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
                     Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
         } else {
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
@@ -420,7 +429,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
                 // only the first chunk stores K and V
                 ggml_tensor * out = build_attn(inp,
-                        nullptr, nullptr, nullptr,
+                        nullptr, nullptr,
                         q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, table_c, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_3d(ctx0, out, out->ne[0], nr, n_stream),
                         ggml_view_3d(ctx0, out_all, out_all->ne[0], nr, n_stream, out_all->nb[1], out_all->nb[2], r0*out_all->nb[1])));
@@ -438,6 +447,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         blocks.push_back(inpSA);
     } else {
         cur = ggml_add(ctx0, inpSA, cur);
+        ggml_build_forward_expand(gf, cur); // right after the conv, so backends can fuse the add into it
     }
 
     ggml_tensor * ffn_inp = cur;
@@ -469,6 +479,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     cb(cur, "ffn_out", il);
 
     cur = ggml_add(ctx0, ffn_inp, cur);
+    ggml_build_forward_expand(gf, cur);
     cb(cur, "l_out", il);
 
     return cur;

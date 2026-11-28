@@ -251,6 +251,8 @@ export interface ChatCommandsOptions {
 	hasPrompts: () => boolean;
 	/** Gates `/cwd`. */
 	hasCwdTools: () => boolean;
+	/** Gates `/system-message`. */
+	canEditSystemMessage: () => boolean;
 }
 
 /** Protocol-level verbs accepted by the realtime inference control endpoint. Mirrors `CONTROL_ACTION`. */
@@ -263,6 +265,8 @@ export interface ChatFormCommand {
 	keywords?: string[];
 	action: ChatFormCommandAction;
 	disabled: boolean;
+	/** Takes an argument after a space (`/cwd ~/git`); the others end at their name. */
+	takesArgument?: boolean;
 }
 
 /**
@@ -324,6 +328,8 @@ export interface ChatMessageActionsContext {
 	setShowForkDialog: (show: boolean) => void;
 	navigateToSibling: (siblingId: string) => void;
 	forkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
+	/** Shares the conversation up to this message; absent in a build without sharing. */
+	share?: () => void;
 }
 
 export interface ChatMessageEditState {
@@ -369,9 +375,13 @@ export interface ChatFormActionsContext {
 	readonly hasVideoModality: boolean;
 	readonly hasVisionModality: boolean;
 	onFileUpload?: () => void;
+	/** Adds files picked outside the form's own file input, such as the camera or photo library. */
+	onFilesSelect?: (files: File[]) => void;
 	onSystemPromptClick?: () => void;
 	/** Opens the working directory picker; set where the + menu offers it. */
 	onWorkingDirectoryClick?: () => void;
 	/** The working directory's name in the + menu, or what sets one. */
 	readonly workingDirectoryLabel: string;
+	/** The working directory's abbreviated path, or null when none is set. */
+	readonly workingDirectory: string | null;
 }
