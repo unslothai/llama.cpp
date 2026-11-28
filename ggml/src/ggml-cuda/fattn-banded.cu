@@ -1012,11 +1012,13 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t n_rb = (n_q*G + NR - 1)/NR;
 
     // split the cells so that the grid fills the GPU
+    // chunks down to one tile: a few queries give few blocks per KV head, so the cells are what fills the GPU
     constexpr int64_t tile      = fattn_banded_vec_threads/16*fattn_banded_vec_cpg; // D = 128
-    constexpr int64_t min_chunk = 4*tile;
+    constexpr int64_t min_chunk = tile;
     const int64_t base_blocks = k->ne[2]*n_rb*q->ne[3];
-    // one wave of resident blocks, 3 per SM
-    const int64_t target      = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*3;
+    // two blocks per SM: at 1-8 queries and 256-4096 cells this beats one wave of 3 per SM with 4-tile chunks
+    // (B200: 2-2.6x at 256-1024 cells, 1.3x at 4096)
+    const int64_t target      = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*2;
     int64_t n_chunks = std::max<int64_t>(1, std::min<int64_t>(target/base_blocks, (n_kv + min_chunk - 1)/min_chunk));
     n_chunks = std::min<int64_t>(n_chunks, 4096); // merge weights in shared memory
     const int64_t chunk = GGML_PAD((n_kv + n_chunks - 1)/n_chunks, tile);
