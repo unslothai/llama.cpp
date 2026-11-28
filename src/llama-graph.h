@@ -827,6 +827,39 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // [base, swa] device copies, made once per graph
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+
+    // [base, swa] K/V cells of the banded attention, 0 = dense
+    uint32_t n_kv_banded[2] = { 0, 0 };
+    bool     banded         = false;
+
+    // padded: the banded attention spans the padded n_kv, which changes only every 256 cells, so that the graph of
+    // a small ubatch is reused. The empty cells past the sequence are masked, and the band is shifted by the padding
+    // through self_rel_shift, the row of the relative bias for each band column, extent past the band (a zero row)
+    bool          banded_pad        = false;
+    bool          banded_swa_dense  = false; // the graph keeps the SWA layers dense
+    ggml_tensor * self_rel_shift[2] = { nullptr, nullptr }; // I32 [extent + n_rel_pad], [extent_swa + n_rel_pad]
+
+    static constexpr uint32_t n_rel_pad = 256;
+
+    // [base, swa] I32 [n_kv] position of each cell (-1 if empty), when the banded attention takes the distances
+    // from the positions: the cells of several sequences, or a wrapped cache. Null when the cells are the positions
+    ggml_tensor * self_k_pos[2] = { nullptr, nullptr };
+    // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
+    // banded ubatch, also when the cells are the positions (a check: the result must not change)
+    int banded_pos = 0;
+    // the graph may take the causal attention without a mask (one sequence, causal, CUDA or CPU layers)
+    bool banded_causal_ok = false;
+
+    // cells of the banded attention of one cache for this memory context and ubatch, and whether it takes the positions
+    uint32_t get_n_kv_banded(const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const;
+
+    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes, and whether it
+    // takes the positions: the graph build and can_reuse() take the same decision
+    void get_n_kv_banded(const llama_kv_cache_iswa_context * kv, const llama_ubatch & ubatch,
+            uint32_t (&n)[2], bool (&use_pos)[2]) const;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1207,7 +1240,8 @@ struct llm_graph_context {
     // do mat_mul, while optionally apply lora and the weight scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
-              ggml_tensor * cur) const;
+              ggml_tensor * cur,
+            enum ggml_prec   prec = GGML_PREC_UNDEFINED) const;
 
     // do mat_mul_id, while optionally apply lora and the weight scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
@@ -1569,7 +1603,8 @@ struct llm_graph_context {
             ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   i_row = 0) const; // first mask row of q_cur and bias_table
 
     //
     // pooling

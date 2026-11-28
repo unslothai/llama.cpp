@@ -1454,6 +1454,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    for (int i = 0; i < 2; ++i) {
+        if (self_k_pos[i] && self_k_pos[i]->buffer) {
+            (i ? attn_ctx->get_swa() : attn_ctx->get_base())->set_input_cell_pos(self_k_pos[i], ubatch);
+        }
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1466,6 +1472,26 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    // padded banded: query i is at cell n_kv_used - n_tokens + i, the op aligns it to n_kv - n_tokens + i,
+    // so band column j holds distance j - (n_kv - n_kv_used)
+    for (int i = 0; i < 2; ++i) {
+        ggml_tensor * shift = self_rel_shift[i];
+        if (!shift || !shift->buffer) {
+            continue;
+        }
+        const auto *   kv_ctx = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+        const uint32_t n_used = kv_ctx->get_n_kv_pos_contiguous();
+        const int32_t  ext    = i ? extent_swa : extent;
+        GGML_ASSERT(n_used > 0 && n_used <= n_kv_banded[i] && n_kv_banded[i] - n_used < n_rel_pad);
+        GGML_ASSERT(shift->ne[0] == ext + (int64_t) n_rel_pad);
+        const int32_t delta = n_kv_banded[i] - n_used;
+        std::vector<int32_t> data(shift->ne[0]);
+        for (int32_t j = 0; j < (int32_t) data.size(); ++j) {
+            data[j] = j >= delta && j - delta < ext ? j - delta : ext;
+        }
+        ggml_backend_tensor_set(shift, data.data(), 0, ggml_nbytes(shift));
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1481,6 +1507,70 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     inp_rs->set_input_rep(mctx->get_recr(), ubatch);
+}
+
+uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(
+        const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const {
+    // one sequence whose cells are its positions: the cell distance is the position distance
+    const uint32_t n_used = ubatch.n_seqs_unq == 1 ? kv->get_n_kv_pos_contiguous() : 0;
+    use_pos = banded_pos != 0 && (n_used == 0 || banded_pos == 2);
+    if (use_pos) {
+        return kv->get_n_kv();
+    }
+    if (!banded_pad || n_used == 0) {
+        return n_used;
+    }
+    // padded: the shift table covers a padding of less than n_rel_pad cells, one sequence alone in the cache always
+    // fits; else the positions, if allowed
+    const uint32_t n_kv = kv->get_n_kv();
+    if (n_used <= n_kv && n_kv - n_used < n_rel_pad) {
+        return n_kv;
+    }
+    use_pos = banded_pos != 0;
+    return use_pos ? n_kv : 0;
+}
+
+void llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(const llama_kv_cache_iswa_context * kv,
+        const llama_ubatch & ubatch, uint32_t (&n)[2], bool (&use_pos)[2]) const {
+    for (int i = 0; i < 2; ++i) {
+        n[i]       = 0;
+        use_pos[i] = false;
+    }
+    if (!banded) {
+        return;
+    }
+    for (int i = 0; i < (banded_swa_dense ? 1 : 2); ++i) {
+        // without the positions a ubatch of several sequences is dense at runtime, so the reserved worst case
+        // (a ubatch of every sequence) is dense too, else the dense graph outgrows the reserved buffer
+        n[i] = get_n_kv_banded(i ? kv->get_swa() : kv->get_base(), ubatch, use_pos[i]);
+    }
+    const uint32_t n_tokens = ubatch.n_tokens;
+    // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
+    // while at runtime it does so only for consecutive ones
+    if (n[0] > 0 && n_tokens > 1 && ubatch.pos[0] == ubatch.pos[n_tokens - 1]) {
+        if (banded_pos) {
+            // a gap, several sequences or a wrapped SWA cache take the positions at runtime: reserve that graph,
+            // it holds the contiguous one
+            for (int i = 0; i < 2; ++i) {
+                if (!use_pos[i]) {
+                    n[i]       = (i ? kv->get_swa() : kv->get_base())->get_n_kv();
+                    use_pos[i] = true;
+                }
+            }
+        } else {
+            // without the positions a cache whose cells are not the positions is dense: a wrapped SWA cache,
+            // a sequence that does not start at cell 0
+            n[0] = 0;
+            n[1] = 0;
+        }
+    }
+    // a padded span of 2 or more tokens (drafts, prompt tails) of the full-attention cache takes the positions when the
+    // causal attention applies: it then needs neither the shift table nor the n_kv x n_tokens mask, which the reserve graph
+    // (a full ubatch, causal) does not hold, so the first such span would grow the compute buffers
+    if (banded_causal_ok && banded_pad && n_tokens > 1 && banded_pos != 0 && n[0] > 0 && !use_pos[0]) {
+        n[0]       = kv->get_base()->get_n_kv();
+        use_pos[0] = true;
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1513,6 +1603,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    if (banded) {
+        uint32_t n[2];
+        bool     use_pos[2];
+        get_n_kv_banded(attn_ctx, params.ubatch, n, use_pos);
+        for (int i = 0; i < 2; ++i) {
+            res &= n[i] == n_kv_banded[i];
+            res &= use_pos[i] == (self_k_pos[i] != nullptr);
+        }
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1866,7 +1966,8 @@ ggml_tensor * llm_graph_context::get_input_scale(const ggml_tensor * w) const {
 
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
-          ggml_tensor * cur) const {
+          ggml_tensor * cur,
+        enum ggml_prec   prec) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat_ext(ctx0, w, cur_mm, get_weight_scale(w), get_input_scale(w));
@@ -1876,6 +1977,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     prec_policy.apply(res, w);
+
+    if (prec != GGML_PREC_UNDEFINED) {
+        // explicit precision wins; set on the base MUL_MAT before scale/LoRA changes the root op
+        ggml_prec_set_acc(res, prec);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -3179,6 +3285,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bias_indices->ne[0], q->ne[1], n_stream);
         bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
         cb(bias, "kq_b", il);
+
+        if (cparams.flash_attn && bias->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16 && hparams.f_max_alibi_bias == 0.0f) {
+            // convert the bias to F16 in one copy, from the source of its contiguous copy (the same values),
+            // and add the mask in F16: the mask is 0 or -inf, so this rounds the same as adding in F32 and converting
+            // a cast, not a copy into a new tensor: that tensor would be a graph leaf, which the allocator keeps
+            // for the whole graph, so the bias of every chunk and layer would stay allocated at once
+            ggml_tensor * mask = ggml_add(ctx0, ggml_cast(ctx0, bias->src[0], GGML_TYPE_F16), kq_mask);
+            cb(mask, "kq_mask_rel_pos", il);
+            return mask;
+        }
 
         ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
         mask = ggml_add(ctx0, bias, mask);
@@ -4513,7 +4629,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * bias_table,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        int64_t       i_row) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4522,6 +4639,26 @@ ggml_tensor * llm_graph_context::build_attn(
 
     GGML_ASSERT(attn_mask.rows == nullptr);
     ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+    if (bias_table->ne[2] != indices->ne[1]) {
+        // a chunk of query rows from i_row on: its rows of the mask and of the distances, in each stream
+        ggml_tensor * kq_mask = attn_mask.raw;
+        const int64_t n_stream     = kq_mask->ne[3];
+        const int64_t n_seq_tokens = indices->ne[1]/n_stream;
+        const int64_t n_rows       = bias_table->ne[2]/n_stream;
+        ggml_tensor *& dev = inp->self_rel_pos_dev[is_swa];
+        if (!dev) {
+            dev = ggml_cont(ctx0, indices);
+        }
+        ggml_tensor * rel_pos = ggml_cont(ctx0, ggml_view_3d(ctx0, dev, dev->ne[0], n_rows, n_stream,
+                dev->nb[1], n_seq_tokens*dev->nb[1], i_row*dev->nb[1]));
+        rel_pos = ggml_reshape_2d(ctx0, rel_pos, rel_pos->ne[0], n_rows*n_stream);
+        kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], n_rows, kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]));
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr,
+                sinks, nullptr, kq_scale, il, bias_table, rel_pos);
+    }
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr,
             sinks, nullptr, kq_scale, il, bias_table, indices);

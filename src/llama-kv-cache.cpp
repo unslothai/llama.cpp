@@ -1310,6 +1310,61 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
+        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+
+    const auto & cells = v_cells[stream];
+    const llama_pos pos_max = cells.seq_pos_max(seq_id);
+
+    if (pos_max < 0 || pos_max >= (llama_pos) cells.size()) {
+        return 0;
+    }
+
+    // the banded op aligns Q to the tail of K: the ubatch must be that monotonic tail, else dense bias
+    if ((uint32_t) pos_max + 1 < ubatch.n_tokens) {
+        return 0;
+    }
+    const llama_pos pos_start = pos_max + 1 - ubatch.n_tokens;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
+            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return 0;
+        }
+    }
+
+    // the sequence must be one run of cells c0 + pos, pos = 0..pos_max; the cells before c0 hold other sequences
+    // (several slots in a unified cache) and are masked, so the distances stay cell differences
+    uint32_t c0 = 0;
+    while (c0 < cells.size() && (cells.is_empty(c0) || !cells.seq_has(c0, seq_id))) {
+        ++c0;
+    }
+    if ((uint64_t) c0 + pos_max + 1 > cells.size()) {
+        return 0;
+    }
+    for (llama_pos pos = 0; pos <= pos_max; ++pos) {
+        const uint32_t i = c0 + pos;
+        if (cells.is_empty(i) || cells.pos_get(i) != pos || !cells.seq_has(i, seq_id)) {
+            return 0;
+        }
+    }
+
+    return c0 + pos_max + 1;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -1998,6 +2053,39 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    int32_t * data = (int32_t *) dst->data;
+
+    const int64_t n_kv = dst->ne[0];
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+
+    // [n_kv, n_tokens] in GLOBAL token order (stream-major, same as the KQ mask)
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+        const llama_pos p1 = ubatch->pos[i];
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            // use the ACTUAL absolute position in the KV cell; physical slot order is not monotonic
+            int32_t rel = (int32_t) extent;
+            if (!cells.is_empty(j)) {
+                const llama_pos d = p1 - cells.pos_get(j);
+                if (d >= 0 && d < (llama_pos) extent) {
+                    rel = (int32_t) d;
+                }
+            }
+
+            data[i*n_kv + j] = (int32_t) (i*(extent + 1)) + rel;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const {
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
@@ -2133,6 +2221,18 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
             const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
             data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
         }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    GGML_ASSERT(n_kv <= (int64_t) cells.size());
+    std::vector<int32_t> data(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        data[j] = cells.is_empty(j) ? -1 : cells.pos_get(j);
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
@@ -3151,6 +3251,8 @@ bool llama_kv_cache_context::apply() {
     n_kv      = kv->get_n_kv(sinfos[i_cur]);
     n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
 
+    i_pos_contiguous = SIZE_MAX;
+
     return true;
 }
 
@@ -3166,6 +3268,30 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        // reserve the banded path; the dense fallback is unallocatable at large n_ctx
+        if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
+            return n_kv;
+        }
+        return 0;
+    }
+
+    // memoized per ubatch: every layer of the graph asks
+    if (i_pos_contiguous != i_cur) {
+        n_pos_contiguous = [&]() -> uint32_t {
+            const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
+            return result <= (uint32_t) n_kv ? result : 0;
+        }();
+        i_pos_contiguous = i_cur;
+    }
+    return n_pos_contiguous;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
@@ -3240,6 +3366,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
+void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_pos_rel_flat(dst, ubatch, extent);
+}
+
 void llama_kv_cache_context::set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch, uint32_t kpool) const {
     kv->set_input_kpool(pool_idxs, pool_pos, pool_mask, tail_idxs, ubatch, sinfos[i_cur], kpool, n_kv);
@@ -3247,6 +3377,10 @@ void llama_kv_cache_context::set_input_kpool(ggml_tensor * pool_idxs, ggml_tenso
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_cell_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

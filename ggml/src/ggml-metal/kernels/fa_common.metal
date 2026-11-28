@@ -3,6 +3,7 @@ constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_has_rel   [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
@@ -13,6 +14,19 @@ constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 20)]];
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
+
+constant int32_t FC_flash_attn_ext_rel_type [[function_constant(FC_FLASH_ATTN_EXT + 23)]];
+
+static inline float flash_attn_ext_rel_load(device const char * rel, int32_t i) {
+    if (FC_flash_attn_ext_rel_type == 2) {
+        // BF16 by bit shift: exact, and independent of GGML_METAL_HAS_BF16, which a precompiled library or Metal < 3.1 lacks
+        return as_type<float>(((uint) ((device const ushort *) rel)[i]) << 16);
+    }
+    if (FC_flash_attn_ext_rel_type == 1) {
+        return ((device const half *) rel)[i];
+    }
+    return ((device const float *) rel)[i];
+}
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -43,6 +57,7 @@ void kernel_flash_attn_ext_impl(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rel,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
@@ -422,12 +437,41 @@ void kernel_flash_attn_ext_impl(
                     s2 = args.logit_softcap*precise::tanh(s2);
                 }
 
+                // banded: the distance of column ic0*C + 2*tiisg is d0, of the next column d0 - 1
+                if (FC_flash_attn_ext_has_rel) {
+                    const int32_t dmax = iq1 + j + args.q_off - ic0*C;
+
+                    if (iq1 + j < args.ne01 && dmax >= 0 && dmax - (C - 1) < args.ne_r0) {
+                        device const char * pr = rel + iq2*args.nb_r1 + (iq1 + j)*args.nb_r2 + iq3*args.nb_r3;
+
+                        const int32_t d0 = dmax - 2*tiisg;
+
+                        if (d0 >= 0 && d0 < args.ne_r0) {
+                            s2[0] += flash_attn_ext_rel_load(pr, d0);
+                        }
+                        if (d0 >= 1 && d0 - 1 < args.ne_r0) {
+                            s2[1] += flash_attn_ext_rel_load(pr, d0 - 1);
+                        }
+                    }
+                }
+
                 // mqk = mqk + slope*mask
                 if (blk_cur != 2) {
                     if (FC_flash_attn_ext_has_bias) {
                         s2 += s2_t(sm2[j*SH + tiisg])*slope;
                     } else {
                         s2 += s2_t(sm2[j*SH + tiisg]);
+                    }
+                }
+
+                // banded: the padded keys past ne11 are out of the softmax whatever the band adds (the pad mask is finite)
+                if (FC_flash_attn_ext_has_rel && FC_flash_attn_ext_has_kvpad) {
+                    const int32_t ik = ic0*C + 2*tiisg;
+                    if (ik >= args.ne11) {
+                        s2[0] = -FLT_MAX/2;
+                    }
+                    if (ik + 1 >= args.ne11) {
+                        s2[1] = -FLT_MAX/2;
                     }
                 }
 
@@ -611,7 +655,12 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+
+                // per-query sinks (banded only); plain FA keeps the per-head load
+                const int32_t jq = min(iq1 + j, args.ne01 - 1);
+                const float s = tiisg != 0 ? -FLT_MAX/2 : FC_flash_attn_ext_has_rel
+                    ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2))
+                    : ((device const float *) sinks)[iq2];
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -682,12 +731,13 @@ kernel void kernel_flash_attn_ext(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rel,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, k_t, v_t, qk_t, s_t, o_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, rel, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
       //case 1: kernel_flash_attn_ext_impl<FWD_TMPL, 1>(FWD_ARGS); break;

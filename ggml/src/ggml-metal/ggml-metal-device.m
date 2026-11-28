@@ -1556,6 +1556,50 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+// mixed K/V cache types (e.g. -ctk q8_0 -ctv q4_0): the half8x8 and vec kernels are instantiated for
+// these pairs at head sizes 64 and 128 and dequantize K and V inline, without an F16 copy of the cache
+static bool ggml_metal_fa_kv_mixed_ok(const struct ggml_tensor * op) {
+    const enum ggml_type tk = op->src[1]->type;
+    const enum ggml_type tv = op->src[2]->type;
+
+    const bool tk_ok = tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_Q4_0;
+    const bool tv_ok = tv == GGML_TYPE_F16 || tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0;
+
+    return tk != tv && tk_ok && tv_ok && op->src[5] == NULL &&
+        op->src[1]->ne[0] == op->src[2]->ne[0] && (op->src[1]->ne[0] == 64 || op->src[1]->ne[0] == 128);
+}
+
+// the layouts the banded and mixed K/V FA launches can address (the plain same-type path keeps upstream's rules):
+// K/V share rows and heads (the launcher asserts ne11 == ne21, ne12 == ne22), fewer than 65536 queries, Q rows
+// loaded as float4, F32/F16/BF16 K/V rows on 4-element boundaries (the vec kernels address them as 4-vectors and
+// divide the row stride by 4), and a mask exactly n_kv wide (the mask blocks are classified over its width but read
+// over the K length)
+static bool ggml_metal_fa_layout_ok(const struct ggml_tensor * op) {
+    const struct ggml_tensor * q    = op->src[0];
+    const struct ggml_tensor * k    = op->src[1];
+    const struct ggml_tensor * v    = op->src[2];
+    const struct ggml_tensor * mask = op->src[3];
+
+    if (q->type != GGML_TYPE_F32 || q->ne[1] >= 65536 || k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2]) {
+        return false;
+    }
+    if (q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0 || q->nb[3] % 16 != 0) {
+        return false;
+    }
+    for (int i = 1; i <= 2; ++i) {
+        const struct ggml_tensor * t = op->src[i];
+        const size_t ts = ggml_type_size(t->type);
+        if (t->nb[0] != ts || t->nb[1] % ts != 0 || t->nb[1] < ggml_row_size(t->type, t->ne[0])) {
+            return false;
+        }
+        if (!ggml_is_quantized(t->type) &&
+                ((t->view_offs | t->nb[1] | t->nb[2] | t->nb[3]) % (4*ts) != 0)) {
+            return false;
+        }
+    }
+    return !mask || (mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[1] >= q->ne[1]);
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1814,7 +1858,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                return false;
+                return ggml_metal_fa_kv_mixed_ok(op) && ggml_metal_fa_layout_ok(op) && has_simdgroup_mm;
             }
             switch (op->src[1]->type) {
                 case GGML_TYPE_F32:
@@ -1834,6 +1878,81 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
+            {
+                const struct ggml_tensor * sinks = op->src[4];
+                const struct ggml_tensor * rel   = op->src[6];
+
+                if (op->src[0]->ne[0] != 64 && op->src[0]->ne[0] != 128) {
+                    return false;
+                }
+                // causal without a mask (ggml_flash_attn_ext_banded_set_causal): the kernels do not mask the cells
+                // after each query, so this falls back to the CPU until they do
+                if (ggml_flash_attn_ext_banded_is_causal(op)) {
+                    return false;
+                }
+                // K/V cell and query positions (src[7], src[8]): the kernels take the distance from the cell index
+                if (op->src[7] || op->src[8]) {
+                    return false;
+                }
+                if (op->src[2]->ne[0] != op->src[1]->ne[0]) {
+                    return false;
+                }
+                if (op->src[2]->ne[2] != op->src[1]->ne[2]) {
+                    return false;
+                }
+                // the launcher asserts ne01 < 65536 and ne11 == ne21
+                if (op->src[0]->ne[1] >= 65536 || op->src[2]->ne[1] != op->src[1]->ne[1]) {
+                    return false;
+                }
+                if (op->src[1]->type != op->src[2]->type && !ggml_metal_fa_kv_mixed_ok(op)) {
+                    return false;
+                }
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    // quantized K/V: dequantized inline by the half8x8 and vec kernels, no F16 copy of the cache
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                        break;
+                    case GGML_TYPE_BF16:
+#if GGML_METAL_EMBED_LIBRARY
+                        if (!has_bfloat) {
+                            return false;
+                        }
+                        break;
+#else
+                        // a precompiled default.metallib is built without GGML_METAL_HAS_BF16: no BF16 K/V kernels
+                        return false;
+#endif
+                    default:
+                        return false;
+                }
+                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16 &&
+                        !(rel->type == GGML_TYPE_BF16 && has_bfloat)) {
+                    return false;
+                }
+                if (rel->nb[0] != ggml_type_size(rel->type)) {
+                    return false;
+                }
+                // the kernels load Q rows as float4 and K/V rows with an element stride of nb1/nb0
+                if (op->src[0]->nb[0] != sizeof(float) || op->src[0]->nb[1] % 16 != 0 ||
+                        op->src[0]->nb[2] % 16 != 0 || op->src[0]->nb[3] % 16 != 0) {
+                    return false;
+                }
+                if (!ggml_metal_fa_layout_ok(op)) {
+                    return false;
+                }
+                if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float) ||
+                        (sinks->ne[1] != 1 && sinks->ne[1] != op->src[0]->ne[1]) ||
+                        (sinks->ne[2] != 1 && sinks->ne[2] != op->src[0]->ne[3]))) {
+                    return false;
+                }
+                return has_simdgroup_mm;
+            }
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;

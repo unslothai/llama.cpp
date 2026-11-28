@@ -191,6 +191,11 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 //   1 - hint
 //   2 - src0 precision
 //   3 - src1 precision
+//
+// - GGML_OP_FLASH_ATTN_EXT
+// - GGML_OP_FLASH_ATTN_EXT_BANDED
+//   0..2 - scale, max_bias, logit_softcap (f32)
+//   3    - acc
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;
@@ -199,6 +204,13 @@ static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int3
 static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, float value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(float));
     ((float *)(tensor->op_params))[i] = value;
+}
+
+// GGML_OP_FLASH_ATTN_EXT_BANDED: op param 6 is 1 when the op is causal without a mask (ggml_flash_attn_ext_banded_set_causal)
+#define GGML_FLASH_ATTN_EXT_BANDED_CAUSAL_PARAM 6
+
+static inline bool ggml_flash_attn_ext_banded_is_causal(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED && ggml_get_op_params_i32(tensor, GGML_FLASH_ATTN_EXT_BANDED_CAUSAL_PARAM) != 0;
 }
 
 struct ggml_map_custom1_op_params {
