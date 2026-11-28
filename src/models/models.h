@@ -2722,6 +2722,9 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // every cache slot runs on the device of the physical layer it shares the weights of
+    int32_t layer_weights(int32_t il) const override { return layer_phys(il); }
 };
 
 struct llama_model_lfm2 : public llama_model_base {

@@ -590,7 +590,7 @@ llama_context::llama_context(
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
+            model.n_gpu_layers() > model.n_layer_weights() &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
@@ -3161,11 +3161,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
 
-    // Later loop passes can select different experts from the same device copy.
-    // TODO: copy only the experts needed by each pass (see #32807 and #32809).
-    if (lctx->model.arch == LLM_ARCH_INKLING2_LOOP) {
-        return false;
-    }
+    // Later loop passes used to read the device copy made for the first pass of a shared host weight.
+    // llama_model_shared_host_views gives every later visit its own view, so each pass gets its own copy and the experts it selects are enough.
+    // Copying all of them here instead (#32807) made the scheduler upload every expert with a blocking copy, about 15% slower prompt processing with experts in host memory.
 
     const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
@@ -3243,7 +3241,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+        const bool full_offload = model.n_gpu_layers() > model.n_layer_weights();
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
