@@ -67,9 +67,8 @@ private:
 #include <cstdio>
 #endif
 
-// free host memory as seen by the OS, in bytes, -1 if unknown:
-//   phys:   available physical memory (Windows ullAvailPhys, Linux MemAvailable)
-//   commit: available commit charge (Windows ullAvailPageFile), -1 where it is not a limit
+// free host memory as seen by the OS in bytes, -1 if unknown.
+// phys is ullAvailPhys / MemAvailable, commit is ullAvailPageFile (-1 where commit is not a limit).
 static void common_fit_get_host_free(int64_t & phys, int64_t & commit) {
     phys   = -1;
     commit = -1;
@@ -97,15 +96,11 @@ static void common_fit_get_host_free(int64_t & phys, int64_t & commit) {
 #endif
 }
 
-// integrated GPUs allocate from the same memory as the host: their reported free memory can exceed it
-// (e.g. Windows WDDM reports dedicated + shared system memory), so cap it at the free host memory that is left after
-// the host buffers in dmds (dmds.back()); several integrated devices split that budget by their free memory
-//   Linux:   MemAvailable - host buffers
-//   Windows: available commit - host buffers - margin; every GPU allocation is charged to the commit limit, even
-//            those in a dedicated carve-out that does not lower ullAvailPhys, so commit is the binding limit
-//   other:   free memory of the CPU device - host buffers
-// margins == nullptr (measurement only) applies no margin; discrete GPUs are not changed;
-// applying it again after adding more host buffers only lowers the cap
+// cap the free memory of integrated GPUs at the host memory left after the host buffers in dmds.back().
+// WDDM reports dedicated + shared system memory, which can exceed what is left.
+// Windows uses commit (ullAvailPageFile) minus a margin: every GPU allocation is charged to it, even in a carve-out.
+// Linux uses MemAvailable; several integrated devices split the budget by their free memory.
+// margins == nullptr applies no margin, discrete GPUs are not changed, and re-applying only lowers the cap.
 static void common_fit_cap_integrated_free(
         std::vector<llama_device_memory_data> & dmds, const std::vector<ggml_backend_dev_t> & devs, const size_t * margins = nullptr) {
     int64_t sum_free_igpu = 0;
