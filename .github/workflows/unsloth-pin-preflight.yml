@@ -203,7 +203,10 @@ jobs:
             # and an arch arm made unreachable by the same arch appearing in an
             # earlier fallthrough condition. Both are checked here, on the tree the
             # pins just produced, because this is the first point it exists.
-            if ! python3 ../scripts/unsloth/merge_checks.py --root . ; then
+            # It also compares every static_assert(X_COUNT == N) with the enum it counts: on 11-23 the
+            # pins added a ggml op, ggml-rpc.h still asserted upstream's GGML_OP_COUNT, and only the
+            # nightly's RPC-enabled legs compiled that header.
+            if ! python3 ../scripts/unsloth/merge_checks.py --root . --base "$BASE" ; then
               PROBLEMS="${PROBLEMS}- the merged tree builds, but \`scripts/unsloth/merge_checks.py\` found a resolution that is silently wrong. See the run log for file and line.\n"
             fi
 
@@ -229,10 +232,10 @@ jobs:
             # that translation unit lives; 59s cold at -j4 with no ccache.
             GATE_OK=1
             if ! cmake -B "${RUNNER_TEMP}/gate" -DCMAKE_BUILD_TYPE=Release \
-                   -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF \
+                   -DGGML_CUDA=OFF -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF \
                    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF > /dev/null \
                || ! cmake --build "${RUNNER_TEMP}/gate" -j "$(nproc)" \
-                     --target llama test-llama-archs test-backend-ops test-mtmd-impl ; then
+                     --target llama test-llama-archs test-backend-ops test-mtmd-impl ggml-rpc ggml-rpc-server ; then
               GATE_OK=
               PROBLEMS="${PROBLEMS}- the pins merge cleanly and the merged tree does not compile. See the run log for the file and line; this is the failure that only shows up in the CUDA leg once the nightly has fanned out.\n"
             fi

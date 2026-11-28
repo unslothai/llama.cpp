@@ -48,6 +48,7 @@ import ast
 import collections
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -280,24 +281,163 @@ def unreachable_arch_arms(path: Path) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- enum counts
+#
+# Observed 11-23: upstream b12635 added a ggml op and moved `static_assert(GGML_OP_COUNT == 101)` in
+# ggml/include/ggml-rpc.h; our Inkling pins add GGML_OP_FLASH_ATTN_EXT_BANDED and had resolved that line to
+# upstream's 101, so the merged tree had 102 ops. It merged clean and every gate built, because ggml-rpc.h is
+# only compiled with GGML_RPC=ON, and the nightly died hours later in the CPU and Vulkan legs. A pin that adds
+# an enum entry has to move every count assert in the tree with it, and a text merge cannot know that.
+# Checked statically here so it costs well under a second and does not depend on which backends a build enables.
+
+_COUNT_ASSERT = re.compile(
+    # both operands must be complete: `E_COUNT == 1 + 2` is an expression, not the literal 1, and is not read
+    r"static_assert\s*\(\s*(?:([A-Za-z_]\w*_COUNT)\s*==\s*(\d+)|(\d+)\s*==\s*([A-Za-z_]\w*_COUNT))\s*[,)]")
+_ENUM = re.compile(r"\benum\s+(?:class\s+)?(\w+)?\s*(?::\s*[\w:\s]+)?\{")
+_SCAN_DIRS = ("ggml", "src", "common", "tools")
+_SCAN_EXT = {".c", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".m", ".mm"}
+
+
+def _scan_files(root: Path):
+    for d in _SCAN_DIRS:
+        base = root / d
+        if not base.is_dir():
+            continue
+        for p in base.rglob("*"):
+            if p.suffix in _SCAN_EXT and p.is_file():
+                yield p
+
+
+def enum_members(code: str) -> dict[str, tuple[str, int | None]]:
+    """`{member: (enum name, value)}` for every enum in decommented code.
+
+    A value is known only while the members count up from literals: `A = 0, B, C = 5, D` gives 0, 1, 5, 6.
+    After any non-literal initializer, or a preprocessor line inside the body, values are unknown (None),
+    so a count that cannot be computed exactly is never compared rather than guessed.
+    """
+    out: dict[str, tuple[str, int | None]] = {}
+    for m in _ENUM.finditer(code):
+        close = code.find("}", m.end())
+        if close == -1:
+            continue
+        body = code[m.end():close]
+        name = m.group(1) or "<anonymous>"
+        value: int | None = 0
+        known = "#" not in body
+        for item in body.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            ident, _, init = item.partition("=")
+            ident = ident.strip()
+            if not re.fullmatch(r"[A-Za-z_]\w*", ident):
+                known = False
+                continue
+            if init.strip():
+                lit = init.strip()
+                if known and re.fullmatch(r"-?\d+", lit):
+                    value = int(lit)
+                else:
+                    known = False
+            # a member repeated in one file (#ifdef / #else alternatives) has no single value
+            out[ident] = (name, None) if ident in out else (name, value if known else None)
+            if known:
+                value += 1
+    return out
+
+
+def count_asserts(root: Path) -> tuple[list[tuple[Path, int, str, int]], dict[str, tuple[Path, str, int | None]]]:
+    """Every `static_assert(X_COUNT == N)` in the tree, and where each X_COUNT is an enum member."""
+    asserts: list[tuple[Path, int, str, int]] = []
+    members: dict[str, tuple[Path, str, int | None]] = {}
+    for p in _scan_files(root):
+        raw = p.read_text(errors="replace")
+        has_assert = "static_assert" in raw and "_COUNT" in raw
+        has_enum = p.suffix in (".h", ".hpp", ".cuh") and "enum" in raw and "_COUNT" in raw
+        if not (has_assert or has_enum):
+            continue
+        lines = _decommented(raw)
+        code = "\n".join(lines)
+        if has_assert:
+            for i, line in enumerate(lines, 1):
+                for m in _COUNT_ASSERT.finditer(line):
+                    sym = m.group(1) or m.group(4)
+                    n = int(m.group(2) or m.group(3))
+                    asserts.append((p, i, sym, n))
+        if has_enum:
+            for ident, (ename, val) in enum_members(code).items():
+                if ident.endswith("_COUNT"):
+                    # a COUNT defined twice (two headers, or #if branches) is ambiguous: never compared
+                    members[ident] = (p, ename, None) if ident in members else (p, ename, val)
+    return asserts, members
+
+
+def _enum_change_note(root: Path, header: Path, enum: str, base: str | None) -> str:
+    """Which entries of `enum` the merged tree adds over `base`, and the merges that touched its header."""
+    if not base:
+        return ""
+    rel = header.relative_to(root).as_posix()
+    try:
+        old = subprocess.run(["git", "-C", str(root), "show", f"{base}:{rel}"],
+                             capture_output=True, text=True, timeout=20)
+        log = subprocess.run(["git", "-C", str(root), "log", "--first-parent", "--format=%s",
+                              f"{base}..HEAD", "--", rel], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    note = []
+    if old.returncode == 0:
+        before = {k for k, (e, _) in enum_members("\n".join(_decommented(old.stdout))).items() if e == enum}
+        after = {k for k, (e, _) in enum_members(
+            "\n".join(_decommented(header.read_text(errors="replace")))).items() if e == enum}
+        added = sorted(after - before)
+        if added:
+            note.append(f"entries added over {base}: {', '.join(added)}")
+    subjects = [s for s in log.stdout.splitlines() if s.strip()] if log.returncode == 0 else []
+    if subjects:
+        note.append(f"merges touching {rel}: {'; '.join(subjects[:8])}")
+    return ("; " + "; ".join(note)) if note else ""
+
+
+def enum_count_asserts(root: Path, base: str | None = None) -> tuple[list[str], int]:
+    """`static_assert(X_COUNT == N)` whose N is not the enum's actual count. Returns (findings, asserts checked)."""
+    asserts, members = count_asserts(root)
+    out, checked = [], 0
+    for path, line, sym, n in asserts:
+        hdr, enum, actual = members.get(sym, (None, None, None))
+        if actual is None:
+            continue
+        checked += 1
+        if actual != n:
+            rel = path.relative_to(root) if path.is_relative_to(root) else path
+            out.append(f"{rel}:{line}: static_assert({sym} == {n}) but {enum} in "
+                       f"{hdr.relative_to(root)} counts {actual}"
+                       f"{_enum_change_note(root, hdr, enum, base)}")
+    return out, checked
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=".", help="tree to check")
     ap.add_argument("--report", metavar="PATH", help="write a JSON summary here")
+    ap.add_argument("--base", metavar="REF",
+                    help="upstream base of the merged tree; names the enum entries and merges behind a count finding")
     a = ap.parse_args()
     root = Path(a.root)
 
     findings: list[str] = []
-    scanned = {"python": 0, "cpp": 0}
+    scanned = {"python": 0, "cpp": 0, "count_asserts": 0}
     for p in sorted(root.glob("gguf-py/**/*.py")):
         scanned["python"] += 1
         findings += duplicate_dict_keys(p)
     for p in sorted(root.glob("src/**/*.cpp")):
         scanned["cpp"] += 1
         findings += unreachable_arch_arms(p)
+    counts, scanned["count_asserts"] = enum_count_asserts(root, a.base)
+    findings += counts
 
-    print(f"merge_checks: scanned {scanned['python']} python and {scanned['cpp']} c++ files")
+    print(f"merge_checks: scanned {scanned['python']} python and {scanned['cpp']} c++ files, "
+          f"{scanned['count_asserts']} enum count asserts")
     for f in findings:
         print(f"  {f}")
     if a.report:

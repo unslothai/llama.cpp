@@ -365,6 +365,66 @@ check("a blank line between } and else does not end the chain",
 rc, out = run(cpp=CLOSED_THEN_NEW)
 check("a genuinely closed chain does not absorb the next one", rc == 0, out)
 
+# ---- enum count asserts (11-23: ggml-rpc.h asserted GGML_OP_COUNT == 101 while the merged ggml.h had 102 ops)
+
+
+def run_tree(files):
+    d = Path(tempfile.mkdtemp(prefix="mc_"))
+    for rel, text in files.items():
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(text)
+    r = subprocess.run([sys.executable, str(SCRIPT), "--root", str(d)], capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+OPS = """
+enum ggml_op {
+    GGML_OP_NONE = 0,
+    GGML_OP_DUP, // a comment, with a comma
+    GGML_OP_ADD,
+    /* GGML_OP_GONE, */
+    GGML_OP_COUNT,
+};
+"""
+RPC = 'static_assert(GGML_OP_COUNT == {n}, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");\n'
+
+rc, out = run_tree({"ggml/include/ggml.h": OPS, "ggml/include/ggml-rpc.h": RPC.format(n=3)})
+check("an op count assert that matches the enum is clean", rc == 0 and "1 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": OPS, "ggml/include/ggml-rpc.h": RPC.format(n=2)})
+check("catches the 11-23 shape: assert one behind the enum",
+      rc == 1 and "ggml-rpc.h:1: static_assert(GGML_OP_COUNT == 2) but ggml_op" in out and "counts 3" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": OPS,
+                    "ggml/src/ggml.c": "static_assert(3 == GGML_OP_COUNT, \"x\");\n"
+                                       "// static_assert(GGML_OP_COUNT == 7, \"commented out\");\n"})
+check("reads `N == X_COUNT` and ignores a commented-out assert", rc == 0 and "1 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A = 0, B, C = 5, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 6, \"\");\n"})
+check("counts on from an explicit literal value", rc == 0 and "1 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A = 0, B = A + 4, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 2, \"\");\n"})
+check("a non-literal initializer makes the count unknown, never compared", rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e {\n A,\n#ifdef X\n B,\n#endif\n E_COUNT,\n};\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 1, \"\");\n"})
+check("an #ifdef inside the enum is never compared", rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/a.h": "enum e { A, E_COUNT };\n", "ggml/include/b.h": "enum f { B, C, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 7, \"\");\n"})
+check("a COUNT defined in two headers is ambiguous, never compared", rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": OPS,
+                    "ggml/src/x.cpp": "static_assert(MAX_PARAMETER_COUNT == 12);\n"})
+check("a COUNT that is not an enum member is not checked", rc == 0 and "0 enum count asserts" in out, out)
+
+rc, out = run_tree({"ggml/include/ggml.h": "#ifdef X\nenum e { A, E_COUNT };\n#else\nenum e { A, B, E_COUNT };\n#endif\n",
+                    "ggml/src/x.c": "#ifdef X\nstatic_assert(E_COUNT == 1, \"\");\n#else\n"
+                                    "static_assert(E_COUNT == 2, \"\");\n#endif\n"})
+check("a COUNT defined twice in one header (#ifdef / #else) is ambiguous, never compared",
+      rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A, B, C, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 1 + 2, \"\");\nstatic_assert(1 + 2 == E_COUNT);\n"})
+check("an expression operand is not read as its first literal", rc == 0 and "0 enum count asserts" in out, out)
+rc, out = run_tree({"ggml/include/ggml.h": "enum e { A, B, C, E_COUNT };\n",
+                    "ggml/src/x.c": "static_assert(E_COUNT == 2);\n"})
+check("a literal operand ending at ) is still checked", rc == 1 and "counts 3" in out, out)
+
 print()
 print(f"{len(FAILS)} failure(s)" if FAILS else "all merge_checks tests passed")
 sys.exit(1 if FAILS else 0)
