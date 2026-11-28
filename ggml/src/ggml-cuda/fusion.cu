@@ -1923,14 +1923,17 @@ static int ggml_cuda_try_fuse_short_conv(ggml_backend_cuda_context * cuda_ctx, g
     // and cur at a token right before it writes dst there, so dst may be either of them in place when one thread has
     // the whole sequence; any other overlap is rejected
     const bool cur_in_place = cur->data == dst->data;
-    if ((cur_in_place && Ts > 64) || (!cur_in_place && ggml_cuda_tensors_overlap(cur, dst)) ||
+    // in-place past aliases the stored state: a thread reads its channel's past before storing it, so this is safe only with one thread per sequence, kw == 1 and matching strides
+    const bool past_in_place = past->data == cell->data && kw == 1 && past->nb[1] == (size_t) ch_s*sizeof(float) &&
+        past->nb[2] == (size_t) seq_s*sizeof(float);
+    if ((cur_in_place && Ts > 64) || (past_in_place && Ts > 64) || (!cur_in_place && ggml_cuda_tensors_overlap(cur, dst)) ||
         (resid && resid->data != dst->data && ggml_cuda_tensors_overlap(resid, dst)) ||
         ggml_cuda_tensors_overlap(cell, dst) || (resid && ggml_cuda_tensors_overlap(resid, cell))) {
         return 0;
     }
     for (const ggml_tensor * t : { cell, (const ggml_tensor *) dst }) {
         for (const ggml_tensor * src : { past, w, dyn }) {
-            if (src && ggml_cuda_tensors_overlap(t, src)) {
+            if (src && !(past_in_place && t == cell && src == past) && ggml_cuda_tensors_overlap(t, src)) {
                 return 0;
             }
         }
@@ -1955,7 +1958,7 @@ static int ggml_cuda_try_fuse_short_conv(ggml_backend_cuda_context * cuda_ctx, g
     args.state_ch_s   = ch_s;
     args.state_seq_s  = seq_s;
     args.kw           = kw;
-    args.run          = cur_in_place || Ts <= 8 ? Ts : 1;
+    args.run          = cur_in_place || past_in_place || Ts <= 8 ? Ts : 1;
     args.C            = C;
     args.K            = K;
     args.Ts           = Ts;

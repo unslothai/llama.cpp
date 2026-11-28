@@ -4926,11 +4926,12 @@ struct test_l2_clip : public test_case {
 
 // the causal short conv of Inkling 2 as convolve() builds it: CONCAT(past, cur^T), the state store (a CPY of the last
 // columns, or SET_ROWS of the windows of n_slots rollback slots), SSM_CONV, the optional input-dependent taps of H heads,
-// the residual ADD and SCALE, and an optional residual add after it
+// the residual ADD and SCALE, and an optional residual add after it. in_place: past aliases the stored state cell (slot 0)
 struct test_short_conv : public test_case {
     const int64_t C, Ts, S, H, n_slots;
     const bool    res;
     const int64_t K; // the conv width
+    const bool    in_place;
 
     std::vector<ggml_tensor *> verify;
 
@@ -4943,11 +4944,12 @@ struct test_short_conv : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR7(C, Ts, S, H, n_slots, res, K);
+        return VARS_TO_STR7(C, Ts, S, H, n_slots, res, K) + (in_place ? ",in_place=1" : "");
     }
 
-    test_short_conv(int64_t C = 1024, int64_t Ts = 1, int64_t S = 1, int64_t H = 0, int64_t n_slots = 0, bool res = false, int64_t K = 4)
-        : C(C), Ts(Ts), S(S), H(H), n_slots(n_slots), res(res), K(K) {}
+    test_short_conv(int64_t C = 1024, int64_t Ts = 1, int64_t S = 1, int64_t H = 0, int64_t n_slots = 0, bool res = false, int64_t K = 4,
+            bool in_place = false)
+        : C(C), Ts(Ts), S(S), H(H), n_slots(n_slots), res(res), K(K), in_place(in_place) {}
 
     // the inputs only: the rollback windows are an overlapping view
     void initialize_tensors(ggml_context * ctx) override {
@@ -4981,6 +4983,11 @@ struct test_short_conv : public test_case {
         ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K1*(C + 64), S*n_planes);
         ggml_set_name(state, "state");
         const size_t row_size = state->nb[1];
+
+        if (in_place) {
+            // the cell (slot 0) of each sequence, the same memory the state store below writes
+            past = ggml_view_3d(ctx, state, K1, C, S, K1*sizeof(float), row_size, 32*K1*sizeof(float));
+        }
 
         ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, Ts, S)), 0);
 
@@ -12098,6 +12105,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t K : { 2, 3, 8 }) {
         test_cases.emplace_back(new test_short_conv(256, 5, 2, 4, 0, true, K));
         test_cases.emplace_back(new test_short_conv(256, 3, 1, 0, 6, false, K));
+    }
+    // past read in place from the state cell: one thread per sequence up to 64 tokens, the separate ops above it
+    for (int64_t H : { 0, 8 }) {
+        for (bool res : { false, true }) {
+            for (int64_t Ts : { 1, 3, 33, 64, 65 }) {
+                for (int64_t S : { 1, 2 }) {
+                    test_cases.emplace_back(new test_short_conv(1024, Ts, S, H, 0, res, 4, true));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_short_conv(256, 5, 2, 4, 0, true, 2, true));
+    test_cases.emplace_back(new test_short_conv(256, 3, 1, 0, 0, false, 3, true));
+    // rollback slots: one token stores slot 0 only and fuses, more tokens store more slots and keep the separate ops
+    for (int64_t H : { 0, 8 }) {
+        for (int64_t Ts : { 1, 3 }) {
+            for (int64_t S : { 1, 2 }) {
+                test_cases.emplace_back(new test_short_conv(1024, Ts, S, H, 4, false, 4, true));
+            }
+        }
     }
     for (int64_t T : { 1, 3 }) {
         for (int64_t Q : { 1, 3, 4 }) {
