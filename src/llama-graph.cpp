@@ -1866,7 +1866,8 @@ ggml_tensor * llm_graph_context::get_input_scale(const ggml_tensor * w) const {
 
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
-          ggml_tensor * cur) const {
+          ggml_tensor * cur,
+        enum ggml_prec   prec) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat_ext(ctx0, w, cur_mm, get_weight_scale(w), get_input_scale(w));
@@ -1876,6 +1877,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     prec_policy.apply(res, w);
+
+    if (prec != GGML_PREC_UNDEFINED) {
+        // explicit precision wins; set on the base MUL_MAT before scale/LoRA changes the root op
+        ggml_prec_set_acc(res, prec);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

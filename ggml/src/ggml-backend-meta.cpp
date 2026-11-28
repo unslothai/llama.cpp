@@ -856,6 +856,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
+    auto handle_flash_attn_ext_banded = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // ggml_flash_attn_ext_banded stores rel_logits [E, n_head, n_q, n_seq] in src[6], split by head like q
+        GGML_ASSERT(                             src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+    };
+
     auto handle_lightning_indexer = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
@@ -1096,6 +1106,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
+            } break;
+            case GGML_OP_FLASH_ATTN_EXT_BANDED: {
+                split_state = handle_flash_attn_ext_banded(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

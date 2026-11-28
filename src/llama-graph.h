@@ -1207,7 +1207,8 @@ struct llm_graph_context {
     // do mat_mul, while optionally apply lora and the weight scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
-              ggml_tensor * cur) const;
+              ggml_tensor * cur,
+            enum ggml_prec   prec = GGML_PREC_UNDEFINED) const;
 
     // do mat_mul_id, while optionally apply lora and the weight scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)

@@ -83,7 +83,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1321,7 +1321,8 @@ void launch_fattn(
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
     const ggml_tensor * mask    = dst->src[3];
-    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * rel     = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
+    const ggml_tensor * sinks   = rel ? rel : dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
 
     const bool has_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
@@ -1586,6 +1587,11 @@ void launch_fattn(
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    if (rel) {
+        GGML_ASSERT(rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel));
+        GGML_ASSERT(rel->ne[0] <= (1 << 20)); // exactly representable in float
+    }
+
     if (logit_softcap != 0.0f) {
         scale /= logit_softcap;
     }
@@ -1593,8 +1599,10 @@ void launch_fattn(
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
-    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    // banded op reuses the MMA ABI: negative m0 tags the branch, sinks_ptr carries rel_logits, -m0 is E
+    // an ordinary m0 is a power of 2 and never negative, whatever max_bias is
+    const float m0 = rel ? -float(rel->ne[0]) : powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = rel ? 1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
