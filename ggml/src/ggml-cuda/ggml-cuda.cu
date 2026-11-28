@@ -37,6 +37,7 @@
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-f32.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2261,6 +2262,11 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc);
+    // one column of Q8_0 against F32 activations, without quantizing src1 to q8_1
+    if (!use_mmq_few && ggml_cuda_should_use_mmvq_f32(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_vec_q_f32(ctx, src0, src1, dst);
+        return false;
+    }
     if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         const bool fold = scale_fold && ggml_cuda_should_fuse_mul_mat_vec_q(dst);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst, fold ? &fusion : nullptr);
