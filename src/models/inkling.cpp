@@ -532,7 +532,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             }
 
             cur = build_attn(inp_attn,
-                    layer.wo, NULL, NULL,
+                    layer.wo, NULL,
                     q, k, v, kq_b, nullptr, nullptr, 1.0f, il);
         }
         cb(cur, "inkling_attn_o", il);
@@ -542,9 +542,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
     auto build_dense_ffn = [&](ggml_tensor * cur, int il) -> ggml_tensor * {
         cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                model.layers[il].ffn_up,   NULL,
+                model.layers[il].ffn_gate, NULL,
+                model.layers[il].ffn_down, NULL,
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cur = ggml_mul(ctx0, cur, model.layers[il].ffn_gscale);
         cb(cur, "inkling_dense_ffn_out", il);
@@ -557,7 +557,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         const int64_t n_shexp = hparams.n_expert_shared;
 
         ggml_tensor * logits = build_lora_mm(
-            layer.ffn_gate_inp, cur, nullptr, GGML_PREC_F32_PEDANTIC);
+            layer.ffn_gate_inp, cur, GGML_PREC_F32_PEDANTIC);
         cb(logits, "inkling_moe_logits", il);
 
         const size_t lsz = ggml_element_size(logits);
@@ -672,7 +672,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     if (!cparams.embeddings) {
         cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         cur = build_lora_mm(
-            model.output, cur, nullptr,
+            model.output, cur,
             model.output->type == GGML_TYPE_F32 ? GGML_PREC_F32_PEDANTIC : GGML_PREC_UNDEFINED);
 
         // padded vocab rows get -inf so samplers never emit a padded id
