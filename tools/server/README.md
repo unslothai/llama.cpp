@@ -210,6 +210,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--mcp-servers-config PATH` | experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_CONFIG) |
 | `--mcp-servers-json JSON` | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_JSON) |
 | `-ag, --agent, -no-ag, --no-agent` | whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_AGENT) |
+| `--ui-agent` | enable agent mode in Llama Chat with nothing enabled on the server: the tools that run in the browser and MCP servers the browser reaches itself, no server tools and no MCP proxy (default: disabled)<br/>note: not needed with --agent, --tools or --ui-mcp-proxy, they enable agent mode in Llama Chat too<br/>(env: LLAMA_ARG_UI_AGENT) |
 | `--ui, --webui, --no-ui, --no-webui` | whether to enable Llama Chat, the built-in chat app (default: enabled)<br/>(env: LLAMA_ARG_UI) |
 | `--connect` | (experimental) open a peer-to-peer tunnel for server using llama-connect (default: disabled)<br/>(env: LLAMA_ARG_CONNECT) |
 | `--connect-code CODE` | manually specify a 40-character code for --connect (default: generate a new one for each run)<br/>(env: LLAMA_ARG_CONNECT_CODE) |
@@ -361,6 +362,8 @@ For more details, please refer to [multimodal documentation](../../docs/multimod
 The server includes a set of server tools that enable the LLM to access the local file system directly from Llama Chat.
 
 To use this feature, start the server with `--tools all`. You can also enable only specific tools by passing a comma-separated list: `--tools name1,name2,...`. Run `--help` for the full list of available tool names.
+
+To use the agent mode of Llama Chat with no access to the machine the server runs on, start the server with `--ui-agent` instead. The LLM then gets the tools that run in the browser (current time, JavaScript sandbox, ...) and the MCP servers the browser reaches itself.
 
 ### MCP servers
 
@@ -1667,6 +1670,12 @@ LFM3-Omni is not trained to reason, run it with `--reasoning off` so that its tu
 
 Tools go into the system prompt with the chat template, and the tool calls are parsed as in `/v1/chat/completions`. The client runs the calls of a response, sends their results as `function_call_output` items, then asks for the next response.
 
+#### Full duplex
+
+Full duplex models, like Hibiki (French to English speech translation), speak while they listen on the same endpoint. There are no turns: the first `input_audio_buffer.append` opens a response, then every 80 ms of input audio gives 80 ms of output audio (`response.output_audio.delta`) and the text of the translation (`response.output_text.delta`). `response.cancel` ends the response with `response.done`, the next audio opens another one. Audio input and output are PCM16 mono, as for a realtime conversation.
+
+The model attends to the last 120 s of the stream, so the context of each slot only needs to hold that window (1500 frames for Hibiki, `-c` divided by `-np`). The model is trained on streams no longer than its window, so once the window is full the first frames of the stream stay in context and the oldest frames after them are dropped, 20 s at a time. This keeps Hibiki-1B going on long streams; Hibiki-2B still degrades after about 2 minutes, as the reference implementation does, cancel the response between long segments of speech. `input_audio_buffer.commit`, `conversation.item.create` and `response.create` are rejected. The text and the audio are sampled with the settings of the model, the text settings can be overridden with the server sampling options.
+
 ### POST `/v1/audio/speech`: OpenAI-compatible Speech API
 
 Generates speech from text, for models that can generate audio. The request is converted to a [`/tts`](#post-tts-generate-speech-audio-from-text) request, so the `/tts` options such as `lang`, `seed` or `speaker_ref_b64` can also be used.
@@ -2429,6 +2438,8 @@ Response:
 
 ### GET `/models/sse`: Real-time events
 
+This endpoint is also available in single-model mode (`-m`, `-hf`, ...), where it is served before the model is loaded, to follow the download and loading progress. As `GET /models` is unavailable until the model is loaded, each new client first receives the last event sent. If the download or the loading fails, a `status_change` event with status `unloaded` is sent before the server exits.
+
 Example events:
 
 ```js
@@ -2658,6 +2669,12 @@ You can specify default preferences for Llama Chat using `--ui-config <JSON conf
 
 ```bash
 ./llama-server -m model.gguf --ui-config '{"pasteLongTextToFileLen": 0, "renderUserContentAsMarkdown": true}'
+```
+
+You can also set the DPI used when parsing a PDF as images (default 108), e.g. 216 for dense tables:
+
+```bash
+./llama-server -m model.gguf --ui-config '{"pdfAsImage": true, "pdfDpi": 216}'
 ```
 
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.

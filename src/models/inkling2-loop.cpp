@@ -100,8 +100,8 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
 
     const int64_t n_core = core_end - core_start;
     if (legacy) {
-        legacy_res_query    = create_tensor(tn(LLM_TENSOR_LOOP_RES_QUERY,    "weight"), {n_embd, 2*n_core}, 0);
-        legacy_kv_res_query = create_tensor(tn(LLM_TENSOR_LOOP_KV_RES_QUERY, "weight"), {n_embd, 2*n_core}, 0);
+        legacy_res_query    = create_tensor(tn(LLM_TENSOR_LOOP_RES_QUERY,    "weight"), {n_embd, 2*n_core}, TENSOR_NO_SCALE);
+        legacy_kv_res_query = create_tensor(tn(LLM_TENSOR_LOOP_KV_RES_QUERY, "weight"), {n_embd, 2*n_core}, TENSOR_NO_SCALE);
     }
 
     loop_layers.resize(n_core);
@@ -109,7 +109,7 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
         auto & l = loop_layers[il - core_start];
         // the q, k, v and ffn message queries, built in the graph for the legacy layout
         if (!legacy) {
-            l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
+            l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, TENSOR_NO_SCALE);
         }
         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
             l.ctrl_down[c]   = create_tensor(tn(legacy ? legacy_down[c]   : down[c],   "weight", il), {2*n_embd, rank}, 0);
@@ -117,7 +117,9 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
             l.ctrl_forget[c] = create_tensor(tn(legacy ? legacy_forget[c] : forget[c], "weight", il), {rank, n_embd}, 0);
         }
     }
+}
 
+void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     // share the physical weights, each cache slot keeps its own KV and conv state
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
         layers[il] = layers[layer_phys(il)];
@@ -145,7 +147,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
 
     auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
+
+    // DSpark target features are indexed by layer visit, not by cache slot
+    int visit = 0;
+
     for (int il = 0; il < start; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -164,6 +171,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+            res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
@@ -174,7 +182,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     }
 
     for (int il = end; il < m.n_phys; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
+    GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
 }
