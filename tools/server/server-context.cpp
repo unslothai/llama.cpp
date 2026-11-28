@@ -4658,11 +4658,24 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // the speculative context processes the batch in the same yield; its outputs are read at the end of
+        // post_decode(), so the draft decode overlaps with the sampling of the target outputs
         int ret = 0;
+        bool spec_ok = true;
         queue_tasks.yield_to_queue([&]() {
+            // a draft decode left in flight may still read the target outputs this decode overwrites
+            common_speculative_sync(spec.get());
+
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+
+            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+            //       for now, always re-evaluate for simplicity
+            //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+            if (ret == 0 && spec) {
+                spec_ok = common_speculative_process_async(spec.get(), batch.view);
             }
         });
 
@@ -4719,21 +4732,11 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
-            });
+        if (!spec_ok) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
 
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
-            }
+            // TODO: handle error
+            throw std::runtime_error("failed to process speculative batch");
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -4899,9 +4902,16 @@ private:
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
 
+            // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
+            const bool use_ckpt_tgt =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // only a checkpoint restore needs the sampler as it was before the draft
+                // the copy holds the candidates of the last sampling, a full vocab of token data
+                common_sampler_ptr smpl_save(use_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4927,11 +4937,6 @@ private:
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-
-                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -5030,6 +5035,9 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        // the draft decode of this batch ran during the sampling above, collect its outputs
+        common_speculative_sync(spec.get());
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
