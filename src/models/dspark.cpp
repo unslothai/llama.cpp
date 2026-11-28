@@ -85,7 +85,6 @@ void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
 
     dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
     dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
-    dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"),   { n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
     dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
@@ -302,9 +301,9 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     ggml_set_name(prev_embd, "dspark_prev_embd");
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
     auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
-    auto * base = g.build_lora_mm(output, hidden, scale);
-    auto * bias = g.build_lora_mm(output, correction, scale);
+    auto * output = llama_model_dflash::get_lm_head(g, model);
+    auto * base = g.build_lora_mm(output, hidden);
+    auto * bias = g.build_lora_mm(output, correction);
     ggml_prec_set_acc(base, GGML_PREC_F32);
     ggml_prec_set_acc(bias, GGML_PREC_F32);
     auto * logits = ggml_add(g.ctx0, base, bias);
@@ -471,7 +470,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             if (f_rnn) {
                 joint = ggml_concat(ctx0, joint, f_rnn, 0);
             }
-            joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
+            joint = ggml_add(ctx0, g.build_lora_mm(model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
 
             const auto chunk = [&](int64_t k) {
                 return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, n_blocks, joint->nb[1], k*rank*ggml_element_size(joint)));
@@ -484,7 +483,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * bias = g.build_lora_mm(w2, markov); // [n_vocab_draft, n_blocks]
         if (model.dspark_markov_w2_b) {
             bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
         }
@@ -514,7 +513,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
                                                     (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
             ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), markov, 0);
-            ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            ggml_tensor * conf = g.build_lora_mm(model.dspark_conf_proj, feat);
             if (model.dspark_conf_proj_b) {
                 conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
             }
@@ -833,9 +832,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
+                layer.ffn_up_shexp, nullptr,
+                layer.ffn_gate_shexp, nullptr,
+                layer.ffn_down_shexp, nullptr,
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
@@ -855,8 +854,8 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    auto * output = get_lm_head(*this, model);
+    cur = build_lora_mm(output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -984,7 +983,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
             cb(kv, "kv", il);
 
             ggml_tensor * out = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
                     q, kv, kv,
                     nullptr, layer.attn_sinks, nullptr,
                     kq_scale, il);
@@ -998,7 +997,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
 
             out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, n_tokens);
             out = ggml_permute(ctx0, out, 0, 2, 1, 3);
-            ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+            ggml_tensor * oa = build_lora_mm(layer.wo_a, out);
             cb(oa, "attn_wo_a", il);
             oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
             oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, n_tokens);
@@ -1034,9 +1033,9 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
+                layer.ffn_up_shexp, nullptr,
+                layer.ffn_gate_shexp, nullptr,
+                layer.ffn_down_shexp, nullptr,
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
@@ -1060,8 +1059,8 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    auto * output = get_lm_head(*this, model);
+    cur = build_lora_mm(output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1094,7 +1093,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
     const auto build_kv = [&](ggml_tensor * x, int il) -> std::pair<ggml_tensor *, ggml_tensor *> {
         const auto & layer = model.layers[il];
 
-        ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, x);
+        ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, x);
         cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
         ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
@@ -1156,7 +1155,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
         cb(cur, "attn_norm", il);
 
         {
-            ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq, cur);
+            ggml_tensor * q = build_lora_mm(layer.wq, cur);
             cb(q, "q", il);
 
             // {n_embd_head_nope, n_tokens, n_head}
@@ -1166,7 +1165,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
             q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
 
             // {kv_lora_rank, n_head, n_tokens}
-            ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+            ggml_tensor * q_nope_absorbed = build_lora_mm(layer.wk_b, q_nope);
             q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
             cb(q_nope_absorbed, "q_nope_absorbed", il);
 
@@ -1185,7 +1184,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 
             // apply wv_b after attn, so the K rotation is already undone
             ggml_tensor * out = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
                     Qcur, Kcur, Vcur,
                     nullptr, nullptr, nullptr,
                     kq_scale, il);
@@ -1193,10 +1192,10 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 
             // {kv_lora_rank, n_tokens, n_head} -> {n_embd_head_v_mla, n_tokens, n_head}
             out = ggml_reshape_3d(ctx0, out, kv_lora_rank, n_head, n_tokens);
-            out = ggml_mul_mat(ctx0, layer.wv_b, ggml_permute(ctx0, out, 0, 2, 1, 3));
+            out = build_lora_mm(layer.wv_b, ggml_permute(ctx0, out, 0, 2, 1, 3));
             out = ggml_cont_2d(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3), n_embd_head_v_mla*n_head, n_tokens);
 
-            cur = build_lora_mm(layer.wo, out, layer.wo_s);
+            cur = build_lora_mm(layer.wo, out);
             cb(cur, "attn_out", il);
         }
 
@@ -1207,9 +1206,9 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-                layer.ffn_up,   nullptr, nullptr,
-                layer.ffn_gate, nullptr, nullptr,
-                layer.ffn_down, nullptr, nullptr,
+                layer.ffn_up,   nullptr,
+                layer.ffn_gate, nullptr,
+                layer.ffn_down, nullptr,
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
@@ -1221,8 +1220,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    ggml_tensor * logits = build_lora_mm(output, cur, output_s);
+    auto * output = get_lm_head(*this, model);
+    ggml_tensor * logits = build_lora_mm(output, cur);
 
     // softcap does not apply to the markov bias
     if (hparams.f_final_logit_softcapping) {
