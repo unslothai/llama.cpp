@@ -2306,8 +2306,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DUP:
         case GGML_OP_CONT:
             {
-                // as for GET_ROWS: waking the other threads costs more than a small copy, e.g. the cont of the
-                // anchor ids that a DSpark draft block gathers on the CPU in every draft step
+                // as for GET_ROWS: waking the other threads costs more than a small copy, e.g. the cont of the DSpark anchor ids in every draft step
                 n_tasks = ggml_nelements(node) >= 4096 ? n_threads : 1;
             } break;
         case GGML_OP_ADD:
@@ -2908,7 +2907,8 @@ struct ggml_cplan ggml_graph_plan(
                             // conversion between F32 and I32
                             (node->src[0]->type == GGML_TYPE_F32 && node->src[1] && node->src[1]->type == GGML_TYPE_I32) ||
                             (node->src[0]->type == GGML_TYPE_I32 && node->src[1] && node->src[1]->type == GGML_TYPE_F32)) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                            // all graph threads run the copy, even when a small copy plans one task
+                            cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_threads;
                         }
                     } break;
                 case GGML_OP_ADD:
