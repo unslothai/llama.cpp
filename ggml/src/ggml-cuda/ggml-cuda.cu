@@ -2235,7 +2235,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // a thin F32 src0 per src1 channel at a few channels (e.g. Inkling 2 loop controllers in a speculative verify batch): MMVF, as cuBLAS runs a slow batched GEMM of tiny products
+    // thin F32 src0 per src1 channel, few channels (Inkling 2 verify batch): MMVF beats cuBLAS tiny batched GEMMs
     // MMVF reads src1 in pairs, so other src1 views keep the old path
     if (src0->type == GGML_TYPE_F32 && ne01 <= 16 && ne02 == ne12 && ne03 == ne13 &&
             ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE && ne11 <= MMVF_MAX_BATCH_SIZE &&
@@ -2290,7 +2290,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return weight_scale != nullptr;
         }
     }
-    // a 2D src0 over a few src1 channels is one GEMM over all their columns, not a batched GEMM of tiny products (e.g. the Inkling 2 relative-bias table)
+    // 2D src0 over a few src1 channels: one GEMM over all columns, not tiny batched GEMMs
     if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE &&
             ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
         ggml_tensor src1_2d = *src1;
