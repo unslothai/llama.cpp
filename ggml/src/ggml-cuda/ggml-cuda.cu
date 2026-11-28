@@ -23,6 +23,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
+#include "ggml-cuda/depth-mix.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -3466,6 +3467,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_depth_mix_shadow_flush(cuda_ctx, cgraph);
 
     return GGML_STATUS_SUCCESS;
 }

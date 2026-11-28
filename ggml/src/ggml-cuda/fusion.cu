@@ -1,6 +1,7 @@
 #include "fusion.cuh"
 #include "graph.cuh"
 #include "binbcast.cuh"
+#include "depth-mix.cuh"
 #include "dsv4-hc.cuh"
 #include "fp8.cuh"
 #include "gated_delta_net.cuh"
@@ -1388,6 +1389,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // try and fuse nodes and return the number of nodes to skip
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
+
+    // depth mix after an RMS_NORM: CONCAT, CONCAT, [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
+    {
+        static const bool depth_mix_disabled = [] { const char * env = getenv("GGML_CUDA_DISABLE_DEPTH_MIX_FUSION"); return env != nullptr && atoi(env) != 0; }();
+        const int n_fused = depth_mix_disabled ? 0 : ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i,
+            [](const ggml_cgraph * g, int idx, int cnt, const int * outs, int n_outs) {
+                return ggml_cuda_check_fusion_memory_ranges(g, idx, cnt, outs, n_outs);
+            });
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
