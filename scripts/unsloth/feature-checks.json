@@ -199,6 +199,12 @@
         { "kind": "backend-op", "op": "CONV_CHAIN_FUSE" }
       ]
     },
+    "cuda-short-conv-in-place": {
+      "owner": "unslothai#462",
+      "checks": [
+        { "kind": "backend-op", "op": "SHORT_CONV", "params": "in_place=1" }
+      ]
+    },
     "cuda-elem-fusions": {
       "owner": "unslothai#412",
       "checks": [
