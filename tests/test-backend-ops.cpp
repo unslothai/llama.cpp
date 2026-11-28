@@ -6624,6 +6624,44 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with a contiguous a and a b that is a view of longer rows
+struct test_mul_mat_view_b : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const std::array<int64_t, 2> bs;
+    const int64_t k_v;    // row length of b in memory
+    const int64_t offset; // element offset of the b view
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, m, n, k, bs, k_v, offset);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_view_b(ggml_type type = GGML_TYPE_F32, int64_t m = 2, int64_t n = 4, int64_t k = 16,
+            std::array<int64_t, 2> bs = {2, 1}, int64_t k_v = 17, int64_t offset = 0)
+        : type(type), m(m), n(n), k(k), bs(bs), k_v(k_v), offset(offset) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(offset + k <= k_v);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, k, m, bs[0], bs[1]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k_v, n, bs[0], bs[1]);
+        ggml_set_name(b, "b");
+        b = ggml_view_4d(ctx, b, k, n, bs[0], bs[1], b->nb[1], b->nb[2], b->nb[3], offset*ggml_element_size(b));
+        ggml_set_name(b, "b_view");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -13907,6 +13945,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : {2, 3, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1280, 24, 16, {1, 1}, {nb, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 24, 16, {1, 1}, {nb, 2}));
+    }
+    // the same thin F32 src0 per channel with a strided b view: odd row stride, odd offset, and an aligned view for MMVF
+    for (int64_t n : {5, 8}) {
+        for (int64_t bs : {2, 3}) {
+            test_cases.emplace_back(new test_mul_mat_view_b(GGML_TYPE_F32, 2,  n, 16, {bs, 1}, 17, 0));
+            test_cases.emplace_back(new test_mul_mat_view_b(GGML_TYPE_F32, 16, n, 16, {bs, 1}, 18, 1));
+            test_cases.emplace_back(new test_mul_mat_view_b(GGML_TYPE_F32, 2,  n, 16, {bs, 1}, 18, 2));
+        }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));

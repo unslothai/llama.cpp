@@ -2235,11 +2235,11 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // a thin F32 src0 with its own matrix per src1 channel at a few channels (e.g. per-token 2304x2 Inkling 2 loop
-    // controllers in a speculative verify batch): MMVF up to its batch size, where cuBLAS runs a batched GEMM of tiny
-    // products that costs 9x the single product. Decode (one channel) and prefill (many channels) keep their kernels.
+    // a thin F32 src0 per src1 channel at a few channels (e.g. Inkling 2 loop controllers in a speculative verify batch): MMVF, as cuBLAS runs a slow batched GEMM of tiny products
+    // MMVF reads src1 in pairs, so other src1 views keep the old path
     if (src0->type == GGML_TYPE_F32 && ne01 <= 16 && ne02 == ne12 && ne03 == ne13 &&
             ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            nb10 == ggml_type_size(src1->type) && ggml_cuda_is_aligned(src1, 2*ggml_type_size(src1->type)) &&
             ggml_cuda_should_use_mmvf(src0, src1->type, cc, warp_size, /*ne11 =*/ 1, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return false;
@@ -2290,9 +2290,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return weight_scale != nullptr;
         }
     }
-    // a 2D src0 broadcast over a few src1 channels is one GEMM over all their columns: cuBLAS would otherwise run a
-    // batched GEMM of tiny products (e.g. the Inkling 2 relative-bias table in a speculative verify batch, 2.3x slower).
-    // Decode (one channel) and prefill (many channels) keep their kernels, so their results are unchanged.
+    // a 2D src0 over a few src1 channels is one GEMM over all their columns, not a batched GEMM of tiny products (e.g. the Inkling 2 relative-bias table)
     if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE &&
             ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
         ggml_tensor src1_2d = *src1;
