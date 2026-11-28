@@ -226,14 +226,9 @@ def probe_penalize_prompt(check: dict, b: Path, gpu: bool) -> str:
 
 
 def probe_decode_kernels(check: dict, b: Path, gpu: bool) -> str:
-    """The named device kernels launch while a synthetic model of the arch decodes.
+    """Every kernel in "kernels" launches during test-llama-archs -a ARCH under nsys.
 
-    A backend-op check builds its own graph, so a fused kernel whose matcher no
-    longer recognises the graph the model builds still passes it, while every
-    real decode runs the separate ops. Upstream 7b74cb92d6 (recurrent states read
-    in place) did that to the Inkling 2 short conv fusions: the op tests stayed
-    green and decode lost 13%. This runs test-llama-archs -a ARCH under nsys and
-    requires every kernel in "kernels" to launch at least once.
+    Backend-op tests build their own graph, so they stay green when the model's graph stops matching a fusion.
     """
     import os
 
