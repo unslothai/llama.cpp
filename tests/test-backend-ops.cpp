@@ -15479,6 +15479,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 1, 64, 64, 512, 1, GGML_TYPE_F16,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 17, 33,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, true));
+    // Inkling 2 at a few tokens (a speculative verify batch): 24 Q heads on 8 KV heads, cells split one tile per block
+    for (int64_t n_q : {2, 3, 4, 8}) {
+        for (int64_t n_kv : {64, 256, 1088}) {
+            for (int mask_kind : {1, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 1));
+            }
+        }
+    }
     // a fully masked query is 0, also on the FA kernel the op delegates to without sinks
     for (int64_t n_kv : {64, 4096}) {
         test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2,  1, n_kv, 32, 4, GGML_TYPE_F16,  GGML_TYPE_F32));
@@ -16037,6 +16045,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini speculative verify (a few tokens): banded attention at small n_kv
+    for (int64_t n_kv : {256, 1024, 4096}) {
+        for (int64_t n_q : {1, 2, 3, 4, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 3, GGML_TYPE_F16, GGML_TYPE_F32, 1));
+        }
+    }
 
     // Inkling-2-Mini decode: banded over a padded n_kv vs flash attention with a dense bias mask
     {
