@@ -230,6 +230,13 @@
       "checks": [
         { "kind": "arch", "arch": "inkling2_loop" }
       ]
+    },
+    "cuda-few-channel-mm": {
+      "owner": "unslothai#460",
+      "checks": [
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=f32,type_b=f32,m=(1|2|16),n=(1|4|8),k=2304,bs=\\[(2|3|8|9),1\\],nr=\\[1,1\\]" },
+        { "kind": "backend-op", "op": "MUL_MAT", "params": "type_a=f32,type_b=f32,m=(1280|1024),n=24,k=16,bs=\\[1,1\\],nr=\\[(2|3|8),(1|2)\\]" }
+      ]
     }
   },
   "unchecked": {
@@ -253,6 +260,7 @@
     "unslothai#396": "looped layers placed by the layers that hold weights, with per-visit host weight views; it only differs with partial offload or several GPUs on a looped GGUF, which the pipeline does not have",
     "unslothai#397": "llama-quantize keeps the DSpark fuse weights F32; needs a DSpark draft GGUF the pipeline does not have",
     "unslothai#385": "Inkling 2 attention chunked over query rows once the dense relative bias for a full cache passes 2^29 elements; it only engages with a large context window (a cache above about 21K cells at -ub 512 for 48 heads), which the small synthetic test-llama-archs context never reaches, and below that budget the graph is unchanged",
-    "unslothai#429": "llama-server --cache-ram auto: sizes the host prompt cache from the RAM left after the model and context load; a server option with no arch, backend-op or mtmd surface, covered by test-arg-parser and the tools/server tests on the merged tree"
+    "unslothai#429": "llama-server --cache-ram auto: sizes the host prompt cache from the RAM left after the model and context load; a server option with no arch, backend-op or mtmd surface, covered by test-arg-parser and the tools/server tests on the merged tree",
+    "unslothai#459": "ggml-cpu runs CPY, DUP and CONT below 4096 elements as one task instead of waking every thread (scheduling only, the copied bytes are the same); covered by test-backend-ops CPY, DUP and CONT on a GPU device, whose CPU reference runs this rule, and there is no feature surface of its own to probe"
   }
 }
