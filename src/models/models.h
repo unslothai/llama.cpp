@@ -2706,6 +2706,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
+    void load_legacy_hparams();
 
     int      n_phys     = 0;
     uint32_t core_start = 0;
@@ -2713,12 +2714,18 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     uint32_t n_passes   = 0;
     uint32_t gate_rank  = 0;
     bool     varying    = false; // trained for a varying number of passes
+    bool     legacy     = false; // earlier inkling2 looped layout, one block per visit
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
 
+    // legacy layout: the message queries of all core layers, {n_embd, 2*(core_end - core_start)} each
+    ggml_tensor * legacy_res_query    = nullptr;
+    ggml_tensor * legacy_kv_res_query = nullptr;
+
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);
+        ggml_tensor * legacy_query(int i) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

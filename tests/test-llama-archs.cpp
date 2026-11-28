@@ -249,7 +249,8 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// looped: an inkling2 file in the earlier looped layout (one block per visit), loaded as inkling2_loop
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool looped = false) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -337,7 +338,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd  = 128;
         n_head  = 4;
         n_ff    = 24;
-        n_layer = 3;
+        n_layer = looped ? 4 : 3; // looped: prelude, two visits of the core, coda
     }
 
     uint32_t n_head_kv = n_head;
@@ -796,6 +797,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
             ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
             ms.add_kv(LLM_KV_LOOP_VARYING,   false);
+        } else if (looped) {
+            // the same model in the earlier layout, the second visit of the core is stored as block 2
+            ms.add_kv(LLM_KV_LOOP_CORE_START, uint32_t(1));
+            ms.add_kv(LLM_KV_LOOP_CORE_END,   uint32_t(2));
+            ms.add_kv(LLM_KV_NUM_LOOPS,       uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK,  uint32_t(8));
         }
         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
@@ -808,7 +815,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,           uint32_t(2));
         std::vector<bool> pattern(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
-            pattern[i] = i % 2 == 0;
+            const uint32_t phys = looped && i >= 2 ? i - 1 : i;
+            pattern[i] = phys % 2 == 0;
         }
         std::vector<uint8_t> values(pattern.begin(), pattern.end());
         gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
@@ -915,7 +923,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
     // the inkling2_loop core boundaries must be multiples of the block size
-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP ? 1 : 12));
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP || looped ? 1 : 12));
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
@@ -1512,18 +1520,20 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
-            if (!moe && moe_mandatory(arch)) {
+            // inkling2 has no dense config, that pass runs the earlier looped layout
+            const bool looped = !moe && arch == LLM_ARCH_INKLING2;
+            if (!moe && moe_mandatory(arch) && !looped) {
                 continue;
             }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            const std::string config_name = looped ? "Looped" : moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe || looped, 0, looped);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                if (dc.host_experts && (!(moe || looped) || !host_experts_test(arch))) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
@@ -1546,6 +1556,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        if (looped) {
+                            char desc[128];
+                            llama_model_desc(model_and_ctx_cpu.first.get(), desc, sizeof(desc));
+                            if (std::string(desc).rfind("inkling2_loop ", 0) != 0) {
+                                throw std::runtime_error("the looped inkling2 layout did not load as inkling2_loop: " + std::string(desc));
+                            }
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
@@ -1618,7 +1635,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
                     }
 
-                    if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    // the looped layout loads as inkling2_loop, which is not saved
+                    if (llama_arch_supports_save(arch) && !looped && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
                         test_executed = true;
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
