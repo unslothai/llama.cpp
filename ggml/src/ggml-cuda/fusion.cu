@@ -1,6 +1,7 @@
 #include "fusion.cuh"
 #include "graph.cuh"
 #include "binbcast.cuh"
+#include "conv-chain.cuh"
 #include "dsv4-hc.cuh"
 #include "fp8.cuh"
 #include "gated_delta_net.cuh"
@@ -1446,6 +1447,15 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
 #endif
             ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // short convolution with a residual: CONCAT, state store, SSM_CONV, [CONT, (MUL, ADD) x n_conv], ADD, SCALE
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool conv_chain_disabled = [] { const char * env = getenv("GGML_CUDA_DISABLE_SHORT_CONV_FUSION"); return env != nullptr && atoi(env) != 0; }();
+        const int n_fused = conv_chain_disabled ? 0 : ggml_cuda_try_fuse_conv_chain(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
