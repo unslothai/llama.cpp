@@ -2,6 +2,7 @@
 #include "graph.cuh"
 #include "binbcast.cuh"
 #include "dsv4-hc.cuh"
+#include "elem-fuse.cuh"
 #include "fp8.cuh"
 #include "gated_delta_net.cuh"
 #include "mmq.cuh"
@@ -1417,6 +1418,59 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
+            }
+        }
+    }
+
+    // y = c -/+ tanh(a)*b: UNARY(TANH), MUL, SUB/ADD
+    if (node->op == GGML_OP_UNARY) {
+        static const bool tanh_mul_disabled = [] { const char * env = getenv("GGML_CUDA_DISABLE_TANH_MUL_ADDSUB_FUSION"); return env != nullptr && atoi(env) != 0; }();
+        ggml_cuda_tanh_mul_addsub_match match;
+        // the elementwise kernel may run in place: the matcher checks the overlaps
+        const int n = tanh_mul_disabled ? 0 : ggml_cuda_match_tanh_mul_addsub(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_tanh_mul_addsub(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
+    // normalized router weights: SUM_ROWS, SCALE/CLAMP, DIV[, RESHAPE, SCALE]
+    if (node->op == GGML_OP_SUM_ROWS) {
+        static const bool row_norm_div_disabled = [] { const char * env = getenv("GGML_CUDA_DISABLE_ROW_NORM_DIV_FUSION"); return env != nullptr && atoi(env) != 0; }();
+        ggml_cuda_row_norm_div_match match;
+        const int n = row_norm_div_disabled ? 0 : ggml_cuda_match_row_norm_div(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_row_norm_div(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
+    // ADD, [RESHAPE,] RMS_NORM of the sum: one kernel writes the sum and the norm
+    // bit-identical to the separate ADD + RMS_NORM only where measured: NVIDIA cc >= 10.0 (B200, RTX PRO 6000); it is
+    // 1 ulp off on T4, L4, A100 and HIP, so it stays off there
+    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes &&
+            GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc >= 1000) {
+        static const bool add_rms_norm_disabled = [] { const char * env = getenv("GGML_CUDA_DISABLE_ADD_RMS_NORM_FUSION"); return env != nullptr && atoi(env) != 0; }();
+        const bool has_reshape = cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE;
+        const int  n           = has_reshape ? 3 : 2;
+        if (!add_rms_norm_disabled && i + n - 1 < cgraph->n_nodes) {
+            ggml_tensor * rms  = cgraph->nodes[i + n - 1];
+            ggml_tensor * next = i + n < cgraph->n_nodes ? cgraph->nodes[i + n] : nullptr;
+            const ggml_op ops[3] = { GGML_OP_ADD, has_reshape ? GGML_OP_RESHAPE : GGML_OP_RMS_NORM, GGML_OP_RMS_NORM };
+            const int outputs[2] = { i, i + n - 1 };
+            // a following MUL or SCALE of the norm is fused with it by the RMS_NORM fusions instead
+            const bool norm_fused_later = next && (next->op == GGML_OP_MUL || next->op == GGML_OP_SCALE) &&
+                (next->src[0] == rms || next->src[1] == rms);
+            if (rms->op == GGML_OP_RMS_NORM && !norm_fused_later &&
+                rms->src[0] == (has_reshape ? cgraph->nodes[i + 1] : node) && (!has_reshape || cgraph->nodes[i + 1]->src[0] == node) &&
+                ggml_can_fuse_subgraph(cgraph, i, n, ops, outputs, 2) && ggml_cuda_add_rms_norm_supported(node, rms) &&
+                // the sum may be written over a or b; each thread reads a and b only at the elements it writes
+                ggml_cuda_elem_overlap_ok(node, node->src[0]) && ggml_cuda_elem_overlap_ok(node, node->src[1]) &&
+                ggml_cuda_elem_overlap_ok(rms, node->src[0]) && ggml_cuda_elem_overlap_ok(rms, node->src[1]) &&
+                ggml_cuda_elem_overlap_ok(rms, node) && rms->data != node->data) {
+                ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, rms);
+                return n - 1;
             }
         }
     }
