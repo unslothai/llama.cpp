@@ -2235,6 +2235,15 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // thin F32 src0 per src1 channel, few channels (Inkling 2 verify batch): MMVF beats cuBLAS tiny batched GEMMs
+    // MMVF reads src1 in pairs, so other src1 views keep the old path
+    if (src0->type == GGML_TYPE_F32 && ne01 <= 16 && ne02 == ne12 && ne03 == ne13 &&
+            ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            nb10 == ggml_type_size(src1->type) && ggml_cuda_is_aligned(src1, 2*ggml_type_size(src1->type)) &&
+            ggml_cuda_should_use_mmvf(src0, src1->type, cc, warp_size, /*ne11 =*/ 1, /*mul_mat_id =*/ false)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return false;
+    }
     if (ggml_cuda_should_use_mmvf(src0, src1->type, cc, warp_size, ne11, /*mul_mat_id =*/ false)) {
         // The custom vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2280,6 +2289,28 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         if (ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst, weight_scale)) {
             return weight_scale != nullptr;
         }
+    }
+    // 2D src0 over a few src1 channels: one GEMM over all columns, not tiny batched GEMMs
+    if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE &&
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_2d = *src1;
+        ggml_tensor dst_2d  = *dst;
+        src1_2d.ne[1] = ne11*ne12*ne13;
+        src1_2d.ne[2] = 1;
+        src1_2d.ne[3] = 1;
+        // contiguous: the rows are packed, whatever stride a size-1 dimension of a permuted view carries
+        src1_2d.nb[1] = ggml_row_size(src1->type, ne10);
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1];
+        src1_2d.nb[3] = src1_2d.nb[2];
+        dst_2d.ne[1]  = src1_2d.ne[1];
+        dst_2d.ne[2]  = 1;
+        dst_2d.ne[3]  = 1;
+        dst_2d.nb[1]  = ggml_row_size(dst->type, ne0);
+        dst_2d.nb[2]  = dst_2d.nb[1]*dst_2d.ne[1];
+        dst_2d.nb[3]  = dst_2d.nb[2];
+        dst_2d.src[1] = &src1_2d;
+        ggml_cuda_mul_mat_cublas(ctx, src0, &src1_2d, &dst_2d);
+        return false;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
     return false;
