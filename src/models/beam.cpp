@@ -103,7 +103,7 @@ void llama_model_beam::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_beam::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 static ggml_tensor * beam_residual_add(ggml_context * ctx, ggml_tensor * h, ggml_tensor * r, int i) {
@@ -112,7 +112,7 @@ static ggml_tensor * beam_residual_add(ggml_context * ctx, ggml_tensor * h, ggml
     return ggml_add(ctx, ggml_scale(ctx, h, h_scale), ggml_scale(ctx, r, r_scale));
 }
 
-llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_beam::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -156,15 +156,9 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
             cb(Kcur, "Kcur_normed", il);
 
             if (is_swa) {
-                const float freq_base_l  = model.get_rope_freq_base (cparams, il);
-                const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                        ext_factor, attn_factor, beta_fast, beta_slow);
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                        ext_factor, attn_factor, beta_fast, beta_slow);
+                Qcur = build_rope(Qcur, inp_pos, il);
+                Kcur = build_rope(Kcur, inp_pos, il);
                 cb(Qcur, "Qcur_rope", il);
                 cb(Kcur, "Kcur_rope", il);
             } else {
@@ -173,7 +167,7 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
             }
 
             cur = build_attn(inp_attn,
-                    NULL, NULL, NULL, // o_proj is applied after the gate
+                    NULL, NULL, // o_proj is applied after the gate
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
 
@@ -188,7 +182,7 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
             cur = ggml_mul(ctx0, cur, gate);
             cb(cur, "attn_gated", il);
 
-            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+            cur = build_lora_mm(layer.wo, cur);
             cb(cur, "attn_o_proj", il);
         }
 
@@ -209,9 +203,9 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
-                    layer.ffn_up,   NULL, NULL,
-                    layer.ffn_gate, NULL, NULL,
-                    layer.ffn_down, NULL, NULL,
+                    layer.ffn_up,   NULL,
+                    layer.ffn_gate, NULL,
+                    layer.ffn_down, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -248,7 +242,7 @@ llama_model_beam::graph::graph(const llama_model & model, const llm_graph_params
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);

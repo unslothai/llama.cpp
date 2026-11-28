@@ -65,10 +65,10 @@ void llama_model_maion_coder::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_maion_coder::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_maion_coder::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_maion_coder::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_k();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_v());
@@ -94,14 +94,10 @@ llama_model_maion_coder::graph::graph(const llama_model & model, const llm_graph
         Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
 
         // Full-attention layers do not use RoPE.
-        if (hparams.is_swa(il)) {
-            const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
-        }
+        Qcur = build_rope(Qcur, inp_pos, il);
+        Kcur = build_rope(Kcur, inp_pos, il);
 
-        cur = build_attn(inp_attn, model.layers[il].wo, NULL, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cur = build_attn(inp_attn, model.layers[il].wo, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -114,9 +110,9 @@ llama_model_maion_coder::graph::graph(const llama_model & model, const llm_graph
 
         if (model.layers[il].ffn_gate_inp == nullptr) {
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
         } else {
             ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
@@ -143,7 +139,7 @@ llama_model_maion_coder::graph::graph(const llama_model & model, const llm_graph
     ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

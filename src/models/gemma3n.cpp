@@ -81,7 +81,7 @@ void llama_model_gemma3n::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_gemma3n::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
@@ -91,9 +91,8 @@ static ggml_tensor * gemma3n_view_2d_slice(ggml_context * ctx0, ggml_tensor * x,
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
-llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_gemma3n::graph::graph(const llm_graph_params & params) :
     llm_graph_context(params),
-    model(model),
     n_embd_head(model.hparams.n_embd_head_k()),
     n_embd_altup(model.hparams.n_embd_altup),
     n_altup(model.hparams.n_altup),
@@ -123,7 +122,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         ggml_tensor * target_magnitude = calc_magnitude(inpL);
         ggml_tensor * inp_repeated     = ggml_repeat_4d(ctx0, inpL, n_embd, n_tokens, n_altup - 1, 1);
         ggml_tensor * altup_added =
-            ggml_mul_mat(ctx0, model.altup_proj, inp_repeated);  // shape: [n_embd, n_tokens, n_altup - 1]
+            build_lora_mm(model.altup_proj, inp_repeated);  // shape: [n_embd, n_tokens, n_altup - 1]
         ggml_tensor * new_magnitude = calc_magnitude(altup_added);
         altup_added                 = ggml_div(ctx0, ggml_mul(ctx0, altup_added, target_magnitude), new_magnitude);
         inpL                        = ggml_concat(ctx0, inpL, altup_added, 2);  // shape: [n_embd, n_tokens, n_altup]
@@ -133,8 +132,6 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
 
     for (int il = 0; il < n_layer; ++il) {
         // this block is made to be closely resemble Gemma3p5DecoderLayer on python code
-        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
         ggml_tensor * cur         = inpL;                    // [n_embd, n_tokens, n_altup]
         ggml_tensor * predictions = altup_predict(cur, il);  // [n_embd, n_tokens, n_altup]
@@ -163,17 +160,14 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             cb(Kcur, "Kcur_normed", il);
             cb(Vcur, "Vcur_normed", il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
-
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur_pos", il);
             cb(Kcur, "Kcur_pos", il);
 
             cur = build_attn(inp_attn, model.layers[il].wo,
-                    NULL, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                    NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
@@ -191,12 +185,11 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
             cb(Qcur, "Qcur_pos", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
+                    model.layers[il].wo, NULL,
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
         cur = build_norm(cur, model.layers[il].attn_post_norm, NULL, LLM_NORM_RMS, il);
@@ -278,7 +271,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             ggml_view_3d(ctx0, cur, n_embd, n_tokens, n_altup - 1, ggml_row_size(cur->type, n_embd),
                          ggml_row_size(cur->type, n_embd * n_tokens), n_embd * n_tokens * ggml_element_size(cur));
         ggml_tensor * altup_unembd =
-            ggml_mul_mat(ctx0, model.altup_unembd_proj, alt_slice);  // shape: [n_embd, n_tokens, n_altup - 1]
+            build_lora_mm(model.altup_unembd_proj, alt_slice);  // shape: [n_embd, n_tokens, n_altup - 1]
         ggml_tensor * new_magnitude = calc_magnitude(altup_unembd);
         altup_unembd                = ggml_div(ctx0, ggml_mul(ctx0, altup_unembd, target_magnitude), new_magnitude);
         cb(altup_unembd, "altup_unembd", -1);
@@ -304,7 +297,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     {
         // final logit soft-capping
@@ -361,7 +354,7 @@ ggml_tensor * llama_model_gemma3n::graph::project_per_layer_inputs(ggml_tensor *
     const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
     ggml_tensor * per_layer_proj;
-    per_layer_proj = ggml_mul_mat   (ctx0, model.per_layer_model_proj, inp_batch);
+    per_layer_proj = build_lora_mm(model.per_layer_model_proj, inp_batch);
     per_layer_proj = ggml_scale     (ctx0, per_layer_proj, per_layer_projection_scale);
     per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_altup, n_layer, n_tokens);
 
@@ -412,7 +405,7 @@ ggml_tensor * llama_model_gemma3n::graph::altup_compute_router_modalities(ggml_t
     // router_input_scale
     router_inputs = ggml_scale(ctx0, router_inputs, 1.0f / (float) n_embd);
 
-    ggml_tensor * output = ggml_mul_mat(ctx0, model.layers[il].altup_router, router_inputs);
+    ggml_tensor * output = build_lora_mm(model.layers[il].altup_router, router_inputs);
     return ggml_tanh(ctx0, output);  // [n_altup, n_tokens]
 }
 

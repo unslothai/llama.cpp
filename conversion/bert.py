@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from .base import ModelBase, SentencePieceTokenTypes, TextModel, gguf, jinja_str_or_json, logger
 
 
-@ModelBase.register("BertModel", "BertForMaskedLM", "CamembertModel", "BertForSequenceClassification")
+@ModelBase.register("BertModel", "BertForMaskedLM", "CamembertModel")
 @ModelBase.example("BAAI/bge-small-en-v1.5", "dangvantuan/sentence-camembert-base")
 class BertModel(TextModel):
     model_arch = gguf.MODEL_ARCH.BERT
@@ -132,6 +132,7 @@ class BertModel(TextModel):
             from base64 import b64decode
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+            assert tokenizer is not None
 
             with open(tokenizer_path, "r", encoding="utf-8") as fp:
                 tokenizer_json = json.load(fp)
@@ -140,13 +141,13 @@ class BertModel(TextModel):
                 with open(tokenizer_config_path, "r", encoding="utf-8") as fp:
                     tokenizer_config_json = json.load(fp)
 
-            add_prefix = tokenizer.add_prefix_space  # ty: ignore[unresolved-attribute]
-            remove_whitespaces = tokenizer.clean_up_tokenization_spaces  # ty: ignore[unresolved-attribute]
+            add_prefix = tokenizer.add_prefix_space
+            remove_whitespaces = tokenizer.clean_up_tokenization_spaces
             precompiled_charsmap = b64decode(tokenizer_json["normalizer"]["precompiled_charsmap"])
 
-            vocab_size = max(self.hparams.get("vocab_size", 0), tokenizer.vocab_size)  # ty: ignore[unresolved-attribute]
+            vocab_size = max(self.hparams.get("vocab_size", 0), tokenizer.vocab_size)
         else:
-            sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[missing-attribute]
             sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
             assert sentencepiece_model.trainer_spec.model_type == 1  # UNIGRAM
 
@@ -183,20 +184,20 @@ class BertModel(TextModel):
                 scores[token_id] = score
                 toktypes[token_id] = toktype
         else:
-            added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
+            added_vocab = tokenizer.get_added_vocab()
             unk_token = tokenizer_config_json.get("unk_token")
-            unk_token_id = added_vocab.get(unk_token, tokenizer_json["model"].get("unk_id", 3))  # ty: ignore[no-matching-overload]
+            unk_token_id = added_vocab.get(unk_token, tokenizer_json["model"].get("unk_id", 3))
 
-            for token_id in range(tokenizer.vocab_size):  # ty: ignore[unresolved-attribute]
-                piece = tokenizer._convert_id_to_token(token_id)  # ty: ignore[unresolved-attribute]
-                if (piece := tokenizer._convert_id_to_token(token_id)) is not None:  # ty: ignore[unresolved-attribute]
+            for token_id in range(tokenizer.vocab_size):
+                piece = tokenizer._convert_id_to_token(token_id)
+                if (piece := tokenizer._convert_id_to_token(token_id)) is not None:
                     text = piece.encode("utf-8")
                     score = tokenizer_json["model"]["vocab"][token_id][1]
 
                     toktype = SentencePieceTokenTypes.NORMAL
                     if token_id == unk_token_id:
                         toktype = SentencePieceTokenTypes.UNKNOWN
-                    elif token_id in tokenizer.all_special_ids:  # ty: ignore[unresolved-attribute]
+                    elif token_id in tokenizer.all_special_ids:
                         toktype = SentencePieceTokenTypes.CONTROL
                     elif token_id in added_vocab.values():
                         toktype = SentencePieceTokenTypes.USER_DEFINED
@@ -238,6 +239,30 @@ class BertModel(TextModel):
 
         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
         special_vocab.add_to_gguf(self.gguf_writer)
+
+
+@ModelBase.register("BertForSequenceClassification")
+@ModelBase.example("cross-encoder/ms-marco-MiniLM-L-12-v2")
+class BertForSequenceClassification(BertModel):
+    model_arch = gguf.MODEL_ARCH.BERT
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.cls_out_labels is None:
+            self.cls_out_labels = self.hparams.get("id2label")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        name = name.replace("pooler.dense", "classifier.dense")
+
+        return super().filter_tensors((name, gen))
+
+    def set_gguf_parameters(self):
+        if "classifier.dense.weight" in self.model_tensors:
+            self.hparams.setdefault("classifier_activation", "tanh")
+        super().set_gguf_parameters()
 
 
 @ModelBase.register("DistilBertModel", "DistilBertForMaskedLM", "DistilBertForSequenceClassification")

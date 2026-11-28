@@ -37,10 +37,10 @@ void llama_model_neo_bert::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_neo_bert::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_neo_bert::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -70,24 +70,15 @@ llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_pa
                     n_embd_head, n_head, n_head_kv, il);
 
             // RoPE
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, nullptr, model.layers[il].wo_s,
+                    model.layers[il].wo, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
             cb(cur, "kqv_out", il);
         }
@@ -110,9 +101,9 @@ llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_pa
         // feed-forward network
         cur = build_ffn(cur,
                 model.layers[il].ffn_up,
-                NULL, NULL, NULL, NULL, NULL,
-                model.layers[il].ffn_down,
                 NULL, NULL, NULL,
+                model.layers[il].ffn_down,
+                NULL, NULL,
                 LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
 
         // attentions bypass the intermediate layer

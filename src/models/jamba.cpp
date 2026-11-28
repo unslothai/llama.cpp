@@ -102,10 +102,10 @@ void llama_model_jamba::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_jamba::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_build_mamba_base(params) {
+llama_model_jamba::graph::graph(const llm_graph_params & params) : llm_build_mamba_base(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     ggml_tensor * cur;
@@ -125,7 +125,7 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "attn_norm", il);
 
         if (n_head_kv == 0) {
-            cur = build_mamba_layer(inp_hybrid->get_recr(), cur, model, ubatch, il);
+            cur = build_mamba_layer(inp_hybrid->get_recr(), cur, ubatch, il);
         } else {
             // Attention
 
@@ -134,7 +134,7 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
 
             // No RoPE :)
             cur = build_attn(inp_hybrid->get_attn(),
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
+                    model.layers[il].wo, NULL,
                     Qcur, Kcur, Vcur, NULL, NULL, NULL, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -152,9 +152,9 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
         if (model.layers[il].ffn_gate_inp == nullptr) {
             // FFN
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -189,7 +189,7 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

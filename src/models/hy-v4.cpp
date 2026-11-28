@@ -154,8 +154,18 @@ void llama_model_hy_v4::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+llama_rope_params llama_model_hy_v4::get_rope_params_indexer(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params_indexer(cparams, il);
+
+    // [nope | rope], the same as the MLA keys
+    res.n_offs = hparams.indexer_head_size - res.n_rot;
+    res.type   = hparams.rope_type;
+
+    return res;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_hy_v4::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // reduce hc streams x[:,i,:] weighted by w[i,:] -> [n_embd, n_tokens]
@@ -185,7 +195,7 @@ llama_model_hy_v4::graph::build_hc_pre(
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc * n_embd, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm); // [2*hc, nt]
+    ggml_tensor * mixes = build_lora_mm(hc_fn, flat_norm); // [2*hc, nt]
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * scale_pre  = hy_v4_view_1d(ctx0, hc_scale, 1, 0);
@@ -254,7 +264,7 @@ ggml_tensor * llama_model_hy_v4::graph::build_hc_head(
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc * n_embd, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm); // [hc, nt]
+    ggml_tensor * mixes = build_lora_mm(hc_fn, flat_norm); // [hc, nt]
     cb(mixes, "hc_head_mixes", -1);
 
     ggml_tensor * pre = ggml_mul(ctx0, mixes, hc_scale);
@@ -267,7 +277,6 @@ ggml_tensor * llama_model_hy_v4::graph::build_hc_head(
 }
 
 ggml_tensor * llama_model_hy_v4::graph::build_attention(
-        const llama_model & model,
         llm_graph_input_attn_k * inp_attn,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
@@ -280,9 +289,9 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
     const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
     const uint32_t kv_lora_rank       = hparams.n_lora_kv;
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * q = build_lora_mm(layer.wq_a, cur);
     q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    q = ggml_mul_mat(ctx0, layer.wq_b, q);
+    q = build_lora_mm(layer.wq_b, q);
 
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
             ggml_row_size(q->type, n_embd_head_k), ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
@@ -290,7 +299,7 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
             ggml_row_size(q->type, n_embd_head_k), ggml_row_size(q->type, n_embd_head_k) * n_head,
             ggml_row_size(q->type, n_embd_head_qk_nope));
 
-    ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, cur);
     ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
     ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
@@ -298,11 +307,9 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
 
-    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    q_pe = build_rope(q_pe, inp_pos, il);
     cb(q_pe, "q_pe", il);
-    k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    k_pe = build_rope(k_pe, inp_pos, il);
     cb(k_pe, "k_pe", il);
 
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
@@ -310,7 +317,7 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
 
     // MLA absorption: q_nope @ wk_b -> compressed space
     q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-    ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+    ggml_tensor * q_nope_absorbed = build_lora_mm(layer.wk_b, q_nope);
     q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
 
     // note: rope must go first for in-place context shifting in build_rope_shift()
@@ -322,12 +329,12 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
 
     // MLA-as-MQA; wo applied manually below so the gated-MLA gate can sit before o_proj
     ggml_tensor * attn = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
+            nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, layer.wv_b, kq_scale, il);
     cb(attn, "attn_kqv", il); // [n_head * n_embd_head_v, n_tokens]
 
     // gated MLA: elementwise sigmoid gate on the decompressed attention output
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.wqkv_gate, cur);
+    ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, cur);
     gate = ggml_sigmoid(ctx0, gate);
     attn = ggml_mul(ctx0, attn, gate);
     cb(attn, "attn_gated", il);
@@ -339,7 +346,6 @@ ggml_tensor * llama_model_hy_v4::graph::build_attention(
 }
 
 ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
-        const llama_model & model,
         llm_graph_input_attn_k_dsa * inp_attn_dsa,
         ggml_tensor * cur,
         ggml_tensor * qr,
@@ -349,28 +355,22 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
 
     const int64_t n_indexer_head       = hparams.indexer_n_head;
     const int64_t n_embd_indexer       = hparams.indexer_head_size;
-    const int64_t n_embd_indexer_rope  = hparams.n_rot();
-    const int64_t n_embd_indexer_nope  = n_embd_indexer - n_embd_indexer_rope;
 
     // nope rows come first, so rope only the last n_embd_indexer_rope rows, same as the MLA path
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+    ggml_tensor * iq = build_lora_mm(layer.indexer_attn_q_b, qr);
 
     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
 
-    iq = ggml_rope_ext(ctx0, iq, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base,
-         freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-    iq = ggml_rope_set_offset(iq, n_embd_indexer_nope);
+    iq = build_rope_indexer(iq, inp_pos, il);
     cb(iq, "indexer_q", il);
 
-    ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
+    ggml_tensor * ik = build_lora_mm(layer.indexer_attn_k, cur);
 
     ik = build_norm(ik, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
 
     ik = ggml_reshape_3d(ctx0, ik, n_embd_indexer, 1, n_tokens);
 
-    ik = ggml_rope_ext(ctx0, ik, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base,
-         freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-    ik = ggml_rope_set_offset(ik, n_embd_indexer_nope);
+    ik = build_rope_indexer(ik, inp_pos, il);
     cb(ik, "indexer_k", il);
 
     // the reference applies a Hadamard rotation here, but it only helps its FP8 kernels.
@@ -380,7 +380,7 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
     const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
     ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik, k_idxs_lid, il));
 
-    ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+    ggml_tensor * iw = build_lora_mm(layer.indexer_proj, cur);
 
     ik = mctx_lid->get_k(ctx0, il);
 
@@ -393,24 +393,8 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
     // fold both reference scale factors into the weights before the big score tensor
     iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
 
-    ggml_tensor * score = nullptr;
-    if (cparams.fused_lid) {
-        score = ggml_lightning_indexer(ctx0, iq, ik, iw, inp_attn_dsa->self_attn_mask_lid.raw);
-        cb(score, "indexer_score", il);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    } else {
-        iq = ggml_permute(ctx0, iq, 0, 2, 1, 3);
-        ik = ggml_permute(ctx0, ik, 0, 2, 1, 3);
-
-        score = ggml_mul_mat(ctx0, ik, iq);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-        score = ggml_relu(ctx0, score);
-        score = ggml_mul(ctx0, score, iw);
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-        score = ggml_add(ctx0, score, inp_attn_dsa->self_attn_mask_lid.raw);
-        cb(score, "indexer_score", il);
-    }
+    ggml_tensor * score = ggml_lightning_indexer(ctx0, iq, ik, iw, inp_attn_dsa->self_attn_mask_lid.raw);
+    cb(score, "indexer_score", il);
 
     const uint32_t n_top_k = score->ne[0] < (int64_t) hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
@@ -419,7 +403,6 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
 
 llama_model_hy_v4::graph::attn_dsa
 llama_model_hy_v4::graph::build_attention_dsa(
-        const llama_model & model,
         llm_graph_input_attn_k_dsa * inp_attn_dsa,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
@@ -433,17 +416,17 @@ llama_model_hy_v4::graph::build_attention_dsa(
     const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
     const uint32_t kv_lora_rank       = hparams.n_lora_kv;
 
-    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
 
     ggml_tensor * top_k = last_top_k;
     if (hparams.is_indexer_full(il)) {
-        top_k = build_indexer_top_k(model, inp_attn_dsa, cur, qr, inp_pos, il);
+        top_k = build_indexer_top_k(inp_attn_dsa, cur, qr, inp_pos, il);
         cb(top_k, "top_k", il);
     }
     GGML_ASSERT(top_k != nullptr);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
 
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
             ggml_row_size(q->type, n_embd_head_k), ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
@@ -451,7 +434,7 @@ llama_model_hy_v4::graph::build_attention_dsa(
             ggml_row_size(q->type, n_embd_head_k), ggml_row_size(q->type, n_embd_head_k) * n_head,
             ggml_row_size(q->type, n_embd_head_qk_nope));
 
-    ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, cur);
     ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
     ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
@@ -459,18 +442,16 @@ llama_model_hy_v4::graph::build_attention_dsa(
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
             ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
 
-    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    q_pe = build_rope(q_pe, inp_pos, il);
     cb(q_pe, "q_pe", il);
-    k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    k_pe = build_rope(k_pe, inp_pos, il);
     cb(k_pe, "k_pe", il);
 
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(kv_cmpr, "kv_cmpr", il);
 
     q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-    ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+    ggml_tensor * q_nope_absorbed = build_lora_mm(layer.wk_b, q_nope);
     q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
 
     ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
@@ -480,11 +461,11 @@ llama_model_hy_v4::graph::build_attention_dsa(
     ggml_tensor * Vcur = kv_cmpr;
 
     ggml_tensor * attn = build_attn(inp_attn_dsa,
-            nullptr, nullptr, nullptr,
+            nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, layer.wv_b, top_k, kq_scale, il);
     cb(attn, "attn_kqv", il);
 
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.wqkv_gate, cur);
+    ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, cur);
     gate = ggml_sigmoid(ctx0, gate);
     attn = ggml_mul(ctx0, attn, gate);
     cb(attn, "attn_gated", il);
@@ -495,7 +476,7 @@ llama_model_hy_v4::graph::build_attention_dsa(
     return { out, top_k };
 }
 
-llama_model_hy_v4::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_hy_v4::graph::graph(const llm_graph_params & params) :
     llm_graph_context(params) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t n_embd_head_k = hparams.n_embd_head_k_mla();
@@ -528,11 +509,11 @@ llama_model_hy_v4::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "attn_norm", il);
 
         if (is_dsa) {
-            attn_dsa attn = build_attention_dsa(model, inp_attn_dsa, cur, inp_pos, last_top_k, kq_scale, il);
+            attn_dsa attn = build_attention_dsa(inp_attn_dsa, cur, inp_pos, last_top_k, kq_scale, il);
             cur = attn.cur;
             last_top_k = attn.top_k;
         } else {
-            cur = build_attention(model, inp_attn, cur, inp_pos, kq_scale, il);
+            cur = build_attention(inp_attn, cur, inp_pos, kq_scale, il);
         }
 
         inpL = build_hc_post(cur, residual, attn_hc.post, il);
@@ -548,9 +529,9 @@ llama_model_hy_v4::graph::graph(const llama_model & model, const llm_graph_param
         const auto & layer = model.layers[il];
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
-                    layer.ffn_up,   NULL, NULL,
-                    layer.ffn_gate, NULL, NULL,
-                    layer.ffn_down, NULL, NULL,
+                    layer.ffn_up,   NULL,
+                    layer.ffn_gate, NULL,
+                    layer.ffn_down, NULL,
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
@@ -570,9 +551,9 @@ llama_model_hy_v4::graph::graph(const llama_model & model, const llm_graph_param
             cb(moe_out, "ffn_moe_out", il);
 
             ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   NULL, NULL,
-                    layer.ffn_gate_shexp, NULL, NULL,
-                    layer.ffn_down_shexp, NULL, NULL,
+                    layer.ffn_up_shexp,   NULL,
+                    layer.ffn_gate_shexp, NULL,
+                    layer.ffn_down_shexp, NULL,
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(ffn_shexp, "ffn_shexp", il);
 
@@ -598,7 +579,7 @@ llama_model_hy_v4::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

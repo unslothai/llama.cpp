@@ -112,10 +112,10 @@ void llama_model_wavtokenizer_dec::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_wavtokenizer_dec::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_wavtokenizer_dec::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_wavtokenizer_dec::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -231,9 +231,9 @@ llama_model_wavtokenizer_dec::graph::graph(const llama_model & model, const llm_
                 LLM_NORM, -1);
 
         cur = build_ffn(cur,
-                layer.pw1, layer.pw1_b, NULL,
-                NULL,      NULL,        NULL,
-                layer.pw2, layer.pw2_b, NULL,
+                layer.pw1, layer.pw1_b,
+                NULL,      NULL,
+                layer.pw2, layer.pw2_b,
                 NULL,
                 LLM_FFN_GELU, LLM_FFN_SEQ, il);
 
@@ -253,7 +253,7 @@ llama_model_wavtokenizer_dec::graph::graph(const llama_model & model, const llm_
             LLM_NORM, -1);
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cur = ggml_add(ctx0, cur, model.output_b);
 

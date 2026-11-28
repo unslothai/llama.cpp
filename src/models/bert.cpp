@@ -62,10 +62,10 @@ void llama_model_bert::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_bert::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_bert::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -131,11 +131,8 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
             // RoPE
             if (model.arch == LLM_ARCH_NOMIC_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
                 model.arch == LLM_ARCH_JINA_BERT_V3) {
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
-
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+                Qcur = build_rope(Qcur, inp_pos, il);
+                Kcur = build_rope(Kcur, inp_pos, il);
             }
 
             cb(Qcur, "Qcur", il);
@@ -143,7 +140,7 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
             cb(cur, "kqv_out", il);
         }
@@ -185,25 +182,25 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
         } else if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
                    model.arch == LLM_ARCH_JINA_BERT_V3) {
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
-                    NULL, NULL, NULL,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
+                    model.layers[il].ffn_up, model.layers[il].ffn_up_b,
+                    NULL, NULL,
+                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL,
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
             const bool up_contains_gate = !model.layers[il].ffn_gate && model.layers[il].ffn_up->ne[1] != hparams.n_ff();
             auto type_op = up_contains_gate ? LLM_FFN_GEGLU : LLM_FFN_GELU;
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
+                    model.layers[il].ffn_up, model.layers[il].ffn_up_b,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL,
                     type_op, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
             cur = build_ffn(cur,
-                model.layers[il].ffn_up, NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                model.layers[il].ffn_up, NULL,
+                model.layers[il].ffn_gate, NULL,
+                model.layers[il].ffn_down, NULL,
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         }

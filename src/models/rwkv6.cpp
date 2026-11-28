@@ -88,11 +88,11 @@ void llama_model_rwkv6::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_rwkv6::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_rwkv6::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_rwkv6_base(model, params) {
+llama_model_rwkv6::graph::graph(const llm_graph_params & params) :
+    llm_build_rwkv6_base(params) {
     GGML_ASSERT(hparams.token_shift_count == 2);
 
     ggml_tensor * cur;
@@ -145,6 +145,8 @@ llama_model_rwkv6::graph::graph(const llama_model & model, const llm_graph_param
                                   ggml_view_3d(ctx0, ffn_norm, n_embd, 1, n_seqs, ffn_norm->nb[1], ffn_norm->nb[2],
                                                (n_seq_tokens - 1) * n_embd * ggml_element_size(ffn_norm)),
                                   1);
+        // the shift state can be a view of the cache, read it before the store overwrites it
+        ggml_build_forward_expand(gf, x_prev);
         ggml_build_forward_expand(gf, build_rwkv_token_shift_store(token_shift, ubatch, il));
 
         ffn_inp  = ggml_reshape_2d(ctx0, ffn_inp, n_embd, n_tokens);
@@ -176,7 +178,7 @@ llama_model_rwkv6::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

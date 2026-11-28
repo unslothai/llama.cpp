@@ -7,9 +7,6 @@
 #include "models.h"
 
 void llama_model_laguna::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, hparams.yarn_beta_fast, false);
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, hparams.yarn_beta_slow, false);
-
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
@@ -148,11 +145,26 @@ void llama_model_laguna::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_laguna::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+llama_rope_params llama_model_laguna::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    // plain RoPE on the SWA layers
+    if (hparams.is_swa(il)) {
+        res.n_ctx_orig  = hparams.n_ctx_train;
+        res.ext_factor  = 0.0f;
+        res.attn_factor = 1.0f;
+        res.beta_fast   = 0.0f;
+        res.beta_slow   = 0.0f;
+    }
+
+    return res;
 }
 
-llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+std::unique_ptr<llm_graph_context> llama_model_laguna::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(params);
+}
+
+llama_model_laguna::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -173,26 +185,11 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
-        const bool    is_swa_il   = hparams.is_swa(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
 
         // Per-layer-type RoPE config. SWA layers run plain rope (no YaRN),
         // achieved by zeroing the YaRN ext/beta params for those layers.
-        const int   n_rot_l       = is_swa_il ? hparams.n_rot_swa : n_rot;
-        const float freq_base_l   = is_swa_il ? hparams.rope_freq_base_train_swa : freq_base;
-        const float freq_scale_l  = is_swa_il ? hparams.rope_freq_scale_train_swa : freq_scale;
-        const float ext_factor_l  = is_swa_il ? 0.0f : ext_factor;
-        // YaRN magnitude scaling (mscale) is already handled by the framework:
-        // llama_context pre-divides cparams.yarn_attn_factor by (1 + 0.1*ln(factor))
-        // to cancel ggml rope_yarn's internal mscale *= 1 + 0.1*ln(1/freq_scale).
-        // Pass attn_factor straight through (like every other arch); SWA layers run
-        // plain RoPE (ext_factor 0, no mscale) so force 1.0 there.
-        const float attn_factor_l = is_swa_il ? 1.0f : attn_factor;
-        const float beta_fast_l   = is_swa_il ? 0.0f : beta_fast;
-        const float beta_slow_l   = is_swa_il ? 0.0f : beta_slow;
-        const int   n_ctx_orig_l  = is_swa_il ? hparams.n_ctx_train : n_ctx_orig;
-
         ggml_tensor * inpSA = inpL;
 
         // Pre-norm
@@ -218,21 +215,17 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(Qcur, "Qcur_normed", il);
             cb(Kcur, "Kcur_normed", il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                    n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                    n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
             cb(Qcur, "Qcur_rope", il);
             cb(Kcur, "Kcur_rope", il);
 
             cur = has_swa
                 ? build_attn(inp_attn_iswa,
-                        NULL, NULL, NULL,    // o_proj deferred until after gating
+                        NULL, NULL,    // o_proj deferred until after gating
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
                 : build_attn(inp_attn_kv,
-                        NULL, NULL, NULL,
+                        NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
 
@@ -258,7 +251,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             }
             cb(cur, "attn_gated", il);
 
-            cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            cur = build_lora_mm(model.layers[il].wo, cur);
             cb(cur, "attn_o_proj", il);
         }
 
@@ -293,9 +286,9 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
 
             // Always-on shared expert, summed in parallel.
             ggml_tensor * ffn_shexp = build_ffn(cur,
-                    model.layers[il].ffn_up_shexp,   NULL, NULL,
-                    model.layers[il].ffn_gate_shexp, NULL, NULL,
-                    model.layers[il].ffn_down_shexp, NULL, NULL,
+                    model.layers[il].ffn_up_shexp,   NULL,
+                    model.layers[il].ffn_gate_shexp, NULL,
+                    model.layers[il].ffn_down_shexp, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(ffn_shexp, "ffn_shexp", il);
@@ -305,9 +298,9 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         } else {
             // Dense FFN for the leading n_layer_dense_lead layers (XS.2: 1, M.1: 3)
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);

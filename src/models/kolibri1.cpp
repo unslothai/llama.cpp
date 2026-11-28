@@ -15,6 +15,7 @@ void llama_model_kolibri1::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    hparams.rope_pattern = hparams.is_swa_impl;
 
     hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
@@ -64,7 +65,7 @@ void llama_model_kolibri1::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_params & params)
+llama_model_kolibri1::graph::graph(const llm_graph_params & params)
     : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -95,25 +96,14 @@ llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_pa
         cb(Qcur, "Qcur_normed", il);
         cb(Kcur, "Kcur_normed", il);
 
-        if (hparams.is_swa(il)) {
-            const float freq_base_l  = model.get_rope_freq_base (cparams, il);
-            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+        Qcur = build_rope(Qcur, inp_pos, il);
+        cb(Qcur, "Qcur_rope", il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            cb(Qcur, "Qcur_rope", il);
-
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            cb(Kcur, "Kcur_rope", il);
-        }
+        Kcur = build_rope(Kcur, inp_pos, il);
+        cb(Kcur, "Kcur_rope", il);
 
         cur = build_attn(inp_attn,
-                layer.wo, NULL, layer.wo_s,
+                layer.wo, NULL,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         cb(cur, "attn_out", il);
 
@@ -152,13 +142,13 @@ llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_pa
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il,
                 logits,
-                nullptr, nullptr, nullptr, nullptr, selected);
+                nullptr, selected);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * shared = build_ffn(cur,
-                layer.ffn_up_shexp,   nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr, nullptr,
+                layer.ffn_up_shexp,   nullptr,
+                layer.ffn_gate_shexp, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(shared, "ffn_shexp_out", il);
 
@@ -174,11 +164,11 @@ llama_model_kolibri1::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
 
 std::unique_ptr<llm_graph_context> llama_model_kolibri1::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }

@@ -13,10 +13,17 @@ void llama_model_limite::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
     load_swa_pattern(ml, 4);
+    hparams.rope_pattern = hparams.is_swa_impl;
 
     std::fill(hparams.mudd_tap_idx.begin(), hparams.mudd_tap_idx.end(), -1);
     ml.get_key(LLM_KV_MUDD_TAP_COUNT, hparams.n_mudd_taps, false);
     if (hparams.n_mudd_taps > 0) {
+        // reject metadata where n_layer * n_mudd_taps would index past mudd_tap_idx
+        if (hparams.n_mudd_taps > LLAMA_MAX_LAYERS || (uint64_t) hparams.n_layer() * hparams.n_mudd_taps > LLAMA_MAX_LAYERS) {
+            throw std::runtime_error(format(
+                "invalid limite mudd config: n_layer (%u) * n_mudd_taps (%u) exceeds LLAMA_MAX_LAYERS (%d)",
+                hparams.n_layer(), hparams.n_mudd_taps, LLAMA_MAX_LAYERS));
+        }
         ml.get_key(LLM_KV_MUDD_FEED_FORWARD_LENGTH, hparams.n_mudd_ff);
         ml.get_arr(LLM_KV_MUDD_TAP_INDICES,         hparams.mudd_tap_idx);
     }
@@ -68,11 +75,21 @@ void llama_model_limite::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_limite::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+llama_rope_params llama_model_limite::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    // the SWA layers use the global base and scale
+    res.freq_base  = cparams.rope_freq_base;
+    res.freq_scale = cparams.rope_freq_scale;
+
+    return res;
 }
 
-llama_model_limite::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+std::unique_ptr<llm_graph_context> llama_model_limite::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(params);
+}
+
+llama_model_limite::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_k();
     const int64_t n_taps      = hparams.n_mudd_taps;
 
@@ -160,17 +177,13 @@ llama_model_limite::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_normed", il);
 
             // the full attention layers use no positional encoding
-            if (hparams.is_swa(il)) {
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
-                cb(Qcur, "Qcur", il);
-                cb(Kcur, "Kcur", il);
-            }
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
+            cb(Qcur, "Qcur", il);
+            cb(Kcur, "Kcur", il);
 
             cur = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
             cb(cur, "attn_raw", il);
 
@@ -199,7 +212,7 @@ llama_model_limite::graph::graph(const llama_model & model, const llm_graph_para
             }
 
             cur = ggml_reshape_2d(ctx0, cur, n_embd_head*n_head, n_tokens);
-            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+            cur = build_lora_mm(layer.wo, cur);
             cb(cur, "attn_out", il);
         }
 
@@ -217,9 +230,9 @@ llama_model_limite::graph::graph(const llama_model & model, const llm_graph_para
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-                layer.ffn_up,   nullptr, nullptr,
-                layer.ffn_gate, nullptr, nullptr,
-                layer.ffn_down, nullptr, nullptr,
+                layer.ffn_up,   nullptr,
+                layer.ffn_gate, nullptr,
+                layer.ffn_down, nullptr,
                 nullptr,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
@@ -237,7 +250,7 @@ llama_model_limite::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     // scale * sigmoid((x + shift) / temperature)
     const auto & cap = hparams.final_logit_sigmoid_capping;

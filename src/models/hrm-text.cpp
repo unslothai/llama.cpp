@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cinttypes>
+
 // HRM-Text: alternating low/high transformer stacks over the same token stream.
 // Reference: HrmTextModel in transformers, DFM Mimir 1B.
 
@@ -19,8 +21,15 @@ void llama_model_hrm_text::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_hrm_l_cycles > 0);
 
     // the GGUF block count is the expanded cache-slot count
-    const uint32_t n_slot = hparams.n_hrm_layers_per_stack * hparams.n_hrm_h_cycles * (hparams.n_hrm_l_cycles + 1);
-    GGML_ASSERT(hparams.n_layer() == n_slot);
+    // 64-bit: a 32-bit product can wrap and match n_layer(), then load_arch_tensors() indexes past model.layers
+    const uint64_t n_slot = (uint64_t) hparams.n_hrm_layers_per_stack * hparams.n_hrm_h_cycles * (hparams.n_hrm_l_cycles + 1);
+    if (hparams.n_hrm_layers_per_stack >= hparams.n_layer() || hparams.n_hrm_h_cycles > LLAMA_MAX_LAYERS/2 || hparams.n_hrm_l_cycles >= LLAMA_MAX_LAYERS || n_slot != hparams.n_layer()) {
+        throw std::runtime_error(format(
+            "hrm: cache-slot count %" PRIu64 " (layers_per_stack %u, h_cycles %u, l_cycles %u) "
+            "does not match block_count %u",
+            n_slot, hparams.n_hrm_layers_per_stack, hparams.n_hrm_h_cycles,
+            hparams.n_hrm_l_cycles, hparams.n_layer()));
+    }
 
     switch (hparams.n_embd) {
         case 1536:
@@ -86,7 +95,7 @@ void llama_model_hrm_text::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_hrm_text::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // one stack invocation: lps pre-norm decoder layers, then the parameterless final norm
@@ -114,16 +123,14 @@ ggml_tensor * llama_model_hrm_text::graph::build_stack(llm_graph_input_attn_kv *
 
             auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head_k, n_head, n_head_kv, s);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
             cb(Qcur, "Qcur", s);
 
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = build_rope(Kcur, inp_pos, il);
             cb(Kcur, "Kcur", s);
 
             cur = build_attn(inp_attn,
-                nullptr, nullptr, nullptr,
+                nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, s);
             cb(cur, "attn_pregate", s);
 
@@ -133,7 +140,7 @@ ggml_tensor * llama_model_hrm_text::graph::build_stack(llm_graph_input_attn_kv *
             cur = ggml_mul(ctx0, cur, gate);
             cb(cur, "attn_gated", s);
 
-            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+            cur = build_lora_mm(layer.wo, cur);
             cb(cur, "attn_out", s);
         }
 
@@ -145,9 +152,9 @@ ggml_tensor * llama_model_hrm_text::graph::build_stack(llm_graph_input_attn_kv *
         cb(cur, "ffn_norm", s);
 
         cur = build_ffn(cur,
-            layer.ffn_up, nullptr, nullptr,
-            layer.ffn_gate, nullptr, nullptr,
-            layer.ffn_down, nullptr, nullptr,
+            layer.ffn_up, nullptr,
+            layer.ffn_gate, nullptr,
+            layer.ffn_down, nullptr,
             nullptr,
             LLM_FFN_SILU, LLM_FFN_PAR, s);
         cb(cur, "ffn_out", s);
@@ -165,9 +172,8 @@ ggml_tensor * llama_model_hrm_text::graph::build_stack(llm_graph_input_attn_kv *
     return cur;
 }
 
-llama_model_hrm_text::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_graph_context(params),
-    model(model) {
+llama_model_hrm_text::graph::graph(const llm_graph_params & params) :
+    llm_graph_context(params) {
     ggml_tensor * cur;
 
     // {n_embd, n_tokens}, scaled by hparams.f_embedding_scale inside build_inp_embd
@@ -204,7 +210,7 @@ llama_model_hrm_text::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

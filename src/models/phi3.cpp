@@ -58,14 +58,14 @@ void llama_model_phi3::load_arch_tensors(llama_model_loader &) {
 
 std::unique_ptr<llm_graph_context> llama_model_phi3::build_arch_graph(const llm_graph_params & params) const {
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        return std::make_unique<graph<true>> (*this, params);
+        return std::make_unique<graph<true>> (params);
     } else {
-        return std::make_unique<graph<false>>(*this, params);
+        return std::make_unique<graph<false>>(params);
     }
 }
 
 template<bool iswa>
-llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_phi3::graph<iswa>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -93,8 +93,6 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
 
         // self-attention
         {
-            // rope freq factors for 128k context
-            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
             ggml_tensor* attn_norm_output = build_norm(inpL,
                     model.layers[il].attn_norm,
@@ -104,17 +102,8 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
 
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], attn_norm_output,
                     n_embd_head, n_head, n_head_kv, il);
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -124,7 +113,7 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
             cb(Qcur, "Qcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -142,9 +131,9 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
         // feed-forward network
         if (model.layers[il].ffn_gate_inp == nullptr) {
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    NULL,                      NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL,
+                    NULL,                      NULL,
+                    model.layers[il].ffn_down, NULL,
                     NULL,
                     LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
@@ -179,7 +168,7 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     if (model.output_b != nullptr) {
         cb(cur, "result_output_no_bias", -1);

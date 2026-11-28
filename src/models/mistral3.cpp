@@ -4,8 +4,6 @@ void llama_model_mistral3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_TEMPERATURE_SCALE, hparams.f_attn_temp_scale, false);
 
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, hparams.yarn_beta_fast,    false);
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, hparams.yarn_beta_slow,    false);
     ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL,   hparams.rope_yarn_log_mul, false);
 
     ml.get_key(LLM_KV_REALTIME_DELAY_TOKENS, hparams.n_tokens_delay, false);
@@ -124,10 +122,10 @@ public:
 };
 
 std::unique_ptr<llm_graph_context> llama_model_mistral3::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_mistral3::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -175,24 +173,12 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
 
         // self-attention
         {
-            // rope freq factors for llama3; may return nullptr for llama2 and other models
-            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
-
             // compute Q and K and RoPE them
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -205,7 +191,7 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
             }
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
@@ -227,9 +213,9 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
             if (t_cond) {
                 // ada rms norm: scale the normalized input by (1 + mlp(t_cond))
                 ggml_tensor * ada = build_ffn(t_cond,
-                        model.layers[il].ffn_norm_ada_down, NULL, NULL,
-                        NULL, NULL, NULL,
-                        model.layers[il].ffn_norm_ada_up, NULL, NULL,
+                        model.layers[il].ffn_norm_ada_down, NULL,
+                        NULL, NULL,
+                        model.layers[il].ffn_norm_ada_up, NULL,
                         NULL,
                         LLM_FFN_GELU_ERF, LLM_FFN_SEQ, il);
                 cur = ggml_add(ctx0, cur, ggml_mul(ctx0, cur, ada));
@@ -237,9 +223,9 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
             }
 
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
-                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b,
+                    model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -260,11 +246,7 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
                     LLM_FFN_SILU, true,
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il,
-                    nullptr, nullptr,
-                    model.layers[il].ffn_up_exps_s,
-                    model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    il);
             cb(cur, "ffn_moe_out", il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -286,7 +268,7 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

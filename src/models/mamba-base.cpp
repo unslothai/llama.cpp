@@ -8,7 +8,6 @@ llm_build_mamba_base::llm_build_mamba_base(const llm_graph_params & params) : ll
 
 ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
                                                          ggml_tensor *        cur,
-                                                         const llama_model &  model,
                                                          const llama_ubatch & ubatch,
                                                          int                  il) {
     const auto * mctx_cur = inp->mctx;
@@ -44,7 +43,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
     cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
 
     // {n_embd, 2*d_inner} @ {n_embd, n_seq_tokens, n_seqs} => {2*d_inner, n_seq_tokens, n_seqs}
-    ggml_tensor * xz = build_lora_mm(layer.ssm_in, cur, layer.ssm_in_s);
+    ggml_tensor * xz = build_lora_mm(layer.ssm_in, cur);
     // split the above in two
     // => {d_inner, n_seq_tokens, n_seqs}
     ggml_tensor * x  = ggml_view_3d(ctx0, xz, d_inner, xz->ne[1], xz->ne[2], xz->nb[1], xz->nb[2], 0);
@@ -141,7 +140,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
         y = ggml_swiglu_split(ctx0, ggml_cont(ctx0, z), y);
 
         // {d_inner, n_embd} @ {d_inner, n_seq_tokens, n_seqs} => {n_embd, n_seq_tokens, n_seqs}
-        cur = build_lora_mm(layer.ssm_out, y, layer.ssm_out_s);
+        cur = build_lora_mm(layer.ssm_out, y);
     }
 
     // {n_embd, n_seq_tokens, n_seqs} => {n_embd, n_tokens}
@@ -152,7 +151,6 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
 
 ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                           ggml_tensor *        cur,
-                                                          const llama_model &  model,
                                                           const llama_ubatch & ubatch,
                                                           int                  il) const {
     const auto * mctx_cur = inp->mctx;
@@ -189,7 +187,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     // Keep the projection 2D: with a {n_embd, 1, n_seqs} batch the CUDA backend
     // dispatches a column-batched GEMV for what is a large dense GEMM.
     // {n_embd, d_in_proj} @ {n_embd, n_tokens} => {d_in_proj, n_tokens}
-    ggml_tensor * zxBCdt = build_lora_mm(model.layers[il].ssm_in, cur, model.layers[il].ssm_in_s);
+    ggml_tensor * zxBCdt = build_lora_mm(model.layers[il].ssm_in, cur);
     // {d_in_proj, n_tokens} => {d_in_proj, n_seq_tokens, n_seqs}
     zxBCdt = ggml_reshape_3d(ctx0, zxBCdt, zxBCdt->ne[0], n_seq_tokens, n_seqs);
 
@@ -206,19 +204,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
         ggml_tensor * conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
 
-        const int64_t row_count = (d_conv - 1) * (d_inner + 2 * n_group * d_state);
-        const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
-
-        for (int64_t slot = 0; slot < n_written; ++slot) {
-            ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
-                                                   conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
-                                                   ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
-                                                                conv_states_all->nb[1],
-                                                                ((size_t) slot * mem_size + kv_head) * row_size)));
-        }
+        build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -300,7 +286,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         y = ggml_reshape_2d(ctx0, y, d_inner, n_seq_tokens * n_seqs);
 
         // {d_inner, n_embd} @ {d_inner, n_tokens} => {n_embd, n_tokens}
-        cur = build_lora_mm(model.layers[il].ssm_out, y, model.layers[il].ssm_out_s);
+        cur = build_lora_mm(model.layers[il].ssm_out, y);
     }
 
     cb(cur, "mamba_out", il);

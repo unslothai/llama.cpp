@@ -59,14 +59,14 @@ void llama_model_plamo3::load_arch_tensors(llama_model_loader &) {
 
 std::unique_ptr<llm_graph_context> llama_model_plamo3::build_arch_graph(const llm_graph_params & params) const {
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        return std::make_unique<graph<true>> (*this, params);
+        return std::make_unique<graph<true>> (params);
     } else {
-        return std::make_unique<graph<false>>(*this, params);
+        return std::make_unique<graph<false>>(params);
     }
 }
 
 template <bool iswa>
-llama_model_plamo3::graph<iswa>::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_plamo3::graph<iswa>::graph(const llm_graph_params & params) :
     llm_graph_context(params) {
     const int64_t head_dim_q = hparams.n_embd_head_k();
     const int64_t head_dim_v = hparams.n_embd_head_v();
@@ -88,16 +88,6 @@ llama_model_plamo3::graph<iswa>::graph(const llama_model & model, const llm_grap
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * residual = inpL;
-
-        float freq_base_l  = 0.0f;
-        float freq_scale_l = 0.0f;
-        if constexpr (iswa) {
-            freq_base_l  = model.get_rope_freq_base (cparams, il);
-            freq_scale_l = model.get_rope_freq_scale(cparams, il);
-        } else {
-            freq_base_l  = freq_base;
-            freq_scale_l = freq_scale;
-        }
 
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -128,17 +118,13 @@ llama_model_plamo3::graph<iswa>::graph(const llama_model & model, const llm_grap
         Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         cb(Kcur, "attn_k_norm", il);
 
-        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                ext_factor, attn_factor, beta_fast, beta_slow);
-        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+        Qcur = build_rope(Qcur, inp_pos, il);
+        Kcur = build_rope(Kcur, inp_pos, il);
 
         const float attn_scale = 1.0f / sqrtf(float(head_dim_q));
 
         cur = build_attn(inp_attn,
-                model.layers[il].wo, NULL, model.layers[il].wo_s,
+                model.layers[il].wo, NULL,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, attn_scale, il);
         cb(cur, "attn_out", il);
 
@@ -159,9 +145,9 @@ llama_model_plamo3::graph<iswa>::graph(const llama_model & model, const llm_grap
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, NULL,
-                NULL,                      NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                model.layers[il].ffn_up,   NULL,
+                NULL,                      NULL,
+                model.layers[il].ffn_down, NULL,
                 NULL,
                 LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
         cb(cur, "ffn_out", il);
@@ -184,7 +170,7 @@ llama_model_plamo3::graph<iswa>::graph(const llama_model & model, const llm_grap
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     res->t_logits = cur;
 }
 

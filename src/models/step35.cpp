@@ -172,14 +172,24 @@ void llama_model_step35::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_step35::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
+llama_rope_params llama_model_step35::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    if (hparams.is_swa(il)) {
+        res.factors = nullptr;
     }
-    return std::make_unique<graph>(*this, params);
+
+    return res;
 }
 
-llama_model_step35::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+std::unique_ptr<llm_graph_context> llama_model_step35::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(params);
+    }
+    return std::make_unique<graph>(params);
+}
+
+llama_model_step35::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -194,9 +204,6 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
 
         const uint32_t n_head_l    = hparams.n_head(il);
         const uint32_t n_head_kv_l = hparams.n_head_kv(il);
-
-        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
         cur = inpL;
 
@@ -232,25 +239,14 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             }
 
             // RoPE (partial rotary factors per layer)
-            const bool is_swa = hparams.is_swa(il);
-            ggml_tensor * rope_factors = is_swa ? nullptr : model.get_rope_factors(cparams, il);
-            const int64_t n_rot_l = hparams.n_rot(il);
-            Qcur = ggml_rope_ext(
-                ctx0, Qcur, inp_pos, rope_factors,
-                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                ext_factor, attn_factor, beta_fast, beta_slow
-            );
-            Kcur = ggml_rope_ext(
-                ctx0, Kcur, inp_pos, rope_factors,
-                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                ext_factor, attn_factor, beta_fast, beta_slow
-            );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
             cb(Qcur, "Qcur_pos", il);
             cb(Kcur, "Kcur_pos", il);
 
             const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
             ggml_tensor * attn_out = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(attn_out, "attn_out", il);
             // head-wise attention gate: sigmoid(g_proj(x)) in torch
@@ -274,7 +270,7 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             }
 
             // output projection
-            cur = build_lora_mm(model.layers[il].wo, attn_out, model.layers[il].wo_s);
+            cur = build_lora_mm(model.layers[il].wo, attn_out);
             cb(cur, "attn_proj", il);
         }
 
@@ -293,9 +289,9 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
         if (model.layers[il].ffn_gate_inp == nullptr) {
             // dense MLP
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   nullptr,
-                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, nullptr,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, nullptr,
+                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b,
+                    model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                     nullptr,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -316,9 +312,9 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
 
             // shared expert MLP (always added on MoE layers in Step35)
             ggml_tensor * sh_out = build_ffn(cur,
-                    model.layers[il].ffn_up_shexp,   nullptr, nullptr,
-                    model.layers[il].ffn_gate_shexp, nullptr, nullptr,
-                    model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                    model.layers[il].ffn_up_shexp,   nullptr,
+                    model.layers[il].ffn_gate_shexp, nullptr,
+                    model.layers[il].ffn_down_shexp, nullptr,
                     nullptr,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(sh_out, "ffn_shared_out", il);
@@ -348,13 +344,13 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Step3p5 (MoE)
-llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+llama_model_step35::graph_mtp::graph_mtp(const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "STEP35 MTP requires n_layer_nextn > 0");
 
@@ -375,9 +371,6 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     const uint32_t n_head_l    = hparams.n_head(il);
     const uint32_t n_head_kv_l = hparams.n_head_kv(il);
 
-    const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-    const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -386,9 +379,7 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    inp->h = build_inp_embd_state(inp.get(), hparams.n_embd);
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
@@ -441,24 +432,14 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         cb(Kcur, "mtp_Kcur_normed", il);
     }
 
-    const bool    is_swa       = hparams.is_swa(il);
-    ggml_tensor * rope_factors = is_swa ? nullptr : model.get_rope_factors(cparams, il);
-    const int64_t n_rot_l      = hparams.n_rot(il);
-
-    Qcur = ggml_rope_ext(
-        ctx0, Qcur, inp_pos, rope_factors,
-        n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-        ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_ext(
-        ctx0, Kcur, inp_pos, rope_factors,
-        n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-        ext_factor, attn_factor, beta_fast, beta_slow);
+    Qcur = build_rope(Qcur, inp_pos, il);
+    Kcur = build_rope(Kcur, inp_pos, il);
     cb(Qcur, "mtp_Qcur_pos", il);
     cb(Kcur, "mtp_Kcur_pos", il);
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
     ggml_tensor * attn_out = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
+            nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(attn_out, "mtp_attn_out", il);
 
@@ -481,7 +462,7 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         cb(attn_out, "mtp_attn_gated", il);
     }
 
-    cur = build_lora_mm(layer.wo, attn_out, layer.wo_s);
+    cur = build_lora_mm(layer.wo, attn_out);
     cb(cur, "mtp_attn_proj", il);
 
     cur = ggml_add(ctx0, cur, inpSA);
@@ -494,9 +475,9 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // FFN: dense MLP or MoE (mirrors trunk path)
     if (layer.ffn_gate_inp == nullptr) {
         cur = build_ffn(cur,
-                layer.ffn_up,   layer.ffn_up_b,   nullptr,
-                layer.ffn_gate, layer.ffn_gate_b, nullptr,
-                layer.ffn_down, layer.ffn_down_b, nullptr,
+                layer.ffn_up,   layer.ffn_up_b,
+                layer.ffn_gate, layer.ffn_gate_b,
+                layer.ffn_down, layer.ffn_down_b,
                 nullptr,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "mtp_ffn_out", il);
@@ -515,9 +496,9 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         cb(moe_out, "mtp_ffn_moe_out", il);
 
         ggml_tensor * sh_out = build_ffn(cur,
-                layer.ffn_up_shexp,   nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
+                layer.ffn_up_shexp,   nullptr,
+                layer.ffn_gate_shexp, nullptr,
+                layer.ffn_down_shexp, nullptr,
                 nullptr,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(sh_out, "mtp_ffn_shared_out", il);

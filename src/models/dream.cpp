@@ -46,10 +46,10 @@ void llama_model_dream::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dream::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_dream::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_dream::graph::graph(const llm_graph_params & params) :
     llm_graph_context(params) {
     //copied from qwen2
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -81,18 +81,15 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
-
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -107,9 +104,9 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-            model.layers[il].ffn_up, NULL, NULL,
-            model.layers[il].ffn_gate, NULL, NULL,
-            model.layers[il].ffn_down, NULL, NULL,
+            model.layers[il].ffn_up, NULL,
+            model.layers[il].ffn_gate, NULL,
+            model.layers[il].ffn_down, NULL,
             NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
@@ -129,7 +126,7 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

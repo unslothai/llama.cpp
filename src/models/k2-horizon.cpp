@@ -1,8 +1,6 @@
 #include "models.h"
 
 void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, hparams.yarn_beta_fast, false);
-    ml.get_key(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, hparams.yarn_beta_slow, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,  hparams.n_norm_groups, false);
     if (hparams.n_norm_groups == 0) {
@@ -117,7 +115,7 @@ void llama_model_k2_horizon::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_k2_horizon::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // RMS norm over n_groups equal slices of ne[0], then one full-width weight
@@ -210,7 +208,7 @@ ggml_tensor * llama_model_k2_horizon::graph::build_routed_value(const llama_laye
     return value_out;
 }
 
-llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_k2_horizon::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -245,9 +243,9 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
         {
             ggml_tensor * attn_inp = cur; // saved for the output gate
 
-            ggml_tensor * Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-            ggml_tensor * Vcur = is_mova_layer ? build_routed_value(layer, cur, il) : build_lora_mm(layer.wv, cur, layer.wv_s);
+            ggml_tensor * Qcur = build_lora_mm(layer.wq, cur);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, cur);
+            ggml_tensor * Vcur = is_mova_layer ? build_routed_value(layer, cur, il) : build_lora_mm(layer.wv, cur);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -261,12 +259,8 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
                 Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
             }
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -276,19 +270,19 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
             const bool gated = layer.wqkv_gate != nullptr;
 
             cur = build_attn(inp_attn,
-                    gated ? nullptr : layer.wo, gated ? nullptr : layer.wo_b, gated ? nullptr : layer.wo_s,
+                    gated ? nullptr : layer.wo, gated ? nullptr : layer.wo_b,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
             if (gated) {
                 // softplus with beta = ln(2): log2(1 + 2^x)
                 constexpr float ln2 = 0.6931471805599453f;
-                ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, attn_inp, layer.wqkv_gate_s);
+                ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, attn_inp);
                 gate = ggml_scale(ctx0, gate, ln2);
                 gate = ggml_softplus(ctx0, gate);
                 gate = ggml_scale(ctx0, gate, 1.4426950408889634f); // 1 / ln(2)
 
                 cur = ggml_mul(ctx0, cur, gate);
-                cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+                cur = build_lora_mm(layer.wo, cur);
                 if (layer.wo_b) {
                     cur = ggml_add(ctx0, cur, layer.wo_b);
                 }
@@ -322,9 +316,9 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
 
             if (layer.ffn_gate_shexp) {
                 ggml_tensor * ffn_shexp = build_ffn(cur,
-                        layer.ffn_up_shexp,   NULL, NULL,
-                        layer.ffn_gate_shexp, NULL, NULL,
-                        layer.ffn_down_shexp, NULL, NULL,
+                        layer.ffn_up_shexp,   NULL,
+                        layer.ffn_gate_shexp, NULL,
+                        layer.ffn_down_shexp, NULL,
                         NULL,
                         LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -333,9 +327,9 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
             }
         } else {
             cur = build_ffn(cur,
-                    layer.ffn_up,   NULL, NULL,
-                    layer.ffn_gate, NULL, NULL,
-                    layer.ffn_down, NULL, NULL,
+                    layer.ffn_up,   NULL,
+                    layer.ffn_gate, NULL,
+                    layer.ffn_down, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
         }
@@ -354,7 +348,7 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

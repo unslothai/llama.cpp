@@ -51,16 +51,31 @@ void llama_model_olmo2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+llama_rope_params llama_model_olmo2::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    res.freq_base = cparams.rope_freq_base;
+
+    // regular RoPE on the SWA layers, without YaRN
+    if (hparams.is_swa(il)) {
+        res.freq_scale  = 1.0f;
+        res.ext_factor  = 0.0f;
+        res.attn_factor = 1.0f;
+    }
+
+    return res;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_olmo2::build_arch_graph(const llm_graph_params & params) const {
     if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-        return std::make_unique<graph<true>>(*this, params);
+        return std::make_unique<graph<true>>(params);
     } else {
-        return std::make_unique<graph<false>>(*this, params);
+        return std::make_unique<graph<false>>(params);
     }
 }
 
 template <bool iswa>
-llama_model_olmo2::graph<iswa>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_olmo2::graph<iswa>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -112,42 +127,14 @@ llama_model_olmo2::graph<iswa>::graph(const llama_model & model, const llm_graph
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-            const bool is_swa = hparams.is_swa(il);
-
-            if (is_swa) {
-                // For sliding window layers, Olmo3 use regular rope with no yarn rope scaling.
-                // This is achieved here by setting freq_scale and attn_factor to 1.
-                // We also set ext_factor to 0 to avoid a few unnecessary computations.
-                Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, 1.0,
-                    0.0, 1.0, beta_fast, beta_slow
-                    );
-
-                Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, 1.0,
-                    0.0, 1.0, beta_fast, beta_slow
-                    );
-            } else {
-                Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-                Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-            }
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
+                    model.layers[il].wo, NULL,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -164,9 +151,9 @@ llama_model_olmo2::graph<iswa>::graph(const llama_model & model, const llm_graph
 
         // feed-forward network
         cur = build_ffn(ffn_inp,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                model.layers[il].ffn_up,   NULL,
+                model.layers[il].ffn_gate, NULL,
+                model.layers[il].ffn_down, NULL,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
@@ -195,7 +182,7 @@ llama_model_olmo2::graph<iswa>::graph(const llama_model & model, const llm_graph
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
