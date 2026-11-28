@@ -272,6 +272,8 @@ extern "C" {
     // the precision parameters are stored as ggml_tensor.op_params to the respective ops
     enum ggml_prec {
         GGML_PREC_UNDEFINED = 0,
+        // true IEEE F32, no TF32/reassociation; ranks below GGML_PREC_F32 so "at least F32" checks accept it
+        GGML_PREC_F32_PEDANTIC = 5,
         GGML_PREC_F32       = 10,
         GGML_PREC_BF16      = 15,
         GGML_PREC_F16       = 20,
@@ -398,6 +400,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_BANDED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2281,6 +2284,35 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // flash attention with an additive banded relative-position bias, applied after scale, no dense bias tensor:
+    //   rel_logits: [rel_extent, n_head, n_batch, ne3]; rel_dist = q_idx + (n_kv - n_batch) - kv_idx
+    //   score += rel_logits[rel_dist, head, q_idx, batch] iff 0 <= rel_dist < rel_extent
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel_logits,
+            float                 scale,
+            int64_t               rel_extent);
+
+    // banded attention over a cache whose cells are not the positions (several sequences, a wrapped ring):
+    //   k_pos: [n_kv,    1 or ne3] I32, position of each K/V cell, negative = no bias
+    //   q_pos: [n_batch, 1 or ne3] I32, position of each query
+    //   rel_dist = q_pos[q_idx] - k_pos[kv_idx] replaces the cell distance; the mask still separates sequences
+    GGML_API void ggml_flash_attn_ext_banded_set_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_pos,
+            struct ggml_tensor * q_pos);
+
+    // causal banded attention without a mask: a cell is visible to a query iff its distance (the cell distance, or
+    //   q_pos - k_pos with the positions, -1 for an empty cell) is >= 0; the op must have no mask. This is the causal
+    //   mask of one sequence whose cells are its positions, or, with the positions, of a cache that holds one sequence
+    GGML_API void ggml_flash_attn_ext_banded_set_causal(
+            struct ggml_tensor * a,
+            bool                 causal);
 
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]

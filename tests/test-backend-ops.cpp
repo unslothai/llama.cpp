@@ -10344,6 +10344,366 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT_BANDED
+struct test_flash_attn_ext_banded : public test_case {
+    const int64_t d;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_q;
+    const int64_t n_kv;
+    const int64_t rel_extent;
+    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal over a padded n_kv,
+                         // 4: causal with the first query fully masked
+    const ggml_type kv_type;
+    const ggml_type rel_type;
+    const bool strided;
+    ggml_type v_type = GGML_TYPE_COUNT; // the V type when it differs from K, set by the mixed constructor
+
+    std::string vars() override {
+        if (v_type != GGML_TYPE_COUNT) {
+            return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, v_type);
+        }
+        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
+    }
+
+    double max_nmse_err() override {
+        if (kv_type == GGML_TYPE_F32 && rel_type == GGML_TYPE_F32) {
+            return 2e-6;
+        }
+        return n_kv > 8192 ? 1e-3 : 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4*n_head*n_q*n_kv*d;
+    }
+
+    test_flash_attn_ext_banded(
+            int64_t d, int64_t n_head, int64_t n_head_kv,
+            int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false)
+        : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
+          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided) {}
+
+    // K of kv_type, V of v_type (GGML_TYPE_COUNT: kv_type)
+    test_flash_attn_ext_banded(
+            int64_t d, int64_t n_head, int64_t n_head_kv,
+            int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided, ggml_type v_type)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided) {
+        this->v_type = v_type;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        ggml_tensor * k;
+        ggml_tensor * v;
+        ggml_tensor * r;
+        if (strided && v_type != GGML_TYPE_COUNT) {
+            // a V cache type that differs from K
+            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, v_type,  2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
+            k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0);
+            v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0);
+            r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, 1, rb->nb[1], rb->nb[2], rb->nb[3], 0);
+        } else if (strided) {
+            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
+            ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
+            k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0);
+            v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0);
+            r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, 1, rb->nb[1], rb->nb[2], rb->nb[3], 0);
+        } else {
+            k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+            if (v_type == GGML_TYPE_COUNT) {
+                v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+            } else {
+                v = ggml_new_tensor_4d(ctx, v_type, d, n_kv, n_head_kv, 1);
+            }
+            r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(r, "rel_logits");
+
+        ggml_tensor * m = nullptr;
+        if (mask_kind != 0) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+            ggml_set_name(m, "m");
+            if (strided) {
+                // the first n_kv cells of a wider mask, as the model views it
+                ggml_tensor * mb = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv + 64, n_q, 1, 1);
+                ggml_set_name(mb, "m_wide");
+                m = ggml_view_4d(ctx, mb, n_kv, n_q, 1, 1, mb->nb[1], mb->nb[2], mb->nb[3], 0);
+            }
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m_wide") == 0 || (strcmp(t->name, "m") == 0 && mask_kind == 3)) {
+                // padded n_kv (mask_kind 3): the last cells are empty, the queries are the tail of the cells before them
+                const int64_t nw = t->ne[0];
+                const int64_t n_empty = mask_kind == 3 ? std::min<int64_t>(n_kv - n_q, n_kv/8 + 37) : 0;
+                std::vector<ggml_fp16_t> data(n_q*nw);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < nw; ++ik) {
+                        const int64_t rel_dist = iq + (n_kv - n_empty - n_q) - ik;
+                        const bool visible = ik < n_kv - n_empty && rel_dist >= 0 && (mask_kind != 2 || rel_dist < rel_extent);
+                        data[iq*nw + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "m") == 0 && mask_kind != 3) {
+                std::vector<ggml_fp16_t> data(n_q*n_kv);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < n_kv; ++ik) {
+                        const int64_t rel_dist = iq + (n_kv - n_q) - ik;
+                        const bool visible = rel_dist >= 0 && (mask_kind != 2 || rel_dist < rel_extent) && (mask_kind != 4 || iq != 0);
+                        data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
+struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
+    const int sinks;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded::vars() + ",sinks=" + std::to_string(sinks);
+    }
+
+    test_flash_attn_ext_banded_sinks(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, int sinks, bool strided = false, ggml_type v_type = GGML_TYPE_COUNT)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, v_type), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded::build_graph(ctx);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, sinks == 2 ? n_q : 1);
+        ggml_set_name(s, "sinks");
+        ggml_flash_attn_ext_add_sinks(out, s);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "sinks"), -4.0f, 4.0f);
+    }
+};
+
+// K/V layouts and masks the Metal banded / mixed K/V kernels cannot address (backends may refuse them):
+// K and V with their own types and head counts, K/V rows padded to a stride the 4-vector loads would round down,
+// a mask wider than K
+struct test_flash_attn_ext_kv_layout : public test_case {
+    const bool banded;
+    const int64_t d, n_head, n_q, n_kv;
+    const ggml_type type_k, type_v;
+    const int64_t n_head_k, n_head_v, row_pad, mask_cols;
+
+    std::string vars() override {
+        return VARS_TO_STR10(banded, d, n_head, n_q, n_kv, type_k, type_v, n_head_k, n_head_v, row_pad) +
+            ",mask_cols=" + std::to_string(mask_cols);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_layout(bool banded, int64_t d, int64_t n_head, int64_t n_q, int64_t n_kv, ggml_type type_k, ggml_type type_v,
+            int64_t n_head_k, int64_t n_head_v, int64_t row_pad, int64_t mask_cols)
+        : banded(banded), d(d), n_head(n_head), n_q(n_q), n_kv(n_kv), type_k(type_k), type_v(type_v),
+          n_head_k(n_head_k), n_head_v(n_head_v), row_pad(row_pad), mask_cols(mask_cols) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        // the row padding applies to the non-quantized side(s) only (a quantized row is whole blocks)
+        const int64_t pad_k = ggml_is_quantized(type_k) ? 0 : row_pad;
+        const int64_t pad_v = ggml_is_quantized(type_v) ? 0 : row_pad;
+        ggml_tensor * kb = ggml_new_tensor_4d(ctx, type_k, d + pad_k, n_kv, n_head_k, 1);
+        ggml_tensor * vb = ggml_new_tensor_4d(ctx, type_v, d + pad_v, n_kv, n_head_v, 1);
+        ggml_tensor * k  = pad_k ? ggml_view_4d(ctx, kb, d, n_kv, n_head_k, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0) : kb;
+        ggml_tensor * v  = pad_v ? ggml_view_4d(ctx, vb, d, n_kv, n_head_v, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0) : vb;
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_cols, n_q, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(kb, "kb");
+        ggml_set_name(vb, "vb");
+        ggml_set_name(m, "m");
+        ggml_tensor * out;
+        if (banded) {
+            ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, n_head, n_q, 1);
+            ggml_set_name(r, "rel_logits");
+            out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), 16);
+        } else {
+            out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/float(d), 0.0f, 0.0f);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // causal over the first n_kv columns, the rest masked
+                std::vector<ggml_fp16_t> data(n_q*mask_cols);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < mask_cols; ++ik) {
+                        const bool visible = ik < n_kv && iq + (n_kv - n_q) - ik >= 0;
+                        data[iq*mask_cols + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (t->view_src == nullptr) {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
+// banded attention with cell and query positions: the cells are not the positions
+// layout 1: n_seq sequences interleaved in one unified cache, layout 2: one sequence in a wrapped ring cache
+// some cells are empty (position -1, masked); the mask separates the sequences and, for mask_kind 2, keeps the window
+struct test_flash_attn_ext_banded_pos : public test_case {
+    const int64_t d;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_q;
+    const int64_t n_kv;
+    const int64_t rel_extent;
+    const int layout;
+    const int64_t n_seq;
+    const int mask_kind;
+    const ggml_type kv_type;
+    const ggml_type rel_type;
+    const ggml_type v_type; // V type when it differs from K, else kv_type
+
+    std::string vars() override {
+        return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, layout, n_seq, mask_kind, kv_type, rel_type) +
+            (v_type != kv_type ? ",v_type=" + std::string(ggml_type_name(v_type)) : "");
+    }
+
+    double max_nmse_err() override {
+        if (kv_type == GGML_TYPE_F32 && rel_type == GGML_TYPE_F32) {
+            return 2e-6;
+        }
+        return n_kv > 8192 ? 1e-3 : 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4*n_head*n_q*n_kv*d;
+    }
+
+    test_flash_attn_ext_banded_pos(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int layout, int64_t n_seq, int mask_kind, ggml_type kv_type, ggml_type rel_type, ggml_type v_type = GGML_TYPE_COUNT)
+        : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv), rel_extent(rel_extent),
+          layout(layout), n_seq(n_seq), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type),
+          v_type(v_type == GGML_TYPE_COUNT ? kv_type : v_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, v_type,  d, n_kv, n_head_kv, 1);
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_q);
+        ggml_tensor * kp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * qp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(r, "rel_logits");
+        ggml_set_name(m, "m");
+        ggml_set_name(s, "sinks");
+        ggml_set_name(kp, "k_pos");
+        ggml_set_name(qp, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_banded_set_pos(out, kp, qp);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // cell -> (sequence, position), position -1 = empty; query -> (sequence, position)
+    void layout_cells(std::vector<int32_t> & k_seq, std::vector<int32_t> & k_pos, std::vector<int32_t> & q_seq, std::vector<int32_t> & q_pos) const {
+        k_seq.assign(n_kv, -1);
+        k_pos.assign(n_kv, -1);
+        q_seq.assign(n_q, 0);
+        q_pos.assign(n_q, 0);
+        if (layout == 1) {
+            // cell j of sequence j % n_seq at position j / n_seq, the last n_q cells are the queries, every 7th cell empty
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (j % 7 != 3 || j >= n_kv - n_q) {
+                    k_seq[j] = int32_t(j % n_seq);
+                    k_pos[j] = int32_t(j / n_seq);
+                }
+            }
+            for (int64_t i = 0; i < n_q; ++i) {
+                const int64_t j = n_kv - n_q + i;
+                q_seq[i] = int32_t(j % n_seq);
+                q_pos[i] = int32_t(j / n_seq);
+            }
+        } else {
+            // one sequence of n_total positions in a ring of n_kv cells: cell p % n_kv holds position p, the queries are the last n_q
+            const int64_t n_total = 3*n_kv + n_kv/3 + 1;
+            for (int64_t p = 0; p < n_total; ++p) {
+                k_seq[p % n_kv] = 0;
+                k_pos[p % n_kv] = int32_t(p);
+            }
+            k_seq[(n_total + 5) % n_kv] = -1; // an empty cell outside the queries
+            k_pos[(n_total + 5) % n_kv] = -1;
+            for (int64_t i = 0; i < n_q; ++i) {
+                q_pos[i] = int32_t(n_total - n_q + i);
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<int32_t> k_seq, k_pos, q_seq, q_pos;
+        layout_cells(k_seq, k_pos, q_seq, q_pos);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(n_q*n_kv);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ik = 0; ik < n_kv; ++ik) {
+                        const int64_t dist = int64_t(q_pos[iq]) - k_pos[ik];
+                        const bool visible = k_pos[ik] >= 0 && k_seq[ik] == q_seq[iq] && dist >= 0 &&
+                            (mask_kind != 2 || dist < rel_extent);
+                        data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "k_pos") == 0) {
+                ggml_backend_tensor_set(t, k_pos.data(), 0, k_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, q_pos.data(), 0, q_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11467,6 +11827,7 @@ struct test_generic_op : public test_case {
         case GGML_OP_RWKV_WKV7:
             return 5e-3;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
         {
             // Scale error with kv length to account for accumulating floating point error
             const int64_t kv = sources[1].ne[1];
@@ -11490,7 +11851,7 @@ struct test_generic_op : public test_case {
             }
 
             // FLASH_ATTN_EXT: src[3] is the KQ mask
-            if (op == GGML_OP_FLASH_ATTN_EXT && i == 3) {
+            if ((op == GGML_OP_FLASH_ATTN_EXT || op == GGML_OP_FLASH_ATTN_EXT_BANDED) && i == 3) {
                 init_tensor_kq_mask(t);
                 continue;
             }
@@ -11994,6 +12355,93 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// banded attention without a mask, causal by the sign of the distance (ggml_flash_attn_ext_banded_set_causal)
+struct test_flash_attn_ext_banded_causal : public test_flash_attn_ext_banded_sinks {
+    test_flash_attn_ext_banded_causal(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            ggml_type kv_type, int sinks, bool strided = false)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 0, kv_type, GGML_TYPE_F32, sinks, strided) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",causal=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded_sinks::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_causal(out, true);
+        return out;
+    }
+};
+
+// the causal attention without a mask over cell positions (a cache of one sequence: padded spans, decode-banded steps,
+// the reserve graph): a cell is visible iff its position is not -1 and not after the query's. One sequence with a few
+// empty cells, a gap of positions, empty cells after the queries and two cells of later positions
+struct test_flash_attn_ext_banded_causal_pos : public test_flash_attn_ext_banded_pos {
+    test_flash_attn_ext_banded_causal_pos(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            ggml_type kv_type)
+        : test_flash_attn_ext_banded_pos(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 3, 1, 0, kv_type, GGML_TYPE_F32) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_pos::vars() + ",causal=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, v_type,  d, n_kv, n_head_kv, 1);
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_q);
+        ggml_tensor * kp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * qp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(r, "rel_logits");
+        ggml_set_name(s, "sinks");
+        ggml_set_name(kp, "k_pos");
+        ggml_set_name(qp, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, nullptr, r, 1.0f/float(d), rel_extent);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_banded_set_pos(out, kp, qp);
+        ggml_flash_attn_ext_banded_set_causal(out, true);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // the queries are cells [q0, q0 + n_q); cell j < q0 + n_q holds position j, plus 9 from n_kv/2 on (a gap), every
+        // 13th cell before the queries is empty; after the queries two cells of later positions, then empty cells
+        const int64_t q0 = n_kv - n_q - 4;
+        std::vector<int32_t> k_pos(n_kv, -1);
+        std::vector<int32_t> q_pos(n_q);
+        auto pos_of = [&](int64_t j) { return int32_t(j + (j >= n_kv/2 ? 9 : 0)); };
+        for (int64_t j = 0; j < q0 + n_q; ++j) {
+            if (j % 13 != 7 || j >= q0) {
+                k_pos[j] = pos_of(j);
+            }
+        }
+        k_pos[q0 + n_q + 0] = pos_of(q0 + n_q) + 3;
+        k_pos[q0 + n_q + 1] = pos_of(q0 + n_q) + 4;
+        for (int64_t i = 0; i < n_q; ++i) {
+            q_pos[i] = pos_of(q0 + i);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "k_pos") == 0) {
+                ggml_backend_tensor_set(t, k_pos.data(), 0, k_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, q_pos.data(), 0, q_pos.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -14855,6 +15303,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // a negative max_bias disables ALiBi, it must not select the banded MMA branch
+    for (bool sinks : {true, false}) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 32, true, sinks, -2.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -15020,6 +15473,153 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 16, 16,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  1, 64,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 1, 64, 64, 512, 1, GGML_TYPE_F16,  GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 17, 33,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, true));
+    // Inkling 2 at a few tokens (a speculative verify batch): 24 Q heads on 8 KV heads, cells split one tile per block
+    for (int64_t n_q : {2, 3, 4, 8}) {
+        for (int64_t n_kv : {64, 256, 1088}) {
+            for (int mask_kind : {1, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 1));
+            }
+        }
+    }
+    // a fully masked query is 0, also on the FA kernel the op delegates to without sinks
+    for (int64_t n_kv : {64, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2,  1, n_kv, 32, 4, GGML_TYPE_F16,  GGML_TYPE_F32));
+        test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 33, n_kv, 32, 4, GGML_TYPE_Q8_0, GGML_TYPE_F32));
+    }
+    // layouts and masks backends may refuse: K/V rows padded off a 4-element boundary, a mask wider than K, and (banded)
+    // K/V head counts that differ. Left out: plain FA with a padded F16 K or V, which CUDA FA reads in place: wrong for
+    // F16/F16, and an abort on rows off a 4-byte boundary since the FA loads take half2 strides (ggml-org#32901)
+    //                                                   banded,   d, nh, n_q, n_kv, type_k,          type_v,     hk, hv, pad, mask_cols
+    for (int64_t n_q : { 1, 33 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, n_q, 64, GGML_TYPE_F16, GGML_TYPE_F16, 2, 2, 1, 64));
+    }
+    for (bool banded : { false, true }) {
+        if (banded) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4,  1,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 33,  64, GGML_TYPE_F16,  GGML_TYPE_Q8_0, 2, 2, 1,  64));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0, 128));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_layout(banded, 128, 4, 20,  64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 2, 0,  64));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kv_layout(true, 128, 4, 1, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 1, 0, 64));
+    // cells that are not the positions: several sequences in a unified cache, a wrapped SWA ring
+    for (ggml_type kv_type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        // decode (one token per sequence: the decode kernel up to 8 or 32 queries), short and long prefill (MMA tiles)
+        for (int64_t nq : {1, 4, 17, 33, 64, 130}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv_type, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos( 64, 8, 1, nq,  512,  64, 2, 1, 2, kv_type, GGML_TYPE_F32));
+        }
+    }
+    // every quantized K/V type of the cache, and mixed K/V types: decode (split-KV) and prefill (MMA)
+    for (ggml_type kv_type : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+        for (int64_t nq : {1, 4, 33, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv_type, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq,  512,  64, 2, 1, 2, kv_type, GGML_TYPE_F32));
+        }
+    }
+    for (auto kv : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_F16},
+            {GGML_TYPE_F16, GGML_TYPE_Q8_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0} }) {
+        for (int64_t nq : {4, 17, 64, 130}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq, 1024, 256, 1, 4, 1, kv.first, GGML_TYPE_F32, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 8, 2, nq,  512,  64, 2, 1, 2, kv.first, GGML_TYPE_F32, kv.second));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 48, 8,   1, 4096, 1024, 1, 4, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 48, 8,  64, 4096, 1024, 1, 3, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128, 48, 8, 512, 2048,  512, 2, 1, 2, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(128,  8, 2,  33,  700,   32, 1, 2, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos( 64,  8, 2,   7,  300,   16, 2, 1, 1, GGML_TYPE_F16, GGML_TYPE_F16));
+    for (int sinks : {1, 2}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64, 8, 2,  1,  64,  8, 1, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 2, 33,  64, 16, 2, GGML_TYPE_F16, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 64, 256, 32, 2, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 1, 4096, 1024, 2, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 4, 2048, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2, 1, 1000,    8, 1, GGML_TYPE_F32, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,   16,    16,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  4, 1,   77,  1000,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  4, 2,   64,   300,  16, 0, GGML_TYPE_F16,  GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  100,   100,  64, 1, GGML_TYPE_BF16, GGML_TYPE_BF16, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,   65,   333,  32, 2, GGML_TYPE_F16,  GGML_TYPE_F32,  sinks, true));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  6, 1,   17, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512,  4096, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  512,  4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+    }
+    // quantized K/V cache: q8_0 / q4_0 tiles, other types via an F16 copy, scalar kernels for small n_q
+    for (ggml_type kv_type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  64,  300,   16, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  4, 1,  77, 1000,    8, 1, kv_type, GGML_TYPE_F32, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  65,  333,   32, 2, kv_type, GGML_TYPE_F32, 2, true));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,   1, 4096, 1024, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 512, 3000, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64, 8, 2, kv_type, GGML_TYPE_F32));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+    // small ubatches over a padded n_kv (Inkling-2-Mini decode): empty cells past the sequence are masked
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 2, 3, 4, 8, 16, 32 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 256, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+        for (int64_t n_q : { 3, 8, 48 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kv_type, GGML_TYPE_F32, 2, true));
+        }
+    }
+    // the other cache types and mixed K/V, read in place by the decode kernel up to 32 queries
+    for (auto [kt, vt] : std::vector<std::pair<ggml_type, ggml_type>>{
+             { GGML_TYPE_Q4_1, GGML_TYPE_Q4_1 }, { GGML_TYPE_Q5_0, GGML_TYPE_Q5_0 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q5_1 },
+             { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_F16 }, { GGML_TYPE_F16, GGML_TYPE_Q8_0 } }) {
+        for (int64_t n_q : { 1, 2, 3, 8, 9, 16, 32, 33 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1280, 3, kt, GGML_TYPE_F32, 2, false, vt));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 256, 1280, 3, kt, GGML_TYPE_F32, 2, false, vt));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 3, 4096, 1280, 3, kt, GGML_TYPE_F32, 2, true, vt));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2, 3, 1000,    8, 1, kt, GGML_TYPE_F32, 2, false, vt));
+    }
+    // causal without a mask (a cache of one sequence): decode, small, scalar, split and tensor-core shapes, every cache type
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
+        for (int64_t n_q : { 1, 3, 17, 64, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128, 24, 8, n_q, 4096, 1280, kv_type, 2));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal( 64,  8, 2,  77,  1000,    8, kv_type, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 1, 511, 16403, 1024, kv_type, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal(128,  8, 2,  65,   333,   32, kv_type, 2, true));
+    }
+    // causal without a mask over cell positions: decode (vec), MMA and split shapes
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 17, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, n_q, n_q == 512 ? 2048 : 1000, 1280, kv_type));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(64, 8, 2, 17, 700, 64, kv_type));
+    }
+    // K/V the MMA kernel does not read take the split kernel
+    for (ggml_type kv_type : { GGML_TYPE_F32, GGML_TYPE_Q5_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, 17, 1000, 1280, kv_type));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_causal_pos(128, 24, 8, 300, 1000, 1280, kv_type));
+    }
+
+    // Inkling-2-Small shapes
+    for (int64_t n_q : { 1, 3, 8, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, n_q, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 2048, 4096, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512, 3000, 1024, 2, GGML_TYPE_BF16, GGML_TYPE_F32, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16896, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
 
     // mask broadcast over Q heads and batches
     for (bool sinks : { false, true }) {
@@ -15445,6 +16045,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini speculative verify (a few tokens): banded attention at small n_kv
+    for (int64_t n_kv : {256, 1024, 4096}) {
+        for (int64_t n_q : {1, 2, 3, 4, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 3, GGML_TYPE_F16, GGML_TYPE_F32, 1));
+        }
+    }
+
+    // Inkling-2-Mini decode: banded over a padded n_kv vs flash attention with a dense bias mask
+    {
+        const char * env = std::getenv("GGML_TEST_BANDED_PERF_KV");
+        const std::vector<int64_t> kvs = env ? std::vector<int64_t>{ atoll(env) } : std::vector<int64_t>{ 32768 };
+        for (int64_t kv : kvs) {
+            for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                for (int64_t n_q : { 1, 2, 3, 4, 8, 16, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, kv, 1280, 3, kv_type, GGML_TYPE_F32, 2));
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, n_q, true, true, 0, 0, GGML_PREC_F32, kv_type, kv_type));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

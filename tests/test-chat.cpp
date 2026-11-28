@@ -3225,6 +3225,40 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // Inkling 1, the template shipped in the GGUFs, on the shared Inkling parser
+        auto tst = peg_tester("models/templates/Inkling.jinja", detailed_debug);
+
+        const std::string H = "<|message_model|>";
+        const std::string E = "<|end_message|>";
+        const std::string CALL = "special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E;
+
+        tst.test("<|content_text|>Hello, world!\nWhat's up?" + E)
+            .expect(message_assist)
+            .run();
+
+        tst.test("<|content_thinking|>I'm\nthinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test("<|content_thinking|>I'm\nthinking" + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_with_reasoning_and_tool_call("I'm\nthinking", "special_function", R"({"arg1":1})"))
+            .run();
+
+        tst.test(CALL + H + "python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print('hey')\"}}" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, python_tool })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+                { "python", "{\"code\":\"print('hey')\"}", "" },
+            })
+            .run();
+    }
+
+    {
         // Google Gemma 2 2B - does not support tool calling
         auto tst = peg_tester("models/templates/google-gemma-2-2b-it.jinja");
 

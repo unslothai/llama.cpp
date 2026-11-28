@@ -501,7 +501,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
             } else {
                 GGML_UNUSED(y_scale_used);
             }
-            dst[ids_dst[j]*stride + i] = value * scale;
+            dst[(int64_t) ids_dst[j]*stride + i] = value * scale;
         }
     }
 }
@@ -573,7 +573,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
                     } else {
                         GGML_UNUSED(y_scale_used);
                     }
-                    dst[ids_dst[j]*stride + i] = value * scale_up;
+                    dst[(int64_t) ids_dst[j]*stride + i] = value * scale_up;
                 }
             }
         }

@@ -57,6 +57,7 @@ add_library(mtmd
             models/hy-v4.cpp
             models/inkling2v.cpp
             models/internvl.cpp
+            models/inkling.cpp
             models/kimivl.cpp
             models/kimik25.cpp
             models/nemotron-v2-vl.cpp

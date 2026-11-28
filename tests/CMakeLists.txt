@@ -377,6 +377,9 @@ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
+llama_build_and_test(test-flash-attn-bias.cpp LINK ggml)
+llama_build_and_test(test-flash-attn-generic-hash.cpp LINK ggml)
+
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
     target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
@@ -388,6 +391,7 @@ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
+llama_build_and_test(test-flash-attn-banded-causal.cpp LINK ggml)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)

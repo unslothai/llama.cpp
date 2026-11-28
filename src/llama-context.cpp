@@ -396,6 +396,11 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
         }
+
+        // the banded op and the kq_b fallback index the KQ mask by cell, not by kv_rows
+        if (model.arch == LLM_ARCH_INKLING) {
+            cparams.auto_fkvr = false;
+        }
     }
 
     // initialized later
@@ -902,6 +907,18 @@ void llama_context::sched_reserve() {
         n_nodes_tg         = ggml_graph_n_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
+
+        // Inkling 2 decodes one token of a unified multi-sequence cache dense, the tg graph above is banded
+        if (n_seqs > 1 && cparams.flash_attn && cparams.kv_unified &&
+                (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP)) {
+            std::vector<size_t> sizes(backend_buf_exp_size.size(), 0);
+            if (!graph_reserve(1, 1, 1, mctx.get(), model.no_alloc(), model.no_alloc() ? sizes.data() : nullptr)) {
+                throw std::runtime_error("failed to allocate compute tg buffers");
+            }
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]);
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -4490,6 +4507,13 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    // quantized V forces the dense path, which transposes V - invalid for a block-quantized tensor
+    if (model->arch == LLM_ARCH_INKLING && ggml_is_quantized(params.type_v)) {
+        LLAMA_LOG_ERROR("%s: model does not support a quantized V cache (%s)\n",
+            __func__, ggml_type_name(params.type_v));
         return nullptr;
     }
 
