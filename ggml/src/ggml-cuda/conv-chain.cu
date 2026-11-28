@@ -48,7 +48,8 @@ static __global__ void conv_chain_f32(const conv_chain_params p) {
         w[j] = p.w[c*p.w_nb1 + j];
     }
 
-    // xr[j] = column t + j of x; every input is read before the output of its token is written, so dst may be cur
+    // xr[j] = column t + j of x; every input is read before the output of its token is written, so dst may be cur, and all
+    // of past is read here before the first store, so the stored cell may be past
     float xr[n_conv];
 #pragma unroll
     for (int j = 0; j < n_conv - 1; ++j) {
@@ -356,9 +357,13 @@ int ggml_cuda_try_fuse_conv_chain(ggml_backend_cuda_context & ctx, ggml_cgraph *
     if (conv_chain_overlap(scl, w) || conv_chain_overlap(st_dst, w)) {
         return conv_chain_decline(__LINE__);
     }
+    // with the recurrent states read in place, past is the cell the state is stored into: a thread reads all of the past
+    // of its channel before it stores the state there, so past may be the stored cell itself with the same strides
+    const bool past_in_place = store->op == GGML_OP_CPY && past->data == st_dst->data &&
+        past->nb[1] == (size_t) p.st_ch && past->nb[2] == (size_t) p.st_seq;
     // dst may be cur (in place), nothing else may alias an output
     if ((scl->data != cur->data && conv_chain_overlap(scl, cur)) || conv_chain_overlap(scl, past) || conv_chain_overlap(scl, dyn) ||
-        conv_chain_overlap(scl, st_dst) || conv_chain_overlap(st_dst, cur) || conv_chain_overlap(st_dst, past) ||
+        conv_chain_overlap(scl, st_dst) || conv_chain_overlap(st_dst, cur) || (!past_in_place && conv_chain_overlap(st_dst, past)) ||
         conv_chain_overlap(st_dst, dyn)) {
         return conv_chain_decline(__LINE__);
     }

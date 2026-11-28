@@ -5254,7 +5254,8 @@ struct test_ssm_conv_bias_silu : public test_case {
 };
 
 // short convolution chain of Inkling 2 (convolve): CONCAT(past, transpose(cur)), the state store (CPY, or the rollback
-// SET_ROWS after ARANGE, SCALE, CAST), SSM_CONV, optional dynamic taps (CONT, MUL, ADD per lag), ADD(cur, out), SCALE
+// SET_ROWS after ARANGE, SCALE, CAST), SSM_CONV, optional dynamic taps (CONT, MUL, ADD per lag), ADD(cur, out), SCALE.
+// in_place: past is the state cell the CPY stores into, as when the recurrent states are read in place
 struct test_conv_chain_fuse : public test_case {
     const int64_t C;
     const int64_t T;      // tokens per sequence
@@ -5262,6 +5263,7 @@ struct test_conv_chain_fuse : public test_case {
     const int64_t nc;     // conv width
     const int64_t n_head; // 0: no dynamic taps
     const int64_t K;      // 0: CPY store, else SET_ROWS into K rollback slots
+    const bool    in_place;
 
     ggml_tensor * store = nullptr;
     ggml_tensor * res   = nullptr;
@@ -5276,11 +5278,14 @@ struct test_conv_chain_fuse : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { store, res }; }
 
     std::string vars() override {
-        return VARS_TO_STR6(C, T, ns, nc, n_head, K);
+        return VARS_TO_STR6(C, T, ns, nc, n_head, K) + (in_place ? ",in_place=1" : "");
     }
 
-    test_conv_chain_fuse(int64_t C = 256, int64_t T = 1, int64_t ns = 1, int64_t nc = 4, int64_t n_head = 0, int64_t K = 0)
-        : C(C), T(T), ns(ns), nc(nc), n_head(n_head), K(K) {}
+    test_conv_chain_fuse(int64_t C = 256, int64_t T = 1, int64_t ns = 1, int64_t nc = 4, int64_t n_head = 0, int64_t K = 0,
+            bool in_place = false)
+        : C(C), T(T), ns(ns), nc(nc), n_head(n_head), K(K), in_place(in_place) {
+        GGML_ASSERT(!in_place || K == 0);
+    }
 
     void initialize_tensors(ggml_context * ctx) override {
         // the windows of the rollback store overlap: only the tensors that own their data
@@ -5316,6 +5321,11 @@ struct test_conv_chain_fuse : public test_case {
         if (K == 0) {
             ggml_tensor * s    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols*n_ch, size);
             ggml_set_name(s, "state");
+            if (in_place) {
+                // past is read from the cell the store below writes
+                past = ggml_view_3d(ctx, s, n_cols, C, ns, n_cols*sizeof(float), s->nb[1], offs);
+                x    = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, T, ns)), 0);
+            }
             ggml_tensor * last = ggml_view_3d(ctx, x, n_cols, C, ns, x->nb[1], x->nb[2], ggml_row_size(x->type, T));
             ggml_tensor * cell = ggml_view_2d(ctx, s, n_cols*C, ns, s->nb[1], offs);
             store = ggml_cpy(ctx, last, cell);
@@ -13014,6 +13024,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_conv_chain_fuse( 384, 2, 3, 3, n_head, K));
             test_cases.emplace_back(new test_conv_chain_fuse(1024, 512, 1, 4, n_head, K));
         }
+        // past read in place from the state cell
+        for (int64_t T : { 1, 3, 32, 33 }) {
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, T, 1, 4, n_head, 0, true));
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, T, 2, 4, n_head, 0, true));
+        }
+        test_cases.emplace_back(new test_conv_chain_fuse(384, 2, 3, 3, n_head, 0, true));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
