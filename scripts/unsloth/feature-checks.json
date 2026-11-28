@@ -163,13 +163,13 @@
       ]
     },
     "cuda-clip-rows-fusion": {
-      "owner": "unslothai#401",
+      "owner": null,
       "checks": [
         { "kind": "backend-op", "op": "CLIP_ROWS_FUSE" }
       ]
     },
     "cuda-situ-fusion": {
-      "owner": "unslothai#402",
+      "owner": null,
       "checks": [
         { "kind": "backend-op", "op": "SITU_FUSE" }
       ]
@@ -214,7 +214,7 @@
       ]
     },
     "cuda-rel-bias-fa-fusion": {
-      "owner": "unslothai#413",
+      "owner": null,
       "checks": [
         { "kind": "backend-op", "op": "FA_REL_BIAS_FUSE" }
       ]
