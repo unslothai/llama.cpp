@@ -4513,7 +4513,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * bias_table,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        int64_t       i_row) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4522,6 +4523,26 @@ ggml_tensor * llm_graph_context::build_attn(
 
     GGML_ASSERT(attn_mask.rows == nullptr);
     ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+    if (bias_table->ne[2] != indices->ne[1]) {
+        // a chunk of query rows from i_row on: its rows of the mask and of the distances, in each stream
+        ggml_tensor * kq_mask = attn_mask.raw;
+        const int64_t n_stream     = kq_mask->ne[3];
+        const int64_t n_seq_tokens = indices->ne[1]/n_stream;
+        const int64_t n_rows       = bias_table->ne[2]/n_stream;
+        ggml_tensor *& dev = inp->self_rel_pos_dev[is_swa];
+        if (!dev) {
+            dev = ggml_cont(ctx0, indices);
+        }
+        ggml_tensor * rel_pos = ggml_cont(ctx0, ggml_view_3d(ctx0, dev, dev->ne[0], n_rows, n_stream,
+                dev->nb[1], n_seq_tokens*dev->nb[1], i_row*dev->nb[1]));
+        rel_pos = ggml_reshape_2d(ctx0, rel_pos, rel_pos->ne[0], n_rows*n_stream);
+        kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], n_rows, kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]));
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr,
+                sinks, nullptr, kq_scale, il, bias_table, rel_pos);
+    }
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr,
             sinks, nullptr, kq_scale, il, bias_table, indices);

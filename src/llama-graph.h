@@ -827,6 +827,9 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // [base, swa] device copies, made once per graph
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1569,7 +1572,8 @@ struct llm_graph_context {
             ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   i_row = 0) const; // first mask row of q_cur and bias_table
 
     //
     // pooling

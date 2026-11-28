@@ -3168,6 +3168,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
 }
