@@ -4926,8 +4926,7 @@ struct test_l2_clip : public test_case {
 
 // the causal short conv of Inkling 2 as convolve() builds it: CONCAT(past, cur^T), the state store (a CPY of the last
 // columns, or SET_ROWS of the windows of n_slots rollback slots), SSM_CONV, the optional input-dependent taps of H heads,
-// the residual ADD and SCALE, and an optional residual add after it. in_place: past is the state cell (slot 0) the
-// store writes, as when the recurrent states are read in place
+// the residual ADD and SCALE, and an optional residual add after it. in_place: past aliases the stored state cell (slot 0)
 struct test_short_conv : public test_case {
     const int64_t C, Ts, S, H, n_slots;
     const bool    res;

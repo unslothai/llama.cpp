@@ -1923,9 +1923,7 @@ static int ggml_cuda_try_fuse_short_conv(ggml_backend_cuda_context * cuda_ctx, g
     // and cur at a token right before it writes dst there, so dst may be either of them in place when one thread has
     // the whole sequence; any other overlap is rejected
     const bool cur_in_place = cur->data == dst->data;
-    // with the recurrent states read in place, past is the cell the new state is stored into. a thread reads the past
-    // of its channel before it stores the state of that channel, so this is safe when one thread has the whole sequence,
-    // only one window is stored and past is that slot with the same strides
+    // in-place past aliases the stored state: a thread reads its channel's past before storing it, so this is safe only with one thread per sequence, kw == 1 and matching strides
     const bool past_in_place = past->data == cell->data && kw == 1 && past->nb[1] == (size_t) ch_s*sizeof(float) &&
         past->nb[2] == (size_t) seq_s*sizeof(float);
     if ((cur_in_place && Ts > 64) || (past_in_place && Ts > 64) || (!cur_in_place && ggml_cuda_tensors_overlap(cur, dst)) ||
