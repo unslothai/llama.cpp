@@ -225,8 +225,67 @@ def probe_penalize_prompt(check: dict, b: Path, gpu: bool) -> str:
             "by the default prompt-wide presence penalty")
 
 
+def probe_decode_kernels(check: dict, b: Path, gpu: bool) -> str:
+    """The named device kernels launch while a synthetic model of the arch decodes.
+
+    A backend-op check builds its own graph, so a fused kernel whose matcher no
+    longer recognises the graph the model builds still passes it, while every
+    real decode runs the separate ops. Upstream 7b74cb92d6 (recurrent states read
+    in place) did that to the Inkling 2 short conv fusions: the op tests stayed
+    green and decode lost 13%. This runs test-llama-archs -a ARCH under nsys and
+    requires every kernel in "kernels" to launch at least once.
+    """
+    import os
+
+    if not gpu:
+        raise NeedsGPU("kernel launches can only be counted on the device")
+    nsys = os.environ.get("NSYS") or shutil.which("nsys")
+    if not nsys:
+        raise Unproven("nsys is not on PATH (or $NSYS), so the kernel launches cannot be counted")
+    arch = check["arch"]
+    counts = _DECODE_KERNELS.get((b, arch))
+    if counts is None:
+        counts = _DECODE_KERNELS[(b, arch)] = _decode_kernel_counts(nsys, arch, b, gpu)
+    seen, missing = [], []
+    for k in check["kernels"]:
+        n = sum(v for name, v in counts.items() if re.search(rf"\b{re.escape(k)}\b", name))
+        (seen if n else missing).append(f"{k} x{n}")
+    if missing:
+        raise Unproven(f"never launched in the {arch} decode: {', '.join(missing)} "
+                       "(the fusion no longer matches the model graph)")
+    return f"{', '.join(seen)} in the {arch} decode"
+
+
+# one profiled decode per (build, arch), shared by every check that names the arch
+_DECODE_KERNELS: dict = {}
+
+
+def _decode_kernel_counts(nsys: str, arch: str, b: Path, gpu: bool) -> dict:
+    import csv
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="fm_dk_") as tmp:
+        rep = Path(tmp) / "decode"
+        rc, out = run([nsys, "profile", "-t", "cuda", "-o", str(rep), "-f", "true",
+                       str(b / "test-llama-archs"), "-a", arch, "-s", "1234"], b, gpu)
+        if rc != 0:
+            raise Unproven(f"nsys profile test-llama-archs -a {arch} exited {rc}")
+        rc, out = run([nsys, "stats", "-r", "cuda_gpu_kern_sum", "-f", "csv", "-o", str(rep),
+                       str(rep) + ".nsys-rep"], b, gpu)
+        table = Path(str(rep) + "_cuda_gpu_kern_sum.csv")
+        if rc != 0 or not table.exists():
+            raise Unproven(f"nsys stats wrote no kernel summary (rc {rc})")
+        counts: dict = {}
+        with open(table, newline="") as f:
+            for row in csv.DictReader(f):
+                counts[row["Name"]] = counts.get(row["Name"], 0) + int(row["Instances"])
+    if not counts:
+        raise Unproven(f"no device kernel ran in the {arch} decode")
+    return counts
+
+
 PROBES = {"arch": probe_arch, "backend-op": probe_backend_op, "mtmd": probe_mtmd,
-          "penalize-prompt": probe_penalize_prompt}
+          "penalize-prompt": probe_penalize_prompt, "decode-kernels": probe_decode_kernels}
 
 
 def main() -> int:

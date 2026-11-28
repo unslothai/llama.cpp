@@ -182,6 +182,40 @@ rc, rep, out = run(d, m, "--gpu")
 check("a full (--gpu) build without llama-server is a failure, not a deferral",
       rc == 1 and rep["deferred"] == 0 and "missing from this full build" in json.dumps(rep), out)
 
+# --- 12. decode-kernels: a fused kernel that never launched is a failure ---
+def fake_nsys(dirp: Path, csv_rows: str, rc: int = 0) -> Path:
+    # profile runs the command; stats writes <-o>_cuda_gpu_kern_sum.csv with the given rows
+    p = dirp / "nsys"
+    p.write_text("#!/bin/sh\nif [ \"$1\" = profile ]; then shift 7; \"$@\" > /dev/null; exit " + str(rc) + "; fi\n"
+                 "out=$7; cat > \"${out}_cuda_gpu_kern_sum.csv\" <<'XEOF'\n"
+                 "Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n"
+                 + csv_rows + "\nXEOF\n")
+    p.chmod(0o755)
+    return p
+
+
+DK = [{"kind": "decode-kernels", "arch": "inkling2", "kernels": ["short_conv_f32", "conv_chain_f32"]}]
+FUSED = ('1.0,10,352,1,1,1,1,0,"void short_conv_f32<(bool)0, (bool)1>(ggml_cuda_short_conv_args)"\n'
+         '1.0,10,32,1,1,1,1,0,"void conv_chain_f32<(int)4, (bool)1>(conv_chain_params)"')
+UNFUSED = '1.0,10,384,1,1,1,1,0,"void ssm_conv_f32<(bool)0, (unsigned long)128, (unsigned long)4>(const float *)"'
+d, m = build(checks=DK)
+os.environ["NSYS"] = str(fake_nsys(d, FUSED))
+rc, rep, out = run(d, m, "--gpu")
+check("decode-kernels passes when every kernel launched", rc == 0 and "short_conv_f32 x352" in out, out)
+d, m = build(checks=DK)
+os.environ["NSYS"] = str(fake_nsys(d, UNFUSED))
+rc, rep, out = run(d, m, "--gpu")
+check("decode-kernels fails when a fused kernel never launched",
+      rc == 1 and "never launched" in out and "short_conv_f32 x0" in out, out)
+d, m = build(checks=DK)
+os.environ["NSYS"] = str(fake_nsys(d, "", rc=0))
+rc, rep, out = run(d, m, "--gpu")
+check("decode-kernels with no kernel at all is a failure", rc == 1, out)
+d, m = build(checks=DK)
+rc, rep, out = run(d, m)
+check("decode-kernels is deferred without a GPU", rc == 0 and rep["deferred"] == 1, out)
+del os.environ["NSYS"]
+
 print()
 print(f"{len(FAILS)} failure(s)" + (": " + ", ".join(FAILS) if FAILS else ""))
 sys.exit(1 if FAILS else 0)
