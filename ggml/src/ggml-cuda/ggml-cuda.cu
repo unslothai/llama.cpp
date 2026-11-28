@@ -985,6 +985,10 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    if (getenv("GGML_CUDA_Q8_1_REUSE_STATS")) {
+        GGML_LOG_INFO("%s: src1 q8_1 reuse: %lld hits, %lld quantizations\n", __func__,
+            (long long) src1_cache.n_hit, (long long) src1_cache.n_miss);
+    }
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -3264,6 +3268,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // MUL_MAT nodes that read the same src1 quantize it once (see ggml_cuda_src1_cache)
+            static const bool src1_cache_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_REUSE");
+            ggml_cuda_src1_cache & src1_cache = cuda_ctx->src1_cache;
+            src1_cache.release();
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -3315,7 +3324,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // only a MUL_MAT node of the graph, on one stream, uses the cache: the cache is freed between nodes,
+                // so no pool allocation of a caller may be live below it
+                if (is_concurrent_event_active) {
+                    src1_cache.release();
+                }
+                src1_cache.enabled = !src1_cache_disabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT;
+
                 int nodes_to_skip = ggml_cuda_fusion_disabled() ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                src1_cache.enabled = false;
+                for (int k = i; k <= i + nodes_to_skip && src1_cache.src1; ++k) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                        src1_cache.invalidate_if_written(cgraph->nodes[k]);
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -3344,7 +3367,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                src1_cache.enabled = !src1_cache_disabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                src1_cache.enabled = false;
+                src1_cache.invalidate_if_written(node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -3354,6 +3380,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            src1_cache.release();
         }
 
 #ifdef USE_CUDA_GRAPH
