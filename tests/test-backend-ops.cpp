@@ -112,7 +112,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
-    } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
+    } else if (ggml_is_quantized(tensor->type) || ggml_needs_scale(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
         GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
 
          // dummy importance matrix
@@ -286,7 +286,7 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     const auto * tt = ggml_get_type_traits(t->type);
     size_t bs = ggml_blck_size(t->type);
     std::vector<float> vq(ggml_blck_size(t->type));
-    bool uses_type_conversion = ggml_is_quantized(t->type) || t->type == GGML_TYPE_F8_E4M3;
+    bool uses_type_conversion = ggml_is_quantized(t->type) || ggml_needs_scale(t->type);
 
     // access elements by index to avoid gaps in views
     for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
@@ -6459,9 +6459,11 @@ struct test_mul_mat : public test_case {
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
     const size_t offset_a; // byte offset of the a view when k_v > k or m_v > m
     const bool weights; // a in a weights buffer (CUDA with PDL reads weights early)
+    const int scale_gran; // weight scale granularity: 0=default, 1=per-tensor, 2=per-output-channel
+    const bool scale_view;
 
     std::string vars() override {
-        std::string s = VARS_TO_STR14(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad, offset_a);
+        std::string s = VARS_TO_STR16(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad, offset_a, scale_gran, scale_view);
         if (weights) {
             s += ",weights=1";
         }
@@ -6499,8 +6501,8 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, size_t offset_a = 0, bool weights = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), offset_a(offset_a), weights(weights) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, size_t offset_a = 0, bool weights = false, int scale_gran = 0, bool scale_view = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), offset_a(offset_a), weights(weights), scale_gran(scale_gran), scale_view(scale_view) {}
 
     bool use_weight_context() override {
         return weights;
@@ -6588,10 +6590,25 @@ struct test_mul_mat : public test_case {
             ggml_set_name(b, "b");
         }
 
-        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_tensor * s = nullptr;
+        if (scale_gran == 2) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        } else if (scale_gran == 1 || ggml_needs_scale(type_a)) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        }
+        if (s && scale_view) {
+            s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, s->ne[0], s->ne[1]);
+            s = ggml_view_3d(ctx, s, 1, s->ne[1], s->ne[2], s->nb[1], s->nb[2], sizeof(float));
+            s = ggml_permute(ctx, s, 2, 0, 1, 3);
+        }
+        if (s) {
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_mul_mat_ext(ctx, a, b, s, nullptr);
         ggml_set_name(out, "out");
         for (uint32_t i = 1; i < o; ++i) {
-            ggml_tensor * out2 = ggml_mul_mat(ctx, a, b);
+            ggml_tensor * out2 = ggml_mul_mat_ext(ctx, a, b, s, nullptr);
             ggml_set_name(out2, "out2");
             out = ggml_add(ctx, out, out2);
         }
@@ -6824,9 +6841,11 @@ struct test_mul_mat_id : public test_case {
     const int64_t m_v; // rows of as in memory, the experts of as are strided for m_v > m, no view for m_v == 0
     const bool ids_offset;
     const bool skip; // set some ids to a negative value
+    const int scale_gran; // weight scale granularity: 0=default, 1=per-expert scalar, 2=per-channel-per-expert
+    const bool scale_view;
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip);
+        return VARS_TO_STR13(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip, scale_gran, scale_view);
     }
 
     double max_nmse_err() override {
@@ -6854,9 +6873,9 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            int64_t m_v = 0, bool ids_offset = false, bool skip = false)
+            int64_t m_v = 0, bool ids_offset = false, bool skip = false, int scale_gran = 0, bool scale_view = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip) {
+            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip), scale_gran(scale_gran), scale_view(scale_view) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(m_v == 0 || m_v > m);
         }
@@ -6879,7 +6898,29 @@ struct test_mul_mat_id : public test_case {
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
 
-        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_tensor * s = nullptr;
+        if (scale_gran == 2) {
+            s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n_mats);
+        } else if (scale_gran == 1 || ggml_needs_scale(type_a)) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        }
+        if (s && skip && !scale_view) {
+            const int64_t n_channels = scale_gran == 2 ? m : 1;
+            ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_mats + 1);
+            ggml_set_name(storage, "scale_storage");
+            s = scale_gran == 2 ? ggml_view_2d(ctx, storage, m, n_mats, storage->nb[1], storage->nb[1]) :
+                ggml_view_1d(ctx, storage, n_mats, sizeof(float));
+        }
+        if (s && scale_view) {
+            s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, s->ne[0], s->ne[1]);
+            s = ggml_view_3d(ctx, s, 1, s->ne[1], s->ne[2], s->nb[1], s->nb[2], sizeof(float));
+            s = ggml_permute(ctx, s, 2, 0, 1, 3);
+        }
+        if (s) {
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_mul_mat_id_ext(ctx, as, b, ids, s, nullptr);
         ggml_set_name(out, "out");
 
         return out;
@@ -6887,6 +6928,11 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, skip);
+        if (ggml_tensor * storage = ggml_get_tensor(ctx, "scale_storage")) {
+            // A skipped expert must not read the scale row before the view.
+            std::vector<float> prefix(storage->ne[0], NAN);
+            ggml_backend_tensor_set(storage, prefix.data(), 0, prefix.size()*sizeof(float));
+        }
     }
 
     void reinit_perf_iter(ggml_context * ctx) override {
@@ -9334,7 +9380,7 @@ struct test_mul_mat_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    bool use_weight_context() override { return use_id && with_lane_scale; }
+    bool use_weight_context() override { return use_id && (with_lane_scale || ggml_needs_scale(type)); }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -9351,20 +9397,6 @@ struct test_mul_mat_fusion : public test_case {
             }
         }
         return out;
-    }
-
-    ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        return ggml_mul(ctx, out, scale);
-    }
-
-    ggml_tensor * build_lane_scale_id(ggml_context * ctx, ggml_context * ctx_weights, ggml_tensor * out, ggml_tensor * ids) {
-        GGML_ASSERT(ctx_weights);
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mats);
-        ggml_tensor * s = ggml_reshape_3d(ctx, scale, 1, n_mats, 1);
-        s = ggml_repeat_4d(ctx, s, 1, n_mats, m, 1);
-        s = ggml_get_rows(ctx, s, ids);
-        return ggml_mul(ctx, out, s);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -9384,10 +9416,9 @@ struct test_mul_mat_fusion : public test_case {
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
 
             auto build_lane_up = [&]() {
-                ggml_tensor * ffn_up = ggml_mul_mat(ctx, up, cur);
-                if (with_lane_scale) {
-                    ffn_up = build_lane_scale_dense(ctx, ffn_up);
-                }
+                ggml_tensor * scale = (with_lane_scale || ggml_needs_scale(up->type))
+                    ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+                ggml_tensor * ffn_up = ggml_mul_mat_ext(ctx, up, cur, scale, nullptr);
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
                     ggml_tensor * up_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
@@ -9397,10 +9428,9 @@ struct test_mul_mat_fusion : public test_case {
             };
 
             auto build_lane_gate = [&]() {
-                ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate, cur);
-                if (with_lane_scale) {
-                    ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
-                }
+                ggml_tensor * scale = (with_lane_scale || ggml_needs_scale(gate->type))
+                    ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+                ggml_tensor * ffn_gate = ggml_mul_mat_ext(ctx, gate, cur, scale, nullptr);
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
                     ggml_tensor * gate_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
@@ -9433,10 +9463,9 @@ struct test_mul_mat_fusion : public test_case {
             ggml_set_name(cur, "cur");
 
             auto build_lane_up = [&]() {
-                ggml_tensor * ffn_up = ggml_mul_mat_id(ctx, ups, cur, ids);
-                if (with_lane_scale) {
-                    ffn_up = build_lane_scale_id(ctx, ctx_weights, ffn_up, ids);
-                }
+                ggml_tensor * scale = (with_lane_scale || ggml_needs_scale(ups->type))
+                    ? ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mats) : nullptr;
+                ggml_tensor * ffn_up = ggml_mul_mat_id_ext(ctx, ups, cur, ids, scale, nullptr);
                 if (with_bias) {
                     ggml_tensor * up_bias_param = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_up->ne[0], n_mats);
                     ffn_up = ggml_add_id(ctx, ffn_up, up_bias_param, ids);
@@ -9445,10 +9474,9 @@ struct test_mul_mat_fusion : public test_case {
             };
 
             auto build_lane_gate = [&]() {
-                ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gates, cur, ids);
-                if (with_lane_scale) {
-                    ffn_gate = build_lane_scale_id(ctx, ctx_weights, ffn_gate, ids);
-                }
+                ggml_tensor * scale = (with_lane_scale || ggml_needs_scale(gates->type))
+                    ? ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mats) : nullptr;
+                ggml_tensor * ffn_gate = ggml_mul_mat_id_ext(ctx, gates, cur, ids, scale, nullptr);
                 if (with_bias) {
                     ggml_tensor * gate_bias_param = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_gate->ne[0], n_mats);
                     ffn_gate = ggml_add_id(ctx, ffn_gate, gate_bias_param, ids);
@@ -10558,11 +10586,14 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const ggml_type type_KV;
     const float logit_softcap;
     const bool mask_row;    // query 0 of each stream sees no key
+    const bool causal;      // prefix of 0 per query, -inf after, distance bins
+    const int64_t n_kv_max; // sparse hint
 
     std::vector<int32_t> rows;
+    std::vector<int64_t> visible;
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, logit_softcap, mask_row);
+        return VARS_TO_STR14(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, logit_softcap, mask_row, causal, n_kv_max);
     }
 
     double max_nmse_err() override {
@@ -10571,9 +10602,9 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
     test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3, int64_t kv = 768, int64_t nb = 7, int64_t n_stream = 2,
                                      int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16,
-                                     float logit_softcap = 0.0f, bool mask_row = false)
+                                     float logit_softcap = 0.0f, bool mask_row = false, bool causal = false, int64_t n_kv_max = 0)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV),
-          logit_softcap(logit_softcap), mask_row(mask_row) {}
+          logit_softcap(logit_softcap), mask_row(mask_row), causal(causal), n_kv_max(n_kv_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -10606,6 +10637,7 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
             ggml_flash_attn_ext_add_sinks(out, s);
         }
         ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -10630,18 +10662,33 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
             }
         }
 
+        visible.assign(nb*n_stream, kv);
+        if (causal) {
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t j = 0; j < nb; ++j) {
+                    visible[s*nb + j] = kv/2 + (j + 1)*(kv/2)/nb - 37*s;
+                }
+            }
+        }
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "r") == 0) {
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0 && n_kv_max > 0) {
+                init_tensor_kq_mask_sparse(t, n_kv_max);
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<float> f(ggml_nelements(t));
                 std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t j = 0; j < nb; ++j) {
                         for (int64_t i = 0; i < kv; ++i) {
-                            const bool pad = kv_rows && rows[s*kv + i] < 0;
-                            const bool drop = (i + 3*j + 5*s) % 11 == 0 || (mask_row && j == 0);
-                            f[(s*nb + j)*kv + i] = pad || drop ? -INFINITY : dis(gen);
+                            const bool masked = (kv_rows && rows[s*kv + i] < 0) || (mask_row && j == 0);
+                            if (causal) {
+                                f[(s*nb + j)*kv + i] = masked || i >= visible[s*nb + j] ? -INFINITY : 0.0f;
+                                continue;
+                            }
+                            const bool drop = (i + 3*j + 5*s) % 11 == 0;
+                            f[(s*nb + j)*kv + i] = masked || drop ? -INFINITY : dis(gen);
                         }
                     }
                 }
@@ -10653,6 +10700,14 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
                 std::uniform_int_distribution<int32_t> dis(0, n_bins - 1);
                 for (auto & i : idx) {
                     i = dis(gen);
+                }
+                if (causal) {
+                    for (int64_t q = 0; q < nb*n_stream; ++q) {
+                        for (int64_t i = 0; i < kv; ++i) {
+                            const int64_t dist = visible[q] - 1 - i;
+                            idx[q*kv + i] = dist < 0 ? n_bins - 1 : (int32_t) std::min<int64_t>(dist, n_bins - 1);
+                        }
+                    }
                 }
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "table") == 0) {
@@ -13517,6 +13572,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
+    // stream-k fixup with a partial column tile
+    test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 4, false, 32, 17, 1024));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
@@ -13530,6 +13587,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
             }
         }
+    }
+
+    for (int scale_gran : {1, 2}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F8_E4M3}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 1, 1, false, 32, 4, 32, 0, false, false, scale_gran));
+            for (int64_t n : {1, 4}) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 4, 4, false, 64, n, 256, 0, false, true, scale_gran));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32, 4, 32, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, false, scale_gran, true));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 4, 2, false, 32, 4, 32, 0, false, false, scale_gran, true));
+        }
+        for (int64_t n : {1, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, n, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, false, scale_gran));
+        }
+    }
+
+    for (int64_t n : {1, 16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, false, 32, n, 256, 0, false, false, 0, true));
     }
 
 #if 0
@@ -13616,6 +13691,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 16, 16, 64, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 0, offset_a));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 16, 16, 64, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 17, 4));
+    // scaled weights sliced out of a larger tensor
+    for (ggml_type type : {GGML_TYPE_F8_E4M3, GGML_TYPE_NVFP4}) {
+        for (int scale_gran : {1, 2}) {
+            for (int64_t n : {1, 16}) {
+                for (int64_t bs : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16, n, 64, {bs, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 20, 0, 3*ggml_row_size(type, 64), false, scale_gran));
+                }
+            }
+        }
+    }
 
     // testing very large N
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16, 2105344, 32, {1, 1}, {1, 1}));
@@ -14964,6 +15049,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, false, GGML_TYPE_F16, 0.0f, true));
         }
     }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 2048, nb, 2, 33, false, true, type, 0.0f, false, true));
+        }
+    }
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 4096, nb, 2, 33, false, true, GGML_TYPE_F16, 0.0f, false, false, 512));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(256, 2, 3, 768, 65, 2, 17));
+    for (int64_t hs : {128, 256}) {
+        for (int64_t nb : {1, 7, 65}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(hs, 2, 3, 1000, nb, 2, 17));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, 0.0f, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100,   7, 2, 33, false, true, GGML_TYPE_Q8_0));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -15133,7 +15234,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 continue;
                             }
                             for (bool with_lane_scale : {false, true}) {
-                                if (with_lane_scale && type != GGML_TYPE_NVFP4 && type != GGML_TYPE_F8_E4M3) {
+                                if (with_lane_scale && !ggml_needs_scale(type)) {
                                     continue;
                                 }
                                 test_cases.emplace_back(new test_mul_mat_fusion(type, glu_op, 1, 32, 256,
