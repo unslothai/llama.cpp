@@ -165,13 +165,13 @@
     "cuda-clip-rows-fusion": {
       "owner": null,
       "checks": [
-        { "kind": "backend-op", "op": "CLIP_ROWS_FUSE" }
+        { "kind": "backend-op", "op": "L2_CLIP" }
       ]
     },
     "cuda-situ-fusion": {
       "owner": null,
       "checks": [
-        { "kind": "backend-op", "op": "SITU_FUSE" }
+        { "kind": "backend-op", "op": "SITU" }
       ]
     },
     "cuda-concat-flat": {
@@ -216,7 +216,7 @@
     "cuda-rel-bias-fa-fusion": {
       "owner": null,
       "checks": [
-        { "kind": "backend-op", "op": "FA_REL_BIAS_FUSE" }
+        { "kind": "backend-op", "op": "FLASH_ATTN_EXT" }
       ]
     },
     "cuda-q8-1-reuse": {
