@@ -54,7 +54,7 @@ void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * gate
 // one thread per (channel, run of tokens of one sequence). the last K columns of x stay in registers, right-aligned in
 // M = GGML_CUDA_SHORT_CONV_MAX_K slots with zero weights in front, so K needs no template and the sums keep their order.
 // a thread reads cur at a token before it writes dst there and never again, so dst may be cur itself when a thread has
-// the whole sequence
+// the whole sequence. it also reads all of past before it stores the state, so the state may be past itself then
 template <bool has_dyn, bool has_res>
 static __global__ void short_conv_f32(const ggml_cuda_short_conv_args a) {
     ggml_cuda_pdl_lc();
