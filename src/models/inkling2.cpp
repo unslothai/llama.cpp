@@ -23,6 +23,28 @@ static bool inkling2_banded_causal_enabled() {
     return enabled;
 }
 
+// ubatches of 2 to this many tokens over at most n_kv_dense_max cells take the dense attention with the indexed
+// relative bias (one FA tile kernel), not the banded op and its merge. On a B200 the dense path is faster for 2 to 8
+// tokens up to 128K cells; 16 tokens lose from 64K cells. LLAMA_INKLING_DENSE_NMAX and LLAMA_INKLING_DENSE_KV_MAX
+// override them (for sweeps; NMAX=1 restores the banded path for every ubatch of 2+ tokens)
+static constexpr int64_t n_tokens_dense_max = 8;
+static constexpr int64_t n_kv_dense_max     = INT64_MAX;
+
+static int64_t inkling2_env_i64(const char * name, int64_t def) {
+    const char * env = getenv(name);
+    return env == nullptr ? def : std::max<int64_t>(0, atoll(env));
+}
+
+static int64_t inkling2_dense_n_max() {
+    static const int64_t v = inkling2_env_i64("LLAMA_INKLING_DENSE_NMAX", n_tokens_dense_max);
+    return v;
+}
+
+static int64_t inkling2_dense_kv_max() {
+    static const int64_t v = inkling2_env_i64("LLAMA_INKLING_DENSE_KV_MAX", n_kv_dense_max);
+    return v;
+}
+
 static int inkling2_banded_pos_mode() {
     static const int mode = [] {
         const char * env = getenv("LLAMA_INKLING_BANDED_POS");
@@ -379,10 +401,16 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     const auto * base = attn->mctx->get_base();
     const ggml_type tk = base->type_k();
     const ggml_type tv = base->type_v();
-    decode_banded = n_tokens == 1 && cparams.n_seq_max == 1 && (tk == tv ?
+    const bool kv_converted = tk == tv ?
         tk == GGML_TYPE_Q4_1 || tk == GGML_TYPE_Q5_0 || tk == GGML_TYPE_Q5_1 :
-        tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q4_0 || tv == GGML_TYPE_F16));
-    inp->banded     = cparams.flash_attn && (n_tokens > 1 || decode_banded);
+        tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q4_0 || tv == GGML_TYPE_F16);
+    decode_banded = n_tokens == 1 && cparams.n_seq_max == 1 && kv_converted;
+    // a few-token ubatch (speculative verify, prompt tails) over a short enough cache stays dense too: the FA tile
+    // kernel with the indexed bias beats the banded op plus its merge there. n_kv is part of can_reuse(), so a reused
+    // graph made the same choice
+    const bool small_dense = n_tokens > 1 && n_tokens <= inkling2_dense_n_max() && !kv_converted &&
+        (int64_t) base->get_n_kv() <= inkling2_dense_kv_max();
+    inp->banded     = cparams.flash_attn && ((n_tokens > 1 && !small_dense) || decode_banded);
     inp->banded_pad = n_tokens <= n_tokens_banded_min;
     // the cells of several sequences, or of a wrapped cache, are not the positions: the banded attention then
     // takes the distances from the positions of the cells and the queries; disabled, those ubatches are dense
